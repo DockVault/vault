@@ -244,15 +244,30 @@ app.include_router(info_router)
 from app.config.branding import HEX_COLOR_RE
 from app.config.effective import BRAND_SETTINGS_KEY, set_brand_overrides
 
-# Import and include setup router (first-run detection)
+# First-run gate for the ENTIRE setup surface. The setup wizard is UNAUTHENTICATED (it has
+# to run before any admin exists), so it must become unreachable the moment an instance is
+# set up — otherwise an anonymous request could reconfigure a live production instance
+# (create/alter the admin, rewrite config). "Set up" = ANY admin user exists, which every
+# production deploy has from startup (setup-secure.sh and the SaaS portal seed the admin
+# from env). Queried WITHOUT the is_active filter on purpose: a deactivated admin still
+# means the instance is set up and must NOT re-open the wizard. Setup is done by the
+# provisioning script / portal, so the wizard is a first-run-only fallback for a bare deploy.
+def require_setup_not_complete(db: Session = Depends(get_db)):
+    from models import User, RoleEnum
+    if db.query(User).filter(User.role == RoleEnum.ADMIN).count() > 0:
+        raise HTTPException(status_code=404, detail="Not found")
+
+# Import and include setup router (first-run detection). Gated: 404 once the instance is set up.
 # NOTE: Changed prefix from "/api" to "/api/setup-legacy" to avoid conflicts with wizard_router
 # The old setup API is kept for backwards compatibility but should not be used for new setups
 from app.setup.api import router as setup_router
-app.include_router(setup_router, prefix="/api/setup-legacy")
+app.include_router(setup_router, prefix="/api/setup-legacy",
+                   dependencies=[Depends(require_setup_not_complete)])
 
-# Import and include setup wizard router (NEW - use this one!)
+# Import and include setup wizard router (NEW - use this one!). Gated: 404 once set up.
 from app.setup.wizard_api import router as wizard_router
-app.include_router(wizard_router, prefix="/api/setup")
+app.include_router(wizard_router, prefix="/api/setup",
+                   dependencies=[Depends(require_setup_not_complete)])
 
 # Import and include ECC router (Elliptic Curve Cryptography)
 from ecc_router import router as ecc_router
@@ -263,8 +278,9 @@ from app.setup.detector import needs_setup
 from fastapi.responses import RedirectResponse, HTMLResponse
 
 @app.get("/setup", response_class=HTMLResponse)
-async def setup_wizard_page():
-    """Serve the setup wizard HTML page."""
+async def setup_wizard_page(_: None = Depends(require_setup_not_complete)):
+    """Serve the setup wizard HTML page. Gated: 404 once the instance is set up (an admin
+    exists), so the wizard page can't be opened on a live production instance."""
     templates_dir = os.path.join(os.path.dirname(__file__), "templates")
     wizard_file = os.path.join(templates_dir, "setup_wizard.html")
     

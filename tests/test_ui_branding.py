@@ -209,16 +209,6 @@ def test_admin_branding_editor_saves_live(page: Page, admin_creds, admin):
         _delete_brand_quiet()
 
 
-def test_setup_page_renders_effective_branding(page: Page):
-    """A5: the /setup wizard page renders the EFFECTIVE app_name (env + admin/DB overrides)
-    via a client-side /branding fetch into [data-brand-name] + the title — not a hardcoded
-    literal. The page is public (first-run tool), so no login is needed."""
-    with brand_override({"app_name": "SetupPageBrand"}):
-        page.goto("/setup")
-        expect(page.locator("[data-brand-name]").first).to_have_text("SetupPageBrand", timeout=10000)
-        expect(page).to_have_title(re.compile(r"^SetupPageBrand\b"), timeout=10000)
-
-
 def test_admin_uploads_logo_via_form(page: Page, admin_creds, admin, tmp_path):
     """A4 e2e through the REAL admin form: log in, open Settings -> Branding, upload a logo
     via the file input + Upload button, and confirm /branding points every logo slot at the
