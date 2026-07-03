@@ -1,20 +1,20 @@
 """
 Static-asset supply-chain guard (no live server needed).
 
-The vault dashboard used to pull Chart.js from `cdn.jsdelivr.net` with no
-Subresource Integrity — a compromised/tampered CDN response would execute in the
-vault's own origin (Semgrep `html.security.audit.missing-integrity`). The fix
-vendors Chart.js locally (matching the project's air-gapped / self-hosted asset
-posture — the admin panel vendors Leaflet + this same Chart.js build) and drops
-the CDN origin from the page CSP. These tests read the repo files directly, so
-they run without a running vault container.
+The vault UI must not load any resource (script/stylesheet) from an external
+origin — a compromised/tampered CDN response would execute in the vault's own
+origin (Semgrep `html.security.audit.missing-integrity`). All assets are
+vendored under /static (fonts, JS, CSS), matching the project's air-gapped /
+self-hosted posture. These tests read the repo files directly, so they run
+without a running vault container.
 """
 import re
 from pathlib import Path
 
 import pytest
 
-STATIC = Path(__file__).resolve().parent.parent / "static"
+ROOT = Path(__file__).resolve().parent.parent
+STATIC = ROOT / "static"
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -26,12 +26,17 @@ def _require_running_container():
     vendored asset would otherwise slip through unnoticed)."""
     return None
 
-# The customer-facing product dashboards. Any external-CDN <script>/<link> here
-# is a supply-chain risk (executes in the vault origin), so they must be self-hosted.
-DASHBOARD_HTML = STATIC / "dashboard_new.html"
+
+# The customer-facing pages actually served by api_server.py: GET / serves
+# static/index.html (the dual-skin SPA shell), GET /setup serves the first-run
+# wizard. Any external-origin <script src>/<link href> here is a supply-chain
+# risk (executes in the vault origin), so they must be self-hosted. Plain
+# anchors (e.g. the "powered by" link) are navigation, not loaded resources.
+LIVE_HTML = [STATIC / "index.html", ROOT / "templates" / "setup_wizard.html"]
 # The authoritative CSP is the response header set in api_server.py (the meta tag
-# is a belt-and-braces copy); its script-src must also drop the CDN origin.
-API_SERVER = Path(__file__).resolve().parent.parent / "api_server.py"
+# in index.html is a belt-and-braces copy); its script-src must not allow-list
+# any external origin.
+API_SERVER = ROOT / "api_server.py"
 
 
 def _read(p: Path) -> str:
@@ -39,35 +44,25 @@ def _read(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="ignore")
 
 
-def test_dashboard_has_no_external_resource_urls():
-    """No src=/href= may point at an external http(s) origin — all self-hosted."""
-    html = _read(DASHBOARD_HTML)
-    external = re.findall(r'(?:src|href)\s*=\s*"(https?://[^"]+)"', html)
-    assert external == [], f"dashboard loads external resources (supply-chain risk): {external}"
+@pytest.mark.parametrize("page", LIVE_HTML, ids=lambda p: p.name)
+def test_live_page_loads_no_external_resources(page):
+    """No <script src>/<link href> may point at an external http(s) origin."""
+    html = _read(page)
+    external = re.findall(r'<(?:script|link)\b[^>]*?(?:src|href)\s*=\s*"(https?://[^"]+)"', html)
+    assert external == [], f"{page.name} loads external resources (supply-chain risk): {external}"
 
 
-def test_dashboard_chartjs_is_self_hosted():
-    """Chart.js must be referenced from the local /static path, not a CDN."""
-    html = _read(DASHBOARD_HTML)
-    assert 'src="/static/js/chart.umd.min.js"' in html, "dashboard must load the vendored chart.js"
-    # The comprehensive "no external origin" guard is test_dashboard_has_no_external_resource_urls;
-    # here we only pin that the specific former CDN (jsdelivr) is gone (no broad "cdn." substring —
-    # that would false-fail on benign text like a comment mentioning a CDN).
-    assert "jsdelivr" not in html, "the former jsdelivr CDN reference must be gone from the dashboard"
-
-
-def test_dashboard_csp_script_src_is_self_only():
-    """The page CSP must not allow-list any external script origin."""
-    html = _read(DASHBOARD_HTML)
+def test_index_csp_script_src_is_self_only():
+    """The served page's CSP meta must not allow-list any external script origin."""
+    html = _read(STATIC / "index.html")
     m = re.search(r'Content-Security-Policy"\s+content="([^"]+)"', html)
-    assert m, "dashboard must declare a Content-Security-Policy meta tag"
+    assert m, "index.html must declare a Content-Security-Policy meta tag"
     csp = m.group(1)
     script_src = next((d for d in csp.split(";") if d.strip().startswith("script-src")), "")
     assert script_src, "CSP must declare a script-src directive"
     # only 'self' / 'unsafe-inline' style keywords — no scheme/host source expressions
     assert "http://" not in script_src and "https://" not in script_src, \
         f"script-src still allow-lists an external origin: {script_src.strip()!r}"
-    assert "jsdelivr" not in script_src
 
 
 def test_server_side_csp_script_src_is_self_only():
@@ -80,14 +75,6 @@ def test_server_side_csp_script_src_is_self_only():
     assert "http://" not in script_src and "https://" not in script_src, \
         f"server-side script-src still allow-lists an external origin: {script_src!r}"
     assert "jsdelivr" not in script_src
-
-
-def test_vendored_chartjs_is_complete_and_correct_version():
-    """The vendored file must be a complete Chart.js v4.4.0 (the version the page expects)."""
-    js = STATIC / "js" / "chart.umd.min.js"
-    data = _read(js)
-    assert len(data) > 100_000, "vendored chart.js looks truncated"
-    assert "Chart.js v4.4.0" in data, "vendored chart.js is not the expected 4.4.0 build"
 
 
 if __name__ == "__main__":  # allow: python test_static_selfhosted_assets.py

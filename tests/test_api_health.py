@@ -27,9 +27,12 @@ def test_root_serves_ui(base_url):
 
 
 def test_setup_wizard_served(base_url):
+    # /setup is gated to first-run: it serves the wizard until an admin exists,
+    # then 404s (see app/setup — "gate the /setup surface to first-run").
     r = requests.get(f"{base_url}/setup", timeout=10)
-    assert r.status_code == 200
-    assert "<" in r.text  # HTML document
+    assert r.status_code in (200, 404)
+    if r.status_code == 200:
+        assert "<" in r.text  # HTML document
 
 
 def test_static_app_js_served(base_url):
