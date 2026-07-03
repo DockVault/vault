@@ -309,24 +309,6 @@ async def root():
         response.headers['Expires'] = '0'
         return response
     
-    # Fallback to dashboard_new.html (old dashboard)
-    dashboard_path = os.path.join(static_dir, "dashboard_new.html")
-    if os.path.exists(dashboard_path):
-        response = FileResponse(dashboard_path)
-        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
-        response.headers['Pragma'] = 'no-cache'
-        response.headers['Expires'] = '0'
-        return response
-    
-    # Fallback to dashboard.html
-    dashboard_path = os.path.join(static_dir, "dashboard.html")
-    if os.path.exists(dashboard_path):
-        response = FileResponse(dashboard_path)
-        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
-        response.headers['Pragma'] = 'no-cache'
-        response.headers['Expires'] = '0'
-        return response
-    
     # If no HTML files found, return status
     return {
         "status": "running",
@@ -7377,49 +7359,6 @@ app.router.lifespan_context = lifespan
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.exists(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
-
-
-# NOTE: Root endpoint defined earlier in file (line 214)
-# This duplicate route has been commented out to avoid conflicts
-# @app.get("/")
-# async def root():
-#     """Serve the web interface."""
-#     # Serve the new dashboard
-#     dashboard_path = os.path.join(static_dir, "dashboard_new.html")
-#     if os.path.exists(dashboard_path):
-#         response = FileResponse(dashboard_path)
-#         # Prevent caching with multiple headers
-#         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
-#         response.headers['Pragma'] = 'no-cache'
-#         response.headers['Expires'] = '0'
-#         # Force revalidation with timestamp-based ETag
-#         import time
-#         response.headers['ETag'] = f'"{int(time.time())}"'
-#         response.headers['Last-Modified'] = time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime())
-#         return response
-#     
-#     # Fallback to old index
-#     index_path = os.path.join(static_dir, "index.html")
-#     if os.path.exists(index_path):
-#         response = FileResponse(index_path)
-#         # Prevent caching
-#         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
-#         response.headers['Pragma'] = 'no-cache'
-#         response.headers['Expires'] = '0'
-#         return response
-#     
-#     return {"message": "DockVault API Server", "docs": "/docs"}
-
-
-
-@app.get("/permissions")
-async def permissions_page():
-    """Serve the permissions management page."""
-    permissions_path = os.path.join(static_dir, "permissions.html")
-    if os.path.exists(permissions_path):
-        return FileResponse(permissions_path)
-    else:
-        raise HTTPException(status_code=404, detail="Permissions page not found")
 
 
 if __name__ == "__main__":
