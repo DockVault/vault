@@ -1,0 +1,1467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:;">
+    <title>DockVault - Secure File Transfer Platform</title>
+    <link rel="stylesheet" href="/static/css/dashboard_new.css">
+    <link rel="stylesheet" href="/static/css/user_management.css?v=2025100423">
+    <link rel="stylesheet" href="/static/css/roles.css?v=2025100508">
+    <style>
+        /* Temp Credentials View Styles */
+        .temp-cred-item {
+            padding: 15px;
+            border: 1px solid #e0e0e0;
+            border-left: 4px solid #e0e0e0; /* Default color */
+            border-radius: 8px;
+            margin-bottom: 12px;
+            background: white;
+            transition: border-left-color 0.2s ease;
+        }
+        
+        /* Colored left borders based on credential status */
+        .temp-cred-item[data-status="active"] {
+            border-left-color: #4CAF50; /* Green for active */
+        }
+        
+        .temp-cred-item[data-status="used"] {
+            border-left-color: #FF9800; /* Orange for used */
+        }
+        
+        .temp-cred-item[data-status="expired"] {
+            border-left-color: #F44336; /* Red for expired */
+        }
+        
+        .temp-cred-item[data-status="deactivated"] {
+            border-left-color: #9E9E9E; /* Gray for deactivated */
+        }
+
+        .temp-cred-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .temp-cred-username {
+            font-family: 'Courier New', monospace;
+            font-weight: bold;
+            font-size: 16px;
+            color: #1976D2;
+        }
+
+        .temp-cred-status {
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .temp-cred-status.active {
+            background: #4CAF50;
+            color: white;
+        }
+
+        .temp-cred-status.expired {
+            background: #9E9E9E;
+            color: white;
+        }
+
+        .temp-cred-status.used {
+            background: #FF9800;
+            color: white;
+        }
+
+        .temp-cred-details {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin-bottom: 10px;
+            font-size: 14px;
+        }
+
+        .temp-cred-detail {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .temp-cred-actions {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+        }
+
+        .countdown-timer {
+            font-weight: bold;
+            color: #FF5722;
+        }
+
+        /* Live Monitor View Styles */
+        .monitor-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: white;
+            border-radius: 8px;
+            border: 1px solid #e0e0e0;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            animation: pulse-dot 2s infinite;
+        }
+
+        .status-dot.connected {
+            background: #4CAF50;
+        }
+
+        .status-dot.disconnected {
+            background: #9E9E9E;
+            animation: none;
+        }
+
+        .status-dot.connecting {
+            background: #FF9800;
+        }
+
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.7; transform: scale(1.1); }
+        }
+
+        .operations-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .operation-item {
+            padding: 12px;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            background: white;
+        }
+
+        .operation-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .operation-user {
+            font-weight: 600;
+            color: #333;
+        }
+
+        .operation-file {
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            color: #666;
+        }
+
+        .operation-progress {
+            margin: 8px 0;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 24px;
+            background: #f0f0f0;
+            border-radius: 4px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #4CAF50 0%, #8BC34A 100%);
+            transition: width 0.3s ease;
+            position: relative;
+        }
+
+        .progress-fill.upload {
+            background: linear-gradient(90deg, #2196F3 0%, #64B5F6 100%);
+        }
+
+        .progress-fill.download {
+            background: linear-gradient(90deg, #FF9800 0%, #FFB74D 100%);
+        }
+
+        .progress-text {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 12px;
+            font-weight: 600;
+            color: #333;
+            z-index: 1;
+        }
+
+        .operation-stats {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            color: #666;
+        }
+
+        .activity-feed {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .activity-item {
+            padding: 10px;
+            border-bottom: 1px solid #f0f0f0;
+            font-size: 13px;
+        }
+
+        .activity-item:last-child {
+            border-bottom: none;
+        }
+
+        .activity-time {
+            color: #999;
+            font-size: 11px;
+        }
+
+        .activity-user {
+            font-weight: 600;
+            color: #1976D2;
+        }
+
+        .activity-action {
+            color: #666;
+        }
+    </style>
+    
+    <!-- Chart.js for monitoring graphs (self-hosted; no external CDN — matches the air-gapped asset posture) -->
+    <script src="/static/js/chart.umd.min.js"></script>
+    
+    <!-- Live Monitor Styles -->
+    <link rel="stylesheet" href="/static/css/live_monitor_new.css">
+</head>
+<body>
+    <!-- Loading Screen -->
+    <div id="loading-screen" class="screen active">
+        <div class="loading-container">
+            <div class="spinner"></div>
+            <h2>Loading DockVault...</h2>
+            <p>Checking authentication...</p>
+        </div>
+    </div>
+
+    <!-- Login Screen -->
+    <div id="login-screen" class="screen">
+        <div class="login-container">
+            <div class="login-card">
+                <div class="login-header">
+                    <h1>🔒 DockVault</h1>
+                    <p class="subtitle">Secure File Transfer Platform</p>
+                </div>
+                
+                <form id="login-form">
+                    <div class="form-group">
+                        <label for="username">Username</label>
+                        <input type="text" id="username" name="username" required autocomplete="username">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input type="password" id="password" name="password" required autocomplete="current-password">
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary btn-block">Login</button>
+                </form>
+                
+                <div id="login-error" class="alert alert-error" style="display: none;"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Dashboard Screen -->
+    <div id="dashboard-screen" class="screen">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h2>DockVault</h2>
+            </div>
+            
+            <div class="sidebar-user">
+                <div class="user-avatar" id="user-avatar">A</div>
+                <div class="user-info">
+                    <div class="user-name" id="user-name">Admin</div>
+                    <div class="user-role" id="user-role">admin</div>
+                </div>
+            </div>
+            
+            <nav class="sidebar-nav">
+                <a href="javascript:void(0)" class="nav-item active" data-view="dashboard" id="nav-dashboard">
+                    <span class="nav-icon">📊</span>
+                    <span>Dashboard</span>
+                </a>
+                <a href="javascript:void(0)" class="nav-item" data-view="vaults" id="nav-vaults">
+                    <span class="nav-icon">🗂️</span>
+                    <span>Vaults</span>
+                </a>
+                <a href="javascript:void(0)" class="nav-item" data-view="temp-creds" id="nav-temp-creds" style="display: none;">
+                    <span class="nav-icon">⏱️</span>
+                    <span>Temp Credentials</span>
+                </a>
+                <a href="javascript:void(0)" class="nav-item" data-view="monitor" id="nav-monitor" style="display: none;">
+                    <span class="nav-icon">🔴</span>
+                    <span>Live Monitor</span>
+                </a>
+                <a href="javascript:void(0)" class="nav-item" data-view="roles" id="nav-roles" style="display: none;">
+                    <span class="nav-icon">🔑</span>
+                    <span>Roles</span>
+                </a>
+                <a href="javascript:void(0)" class="nav-item" data-view="users" id="nav-users">
+                    <span class="nav-icon">👥</span>
+                    <span>Users</span>
+                </a>
+                <a href="javascript:void(0)" class="nav-item" data-view="settings" id="nav-settings">
+                    <span class="nav-icon">⚙️</span>
+                    <span>Settings</span>
+                </a>
+            </nav>
+            
+            <div class="sidebar-footer">
+                <button id="logout-btn" class="btn btn-secondary btn-block">
+                    <span>🚪</span> Logout
+                </button>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Dashboard View -->
+                        <!-- Main Content -->
+            <div id="dashboard-view" class="view">
+                <div class="view-header">
+                    <h1>Dashboard</h1>
+                    <p class="text-muted">Overview of your DockVault system</p>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon stat-primary">🗂️</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="stat-vaults">0</div>
+                            <div class="stat-label">Total Vaults</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon stat-success">👥</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="stat-users">0</div>
+                            <div class="stat-label">Active Users</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon stat-info">💾</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="stat-storage">0 MB</div>
+                            <div class="stat-label">Storage Used</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon stat-warning">🔑</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="stat-temp-creds">0</div>
+                            <div class="stat-label">Active Temp Creds</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="content-grid">
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>Recent Events</h3>
+                        </div>
+                        <div class="card-body">
+                            <div id="events-feed" class="events-list">
+                                <div class="empty-state">
+                                    <p>No recent events</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>System Status</h3>
+                        </div>
+                        <div class="card-body">
+                            <div class="status-list">
+                                <div class="status-item">
+                                    <span>Database</span>
+                                    <span class="badge badge-success" id="status-db">Connected</span>
+                                </div>
+                                <div class="status-item">
+                                    <span>Redis</span>
+                                    <span class="badge badge-success" id="status-redis">Connected</span>
+                                </div>
+                                <div class="status-item">
+                                    <span>SFTP Server</span>
+                                    <span class="badge badge-success" id="status-sftp">Running</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Vaults View -->
+            <div id="vaults-view" class="view">
+                <div class="view-header">
+                    <div>
+                        <h1>Vaults</h1>
+                        <p class="text-muted">Manage secure file storage vaults</p>
+                    </div>
+                    <button id="create-vault-btn" class="btn btn-primary">
+                        <span>➕</span> Create Vault
+                    </button>
+                </div>
+
+                <div id="vaults-grid" class="vaults-grid">
+                    <div class="empty-state">
+                        <h3>No Vaults</h3>
+                        <p>Create your first vault to get started</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Vault View (Single Vault Management) -->
+            <div id="vault-view" class="view" style="display: none;">
+                <div class="view-header">
+                    <div>
+                        <button id="close-vault-btn" class="btn btn-secondary btn-small" style="margin-right: 16px;">
+                            <span>←</span> Back to Vaults
+                        </button>
+                        <span>
+                            <h1 id="vault-view-title" style="display: inline;">Vault Name</h1>
+                            <span id="vault-view-lock-icon" style="font-size: 1.2em; margin-left: 8px;"></span>
+                        </span>
+                        <p class="text-muted" id="vault-view-description">Vault description</p>
+                    </div>
+                    <div>
+                        <button id="upload-file-btn" class="btn btn-primary">
+                            <span>📤</span> Upload File
+                        </button>
+                        <button id="create-folder-btn" class="btn btn-secondary">
+                            <span>📁</span> New Folder
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Tab Navigation -->
+                <div class="tabs">
+                    <button class="tab-btn active" data-tab="files">📁 Files</button>
+                    <button class="tab-btn" data-tab="info">ℹ️ Info</button>
+                    <button class="tab-btn" data-tab="permissions">👥 Permissions</button>
+                    <button class="tab-btn" data-tab="settings">⚙️ Settings</button>
+                </div>
+
+                <!-- Files Tab -->
+                <div id="files-tab" class="tab-content active">
+                    <!-- Breadcrumb Navigation -->
+                    <div class="breadcrumb">
+                        <span class="breadcrumb-item" data-path="">🏠 Root</span>
+                    </div>
+
+                    <!-- File List -->
+                    <div class="table-container">
+                        <table class="data-table file-table">
+                            <thead>
+                                <tr>
+                                    <th style="width: 40%;">Name</th>
+                                    <th style="width: 15%;">Size</th>
+                                    <th style="width: 15%;">Type</th>
+                                    <th style="width: 20%;">Modified</th>
+                                    <th style="width: 10%;">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="files-table-body">
+                                <tr>
+                                    <td colspan="5" class="text-center">Loading files...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- Drop Zone for Drag & Drop Upload -->
+                    <div id="drop-zone" class="drop-zone" style="display: none;">
+                        <div class="drop-zone-content">
+                            <p style="font-size: 48px; margin: 0;">📤</p>
+                            <p style="font-size: 18px; margin: 8px 0;">Drop files here to upload</p>
+                            <p style="color: #6c757d;">or click "Upload File" button</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Info Tab (Read-only vault information) -->
+                <div id="info-tab" class="tab-content">
+                    <!-- Stats Overview -->
+                    <div class="info-stats-grid">
+                        <div class="info-stat-card">
+                            <div class="info-stat-icon">📁</div>
+                            <div class="info-stat-content">
+                                <div class="info-stat-value">
+                                    <span id="info-file-count">0</span>
+                                    <span id="info-file-count-label" class="info-stat-unit">files</span>
+                                </div>
+                                <div class="info-stat-label">Total Files</div>
+                            </div>
+                        </div>
+                        <div class="info-stat-card">
+                            <div class="info-stat-icon">💾</div>
+                            <div class="info-stat-content">
+                                <div class="info-stat-value" id="info-total-size">0 B</div>
+                                <div class="info-stat-label">Storage Used</div>
+                            </div>
+                        </div>
+                        <div class="info-stat-card">
+                            <div class="info-stat-icon">👤</div>
+                            <div class="info-stat-content">
+                                <div class="info-stat-value" id="info-vault-owner">-</div>
+                                <div class="info-stat-label">Owner</div>
+                            </div>
+                        </div>
+                        <div class="info-stat-card">
+                            <div class="info-stat-icon">📅</div>
+                            <div class="info-stat-content">
+                                <div class="info-stat-value" id="info-vault-created-ago">-</div>
+                                <div class="info-stat-label">Created</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="settings-grid">
+                        <!-- Vault Details Card -->
+                        <div class="info-card">
+                            <div class="info-card-header">
+                                <h3>📋 Vault Details</h3>
+                            </div>
+                            <div class="info-card-body">
+                                <div class="info-item">
+                                    <label class="info-label">Name</label>
+                                    <div id="info-vault-name" class="info-value-modern">-</div>
+                                </div>
+                                <div class="info-item">
+                                    <label class="info-label">Description</label>
+                                    <div id="info-vault-description" class="info-value-modern info-value-muted">-</div>
+                                </div>
+                                <div class="info-item">
+                                    <label class="info-label">Created Date</label>
+                                    <div id="info-vault-created" class="info-value-modern">-</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Storage Card -->
+                        <div class="info-card">
+                            <div class="info-card-header">
+                                <h3>💾 Storage Usage</h3>
+                            </div>
+                            <div class="info-card-body">
+                                <div id="info-storage-bar" class="storage-progress-container">
+                                    <div class="storage-progress-bar">
+                                        <div id="info-storage-bar-fill" class="storage-progress-fill"></div>
+                                    </div>
+                                    <div id="info-storage-text" class="storage-progress-text">-</div>
+                                </div>
+                                <div class="info-storage-note">
+                                    <span>💡</span>
+                                    <span>Storage usage updates in real-time as files are added or removed</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Security Card -->
+                        <div class="info-card">
+                            <div class="info-card-header">
+                                <h3>🔒 Security Settings</h3>
+                            </div>
+                            <div class="info-card-body">
+                                <div class="info-item">
+                                    <label class="info-label">Access Control</label>
+                                    <div id="info-has-password">-</div>
+                                </div>
+                                <div class="info-item">
+                                    <label class="info-label">File Retention</label>
+                                    <div id="info-file-expiration">-</div>
+                                </div>
+                                <div class="info-item">
+                                    <label class="info-label">Last Activity</label>
+                                    <div class="info-value-modern">
+                                        <div id="info-last-accessed">-</div>
+                                        <div id="info-last-accessed-ago" class="info-subtext"></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Permissions Tab -->
+                <div id="permissions-tab" class="tab-content">
+                    <div class="view-header">
+                        <div>
+                            <h2>Vault Access Control</h2>
+                            <p class="text-muted">Manage who can access this vault</p>
+                        </div>
+                        <button id="add-permission-btn" class="btn btn-primary">
+                            <span>➕</span> Grant Access
+                        </button>
+                    </div>
+
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>User</th>
+                                    <th>Email</th>
+                                    <th>Permission Level</th>
+                                    <th>Granted</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="permissions-table-body">
+                                <tr>
+                                    <td colspan="5" class="text-center">Loading permissions...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Settings Tab -->
+                <div id="settings-tab" class="tab-content">
+                    <div class="settings-grid">
+                        <!-- Vault Information Card -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>📊 Vault Information</h3>
+                            </div>
+                            <div class="card-body">
+                                <div class="info-row">
+                                    <span class="info-label">Name:</span>
+                                    <span id="settings-vault-name">-</span>
+                                </div>
+                                <div class="info-row">
+                                    <span class="info-label">Description:</span>
+                                    <span id="settings-vault-description">-</span>
+                                </div>
+                                <div class="info-row">
+                                    <span class="info-label">Created:</span>
+                                    <span id="settings-vault-created">-</span>
+                                </div>
+                                <button id="edit-vault-info-btn" class="btn btn-secondary" style="margin-top: 16px;">
+                                    <span>✏️</span> Edit Information
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Storage Usage Card -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>💾 Storage Usage</h3>
+                            </div>
+                            <div class="card-body">
+                                <div class="info-row">
+                                    <span class="info-label">Current Size:</span>
+                                    <span id="settings-vault-size">-</span>
+                                </div>
+                                <div class="info-row">
+                                    <span class="info-label">Size Limit:</span>
+                                    <span id="settings-vault-limit">-</span>
+                                </div>
+                                <div class="info-row">
+                                    <span class="info-label">Files:</span>
+                                    <span id="settings-vault-files">-</span>
+                                </div>
+                                <div class="storage-bar" style="margin-top: 16px;">
+                                    <div class="storage-bar-fill" id="storage-bar-fill" style="width: 0%;"></div>
+                                </div>
+                                <p class="text-muted" style="margin-top: 8px; font-size: 12px;">
+                                    <span id="storage-percentage">0</span>% used
+                                </p>
+                                <div style="margin-top: 16px;">
+                                    <label for="vault-size-limit" class="info-label">Size Limit:</label>
+                                    <div style="display: flex; gap: 8px; align-items: center; margin-top: 8px;">
+                                        <input type="number" id="vault-size-limit" class="form-input" 
+                                               placeholder="Size in MB" min="0" step="1" 
+                                               style="flex: 1;">
+                                        <button id="update-size-limit-btn" class="btn btn-primary">
+                                            Update Limit
+                                        </button>
+                                    </div>
+                                    <p class="text-muted" style="margin-top: 4px; font-size: 11px;">
+                                        Limit cannot be less than currently used space
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Security Settings Card -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>🔐 Security</h3>
+                            </div>
+                            <div class="card-body">
+                                <div class="info-row">
+                                    <span class="info-label">Password Protected:</span>
+                                    <span id="settings-has-password">-</span>
+                                </div>
+                                <div class="info-row">
+                                    <span class="info-label">File Expiry:</span>
+                                    <span id="settings-file-expiry">-</span>
+                                </div>
+                                <button id="change-vault-password-btn" class="btn btn-secondary" style="margin-top: 16px; margin-right: 8px;">
+                                    <span>🔑</span> Change Password
+                                </button>
+                                <button id="set-expiry-btn" class="btn btn-secondary" style="margin-top: 16px;">
+                                    <span>⏱️</span> Set Expiry
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Danger Zone Card -->
+                        <div class="card card-danger">
+                            <div class="card-header">
+                                <h3>⚠️ Danger Zone</h3>
+                            </div>
+                            <div class="card-body">
+                                <p class="text-muted" style="margin-bottom: 16px;">
+                                    Destructive actions that cannot be undone
+                                </p>
+                                <button id="delete-vault-from-settings-btn" class="btn btn-danger">
+                                    <span>🗑️</span> Delete Vault
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Roles View -->
+            <div id="roles-view" class="view">
+                <div class="roles-view-header">
+                    <h1>🎭 Role Management</h1>
+                    <p>Manage user roles and understand permission levels</p>
+                </div>
+
+                <div id="roles-alert-container"></div>
+
+                <!-- Role Cards Section -->
+                <div id="roles-cards-container" class="roles-grid">
+                    <div class="loading-state">
+                        <div class="loading-spinner"></div>
+                        <p>Loading role definitions...</p>
+                    </div>
+                </div>
+
+                <!-- Users Management Section -->
+                <div class="users-section">
+                    <div class="users-section-header">
+                        <h2>Users & Roles</h2>
+                        <div class="users-controls">
+                            <div class="search-box">
+                                <input type="text" id="roles-search-input" placeholder="Search users...">
+                            </div>
+                            <div class="role-filter">
+                                <button class="role-filter-btn active" data-role="all">All</button>
+                                <button class="role-filter-btn admin" data-role="admin">👑 Admin</button>
+                                <button class="role-filter-btn user" data-role="user">👤 User</button>
+                                <button class="role-filter-btn external" data-role="external">🌐 External</button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div id="users-result-count" style="margin-bottom: 1rem; color: #6b7280; font-size: 0.875rem;">
+                        Loading users...
+                    </div>
+
+                    <div class="users-table-container">
+                        <table class="users-table">
+                            <thead>
+                                <tr>
+                                    <th>User</th>
+                                    <th>Role</th>
+                                    <th>Status</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="users-table-body">
+                                <tr>
+                                    <td colspan="4">
+                                        <div class="loading-state">
+                                            <div class="loading-spinner"></div>
+                                            <p>Loading users...</p>
+                                        </div>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Users View -->
+            <div id="users-view" class="view">
+                <div class="view-header">
+                    <div>
+                        <h1>👥 User Management</h1>
+                        <p class="text-muted">Comprehensive user administration with temp credentials and activity tracking</p>
+                    </div>
+                    <button id="create-user-btn" class="btn btn-primary">
+                        <span>➕</span> Create User
+                    </button>
+                </div>
+
+                <!-- Metrics Cards -->
+                <div id="user-metrics-cards" class="user-metrics-container"></div>
+
+                <!-- Filters -->
+                <div class="user-filters">
+                    <div class="filters-grid">
+                        <div class="filter-group">
+                            <label for="user-search-input">Search</label>
+                            <input type="text" id="user-search-input" placeholder="Search by username or email...">
+                        </div>
+                        <div class="filter-group">
+                            <label for="user-role-filter">Role</label>
+                            <select id="user-role-filter">
+                                <option value="all">All Roles</option>
+                                <option value="admin">Admin</option>
+                                <option value="user">User</option>
+                                <option value="external">External</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label for="user-status-filter">Status</label>
+                            <select id="user-status-filter">
+                                <option value="all">All Status</option>
+                                <option value="active">Active</option>
+                                <option value="inactive">Inactive</option>
+                            </select>
+                        </div>
+                        <div class="filter-actions">
+                            <button class="btn btn-secondary" id="clear-user-filters-btn">Clear</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Users List -->
+                <div id="users-list-container" class="users-list-container">
+                    <div class="loading">Loading users...</div>
+                </div>
+            </div>
+
+            <!-- User Detail Modal -->
+            <div id="user-detail-modal" class="user-detail-modal">
+                <div id="user-detail-modal-content" class="modal-content">
+                    <!-- Modal content will be dynamically generated -->
+                </div>
+            </div>
+
+            <!-- Settings View -->
+            <div id="settings-view" class="view">
+                <div class="view-header">
+                    <h1>Settings</h1>
+                    <p class="text-muted">Application settings and configuration</p>
+                </div>
+
+                <div class="card">
+                    <div class="card-body">
+                        <div class="empty-state">
+                            <h3>⚙️ Coming Soon</h3>
+                            <p>Settings panel is under development</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Temporary Credentials View -->
+            <div id="temp-creds-view" class="view">
+                <div class="view-header">
+                    <h1>⏱️ Temporary Credentials</h1>
+                    <p class="text-muted">Manage temporary one-time access credentials</p>
+                    <button id="create-temp-cred-btn" class="btn btn-primary">
+                        <span>+</span> Generate New Credential
+                    </button>
+                </div>
+
+                <div id="temp-creds-alert-container"></div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3>Active & Recent Credentials</h3>
+                    </div>
+                    <div class="card-body">
+                        <div id="temp-creds-list">
+                            <div class="loading">
+                                <div class="spinner"></div>
+                                <p>Loading temporary credentials...</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Live Monitor View -->
+            <div id="monitor-view" class="view">
+                <div class="view-header">
+                    <h1>🔴 Live Monitor</h1>
+                    <p class="text-muted">Real-time system monitoring and analytics</p>
+                </div>
+
+                <div id="monitor-alert-container"></div>
+
+                <!-- Connection Status Banner -->
+                <div class="monitor-status-banner" id="monitor-status-banner">
+                    <div class="status-indicator">
+                        <span class="status-dot" id="status-dot"></span>
+                        <span class="status-text" id="status-text">Connecting...</span>
+                    </div>
+                    <div class="last-update" id="last-update">Last update: Never</div>
+                </div>
+
+                <!-- Metrics Row (Top) -->
+                <div class="metrics-grid" id="monitor-metrics">
+                    <div class="metric-card">
+                        <div class="metric-icon" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+                            <i class="fas fa-users"></i>
+                        </div>
+                        <div class="metric-content">
+                            <div class="metric-label">Active Users</div>
+                            <div class="metric-value" id="metric-active-users">0</div>
+                            <div class="metric-change">Real-time</div>
+                        </div>
+                    </div>
+
+                    <div class="metric-card">
+                        <div class="metric-icon" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
+                            <i class="fas fa-clock"></i>
+                        </div>
+                        <div class="metric-content">
+                            <div class="metric-label">Temp Credentials</div>
+                            <div class="metric-value" id="metric-temp-creds">0</div>
+                            <div class="metric-change" id="metric-temp-change">0 active</div>
+                        </div>
+                    </div>
+
+                    <div class="metric-card">
+                        <div class="metric-icon" style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);">
+                            <i class="fas fa-upload"></i>
+                        </div>
+                        <div class="metric-content">
+                            <div class="metric-label">Upload Traffic</div>
+                            <div class="metric-value" id="metric-upload">0 MB</div>
+                            <div class="metric-change" id="metric-upload-rate">0 KB/s</div>
+                        </div>
+                    </div>
+
+                    <div class="metric-card">
+                        <div class="metric-icon" style="background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);">
+                            <i class="fas fa-download"></i>
+                        </div>
+                        <div class="metric-content">
+                            <div class="metric-label">Download Traffic</div>
+                            <div class="metric-value" id="metric-download">0 MB</div>
+                            <div class="metric-change" id="metric-download-rate">0 KB/s</div>
+                        </div>
+                    </div>
+
+                    <div class="metric-card">
+                        <div class="metric-icon" style="background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);">
+                            <i class="fas fa-tasks"></i>
+                        </div>
+                        <div class="metric-content">
+                            <div class="metric-label">Active Operations</div>
+                            <div class="metric-value" id="metric-operations">0</div>
+                            <div class="metric-change" id="metric-operations-type">No activity</div>
+                        </div>
+                    </div>
+
+                    <div class="metric-card">
+                        <div class="metric-icon" style="background: linear-gradient(135deg, #30cfd0 0%, #330867 100%);">
+                            <i class="fas fa-database"></i>
+                        </div>
+                        <div class="metric-content">
+                            <div class="metric-label">Total Files</div>
+                            <div class="metric-value" id="metric-files">0</div>
+                            <div class="metric-change" id="metric-storage">0 GB used</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Graphs Section -->
+                <div class="graphs-container">
+                    <div class="graph-card">
+                        <div class="graph-header">
+                            <h3><i class="fas fa-chart-line"></i> Traffic Over Time</h3>
+                            <div class="graph-controls">
+                                <button class="btn-graph-control active" data-range="1h">1H</button>
+                                <button class="btn-graph-control" data-range="6h">6H</button>
+                                <button class="btn-graph-control" data-range="24h">24H</button>
+                            </div>
+                        </div>
+                        <div class="graph-canvas-container">
+                            <canvas id="traffic-chart"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="graph-card">
+                        <div class="graph-header">
+                            <h3><i class="fas fa-chart-area"></i> Active Operations</h3>
+                        </div>
+                        <div class="graph-canvas-container">
+                            <canvas id="operations-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Active Operations -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3><i class="fas fa-spinner fa-pulse"></i> Active Operations</h3>
+                        <span class="badge" id="active-ops-count">0</span>
+                    </div>
+                    <div class="card-body">
+                        <div id="operations-list">
+                            <div class="empty-state">
+                                <p>No active operations</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Activity Feed / Events -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3><i class="fas fa-stream"></i> Live Event Stream</h3>
+                        <div class="card-header-actions">
+                            <button id="pause-events-btn" class="btn btn-secondary btn-sm">
+                                <i class="fas fa-pause"></i> Pause
+                            </button>
+                            <button id="clear-activity-btn" class="btn btn-secondary btn-sm">
+                                <i class="fas fa-trash"></i> Clear
+                            </button>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="event-filters">
+                            <button class="filter-btn active" data-filter="all">All Events</button>
+                            <button class="filter-btn" data-filter="login">
+                                <i class="fas fa-sign-in-alt"></i> Logins
+                            </button>
+                            <button class="filter-btn" data-filter="upload">
+                                <i class="fas fa-upload"></i> Uploads
+                            </button>
+                            <button class="filter-btn" data-filter="download">
+                                <i class="fas fa-download"></i> Downloads
+                            </button>
+                            <button class="filter-btn" data-filter="error">
+                                <i class="fas fa-exclamation-triangle"></i> Errors
+                            </button>
+                        </div>
+                        <div id="activity-feed" class="activity-feed">
+                            <div class="empty-state">
+                                <i class="fas fa-inbox fa-3x"></i>
+                                <p>Waiting for events...</p>
+                                <small>Events will appear here in real-time</small>
+                            </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            
+        </main>
+    </div>
+
+    <!-- Create Vault Modal -->
+    <div id="create-vault-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Create New Vault</h3>
+                <button class="modal-close" data-modal="create-vault-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="create-vault-form">
+                    <div class="form-group">
+                        <label for="vault-name">Vault Name *</label>
+                        <input type="text" id="vault-name" required minlength="1" maxlength="255">
+                    </div>
+                    <div class="form-group">
+                        <label for="vault-description">Description</label>
+                        <textarea id="vault-description" rows="3" maxlength="500"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label for="vault-password">Vault Password</label>
+                        <input type="password" id="vault-password" minlength="8">
+                        <small>Optional. Encrypts files in the vault (min 8 characters)</small>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-secondary close-modal-btn" data-modal="create-vault-modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Create Vault</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create User Modal -->
+    <div id="create-user-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Create New User</h3>
+                <button class="modal-close" data-modal="create-user-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="create-user-form">
+                    <div class="form-group">
+                        <label for="user-username">Username *</label>
+                        <input type="text" id="user-username" required minlength="3" maxlength="50">
+                    </div>
+                    <div class="form-group">
+                        <label for="user-email">Email *</label>
+                        <input type="email" id="user-email" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="user-password">Password *</label>
+                        <input type="password" id="user-password" required minlength="12">
+                        <small>Minimum 12 characters</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="create-user-role">Role *</label>
+                        <select id="create-user-role" required>
+                            <option value="user">User</option>
+                            <option value="external">External</option>
+                            <option value="admin">Admin</option>
+                        </select>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-secondary close-modal-btn" data-modal="create-user-modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Create User</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Generate Temp Credentials Modal -->
+    <div id="temp-creds-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>🔐 Temporary Credentials Generated</h3>
+                <button class="modal-close" data-modal="temp-creds-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="alert alert-danger">
+                    <strong>🚨 CRITICAL SECURITY WARNING:</strong>
+                    <ul style="margin: 10px 0 0 20px; text-align: left;">
+                        <li><strong>Save this password NOW</strong> - it will only be shown once</li>
+                        <li>After closing this dialog, the password <strong>CANNOT be recovered</strong></li>
+                        <li>The password is <strong>cryptographically hashed</strong> and cannot be retrieved</li>
+                        <li>Use the copy buttons below to safely copy credentials</li>
+                    </ul>
+                </div>
+                
+                <div class="credentials-box">
+                    <div class="cred-item">
+                        <strong>Username:</strong>
+                        <code id="temp-cred-username">-</code>
+                        <button class="btn-icon copy-btn" data-copy="temp-cred-username" title="Copy Username">📋</button>
+                    </div>
+                    <div class="cred-item">
+                        <strong>🔑 One-Time Password:</strong>
+                        <code id="temp-cred-password" class="password-field" style="font-size: 14px; background: #fff3cd; padding: 5px; border: 2px solid #ffc107;">-</code>
+                        <button class="btn-icon toggle-password-btn" data-target="temp-cred-password" title="Show/Hide Password">👁️</button>
+                        <button class="btn-icon copy-btn" data-copy="temp-cred-password" title="Copy Password (Secure)">📋</button>
+                    </div>
+                    <div class="cred-item">
+                        <strong>Expires:</strong>
+                        <span id="temp-cred-expires">-</span>
+                    </div>
+                    <div class="cred-item">
+                        <strong>SFTP Command:</strong>
+                        <code id="temp-cred-command">-</code>
+                        <button class="btn-icon copy-btn" data-copy="temp-cred-command" title="Copy Command">📋</button>
+                    </div>
+                </div>
+                
+                <div class="alert alert-info" style="margin-top: 15px;">
+                    <strong>💡 Security Features:</strong>
+                    <ul style="margin: 5px 0 0 20px; text-align: left; font-size: 12px;">
+                        <li>Password is bcrypt-hashed with salt (industry standard)</li>
+                        <li>One-time use only - expires after first login or time limit</li>
+                        <li>Cannot be retrieved or reset - must generate new credentials</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <div style="text-align: left; flex: 1; color: #721c24; font-weight: bold;">
+                    ⚠️ Remember: Password will be hidden when you close this dialog
+                </div>
+                <button class="btn btn-danger close-modal-btn" data-modal="temp-creds-modal">I've Saved the Password - Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Upload File Modal -->
+    <div id="upload-file-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>📤 Upload File</h3>
+                <button class="modal-close" data-modal="upload-file-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="upload-file-form">
+                    <div class="form-group">
+                        <label for="file-input">Select File *</label>
+                        <input type="file" id="file-input" required multiple>
+                        <small>You can select multiple files</small>
+                    </div>
+                    <div id="upload-progress" style="display: none;">
+                        <div class="progress-bar">
+                            <div class="progress-bar-fill" id="upload-progress-fill" style="width: 0%;"></div>
+                        </div>
+                        <p class="text-center" id="upload-progress-text">Uploading...</p>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-secondary close-modal-btn" data-modal="upload-file-modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Upload</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create Folder Modal -->
+    <div id="create-folder-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>📁 Create Folder</h3>
+                <button class="modal-close" data-modal="create-folder-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="create-folder-form">
+                    <div class="form-group">
+                        <label for="folder-name">Folder Name *</label>
+                        <input type="text" id="folder-name" required minlength="1" maxlength="255" pattern="[^/\\?%*:|'<>]+">
+                        <small>Cannot contain: / \ ? % * : | ' " < ></small>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-secondary close-modal-btn" data-modal="create-folder-modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Create</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Rename File/Folder Modal -->
+    <div id="rename-item-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>✏️ Rename</h3>
+                <button class="modal-close" data-modal="rename-item-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="rename-item-form">
+                    <input type="hidden" id="rename-item-id" value="">
+                    <div class="form-group">
+                        <label for="new-item-name">New Name *</label>
+                        <input type="text" id="new-item-name" required minlength="1" maxlength="255" autocomplete="off">
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-secondary close-modal-btn" data-modal="rename-item-modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Rename</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Grant Permission Modal -->
+    <div id="grant-permission-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>👥 Grant Access</h3>
+                <button class="modal-close" data-modal="grant-permission-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="grant-permission-form">
+                    <div class="form-group">
+                        <label for="permission-user">User *</label>
+                        <select id="permission-user" required>
+                            <option value="">Select a user...</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="permission-level">Permission Level *</label>
+                        <select id="permission-level" required>
+                            <option value="read">Read Only</option>
+                            <option value="write">Read & Write</option>
+                            <option value="delete">Full Control (Files Only)</option>
+                        </select>
+                        <small style="color: var(--text-muted);">
+                            <strong>Read:</strong> View and download files only<br>
+                            <strong>Write:</strong> Read + upload and modify files<br>
+                            <strong>Delete:</strong> Write + delete files and folders<br>
+                            <br>
+                            <strong>Note:</strong> Only the vault <strong>owner</strong> can manage vault settings, change passwords, or grant/revoke permissions to others.
+                        </small>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-secondary close-modal-btn" data-modal="grant-permission-modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Grant Access</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Vault Info Modal -->
+    <div id="edit-vault-info-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>✏️ Edit Vault Information</h3>
+                <button class="modal-close" data-modal="edit-vault-info-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="edit-vault-info-form">
+                    <div class="form-group">
+                        <label for="edit-vault-name">Vault Name *</label>
+                        <input type="text" id="edit-vault-name" required minlength="1" maxlength="255">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit-vault-description">Description</label>
+                        <textarea id="edit-vault-description" rows="3"></textarea>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-secondary close-modal-btn" data-modal="edit-vault-info-modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Save Changes</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Change Vault Password Modal -->
+    <div id="change-vault-password-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>🔑 Change Vault Password</h3>
+                <button class="modal-close" data-modal="change-vault-password-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="change-vault-password-form">
+                    <div class="form-group">
+                        <label for="current-vault-password">Current Password</label>
+                        <input type="password" id="current-vault-password" 
+                               placeholder="Leave empty if vault has no password">
+                    </div>
+                    <div class="form-group">
+                        <label for="new-vault-password">New Password</label>
+                        <input type="password" id="new-vault-password" 
+                               placeholder="Leave empty to remove password">
+                    </div>
+                    <div class="form-group">
+                        <label for="confirm-new-vault-password">Confirm New Password</label>
+                        <input type="password" id="confirm-new-vault-password" 
+                               placeholder="Confirm new password">
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-secondary close-modal-btn" data-modal="change-vault-password-modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Change Password</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Set Vault Expiry Modal -->
+    <div id="set-expiry-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>⏱️ Set File Expiration</h3>
+                <button class="modal-close" data-modal="set-expiry-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="set-expiry-form">
+                    <div class="form-group">
+                        <label for="expire-files-value">Expire files after</label>
+                        <div style="display: flex; gap: 8px;">
+                            <input type="number" id="expire-files-value" min="0" step="1"
+                                   placeholder="0 = never" style="flex: 1;">
+                            <select id="expire-files-unit" style="flex: 0 0 120px;">
+                                <option value="minutes">Minutes</option>
+                                <option value="hours">Hours</option>
+                                <option value="days" selected>Days</option>
+                            </select>
+                        </div>
+                        <small>Files older than this will be automatically deleted. Set to 0 to disable expiration.</small>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-secondary close-modal-btn" data-modal="set-expiry-modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Set Expiration</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Vault Password Modal -->
+    <div id="vault-password-modal" class="modal" style="display: none;">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content" style="max-width: 400px;">
+            <div class="modal-header">
+                <h3 id="vault-password-modal-title">🔒 Enter Vault Password</h3>
+            </div>
+            <div class="modal-body">
+                <p id="vault-password-modal-message" style="margin-bottom: 16px; color: var(--text-muted);">
+                    This vault is password-protected. Please enter the password to continue.
+                </p>
+                <form id="vault-password-form">
+                    <div class="form-group">
+                        <label for="vault-password-input">Password:</label>
+                        <input type="password" id="vault-password-input" class="form-input" 
+                               placeholder="Enter vault password" required autofocus>
+                    </div>
+                    <div id="vault-password-error" class="alert alert-error" style="display: none; margin-top: 12px;"></div>
+                    <div class="modal-actions" style="margin-top: 20px;">
+                        <button type="button" id="vault-password-cancel-btn" class="btn btn-secondary">Cancel</button>
+                        <button type="submit" id="vault-password-submit-btn" class="btn btn-primary">
+                            <span id="vault-password-submit-text">Unlock</span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Cache Manager MUST load first - provides ETag caching for all API calls -->
+    <script src="/static/js/cache_manager.js?v=2025100501"></script>
+    <!-- Inline SVG icon helper (self-contained; provides window.svgIcon) -->
+    <script src="/static/js/icons.js?v=20260612"></script>
+    <script src="/static/js/permissions.js?v=2025100210"></script>
+    <script src="/static/js/roles.js?v=2025100503"></script>
+    <script src="/static/js/session_manager.js?v=2025100413"></script>
+    <script src="/static/js/temp_creds_monitor.js?v=2025100411"></script>
+    <script src="/static/js/live_monitor_new.js?v=2025100512"></script>
+    <script src="/static/js/user_management.js?v=2025100430"></script>
+    <script src="/static/js/dashboard_view.js?v=2025100501"></script>
+    <script src="/static/js/dashboard_new.js?v=2025100413"></script>
+</body>
+</html>

@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CSS Diagnostic Test</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .test-box {
+            background: white;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .success { border-left: 4px solid #10b981; }
+        .error { border-left: 4px solid #ef4444; }
+        .warning { border-left: 4px solid #f59e0b; }
+        code {
+            background: #f0f0f0;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔍 CSS Load Diagnostic</h1>
+    
+    <div class="test-box">
+        <h2>Step 1: Check CSS File Requests</h2>
+        <p>Press <code>F12</code> to open DevTools, then go to the <code>Network</code> tab.</p>
+        <p>Refresh this page and look for:</p>
+        <ul>
+            <li><code>theme.css?v=20251014</code></li>
+            <li><code>components.css?v=20251014</code></li>
+            <li><code>utilities.css?v=20251014</code></li>
+        </ul>
+        <p>Each should show <strong>200 OK</strong> or <strong>304 Not Modified</strong></p>
+    </div>
+
+    <div class="test-box">
+        <h2>Step 2: Test CSS Variable</h2>
+        <p>This box should have a <span style="color: #0f172a; font-weight: bold;">deep slate</span> colored text below:</p>
+        <p style="color: var(--brand-primary, red); font-size: 24px; font-weight: bold;">
+            If this text is RED, CSS is not loading. If it's DARK BLUE/SLATE, CSS is working!
+        </p>
+    </div>
+
+    <div class="test-box">
+        <h2>Step 3: Check Browser Console</h2>
+        <p>Press <code>F12</code> and go to the <code>Console</code> tab.</p>
+        <p>Look for errors in red. Common errors:</p>
+        <ul>
+            <li><code>Failed to load resource: 404</code> - File not found</li>
+            <li><code>Refused to apply style...</code> - CSP blocking</li>
+            <li><code>CORS policy</code> - Cross-origin issue</li>
+        </ul>
+        <button onclick="testCSSLoaded()">Run Console Test</button>
+    </div>
+
+    <div class="test-box">
+        <h2>Step 4: Direct CSS Access</h2>
+        <p>Try accessing the CSS files directly:</p>
+        <ul>
+            <li><a href="/static/css/theme.css?v=20251014" target="_blank">Open theme.css</a></li>
+            <li><a href="/static/css/components.css?v=20251014" target="_blank">Open components.css</a></li>
+            <li><a href="/static/css/utilities.css?v=20251014" target="_blank">Open utilities.css</a></li>
+        </ul>
+        <p>You should see CSS code in each. If you see "404 Not Found", the files aren't being served.</p>
+    </div>
+
+    <div class="test-box">
+        <h2>Step 5: Hard Refresh</h2>
+        <p>Try these keyboard shortcuts:</p>
+        <ul>
+            <li><strong>Windows/Linux:</strong> <code>Ctrl + Shift + R</code> or <code>Ctrl + F5</code></li>
+            <li><strong>Mac:</strong> <code>Cmd + Shift + R</code></li>
+        </ul>
+        <p>Or in DevTools:</p>
+        <ol>
+            <li>Right-click the refresh button</li>
+            <li>Select "Empty Cache and Hard Reload"</li>
+        </ol>
+    </div>
+
+    <div class="test-box">
+        <h2>Step 6: View Computed Styles</h2>
+        <p id="test-element" style="background: var(--brand-primary, red); color: white; padding: 10px; border-radius: 4px;">
+            This should have a dark slate background (not red)
+        </p>
+        <button onclick="checkComputedStyle()">Check Computed Background</button>
+        <p id="computed-result"></p>
+    </div>
+
+    <div class="test-box warning">
+        <h2>⚠️ Most Common Issue: Browser Cache</h2>
+        <p>If you previously loaded the page with old CSS, your browser cached it.</p>
+        <p><strong>Solution:</strong></p>
+        <ol>
+            <li>Open a new <strong>Incognito/Private</strong> window (<code>Ctrl + Shift + N</code>)</li>
+            <li>Navigate to <code>http://localhost:8000</code></li>
+            <li>You should see the new design there</li>
+        </ol>
+    </div>
+
+    <!-- Load the actual CSS files to test -->
+    <link rel="stylesheet" href="/static/css/theme.css?v=20251014">
+    <link rel="stylesheet" href="/static/css/components.css?v=20251014">
+    <link rel="stylesheet" href="/static/css/utilities.css?v=20251014">
+
+    <script>
+        function testCSSLoaded() {
+            const root = getComputedStyle(document.documentElement);
+            const primaryColor = root.getPropertyValue('--brand-primary').trim();
+            
+            console.log('=== CSS DIAGNOSTIC TEST ===');
+            console.log('--brand-primary:', primaryColor);
+            console.log('--brand-secondary:', root.getPropertyValue('--brand-secondary').trim());
+            console.log('--brand-accent:', root.getPropertyValue('--brand-accent').trim());
+            console.log('--space-md:', root.getPropertyValue('--space-md').trim());
+            
+            if (primaryColor) {
+                console.log('✅ CSS LOADED SUCCESSFULLY!');
+                console.log('Primary color is:', primaryColor);
+                alert('✅ CSS is loaded! Check console for details.');
+            } else {
+                console.log('❌ CSS NOT LOADED!');
+                console.log('CSS custom properties are empty.');
+                alert('❌ CSS is NOT loaded! Check Network tab for errors.');
+            }
+        }
+
+        function checkComputedStyle() {
+            const element = document.getElementById('test-element');
+            const computed = getComputedStyle(element);
+            const bgColor = computed.backgroundColor;
+            const result = document.getElementById('computed-result');
+            
+            console.log('Computed background-color:', bgColor);
+            
+            if (bgColor === 'rgb(255, 0, 0)' || bgColor === 'red') {
+                result.innerHTML = '❌ <strong style="color: red;">CSS NOT LOADED!</strong> Background is red (fallback color).';
+                result.style.color = '#ef4444';
+            } else {
+                result.innerHTML = '✅ <strong style="color: green;">CSS LOADED!</strong> Background is: ' + bgColor;
+                result.style.color = '#10b981';
+            }
+        }
+
+        // Auto-run test on load
+        window.addEventListener('load', function() {
+            setTimeout(function() {
+                console.log('%c=== AUTO-RUNNING CSS DIAGNOSTIC ===', 'color: blue; font-size: 16px; font-weight: bold;');
+                testCSSLoaded();
+                checkComputedStyle();
+            }, 500);
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,1536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Setup Wizard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #2563eb;
+            --primary-dark: #1e40af;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --error: #ef4444;
+            --gray-50: #f9fafb;
+            --gray-100: #f3f4f6;
+            --gray-200: #e5e7eb;
+            --gray-300: #d1d5db;
+            --gray-600: #4b5563;
+            --gray-700: #374151;
+            --gray-800: #1f2937;
+            --gray-900: #111827;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 900px;
+            width: 100%;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+
+        .progress-bar {
+            height: 6px;
+            background: rgba(255, 255, 255, 0.3);
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: var(--success);
+            transition: width 0.3s ease;
+            width: 0%;
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        .step {
+            display: none;
+        }
+
+        .step.active {
+            display: block;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .step-title {
+            font-size: 24px;
+            font-weight: 600;
+            color: var(--gray-900);
+            margin-bottom: 10px;
+        }
+
+        .step-description {
+            color: var(--gray-600);
+            margin-bottom: 30px;
+            line-height: 1.6;
+        }
+
+        .form-group {
+            margin-bottom: 24px;
+        }
+
+        .form-label {
+            display: block;
+            font-weight: 500;
+            color: var(--gray-700);
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+
+        .form-label .required {
+            color: var(--error);
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid var(--gray-300);
+            border-radius: 8px;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+
+        .form-input.error {
+            border-color: var(--error);
+        }
+
+        .form-input.success {
+            border-color: var(--success);
+        }
+
+        .form-help {
+            font-size: 13px;
+            color: var(--gray-600);
+            margin-top: 6px;
+        }
+
+        .form-error {
+            font-size: 13px;
+            color: var(--error);
+            margin-top: 6px;
+            display: none;
+        }
+
+        .form-error.visible {
+            display: block;
+        }
+
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .checkbox-group input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+
+        .alert {
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 24px;
+            display: flex;
+            align-items: start;
+            gap: 12px;
+        }
+
+        .alert-info {
+            background: #dbeafe;
+            border-left: 4px solid var(--primary);
+            color: #1e40af;
+        }
+
+        .alert-success {
+            background: #d1fae5;
+            border-left: 4px solid var(--success);
+            color: #065f46;
+        }
+
+        .alert-warning {
+            background: #fef3c7;
+            border-left: 4px solid var(--warning);
+            color: #92400e;
+        }
+
+        .alert-error {
+            background: #fee2e2;
+            border-left: 4px solid var(--error);
+            color: #991b1b;
+        }
+
+        .alert-icon {
+            font-size: 20px;
+            flex-shrink: 0;
+        }
+
+        .test-connection-btn {
+            background: var(--gray-100);
+            color: var(--gray-700);
+            border: 2px solid var(--gray-300);
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .test-connection-btn:hover {
+            background: var(--gray-200);
+        }
+
+        .test-connection-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .test-result {
+            margin-top: 16px;
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 14px;
+            display: none;
+        }
+
+        .test-result.visible {
+            display: block;
+        }
+
+        .test-result.success {
+            background: #d1fae5;
+            color: #065f46;
+        }
+
+        .test-result.error {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .button-group {
+            display: flex;
+            gap: 12px;
+            margin-top: 40px;
+            padding-top: 30px;
+            border-top: 2px solid var(--gray-100);
+        }
+
+        .btn {
+            padding: 14px 28px;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: var(--primary-dark);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
+        }
+
+        .btn-secondary {
+            background: var(--gray-100);
+            color: var(--gray-700);
+        }
+
+        .btn-secondary:hover {
+            background: var(--gray-200);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none !important;
+        }
+
+        .btn-icon {
+            font-size: 18px;
+        }
+
+        .spinner {
+            width: 18px;
+            height: 18px;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .summary-section {
+            background: var(--gray-50);
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .summary-section h3 {
+            font-size: 18px;
+            color: var(--gray-900);
+            margin-bottom: 12px;
+        }
+
+        .summary-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px solid var(--gray-200);
+        }
+
+        .summary-item:last-child {
+            border-bottom: none;
+        }
+
+        .summary-label {
+            color: var(--gray-600);
+            font-size: 14px;
+        }
+
+        .summary-value {
+            color: var(--gray-900);
+            font-weight: 500;
+            font-size: 14px;
+        }
+
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+        }
+
+        .loading-overlay.visible {
+            display: flex;
+        }
+
+        .loading-content {
+            background: white;
+            padding: 40px;
+            border-radius: 12px;
+            text-align: center;
+        }
+
+        .loading-spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid var(--gray-200);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        .step-indicator {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 30px;
+            padding: 0 20px;
+        }
+
+        .step-dot {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: var(--gray-200);
+            color: var(--gray-600);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 14px;
+            position: relative;
+        }
+
+        .step-dot.completed {
+            background: var(--success);
+            color: white;
+        }
+
+        .step-dot.active {
+            background: var(--primary);
+            color: white;
+            box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.2);
+        }
+
+        .step-dot:not(:last-child)::after {
+            content: '';
+            position: absolute;
+            left: 100%;
+            top: 50%;
+            transform: translateY(-50%);
+            width: calc(100% - 40px);
+            height: 2px;
+            background: var(--gray-200);
+        }
+
+        .step-dot.completed:not(:last-child)::after {
+            background: var(--success);
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                border-radius: 0;
+            }
+
+            .content {
+                padding: 30px 20px;
+            }
+
+            .header {
+                padding: 20px;
+            }
+
+            .header h1 {
+                font-size: 22px;
+            }
+
+            .button-group {
+                flex-direction: column;
+            }
+
+            .btn {
+                width: 100%;
+                justify-content: center;
+            }
+
+            .step-indicator {
+                padding: 0 10px;
+            }
+
+            .step-dot {
+                width: 30px;
+                height: 30px;
+                font-size: 12px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 <span data-brand-name>DockVault</span> Setup Wizard</h1>
+            <p>Let's configure your secure file transfer platform</p>
+        </div>
+
+        <div class="progress-bar">
+            <div class="progress-fill" id="progressBar"></div>
+        </div>
+
+        <div class="content">
+            <!-- Step Indicator -->
+            <div class="step-indicator" id="stepIndicator"></div>
+
+            <!-- Step 1: Welcome -->
+            <div class="step active" id="step-welcome">
+                <h2 class="step-title">Welcome</h2>
+                <p class="step-description">
+                    This wizard will guide you through the initial configuration of your instance.
+                    The setup process is safe and can be resumed if interrupted.
+                </p>
+
+                <div class="alert alert-info" id="environmentDetection">
+                    <span class="alert-icon">ℹ️</span>
+                    <div>
+                        <strong>Detecting environment...</strong>
+                        <div id="detectionDetails"></div>
+                    </div>
+                </div>
+
+                <div class="summary-section">
+                    <h3>What We'll Configure</h3>
+                    <div class="summary-item">
+                        <span class="summary-label">✓ Database Connection</span>
+                        <span class="summary-value">PostgreSQL</span>
+                    </div>
+                    <div class="summary-item">
+                        <span class="summary-label">✓ Cache Server</span>
+                        <span class="summary-value">Redis</span>
+                    </div>
+                    <div class="summary-item">
+                        <span class="summary-label">✓ Security Keys</span>
+                        <span class="summary-value">Encryption & JWT</span>
+                    </div>
+                    <div class="summary-item">
+                        <span class="summary-label">✓ Admin Account</span>
+                        <span class="summary-value">First administrator</span>
+                    </div>
+                    <div class="summary-item">
+                        <span class="summary-label">✓ File Storage</span>
+                        <span class="summary-value">Upload limits & cleanup</span>
+                    </div>
+                    <div class="summary-item">
+                        <span class="summary-label">✓ Branding</span>
+                        <span class="summary-value">Customize appearance</span>
+                    </div>
+                </div>
+
+                <div class="button-group">
+                    <button class="btn btn-primary" onclick="nextStep()">
+                        Get Started
+                        <span class="btn-icon">→</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Step 2: Database (no product-key step — the free build needs no license) -->
+            <div class="step" id="step-database">
+                <h2 class="step-title">Database Configuration</h2>
+                
+                <!-- Managed Database UI -->
+                <div id="db-managed-ui" style="display: none;">
+                    <div class="alert alert-success">
+                        <span class="alert-icon">✓</span>
+                        <div>
+                            <strong>PostgreSQL Managed by Us</strong>
+                            <p style="margin-top: 8px; margin-bottom: 0;">
+                                Your database has been automatically configured and secured. No action required!
+                            </p>
+                        </div>
+                    </div>
+
+                    <div class="summary-section">
+                        <h3>Auto-Configured Settings</h3>
+                        <div class="summary-item">
+                            <span class="summary-label">Host</span>
+                            <span class="summary-value">postgres (internal)</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="summary-label">Port</span>
+                            <span class="summary-value">5432</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="summary-label">Database</span>
+                            <span class="summary-value">psftp_db</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="summary-label">Username</span>
+                            <span class="summary-value">psftp_user</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="summary-label">Password</span>
+                            <span class="summary-value">🔒 Securely generated</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="summary-label">SSL Mode</span>
+                            <span class="summary-value">Disabled (internal network)</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Manual Database UI -->
+                <div id="db-manual-ui">
+                    <p class="step-description">
+                        Configure your PostgreSQL database connection. We'll test the connection before proceeding.
+                    </p>
+
+                    <div class="form-group">
+                        <label class="form-label">
+                            Host <span class="required">*</span>
+                        </label>
+                        <input type="text" class="form-input" id="db_host" placeholder="localhost or postgres" value="postgres">
+                        <p class="form-help">Database server hostname or IP address</p>
+                        <p class="form-error" id="db_host_error"></p>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">
+                            Port <span class="required">*</span>
+                        </label>
+                        <input type="number" class="form-input" id="db_port" placeholder="5432" value="5432">
+                        <p class="form-help">PostgreSQL port (default: 5432)</p>
+                        <p class="form-error" id="db_port_error"></p>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">
+                            Database Name <span class="required">*</span>
+                        </label>
+                        <input type="text" class="form-input" id="db_database" placeholder="psftp_db" value="psftp_db">
+                        <p class="form-help">Name of the database to use</p>
+                        <p class="form-error" id="db_database_error"></p>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">
+                            Username <span class="required">*</span>
+                        </label>
+                        <input type="text" class="form-input" id="db_username" placeholder="psftp_user" value="psftp_user">
+                        <p class="form-error" id="db_username_error"></p>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">
+                            Password <span class="required">*</span>
+                        </label>
+                        <input type="password" class="form-input" id="db_password" placeholder="••••••••">
+                        <p class="form-error" id="db_password_error"></p>
+                    </div>
+
+                    <div class="form-group">
+                        <button class="test-connection-btn" onclick="testDatabase()">
+                            🔍 Test Connection
+                        </button>
+                        <div class="test-result" id="db_test_result"></div>
+                    </div>
+                </div>
+
+                <div class="button-group">
+                    <button class="btn btn-secondary" onclick="previousStep()">
+                        <span class="btn-icon">←</span>
+                        Back
+                    </button>
+                    <button class="btn btn-primary" id="db_next_btn" onclick="saveAndNext('database')">
+                        Continue
+                        <span class="btn-icon">→</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Step 4: Redis -->
+            <div class="step" id="step-redis">
+                <h2 class="step-title">Redis Configuration</h2>
+                
+                <!-- Managed Redis UI -->
+                <div id="redis-managed-ui" style="display: none;">
+                    <div class="alert alert-success">
+                        <span class="alert-icon">✓</span>
+                        <div>
+                            <strong>Redis Managed by Us</strong>
+                            <p style="margin-top: 8px; margin-bottom: 0;">
+                                Your Redis cache has been automatically configured and secured. No action required!
+                            </p>
+                        </div>
+                    </div>
+
+                    <div class="summary-section">
+                        <h3>Auto-Configured Settings</h3>
+                        <div class="summary-item">
+                            <span class="summary-label">Host</span>
+                            <span class="summary-value">redis (internal)</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="summary-label">Port</span>
+                            <span class="summary-value">6379</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="summary-label">Database</span>
+                            <span class="summary-value">0</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="summary-label">Password</span>
+                            <span class="summary-value">🔒 Securely generated</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="summary-label">SSL</span>
+                            <span class="summary-value">Disabled (internal network)</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Manual Redis UI -->
+                <div id="redis-manual-ui">
+                    <p class="step-description">
+                        Configure your Redis cache server for sessions and rate limiting.
+                    </p>
+
+                    <div class="form-group">
+                        <label class="form-label">
+                            Host <span class="required">*</span>
+                        </label>
+                        <input type="text" class="form-input" id="redis_host" placeholder="localhost or redis" value="redis">
+                        <p class="form-help">Redis server hostname or IP address</p>
+                        <p class="form-error" id="redis_host_error"></p>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">
+                            Port <span class="required">*</span>
+                        </label>
+                        <input type="number" class="form-input" id="redis_port" placeholder="6379" value="6379">
+                        <p class="form-help">Redis port (default: 6379)</p>
+                        <p class="form-error" id="redis_port_error"></p>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">
+                            Password
+                        </label>
+                        <input type="password" class="form-input" id="redis_password" placeholder="Optional">
+                        <p class="form-help">Leave empty if Redis has no password</p>
+                    </div>
+
+                    <div class="form-group">
+                        <button class="test-connection-btn" onclick="testRedis()">
+                            🔍 Test Connection
+                        </button>
+                        <div class="test-result" id="redis_test_result"></div>
+                    </div>
+                </div>
+
+                <div class="button-group">
+                    <button class="btn btn-secondary" onclick="previousStep()">
+                        <span class="btn-icon">←</span>
+                        Back
+                    </button>
+                    <button class="btn btn-primary" id="redis_next_btn" onclick="saveAndNext('redis')">
+                        Continue
+                        <span class="btn-icon">→</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Step 4: Security -->
+            <div class="step" id="step-security">
+                <h2 class="step-title">Security Configuration</h2>
+                <p class="step-description">
+                    Configure encryption keys and security settings. We recommend generating new keys automatically.
+                </p>
+
+                <div class="alert alert-info">
+                    <span class="alert-icon">🔐</span>
+                    <div>
+                        <strong>Secure Keys Required</strong>
+                        <p>These keys encrypt sensitive data and sign authentication tokens. Keep them safe!</p>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="generate_keys" checked onchange="toggleKeyInputs()">
+                        <label class="form-label" for="generate_keys" style="margin-bottom: 0;">
+                            Generate keys automatically (recommended)
+                        </label>
+                    </div>
+                </div>
+
+                <div id="manual_keys" style="display: none;">
+                    <div class="form-group">
+                        <label class="form-label">
+                            Encryption Key (Fernet) <span class="required">*</span>
+                        </label>
+                        <input type="text" class="form-input" id="encryption_key" placeholder="Base64-encoded 32-byte key">
+                        <p class="form-help">Must be a valid Fernet key (44 characters, base64-encoded)</p>
+                        <p class="form-error" id="encryption_key_error"></p>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">
+                            JWT Secret Key <span class="required">*</span>
+                        </label>
+                        <input type="text" class="form-input" id="jwt_secret" placeholder="Random secret string">
+                        <p class="form-help">Minimum 32 characters for security</p>
+                        <p class="form-error" id="jwt_secret_error"></p>
+                    </div>
+                </div>
+
+                <div class="button-group">
+                    <button class="btn btn-secondary" onclick="previousStep()">
+                        <span class="btn-icon">←</span>
+                        Back
+                    </button>
+                    <button class="btn btn-primary" onclick="saveAndNext('security')">
+                        Continue
+                        <span class="btn-icon">→</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Step 5: Admin Account -->
+            <div class="step" id="step-admin">
+                <h2 class="step-title">Create Admin Account</h2>
+                <p class="step-description">
+                    Create the first administrator account. You'll use this to log in and manage your instance.
+                </p>
+
+                <div class="alert alert-warning">
+                    <span class="alert-icon">⚠️</span>
+                    <div>
+                        <strong>Important</strong>
+                        <p>Use a strong password with at least 12 characters, including uppercase, lowercase, numbers, and symbols.</p>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">
+                        Username <span class="required">*</span>
+                    </label>
+                    <input type="text" class="form-input" id="admin_username" placeholder="admin" value="admin">
+                    <p class="form-help">Alphanumeric characters and underscores only</p>
+                    <p class="form-error" id="admin_username_error"></p>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">
+                        Email <span class="required">*</span>
+                    </label>
+                    <input type="email" class="form-input" id="admin_email" placeholder="admin@example.com">
+                    <p class="form-help">Used for account recovery and notifications</p>
+                    <p class="form-error" id="admin_email_error"></p>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">
+                        Password <span class="required">*</span>
+                    </label>
+                    <input type="password" class="form-input" id="admin_password" placeholder="••••••••" oninput="checkPasswordStrength()">
+                    <div id="password_strength" class="form-help"></div>
+                    <p class="form-error" id="admin_password_error"></p>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">
+                        Confirm Password <span class="required">*</span>
+                    </label>
+                    <input type="password" class="form-input" id="admin_password_confirm" placeholder="••••••••">
+                    <p class="form-error" id="admin_password_confirm_error"></p>
+                </div>
+
+                <div class="button-group">
+                    <button class="btn btn-secondary" onclick="previousStep()">
+                        <span class="btn-icon">←</span>
+                        Back
+                    </button>
+                    <button class="btn btn-primary" onclick="saveAndNext('admin')">
+                        Continue
+                        <span class="btn-icon">→</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Step 6: Storage -->
+            <div class="step" id="step-storage">
+                <h2 class="step-title">File Storage Configuration</h2>
+                <p class="step-description">
+                    Configure storage limits and file transfer settings.
+                </p>
+
+                <div class="form-group">
+                    <label class="form-label">
+                        Maximum File Size (MB) <span class="required">*</span>
+                    </label>
+                    <input type="number" class="form-input" id="max_file_size" placeholder="15360" value="15360">
+                    <p class="form-help">Maximum size for a single file (default: 15GB)</p>
+                    <p class="form-error" id="max_file_size_error"></p>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">
+                        Transfer Speed Limit (KB/s)
+                    </label>
+                    <input type="number" class="form-input" id="transfer_speed_limit" placeholder="0" value="0">
+                    <p class="form-help">0 = unlimited (recommended for most use cases)</p>
+                </div>
+
+                <div class="button-group">
+                    <button class="btn btn-secondary" onclick="previousStep()">
+                        <span class="btn-icon">←</span>
+                        Back
+                    </button>
+                    <button class="btn btn-primary" onclick="saveAndNext('storage')">
+                        Continue
+                        <span class="btn-icon">→</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Step 7: Branding -->
+            <div class="step" id="step-branding">
+                <h2 class="step-title">Branding (Optional)</h2>
+                <p class="step-description">
+                    Customize the appearance of your instance. You can skip this and configure it later.
+                </p>
+
+                <div class="form-group">
+                    <label class="form-label">
+                        Application Name
+                    </label>
+                    <input type="text" class="form-input" id="brand_app_name" placeholder="DockVault" value="DockVault">
+                    <p class="form-help">Displayed in headers and page titles</p>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">
+                        Company Name
+                    </label>
+                    <input type="text" class="form-input" id="brand_company_name" placeholder="Your Company">
+                    <p class="form-help">Displayed in footer</p>
+                </div>
+
+                <div class="button-group">
+                    <button class="btn btn-secondary" onclick="previousStep()">
+                        <span class="btn-icon">←</span>
+                        Back
+                    </button>
+                    <button class="btn btn-secondary" onclick="skipBranding()">
+                        Skip
+                    </button>
+                    <button class="btn btn-primary" onclick="saveAndNext('branding')">
+                        Continue
+                        <span class="btn-icon">→</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Step 8: Review -->
+            <div class="step" id="step-review">
+                <h2 class="step-title">Review Configuration</h2>
+                <p class="step-description">
+                    Please review your configuration before completing the setup.
+                </p>
+
+                <div id="reviewSummary"></div>
+
+                <div class="alert alert-success">
+                    <span class="alert-icon">✓</span>
+                    <div>
+                        <strong>Ready to Complete</strong>
+                        <p>Click "Complete Setup" to initialize your instance with these settings.</p>
+                    </div>
+                </div>
+
+                <div class="button-group">
+                    <button class="btn btn-secondary" onclick="previousStep()">
+                        <span class="btn-icon">←</span>
+                        Back
+                    </button>
+                    <button class="btn btn-primary" onclick="completeSetup()">
+                        Complete Setup
+                        <span class="btn-icon">✓</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Step 9: Complete -->
+            <div class="step" id="step-complete">
+                <div style="text-align: center; padding: 40px 0;">
+                    <div style="font-size: 72px; margin-bottom: 20px;">🎉</div>
+                    <h2 class="step-title">Setup Complete!</h2>
+                    <p class="step-description">
+                        Your configuration has been saved. The Docker containers are being deployed.
+                    </p>
+
+                    <div class="alert alert-info" style="margin-top: 30px;">
+                        <span class="alert-icon">⏳</span>
+                        <div>
+                            <strong>Deployment in Progress</strong>
+                            <p style="margin-top: 8px; margin-bottom: 8px;">
+                                The system is now deploying your containers with the configured settings.
+                                This typically takes 2-5 minutes depending on your system.
+                            </p>
+                            <p style="margin-top: 8px; margin-bottom: 0;">
+                                <strong>Docker Command:</strong><br>
+                                <code id="dockerCommand" style="background: #f3f4f6; padding: 8px; display: inline-block; margin-top: 8px; border-radius: 4px;">
+                                    docker-compose --profile enterprise up -d
+                                </code>
+                            </p>
+                        </div>
+                    </div>
+
+                    <div class="alert alert-success" style="margin-top: 20px;">
+                        <span class="alert-icon">✓</span>
+                        <div>
+                            <strong>Next Steps</strong>
+                            <ol style="text-align: left; margin-top: 10px; margin-left: 20px;">
+                                <li><strong>Wait for containers to start</strong> - Check with: <code>docker-compose ps</code></li>
+                                <li><strong>Access your instance</strong> - Once running, visit: <strong id="accessUrl">http://localhost:8080</strong></li>
+                                <li><strong>Log in with your admin credentials</strong></li>
+                                <li><strong>Configure database/Redis if needed</strong> - Use the admin panel if containers show errors</li>
+                                <li><strong>Start transferring files securely!</strong></li>
+                            </ol>
+                        </div>
+                    </div>
+
+                    <div class="button-group" style="justify-content: center; margin-top: 30px;">
+                        <button class="btn btn-secondary" onclick="window.open('http://localhost:8080', '_blank')">
+                            <span class="btn-icon">🔗</span>
+                            Open App (New Tab)
+                        </button>
+                        <button class="btn btn-primary" onclick="window.location.href='http://localhost:8080'">
+                            Go to App
+                            <span class="btn-icon">→</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="loading-content">
+            <div class="loading-spinner"></div>
+            <p id="loadingMessage">Processing...</p>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = '/api/setup';
+        let currentStep = 0;
+        const steps = ['welcome', 'database', 'redis', 'security', 'admin', 'storage', 'branding', 'review', 'complete'];
+        let wizardState = {};
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadWizardState();
+            detectEnvironment();
+            updateStepIndicator();
+        });
+
+        async function loadWizardState() {
+            try {
+                const response = await fetch(`${API_BASE}/state`);
+                if (response.ok) {
+                    wizardState = await response.json();
+                    // Resume from last step if needed
+                    if (wizardState.current_step) {
+                        const stepIndex = steps.indexOf(wizardState.current_step);
+                        if (stepIndex > 0) {
+                            currentStep = stepIndex;
+                            showStep(currentStep);
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to load wizard state:', error);
+            }
+        }
+
+        async function detectEnvironment() {
+            try {
+                const response = await fetch('/api/setup/detailed');
+                if (response.ok) {
+                    const data = await response.json();
+                    const details = document.getElementById('detectionDetails');
+                    
+                    let html = '<ul style="margin-top: 10px; list-style-position: inside;">';
+                    if (data.environment.is_docker) {
+                        html += '<li>✓ Running in Docker container</li>';
+                    }
+                    if (data.environment.database_initialized) {
+                        html += '<li>✓ Database already initialized</li>';
+                    }
+                    if (data.environment.has_admin_user) {
+                        html += '<li>✓ Admin user exists</li>';
+                    }
+                    html += `<li>Environment: ${data.environment.credential_mode}</li>`;
+                    html += '</ul>';
+                    
+                    details.innerHTML = html;
+                }
+            } catch (error) {
+                console.error('Failed to detect environment:', error);
+            }
+        }
+
+        function showStep(index) {
+            document.querySelectorAll('.step').forEach(step => step.classList.remove('active'));
+            const stepName = steps[index];
+            document.getElementById(`step-${stepName}`).classList.add('active');
+            
+            // Handle adaptive UI for database step
+            if (stepName === 'database' && wizardState.autoConfig) {
+                const isManaged = wizardState.autoConfig.postgresql && wizardState.autoConfig.postgresql.managed;
+                document.getElementById('db-managed-ui').style.display = isManaged ? 'block' : 'none';
+                document.getElementById('db-manual-ui').style.display = isManaged ? 'none' : 'block';
+                
+                // If managed, enable next button immediately
+                if (isManaged) {
+                    document.getElementById('db_next_btn').disabled = false;
+                }
+            }
+            
+            // Handle adaptive UI for Redis step
+            if (stepName === 'redis' && wizardState.autoConfig) {
+                const isManaged = wizardState.autoConfig.redis && wizardState.autoConfig.redis.managed;
+                document.getElementById('redis-managed-ui').style.display = isManaged ? 'block' : 'none';
+                document.getElementById('redis-manual-ui').style.display = isManaged ? 'none' : 'block';
+                
+                // If managed, enable next button immediately
+                if (isManaged) {
+                    document.getElementById('redis_next_btn').disabled = false;
+                }
+            }
+            
+            updateProgress();
+            updateStepIndicator();
+        }
+
+        function updateProgress() {
+            const progress = (currentStep / (steps.length - 1)) * 100;
+            document.getElementById('progressBar').style.width = `${progress}%`;
+        }
+
+        function updateStepIndicator() {
+            const indicator = document.getElementById('stepIndicator');
+            indicator.innerHTML = steps.slice(0, -1).map((step, index) => {
+                let className = 'step-dot';
+                if (index < currentStep) className += ' completed';
+                if (index === currentStep) className += ' active';
+                return `<div class="${className}">${index + 1}</div>`;
+            }).join('');
+        }
+
+        function nextStep() {
+            if (currentStep < steps.length - 1) {
+                currentStep++;
+                showStep(currentStep);
+            }
+        }
+
+        function previousStep() {
+            if (currentStep > 0) {
+                currentStep--;
+                showStep(currentStep);
+            }
+        }
+
+        function toggleKeyInputs() {
+            const manualKeys = document.getElementById('manual_keys');
+            const generateKeys = document.getElementById('generate_keys');
+            manualKeys.style.display = generateKeys.checked ? 'none' : 'block';
+        }
+
+        async function testDatabase() {
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Testing...';
+
+            const config = {
+                host: document.getElementById('db_host').value,
+                port: parseInt(document.getElementById('db_port').value),
+                database: document.getElementById('db_database').value,
+                username: document.getElementById('db_username').value,
+                password: document.getElementById('db_password').value,
+                ssl_mode: 'prefer'
+            };
+
+            try {
+                const response = await fetch(`${API_BASE}/database/test`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+
+                const result = await response.json();
+                const testResult = document.getElementById('db_test_result');
+                testResult.className = 'test-result visible ' + (result.success ? 'success' : 'error');
+                testResult.textContent = result.message;
+
+                if (result.success) {
+                    document.getElementById('db_next_btn').disabled = false;
+                }
+            } catch (error) {
+                const testResult = document.getElementById('db_test_result');
+                testResult.className = 'test-result visible error';
+                testResult.textContent = 'Connection test failed: ' + error.message;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🔍 Test Connection';
+            }
+        }
+
+        async function testRedis() {
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Testing...';
+
+            const config = {
+                host: document.getElementById('redis_host').value,
+                port: parseInt(document.getElementById('redis_port').value),
+                password: document.getElementById('redis_password').value || null,
+                database: 0,
+                ssl: false
+            };
+
+            try {
+                const response = await fetch(`${API_BASE}/redis/test`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+
+                const result = await response.json();
+                const testResult = document.getElementById('redis_test_result');
+                testResult.className = 'test-result visible ' + (result.success ? 'success' : 'error');
+                testResult.textContent = result.message;
+
+                if (result.success) {
+                    document.getElementById('redis_next_btn').disabled = false;
+                }
+            } catch (error) {
+                const testResult = document.getElementById('redis_test_result');
+                testResult.className = 'test-result visible error';
+                testResult.textContent = 'Connection test failed: ' + error.message;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🔍 Test Connection';
+            }
+        }
+
+        async function saveAndNext(stepName) {
+            showLoading('Saving configuration...');
+
+            try {
+                let data = {};
+                
+                if (stepName === 'database') {
+                    // Check if database is managed
+                    const isManaged = wizardState.autoConfig?.postgresql?.managed;
+                    
+                    if (isManaged) {
+                        // Use auto-configured values for managed database
+                        data = {
+                            host: wizardState.autoConfig.postgresql.host,
+                            port: wizardState.autoConfig.postgresql.port,
+                            database: wizardState.autoConfig.postgresql.database,
+                            username: wizardState.autoConfig.postgresql.username,
+                            password: wizardState.autoConfig.postgresql.password,
+                            ssl_mode: wizardState.autoConfig.postgresql.ssl_mode,
+                            managed: true  // Skip connection test for managed services
+                        };
+                    } else {
+                        // Use manual form values
+                        data = {
+                            host: document.getElementById('db_host').value,
+                            port: parseInt(document.getElementById('db_port').value),
+                            database: document.getElementById('db_database').value,
+                            username: document.getElementById('db_username').value,
+                            password: document.getElementById('db_password').value,
+                            ssl_mode: 'prefer',
+                            managed: false
+                        };
+                    }
+                } else if (stepName === 'redis') {
+                    // Check if Redis is managed
+                    const isManaged = wizardState.autoConfig?.redis?.managed;
+                    
+                    if (isManaged) {
+                        // Use auto-configured values for managed Redis
+                        data = {
+                            host: wizardState.autoConfig.redis.host,
+                            port: wizardState.autoConfig.redis.port,
+                            password: wizardState.autoConfig.redis.password,
+                            database: wizardState.autoConfig.redis.database || 0,
+                            ssl: wizardState.autoConfig.redis.ssl || false,
+                            managed: true  // Skip connection test for managed services
+                        };
+                    } else {
+                        // Use manual form values
+                        data = {
+                            host: document.getElementById('redis_host').value,
+                            port: parseInt(document.getElementById('redis_port').value),
+                            password: document.getElementById('redis_password').value || null,
+                            database: 0,
+                            ssl: false,
+                            managed: false
+                        };
+                    }
+                } else if (stepName === 'security') {
+                    data = {
+                        generate_keys: document.getElementById('generate_keys').checked,
+                        session_timeout_minutes: 60,
+                        max_login_attempts: 5,
+                        password_min_length: 12
+                    };
+                    if (!data.generate_keys) {
+                        data.encryption_key = document.getElementById('encryption_key').value;
+                        data.jwt_secret_key = document.getElementById('jwt_secret').value;
+                    } else {
+                        data.encryption_key = null;
+                        data.jwt_secret_key = null;
+                    }
+                } else if (stepName === 'admin') {
+                    // Validate password confirmation first
+                    const confirmPassword = document.getElementById('admin_password_confirm').value;
+                    const password = document.getElementById('admin_password').value;
+                    
+                    if (password !== confirmPassword) {
+                        hideLoading();
+                        alert('Passwords do not match!');
+                        return;
+                    }
+                    
+                    data = {
+                        username: document.getElementById('admin_username').value,
+                        email: document.getElementById('admin_email').value,
+                        password: password,
+                        password_confirm: confirmPassword
+                    };
+                } else if (stepName === 'storage') {
+                    data = {
+                        storage_path: '/data/uploads',
+                        max_file_size_mb: parseInt(document.getElementById('max_file_size').value),
+                        transfer_speed_limit_kb: parseInt(document.getElementById('transfer_speed_limit').value),
+                        enable_encryption: true,
+                        retention_days: 0
+                    };
+                } else if (stepName === 'branding') {
+                    data = {
+                        app_name: document.getElementById('brand_app_name').value,
+                        company_name: document.getElementById('brand_company_name').value,
+                        support_email: null,
+                        support_url: null,
+                        primary_color: '#3B82F6',
+                        secondary_color: '#10B981'
+                    };
+                }
+
+                const response = await fetch(`${API_BASE}/${stepName}/save`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to save configuration');
+                }
+
+                hideLoading();
+                
+                if (stepName === 'branding') {
+                    // Load review summary
+                    await loadReviewSummary();
+                }
+                
+                nextStep();
+            } catch (error) {
+                hideLoading();
+                alert('Error: ' + error.message);
+            }
+        }
+
+        function skipBranding() {
+            loadReviewSummary();
+            nextStep();
+        }
+
+        async function loadReviewSummary() {
+            try {
+                const response = await fetch(`${API_BASE}/state`);
+                if (response.ok) {
+                    const state = await response.json();
+                    const summary = document.getElementById('reviewSummary');
+                    
+                    let html = '';
+                    
+                    for (const [stepName, stepData] of Object.entries(state.steps)) {
+                        if (stepData.status === 'completed' && stepData.data) {
+                            html += `<div class="summary-section">`;
+                            html += `<h3>${stepName.charAt(0).toUpperCase() + stepName.slice(1)}</h3>`;
+                            
+                            for (const [key, value] of Object.entries(stepData.data)) {
+                                // Skip sensitive and internal fields
+                                if (key === 'password' || key === 'tested_at' || key === 'saved_at' || key === 'created_at' || !value) {
+                                    continue;
+                                }
+                                
+                                // Handle test_result object
+                                if (key === 'test_result') {
+                                    if (typeof value === 'object' && value.message) {
+                                        html += `<div class="summary-item">`;
+                                        html += `<span class="summary-label">Connection Test</span>`;
+                                        html += `<span class="summary-value">${value.success ? '✓' : '✗'} ${value.message}</span>`;
+                                        html += `</div>`;
+                                    }
+                                    continue;
+                                }
+                                
+                                // Skip objects that aren't handled above
+                                if (typeof value === 'object') {
+                                    continue;
+                                }
+                                
+                                // Format boolean values
+                                let displayValue = value;
+                                if (typeof value === 'boolean') {
+                                    displayValue = value ? '✓ Yes' : '✗ No';
+                                }
+                                
+                                html += `<div class="summary-item">`;
+                                html += `<span class="summary-label">${key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}</span>`;
+                                html += `<span class="summary-value">${displayValue}</span>`;
+                                html += `</div>`;
+                            }
+                            
+                            html += `</div>`;
+                        }
+                    }
+                    
+                    summary.innerHTML = html;
+                }
+            } catch (error) {
+                console.error('Failed to load review summary:', error);
+            }
+        }
+
+        async function completeSetup() {
+            showLoading('Completing setup and preparing deployment...');
+
+            try {
+                const response = await fetch(`${API_BASE}/complete`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to complete setup');
+                }
+
+                const result = await response.json();
+                
+                hideLoading();
+                
+                // Update Docker command display with actual profile
+                if (result.docker_command) {
+                    document.getElementById('dockerCommand').textContent = result.docker_command;
+                }
+                
+                // Update access URL if provided
+                if (result.access_url) {
+                    document.getElementById('accessUrl').textContent = result.access_url;
+                    // Update button links
+                    document.querySelectorAll('#step-complete button').forEach(btn => {
+                        const onclick = btn.getAttribute('onclick');
+                        if (onclick && onclick.includes('localhost:8080')) {
+                            btn.setAttribute('onclick', onclick.replace(/localhost:8080/g, result.access_url.replace('http://', '').replace('https://', '')));
+                        }
+                    });
+                }
+                
+                nextStep();
+            } catch (error) {
+                hideLoading();
+                alert('Error: ' + error.message);
+            }
+        }
+
+        function checkPasswordStrength() {
+            const password = document.getElementById('admin_password').value;
+            const strengthDiv = document.getElementById('password_strength');
+            
+            let strength = 0;
+            if (password.length >= 8) strength++;
+            if (password.length >= 12) strength++;
+            if (/[a-z]/.test(password)) strength++;
+            if (/[A-Z]/.test(password)) strength++;
+            if (/[0-9]/.test(password)) strength++;
+            if (/[^a-zA-Z0-9]/.test(password)) strength++;
+            
+            if (strength < 3) {
+                strengthDiv.textContent = '❌ Weak password';
+                strengthDiv.style.color = 'var(--error)';
+            } else if (strength < 5) {
+                strengthDiv.textContent = '⚠️ Medium password';
+                strengthDiv.style.color = 'var(--warning)';
+            } else {
+                strengthDiv.textContent = '✓ Strong password';
+                strengthDiv.style.color = 'var(--success)';
+            }
+        }
+
+        function showLoading(message) {
+            document.getElementById('loadingMessage').textContent = message;
+            document.getElementById('loadingOverlay').classList.add('visible');
+        }
+
+        function hideLoading() {
+            document.getElementById('loadingOverlay').classList.remove('visible');
+        }
+
+        function goToLogin() {
+            window.location.href = '/';
+        }
+    </script>
+    <script>
+        // A5: render the EFFECTIVE branding (env defaults + admin/DB overrides) into the
+        // wizard, exactly like the main app's brand.js — XSS-safe via textContent only.
+        (function () {
+            fetch('/branding').then(function (r) { return r.json(); }).then(function (b) {
+                if (!b || !b.app_name) return;
+                var name = String(b.app_name);
+                document.querySelectorAll('[data-brand-name]').forEach(function (el) {
+                    el.textContent = name;
+                });
+                document.title = name + ' Setup Wizard';
+            }).catch(function () { /* first run before the API is up — keep the neutral default */ });
+        })();
+    </script>
+</body>
+</html>

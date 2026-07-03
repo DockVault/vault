@@ -1,0 +1,27 @@
+# Keep secrets and runtime data OUT of the image build context. The Dockerfile
+# does `COPY . .`, so anything not excluded here is baked into image layers —
+# a `docker save`/`docker push` of the tag would leak it, and old layers keep
+# old secrets even after rotation. Runtime gets these another way: env vars via
+# compose env_file, certs via the ./certs bind mount, data via named volumes.
+.env
+.env.*
+!.env.example
+certs/
+keys/
+storage/
+logs/
+uploads/
+temp/
+tmp/
+
+# Build hygiene (never needed inside the image)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.backup
+*.bak
+setup_state.json
+setup.lock
+docker-compose*.yml
+.dockerignore
+.gitignore

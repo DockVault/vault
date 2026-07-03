@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self';">
+    <title>DockVault - Secure File Transfer</title>
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+</head>
+<body>
+    <!-- Login Screen -->
+    <div id="login-screen" class="screen active">
+        <div class="login-container">
+            <div class="login-card">
+                <div class="login-header">
+                    <h1>🔒 DockVault</h1>
+                    <p class="subtitle">Secure File Transfer Platform</p>
+                </div>
+                
+                <form id="login-form">
+                    <div class="form-group">
+                        <label for="username">Username</label>
+                        <input type="text" id="username" name="username" required autocomplete="username" autofocus>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input type="password" id="password" name="password" required autocomplete="current-password">
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary btn-block">
+                        <span class="btn-text">Sign In</span>
+                        <span class="btn-loading" style="display: none;">
+                            <span class="spinner-small"></span> Authenticating...
+                        </span>
+                    </button>
+                </form>
+                
+                <div id="login-error" class="alert alert-error" style="display: none;"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Dashboard Screen -->
+    <div id="dashboard-screen" class="screen">
+        <!-- Sidebar -->
+        <div class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <h2>🔒 DockVault</h2>
+                <button class="sidebar-toggle" onclick="toggleSidebar()">☰</button>
+            </div>
+            
+            <div class="sidebar-user">
+                <div class="user-avatar" id="user-avatar">A</div>
+                <div class="user-info">
+                    <div class="user-name" id="user-name">Admin</div>
+                    <div class="user-role" id="user-role">Administrator</div>
+                </div>
+            </div>
+            
+            <nav class="sidebar-nav">
+                <a href="#" class="nav-item active" data-view="dashboard" onclick="navigate('dashboard', event)">
+                    <span class="nav-icon">📊</span>
+                    <span class="nav-text">Dashboard</span>
+                </a>
+                <a href="#" class="nav-item" data-view="vaults" onclick="navigate('vaults', event)">
+                    <span class="nav-icon">🗂️</span>
+                    <span class="nav-text">Vaults</span>
+                </a>
+                <a href="#" class="nav-item" data-view="users" onclick="navigate('users', event)" id="nav-users">
+                    <span class="nav-icon">👥</span>
+                    <span class="nav-text">Users</span>
+                </a>
+                <a href="#" class="nav-item" data-view="temp-access" onclick="navigate('temp-access', event)">
+                    <span class="nav-icon">🔑</span>
+                    <span class="nav-text">Temp Access</span>
+                </a>
+                <a href="#" class="nav-item" data-view="audit" onclick="navigate('audit', event)" id="nav-audit">
+                    <span class="nav-icon">📋</span>
+                    <span class="nav-text">Audit Logs</span>
+                </a>
+                <a href="#" class="nav-item" data-view="settings" onclick="navigate('settings', event)">
+                    <span class="nav-icon">⚙️</span>
+                    <span class="nav-text">Settings</span>
+                </a>
+            </nav>
+            
+            <div class="sidebar-footer">
+                <button class="btn btn-secondary btn-block" onclick="logout()">
+                    <span class="nav-icon">🚪</span>
+                    <span class="nav-text">Logout</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <!-- Dashboard View -->
+            <div id="dashboard-view" class="view active">
+                <div class="view-header">
+                    <h1>Dashboard</h1>
+                    <p class="text-muted">System overview and quick stats</p>
+                </div>
+                
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon stat-primary">🗂️</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="stat-vaults">-</div>
+                            <div class="stat-label">Total Vaults</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon stat-success">👥</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="stat-users">-</div>
+                            <div class="stat-label">Active Users</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon stat-warning">📁</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="stat-files">-</div>
+                            <div class="stat-label">Total Files</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon stat-info">🔑</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="stat-temp-creds">-</div>
+                            <div class="stat-label">Temp Credentials</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="content-grid">
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>Recent Activity</h3>
+                        </div>
+                        <div class="card-body">
+                            <div id="recent-activity" class="activity-list">
+                                <div class="loading-spinner"></div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>System Status</h3>
+                        </div>
+                        <div class="card-body">
+                            <div class="status-item">
+                                <span>API Server</span>
+                                <span class="badge badge-success" id="status-api">Online</span>
+                            </div>
+                            <div class="status-item">
+                                <span>Database</span>
+                                <span class="badge badge-success" id="status-db">Connected</span>
+                            </div>
+                            <div class="status-item">
+                                <span>Redis Cache</span>
+                                <span class="badge badge-success" id="status-redis">Connected</span>
+                            </div>
+                            <div class="status-item">
+                                <span>SFTP Server</span>
+                                <span class="badge badge-success">Port 2222</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Vaults View -->
+            <div id="vaults-view" class="view">
+                <div class="view-header">
+                    <div>
+                        <h1>Vaults</h1>
+                        <p class="text-muted">Manage secure file vaults</p>
+                    </div>
+                    <button class="btn btn-primary" onclick="showCreateVault()">
+                        <span>+ Create Vault</span>
+                    </button>
+                </div>
+                
+                <div id="vaults-list" class="items-grid">
+                    <div class="loading-spinner"></div>
+                </div>
+            </div>
+
+            <!-- Users View (Admin Only) -->
+            <div id="users-view" class="view">
+                <div class="view-header">
+                    <div>
+                        <h1>Users</h1>
+                        <p class="text-muted">Manage user accounts and permissions</p>
+                    </div>
+                    <button class="btn btn-primary" onclick="showCreateUser()">
+                        <span>+ Create User</span>
+                    </button>
+                </div>
+                
+                <div class="table-container">
+                    <table class="data-table" id="users-table">
+                        <thead>
+                            <tr>
+                                <th>Username</th>
+                                <th>Email</th>
+                                <th>Role</th>
+                                <th>Status</th>
+                                <th>Created</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="users-table-body">
+                            <tr>
+                                <td colspan="6" class="text-center">
+                                    <div class="loading-spinner"></div>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Temp Access View -->
+            <div id="temp-access-view" class="view">
+                <div class="view-header">
+                    <div>
+                        <h1>Temporary Access</h1>
+                        <p class="text-muted">Generate one-time SFTP credentials</p>
+                    </div>
+                    <button class="btn btn-primary" onclick="generateTempCreds()">
+                        <span>+ Generate Credentials</span>
+                    </button>
+                </div>
+                
+                <div id="temp-creds-display" class="alert alert-warning" style="display: none;">
+                    <h3>⚠️ One-Time Credentials Generated</h3>
+                    <p><strong>Copy these credentials now - they won't be shown again!</strong></p>
+                    
+                    <div class="credentials-box">
+                        <div class="cred-item">
+                            <strong>Username:</strong>
+                            <code id="temp-username"></code>
+                            <button onclick="copyToClipboard('temp-username')" class="btn-icon">📋</button>
+                        </div>
+                        <div class="cred-item">
+                            <strong>Password:</strong>
+                            <code id="temp-password"></code>
+                            <button onclick="copyToClipboard('temp-password')" class="btn-icon">📋</button>
+                        </div>
+                        <div class="cred-item">
+                            <strong>Expires:</strong>
+                            <span id="temp-expires"></span>
+                        </div>
+                        <div class="cred-item">
+                            <strong>SFTP Command:</strong>
+                            <code id="sftp-command"></code>
+                            <button onclick="copyToClipboard('sftp-command')" class="btn-icon">📋</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="temp-creds-list" class="items-grid">
+                    <div class="loading-spinner"></div>
+                </div>
+            </div>
+
+            <!-- Audit Logs View (Admin Only) -->
+            <div id="audit-view" class="view">
+                <div class="view-header">
+                    <h1>Audit Logs</h1>
+                    <p class="text-muted">System activity and security events</p>
+                </div>
+                
+                <div class="card">
+                    <div class="card-body">
+                        <p class="text-muted text-center">Audit log viewer coming soon...</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings View -->
+            <div id="settings-view" class="view">
+                <div class="view-header">
+                    <h1>Settings</h1>
+                    <p class="text-muted">Account and security settings</p>
+                </div>
+                
+                <div class="card">
+                    <div class="card-header">
+                        <h3>Change Password</h3>
+                    </div>
+                    <div class="card-body">
+                        <form id="change-password-form">
+                            <div class="form-group">
+                                <label for="current-password">Current Password</label>
+                                <input type="password" id="current-password" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="new-password">New Password</label>
+                                <input type="password" id="new-password" required minlength="12">
+                            </div>
+                            <div class="form-group">
+                                <label for="confirm-password">Confirm New Password</label>
+                                <input type="password" id="confirm-password" required minlength="12">
+                            </div>
+                            <button type="submit" class="btn btn-primary">Update Password</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create Vault Modal -->
+    <div id="create-vault-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Create New Vault</h3>
+                <button class="modal-close" onclick="closeModal('create-vault-modal')">&times;</button>
+            </div>
+            <form id="create-vault-form">
+                <div class="modal-body">
+                    <div class="form-group">
+                        <label for="vault-name">Vault Name *</label>
+                        <input type="text" id="vault-name" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="vault-desc">Description</label>
+                        <textarea id="vault-desc" rows="3"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label for="vault-password">Vault Password *</label>
+                        <input type="password" id="vault-password" required minlength="8">
+                        <small>Minimum 8 characters. This encrypts files in the vault.</small>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" onclick="closeModal('create-vault-modal')" class="btn btn-secondary">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create Vault</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Create User Modal -->
+    <div id="create-user-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Create New User</h3>
+                <button class="modal-close" onclick="closeModal('create-user-modal')">&times;</button>
+            </div>
+            <form id="create-user-form">
+                <div class="modal-body">
+                    <div class="form-group">
+                        <label for="new-username">Username *</label>
+                        <input type="text" id="new-username" required minlength="3">
+                    </div>
+                    <div class="form-group">
+                        <label for="new-email">Email *</label>
+                        <input type="email" id="new-email" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="new-password">Password *</label>
+                        <input type="password" id="new-password" required minlength="12">
+                        <small>Minimum 12 characters</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="new-role">Role *</label>
+                        <select id="new-role" required>
+                            <option value="user">User - Can create vaults and manage files</option>
+                            <option value="external">External - Limited read access</option>
+                            <option value="admin">Admin - Full system access</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" onclick="closeModal('create-user-modal')" class="btn btn-secondary">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create User</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>

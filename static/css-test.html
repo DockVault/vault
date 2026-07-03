@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CSS Variable Test</title>
+    <link rel="stylesheet" href="/static/css/theme.css?v=20251014b">
+    <link rel="stylesheet" href="/static/css/components.css?v=20251014b">
+    <link rel="stylesheet" href="/static/css/utilities.css?v=20251014b">
+</head>
+<body style="padding: 20px;">
+    <h1>CSS Variable Diagnostic</h1>
+    
+    <div style="padding: 20px; margin: 20px 0; background: white; border: 2px solid red;">
+        <h2>Color Tests</h2>
+        <p style="color: var(--brand-primary); font-size: 20px;">This should be DEEP SLATE (#0f172a)</p>
+        <p style="color: var(--brand-secondary); font-size: 20px;">This should be BRIGHT BLUE (#3b82f6)</p>
+        <p style="color: var(--brand-accent); font-size: 20px;">This should be CYAN (#06b6d4)</p>
+        <p style="color: var(--text-primary); font-size: 20px;">This should be DARK TEXT</p>
+        <p style="color: var(--text-secondary); font-size: 20px;">This should be GRAY TEXT</p>
+    </div>
+
+    <div style="padding: 20px; margin: 20px 0; background: linear-gradient(135deg, var(--brand-primary) 0%, var(--brand-secondary) 100%); color: white; min-height: 200px;">
+        <h2>Gradient Background Test</h2>
+        <p>If you see a gradient from deep slate to bright blue, CSS variables are working!</p>
+        <p>If this is a solid color or white, variables aren't loading.</p>
+    </div>
+
+    <div class="card" style="max-width: 400px;">
+        <div class="card-body">
+            <h3>Card Test</h3>
+            <p>This card should have elevation/shadow</p>
+            <button class="btn btn-primary">Button Test</button>
+        </div>
+    </div>
+
+    <script>
+        // Log CSS variables to console
+        console.log('=== CSS VARIABLES TEST ===');
+        const root = getComputedStyle(document.documentElement);
+        console.log('--brand-primary:', root.getPropertyValue('--brand-primary'));
+        console.log('--brand-secondary:', root.getPropertyValue('--brand-secondary'));
+        console.log('--brand-accent:', root.getPropertyValue('--brand-accent'));
+        console.log('--text-primary:', root.getPropertyValue('--text-primary'));
+        console.log('--surface-0:', root.getPropertyValue('--surface-0'));
+        
+        // Test if any are empty
+        if (!root.getPropertyValue('--brand-primary').trim()) {
+            alert('❌ CSS VARIABLES NOT LOADING! Check Network tab for CSS files.');
+        } else {
+            alert('✅ CSS Variables are loading correctly!');
+        }
+    </script>
+
+    <script src="/static/js/theme.js?v=20251014b"></script>
+</body>
+</html>

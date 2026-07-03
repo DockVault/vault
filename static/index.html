@@ -1,0 +1,1874 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self' blob:; object-src 'self' blob:;">
+    <title>DockVault</title>
+    <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
+    <link rel="apple-touch-icon" href="/static/assets/logo.png?v=1">
+    <link rel="stylesheet" href="/static/css/theme.css?v=20251015c">
+    <link rel="stylesheet" href="/static/css/components.css?v=20251015c">
+    <link rel="stylesheet" href="/static/css/utilities.css?v=20251015c">
+    <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-sans-500.woff2" crossorigin>
+    <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-mono-500.woff2" crossorigin>
+    <!-- UI skins: exactly one of the two links below is active, chosen by
+         js/ui-boot.js from localStorage `ui` (v1 = Classic default, v2 = Console).
+         Deliberately NO rel=preload for the disabled v2 sheet: v1-default users
+         shouldn't pay ~90KB for a skin they never enable; v2 users take one
+         slower cold-cache first paint instead (the enabled sheet still blocks
+         render, so there is no unstyled flash).
+         To adopt v2 permanently: keep only ui-v2.css, delete redesign.css +
+         ui-boot.js + the Interface switcher in the profile dropdown. -->
+    <link rel="stylesheet" href="/static/css/redesign.css?v=20260703a" id="skin-v1">
+    <link rel="stylesheet" href="/static/css/ui-v2.css?v=20260703a" id="skin-v2" disabled>
+    <script src="/static/js/ui-boot.js?v=20260703a"></script>
+    <!-- Branding boot: applies effective /branding (name, logo, favicon, theme colours)
+         to the shell, pre-paint after the skin boot. See static/js/brand.js. -->
+    <script src="/static/js/brand.js?v=20260703a"></script>
+    <meta name="theme-color" content="#0a0f18">
+</head>
+<body>
+    <!-- Icon sprite (Lucide-style, stroke=currentColor). Reference via <svg class="icon"><use href="#i-..."/></svg> -->
+    <svg class="svg-sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+        <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></symbol>
+        <symbol id="i-vault" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="11" cy="12" r="3.5"/><path d="M11 12h.01"/><path d="m13.5 9.5 1.5-1.5"/><path d="M7 20v1"/><path d="M17 20v1"/></symbol>
+        <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></symbol>
+        <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+        <symbol id="i-shield" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol>
+        <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+        <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+        <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></symbol>
+        <symbol id="i-login" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></symbol>
+        <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></symbol>
+        <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+        <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14M12 5v14"/></symbol>
+        <symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></symbol>
+        <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+        <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+        <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></symbol>
+        <symbol id="i-edit" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></symbol>
+        <symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></symbol>
+        <symbol id="i-file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v5h5"/></symbol>
+        <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.5 12.5 7-7"/><path d="m17.5 5.5 2 2"/><path d="m14.5 8.5 2 2"/></symbol>
+        <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+        <symbol id="i-hard-drive" viewBox="0 0 24 24"><line x1="22" y1="12" x2="2" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" y1="16" x2="6.01" y2="16"/><line x1="10" y1="16" x2="10.01" y2="16"/></symbol>
+        <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+        <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+        <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+        <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+        <symbol id="i-power" viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></symbol>
+        <symbol id="i-alert-triangle" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+        <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+        <symbol id="i-user" viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+        <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></symbol>
+        <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></symbol>
+        <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/></symbol>
+        <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+        <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></symbol>
+        <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+        <symbol id="i-file-text" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v5h5"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></symbol>
+        <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></symbol>
+        <symbol id="i-film" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></symbol>
+        <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></symbol>
+        <symbol id="i-archive" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></symbol>
+        <symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+        <symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+        <symbol id="i-chevron-right" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+        <symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+        <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+        <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></symbol>
+    </svg>
+
+    <!-- Login Screen -->
+    <div id="login-screen" class="screen active">
+        <div class="flex items-center justify-center" style="min-height: 100vh; background: linear-gradient(135deg, var(--brand-primary) 0%, var(--brand-secondary) 100%);">
+            <div class="card" style="max-width: 420px; width: 100%; margin: var(--space-lg);">
+                <div class="card-body text-center">
+                    <div class="flex items-center justify-center mb-md">
+                        <img src="/static/assets/logo-small.png" data-brand-logo alt="Logo" style="height: 48px; margin-right: var(--space-sm);">
+                        <h1 class="text-3xl font-bold" data-brand-name style="line-height:48px; margin:0;">DockVault</h1>
+                    </div>
+                    <p class="text-secondary mb-lg" data-brand-tagline>Secure File Transfer Platform</p>
+                    
+                    <form id="login-form">
+                        <div class="form-group">
+                            <label for="username">Username</label>
+                            <input type="text" id="username" name="username" class="form-control" required autocomplete="username">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="password">Password</label>
+                            <input type="password" id="password" name="password" class="form-control" required autocomplete="current-password">
+                        </div>
+                        
+                        <button type="submit" class="btn btn-primary btn-block"><svg class="icon"><use href="#i-login"/></svg> Sign in</button>
+                    </form>
+                    
+                    <div id="login-error" class="alert alert-error mt-md" style="display: none;"></div>
+
+                    <!-- Persistent product attribution. Visible by default so it survives even
+                         if JS/branding fails; brand.js updates the name/link and only hides it
+                         when a deploy sets BRAND_SHOW_POWERED_BY=false. NOT tenant-editable. -->
+                    <div id="powered-by" class="text-secondary" style="margin-top: var(--space-lg); font-size: 0.8em; opacity: 0.7;">
+                        powered by <a data-powered-by-link href="https://dockvault.io" target="_blank" rel="noopener noreferrer" style="color: inherit; font-weight: 600; text-decoration: none;"><span data-powered-by-name>DockVault</span></a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Dashboard Screen -->
+    <div id="dashboard-screen" class="screen">
+        <nav class="navbar">
+            <div class="navbar-brand">
+                <img src="/static/assets/logo-small.png" data-brand-logo alt="Logo" style="height: 32px; margin-right: var(--space-xs);">
+                <span data-brand-name>DockVault</span>
+            </div>
+            <div class="navbar-menu">
+                <button id="theme-toggle" class="theme-toggle mr-md" aria-label="Toggle theme">
+                    <span class="theme-toggle-slider">
+                        <span class="theme-toggle-icon"><svg class="icon icon-sm"><use href="#i-sun"/></svg></span>
+                    </span>
+                </button>
+                
+                <div class="profile-menu">
+                    <button id="profile-btn" class="profile-btn">
+                        <div class="profile-avatar" id="profile-avatar">AD</div>
+                    </button>
+                    <div id="profile-dropdown" class="profile-dropdown">
+                        <div class="profile-dropdown-header">
+                            <div class="profile-avatar-large" id="profile-avatar-large">AD</div>
+                            <div>
+                                <div class="profile-username" id="profile-username">admin</div>
+                                <div class="profile-role" id="profile-role">Administrator</div>
+                            </div>
+                        </div>
+                        <div class="profile-dropdown-divider"></div>
+                        <div class="accent-picker">
+                            <span class="accent-picker-label">Accent color</span>
+                            <div class="accent-swatches" role="group" aria-label="Accent color">
+                                <button type="button" class="accent-swatch" data-accent="teal" style="background:#0d9488" aria-label="Teal" title="Teal"></button>
+                                <button type="button" class="accent-swatch" data-accent="indigo" style="background:#4f46e5" aria-label="Indigo" title="Indigo"></button>
+                                <button type="button" class="accent-swatch" data-accent="violet" style="background:#7c3aed" aria-label="Violet" title="Violet"></button>
+                                <button type="button" class="accent-swatch" data-accent="rose" style="background:#e11d48" aria-label="Rose" title="Rose"></button>
+                                <button type="button" class="accent-swatch" data-accent="orange" style="background:#ea580c" aria-label="Orange" title="Orange"></button>
+                                <button type="button" class="accent-swatch" data-accent="sky" style="background:#0284c7" aria-label="Sky" title="Sky"></button>
+                            </div>
+                        </div>
+                        <div class="accent-picker">
+                            <span class="accent-picker-label">Background</span>
+                            <div class="accent-swatches" role="group" aria-label="Background color">
+                                <button type="button" class="bg-swatch" data-bg="slate" style="background:#64748b" aria-label="Slate" title="Slate"></button>
+                                <button type="button" class="bg-swatch" data-bg="graphite" style="background:#6b7280" aria-label="Graphite" title="Graphite"></button>
+                                <button type="button" class="bg-swatch" data-bg="navy" style="background:#1e3a8a" aria-label="Navy" title="Navy"></button>
+                                <button type="button" class="bg-swatch" data-bg="warm" style="background:#a89a82" aria-label="Warm" title="Warm"></button>
+                                <button type="button" class="bg-swatch" data-bg="forest" style="background:#4b7d5e" aria-label="Forest" title="Forest"></button>
+                                <button type="button" class="bg-swatch" data-bg="plum" style="background:#7e6a96" aria-label="Plum" title="Plum"></button>
+                            </div>
+                        </div>
+                        <div class="accent-picker ui-picker">
+                            <span class="accent-picker-label">Interface</span>
+                            <div class="ui-switch" role="group" aria-label="Interface style">
+                                <button type="button" class="ui-choice" data-ui-choice="v1" title="Classic — the original interface">Classic</button>
+                                <button type="button" class="ui-choice" data-ui-choice="v2" title="Console — the new enterprise interface">Console</button>
+                            </div>
+                        </div>
+                        <div class="profile-dropdown-divider"></div>
+                        <button class="profile-dropdown-item" id="encryption-key-btn">
+                            <svg class="icon"><use href="#i-key"/></svg>
+                            <span>Encryption key</span>
+                        </button>
+                        <button class="profile-dropdown-item" id="settings-btn">
+                            <svg class="icon"><use href="#i-settings"/></svg>
+                            <span>Settings</span>
+                        </button>
+                        <button class="profile-dropdown-item" id="dropdown-logout-btn">
+                            <svg class="icon"><use href="#i-logout"/></svg>
+                            <span>Logout</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </nav>
+
+        <!-- Main Layout with Sidebar -->
+        <div class="app-layout">
+            <!-- Sidebar -->
+            <aside class="sidebar" id="sidebar">
+                <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle sidebar">
+                    <span class="sidebar-toggle-icon">☰</span>
+                </button>
+                
+                <nav class="sidebar-nav">
+                    <a href="#" class="sidebar-item active" data-section="dashboard">
+                        <span class="sidebar-icon"><svg class="icon"><use href="#i-dashboard"/></svg></span>
+                        <span class="sidebar-text">Dashboard</span>
+                    </a>
+                    <a href="#" class="sidebar-item" data-section="vaults">
+                        <span class="sidebar-icon"><svg class="icon"><use href="#i-vault"/></svg></span>
+                        <span class="sidebar-text">Vaults</span>
+                    </a>
+                    <a href="#" class="sidebar-item" data-section="temp-creds">
+                        <span class="sidebar-icon"><svg class="icon"><use href="#i-clock"/></svg></span>
+                        <span class="sidebar-text">Temp Credentials</span>
+                    </a>
+                    <a href="#" class="sidebar-item admin-only" data-section="users" style="display: none;">
+                        <span class="sidebar-icon"><svg class="icon"><use href="#i-users"/></svg></span>
+                        <span class="sidebar-text">Users</span>
+                    </a>
+                    <a href="#" class="sidebar-item admin-only" data-section="groups" style="display: none;">
+                        <span class="sidebar-icon"><svg class="icon"><use href="#i-shield"/></svg></span>
+                        <span class="sidebar-text">Groups</span>
+                    </a>
+                    <a href="#" class="sidebar-item" data-section="monitor">
+                        <span class="sidebar-icon"><svg class="icon"><use href="#i-activity"/></svg></span>
+                        <span class="sidebar-text">Live Monitor</span>
+                    </a>
+                    <a href="#" class="sidebar-item admin-only" data-section="settings" style="display: none;">
+                        <span class="sidebar-icon"><svg class="icon"><use href="#i-settings"/></svg></span>
+                        <span class="sidebar-text">Settings</span>
+                    </a>
+                </nav>
+            </aside>
+
+            <!-- Toast Notification Container -->
+            <div id="toast-container" class="toast-container"></div>
+
+            <!-- Main Content Area -->
+            <main class="main-content">
+                <!-- Dashboard Section -->
+                <div id="dashboard-section" class="content-section active">
+                    <h1 class="text-3xl font-bold mb-lg">Dashboard</h1>
+                    <p class="text-secondary mb-lg" data-brand-template="Overview of your {name} system">Overview of your system</p>
+                    
+                    <!-- Stats Grid -->
+                    <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: var(--space-md); margin-bottom: var(--space-xl);">
+                        <div class="card stat-card">
+                            <div class="card-body">
+                                <div class="flex items-center gap-md">
+                                    <div class="stat-tile"><svg class="icon"><use href="#i-vault"/></svg></div>
+                                    <div>
+                                        <div class="stat-label">Total Vaults</div>
+                                        <div class="stat-value" id="dashboard-vaults-count">-</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card stat-card">
+                            <div class="card-body">
+                                <div class="flex items-center gap-md">
+                                    <div class="stat-tile is-success"><svg class="icon"><use href="#i-users"/></svg></div>
+                                    <div>
+                                        <div class="stat-label">Active Users</div>
+                                        <div class="stat-value" id="dashboard-users-count">-</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card stat-card">
+                            <div class="card-body">
+                                <div class="flex items-center gap-md">
+                                    <div class="stat-tile is-info"><svg class="icon"><use href="#i-hard-drive"/></svg></div>
+                                    <div>
+                                        <div class="stat-label">Storage Used</div>
+                                        <div class="stat-value" id="dashboard-storage">-</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card stat-card">
+                            <div class="card-body">
+                                <div class="flex items-center gap-md">
+                                    <div class="stat-tile is-warning"><svg class="icon"><use href="#i-clock"/></svg></div>
+                                    <div>
+                                        <div class="stat-label">Active Temp Creds</div>
+                                        <div class="stat-value" id="dashboard-temp-creds-count">-</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Recent Events and System Status -->
+                    <div class="grid" style="grid-template-columns: 2fr 1fr; gap: var(--space-md);">
+                        <!-- Recent Events -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h3 class="text-xl font-bold"><svg class="icon"><use href="#i-activity"/></svg> Recent Events</h3>
+                            </div>
+                            <div class="card-body" style="max-height: 400px; overflow-y: auto;">
+                                <div id="events-feed" class="events-list">
+                                    <div class="empty-state text-center p-lg">
+                                        <p class="text-secondary">No recent events</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- System Status -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h3 class="text-xl font-bold"><svg class="icon"><use href="#i-shield"/></svg> System Status</h3>
+                            </div>
+                            <div class="card-body">
+                                <div class="status-list">
+                                    <div class="flex justify-between items-center mb-md">
+                                        <span class="font-medium">Database</span>
+                                        <span class="badge badge-secondary" id="status-db">—</span>
+                                    </div>
+                                    <div class="flex justify-between items-center mb-md">
+                                        <span class="font-medium">Cache (Redis)</span>
+                                        <span class="badge badge-secondary" id="status-sftp">—</span>
+                                    </div>
+                                    <div class="flex justify-between items-center">
+                                        <span class="font-medium">API</span>
+                                        <span class="badge badge-secondary" id="status-sessions">—</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Vaults Section -->
+                <div id="vaults-section" class="content-section">
+                    <div class="flex justify-between items-center mb-lg">
+                        <h2 class="text-2xl font-bold">My Vaults</h2>
+                        <div class="flex items-center gap-sm">
+                            <div class="seg-filter" role="group" aria-label="Filter vaults">
+                                <button id="vault-filter-all" class="seg-btn active" type="button">All</button>
+                                <button id="vault-filter-fav" class="seg-btn" type="button"><svg class="icon icon-sm"><use href="#i-star"/></svg> Favorites</button>
+                            </div>
+                            <div class="seg-filter" role="group" aria-label="Vault view">
+                                <button id="vaults-view-grid" class="seg-btn active" type="button" data-vaults-view="grid" title="Grid view" aria-label="Grid view"><svg class="icon icon-sm"><use href="#i-grid"/></svg></button>
+                                <button id="vaults-view-list" class="seg-btn" type="button" data-vaults-view="list" title="List view" aria-label="List view"><svg class="icon icon-sm"><use href="#i-list"/></svg></button>
+                            </div>
+                            <button id="create-vault-btn" class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg> Create Vault</button>
+                        </div>
+                    </div>
+
+                    <div id="vaults-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: var(--space-md);"></div>
+                </div>
+
+                <!-- Individual Vault View (Hidden by default) -->
+                <div id="vault-view-section" class="content-section">
+                    <!-- Compact vault header: back + title + lock, all inline -->
+                    <div class="vault-view-head">
+                        <button id="close-vault-btn" class="btn btn-ghost btn-sm vault-back" title="Back to vaults">← Back</button>
+                        <h1 class="vault-view-title" id="vault-view-title">Vault Name</h1>
+                        <span id="vault-view-lock-icon" class="vault-lock"></span>
+                        <span class="vault-view-desc" id="vault-view-description"></span>
+                    </div>
+
+                    <!-- Primary tab navigation -->
+                    <div class="tabs vault-tabs">
+                        <button class="tab-btn active" data-vault-tab="files"><svg class="icon icon-sm"><use href="#i-folder"/></svg> Files</button>
+                        <button class="tab-btn" data-vault-tab="info"><svg class="icon icon-sm"><use href="#i-info"/></svg> Info</button>
+                        <button class="tab-btn" data-vault-tab="permissions"><svg class="icon icon-sm"><use href="#i-users"/></svg> Permissions</button>
+                        <button class="tab-btn" data-vault-tab="settings"><svg class="icon icon-sm"><use href="#i-settings"/></svg> Settings</button>
+                    </div>
+
+                    <!-- Files Tab -->
+                    <div id="vault-files-tab" class="vault-tab-content active">
+                        <!-- Toolbar: breadcrumb + view switch + per-folder actions -->
+                        <div class="files-toolbar mb-md">
+                            <div id="vault-breadcrumb" class="breadcrumb">
+                                <span class="breadcrumb-item active" data-path="">Root</span>
+                            </div>
+                            <div class="files-toolbar-actions">
+                                <div class="seg-filter" role="group" aria-label="File view">
+                                    <button id="files-view-table" class="seg-btn active" type="button" data-files-view="table" title="Table view" aria-label="Table view"><svg class="icon icon-sm"><use href="#i-list"/></svg> Table</button>
+                                    <button id="files-view-grid" class="seg-btn" type="button" data-files-view="grid" title="Grid view" aria-label="Grid view"><svg class="icon icon-sm"><use href="#i-grid"/></svg> Grid</button>
+                                </div>
+                                <input type="file" id="file-upload-input" multiple style="display: none;">
+                                <button id="upload-file-btn" class="btn btn-primary btn-sm"><svg class="icon icon-sm"><use href="#i-upload"/></svg> Upload File</button>
+                                <button id="create-folder-btn" class="btn btn-secondary btn-sm"><svg class="icon icon-sm"><use href="#i-folder"/></svg> New Folder</button>
+                            </div>
+                        </div>
+
+                        <!-- Bulk action bar (shown when files are selected) -->
+                        <div id="files-bulk-bar" class="bulk-bar" hidden>
+                            <span class="bulk-bar-count"><strong id="files-bulk-count">0</strong> selected</span>
+                            <div class="bulk-bar-actions">
+                                <button id="files-bulk-download" class="btn btn-sm btn-secondary" type="button"><svg class="icon icon-sm"><use href="#i-download"/></svg> Download</button>
+                                <button id="files-bulk-delete" class="btn btn-sm btn-danger" type="button"><svg class="icon icon-sm"><use href="#i-trash"/></svg> Delete</button>
+                                <button id="files-bulk-clear" class="btn btn-sm btn-ghost" type="button">Clear</button>
+                            </div>
+                        </div>
+
+                        <!-- File Table view -->
+                        <div id="vault-files-table-wrap" class="card">
+                            <div class="card-body" style="padding: 0;">
+                                <div style="overflow-x: auto;">
+                                    <table class="data-table files-table">
+                                        <thead>
+                                            <tr>
+                                                <th class="col-check"><input type="checkbox" id="files-select-all" class="files-check" aria-label="Select all files"></th>
+                                                <th>Name</th>
+                                                <th class="col-num">Size</th>
+                                                <th>Type</th>
+                                                <th>Modified</th>
+                                                <th class="col-actions">Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="vault-files-table-body">
+                                            <tr>
+                                                <td colspan="6" class="text-center p-lg">Loading files...</td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- File Grid view -->
+                        <div id="vault-files-grid" class="files-grid" hidden></div>
+
+                        <!-- Drag & Drop Zone (Hidden by default, shown on drag) -->
+                        <div id="drop-zone" class="drop-zone" style="display: none;">
+                            <div class="drop-zone-content">
+                                <p style="font-size: 48px; margin: 0;"><svg class="icon icon-lg"><use href="#i-upload"/></svg></p>
+                                <p style="font-size: 18px; margin: 8px 0;">Drop files here to upload</p>
+                                <p style="color: var(--text-secondary);">or click "Upload File" button</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Info Tab -->
+                    <div id="vault-info-tab" class="vault-tab-content">
+                        <!-- Compact stat strip -->
+                        <div class="info-stat-strip mb-lg">
+                            <div class="info-stat">
+                                <span class="info-stat-icon"><svg class="icon"><use href="#i-folder"/></svg></span>
+                                <span class="info-stat-text">
+                                    <span class="info-stat-val" id="info-file-count">0</span>
+                                    <span class="info-stat-label">Total Files</span>
+                                </span>
+                            </div>
+                            <div class="info-stat">
+                                <span class="info-stat-icon"><svg class="icon"><use href="#i-hard-drive"/></svg></span>
+                                <span class="info-stat-text">
+                                    <span class="info-stat-val" id="info-total-size">0 B</span>
+                                    <span class="info-stat-label">Storage Used</span>
+                                </span>
+                            </div>
+                            <div class="info-stat">
+                                <span class="info-stat-icon"><svg class="icon"><use href="#i-user"/></svg></span>
+                                <span class="info-stat-text">
+                                    <span class="info-stat-val" id="info-vault-owner">-</span>
+                                    <span class="info-stat-label">Owner</span>
+                                </span>
+                            </div>
+                            <div class="info-stat">
+                                <span class="info-stat-icon"><svg class="icon"><use href="#i-calendar"/></svg></span>
+                                <span class="info-stat-text">
+                                    <span class="info-stat-val" id="info-vault-created-ago">-</span>
+                                    <span class="info-stat-label">Created</span>
+                                </span>
+                            </div>
+                        </div>
+
+                        <!-- Details Grid -->
+                        <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: var(--space-md);">
+                            <!-- Vault Details -->
+                            <div class="card">
+                                <div class="card-header">
+                                    <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-copy"/></svg> Vault Details</h3>
+                                </div>
+                                <div class="card-body">
+                                    <div class="mb-md">
+                                        <div class="text-sm text-secondary mb-xs">Name</div>
+                                        <div class="font-medium" id="info-vault-name">-</div>
+                                    </div>
+                                    <div class="mb-md">
+                                        <div class="text-sm text-secondary mb-xs">Description</div>
+                                        <div class="text-secondary" id="info-vault-description">-</div>
+                                    </div>
+                                    <div>
+                                        <div class="text-sm text-secondary mb-xs">Created Date</div>
+                                        <div id="info-vault-created">-</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Storage Usage -->
+                            <div class="card">
+                                <div class="card-header">
+                                    <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-hard-drive"/></svg> Storage Usage</h3>
+                                </div>
+                                <div class="card-body">
+                                    <div class="mb-md">
+                                        <div class="flex justify-between mb-xs">
+                                            <span class="text-sm text-secondary">Used</span>
+                                            <span class="font-bold" id="info-storage-text">0 B</span>
+                                        </div>
+                                        <div class="progress-bar">
+                                            <div class="progress-bar-fill" id="info-storage-bar-fill" style="width: 0%;"></div>
+                                        </div>
+                                    </div>
+                                    <div class="alert alert-info" style="font-size: 0.875rem;">
+                                        <span>💡</span>
+                                        <span>Storage updates in real-time</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Security Settings -->
+                            <div class="card">
+                                <div class="card-header">
+                                    <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-shield"/></svg> Security</h3>
+                                </div>
+                                <div class="card-body">
+                                    <div class="mb-md">
+                                        <div class="text-sm text-secondary mb-xs">Access Control</div>
+                                        <div id="info-has-password">-</div>
+                                    </div>
+                                    <div>
+                                        <div class="text-sm text-secondary mb-xs">File Retention</div>
+                                        <div id="info-file-expiration">-</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Permissions Tab -->
+                    <div id="vault-permissions-tab" class="vault-tab-content">
+                        <div class="mb-md">
+                            <h2 class="text-xl font-bold">Vault Access Control</h2>
+                            <p class="text-secondary">Whitelist departments and individual users. Everyone else is denied.</p>
+                        </div>
+
+                        <!-- Department (group) access -->
+                        <div class="card mb-md">
+                            <div class="card-header">
+                                <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-users"/></svg> Department access</h3>
+                            </div>
+                            <div class="card-body" id="vault-group-access-list"></div>
+                        </div>
+
+                        <!-- Individual user access -->
+                        <div class="flex justify-between items-center mb-sm">
+                            <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-user"/></svg> Individual users</h3>
+                            <button id="add-permission-btn" class="btn btn-sm btn-primary"><svg class="icon icon-sm"><use href="#i-plus"/></svg> Grant access</button>
+                        </div>
+                        <div class="card">
+                            <div class="card-body" style="padding: 0;">
+                                <div style="overflow-x: auto;">
+                                    <table class="data-table">
+                                        <thead>
+                                            <tr>
+                                                <th>User</th>
+                                                <th>Email</th>
+                                                <th>Permission Level</th>
+                                                <th>Granted</th>
+                                                <th>Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="permissions-table-body">
+                                            <tr>
+                                                <td colspan="5" class="text-center p-lg">Loading permissions...</td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Settings Tab -->
+                    <div id="vault-settings-tab" class="vault-tab-content">
+                        <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: var(--space-md);">
+                            <!-- Vault Information -->
+                            <div class="card">
+                                <div class="card-header">
+                                    <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-activity"/></svg> Vault Information</h3>
+                                </div>
+                                <div class="card-body">
+                                    <div class="mb-sm">
+                                        <span class="text-sm text-secondary">Name:</span>
+                                        <span class="ml-sm font-medium" id="settings-vault-name">-</span>
+                                    </div>
+                                    <div class="mb-sm">
+                                        <span class="text-sm text-secondary">Description:</span>
+                                        <span class="ml-sm" id="settings-vault-description">-</span>
+                                    </div>
+                                    <div class="mb-md">
+                                        <span class="text-sm text-secondary">Created:</span>
+                                        <span class="ml-sm" id="settings-vault-created">-</span>
+                                    </div>
+                                    <button id="edit-vault-info-btn" class="btn btn-secondary btn-block">
+                                        <svg class="icon"><use href="#i-edit"/></svg> Edit Information
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Security -->
+                            <div class="card">
+                                <div class="card-header">
+                                    <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-lock"/></svg> Security</h3>
+                                </div>
+                                <div class="card-body">
+                                    <div class="mb-sm">
+                                        <span class="text-sm text-secondary">Password Protected:</span>
+                                        <span class="ml-sm" id="settings-has-password">-</span>
+                                    </div>
+                                    <div class="mb-md">
+                                        <span class="text-sm text-secondary">File Expiry:</span>
+                                        <span class="ml-sm" id="settings-file-expiry">-</span>
+                                    </div>
+                                    <div class="flex gap-sm">
+                                        <button id="change-vault-password-btn" class="btn btn-secondary" style="flex: 1;">
+                                            <svg class="icon"><use href="#i-key"/></svg> Change Password
+                                        </button>
+                                        <button id="set-expiry-btn" class="btn btn-secondary" style="flex: 1;">
+                                            <svg class="icon"><use href="#i-clock"/></svg> Set Expiry
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Danger Zone -->
+                            <div class="card" style="border-color: var(--error);">
+                                <div class="card-header" style="background: var(--error); color: white;">
+                                    <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-alert-triangle"/></svg> Danger Zone</h3>
+                                </div>
+                                <div class="card-body">
+                                    <p class="text-secondary mb-md" style="font-size: 0.875rem;">
+                                        Destructive actions that cannot be undone
+                                    </p>
+                                    <button id="delete-vault-from-settings-btn" class="btn btn-danger btn-block">
+                                        <svg class="icon"><use href="#i-trash"/></svg> Delete Vault
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Temp Credentials Section -->
+                <div id="temp-creds-section" class="content-section">
+                    <div class="flex justify-between items-center mb-lg">
+                        <h2 class="text-2xl font-bold">Temporary Access Credentials</h2>
+                        <button id="generate-temp-creds-btn" class="btn btn-primary"><svg class="icon"><use href="#i-key"/></svg> Generate Credentials</button>
+                    </div>
+
+                    <div class="toolbar mb-md">
+                        <select id="tc-status-filter" class="form-control toolbar-select" aria-label="Filter credentials">
+                            <option value="all">All statuses</option>
+                            <option value="active" selected>Active</option>
+                            <option value="expired">Expired</option>
+                            <option value="used">Used</option>
+                            <option value="deactivated">Deactivated</option>
+                        </select>
+                        <div class="menu-wrap">
+                            <button id="tc-cleanup-btn" type="button" class="btn btn-secondary btn-sm"><svg class="icon icon-sm"><use href="#i-trash"/></svg> Clean up <svg class="icon icon-sm chevron"><use href="#i-chevron-right"/></svg></button>
+                            <div id="tc-cleanup-menu" class="dropdown-menu" hidden>
+                                <button type="button" data-clean="expired">Delete expired</button>
+                                <button type="button" data-clean="used">Delete used</button>
+                                <button type="button" data-clean="both">Delete expired &amp; used</button>
+                            </div>
+                        </div>
+                        <button id="tc-invalidate-btn" type="button" class="btn btn-warning btn-sm"><svg class="icon icon-sm"><use href="#i-ban"/></svg> Invalidate all active</button>
+                        <span id="tc-count" class="toolbar-count"></span>
+                    </div>
+
+                    <div id="active-temp-creds"></div>
+                </div>
+
+                <!-- Users Section -->
+                <div id="users-section" class="content-section">
+                    <div class="flex justify-between items-center mb-lg">
+                        <h2 class="text-2xl font-bold">User Management</h2>
+                        <button id="create-user-btn" class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg> Create User</button>
+                    </div>
+
+                    <div class="toolbar mb-md">
+                        <div class="toolbar-search">
+                            <svg class="icon icon-sm"><use href="#i-search"/></svg>
+                            <input type="text" id="users-search" placeholder="Search username or email…" autocomplete="off">
+                        </div>
+                        <select id="users-role-filter" class="form-control toolbar-select" aria-label="Filter by role">
+                            <option value="all">All roles</option>
+                            <option value="admin">Admin</option>
+                            <option value="user">User</option>
+                            <option value="external">External</option>
+                        </select>
+                        <select id="users-group-filter" class="form-control toolbar-select" aria-label="Filter by department">
+                            <option value="all">All departments</option>
+                        </select>
+                        <select id="users-status-filter" class="form-control toolbar-select" aria-label="Filter by status">
+                            <option value="all">All statuses</option>
+                            <option value="active">Active</option>
+                            <option value="inactive">Inactive</option>
+                            <option value="locked">Locked</option>
+                        </select>
+                        <span id="users-count" class="toolbar-count"></span>
+                    </div>
+
+                    <div id="users-list"></div>
+                </div>
+
+                <!-- Groups & Roles Section -->
+                <div id="groups-section" class="content-section">
+                    <div class="flex justify-between items-center mb-lg">
+                        <div>
+                            <h2 class="text-2xl font-bold"><svg class="icon"><use href="#i-users"/></svg> Groups &amp; Roles</h2>
+                            <p class="text-secondary">Organize people into departments and review role distribution</p>
+                        </div>
+                        <button id="create-group-btn" class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg> New Group</button>
+                    </div>
+
+                    <!-- Departments workspace: tree + detail -->
+                    <div class="groups-layout">
+                        <aside class="card groups-tree-card">
+                            <div class="card-header"><h3 class="text-lg font-bold">Departments</h3></div>
+                            <div class="card-body">
+                                <div id="groups-tree" class="groups-tree">
+                                    <div class="loading-spinner mx-auto my-md"></div>
+                                </div>
+                            </div>
+                        </aside>
+                        <section class="card groups-detail-card">
+                            <div class="card-body" id="group-detail">
+                                <div class="empty-state text-center p-xl text-secondary">
+                                    <div style="font-size:3rem;"><svg class="icon icon-lg"><use href="#i-users"/></svg></div>
+                                    <p class="mt-sm">Select a department to manage its members, or create a new one.</p>
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+                </div>
+
+                <!-- Live Monitor Section -->
+                <div id="monitor-section" class="content-section">
+                    <div class="flex justify-between items-center mb-lg">
+                        <div>
+                            <h2 class="text-2xl font-bold"><svg class="icon"><use href="#i-activity"/></svg> Live Monitor</h2>
+                            <p class="text-secondary">Real-time system activity and analytics</p>
+                        </div>
+                        <div id="monitor-connection-status" class="flex items-center gap-md">
+                            <div class="flex items-center gap-sm">
+                                <div id="monitor-status-dot" class="status-dot" style="width: 12px; height: 12px; border-radius: 50%; background: #888;"></div>
+                                <span id="monitor-status-text" class="text-sm">Connecting...</span>
+                            </div>
+                            <button id="monitor-reconnect-btn" class="btn btn-sm btn-secondary" style="display: none;">Reconnect</button>
+                        </div>
+                    </div>
+
+                    <!-- Metrics Cards -->
+                    <div class="grid grid-cols-3 gap-lg mb-xl">
+                        <div class="card">
+                            <div class="flex items-center gap-md">
+                                <div class="monitor-metric-icon mm-accent">
+                                    <svg class="icon"><use href="#i-users"/></svg>
+                                </div>
+                                <div class="flex-1">
+                                    <p class="text-sm text-secondary mb-xs">Active Users</p>
+                                    <p class="text-2xl font-bold" id="monitor-active-users">0</p>
+                                    <p class="text-xs text-secondary">Real-time</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card">
+                            <div class="flex items-center gap-md">
+                                <div class="monitor-metric-icon mm-info">
+                                    <svg class="icon"><use href="#i-activity"/></svg>
+                                </div>
+                                <div class="flex-1">
+                                    <p class="text-sm text-secondary mb-xs">Events/Min</p>
+                                    <p class="text-2xl font-bold" id="monitor-events-rate">0</p>
+                                    <p class="text-xs text-secondary" id="monitor-total-events">0 total</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card">
+                            <div class="flex items-center gap-md">
+                                <div class="monitor-metric-icon mm-success">
+                                    <svg class="icon"><use href="#i-power"/></svg>
+                                </div>
+                                <div class="flex-1">
+                                    <p class="text-sm text-secondary mb-xs">Active Sessions</p>
+                                    <p class="text-2xl font-bold" id="monitor-active-sessions">0</p>
+                                    <p class="text-xs text-secondary" id="monitor-session-info">No activity</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Event Filters -->
+                    <div class="card mb-lg">
+                        <div class="card-header">
+                            <h3>Event Filters</h3>
+                        </div>
+                        <div class="flex gap-md p-lg flex-wrap">
+                            <button class="btn btn-sm btn-secondary event-filter-btn active" data-type="all">All Events</button>
+                            <button class="btn btn-sm btn-secondary event-filter-btn" data-type="login"><svg class="icon icon-sm"><use href="#i-login"/></svg> Logins</button>
+                            <button class="btn btn-sm btn-secondary event-filter-btn" data-type="upload"><svg class="icon icon-sm"><use href="#i-upload"/></svg> Uploads</button>
+                            <button class="btn btn-sm btn-secondary event-filter-btn" data-type="download"><svg class="icon icon-sm"><use href="#i-download"/></svg> Downloads</button>
+                            <button class="btn btn-sm btn-secondary event-filter-btn" data-type="vault_access"><svg class="icon icon-sm"><use href="#i-unlock"/></svg> Vault Access</button>
+                            <button class="btn btn-sm btn-secondary event-filter-btn" data-type="temp_cred"><svg class="icon icon-sm"><use href="#i-clock"/></svg> Temp Credentials</button>
+                            <button class="btn btn-sm btn-secondary event-filter-btn" data-type="error"><svg class="icon icon-sm"><use href="#i-alert-triangle"/></svg> Errors</button>
+                            <button id="monitor-clear-events" class="btn btn-sm btn-outline ml-auto">Clear Events</button>
+                        </div>
+                    </div>
+
+                    <!-- Live Event Stream -->
+                    <div class="card">
+                        <div class="card-header flex justify-between items-center">
+                            <h3>Live Event Stream</h3>
+                            <span class="badge badge-primary" id="monitor-event-count">0 events</span>
+                        </div>
+                        <div id="monitor-events-list" class="monitor-events-container" style="max-height: 600px; overflow-y: auto;">
+                            <div class="text-center py-xl text-secondary">
+                                <div style="font-size: 3rem; margin-bottom: 1rem;"><svg class="icon icon-lg"><use href="#i-activity"/></svg></div>
+                                <p class="font-semibold mb-xs">Waiting for events...</p>
+                                <p class="text-sm">Real-time events will appear here</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Settings Section -->
+                <div id="settings-section" class="content-section">
+                    <div class="flex justify-between items-center mb-lg">
+                        <div>
+                            <h2 class="text-2xl font-bold"><svg class="icon"><use href="#i-settings"/></svg> System Settings</h2>
+                            <p class="text-secondary">Configure system preferences and policies (Admin Only)</p>
+                        </div>
+                        <button id="save-all-settings-btn" class="btn btn-primary"><svg class="icon"><use href="#i-save"/></svg> Save All Changes</button>
+                    </div>
+
+                    <!-- Settings Tabs -->
+                    <div class="tabs mb-lg">
+                        <button class="tab-btn active" data-tab="general">General</button>
+                        <button class="tab-btn" data-tab="branding">Branding</button>
+                        <button class="tab-btn" data-tab="security">Security</button>
+                        <button class="tab-btn" data-tab="storage">Storage</button>
+                        <button class="tab-btn" data-tab="email">Email</button>
+                        <button class="tab-btn" data-tab="sftp">SFTP &amp; Encryption</button>
+                        <button class="tab-btn" data-tab="audit">Audit Log</button>
+                    </div>
+
+                    <!-- General Settings Tab -->
+                    <div id="settings-tab-general" class="settings-tab-content active">
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>General Configuration</h3>
+                            </div>
+                            <div class="p-lg">
+                                <div class="form-group">
+                                    <label for="setting-app-name">Application Name</label>
+                                    <input type="text" id="setting-app-name" class="form-control" placeholder="e.g. Secure Vault">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-app-description">Application Description</label>
+                                    <textarea id="setting-app-description" class="form-control" rows="3" placeholder="Secure file transfer and storage platform"></textarea>
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-max-file-size">Max File Upload Size (MB)</label>
+                                    <input type="number" id="setting-max-file-size" class="form-control" placeholder="100" min="1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-allowed-types">Allowed File Types (comma-separated)</label>
+                                    <input type="text" id="setting-allowed-types" class="form-control" placeholder="pdf,docx,xlsx,zip,png,jpg">
+                                    <small class="text-secondary">Leave empty to allow all file types</small>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Branding Settings Tab (A3: white-label — edits drive /branding + the shell live) -->
+                    <div id="settings-tab-branding" class="settings-tab-content">
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>Brand Identity</h3>
+                            </div>
+                            <div class="p-lg">
+                                <p class="text-secondary mb-md">Customize how this instance is named and presented. Changes apply live — no restart. Leave a field blank to fall back to the built-in default. The application name lives on the General tab.</p>
+                                <div class="form-group">
+                                    <label for="setting-brand-full-name">Full Product Name</label>
+                                    <input type="text" id="setting-brand-full-name" class="form-control" maxlength="150" placeholder="e.g. Secure File Transfer Platform">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-brand-tagline">Tagline</label>
+                                    <input type="text" id="setting-brand-tagline" class="form-control" maxlength="200" placeholder="A short marketing tagline">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-brand-company-name">Company Name</label>
+                                    <input type="text" id="setting-brand-company-name" class="form-control" maxlength="120" placeholder="e.g. My Company Inc.">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-brand-support-email">Support Email</label>
+                                    <input type="email" id="setting-brand-support-email" class="form-control" maxlength="254" placeholder="support@example.com">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-brand-copyright-holder">Copyright Holder</label>
+                                    <input type="text" id="setting-brand-copyright-holder" class="form-control" maxlength="120" placeholder="e.g. My Company Inc.">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header">
+                                <h3>Links</h3>
+                            </div>
+                            <div class="p-lg">
+                                <div class="form-group">
+                                    <label for="setting-brand-company-url">Company URL</label>
+                                    <input type="url" id="setting-brand-company-url" class="form-control" maxlength="500" placeholder="https://example.com">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-brand-website-url">Website URL</label>
+                                    <input type="url" id="setting-brand-website-url" class="form-control" maxlength="500" placeholder="https://example.com">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-brand-docs-url">Documentation URL</label>
+                                    <input type="url" id="setting-brand-docs-url" class="form-control" maxlength="500" placeholder="https://example.com/docs">
+                                </div>
+                                <small class="text-secondary">Only <code>https://</code>, <code>http://</code>, or a site-relative <code>/path</code> is accepted.</small>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header">
+                                <h3>Theme Colors</h3>
+                            </div>
+                            <div class="p-lg">
+                                <p class="text-secondary mb-md">Hex colors (<code>#2563eb</code> or <code>#25f</code>) applied to the interface theme. Blank keeps the default.</p>
+                                <div class="grid grid-cols-2 gap-md">
+                                    <div class="form-group">
+                                        <label for="setting-brand-primary-color">Primary</label>
+                                        <div class="flex items-center gap-sm">
+                                            <input type="color" id="setting-brand-primary-color-pick" class="brand-color-pick" aria-label="Primary color picker">
+                                            <input type="text" id="setting-brand-primary-color" class="form-control" placeholder="#2563eb">
+                                        </div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-brand-secondary-color">Secondary</label>
+                                        <div class="flex items-center gap-sm">
+                                            <input type="color" id="setting-brand-secondary-color-pick" class="brand-color-pick" aria-label="Secondary color picker">
+                                            <input type="text" id="setting-brand-secondary-color" class="form-control" placeholder="#7c3aed">
+                                        </div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-brand-accent-color">Accent</label>
+                                        <div class="flex items-center gap-sm">
+                                            <input type="color" id="setting-brand-accent-color-pick" class="brand-color-pick" aria-label="Accent color picker">
+                                            <input type="text" id="setting-brand-accent-color" class="form-control" placeholder="#10b981">
+                                        </div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-brand-success-color">Success</label>
+                                        <div class="flex items-center gap-sm">
+                                            <input type="color" id="setting-brand-success-color-pick" class="brand-color-pick" aria-label="Success color picker">
+                                            <input type="text" id="setting-brand-success-color" class="form-control" placeholder="#10b981">
+                                        </div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-brand-warning-color">Warning</label>
+                                        <div class="flex items-center gap-sm">
+                                            <input type="color" id="setting-brand-warning-color-pick" class="brand-color-pick" aria-label="Warning color picker">
+                                            <input type="text" id="setting-brand-warning-color" class="form-control" placeholder="#f59e0b">
+                                        </div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-brand-error-color">Error</label>
+                                        <div class="flex items-center gap-sm">
+                                            <input type="color" id="setting-brand-error-color-pick" class="brand-color-pick" aria-label="Error color picker">
+                                            <input type="text" id="setting-brand-error-color" class="form-control" placeholder="#ef4444">
+                                        </div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-brand-text-color">Text</label>
+                                        <div class="flex items-center gap-sm">
+                                            <input type="color" id="setting-brand-text-color-pick" class="brand-color-pick" aria-label="Text color picker">
+                                            <input type="text" id="setting-brand-text-color" class="form-control" placeholder="#1f2937">
+                                        </div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-brand-background-color">Background</label>
+                                        <div class="flex items-center gap-sm">
+                                            <input type="color" id="setting-brand-background-color-pick" class="brand-color-pick" aria-label="Background color picker">
+                                            <input type="text" id="setting-brand-background-color" class="form-control" placeholder="#ffffff">
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header">
+                                <h3>Logo &amp; Favicon</h3>
+                            </div>
+                            <div class="p-lg">
+                                <p class="text-secondary mb-md">Upload a logo and favicon (PNG, JPG, WebP, GIF, ICO or SVG, up to 2&nbsp;MB). Uploaded assets are stored on the server and survive restarts. Reset restores the built-in default.</p>
+                                <div class="form-group">
+                                    <label>Logo</label>
+                                    <div class="flex items-center gap-md flex-wrap">
+                                        <img id="brand-logo-preview" alt="Logo preview" style="height:48px;max-width:180px;object-fit:contain;background:var(--surface-1);border-radius:6px;padding:4px;">
+                                        <input type="file" id="brand-logo-file" accept="image/png,image/jpeg,image/gif,image/webp,image/x-icon,image/svg+xml">
+                                        <button type="button" id="brand-logo-upload" class="btn btn-secondary">Upload</button>
+                                        <button type="button" id="brand-logo-reset" class="btn btn-secondary">Reset</button>
+                                    </div>
+                                    <small class="text-secondary" id="brand-logo-status"></small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Favicon</label>
+                                    <div class="flex items-center gap-md flex-wrap">
+                                        <img id="brand-favicon-preview" alt="Favicon preview" style="height:32px;width:32px;object-fit:contain;background:var(--surface-1);border-radius:6px;padding:2px;">
+                                        <input type="file" id="brand-favicon-file" accept="image/png,image/x-icon,image/svg+xml,image/gif,image/webp">
+                                        <button type="button" id="brand-favicon-upload" class="btn btn-secondary">Upload</button>
+                                        <button type="button" id="brand-favicon-reset" class="btn btn-secondary">Reset</button>
+                                    </div>
+                                    <small class="text-secondary" id="brand-favicon-status"></small>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Security Settings Tab -->
+                    <div id="settings-tab-security" class="settings-tab-content">
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>Security & Authentication</h3>
+                            </div>
+                            <div class="p-lg">
+                                <div class="form-group">
+                                    <label for="setting-password-min-length">Minimum Password Length</label>
+                                    <input type="number" id="setting-password-min-length" class="form-control" placeholder="12" min="8" max="128">
+                                </div>
+                                <div class="form-group">
+                                    <label>Password Requirements</label>
+                                    <div class="flex flex-col gap-sm">
+                                        <label class="flex items-center gap-sm">
+                                            <input type="checkbox" id="setting-require-uppercase">
+                                            <span>Require uppercase letters (A-Z)</span>
+                                        </label>
+                                        <label class="flex items-center gap-sm">
+                                            <input type="checkbox" id="setting-require-lowercase">
+                                            <span>Require lowercase letters (a-z)</span>
+                                        </label>
+                                        <label class="flex items-center gap-sm">
+                                            <input type="checkbox" id="setting-require-numbers">
+                                            <span>Require numbers (0-9)</span>
+                                        </label>
+                                        <label class="flex items-center gap-sm">
+                                            <input type="checkbox" id="setting-require-special">
+                                            <span>Require special characters (!@#$%^&*)</span>
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-session-timeout">Session Timeout (minutes)</label>
+                                    <input type="number" id="setting-session-timeout" class="form-control" placeholder="60" min="5" max="1440">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-max-login-attempts">Max Login Attempts</label>
+                                    <input type="number" id="setting-max-login-attempts" class="form-control" placeholder="5" min="3" max="10">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-lockout-duration">Account Lockout Duration (minutes)</label>
+                                    <input type="number" id="setting-lockout-duration" class="form-control" placeholder="30" min="5" max="1440">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Storage Settings Tab -->
+                    <div id="settings-tab-storage" class="settings-tab-content">
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>Storage Configuration</h3>
+                            </div>
+                            <div class="p-lg">
+                                <div class="form-group">
+                                    <label for="setting-default-quota">Default User Storage Quota (GB)</label>
+                                    <input type="number" id="setting-default-quota" class="form-control" placeholder="10" min="1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-max-vault-size">Max Vault Size (GB)</label>
+                                    <input type="number" id="setting-max-vault-size" class="form-control" placeholder="100" min="1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-storage-path">Storage Path (Read-Only)</label>
+                                    <input type="text" id="setting-storage-path" class="form-control" readonly placeholder="/data/uploads">
+                                    <small class="text-secondary">Storage path is configured in the server configuration</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Storage Statistics</label>
+                                    <div class="grid grid-cols-3 gap-md">
+                                        <div class="p-md" style="background: var(--surface-1); border-radius: 8px;">
+                                            <p class="text-sm text-secondary mb-xs">Total Storage</p>
+                                            <p class="text-xl font-bold" id="storage-stat-total">-</p>
+                                        </div>
+                                        <div class="p-md" style="background: var(--surface-1); border-radius: 8px;">
+                                            <p class="text-sm text-secondary mb-xs">Used Storage</p>
+                                            <p class="text-xl font-bold" id="storage-stat-used">-</p>
+                                        </div>
+                                        <div class="p-md" style="background: var(--surface-1); border-radius: 8px;">
+                                            <p class="text-sm text-secondary mb-xs">Available</p>
+                                            <p class="text-xl font-bold" id="storage-stat-available">-</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Email Settings Tab -->
+                    <div id="settings-tab-email" class="settings-tab-content">
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>Email Configuration</h3>
+                            </div>
+                            <div class="p-lg">
+                                <div class="form-group">
+                                    <label for="setting-smtp-server">SMTP Server</label>
+                                    <input type="text" id="setting-smtp-server" class="form-control" placeholder="smtp.gmail.com">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-smtp-port">SMTP Port</label>
+                                    <input type="number" id="setting-smtp-port" class="form-control" placeholder="587" min="1" max="65535">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-smtp-username">SMTP Username</label>
+                                    <input type="text" id="setting-smtp-username" class="form-control" placeholder="user@example.com">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-smtp-password">SMTP Password</label>
+                                    <input type="password" id="setting-smtp-password" class="form-control" placeholder="••••••••">
+                                    <small class="text-secondary">Leave empty to keep existing password</small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-from-email">From Email Address</label>
+                                    <input type="email" id="setting-from-email" class="form-control" placeholder="noreply@example.com">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-from-name">From Name</label>
+                                    <input type="text" id="setting-from-name" class="form-control" placeholder="e.g. Secure Vault">
+                                </div>
+                                <div class="form-group">
+                                    <button id="test-email-btn" class="btn btn-secondary">📧 Send Test Email</button>
+                                    <span id="test-email-result" class="ml-md text-sm"></span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- SFTP & Encryption Settings Tab -->
+                    <div id="settings-tab-sftp" class="settings-tab-content">
+                        <div class="card mb-lg">
+                            <div class="card-header">
+                                <h3>SFTP Authentication Policy</h3>
+                            </div>
+                            <div class="p-lg">
+                                <div class="form-group">
+                                    <label>Require a temporary credential for SFTP</label>
+                                    <p class="text-secondary text-sm mb-sm">Members of the selected departments may only authenticate to SFTP with a temporary credential — direct password and SSH-key auth are refused. This is per-department by design, so SSH-key automation in other departments keeps working.</p>
+                                    <div id="sftp-temp-cred-group-picker"></div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>Zero-Knowledge Vaults</h3>
+                            </div>
+                            <div class="p-lg">
+                                <label class="flex items-center gap-sm">
+                                    <input type="checkbox" id="setting-zero-knowledge-enabled">
+                                    <span>Allow creating zero-knowledge vaults</span>
+                                </label>
+                                <p class="text-secondary text-sm mt-sm">When enabled, users can create vaults whose contents are encrypted in the browser — the server stores only opaque ciphertext and can never read them. Zero-knowledge vaults are web-only (they are not exposed over SFTP). Leave this off until the browser-crypto vault UI is in use.</p>
+
+                                <div class="mt-lg">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="setting-force-zero-knowledge">
+                                        <span>Require zero-knowledge for all new vaults</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">When enabled (and zero-knowledge is allowed above), new vaults must be zero-knowledge — except for members of the exempt departments below, who may still create standard vaults.</p>
+                                </div>
+                                <div class="form-group mt-md">
+                                    <label>Departments exempt from the requirement</label>
+                                    <div id="standard-vault-allowed-group-picker"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Audit Log Tab -->
+                    <div id="settings-tab-audit" class="settings-tab-content">
+                        <div class="card mb-lg">
+                            <div class="card-header">
+                                <h3>Audit Log Filters</h3>
+                            </div>
+                            <div class="p-lg">
+                                <div class="grid grid-cols-4 gap-md">
+                                    <div class="form-group">
+                                        <label for="audit-filter-user">User</label>
+                                        <select id="audit-filter-user" class="form-control">
+                                            <option value="">All Users</option>
+                                        </select>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="audit-filter-action">Action</label>
+                                        <select id="audit-filter-action" class="form-control">
+                                            <option value="">All Actions</option>
+                                            <option value="login">Login</option>
+                                            <option value="logout">Logout</option>
+                                            <option value="upload">Upload</option>
+                                            <option value="download">Download</option>
+                                            <option value="delete">Delete</option>
+                                            <option value="vault_created">Vault Created</option>
+                                            <option value="user_created">User Created</option>
+                                        </select>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="audit-filter-from">From Date</label>
+                                        <input type="date" id="audit-filter-from" class="form-control">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="audit-filter-to">To Date</label>
+                                        <input type="date" id="audit-filter-to" class="form-control">
+                                    </div>
+                                </div>
+                                <div class="flex gap-md">
+                                    <button id="audit-search-btn" class="btn btn-primary"><svg class="icon"><use href="#i-search"/></svg> Search</button>
+                                    <button id="audit-export-btn" class="btn btn-secondary"><svg class="icon"><use href="#i-download"/></svg> Export CSV</button>
+                                    <button id="audit-clear-filters-btn" class="btn btn-outline">Clear Filters</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card">
+                            <div class="card-header flex justify-between items-center">
+                                <h3>Audit Log Entries</h3>
+                                <span class="badge badge-primary" id="audit-count">0 entries</span>
+                            </div>
+                            <div class="data-table-wrapper">
+                                <table class="data-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Timestamp</th>
+                                            <th>User</th>
+                                            <th>Action</th>
+                                            <th>Status</th>
+                                            <th>IP Address</th>
+                                            <th>Details</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="audit-log-body">
+                                        <tr>
+                                            <td colspan="6" class="text-center py-xl text-secondary">
+                                                Click "Search" to load audit log entries
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+
+        <div>
+            <!-- Active modals: create vault, create user, edit user, change user password.
+                 NOTE: do NOT wrap these in display:none — each .modal is hidden by default
+                 and shown via the .active class; a hidden ancestor would make them unreachable. -->
+                <div id="create-vault-modal" class="modal">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3>Create New Vault</h3>
+                            <button class="close-modal-btn modal-close" aria-label="Close">×</button>
+                        </div>
+                        <form id="create-vault-form">
+                            <div class="modal-body">
+                                <div class="form-group">
+                                    <label for="vault-name">Vault Name</label>
+                                    <input type="text" id="vault-name" class="form-control" required>
+                                </div>
+                                <div class="form-group">
+                                    <label for="vault-desc">Description</label>
+                                    <textarea id="vault-desc" class="form-control" rows="3"></textarea>
+                                </div>
+                                <div class="form-group">
+                                    <label for="vault-password">Vault Password <span class="text-tertiary">(optional)</span></label>
+                                    <input type="password" id="vault-password" class="form-control" minlength="8" autocomplete="new-password">
+                                    <small class="form-help">Leave empty for no password. If set (min 8 characters), it adds a web access prompt before files can be viewed — it is <strong>not encryption</strong> and does not restrict SFTP. For confidentiality the server itself cannot read, use a Zero-Knowledge vault.</small>
+                                </div>
+                                <div class="form-group" id="vault-type-group" style="display:none;">
+                                    <label for="vault-type">Vault Type</label>
+                                    <select id="vault-type" class="form-control">
+                                        <option value="standard">Standard (server-encrypted)</option>
+                                        <option value="zero_knowledge">Zero-knowledge (encrypted in your browser)</option>
+                                    </select>
+                                    <small class="form-help">Zero-knowledge vaults are encrypted client-side with your passphrase — the server can never read them. Web-only (not available over SFTP).</small>
+                                    <label class="checkbox-label" style="margin-top:8px; display:block;">
+                                        <input type="checkbox" id="vault-hierarchical"> Team mode (hierarchical key)
+                                    </label>
+                                    <small class="form-help">For large teams: the vault key is wrapped once to a shared team key, so adding members and routine key rotation stay fast (O(1)). Removing a member still rotates the team key. Zero-knowledge — the server never sees the key.</small>
+                                </div>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="close-modal-btn btn btn-secondary">Cancel</button>
+                                <button type="submit" class="btn btn-primary">Create Vault</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Encryption Key Modal (per-user zero-knowledge keypair) -->
+                <div id="encryption-key-modal" class="modal">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3>Encryption key</h3>
+                            <button class="close-modal-btn modal-close" aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <p class="text-secondary text-sm" style="margin-top:0;">
+                                Your personal encryption key lets you create zero-knowledge vaults and be
+                                granted access to them — their files are encrypted in your browser, so the
+                                server can never read them. This is a one-time setup.
+                            </p>
+                            <div id="encryption-key-status" class="mb-md"></div>
+                            <p class="form-help" id="encryption-key-hint" style="display:none;">
+                                Pick a passphrase you won't forget — it protects your key and
+                                <strong>cannot be recovered</strong> if lost.
+                            </p>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="close-modal-btn btn btn-secondary">Close</button>
+                            <button type="button" id="encryption-key-setup-btn" class="btn btn-primary">Set up encryption key</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Generate Temporary Credentials Modal -->
+                <div id="generate-temp-creds-modal" class="modal">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3>Generate Temporary Credentials</h3>
+                            <button class="close-modal-btn modal-close" aria-label="Close">×</button>
+                        </div>
+                        <form id="generate-temp-creds-form">
+                            <div class="modal-body">
+                                <p class="text-secondary mb-md">
+                                    Issue one-time SFTP credentials. Choose how long they stay valid before they are deactivated.
+                                </p>
+                                <div class="form-group">
+                                    <label for="temp-cred-validity-minutes">Valid for (minutes)</label>
+                                    <input type="number" id="temp-cred-validity-minutes" class="form-control" min="1" max="43200" step="1" value="65">
+                                    <small class="form-help">How long the credential can be used before it deactivates. Default: 65 minutes (max 30 days).</small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="temp-cred-end-datetime">Or pick an end date &amp; time (optional)</label>
+                                    <input type="datetime-local" id="temp-cred-end-datetime" class="form-control">
+                                    <small class="form-help">If set, this overrides the minutes above — the credential expires at the chosen time.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="temp-cred-note">Note <span class="text-tertiary">(optional)</span></label>
+                                    <textarea id="temp-cred-note" class="form-control" rows="2" maxlength="500" placeholder="Why is this credential being issued? e.g. Vendor X — Q3 audit files"></textarea>
+                                    <small class="form-help">Recorded with the credential so its purpose is clear later.</small>
+                                </div>
+                                <div class="form-group" id="tc-legacy-cancreate-group">
+                                    <label class="checkbox-row">
+                                        <input type="checkbox" id="temp-cred-can-create">
+                                        <span>Allow this credential to create temporary credentials</span>
+                                    </label>
+                                    <small class="form-help">Off by default — leave unchecked so the holder can't mint and hand out further accounts.</small>
+                                </div>
+
+                                <div class="form-group">
+                                    <label class="checkbox-row">
+                                        <input type="checkbox" id="tc-scope-enable">
+                                        <span>Limit what this credential can access (least privilege)</span>
+                                    </label>
+                                    <small class="form-help">Off = full access of your account. On = choose exactly which pages, actions and vaults.</small>
+                                </div>
+
+                                <div id="tc-scope-builder" hidden>
+                                    <div class="scope-section">
+                                        <div class="scope-section-title">Pages</div>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-page" value="dashboard" checked><span>Dashboard</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-page" value="vaults" checked><span>Vaults</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-page" value="temp_creds" id="tc-page-tempcreds"><span>Temp Credentials</span></label>
+                                    </div>
+
+                                    <div class="scope-section" id="tc-temp-perms" hidden>
+                                        <div class="scope-section-title">Temp-credentials actions</div>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-temp" value="view" checked><span>View temp credentials</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-temp" value="create" id="tc-temp-create"><span>Create temp credentials</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-temp" value="invalidate"><span>Invalidate (only ones it created)</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-temp" value="clear"><span>Delete/clear (only ones it created)</span></label>
+                                        <label class="checkbox-row" id="tc-temp-delegate-row" hidden><input type="checkbox" class="tc-temp" value="delegate"><span>Allow created creds to create temp creds</span></label>
+                                    </div>
+
+                                    <div class="scope-section" id="tc-vault-scope">
+                                        <div class="scope-section-title">Vault access</div>
+                                        <label class="radio-row"><input type="radio" name="tc-vault-mode" value="all"><span>All my vaults</span></label>
+                                        <label class="radio-row"><input type="radio" name="tc-vault-mode" value="selected" checked><span>Selected vaults only</span></label>
+                                        <div id="tc-vault-select">
+                                            <div class="toolbar-search mt-sm mb-sm">
+                                                <svg class="icon icon-sm"><use href="#i-search"/></svg>
+                                                <input type="text" id="tc-vault-search" placeholder="Search vaults…" autocomplete="off">
+                                            </div>
+                                            <div id="tc-vault-list" class="member-pick-list"></div>
+                                        </div>
+                                    </div>
+
+                                    <div class="scope-section" id="tc-vault-caps">
+                                        <div class="scope-section-title">What can they do in those vaults?</div>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.see_info" checked><span>See vault info</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.see_files" checked><span>See files</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="file.download" checked><span>Download files</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="file.upload"><span>Upload files</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="folder.create"><span>Create folders</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="folder.delete"><span>Delete folders</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="file.rename"><span>Rename files</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="file.delete"><span>Delete files</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.see_permissions"><span>See permissions</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.change_permissions"><span>Change permissions</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.change_info"><span>Change vault info</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.change_password"><span>Change vault password</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.change_expiry"><span>Change expiry / policies</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.delete"><span>Delete vault</span></label>
+                                    </div>
+
+                                    <div class="scope-section">
+                                        <div class="scope-section-title">Other</div>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-global-cap" value="vault.create"><span>Create new vaults</span></label>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="close-modal-btn btn btn-secondary">Cancel</button>
+                                <button type="submit" class="btn btn-primary">Generate</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Create User Modal -->
+                <div id="create-user-modal" class="modal">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3>Create New User</h3>
+                            <button class="close-modal-btn modal-close" aria-label="Close">×</button>
+                        </div>
+                        <form id="create-user-form">
+                            <div class="modal-body">
+                                <div class="form-group">
+                                    <label for="new-username">Username</label>
+                                    <input type="text" id="new-username" class="form-control" required>
+                                </div>
+                                <div class="form-group">
+                                    <label for="new-email">Email</label>
+                                    <input type="email" id="new-email" class="form-control" required>
+                                </div>
+                                <div class="form-group">
+                                    <label for="new-password">Password</label>
+                                    <input type="password" id="new-password" class="form-control" required minlength="12">
+                                    <small class="form-help">Minimum 12 characters</small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="new-role">Role</label>
+                                    <select id="new-role" class="form-control" required>
+                                        <option value="user">User</option>
+                                        <option value="external">External</option>
+                                        <option value="admin">Admin</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="close-modal-btn btn btn-secondary">Cancel</button>
+                                <button type="submit" class="btn btn-primary">Create User</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Edit User Modal -->
+                <div id="edit-user-modal" class="modal">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3>Edit User</h3>
+                            <button class="close-modal-btn modal-close" aria-label="Close">×</button>
+                        </div>
+                        <form id="edit-user-form">
+                            <div class="modal-body">
+                                <input type="hidden" id="edit-user-id">
+                                <div class="form-group">
+                                    <label for="edit-user-username">Username</label>
+                                    <input type="text" id="edit-user-username" class="form-control" required readonly>
+                                </div>
+                                <div class="form-group">
+                                    <label for="edit-user-email">Email</label>
+                                    <input type="email" id="edit-user-email" class="form-control" required>
+                                </div>
+                                <div class="form-group">
+                                    <label for="edit-user-role">Role</label>
+                                    <select id="edit-user-role" class="form-control" required>
+                                        <option value="user">User</option>
+                                        <option value="external">External</option>
+                                        <option value="admin">Admin</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label>
+                                        <input type="checkbox" id="edit-user-active">
+                                        Active
+                                    </label>
+                                </div>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="close-modal-btn btn btn-secondary">Cancel</button>
+                                <button type="submit" class="btn btn-primary">Save Changes</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Change Password Modal -->
+                <div id="change-password-modal" class="modal">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3>Change User Password</h3>
+                            <button class="close-modal-btn modal-close" aria-label="Close">×</button>
+                        </div>
+                        <form id="change-password-form">
+                            <div class="modal-body">
+                                <input type="hidden" id="change-password-user-id">
+                                <div class="form-group">
+                                    <label for="change-password-new">New Password</label>
+                                    <input type="password" id="change-password-new" class="form-control" required minlength="12">
+                                    <small class="form-help">Minimum 12 characters</small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="change-password-confirm">Confirm Password</label>
+                                    <input type="password" id="change-password-confirm" class="form-control" required minlength="12">
+                                </div>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="close-modal-btn btn btn-secondary">Cancel</button>
+                                <button type="submit" class="btn btn-primary">Change Password</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Edit Vault Info Modal -->
+            <div id="edit-vault-info-modal" class="modal">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3><svg class="icon"><use href="#i-edit"/></svg> Edit Vault Information</h3>
+                        <button class="close-modal-btn" data-modal="edit-vault-info-modal">×</button>
+                    </div>
+                    <div class="modal-body">
+                        <form id="edit-vault-info-form">
+                            <div class="form-group">
+                                <label for="edit-vault-name">Vault Name *</label>
+                                <input type="text" id="edit-vault-name" class="form-control" required minlength="1" maxlength="255">
+                            </div>
+                            <div class="form-group">
+                                <label for="edit-vault-description">Description</label>
+                                <textarea id="edit-vault-description" class="form-control" rows="3"></textarea>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="btn btn-secondary close-modal-btn" data-modal="edit-vault-info-modal">Cancel</button>
+                                <button type="submit" class="btn btn-primary"><svg class="icon"><use href="#i-save"/></svg> Save Changes</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Change Vault Password Modal -->
+            <div id="change-vault-password-modal" class="modal">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3><svg class="icon"><use href="#i-key"/></svg> Change Vault Password</h3>
+                        <button class="close-modal-btn" data-modal="change-vault-password-modal">×</button>
+                    </div>
+                    <div class="modal-body">
+                        <form id="change-vault-password-form">
+                            <div class="form-group">
+                                <label for="current-vault-password">Current Password</label>
+                                <input type="password" id="current-vault-password" class="form-control" 
+                                       placeholder="Leave empty if vault has no password">
+                            </div>
+                            <div class="form-group">
+                                <label for="new-vault-password">New Password</label>
+                                <input type="password" id="new-vault-password" class="form-control" 
+                                       placeholder="Leave empty to remove password">
+                            </div>
+                            <div class="form-group">
+                                <label for="confirm-new-vault-password">Confirm New Password</label>
+                                <input type="password" id="confirm-new-vault-password" class="form-control" 
+                                       placeholder="Confirm new password">
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="btn btn-secondary close-modal-btn" data-modal="change-vault-password-modal">Cancel</button>
+                                <button type="submit" class="btn btn-primary"><svg class="icon"><use href="#i-key"/></svg> Change Password</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Set File Expiry Modal -->
+            <div id="set-expiry-modal" class="modal">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3><svg class="icon"><use href="#i-clock"/></svg> Vault policies</h3>
+                        <button class="close-modal-btn modal-close" data-modal="set-expiry-modal" aria-label="Close">×</button>
+                    </div>
+                    <div class="modal-body">
+                        <form id="set-expiry-form">
+                            <div class="form-group">
+                                <label for="expire-files-value">Expire files after</label>
+                                <div style="display: flex; gap: 8px;">
+                                    <input type="number" id="expire-files-value" class="form-control" min="0" step="1"
+                                           placeholder="0 = never" style="flex: 1;">
+                                    <select id="expire-files-unit" class="form-control" style="flex: 0 0 120px;">
+                                        <option value="minutes">Minutes</option>
+                                        <option value="hours">Hours</option>
+                                        <option value="days" selected>Days</option>
+                                    </select>
+                                </div>
+                                <small class="text-secondary">Files older than this will be automatically deleted. Set to 0 to disable expiration.</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="unlock-remember-minutes">Remember unlock for (minutes)</label>
+                                <input type="number" id="unlock-remember-minutes" class="form-control" min="0" max="1440" step="1" placeholder="15 (default)">
+                                <small class="text-secondary">How long this device keeps the vault unlocked before asking for the password again. <strong>0 = always ask</strong> (best for sensitive vaults). Leave blank for the 15-minute default.</small>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="btn btn-secondary close-modal-btn" data-modal="set-expiry-modal">Cancel</button>
+                                <button type="submit" class="btn btn-primary"><svg class="icon"><use href="#i-clock"/></svg> Save policies</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Add Permission Modal -->
+            <div id="add-permission-modal" class="modal">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3><svg class="icon"><use href="#i-users"/></svg> Add User Permission</h3>
+                        <button class="close-modal-btn" data-modal="add-permission-modal">×</button>
+                    </div>
+                    <div class="modal-body">
+                        <form id="add-permission-form">
+                            <div class="form-group">
+                                <label for="permission-user-select">Select User *</label>
+                                <select id="permission-user-select" class="form-control" required>
+                                    <option value="">-- Select a user --</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="permission-level-select">Permission Level *</label>
+                                <select id="permission-level-select" class="form-control" required>
+                                    <option value="read">Read Only - Can view and download files</option>
+                                    <option value="write">Write - Can upload and download files</option>
+                                    <option value="admin">Admin - Full control of vault</option>
+                                </select>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="btn btn-secondary close-modal-btn" data-modal="add-permission-modal">Cancel</button>
+                                <button type="submit" class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg> Add Permission</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Create / Edit Group Modal -->
+            <div id="group-modal" class="modal">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3 id="group-modal-title"><svg class="icon"><use href="#i-users"/></svg> New Group</h3>
+                        <button class="close-modal-btn modal-close" aria-label="Close">×</button>
+                    </div>
+                    <form id="group-form">
+                        <div class="modal-body">
+                            <input type="hidden" id="group-id">
+                            <input type="hidden" id="group-color" value="">
+                            <div class="form-group">
+                                <label for="group-name">Name *</label>
+                                <input type="text" id="group-name" class="form-control" required maxlength="120" placeholder="e.g. Engineering">
+                            </div>
+                            <div class="form-group">
+                                <label for="group-desc">Description</label>
+                                <textarea id="group-desc" class="form-control" rows="2"></textarea>
+                            </div>
+                            <div class="form-group">
+                                <label for="group-parent">Parent department</label>
+                                <select id="group-parent" class="form-control">
+                                    <option value="">— None (top level) —</option>
+                                </select>
+                                <small class="form-help">Nest this group under another to build a hierarchy.</small>
+                            </div>
+                            <div class="form-group">
+                                <label>Color tag</label>
+                                <div class="accent-swatches" id="group-color-swatches">
+                                    <button type="button" class="accent-swatch" data-color="" style="background:var(--surface-4)" title="None" aria-label="No color"></button>
+                                    <button type="button" class="accent-swatch" data-color="teal" style="background:#0d9488" title="Teal"></button>
+                                    <button type="button" class="accent-swatch" data-color="indigo" style="background:#4f46e5" title="Indigo"></button>
+                                    <button type="button" class="accent-swatch" data-color="violet" style="background:#7c3aed" title="Violet"></button>
+                                    <button type="button" class="accent-swatch" data-color="rose" style="background:#e11d48" title="Rose"></button>
+                                    <button type="button" class="accent-swatch" data-color="orange" style="background:#ea580c" title="Orange"></button>
+                                    <button type="button" class="accent-swatch" data-color="sky" style="background:#0284c7" title="Sky"></button>
+                                    <button type="button" class="accent-swatch" data-color="emerald" style="background:#059669" title="Emerald"></button>
+                                    <button type="button" class="accent-swatch" data-color="amber" style="background:#d97706" title="Amber"></button>
+                                    <input type="color" id="group-color-custom" class="color-custom" value="#0d9488" title="Custom colour" aria-label="Custom colour">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="close-modal-btn btn btn-secondary">Cancel</button>
+                            <button type="submit" class="btn btn-primary" id="group-save-btn">Create Group</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Add Members Modal (searchable, multi-select) -->
+            <div id="add-members-modal" class="modal">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3><svg class="icon"><use href="#i-users"/></svg> Add members</h3>
+                        <button class="close-modal-btn modal-close" aria-label="Close">×</button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="toolbar-search mb-md">
+                            <svg class="icon icon-sm"><use href="#i-search"/></svg>
+                            <input type="text" id="add-members-search" placeholder="Search users…" autocomplete="off">
+                        </div>
+                        <div id="add-members-list" class="member-pick-list"></div>
+                    </div>
+                    <div class="modal-footer">
+                        <span id="add-members-count" class="text-tertiary text-sm mr-auto"></span>
+                        <button type="button" class="close-modal-btn btn btn-secondary">Cancel</button>
+                        <button type="button" id="add-members-confirm" class="btn btn-primary" disabled>Add selected</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Grant Vault Access Modal (searchable, multi-select) -->
+            <div id="vault-grant-modal" class="modal">
+                <div class="modal-content" style="max-width: 640px;">
+                    <div class="modal-header">
+                        <h3><svg class="icon"><use href="#i-user"/></svg> Grant vault access</h3>
+                        <button class="close-modal-btn modal-close" aria-label="Close">×</button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="grant-toolbar">
+                            <div class="toolbar-search">
+                                <svg class="icon icon-sm"><use href="#i-search"/></svg>
+                                <input type="text" id="vault-grant-search" placeholder="Search users…" autocomplete="off">
+                            </div>
+                            <select id="vault-grant-group-filter" class="form-control toolbar-select" aria-label="Filter by department">
+                                <option value="all">All departments</option>
+                            </select>
+                            <select id="vault-grant-level" class="form-control toolbar-select" aria-label="Access level">
+                                <option value="read">Read only</option>
+                                <option value="write">Read &amp; write</option>
+                                <!-- "Manager" is owner/admin-only; shown/hidden in openVaultGrantModal. -->
+                                <option value="manage" data-manager-only="1" hidden>Manager (full access + sharing)</option>
+                            </select>
+                        </div>
+                        <div id="vault-grant-list" class="member-pick-list"></div>
+                    </div>
+                    <div class="modal-footer">
+                        <span id="vault-grant-count" class="text-tertiary text-sm mr-auto"></span>
+                        <button type="button" class="close-modal-btn btn btn-secondary">Cancel</button>
+                        <button type="button" id="vault-grant-confirm" class="btn btn-primary" disabled>Grant access</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- File Preview Modal -->
+            <div id="file-preview-modal" class="modal">
+                <div class="modal-content" style="max-width: 900px; width: 92%;">
+                    <div class="modal-header">
+                        <h3 id="file-preview-title" class="mono" style="font-size: var(--text-base); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">Preview</h3>
+                        <div class="flex items-center gap-sm">
+                            <button id="file-preview-download" class="btn btn-sm btn-secondary"><svg class="icon icon-sm"><use href="#i-download"/></svg> Download</button>
+                            <button class="close-modal-btn modal-close" aria-label="Close">×</button>
+                        </div>
+                    </div>
+                    <div class="modal-body" id="file-preview-body"></div>
+                </div>
+            </div>
+
+            <!-- User Permissions Modal (admin) -->
+            <div id="user-permissions-modal" class="modal">
+                <div class="modal-content" style="max-width: 580px;">
+                    <div class="modal-header">
+                        <h3 id="user-permissions-title"><svg class="icon"><use href="#i-shield"/></svg> Permissions</h3>
+                        <button class="close-modal-btn modal-close" aria-label="Close">×</button>
+                    </div>
+                    <div class="modal-body" id="user-permissions-body"></div>
+                    <div class="modal-footer">
+                        <button class="close-modal-btn btn btn-primary">Done</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Upload Filename Conflict Modal -->
+            <div id="upload-conflict-modal" class="modal">
+                <div class="modal-content" style="max-width: 480px;">
+                    <div class="modal-header">
+                        <h3><svg class="icon"><use href="#i-alert-triangle"/></svg> File already exists</h3>
+                        <button class="close-modal-btn modal-close" id="uc-close" aria-label="Close">×</button>
+                    </div>
+                    <div class="modal-body">
+                        <p class="mb-md">A file named <strong id="uc-name" class="mono"></strong> already exists in this folder.</p>
+                        <div class="form-group">
+                            <label class="radio-row"><input type="radio" name="uc-action" value="autorename" checked><span>Keep both — save as <span id="uc-auto" class="mono"></span></span></label>
+                            <label class="radio-row"><input type="radio" name="uc-action" value="overwrite"><span>Replace the existing file</span></label>
+                            <label class="radio-row"><input type="radio" name="uc-action" value="rename"><span>Rename to:</span></label>
+                            <input type="text" id="uc-rename" class="form-control mt-xs" disabled>
+                        </div>
+                        <label class="checkbox-row"><input type="checkbox" id="uc-applyall"><span>Apply to all remaining conflicts</span></label>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" id="uc-skip">Skip this file</button>
+                        <button type="button" class="btn btn-primary" id="uc-confirm">Upload</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Confirmation Modal -->
+            <div id="confirm-modal" class="modal">
+                <div class="modal-content" style="max-width: 500px;">
+                    <div class="modal-header">
+                        <h3 id="confirm-modal-title">Confirm Action</h3>
+                        <button class="close-modal-btn modal-close" id="confirm-modal-close-btn" aria-label="Close">×</button>
+                    </div>
+                    <div class="modal-body">
+                        <p id="confirm-modal-message">Are you sure you want to proceed?</p>
+                        <input type="text" id="confirm-modal-input" class="form-control" style="display: none;" placeholder="Type to confirm">
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" id="confirm-modal-cancel-btn">Cancel</button>
+                        <button type="button" id="confirm-modal-confirm-btn" class="btn btn-primary">Confirm</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/theme.js?v=20260703a"></script>
+    <script src="/static/js/ui-v2.js?v=20260703a"></script>
+    <script src="/static/js/ecc_crypto.js?v=20260617a"></script>
+    <script src="/static/js/app.js?v=20260617a"></script>
+</body>
+</html>
+
