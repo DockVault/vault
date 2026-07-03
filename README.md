@@ -21,15 +21,36 @@ Licensed under **AGPL-3.0** — self-host it freely.
 - **Single standalone image** — needs only its bundled PostgreSQL + Redis; no external
   services required.
 
-## Quick start
+## Quick start — production (HTTPS)
+
+On a Linux host with Docker, one script sets up everything for production:
 
 ```bash
-cp .env.example .env      # fill in the secrets — generate strong keys
-docker compose up -d      # web/API on http://localhost:8200, SFTP on localhost:2322
+sudo ./setup-secure.sh
 ```
 
-Open <http://localhost:8200> and complete the first-run setup wizard to create your admin
+It is interactive and idempotent: it collects your domain and TLS choice (Let's Encrypt,
+self-signed, or bring-your-own certificate), writes `.env` with freshly generated secrets,
+provisions the certificates, and starts the HTTPS-only stack — the web UI/API on port **443**
+(TLS terminated in-container, no plaintext listener) plus optional SFTP. Re-run it any time to
+rebuild; it **reuses your existing `.env`** and keeps your data.
+
+Then open `https://<your-domain>` and complete the first-run setup wizard to create your admin
 account. No license key, no activation.
+
+> Re-running after changing `VAULT_DB_PASSWORD` (or starting fresh by removing `.env`) requires
+> resetting the database volume, or Postgres keeps the old password:
+> `docker compose -f docker-compose.secure.yml down -v` then re-run the script. This destroys
+> stored data, so only do it before you have real vaults.
+
+### Local trial (HTTP, no TLS)
+
+For a quick test on your machine without certificates:
+
+```bash
+cp .env.example .env      # fill in the secrets
+docker compose up -d      # web/API on http://localhost:8200
+```
 
 ## Security model
 
@@ -48,17 +69,6 @@ account. No license key, no activation.
 
 Every setting lives in `.env`. Copy `.env.example`, which documents each key — database,
 Redis, encryption/JWT secrets, SFTP, rate limits, SMTP, and more.
-
-## Development
-
-Application source is baked into the image, so rebuild after code changes:
-
-```bash
-docker compose build && docker compose up -d
-```
-
-An integration test suite (pytest + Playwright, run on the host against the live container)
-lives in `tests/` — see `tests/README.md`.
 
 ## License
 
