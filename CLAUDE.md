@@ -21,6 +21,9 @@ ships inside the built image (`Dockerfile` does `COPY . .`, filtered only by
   untracked; `.env.example` is the only template.
 - All web assets are self-hosted under `static/` — no CDN references
   (`tests/test_static_selfhosted_assets.py` guards this).
+- **No AI attribution in commits (owner, 2026-07-04).** Never add
+  `Co-Authored-By: Claude`, "Generated with Claude Code", or any Claude/AI
+  co-author or generated-by trailer to commit messages or PR bodies.
 - `BRAND_*` env vars (see `app/config/branding.py`) are a public contract consumed
   by downstream provisioning — don't rename or remove them without a deprecation path.
 
