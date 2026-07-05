@@ -4294,6 +4294,13 @@ async def list_vault_files(
         # sealed ZK rows (plaintext only for not-yet-migrated legacy rows). Standard vaults
         # are unchanged: 'name' is the server-decrypted plaintext, no enc_* fields sent.
         is_zk = _is_zk_vault(vault)
+        # Read guard: the server must NEVER surface plaintext zero-knowledge metadata.
+        # A SEALED row decrypts in the browser from enc_name (its plaintext name is already
+        # NULL); a legacy/UNSEALED row (enc_name NULL but a plaintext name left over from
+        # before client-side sealing was enforced on the write paths) gets masked with a
+        # neutral placeholder so cleartext the ZK contract says we don't hold is never served.
+        from security import is_zk_sealed_name as _zk_sealed
+        _ZK_UNSEALED = "[encrypted - re-seal required]"
 
         # Add folders
         for folder in folders:
@@ -4308,6 +4315,9 @@ async def list_vault_files(
             if is_zk:
                 entry['enc_name'] = folder.enc_name
                 entry['name_key_version'] = folder.name_key_version or 1
+                # Sealed -> browser decrypts from enc_name (name already NULL); unsealed
+                # legacy -> mask the leftover plaintext instead of serving it.
+                entry['name'] = None if _zk_sealed(folder.enc_name) else _ZK_UNSEALED
             items.append(entry)
 
         # Add files
@@ -4329,6 +4339,10 @@ async def list_vault_files(
             if is_zk:
                 entry['enc_name'] = file.enc_name
                 entry['enc_mime'] = file.enc_mime
+                # Sealed -> browser decrypts from enc_name/enc_mime; unsealed legacy ->
+                # mask the leftover plaintext name + never serve a plaintext ZK mime.
+                entry['name'] = None if _zk_sealed(file.enc_name) else _ZK_UNSEALED
+                entry['mime_type'] = None
             items.append(entry)
         
         response_data = {'items': items}
