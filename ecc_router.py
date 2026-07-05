@@ -18,6 +18,8 @@ from models import User, Vault, UserKeyPair, VaultMemberKey, vault_members, Role
 from ecc_crypto_service import ECCCryptoService
 from audit_logger import AuditLogger
 from rate_limiter import rate_limiter as _rate_limiter
+from endpoint_permissions import require_endpoint_permission
+from temp_scope import require_vault_cap, enforce_vault
 from cryptography.hazmat.primitives import serialization
 from datetime import datetime, timezone, timedelta
 
@@ -563,6 +565,11 @@ async def get_vault_keys(
     if not vault:
         raise HTTPException(status_code=404, detail="Vault not found")
 
+    # Confine a scoped temp credential to its granted vaults — the SAME gate the standard
+    # read path applies (vault_service.get_vault -> enforce_vault). Without it a cred scoped
+    # to vault A could still read vault B's wrapped DEK here. No-op for normal principals.
+    enforce_vault(current_user, vault_id)
+
     # Close any authz/crypto divergence before handing out a key.
     _reconcile_orphan_member_keys(db, vault)
 
@@ -662,6 +669,8 @@ class GrantMemberKeyRequest(BaseModel):
 
 
 @router.post("/vaults/{vault_id}/members")
+@require_endpoint_permission("VAULT_PERMISSIONS")
+@require_vault_cap("vault.change_permissions")
 async def grant_member_key(
     vault_id: str,
     request: GrantMemberKeyRequest,
@@ -757,6 +766,8 @@ async def grant_member_key(
 
 
 @router.delete("/vaults/{vault_id}/members/{user_id}")
+@require_endpoint_permission("VAULT_PERMISSIONS")
+@require_vault_cap("vault.change_permissions")
 async def revoke_member_key(
     vault_id: str,
     user_id: uuid.UUID,
@@ -867,6 +878,10 @@ async def list_member_keys(
     if not vault:
         raise HTTPException(status_code=404, detail="Vault not found")
 
+    # Confine a scoped temp credential to its granted vaults (parity with the standard read
+    # path). Without it a cred scoped to vault A could enumerate vault B's member roster here.
+    enforce_vault(current_user, vault_id)
+
     caller_key = db.query(VaultMemberKey).filter(
         VaultMemberKey.vault_id == vault_id,
         VaultMemberKey.user_id == current_user.id,
@@ -904,6 +919,8 @@ async def list_member_keys(
 
 
 @router.post("/vaults/{vault_id}/rekey")
+@require_endpoint_permission("VAULT_PERMISSIONS")
+@require_vault_cap("vault.change_permissions")
 async def rekey_vault(
     vault_id: str,
     request: RekeyRequest,
@@ -1112,6 +1129,8 @@ async def rekey_vault(
 
 
 @router.post("/vaults/{vault_id}/retire-version")
+@require_endpoint_permission("VAULT_PERMISSIONS")
+@require_vault_cap("vault.change_permissions")
 async def retire_dek_versions(
     vault_id: str,
     current_user: User = Depends(get_current_user),
