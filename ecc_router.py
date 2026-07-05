@@ -17,6 +17,7 @@ from database import get_db
 from models import User, Vault, UserKeyPair, VaultMemberKey, vault_members, RoleEnum
 from ecc_crypto_service import ECCCryptoService
 from audit_logger import AuditLogger
+from rate_limiter import rate_limiter as _rate_limiter
 from cryptography.hazmat.primitives import serialization
 from datetime import datetime, timezone, timedelta
 
@@ -233,6 +234,49 @@ def _audit_zk(db: Session, actor: User, action: str, *, resource_id,
         db.rollback()
 
 
+# Per-user sliding-window throttles for the /ecc key endpoints, so the key-management plane
+# can't be driven as a brute-force / key-enumeration engine. Limits are generous — far above
+# any legitimate interactive rate — and keyed per user. Fail OPEN on a Redis outage (these are
+# availability-sensitive crypto operations, not an auth gate) — check_rate_limit's default.
+_ECC_RATELIMIT = {
+    "register": (15, 60),      # a user registers a keypair once (idempotent); no burst is legit
+    "public_key": (100, 60),   # resolving recipients' keys while sharing to a team
+    "mutate": (400, 60),       # grant / revoke / rekey / retire
+}
+
+
+def _ecc_rate_limit(user: User, bucket: str) -> None:
+    limit, window = _ECC_RATELIMIT[bucket]
+    allowed, _, reset = _rate_limiter.check_rate_limit(
+        identifier=str(user.id), limit=limit, window=window, prefix=f"ecc:{bucket}")
+    if not allowed:
+        import time as _time
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many key-management requests; please slow down.",
+            headers={"Retry-After": str(max(1, reset - int(_time.time())))},
+        )
+
+
+def _manages_any_vault(db: Session, user: User) -> bool:
+    """True if the user is a global admin, owns any vault, or is a Manager (manage_permission)
+    of any vault — i.e. is a potential SHARER who could legitimately add a member to some vault.
+    Scopes the public-key lookup so it is not a has-a-keypair enumeration oracle for arbitrary
+    accounts. Does NOT break onboarding: the browser share/rekey flows always run as a manager
+    of the vault they're sharing, and they fetch a not-yet-member recipient's key from here."""
+    if getattr(user, 'role', None) == RoleEnum.ADMIN:
+        return True
+    if db.query(Vault.id).filter(Vault.owner_id == user.id).first():
+        return True
+    row = db.execute(
+        select(vault_members.c.vault_id).where(
+            vault_members.c.user_id == user.id,
+            vault_members.c.manage_permission == True,  # noqa: E712
+        )
+    ).first()
+    return row is not None
+
+
 # =============================================================================
 # Utility Endpoints
 # =============================================================================
@@ -329,6 +373,7 @@ async def register_public_key(
     - Stores in database for ECDH key wrapping
     - Optionally stores password-encrypted private key for recovery
     """
+    _ecc_rate_limit(current_user, "register")
     try:
         # Validate public key format by trying to import it
         public_key_obj = ECCCryptoService.import_public_key(request.public_key)
@@ -586,7 +631,14 @@ async def get_user_public_key(
 ):
     """Return ANOTHER user's ECC public key so an existing vault member can wrap
     the vault DEK for them (zero-knowledge re-share). Public keys are not secret;
-    only the public half is exposed."""
+    only the public half is exposed.
+
+    Scoped to callers who could legitimately share a vault (own/manage one, or admin) so this
+    isn't a has-a-keypair enumeration oracle any authenticated account can sweep, and
+    rate-limited on top. Non-sharers get 403 without revealing whether the target has a key."""
+    _ecc_rate_limit(current_user, "public_key")
+    if not _manages_any_vault(db, current_user):
+        raise HTTPException(status_code=403, detail="Only a vault owner or manager may look up a member's key")
     kp = db.query(UserKeyPair).filter(UserKeyPair.user_id == user_id).first()
     if not kp:
         return {"user_id": user_id, "public_key": None, "fingerprint": None, "has_keypair": False}
@@ -625,6 +677,7 @@ async def grant_member_key(
     so this DEK-minting path is not a weaker surface that any plain member could use to
     re-grant a revoked user a working key. The caller must ALSO hold an active key (so they
     could actually unwrap+re-wrap the DEK). The recipient must have a registered keypair."""
+    _ecc_rate_limit(current_user, "mutate")
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
     if not vault:
         raise HTTPException(status_code=404, detail="Vault not found")
@@ -730,6 +783,7 @@ async def revoke_member_key(
     POST /ecc/vaults/{vault_id}/rekey, which mints a NEW DEK epoch the removed member never
     receives (the browser revoke flow calls /rekey). Deactivates the member's rows across
     ALL epochs so no stale-epoch key is left readable."""
+    _ecc_rate_limit(current_user, "mutate")
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
     if not vault:
         raise HTTPException(status_code=404, detail="Vault not found")
@@ -871,6 +925,7 @@ async def rekey_vault(
     Authorization: owner / global admin / Manager (parity with /vaults permission changes —
     a security-critical op must not be a weaker authz surface than a plain permission edit).
     """
+    _ecc_rate_limit(current_user, "mutate")
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
     if not vault:
         raise HTTPException(status_code=404, detail="Vault not found")
@@ -1072,6 +1127,7 @@ async def retire_dek_versions(
     Folders MUST be counted: a ZK folder name is encrypted under its own epoch's DEK (folders
     have no content epoch), so retiring a member key for that epoch would make the folder name
     permanently undecryptable for everyone — data loss."""
+    _ecc_rate_limit(current_user, "mutate")
     from models import File, Folder  # local import: avoid a heavier import at module load
 
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
