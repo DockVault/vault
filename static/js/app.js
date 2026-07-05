@@ -4812,6 +4812,96 @@ async function zkChangePassphrase() {
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
 }
 
+// Export a recovery kit: re-wrap the private key under a SEPARATE recovery passphrase and download
+// it as a file. The user stores it out-of-band; if they later forget their main passphrase they can
+// restore access with the recovery passphrase (zkRestoreFromRecoveryKey). Everything happens in the
+// browser — the kit holds only ciphertext the server never sees. Throws Error('Cancelled.') on
+// back-out.
+async function zkExportRecoveryKey() {
+    const priv = await apiRequest('/ecc/keys/private', { silent: true });
+    if (!priv || !priv.has_keypair || !priv.encrypted_private_key) throw new Error('No encryption key is set up for your account.');
+    let bundle;
+    try { bundle = JSON.parse(priv.encrypted_private_key); }
+    catch (_) { throw new Error('Stored encryption key is in an unexpected format.'); }
+    if (!bundle || !bundle.encrypted || !bundle.salt) throw new Error('Stored encryption key is incomplete or corrupt.');
+    const current = await showPrompt('Enter your CURRENT encryption passphrase to export a recovery key.', 'Export recovery key', { password: true });
+    if (current === null) throw new Error('Cancelled.');
+    let pem;
+    try { pem = await eccLib().decryptPrivateKey(bundle.encrypted, current, bundle.salt, bundle.iterations); }
+    catch (e) { console.error('Recovery export unlock failed:', e); throw new Error('Incorrect current passphrase (or the stored key is corrupt).'); }
+    const rec = await showPrompt('Choose a RECOVERY passphrase. Store it somewhere safe and SEPARATE from your normal passphrase — it protects the recovery key you are about to download.', 'Recovery passphrase', { password: true });
+    if (rec === null) throw new Error('Cancelled.');
+    if (!rec || rec.length < 8) throw new Error('Recovery passphrase must be at least 8 characters.');
+    const confirm = await showPrompt('Re-enter your RECOVERY passphrase to confirm.', 'Confirm recovery passphrase', { password: true });
+    if (confirm === null) throw new Error('Cancelled.');
+    if (confirm !== rec) throw new Error('Passphrases do not match.');
+
+    const enc = await eccLib().encryptPrivateKey(pem, rec);  // {encrypted, salt, iterations}
+    const pub = await apiRequest('/ecc/keys/public', { silent: true });
+    const kit = {
+        type: 'dockvault-zk-recovery-key',
+        version: 1,
+        user_id: (typeof currentUser !== 'undefined' && currentUser && currentUser.id) || null,
+        fingerprint: (pub && pub.fingerprint) || null,
+        public_key: (pub && pub.public_key) || null,   // to verify the kit matches this account on restore
+        recovery: enc,
+    };
+    const blob = new Blob([JSON.stringify(kit, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `dockvault-recovery-key-${kit.fingerprint || 'key'}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+}
+
+// Restore access from a recovery kit: decrypt the recovery-wrapped private key with the recovery
+// passphrase, verify it belongs to THIS account (its public key must match the registered one),
+// re-wrap it under a NEW main passphrase, and store it (PUT /ecc/keys/private). Used when the main
+// passphrase was lost. Throws Error('Cancelled.') on back-out.
+async function zkRestoreFromRecoveryKey(kitText) {
+    let kit;
+    try { kit = JSON.parse(kitText); }
+    catch (_) { throw new Error('That file is not a valid recovery key.'); }
+    if (!kit || kit.type !== 'dockvault-zk-recovery-key' || !kit.recovery || !kit.recovery.encrypted) {
+        throw new Error('That file is not a DockVault recovery key.');
+    }
+    const pub = await apiRequest('/ecc/keys/public', { silent: true });
+    if (!pub || !pub.has_keypair || !pub.public_key) throw new Error('This account has no encryption key to restore.');
+    // Fast pre-check on the kit's ASSERTED public key (untrusted metadata — a nicety so an
+    // obviously-wrong kit is rejected before asking for the recovery passphrase).
+    if (kit.public_key && kit.public_key.trim() !== pub.public_key.trim()) {
+        throw new Error('This recovery key is for a different account or keypair.');
+    }
+    const rec = await showPrompt('Enter the RECOVERY passphrase for this recovery key.', 'Restore access', { password: true });
+    if (rec === null) throw new Error('Cancelled.');
+    let pem;
+    try { pem = await eccLib().decryptPrivateKey(kit.recovery.encrypted, rec, kit.recovery.salt, kit.recovery.iterations); }
+    catch (e) { console.error('Recovery restore decrypt failed:', e); throw new Error('Incorrect recovery passphrase (or the recovery key is corrupt).'); }
+    // SECURITY: verify the DECRYPTED private key actually matches this account's registered public
+    // key. The kit's asserted public_key is untrusted metadata (a corrupt/forged/null-public_key
+    // kit could carry a different private key), so derive the public key FROM the private key and
+    // compare — adopting a mismatched key would silently orphan every wrapped DEK (permanent lockout).
+    let derivedPub;
+    try { derivedPub = await eccLib().derivePublicKeyPEMFromPrivatePEM(pem); }
+    catch (e) { console.error('Recovery key derive failed:', e); throw new Error('The recovery key is corrupt or not a valid key.'); }
+    if (derivedPub.trim() !== pub.public_key.trim()) {
+        throw new Error("This recovery key does not match your account's encryption key and cannot be restored.");
+    }
+    const next = await showPrompt('Set a NEW encryption passphrase. It replaces your forgotten one and CANNOT be recovered if lost.', 'New passphrase', { password: true });
+    if (next === null) throw new Error('Cancelled.');
+    if (!next || next.length < 8) throw new Error('Passphrase must be at least 8 characters.');
+    const confirm = await showPrompt('Re-enter your NEW passphrase to confirm.', 'Confirm new passphrase', { password: true });
+    if (confirm === null) throw new Error('Cancelled.');
+    if (confirm !== next) throw new Error('Passphrases do not match.');
+
+    const enc = await eccLib().encryptPrivateKey(pem, next);
+    await apiRequest('/ecc/keys/private', { method: 'PUT', body: JSON.stringify({ encrypted_private_key: JSON.stringify(enc) }) });
+    zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
+}
+
 // Ensure the user has an ECC keypair: create + register one (first time) or just
 // unlock the existing one. Leaves the private key unlocked in memory.
 async function zkEnsureKeypair() {
@@ -4855,9 +4945,11 @@ async function refreshEncryptionKeyStatus() {
     const hintEl = document.getElementById('encryption-key-hint');
     const setupBtn = document.getElementById('encryption-key-setup-btn');
     const changeBtn = document.getElementById('encryption-key-change-passphrase-btn');
+    const recoveryEl = document.getElementById('encryption-key-recovery');
     if (!statusEl) return;
     statusEl.replaceChildren();
-    if (changeBtn) changeBtn.style.display = 'none';  // only shown once a key exists
+    if (changeBtn) changeBtn.style.display = 'none';   // only shown once a key exists
+    if (recoveryEl) recoveryEl.style.display = 'none'; // ditto for the recovery-key actions
     let pub = null, lookupFailed = false;
     try { pub = await apiRequest('/ecc/keys/public', { silent: true }); } catch (_) { lookupFailed = true; }
 
@@ -4892,7 +4984,8 @@ async function refreshEncryptionKeyStatus() {
         }
         if (hintEl) hintEl.style.display = 'none';
         if (setupBtn) setupBtn.style.display = 'none';
-        if (changeBtn) changeBtn.style.display = '';  // offer a passphrase change
+        if (changeBtn) changeBtn.style.display = '';    // offer a passphrase change
+        if (recoveryEl) recoveryEl.style.display = '';  // offer recovery-key export / restore
     } else {
         const note = document.createElement('div');
         note.className = 'alert alert-info';
@@ -4943,6 +5036,34 @@ async function changeEncryptionPassphrase() {
         if (!/cancelled/i.test(msg)) showError(msg || 'Failed to change passphrase');
     } finally {
         if (btn) btn.disabled = false;
+        await refreshEncryptionKeyStatus();
+    }
+}
+
+async function exportRecoveryKey() {
+    const btn = document.getElementById('encryption-key-export-recovery-btn');
+    try {
+        if (btn) btn.disabled = true;
+        await zkExportRecoveryKey();
+        showSuccess('Recovery key downloaded. Store it somewhere safe and separate from your passphrase.');
+    } catch (e) {
+        const msg = (e && e.message) || '';
+        if (!/cancelled/i.test(msg)) showError(msg || 'Failed to export recovery key');
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+async function restoreFromRecoveryKeyFile(file) {
+    if (!file) return;
+    try {
+        const text = await file.text();
+        await zkRestoreFromRecoveryKey(text);
+        showSuccess('Access restored. Use your new passphrase from now on.');
+    } catch (e) {
+        const msg = (e && e.message) || '';
+        if (!/cancelled/i.test(msg)) showError(msg || 'Failed to restore from recovery key');
+    } finally {
         await refreshEncryptionKeyStatus();
     }
 }
@@ -7486,6 +7607,20 @@ document.addEventListener('DOMContentLoaded', () => {
     const encryptionKeyChangePassBtn = document.getElementById('encryption-key-change-passphrase-btn');
     if (encryptionKeyChangePassBtn) {
         encryptionKeyChangePassBtn.addEventListener('click', changeEncryptionPassphrase);
+    }
+    const encryptionKeyExportRecoveryBtn = document.getElementById('encryption-key-export-recovery-btn');
+    if (encryptionKeyExportRecoveryBtn) {
+        encryptionKeyExportRecoveryBtn.addEventListener('click', exportRecoveryKey);
+    }
+    const encryptionKeyRestoreBtn = document.getElementById('encryption-key-restore-btn');
+    const encryptionKeyRestoreInput = document.getElementById('encryption-key-restore-input');
+    if (encryptionKeyRestoreBtn && encryptionKeyRestoreInput) {
+        encryptionKeyRestoreBtn.addEventListener('click', () => encryptionKeyRestoreInput.click());
+        encryptionKeyRestoreInput.addEventListener('change', (e) => {
+            const file = e.target.files && e.target.files[0];
+            e.target.value = '';  // allow re-selecting the same file
+            restoreFromRecoveryKeyFile(file);
+        });
     }
 
     // Settings button

@@ -1547,3 +1547,91 @@ def test_change_encryption_passphrase_via_ui(page: Page, admin):
         if vid:
             owner.delete_vault(vid)
         admin.delete_user(user["id"])
+
+
+_NODE_IDENTITY_PROBE = r'''
+const { webcrypto } = require('crypto');
+global.window = { crypto: webcrypto };
+console.log = () => {};
+const ECC = require(process.env.ECC_JS);
+(async () => {
+  const lib = new ECC();
+  const b1 = JSON.parse(process.env.BLOB1), b2 = JSON.parse(process.env.BLOB2);
+  const pem1 = await lib.decryptPrivateKey(b1.encrypted, process.env.P1, b1.salt, b1.iterations);
+  const pem2 = await lib.decryptPrivateKey(b2.encrypted, process.env.P2, b2.salt, b2.iterations);
+  process.stdout.write(JSON.stringify({ same: pem1 === pem2 }));
+})().catch(e => { console.error(e); process.exit(1); });
+'''
+
+
+def test_recovery_key_export_and_restore_via_ui(page: Page, admin):
+    """Export a recovery key, then restore access from it under a NEW passphrase — end to end via
+    the UI (download the kit, upload it back). The restored key is checked cryptographically on the
+    ACTUAL blob the UI wrote: it must unlock with the new passphrase and not the original one."""
+    import json as _json, os as _os, shutil as _shutil, subprocess as _subprocess
+    from pathlib import Path as _Path
+    from conftest import ApiClient
+
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    user = admin.create_user(role="admin")
+    owner = ApiClient()
+    owner.login(user["_username"], user["_password"])
+    P1, R, P2 = "recovery-main-1", "recovery-secret-R", "recovery-new-2"
+    vid = None
+    try:
+        _login(page, user["_username"], user["_password"])
+        vid = _create_zk_vault_via_ui(page, owner, P1)          # keypair under P1
+        blob_before = owner.get("/ecc/keys/private").json()["encrypted_private_key"]
+
+        page.click("#profile-btn")
+        page.click("#encryption-key-btn")
+        expect(page.locator("#encryption-key-modal")).to_be_visible(timeout=5000)
+        expect(page.locator("#encryption-key-recovery")).to_be_visible(timeout=10000)
+
+        # EXPORT — capture the downloaded recovery kit (prompts: current P1, recovery R, confirm R).
+        with page.expect_download() as dl_info:
+            page.click("#encryption-key-export-recovery-btn")
+            for val in (P1, R, R):
+                expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=5000)
+                page.fill("#confirm-modal-input", val)
+                page.click("#confirm-modal-confirm-btn")
+        kit_path = dl_info.value.path()
+
+        # RESTORE from the kit (prompts: recovery R, new main P2, confirm P2).
+        page.set_input_files("#encryption-key-restore-input", kit_path)
+        for val in (R, P2, P2):
+            expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=5000)
+            page.fill("#confirm-modal-input", val)
+            page.click("#confirm-modal-confirm-btn")
+
+        # The stored blob was replaced; prove it now unlocks with P2 and NOT the original P1.
+        blob_after = blob_before
+        for _ in range(20):
+            blob_after = owner.get("/ecc/keys/private").json()["encrypted_private_key"]
+            if blob_after != blob_before:
+                break
+            page.wait_for_timeout(300)
+        assert blob_after != blob_before, "restore did not update the stored key blob"
+        node = _shutil.which("node")
+        if node:
+            ecc_js = str((_Path(__file__).resolve().parent.parent / "static" / "js" / "ecc_crypto.js")).replace("\\", "/")
+            proc = _subprocess.run([node, "-"], input=_NODE_DECRYPT_PROBE, capture_output=True, text=True,
+                                   encoding="utf-8", timeout=30,
+                                   env={**_os.environ, "ECC_JS": ecc_js, "BLOB": blob_after, "PGOOD": P2, "PBAD": P1})
+            assert proc.returncode == 0, proc.stderr
+            out = _json.loads(proc.stdout)
+            assert out["goodOk"] is True, "the restored key did not unlock with the new passphrase"
+            assert out["badFails"] is True, "the restored key still unlocked with the original passphrase"
+            # Prove the restored key IS the ORIGINAL private key (not a freshly generated one that
+            # would silently no longer match the registered public key): decrypt the before-blob
+            # with P1 and the after-blob with P2 and assert they are the same private key.
+            id_proc = _subprocess.run([node, "-"], input=_NODE_IDENTITY_PROBE, capture_output=True, text=True,
+                                      encoding="utf-8", timeout=30,
+                                      env={**_os.environ, "ECC_JS": ecc_js, "BLOB1": blob_before, "P1": P1,
+                                           "BLOB2": blob_after, "P2": P2})
+            assert id_proc.returncode == 0, id_proc.stderr
+            assert _json.loads(id_proc.stdout)["same"] is True, "restore produced a DIFFERENT key, not the recovered one"
+    finally:
+        if vid:
+            owner.delete_vault(vid)
+        admin.delete_user(user["id"])

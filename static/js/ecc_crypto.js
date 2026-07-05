@@ -171,7 +171,28 @@ class ECCCryptoLibrary {
             throw new Error(`Failed to import private key: ${error.message}`);
         }
     }
-    
+
+    /**
+     * Derive the PUBLIC key PEM that corresponds to a private key, from the private key's PEM.
+     * Used to verify a recovery key's private key actually belongs to a registered public key
+     * before adopting it — trusting a supplied/asserted public-key string is not enough, since it
+     * is not cryptographically bound to the private key.
+     * @param {string} privateKeyPEM - PEM-encoded private key
+     * @returns {Promise<string>} PEM-encoded matching public key
+     */
+    async derivePublicKeyPEMFromPrivatePEM(privateKeyPEM) {
+        const base64 = this._extractPEMContent(privateKeyPEM);
+        const der = this._base64ToArrayBuffer(base64);
+        // Import EXTRACTABLE so the public point (x/y) can be read out of the JWK.
+        const priv = await window.crypto.subtle.importKey(
+            'pkcs8', der, { name: 'ECDH', namedCurve: this.CURVE }, true, this.KEY_USAGES_PRIVATE);
+        const jwk = await window.crypto.subtle.exportKey('jwk', priv);
+        const pub = await window.crypto.subtle.importKey(
+            'jwk', { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y },
+            { name: 'ECDH', namedCurve: this.CURVE }, true, []);
+        return await this.exportPublicKeyPEM(pub);
+    }
+
     // =========================================================================
     // PASSWORD-BASED PRIVATE KEY ENCRYPTION
     // =========================================================================

@@ -1340,6 +1340,14 @@
                                 Pick a passphrase you won't forget — it protects your key and
                                 <strong>cannot be recovered</strong> if lost.
                             </p>
+                            <div id="encryption-key-recovery" style="display:none; margin-top:12px; border-top:1px solid var(--border, #e5e7eb); padding-top:12px;">
+                                <small class="form-help">A recovery key lets you regain access if you forget your passphrase. Export one and store it safely (separately from your passphrase); if you're ever locked out, restore from it.</small>
+                                <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+                                    <button type="button" id="encryption-key-export-recovery-btn" class="btn btn-secondary">Export recovery key</button>
+                                    <button type="button" id="encryption-key-restore-btn" class="btn btn-secondary">Restore from recovery key</button>
+                                </div>
+                                <input type="file" id="encryption-key-restore-input" accept="application/json,.json" style="display:none;">
+                            </div>
                         </div>
                         <div class="modal-footer">
                             <button type="button" class="close-modal-btn btn btn-secondary">Close</button>
