@@ -781,6 +781,23 @@ async def require_admin(current_user: User = Depends(get_current_user)) -> User:
     return current_user
 
 
+async def require_interactive_admin(current_user: User = Depends(require_admin)) -> User:
+    """Admin dependency that ALSO rejects temporary-credential sessions.
+
+    Org-policy writes — e.g. PUT /settings, which sets zero_knowledge_enabled /
+    force_zero_knowledge / standard_vault_allowed_groups (the confidentiality boundary
+    for the whole deployment) — must be performed by a real INTERACTIVE admin. An
+    admin-minted temporary credential keeps the admin ROLE (get_current_user returns the
+    real admin User and attach_scope does not downgrade role), so require_admin alone would
+    let a tightly-scoped temp credential flip that boundary. Reject temp sessions here."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This action requires an interactive admin session, not a temporary credential.",
+        )
+    return current_user
+
+
 def get_client_ip(request: Request) -> str:
     """Get the client IP. Honours X-Forwarded-For ONLY from a trusted proxy peer, so a direct
     (untrusted) client can't spoof its IP to poison per-IP throttles or audit logs. See
@@ -1221,11 +1238,15 @@ async def get_settings(
 async def update_settings(
     payload: dict,
     request: Request,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Persist global settings. Merges with the stored value so an omitted
-    sensitive field (e.g. smtp_password) keeps its existing value."""
+    sensitive field (e.g. smtp_password) keeps its existing value.
+
+    Gated by require_interactive_admin (NOT plain require_admin): a temporary credential —
+    even one minted from an admin — must not rewrite the deployment's org policy
+    (zero_knowledge_enabled / force_zero_knowledge / standard_vault_allowed_groups)."""
     _validate_settings_payload(payload, db)
     from models import SystemSetting
     row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
