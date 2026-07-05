@@ -4712,6 +4712,19 @@ async function zkEnsureUnlocked() {
 // by ZK vault creation (first time) and the standalone "set up key" action.
 // Throws Error('Setup cancelled.') if the user backs out of either prompt.
 async function zkRegisterNewKeypair() {
+    // Prominent, acknowledged warning: the ZK passphrase is the ONLY key to the
+    // user's zero-knowledge vaults, is never sent to the server, and cannot be reset or
+    // recovered by anyone. Make the user ACTIVELY acknowledge irrecoverability (a dedicated
+    // confirm dialog, not just a line in the passphrase prompt) BEFORE they set a passphrase.
+    // Covers both setup paths (ZK vault creation + the standalone "set up my key" modal).
+    const acknowledged = await showConfirm(
+        'Your encryption passphrase is the ONLY key to your zero-knowledge vaults. '
+        + 'It is never sent to the server and CANNOT be reset or recovered by anyone — not even an administrator. '
+        + 'If you lose it, everything in your zero-knowledge vaults becomes permanently unrecoverable. '
+        + 'Store it somewhere safe, such as a password manager. Do you understand and want to continue?',
+        'Zero-knowledge: your passphrase cannot be recovered'
+    );
+    if (!acknowledged) throw new Error('Setup cancelled.');
     const pass = await showPrompt(
         'Create a passphrase to protect your encryption key. You will need it to open zero-knowledge vaults — it CANNOT be recovered if lost.',
         'Set up encryption key', { password: true }

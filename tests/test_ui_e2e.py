@@ -630,8 +630,11 @@ def test_zero_knowledge_vault_end_to_end(page: Page, admin):
         page.select_option("#vault-type", "zero_knowledge")
         page.click("#create-vault-form button[type=submit]")
 
-        # First-time key setup: enter the passphrase, then confirm it (same modal).
+        # First-time key setup: acknowledge the "passphrase cannot be recovered" warning
+        # (a plain confirm, no input), then enter the passphrase and confirm it (same modal).
         expect(page.locator("#confirm-modal")).to_be_visible(timeout=5000)
+        page.click("#confirm-modal-confirm-btn")
+        expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=5000)
         page.fill("#confirm-modal-input", passphrase)
         page.click("#confirm-modal-confirm-btn")
         page.fill("#confirm-modal-input", passphrase)
@@ -1155,7 +1158,11 @@ def _create_zk_vault_via_ui(page: Page, owner_client, passphrase: str) -> str:
     expect(page.locator("#vault-type-group")).to_be_visible(timeout=5000)
     page.select_option("#vault-type", "zero_knowledge")
     page.click("#create-vault-form button[type=submit]")
+    # Acknowledge the "passphrase cannot be recovered" warning (a plain confirm, no input),
+    # then enter the passphrase and confirm it (same modal).
     expect(page.locator("#confirm-modal")).to_be_visible(timeout=5000)
+    page.click("#confirm-modal-confirm-btn")
+    expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=5000)
     page.fill("#confirm-modal-input", passphrase)
     page.click("#confirm-modal-confirm-btn")
     page.fill("#confirm-modal-input", passphrase)
