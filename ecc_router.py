@@ -496,6 +496,49 @@ async def get_private_key(
     return {"has_keypair": True, "encrypted_private_key": keypair.encrypted_private_key}
 
 
+class PrivateKeyUpdateRequest(BaseModel):
+    """The user's private key RE-WRAPPED in the browser under a NEW passphrase (opaque blob;
+    the server cannot read it). The PUBLIC key is unchanged, so this is a passphrase change,
+    not a key rotation."""
+    encrypted_private_key: str = Field(..., description="password-encrypted private-key blob")
+
+
+@router.put("/keys/private")
+async def update_private_key(
+    request: PrivateKeyUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Change the encryption passphrase: store a private-key blob the browser RE-ENCRYPTED under
+    a new passphrase, WITHOUT touching the public key.
+
+    Because the public key is unchanged, every vault DEK stays valid (they are ECDH-wrapped to
+    that public key), so NO per-vault re-wrap is needed — the user simply unlocks with the new
+    passphrase from now on. Zero-knowledge is preserved: the server only ever stores the opaque
+    ciphertext it cannot read. This is distinct from a key ROTATION (a new public key would
+    orphan every wrapped DEK); we deliberately keep the public key fixed. Rate-limited on the
+    same per-user bucket as registration.
+
+    Requires an INTERACTIVE session: a temporary credential authenticates AS the account owner,
+    and this overwrites the owner's private-key blob verbatim (no current-passphrase proof server
+    side), so a delegated/temp cred must not be able to corrupt it and irreversibly lock the owner
+    out of every zero-knowledge vault. Changing the account passphrase is an owner operation."""
+    _ecc_rate_limit(current_user, "register")
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="A temporary credential cannot change the account encryption passphrase.")
+    if not request.encrypted_private_key:
+        raise HTTPException(status_code=400, detail="encrypted_private_key is required")
+    keypair = db.query(UserKeyPair).filter(UserKeyPair.user_id == current_user.id).first()
+    if not keypair:
+        raise HTTPException(status_code=404, detail="No encryption key is set up for this account.")
+    keypair.encrypted_private_key = request.encrypted_private_key
+    keypair.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    _audit_zk(db, current_user, "zk_passphrase_changed",
+              resource_id=current_user.id, resource_type="user")
+    return {"ok": True, "message": "Encryption passphrase updated."}
+
+
 # NOTE: POST /ecc/vaults (create_vault_with_ecc) was REMOVED. It was a dead,
 # orphaned creation path (the live zero-knowledge create flow is POST /vaults with a
 # browser-wrapped DEK — see api_server.create_vault / static/js/app.js). It was unsafe

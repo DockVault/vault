@@ -1453,8 +1453,11 @@ def test_set_up_encryption_key_from_profile_menu(page: Page, admin):
         expect(page.locator("#encryption-key-status")).to_contain_text("don't have an encryption key")
 
         page.click("#encryption-key-setup-btn")
-        # Passphrase, then confirm (same prompt modal reused).
+        # Acknowledge the "passphrase cannot be recovered" warning (a confirm with no input),
+        # then enter the passphrase and confirm it (same prompt modal reused).
         expect(page.locator("#confirm-modal")).to_be_visible(timeout=5000)
+        page.click("#confirm-modal-confirm-btn")
+        expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=5000)
         page.fill("#confirm-modal-input", passphrase)
         page.click("#confirm-modal-confirm-btn")
         page.fill("#confirm-modal-input", passphrase)
@@ -1468,4 +1471,79 @@ def test_set_up_encryption_key_from_profile_menu(page: Page, admin):
         assert view.get("/ecc/keys/public").json().get("has_keypair") is True
         assert view.get("/ecc/keys/private").json().get("has_keypair") is True
     finally:
+        admin.delete_user(user["id"])
+
+
+_NODE_DECRYPT_PROBE = r'''
+const { webcrypto } = require('crypto');
+global.window = { crypto: webcrypto };
+console.log = () => {};
+const ECC = require(process.env.ECC_JS);
+(async () => {
+  const b = JSON.parse(process.env.BLOB);
+  const lib = new ECC();
+  let goodOk = false, badFails = false;
+  try { await lib.decryptPrivateKey(b.encrypted, process.env.PGOOD, b.salt, b.iterations); goodOk = true; } catch (e) {}
+  try { await lib.decryptPrivateKey(b.encrypted, process.env.PBAD, b.salt, b.iterations); } catch (e) { badFails = true; }
+  process.stdout.write(JSON.stringify({ goodOk, badFails }));
+})().catch(e => { console.error(e); process.exit(1); });
+'''
+
+
+def test_change_encryption_passphrase_via_ui(page: Page, admin):
+    """Change the ZK passphrase from the profile menu: the flow unlocks with the current
+    passphrase, re-wraps the private key under a new one, and PUTs it — the stored blob changes
+    while the PUBLIC key is unchanged (a passphrase change, not a key rotation). That the new
+    passphrase actually decrypts the re-wrapped key is proven by the Node crypto round-trip."""
+    from conftest import ApiClient
+
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    user = admin.create_user(role="admin")
+    owner = ApiClient()
+    owner.login(user["_username"], user["_password"])
+    P1, P2 = "change-pass-ONE-1", "change-pass-TWO-2"
+    vid = None
+    try:
+        _login(page, user["_username"], user["_password"])
+        vid = _create_zk_vault_via_ui(page, owner, P1)   # keypair under P1
+        blob_before = owner.get("/ecc/keys/private").json()["encrypted_private_key"]
+        fp_before = owner.get("/ecc/keys/public").json()["fingerprint"]
+
+        page.click("#profile-btn")
+        page.click("#encryption-key-btn")
+        expect(page.locator("#encryption-key-modal")).to_be_visible(timeout=5000)
+        expect(page.locator("#encryption-key-status")).to_contain_text("set up and active", timeout=10000)
+        expect(page.locator("#encryption-key-change-passphrase-btn")).to_be_visible()
+        page.click("#encryption-key-change-passphrase-btn")
+        for val in (P1, P2, P2):   # current, new, confirm
+            expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=5000)
+            page.fill("#confirm-modal-input", val)
+            page.click("#confirm-modal-confirm-btn")
+
+        # The stored blob was re-wrapped; the public key (fingerprint) is unchanged.
+        blob_after = blob_before
+        for _ in range(20):
+            blob_after = owner.get("/ecc/keys/private").json()["encrypted_private_key"]
+            if blob_after != blob_before:
+                break
+            page.wait_for_timeout(300)
+        assert blob_after != blob_before, "passphrase change did not re-wrap the private-key blob"
+        assert owner.get("/ecc/keys/public").json()["fingerprint"] == fp_before
+        # Prove the ACTUAL blob the UI wrote is unlockable by the NEW passphrase and NOT the old
+        # one — a re-wrap under the wrong passphrase would still flip the blob (fresh salt).
+        import json as _json, os as _os, shutil as _shutil, subprocess as _subprocess
+        from pathlib import Path as _Path
+        node = _shutil.which("node")
+        if node:
+            ecc_js = str((_Path(__file__).resolve().parent.parent / "static" / "js" / "ecc_crypto.js")).replace("\\", "/")
+            proc = _subprocess.run([node, "-"], input=_NODE_DECRYPT_PROBE, capture_output=True, text=True,
+                                   encoding="utf-8", timeout=30,
+                                   env={**_os.environ, "ECC_JS": ecc_js, "BLOB": blob_after, "PGOOD": P2, "PBAD": P1})
+            assert proc.returncode == 0, proc.stderr
+            out = _json.loads(proc.stdout)
+            assert out["goodOk"] is True, "the NEW passphrase did not unlock the key the UI re-wrapped"
+            assert out["badFails"] is True, "the OLD passphrase still unlocked the re-wrapped key"
+    finally:
+        if vid:
+            owner.delete_vault(vid)
         admin.delete_user(user["id"])

@@ -4771,6 +4771,47 @@ async function zkRegisterNewKeypair() {
     zkState.privateKey = await lib.importPrivateKeyPEM(privatePem, false);
 }
 
+// Change the encryption passphrase: unlock the private key with the CURRENT passphrase,
+// re-wrap it under a NEW passphrase IN THE BROWSER, and PUT the new blob. The PUBLIC key is
+// unchanged, so every vault DEK stays valid — the user just unlocks with the new passphrase
+// from now on (this is a passphrase change, not a key rotation). Throws Error('Cancelled.')
+// if the user backs out of any prompt.
+async function zkChangePassphrase() {
+    const priv = await apiRequest('/ecc/keys/private', { silent: true });
+    if (!priv || !priv.has_keypair || !priv.encrypted_private_key) {
+        throw new Error('No encryption key is set up for your account.');
+    }
+    let bundle;
+    try { bundle = JSON.parse(priv.encrypted_private_key); }
+    catch (_) { throw new Error('Stored encryption key is in an unexpected format.'); }
+    if (!bundle || !bundle.encrypted || !bundle.salt) {
+        throw new Error('Stored encryption key is incomplete or corrupt.');
+    }
+    const current = await showPrompt('Enter your CURRENT encryption passphrase.', 'Change passphrase', { password: true });
+    if (current === null) throw new Error('Cancelled.');
+    let pem;
+    try {
+        pem = await eccLib().decryptPrivateKey(bundle.encrypted, current, bundle.salt, bundle.iterations);
+    } catch (e) {
+        console.error('Passphrase-change unlock failed:', e);
+        throw new Error('Incorrect current passphrase (or the stored key is corrupt).');
+    }
+    const next = await showPrompt('Enter a NEW passphrase. It protects your key and CANNOT be recovered if lost.', 'New passphrase', { password: true });
+    if (next === null) throw new Error('Cancelled.');
+    if (!next || next.length < 8) throw new Error('Passphrase must be at least 8 characters.');
+    const confirm = await showPrompt('Re-enter your NEW passphrase to confirm.', 'Confirm new passphrase', { password: true });
+    if (confirm === null) throw new Error('Cancelled.');
+    if (confirm !== next) throw new Error('Passphrases do not match.');
+
+    const enc = await eccLib().encryptPrivateKey(pem, next);  // {encrypted, salt, iterations}
+    await apiRequest('/ecc/keys/private', {
+        method: 'PUT',
+        body: JSON.stringify({ encrypted_private_key: JSON.stringify(enc) }),
+    });
+    // Keep a NON-extractable runtime copy so the session stays unlocked with the same key.
+    zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
+}
+
 // Ensure the user has an ECC keypair: create + register one (first time) or just
 // unlock the existing one. Leaves the private key unlocked in memory.
 async function zkEnsureKeypair() {
@@ -4813,8 +4854,10 @@ async function refreshEncryptionKeyStatus() {
     const statusEl = document.getElementById('encryption-key-status');
     const hintEl = document.getElementById('encryption-key-hint');
     const setupBtn = document.getElementById('encryption-key-setup-btn');
+    const changeBtn = document.getElementById('encryption-key-change-passphrase-btn');
     if (!statusEl) return;
     statusEl.replaceChildren();
+    if (changeBtn) changeBtn.style.display = 'none';  // only shown once a key exists
     let pub = null, lookupFailed = false;
     try { pub = await apiRequest('/ecc/keys/public', { silent: true }); } catch (_) { lookupFailed = true; }
 
@@ -4849,6 +4892,7 @@ async function refreshEncryptionKeyStatus() {
         }
         if (hintEl) hintEl.style.display = 'none';
         if (setupBtn) setupBtn.style.display = 'none';
+        if (changeBtn) changeBtn.style.display = '';  // offer a passphrase change
     } else {
         const note = document.createElement('div');
         note.className = 'alert alert-info';
@@ -4884,6 +4928,21 @@ async function setupEncryptionKey() {
         }
     } finally {
         if (setupBtn) setupBtn.disabled = false;
+        await refreshEncryptionKeyStatus();
+    }
+}
+
+async function changeEncryptionPassphrase() {
+    const btn = document.getElementById('encryption-key-change-passphrase-btn');
+    try {
+        if (btn) btn.disabled = true;
+        await zkChangePassphrase();
+        showSuccess('Encryption passphrase changed. Use your new passphrase from now on.');
+    } catch (e) {
+        const msg = (e && e.message) || '';
+        if (!/cancelled/i.test(msg)) showError(msg || 'Failed to change passphrase');
+    } finally {
+        if (btn) btn.disabled = false;
         await refreshEncryptionKeyStatus();
     }
 }
@@ -7423,6 +7482,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const encryptionKeySetupBtn = document.getElementById('encryption-key-setup-btn');
     if (encryptionKeySetupBtn) {
         encryptionKeySetupBtn.addEventListener('click', setupEncryptionKey);
+    }
+    const encryptionKeyChangePassBtn = document.getElementById('encryption-key-change-passphrase-btn');
+    if (encryptionKeyChangePassBtn) {
+        encryptionKeyChangePassBtn.addEventListener('click', changeEncryptionPassphrase);
     }
 
     // Settings button
