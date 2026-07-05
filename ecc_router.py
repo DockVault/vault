@@ -14,7 +14,6 @@ import os
 import json
 from database import get_db
 from models import User, Vault, UserKeyPair, VaultMemberKey, vault_members, RoleEnum
-from security import verify_access_token
 from ecc_crypto_service import ECCCryptoService
 from cryptography.hazmat.primitives import serialization
 from datetime import datetime, timezone, timedelta
@@ -101,42 +100,25 @@ async def get_current_user(
     db: Session = Depends(get_db)
 ) -> User:
     """
-    Dependency to get current authenticated user from JWT token.
+    Dependency to get the current authenticated user for the /ecc ZK-crypto plane.
+
+    SECURITY: this MUST enforce the exact same hardening as the rest of the
+    API, otherwise the ZK crypto mutators (grant/revoke/rekey/retire/register) are a weaker
+    authentication surface than a plain vault write. The previous bespoke implementation only
+    did verify_access_token + user lookup + is_active — it OMITTED the token denylist, the
+    durable ActiveSession.revoked check, temp-session is_active/grace validation, the
+    account_locked check, and attach_scope (temp-credential least-privilege). So a
+    logged-out / revoked / locked JWT drove crypto mutations until it expired, and an
+    admin-minted, tightly-scoped temp credential acted as a full Manager on every ZK vault.
+
+    We now delegate to the ONE hardened dependency (api_server.get_current_user) so there is a
+    single source of truth for authentication. The import is LAZY (inside the function body)
+    because api_server imports this module at load time to mount the router
+    (api_server.include_router(ecc_router)); a module-level import would be circular. By
+    request time api_server is fully loaded, so the lazy import is a cheap dict lookup.
     """
-    token = credentials.credentials
-    
-    payload = verify_access_token(token)
-    if not payload:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload"
-        )
-    
-    # Get user from database
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found"
-        )
-    
-    # Check if active (handle SQLAlchemy Column type)
-    user_active = bool(user.is_active) if hasattr(user.is_active, '__bool__') else user.is_active
-    if not user_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is disabled"
-        )
-    
-    return user
+    from api_server import get_current_user as _hardened_get_current_user
+    return await _hardened_get_current_user(credentials, db)
 
 
 # =============================================================================
