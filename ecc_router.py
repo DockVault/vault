@@ -94,6 +94,11 @@ class VaultKeysResponse(BaseModel):
     wrapped_team_privkey: Optional[str] = None
     team_ephemeral_public_key: Optional[str] = None
     team_key_version: Optional[int] = None
+    # True when a member was removed (revoke / reconciler sweep / offboarding blacklist) WITHOUT
+    # a DEK rotation — a manager should rotate the vault key for forward secrecy on new content.
+    # Derived, so it clears automatically once a rekey advances the epoch. Only reported to a
+    # caller who holds a key (the no-access response leaves it at the default).
+    rekey_owed: bool = False
 
 
 # =============================================================================
@@ -542,6 +547,23 @@ def _team_rotation_owed(db: Session, vault: Vault) -> bool:
     ).first() is not None
 
 
+def _rekey_owed(db: Session, vault: Vault) -> bool:
+    """True when a member's key was deactivated at the CURRENT epoch WITHOUT a DEK rotation —
+    the signature of a legacy revoke, an orphan-reconciler sweep, or an offboarding blacklist
+    (a deactivated user's wrapped-DEK rows). A manager should rotate the vault key (browser
+    /rekey) for forward secrecy on new content. Derived (not stored): a rekey mints a new epoch
+    the removed member never receives, so no deactivated row remains at the NEW current epoch and
+    the flag clears itself. Hierarchical vaults reuse the team-rotation-owed signal."""
+    if _is_hierarchical(vault):
+        return _team_rotation_owed(db, vault)
+    cur = getattr(vault, 'dek_version', 1) or 1
+    return db.query(VaultMemberKey).filter(
+        VaultMemberKey.vault_id == vault.id,
+        VaultMemberKey.key_version == cur,
+        VaultMemberKey.is_active == False,  # noqa: E712
+    ).first() is not None
+
+
 @router.get("/vaults/{vault_id}/keys", response_model=VaultKeysResponse)
 async def get_vault_keys(
     vault_id: str,
@@ -573,6 +595,7 @@ async def get_vault_keys(
     # Close any authz/crypto divergence before handing out a key.
     _reconcile_orphan_member_keys(db, vault)
 
+    owed = _rekey_owed(db, vault)  # surface "a member was removed without a rotation" to holders
     current = getattr(vault, 'dek_version', 1) or 1
     want = key_version if key_version is not None else current
     mode = getattr(vault, 'key_wrapping_mode', 'direct')
@@ -606,6 +629,7 @@ async def get_vault_keys(
             wrapped_team_privkey=teampriv.wrapped_dek,
             team_ephemeral_public_key=teampriv.ephemeral_public_key,
             team_key_version=team_epoch,
+            rekey_owed=owed,
         )
 
     # DIRECT mode: the DEK is wrapped straight to the caller at the requested DEK epoch. (No
@@ -627,6 +651,7 @@ async def get_vault_keys(
         ephemeral_public_key=member_key.ephemeral_public_key,
         key_version=member_key.key_version,
         current_dek_version=current,
+        rekey_owed=owed,
     )
 
 

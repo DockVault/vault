@@ -482,6 +482,37 @@ async def get_user_detail(
         headers={"ETag": f'"{response_hash}"'}
     )
 
+def _blacklist_user_vault_keys(db: Session, user_id, revoked_by) -> int:
+    """Offboarding: deactivate a user's active wrapped-DEK rows so the server can no longer hand
+    them a zero-knowledge vault key. Called when a user is DEACTIVATED. Forward secrecy for NEW
+    content still needs a manual manager rotation (the server holds no DEK) — the affected vaults
+    surface as 'rekey owed' on the /ecc keys endpoint. Standard-vault access (the vault_members
+    authz rows) is left untouched; this only removes ZK key access.
+
+    OWNER CARVE-OUT: a user's key for a vault they OWN is never blacklisted — the same
+    owner-protection every other ZK path enforces (revoke / rekey refuse the owner, the orphan
+    reconciler skips owner rows). Blacklisting the owner's row would drop the vault's guaranteed
+    key-holder — and for a sole-owner vault that is irreversible (no client left holds the DEK to
+    re-wrap it), bricking the vault. A departing OWNER is an ownership-transfer problem, not a
+    key-blacklist one, so their owned vaults are left intact. Returns the count blacklisted."""
+    from models import VaultMemberKey, Vault
+    now = datetime.now(timezone.utc)
+    owned_vault_ids = {vid for (vid,) in db.query(Vault.id).filter(Vault.owner_id == user_id).all()}
+    rows = db.query(VaultMemberKey).filter(
+        VaultMemberKey.user_id == user_id,
+        VaultMemberKey.is_active == True,  # noqa: E712
+    ).all()
+    blacklisted = 0
+    for mk in rows:
+        if mk.vault_id in owned_vault_ids:
+            continue  # never blacklist the owner's own key (would brick the vault)
+        mk.is_active = False
+        mk.revoked_at = now
+        mk.revoked_by = revoked_by
+        blacklisted += 1
+    return blacklisted
+
+
 @router.put("/users/{user_id}", response_model=UserDetailResponse)
 @require_endpoint_permission("USER_MANAGE")
 async def update_user(
@@ -513,8 +544,12 @@ async def update_user(
         user.role = update_data.role
     
     if update_data.is_active is not None:
+        was_active = user.is_active
         user.is_active = update_data.is_active
-    
+        # Offboarding: deactivating a user blacklists their zero-knowledge vault keys.
+        if was_active and not user.is_active:
+            _blacklist_user_vault_keys(db, user.id, current_user.id)
+
     user.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(user)
@@ -549,6 +584,9 @@ async def toggle_user_active(
         raise HTTPException(status_code=400, detail="Cannot deactivate your own account")
     
     user.is_active = not user.is_active
+    # Offboarding: deactivating a user blacklists their zero-knowledge vault keys.
+    if not user.is_active:
+        _blacklist_user_vault_keys(db, user.id, current_user.id)
     user.updated_at = datetime.now(timezone.utc)
     db.commit()
     
