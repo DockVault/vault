@@ -1472,13 +1472,21 @@ async def get_zk_enabled(
           all — lets the UI show "not available on your plan" vs. "turned off".
       - max_zk_vaults / zk_vault_count: the plan's ZK-vault cap (-1 = unlimited) and
           how many already exist, so the UI can show "2 of 2 used" and pre-empt the
-          create error."""
+          create error.
+      - allowed_vault_types: the operator-set, admin-irreversible allowlist of the
+          types this deployment may create, so the UI can hide/disable a forbidden
+          option instead of surfacing a create error."""
+    allowed = _allowed_vault_types()
+    zk_allowed = "zero_knowledge" in allowed
     return {
-        "zero_knowledge_enabled": _zk_enabled(db),
-        "must_use_zk": _user_must_use_zk(db, current_user),
+        # Effective creatable state: ZK is offered only when both the plan/toggle enable
+        # it AND the allowlist permits it.
+        "zero_knowledge_enabled": _zk_enabled(db) and zk_allowed,
+        "must_use_zk": zk_allowed and _user_must_use_zk(db, current_user),
         "plan_zero_knowledge": bool(settings.plan_zero_knowledge),
         "max_zk_vaults": settings.plan_max_zk_vaults,
         "zk_vault_count": _zk_vault_count(db),
+        "allowed_vault_types": sorted(allowed),
     }
 
 
@@ -2923,6 +2931,19 @@ def _effective_vault_permission(vault, perms, user) -> str:
 VAULT_TYPES = {"standard", "zero_knowledge"}
 
 
+def _allowed_vault_types() -> set:
+    """The vault TYPES creatable on this deployment, per the operator-set,
+    customer-admin-irreversible allowlist (settings.plan_allowed_vault_types, a
+    comma-separated PLAN_* env). Entries are normalised and intersected with the
+    recognised VAULT_TYPES; an EMPTY or all-unrecognised value means NO restriction —
+    every recognised type is allowed (the permissive default). Never returns an empty
+    set, so a mis-set env can't brick all vault creation."""
+    raw = settings.plan_allowed_vault_types or ""
+    wanted = {t.strip().lower() for t in raw.split(",") if t.strip()}
+    allowed = wanted & VAULT_TYPES
+    return allowed or set(VAULT_TYPES)
+
+
 def _is_zk_vault(vault) -> bool:
     """True for zero-knowledge vaults (client-side crypto; server never holds the
     DEK). ZK sharing must be explicit per-user so the DEK can be wrapped to each
@@ -3077,10 +3098,20 @@ def _resolve_vault_type_for_create(current_user: User, requested: Optional[str],
     'zero_knowledge_enabled' AND is under the plan's ZK-vault cap. When the org
     enforces 'force_zero_knowledge', a user who is not in a whitelisted department
     (standard_vault_allowed_groups) may not create 'standard' vaults.
+
+    The operator-set, admin-irreversible allowed-vault-types allowlist
+    (_allowed_vault_types) is the hard outer gate: a type the deployment's policy
+    forbids is never creatable, whatever the local toggles say.
     """
     requested = (requested or "standard").strip().lower()
     if requested not in VAULT_TYPES:
         raise HTTPException(status_code=400, detail=f"Unknown vault type: {requested}")
+    allowed = _allowed_vault_types()
+    if requested not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Vault type '{requested}' is not permitted on this deployment.",
+        )
     if requested == "zero_knowledge":
         if not _zk_enabled(db):
             raise HTTPException(
@@ -3090,7 +3121,9 @@ def _resolve_vault_type_for_create(current_user: User, requested: Optional[str],
         _enforce_zk_vault_cap(db)
         return "zero_knowledge"
     # requested == 'standard'
-    if _user_must_use_zk(db, current_user):
+    # Only force zero-knowledge when it is actually a permitted type — otherwise a
+    # standard-only allowlist and a force-ZK policy would deadlock every create.
+    if "zero_knowledge" in allowed and _user_must_use_zk(db, current_user):
         raise HTTPException(
             status_code=400,
             detail="This organization requires zero-knowledge vaults. Choose the Zero-knowledge type.",

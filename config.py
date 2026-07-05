@@ -102,7 +102,16 @@ class Settings(BaseSettings):
     plan_max_zk_vaults: int = Field(default=-1)             # cap on ZK vaults (-1 unlimited, 0 none, N capped)
     plan_max_storage_gb: int = Field(default=-1)            # aggregate storage cap across the deployment, GB (-1 unlimited)
     plan_max_users: int = Field(default=-1)                 # cap on user accounts (-1 unlimited, 0 = block all, N capped)
-    
+    # Operator-set allowlist of the vault TYPES this deployment may create (comma-separated,
+    # e.g. "standard" to forbid zero-knowledge org-wide, or "zero_knowledge" for ZK-only).
+    # Like the other PLAN_* ceilings it is injected by the control plane and is HARD: the
+    # customer's own admin cannot widen it (there is no local /settings override), so it is
+    # the admin-irreversible "allowed vault types" policy. EMPTY (the default) means NO
+    # restriction — every recognised type is creatable, so an un-gated / local-dev vault
+    # behaves exactly as before. Unrecognised entries are ignored; an all-invalid value is
+    # treated as empty (permissive) so a typo can never brick all vault creation.
+    plan_allowed_vault_types: str = Field(default="")
+
     # Security Configuration (loaded from credential_manager)
     encryption_key: str = Field(
         default_factory=lambda: credential_manager.get('ENCRYPTION_KEY') or "",
