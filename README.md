@@ -62,8 +62,7 @@ docker compose up -d      # web/API on http://localhost:8200
   script. SFTP uses SSH host keys.
 - **Container hardening:** runs as a non-root user on a read-only root filesystem with no
   new privileges; login throttling and account lockout are built in.
-- **Secrets:** all keys and passwords come from `.env` (never commit it — `.env.example` is
-  the template). Use fresh encryption/JWT keys per deployment.
+- **Secrets:** all keys and passwords come from `.env`. Use fresh encryption/JWT keys per deployment.
 
 ## Configuration
 
