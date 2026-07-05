@@ -463,49 +463,16 @@ class ECCCryptoService:
 # CONVENIENCE FUNCTIONS FOR API ENDPOINTS
 # ============================================================================
 
-def create_user_keypair(db: Session, user_id: str, password: str) -> UserKeyPair:
-    """
-    Generate and store ECC keypair for a user.
-    
-    This should typically be done client-side, but this function simulates
-    the process for testing/admin account creation.
-    
-    Args:
-        db: Database session
-        user_id: User ID
-        password: User's password (for encrypting private key)
-        
-    Returns:
-        UserKeyPair record
-    """
-    service = ECCCryptoService()
-    
-    # Generate keypair
-    private_key, public_key = service.generate_ecc_keypair()
-    
-    # Export keys
-    private_key_pem = service.export_private_key(private_key)
-    public_key_pem = service.export_public_key(public_key)
-    
-    # Encrypt private key
-    encrypted_private_key, salt = service.encrypt_private_key(private_key_pem, password)
-    
-    # Create UserKeyPair record
-    keypair = UserKeyPair(
-        user_id=user_id,
-        public_key=public_key_pem,
-        encrypted_private_key=encrypted_private_key,
-        key_salt=salt,
-        key_iterations=PBKDF2_ITERATIONS,
-        key_algorithm='ECC-P384-ECDH',
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc)
-    )
-    
-    db.add(keypair)
-    logger.info(f"Created ECC keypair for user {user_id}")
-    
-    return keypair
+# create_user_keypair() was REMOVED: it generated + stored a user's ECC
+# PRIVATE key SERVER-SIDE (generate_ecc_keypair -> export_private_key -> encrypt_private_key),
+# which would break the zero-knowledge guarantee if any endpoint ever called it. It had NO live
+# caller and its own docstring admitted it only "simulates the process for testing". In the real
+# ZK flow the keypair is generated and the private key is password-encrypted ONLY in the browser
+# (static/js/ecc_crypto.js); the server stores just the public key + the browser-produced encrypted
+# private-key blob (POST /ecc/keys/register). Do NOT re-add a server-side keypair-generation path.
+# The now-orphaned private-key primitives on ECCCryptoService
+# (generate_ecc_keypair / export_private_key / import_private_key / encrypt_private_key /
+# decrypt_private_key) + add a guard test asserting no live route imports them.
 
 
 def add_member_to_vault(
@@ -541,7 +508,6 @@ def add_member_to_vault(
 
 __all__ = [
     'ECCCryptoService',
-    'create_user_keypair',
     'add_member_to_vault',
     'PBKDF2_ITERATIONS',
     'VAULT_DEK_SIZE',
