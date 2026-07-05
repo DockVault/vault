@@ -1290,13 +1290,27 @@ async function showCreateVault() {
     // The zero-knowledge option is only offered when the deployment enables it.
     const grp = document.getElementById('vault-type-group');
     const sel = document.getElementById('vault-type');
+    const note = document.getElementById('zk-unavailable-note');
     const stdOpt = sel ? sel.querySelector('option[value="standard"]') : null;
     if (grp) {
         try {
             const f = await apiRequest('/zk-enabled', { silent: true });
             const on = !!(f && f.zero_knowledge_enabled);
             const must = !!(f && f.must_use_zk);
+            const planHasZk = !!(f && f.plan_zero_knowledge);
             grp.style.display = (on || must) ? '' : 'none';
+            // When zero-knowledge isn't offered, say WHY — the plan doesn't include it vs an
+            // admin turned it off — instead of silently omitting the option (textContent, no HTML).
+            if (note) {
+                if (!on && !must) {
+                    note.textContent = planHasZk
+                        ? 'Zero-knowledge vaults are turned off for this workspace. An administrator can enable them in Settings.'
+                        : 'Zero-knowledge vaults are not available on your current plan.';
+                    note.style.display = '';
+                } else {
+                    note.style.display = 'none';
+                }
+            }
             if (sel) {
                 if (must) {
                     // Org policy forces zero-knowledge for this user — lock the choice.
@@ -1312,6 +1326,7 @@ async function showCreateVault() {
         } catch (e) {
             console.warn('Could not check zero-knowledge availability:', e);
             grp.style.display = 'none';  // fail safe: hide the option if we can't confirm
+            if (note) note.style.display = 'none';
             if (sel) { sel.disabled = false; sel.value = 'standard'; if (stdOpt) stdOpt.disabled = false; }
         }
     }

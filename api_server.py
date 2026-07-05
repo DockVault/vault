@@ -1231,6 +1231,11 @@ async def get_settings(
     data = dict(row.value) if row and row.value else {}
     for k in _SETTINGS_SENSITIVE:
         data.pop(k, None)
+    # Report the EFFECTIVE zero-knowledge state (plan ceiling + auto-enable), not the raw
+    # stored flag: the admin toggle must reflect reality, or a settings save (which sends the
+    # whole object) would persist the unchecked default and silently disable the auto-enabled
+    # feature. An explicit admin off is preserved (_zk_enabled returns it verbatim).
+    data["zero_knowledge_enabled"] = _zk_enabled(db)
     return data
 
 
@@ -2908,14 +2913,18 @@ def _require_zk_sealed_names(*tokens) -> None:
 
 
 def _zk_enabled(db) -> bool:
-    """Whether zero-knowledge vaults may be created on this deployment. Gated by
-    the global setting 'zero_knowledge_enabled' (default OFF) so ZK creation stays
-    opt-in until the browser-crypto UI ships. Reads the admin Settings store.
+    """Whether zero-knowledge vaults may be created on this deployment.
 
-    Plan ceiling: if the deployment's plan does NOT include zero-knowledge, ZK is
-    hard-off here regardless of the local admin toggle (a customer can't self-grant
-    a feature their plan excludes). A plan that FORCES zero-knowledge necessarily
-    enables it (and short-circuits before any DB read, so it holds even on error)."""
+    Plan ceiling first: if the deployment's plan does NOT include zero-knowledge, ZK is
+    hard-off here regardless of any local toggle (a customer can't self-grant a feature
+    their plan excludes). A plan that FORCES zero-knowledge necessarily enables it (and
+    short-circuits before any DB read, so it holds even on error).
+
+    When the plan GRANTS zero-knowledge, ZK is AUTO-ENABLED unless a local admin has
+    explicitly turned it off. The local 'zero_knowledge_enabled' setting now acts only as an
+    admin override: absent => on (the entitled tenant gets ZK without an undiscoverable
+    manual click), explicitly False => off, explicitly True => on. get_settings() reports
+    this EFFECTIVE value so a settings save can't silently clobber the auto-enable."""
     if not settings.plan_zero_knowledge:
         return False
     if settings.plan_force_zero_knowledge:
@@ -2923,9 +2932,13 @@ def _zk_enabled(db) -> bool:
     try:
         from models import SystemSetting
         row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
-        return bool((row.value or {}).get("zero_knowledge_enabled")) if (row and row.value) else False
+        val = (row.value or {}) if (row and row.value) else {}
+        override = val.get("zero_knowledge_enabled")
+        return True if override is None else bool(override)
     except Exception:  # noqa: BLE001
-        return False
+        # Plan grants ZK; fail toward the entitlement (the confidentiality-safe direction),
+        # matching the plan-force short-circuit above rather than silently disabling it.
+        return True
 
 
 def _user_must_use_zk(db, user) -> bool:
