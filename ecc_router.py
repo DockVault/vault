@@ -12,9 +12,11 @@ import hashlib
 import base64
 import os
 import json
+import uuid
 from database import get_db
 from models import User, Vault, UserKeyPair, VaultMemberKey, vault_members, RoleEnum
 from ecc_crypto_service import ECCCryptoService
+from audit_logger import AuditLogger
 from cryptography.hazmat.primitives import serialization
 from datetime import datetime, timezone, timedelta
 
@@ -209,6 +211,28 @@ def _reconcile_orphan_member_keys(db: Session, vault: Vault) -> bool:
     return changed
 
 
+def _audit_zk(db: Session, actor: User, action: str, *, resource_id,
+              resource_type: str = "vault", details: Optional[dict] = None) -> None:
+    """Best-effort audit row for a /ecc ZK-crypto mutation.
+
+    Called AFTER the mutation has committed (AuditLogger.log_action commits its own row), so a
+    failure to record the audit never rolls back or 500s the crypto change it documents — it
+    only drops the audit entry. The /ecc plane previously wrote ZERO audit rows, a forensic
+    blind spot for the security-critical key grant / revoke / rekey / retire / register
+    operations (standard vault create/delete are audited)."""
+    try:
+        AuditLogger(db).log_action(
+            action=action,
+            status="success",
+            user=actor,
+            resource_type=resource_type,
+            resource_id=str(resource_id),
+            details=details or None,
+        )
+    except Exception:  # noqa: BLE001 — audit must never break the mutation it records
+        db.rollback()
+
+
 # =============================================================================
 # Utility Endpoints
 # =============================================================================
@@ -342,6 +366,10 @@ async def register_public_key(
         db.add(keypair)
         db.commit()
         db.refresh(keypair)
+
+        _audit_zk(db, current_user, "zk_keypair_registered",
+                  resource_id=current_user.id, resource_type="user",
+                  details={"fingerprint": fingerprint})
 
         return KeypairRegisterResponse(
             message="Public key registered successfully",
@@ -668,6 +696,9 @@ async def grant_member_key(
             granted_at=datetime.now(timezone.utc),
         ))
     db.commit()
+    _audit_zk(db, current_user, "zk_member_key_granted", resource_id=vault_id,
+              details={"target_user_id": str(request.user_id), "key_version": epoch,
+                       "mode": getattr(vault, 'key_wrapping_mode', 'direct')})
     return {"status": "ok", "vault_id": vault_id, "user_id": request.user_id,
             "key_version": epoch, "mode": getattr(vault, 'key_wrapping_mode', 'direct')}
 
@@ -675,12 +706,23 @@ async def grant_member_key(
 @router.delete("/vaults/{vault_id}/members/{user_id}")
 async def revoke_member_key(
     vault_id: str,
-    user_id: str,
+    user_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """Deactivate a member's wrapped DEK(s) WITHOUT rotating the vault DEK (legacy /
-    back-compat path). The caller must hold an active key for the vault.
+    back-compat path).
+
+    Authorization: owner / global admin / Manager (_can_manage_vault) — the SAME gate as
+    rekey_vault and POST /vaults/{id}/permissions, so deactivating another user's key is not
+    a weaker surface than a plain permission change. Previously this required only that the
+    caller HOLD an active key for the vault, which let any shared member (or, before the auth
+    delegation fix, a revoked/locked token) deactivate any OTHER member's — including the
+    OWNER's — wrapped DEK rows.
+
+    The vault owner can never be revoked: the orphan reconciler skips owner rows and a rekey
+    needs the owner's DEK, so removing the owner's key would permanently lock the vault's
+    guaranteed key-holder out with no self-rescue. Mirrors the rekey owner-guard.
 
     This only stops the member from unwrapping via the server; it does NOT give forward
     secrecy, because the member (and anyone who already unwrapped) has seen the current
@@ -688,13 +730,22 @@ async def revoke_member_key(
     POST /ecc/vaults/{vault_id}/rekey, which mints a NEW DEK epoch the removed member never
     receives (the browser revoke flow calls /rekey). Deactivates the member's rows across
     ALL epochs so no stale-epoch key is left readable."""
-    granter_key = db.query(VaultMemberKey).filter(
-        VaultMemberKey.vault_id == vault_id,
-        VaultMemberKey.user_id == current_user.id,
-        VaultMemberKey.is_active == True,
-    ).first()
-    if not granter_key:
-        raise HTTPException(status_code=403, detail="You don't hold a key for this vault")
+    vault = db.query(Vault).filter(Vault.id == vault_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="Vault not found")
+    if not _can_manage_vault(db, vault, current_user):
+        raise HTTPException(status_code=403, detail="Only the vault owner or a manager can revoke a member's key")
+    # user_id is a uuid.UUID (FastAPI-coerced from the path), so this compares canonical
+    # UUIDs — a non-canonical form (uppercase / hyphen-less) can't slip past the owner-guard
+    # while the DB (which normalizes UUID text) still matches the owner's rows below.
+    if user_id == vault.owner_id:
+        raise HTTPException(status_code=400, detail="Cannot revoke the vault owner")
+    # A Manager cannot unseat a PEER Manager — that stays owner/admin-only, matching
+    # DELETE /vaults/{id}/permissions (which the browser revoke flow pairs this with).
+    if not _is_owner_or_admin(vault, current_user):
+        peer = _member_row(db, vault.id, user_id)
+        if peer and peer.manage_permission:
+            raise HTTPException(status_code=403, detail="Only the vault owner or an admin can revoke a manager")
     rows = db.query(VaultMemberKey).filter(
         VaultMemberKey.vault_id == vault_id,
         VaultMemberKey.user_id == user_id,
@@ -706,6 +757,8 @@ async def revoke_member_key(
         mk.revoked_by = current_user.id
     if rows:
         db.commit()
+    _audit_zk(db, current_user, "zk_member_key_revoked", resource_id=vault_id,
+              details={"target_user_id": str(user_id), "keys_deactivated": len(rows)})
     return {"status": "ok"}
 
 
@@ -734,7 +787,10 @@ class RekeyRequest(BaseModel):
     """
     from_version: int = Field(..., description="DEK epoch the client rotated FROM (optimistic lock)")
     to_version: int = Field(..., description="DEK epoch the client rotated TO (must be from_version+1)")
-    revoke_user_id: Optional[str] = Field(None, description="member being removed, if any")
+    # A UUID (not a bare str) so the owner-guard below compares canonical UUIDs: a
+    # non-canonical form can't slip past `str(revoke_user_id) == str(owner_id)` while the
+    # DB still normalizes it and deactivates the owner's rows.
+    revoke_user_id: Optional[uuid.UUID] = Field(None, description="member being removed, if any")
     member_keys: List[MemberKeyWrap] = Field(..., description="per-remaining-member wraps (empty for a routine hierarchical rotation)")
     # Hierarchical only:
     team_dek_wrapped: Optional[str] = Field(None, description="the new DEK wrapped to a team public key")
@@ -954,6 +1010,10 @@ async def rekey_vault(
             _deactivate_revoked()
         locked.dek_version = request.to_version
         db.commit()
+        _audit_zk(db, current_user, "zk_vault_rekeyed", resource_id=vault_id, details={
+            "revoked_user_id": str(request.revoke_user_id) if request.revoke_user_id else None,
+            "from_version": request.from_version, "to_version": request.to_version,
+            "mode": "hierarchical", "team_key_version": getattr(locked, 'team_key_version', 1)})
         return {"status": "ok", "vault_id": vault_id, "dek_version": request.to_version,
                 "team_key_version": getattr(locked, 'team_key_version', 1)}
 
@@ -990,6 +1050,9 @@ async def rekey_vault(
     # 3) Bump the vault epoch (still under the row lock).
     locked.dek_version = request.to_version
     db.commit()
+    _audit_zk(db, current_user, "zk_vault_rekeyed", resource_id=vault_id, details={
+        "revoked_user_id": str(request.revoke_user_id) if request.revoke_user_id else None,
+        "from_version": request.from_version, "to_version": request.to_version, "mode": "direct"})
     return {"status": "ok", "vault_id": vault_id, "dek_version": request.to_version}
 
 
@@ -1065,6 +1128,9 @@ async def retire_dek_versions(
         for mk in stale:
             db.delete(mk)
         db.commit()  # always persist the (possibly pruned) team_key map
+        _audit_zk(db, current_user, "zk_versions_retired", resource_id=vault_id,
+                  details={"retired_dek_below": dek_floor, "retired_team_below": team_floor,
+                           "rows_deleted": deleted, "mode": "hierarchical"})
         return {"status": "ok", "vault_id": vault_id, "retired_dek_below": dek_floor,
                 "retired_team_below": team_floor, "rows_deleted": deleted}
 
@@ -1078,4 +1144,6 @@ async def retire_dek_versions(
         db.delete(mk)
     if deleted:
         db.commit()
+    _audit_zk(db, current_user, "zk_versions_retired", resource_id=vault_id,
+              details={"retired_below_version": dek_floor, "rows_deleted": deleted, "mode": "direct"})
     return {"status": "ok", "vault_id": vault_id, "retired_below_version": dek_floor, "rows_deleted": deleted}
