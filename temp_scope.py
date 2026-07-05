@@ -43,8 +43,10 @@ VAULT_CAPS = {
     "vault.change_info", "vault.change_password", "vault.change_expiry",
     "vault.delete",
 }
-# Global (non-per-vault) capabilities, stored in scope.caps.
-GLOBAL_CAPS = {"vault.create"}
+# Global (non-per-vault) capabilities, stored in scope.caps. `vault.create` is the legacy,
+# type-agnostic create cap (any vault type); the per-type caps let an operator mint a credential
+# that may create ONLY standard OR ONLY zero-knowledge vaults. Holding `vault.create` implies both.
+GLOBAL_CAPS = {"vault.create", "vault.create.standard", "vault.create.zero_knowledge"}
 TEMP_PERMS = {"view", "create", "invalidate", "clear", "delegate"}
 
 # Endpoint-permission group -> page it belongs to. "__infra__" = always allowed
@@ -138,7 +140,9 @@ def temp_session_allows_group(user, group_name: str, kwargs: dict) -> bool:
         return False
 
     if group_name == "VAULT_CREATE":
-        return "vault.create" in set(scope.get("caps", []))
+        # Any create cap (legacy type-agnostic OR a per-type one) passes the coarse page/nav gate;
+        # the specific vault TYPE is enforced in the handler via require_create_vault_type().
+        return any(c == "vault.create" or c.startswith("vault.create.") for c in scope.get("caps", []))
     if group_name == "TEMP_CREDS_VIEW":
         return bool(scope.get("temp", {}).get("view"))
     if group_name == "TEMP_CREDS_MANAGE":
@@ -175,6 +179,22 @@ def require_cap(user, vault_id, cap: str) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Temporary credential scope does not permit this action",
         )
+
+
+def require_create_vault_type(user, vault_type: str) -> None:
+    """Gate vault creation by TYPE for a scoped temp session. It may create `vault_type` if it
+    holds the legacy type-agnostic `vault.create` OR the per-type `vault.create.<type>` cap.
+    No-op for non-scoped principals (a legacy/unscoped credential is unrestricted). This runs at
+    the create handler AFTER the type is resolved, since the coarse VAULT_CREATE gate can't see it."""
+    if not is_scoped(user):
+        return
+    caps = set((_scope(user) or {}).get("caps", []))
+    if "vault.create" in caps or f"vault.create.{vault_type}" in caps:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=f"Temporary credential scope does not permit creating a {vault_type} vault",
+    )
 
 
 def require_vault_cap(cap: str):

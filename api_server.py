@@ -3087,6 +3087,10 @@ async def create_vault(
     # Confidentiality-policy hook (defaults to 'standard'; rejects unbuilt tiers).
     vault_type = _resolve_vault_type_for_create(current_user, vault_create.type, db)
 
+    # A scoped temp credential may be restricted to a specific vault type (standard vs ZK).
+    from temp_scope import require_create_vault_type
+    require_create_vault_type(current_user, vault_type)
+
     vault = vault_service.create_vault(
         name=vault_create.name,
         owner=current_user,
