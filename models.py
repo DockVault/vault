@@ -946,6 +946,30 @@ class UserKeyPair(Base):
     )
 
 
+class ZKShareInvite(Base):
+    """A pending zero-knowledge share invite (team-onboarding for keyless recipients).
+
+    When a vault manager tries to share a zero-knowledge vault with a user who has no
+    encryption key yet, the DEK can't be wrapped for them, so we record the intent here
+    and prompt the recipient to set up a key ("invite-then-share"). The server holds NO
+    key material — this row is only a "please set up your encryption key so a vault can be
+    shared with you" nudge (the vault name stays client-sealed, so it is not stored here).
+    Cleared when the recipient registers a keypair, or when the share actually lands.
+    """
+    __tablename__ = 'zk_share_invites'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    vault_id = Column(UUID(as_uuid=True), ForeignKey('vaults.id', ondelete='CASCADE'), nullable=False)
+    target_user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    invited_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('vault_id', 'target_user_id', name='uq_zk_invite_vault_target'),
+        Index('idx_zk_invite_target', 'target_user_id'),
+    )
+
+
 class VaultMemberKey(Base):
     """
     Stores per-member wrapped vault Data Encryption Keys (DEKs).

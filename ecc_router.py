@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, Field
 from typing import Optional, List
 import hashlib
@@ -14,7 +15,7 @@ import os
 import json
 import uuid
 from database import get_db
-from models import User, Vault, UserKeyPair, VaultMemberKey, vault_members, RoleEnum
+from models import User, Vault, UserKeyPair, VaultMemberKey, ZKShareInvite, vault_members, RoleEnum
 from ecc_crypto_service import ECCCryptoService
 from audit_logger import AuditLogger
 from rate_limiter import rate_limiter as _rate_limiter
@@ -418,6 +419,18 @@ async def register_public_key(
         db.add(keypair)
         db.commit()
         db.refresh(keypair)
+
+        # Team-onboarding: the recipient now HAS a key, so any pending
+        # "set up your key so a vault can be shared with you" invites are resolved —
+        # clear them (the manager re-shares, which now succeeds). Best-effort: a failed
+        # cleanup must never fail the registration.
+        try:
+            db.query(ZKShareInvite).filter(
+                ZKShareInvite.target_user_id == current_user.id
+            ).delete(synchronize_session=False)
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
 
         _audit_zk(db, current_user, "zk_keypair_registered",
                   resource_id=current_user.id, resource_type="user",
@@ -825,12 +838,111 @@ async def grant_member_key(
             granted_by=current_user.id,
             granted_at=datetime.now(timezone.utc),
         ))
-    db.commit()
+    db.commit()  # persist the grant on its own — authoritative, BEFORE any best-effort cleanup
+    # The share landed, so drop any pending onboarding invite for this (vault, recipient)
+    # — belt-and-suspenders (it is normally already cleared when the recipient registered a
+    # keypair). A SEPARATE commit so a cleanup failure can only drop the stale invite, never
+    # roll back the grant we already committed and are about to report as ok.
+    try:
+        db.query(ZKShareInvite).filter(
+            ZKShareInvite.vault_id == vault_id,
+            ZKShareInvite.target_user_id == request.user_id,
+        ).delete(synchronize_session=False)
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
     _audit_zk(db, current_user, "zk_member_key_granted", resource_id=vault_id,
               details={"target_user_id": str(request.user_id), "key_version": epoch,
                        "mode": getattr(vault, 'key_wrapping_mode', 'direct')})
     return {"status": "ok", "vault_id": vault_id, "user_id": request.user_id,
             "key_version": epoch, "mode": getattr(vault, 'key_wrapping_mode', 'direct')}
+
+
+class ZKInviteRequest(BaseModel):
+    # Coerce at the boundary (mirrors the grant/revoke path params) so a non-canonical UUID
+    # can't slip past a string comparison.
+    user_id: uuid.UUID
+
+
+@router.post("/vaults/{vault_id}/invites")
+@require_endpoint_permission("VAULT_PERMISSIONS")
+@require_vault_cap("vault.change_permissions")
+async def invite_to_vault(
+    vault_id: str,
+    request: ZKInviteRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Invite a KEYLESS user to a zero-knowledge vault (team-onboarding for keyless recipients).
+
+    A zero-knowledge DEK can only be wrapped for a user who has an encryption key, so a
+    manager cannot share directly with a keyless recipient. Instead of a dead-end, this
+    records the intent and lets us prompt the recipient to set up a key; the manager then
+    re-shares (POST .../members) once they have one. NO key material is created here.
+    Manager-gated exactly like the grant path (owner / global admin / Manager)."""
+    _ecc_rate_limit(current_user, "mutate")
+    vault = db.query(Vault).filter(Vault.id == vault_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="Vault not found")
+    if not _can_manage_vault(db, vault, current_user):
+        raise HTTPException(status_code=403, detail="Only the vault owner or a manager can invite members")
+    target = db.query(User).filter(User.id == request.user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target user not found")
+    # Only keyless users need an invite; a user WITH a key can be shared to directly.
+    if db.query(UserKeyPair).filter(UserKeyPair.user_id == request.user_id).first():
+        raise HTTPException(
+            status_code=400,
+            detail="This user already has an encryption key — share the vault with them directly.",
+        )
+    existing = db.query(ZKShareInvite).filter(
+        ZKShareInvite.vault_id == vault_id,
+        ZKShareInvite.target_user_id == request.user_id,
+    ).first()
+    if existing:
+        existing.invited_by = current_user.id
+        existing.created_at = datetime.utcnow()
+    else:
+        db.add(ZKShareInvite(vault_id=vault_id, target_user_id=request.user_id,
+                             invited_by=current_user.id))
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent invite for the same (vault, target) already created the row — the
+        # UNIQUE constraint held, so this is an idempotent no-op, not a 500. (Mirrors the
+        # lost-unique-race handling on the rename path.)
+        db.rollback()
+        return {"status": "invited", "vault_id": vault_id, "user_id": str(request.user_id)}
+    _audit_zk(db, current_user, "zk_share_invited", resource_id=vault_id,
+              details={"target_user_id": str(request.user_id)})
+    return {"status": "invited", "vault_id": vault_id, "user_id": str(request.user_id)}
+
+
+@router.get("/keys/invites")
+async def list_share_invites(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """The CURRENT user's pending zero-knowledge share invites, so the UI can prompt a
+    keyless recipient to set up an encryption key. `needs_keypair` is True when they have
+    no key yet (the case worth prompting on). No key material is involved; the vault name
+    stays client-sealed, so only the vault id + inviter are returned."""
+    has_keypair = db.query(UserKeyPair).filter(
+        UserKeyPair.user_id == current_user.id
+    ).first() is not None
+    rows = db.query(ZKShareInvite).filter(
+        ZKShareInvite.target_user_id == current_user.id
+    ).order_by(ZKShareInvite.created_at.desc()).all()
+    invites = []
+    for r in rows:
+        inviter = db.query(User).filter(User.id == r.invited_by).first() if r.invited_by else None
+        invites.append({
+            "vault_id": str(r.vault_id),
+            "invited_by": str(r.invited_by) if r.invited_by else None,
+            "invited_by_username": getattr(inviter, "username", None),
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        })
+    return {"needs_keypair": not has_keypair, "count": len(invites), "invites": invites}
 
 
 @router.delete("/vaults/{vault_id}/members/{user_id}")

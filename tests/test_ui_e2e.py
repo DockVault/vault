@@ -1635,3 +1635,37 @@ def test_recovery_key_export_and_restore_via_ui(page: Page, admin):
         if vid:
             owner.delete_vault(vid)
         admin.delete_user(user["id"])
+
+
+def test_zk_invite_prompts_keyless_recipient(browser, admin):
+    """ZK team-onboarding (recipient side): a KEYLESS user who's been invited to a
+    zero-knowledge vault is prompted on login to set up an encryption key, so the share can
+    complete. Setup is via the API (the invite endpoint is unit-tested); this proves the prompt."""
+    from conftest import ApiClient, BASE_URL, ensure_ecc_keypair, create_zk_vault, unique
+
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    b = vid = None
+    try:
+        ensure_ecc_keypair(admin)                        # owner needs a key to make a ZK vault
+        vid = create_zk_vault(admin, name=unique("zk"))["id"]
+        b = admin.create_user(role="user")               # a fresh, KEYLESS recipient
+        r = admin.post(f"/ecc/vaults/{vid}/invites", json={"user_id": b["id"]})
+        assert r.status_code == 200, r.text
+
+        ctx = browser.new_context(base_url=BASE_URL)
+        page = ctx.new_page()
+        try:
+            _login(page, b["_username"], b["_password"])
+            # The invite prompt fires after the dashboard loads.
+            modal = page.locator("#confirm-modal")
+            expect(modal).to_be_visible(timeout=15000)
+            expect(page.locator("#confirm-modal-message")).to_contain_text("wants to share")
+            expect(page.locator("#confirm-modal-message")).to_contain_text("encryption key")
+        finally:
+            ctx.close()
+    finally:
+        if b:
+            admin.delete_user(b["id"])
+        if vid:
+            admin.delete_vault(vid)
+        admin.put("/settings", json={"zero_knowledge_enabled": False})

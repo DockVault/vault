@@ -917,7 +917,10 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
 
         // Load dashboard stats
         loadDashboardStats();
-        
+
+        // Prompt a keyless user who's been invited to a ZK vault to set up a key.
+        zkMaybePromptPendingInvites();
+
     } catch (error) {
         console.error('Login error:', error);
         errorDiv.textContent = error.message;
@@ -938,6 +941,9 @@ function logout() {
     // Wipe any saved zero-knowledge upload ciphertext too — on a shared machine it must
     // not outlive the session (it's opaque without the DEK, but matches the scrub above).
     try { zkUploadStore.clear(); } catch (_) {}
+    // Re-arm the once-per-session pending-invite prompt so a DIFFERENT keyless user who
+    // logs in on this same tab (no page refresh) is still prompted to set up a key.
+    _zkInvitePrompted = false;
 
     // Tear down any open vault session + its watchers.
     if (state.accessCheckInterval) { clearInterval(state.accessCheckInterval); state.accessCheckInterval = null; }
@@ -5220,7 +5226,19 @@ async function zkSealLegacyNames(vault, items) {
 async function zkShareVaultToUser(vaultId, userId) {
     const pk = await apiRequest(`/ecc/users/${userId}/public-key`, { silent: true });
     if (!pk || !pk.has_keypair || !pk.public_key) {
-        throw new Error("that user hasn't set up an encryption key yet, so they can't open a zero-knowledge vault.");
+        // Team-onboarding: a zero-knowledge DEK can't be wrapped for a keyless
+        // recipient, so record an invite (prompts them to set up a key) and report an
+        // actionable message. Best-effort — a failed invite still yields a clear reason.
+        let invited = false;
+        try {
+            await apiRequest(`/ecc/vaults/${vaultId}/invites`, {
+                method: 'POST', body: JSON.stringify({ user_id: userId }), silent: true,
+            });
+            invited = true;
+        } catch (_) { /* fall through to the plain message */ }
+        throw new Error(invited
+            ? "that user hasn't set up an encryption key yet — we've asked them to set one up. Share again once they have."
+            : "that user hasn't set up an encryption key yet, so they can't open a zero-knowledge vault.");
     }
     const recipientPub = await eccLib().importPublicKeyPEM(pk.public_key);
     const keys = await apiRequest(`/ecc/vaults/${vaultId}/keys`, { silent: true });
@@ -5245,6 +5263,28 @@ async function zkShareVaultToUser(vaultId, userId) {
         method: 'POST',
         body: JSON.stringify({ user_id: userId, wrapped_dek: wrappedDEK, ephemeral_public_key: ephemeralPublicKey }),
     });
+}
+
+// Team-onboarding (recipient side): if a manager has invited this (keyless) user
+// to a zero-knowledge vault, prompt them once per session to set up an encryption key so the
+// share can complete. Fully no-op for users who already have a key or have no invites.
+let _zkInvitePrompted = false;
+async function zkMaybePromptPendingInvites() {
+    if (_zkInvitePrompted) return;
+    let data;
+    try { data = await apiRequest('/ecc/keys/invites', { silent: true }); }
+    catch (_) { return; }
+    if (!data || !data.needs_keypair || !data.count) return;
+    _zkInvitePrompted = true;  // don't nag again this session, even if they decline
+    const inviter = (data.invites && data.invites[0] && data.invites[0].invited_by_username) || 'A vault manager';
+    const n = data.count;
+    const ok = await showConfirm(
+        `${inviter} wants to share ${n === 1 ? 'a zero-knowledge vault' : n + ' zero-knowledge vaults'} with you. ` +
+        `Set up your encryption key now to receive ${n === 1 ? 'it' : 'them'}? Your passphrase never leaves your ` +
+        `browser and cannot be recovered if lost.`,
+        'Set up encryption key'
+    );
+    if (ok) { try { await setupEncryptionKey(); } catch (_) { /* user cancelled / handled inside */ } }
 }
 
 // Forward-only DEK rotation when revoking a zero-knowledge member. Mints a fresh DEK in
@@ -7553,6 +7593,9 @@ document.addEventListener('DOMContentLoaded', () => {
             // Restrict the sidebar for a scoped temp credential AFTER any restore,
             // so a restored-but-forbidden section is corrected to an allowed one.
             await loadSessionAccess();
+
+            // Prompt a keyless user who's been invited to a ZK vault to set up a key.
+            zkMaybePromptPendingInvites();
         });
     } else {
         // No session, show login
