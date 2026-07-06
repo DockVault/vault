@@ -6105,7 +6105,12 @@ async def rename_file(
             # name to a future DEK epoch no member holds yet (would make it undecryptable) —
             # same guard as create_folder/seal-names. Files send no name_key_version (their name
             # follows the content epoch, which a rename never changes).
-            _cur = getattr(vault, 'dek_version', 1) or 1
+            # Serialize the seal-epoch read+write against retire_dek_versions (which holds the SAME
+            # Vault-row lock): without this a name (re)sealed at an old epoch could land in retire's
+            # scan->delete window and lose its member key -> a permanently undecryptable name.
+            # Same lock order as retire + upload-complete (Vault row first) -> no deadlock.
+            locked_vault = db.query(Vault).filter(Vault.id == vault_id).with_for_update().first()
+            _cur = getattr(locked_vault, 'dek_version', 1) or 1
             if rename_data.name_key_version is not None and int(rename_data.name_key_version) > _cur:
                 raise HTTPException(status_code=400, detail="Folder name epoch is ahead of the vault's current key epoch.")
 
@@ -6237,7 +6242,12 @@ async def create_folder(
                     raise HTTPException(status_code=400, detail="name_key_version must be an integer")
             # A folder name must be sealed under an EXISTING epoch — never a future one (that
             # would pin it to a DEK no member holds yet, risking an undecryptable name).
-            _cur = getattr(vault, 'dek_version', 1) or 1
+            # Serialize the seal-epoch read+write against retire_dek_versions (which holds the SAME
+            # Vault-row lock): without this a name sealed at an old epoch could land in retire's
+            # scan->delete window and lose its member key -> a permanently undecryptable name.
+            # Same lock order as retire + upload-complete (Vault row first) -> no deadlock.
+            locked_vault = db.query(Vault).filter(Vault.id == vault_id).with_for_update().first()
+            _cur = getattr(locked_vault, 'dek_version', 1) or 1
             if zk_name_kv is not None and zk_name_kv > _cur:
                 raise HTTPException(status_code=400, detail="Folder name epoch is ahead of the vault's current key epoch.")
         elif not folder_name:
