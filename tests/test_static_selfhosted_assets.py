@@ -27,12 +27,13 @@ def _require_running_container():
     return None
 
 
-# The customer-facing pages actually served by api_server.py: GET / serves
-# static/index.html (the dual-skin SPA shell), GET /setup serves the first-run
-# wizard. Any external-origin <script src>/<link href> here is a supply-chain
-# risk (executes in the vault origin), so they must be self-hosted. Plain
-# anchors (e.g. the "powered by" link) are navigation, not loaded resources.
-LIVE_HTML = [STATIC / "index.html", ROOT / "templates" / "setup_wizard.html"]
+# The customer-facing page actually served by api_server.py: GET / serves
+# static/index.html (the dual-skin SPA shell). Any external-origin
+# <script src>/<link href> here is a supply-chain risk (executes in the vault
+# origin), so it must be self-hosted. Plain anchors (e.g. the "powered by"
+# link) are navigation, not loaded resources. (The first-run /setup wizard —
+# the only page that used inline scripts — was removed.)
+LIVE_HTML = [STATIC / "index.html"]
 # The authoritative CSP is the response header set in api_server.py (the meta tag
 # in index.html is a belt-and-braces copy); its script-src must not allow-list
 # any external origin.
@@ -75,6 +76,18 @@ def test_server_side_csp_script_src_is_self_only():
     assert "http://" not in script_src and "https://" not in script_src, \
         f"server-side script-src still allow-lists an external origin: {script_src!r}"
     assert "jsdelivr" not in script_src
+
+
+def test_server_side_csp_script_src_has_no_unsafe_inline():
+    """The header CSP script-src must NOT allow 'unsafe-inline': the setup wizard — the only
+    page that needed inline scripts — was removed, so the SPA (self-hosted scripts + its own
+    strict meta CSP) runs fine under script-src 'self' with no inline-script XSS surface."""
+    src = _read(API_SERVER)
+    m = re.search(r'"(script-src[^"]*)"', src)
+    assert m, "api_server.py must declare a script-src CSP directive"
+    script_src = m.group(1)
+    assert "unsafe-inline" not in script_src, \
+        f"header script-src must not allow-list 'unsafe-inline': {script_src!r}"
 
 
 if __name__ == "__main__":  # allow: python test_static_selfhosted_assets.py

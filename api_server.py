@@ -185,7 +185,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         if 'text/html' in content_type:
             csp_directives = [
                 "default-src 'self'",  # Only load resources from same origin
-                "script-src 'self' 'unsafe-inline'",  # Inline scripts + self-hosted Chart.js (vendored under /static/js; no external CDN)
+                "script-src 'self'",  # Self-hosted scripts only (vendored under /static/js); NO inline scripts, no external CDN
                 "style-src 'self' 'unsafe-inline'",  # Allow inline styles
                 "img-src 'self' data: blob:",  # Allow images from same origin, data URIs, blob
                 "media-src 'self' blob:",  # Audio/video previews from in-memory blobs
@@ -252,54 +252,14 @@ from app.config.effective import BRAND_SETTINGS_KEY, set_brand_overrides
 # from env). Queried WITHOUT the is_active filter on purpose: a deactivated admin still
 # means the instance is set up and must NOT re-open the wizard. Setup is done by the
 # provisioning script / portal, so the wizard is a first-run-only fallback for a bare deploy.
-def require_setup_not_complete(db: Session = Depends(get_db)):
-    from models import User, RoleEnum
-    if db.query(User).filter(User.role == RoleEnum.ADMIN).count() > 0:
-        raise HTTPException(status_code=404, detail="Not found")
-
-# Import and include setup router (first-run detection). Gated: 404 once the instance is set up.
-# NOTE: Changed prefix from "/api" to "/api/setup-legacy" to avoid conflicts with wizard_router
-# The old setup API is kept for backwards compatibility but should not be used for new setups
-from app.setup.api import router as setup_router
-app.include_router(setup_router, prefix="/api/setup-legacy",
-                   dependencies=[Depends(require_setup_not_complete)])
-
-# Import and include setup wizard router (NEW - use this one!). Gated: 404 once set up.
-from app.setup.wizard_api import router as wizard_router
-app.include_router(wizard_router, prefix="/api/setup",
-                   dependencies=[Depends(require_setup_not_complete)])
-
 # Import and include ECC router (Elliptic Curve Cryptography)
 from ecc_router import router as ecc_router
 app.include_router(ecc_router, prefix="/ecc")
 
-# Setup wizard HTML route
-from app.setup.detector import needs_setup
-from fastapi.responses import RedirectResponse, HTMLResponse
-
-@app.get("/setup", response_class=HTMLResponse)
-async def setup_wizard_page(_: None = Depends(require_setup_not_complete)):
-    """Serve the setup wizard HTML page. Gated: 404 once the instance is set up (an admin
-    exists), so the wizard page can't be opened on a live production instance."""
-    templates_dir = os.path.join(os.path.dirname(__file__), "templates")
-    wizard_file = os.path.join(templates_dir, "setup_wizard.html")
-    
-    if os.path.exists(wizard_file):
-        with open(wizard_file, "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
-    else:
-        raise HTTPException(status_code=404, detail="Setup wizard not found")
-
 @app.get("/")
 async def root():
-    """Root endpoint - redirect to setup if needed, otherwise serve dashboard."""
-    #if needs_setup():
-    #    return RedirectResponse(url="/setup")
-    
-    # Serve the dashboard after setup is complete
+    """Root endpoint - serve the SPA dashboard."""
     static_dir = os.path.join(os.path.dirname(__file__), "static")
-    
-    # Serve index.html with new redesigned UI
     index_path = os.path.join(static_dir, "index.html")
     if os.path.exists(index_path):
         response = FileResponse(index_path)
@@ -308,13 +268,11 @@ async def root():
         response.headers['Pragma'] = 'no-cache'
         response.headers['Expires'] = '0'
         return response
-    
     # If no HTML files found, return status
     return {
         "status": "running",
         "message": "Vault API Server",
-        "setup_complete": True,
-        "endpoints": {"setup": "/setup", "api_docs": "/docs"}
+        "endpoints": {"api_docs": "/docs"}
     }
 
 # Security
