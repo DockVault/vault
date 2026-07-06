@@ -120,28 +120,44 @@ import hmac as _hmac  # noqa: E402
 import hashlib as _hashlib  # noqa: E402
 
 ZK_NAME_PREFIX = "zk1:"
+ZK_NAME_PREFIX_V2 = "zk2:"
 
 
 def _zk_name_aad(vault_id, field, epoch) -> bytes:
     return f"dv-zk-name-v1|{vault_id}|{field}|{epoch}".encode()
 
 
-def zk_encrypt_name(plaintext: str, dek: bytes, vault_id, field, epoch) -> str:
-    """AES-256-GCM(name) under the vault DEK, AAD-bound to vault|field|epoch. Returns the
-    same ZK_NAME_PREFIX + base64(iv||ct+tag) blob the browser produces."""
+def _zk_name_aad_v2(vault_id, field, epoch, obj_id) -> bytes:
+    return f"dv-zk-name-v2|{vault_id}|{field}|{epoch}|{obj_id}".encode()
+
+
+def zk_encrypt_name(plaintext: str, dek: bytes, vault_id, field, epoch, obj_id=None) -> str:
+    """AES-256-GCM(name) under the vault DEK. Mirrors ecc_crypto.js: v1 (zk1:, AAD vault|field|
+    epoch) when obj_id is None (legacy/backward-compat); v2 (zk2:, AAD also binds obj_id) when an
+    obj_id is given, so a v2 blob can't be transposed to a different object."""
     import os as _os
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     iv = _os.urandom(12)
-    ct = AESGCM(dek).encrypt(iv, str(plaintext).encode(), _zk_name_aad(vault_id, field, epoch))
-    return ZK_NAME_PREFIX + _base64.b64encode(iv + ct).decode()
+    if obj_id is None:
+        aad, prefix = _zk_name_aad(vault_id, field, epoch), ZK_NAME_PREFIX
+    else:
+        aad, prefix = _zk_name_aad_v2(vault_id, field, epoch, obj_id), ZK_NAME_PREFIX_V2
+    ct = AESGCM(dek).encrypt(iv, str(plaintext).encode(), aad)
+    return prefix + _base64.b64encode(iv + ct).decode()
 
 
-def zk_decrypt_name(token: str, dek: bytes, vault_id, field, epoch) -> str:
-    """Inverse of zk_encrypt_name (proves a stored blob is decryptable with the DEK)."""
+def zk_decrypt_name(token: str, dek: bytes, vault_id, field, epoch, obj_id=None) -> str:
+    """Inverse of zk_encrypt_name; branches on the blob version (zk2: binds obj_id, zk1: does not).
+    A v2 blob decrypted with the WRONG obj_id raises (GCM auth failure) — that IS the anti-
+    transposition property."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    b64 = token[len(ZK_NAME_PREFIX):] if token.startswith(ZK_NAME_PREFIX) else token
+    if token.startswith(ZK_NAME_PREFIX_V2):
+        b64, aad = token[len(ZK_NAME_PREFIX_V2):], _zk_name_aad_v2(vault_id, field, epoch, obj_id)
+    else:
+        b64 = token[len(ZK_NAME_PREFIX):] if token.startswith(ZK_NAME_PREFIX) else token
+        aad = _zk_name_aad(vault_id, field, epoch)
     raw = _base64.b64decode(b64)
-    return AESGCM(dek).decrypt(raw[:12], raw[12:], _zk_name_aad(vault_id, field, epoch)).decode()
+    return AESGCM(dek).decrypt(raw[:12], raw[12:], aad).decode()
 
 
 def zk_name_blind_index(name: str, dek: bytes, vault_id, epoch) -> str:
@@ -155,17 +171,20 @@ def zk_name_blind_index(name: str, dek: bytes, vault_id, epoch) -> str:
 
 
 def zk_chunked_upload(client, vault_id, name, content, dek, epoch=1, mime="text/plain",
-                      folder_id=None, chunk_size=None):
+                      folder_id=None, chunk_size=None, file_id=None):
     """Upload a file to a ZERO-KNOWLEDGE vault the browser way: the name + MIME are encrypted
     client-side (never sent in the clear) and the content is sent as opaque bytes. Returns the
-    completed file id. `dek` is the 32-byte vault DEK the caller uses for the name crypto."""
+    completed file id. `dek` is the 32-byte vault DEK the caller uses for the name crypto.
+
+    If `file_id` is given, the name/MIME are sealed BOUND to that id (v2) and the id is supplied
+    at complete (a client-generated id); otherwise legacy v1 (the server assigns the id)."""
     chunk_size = chunk_size or max(1, len(content))
     total_chunks = max(1, (len(content) + chunk_size - 1) // chunk_size)
     init = client.post(f"/vaults/{vault_id}/uploads", json={
         "total_size": len(content), "total_chunks": total_chunks, "chunk_size": chunk_size,
         "zk_key_version": epoch, "folder_id": folder_id,
-        "enc_name": zk_encrypt_name(name, dek, vault_id, "name", epoch),
-        "enc_mime": zk_encrypt_name(mime, dek, vault_id, "mime", epoch) if mime else None,
+        "enc_name": zk_encrypt_name(name, dek, vault_id, "name", epoch, obj_id=file_id),
+        "enc_mime": zk_encrypt_name(mime, dek, vault_id, "mime", epoch, obj_id=file_id) if mime else None,
         "name_bi": zk_name_blind_index(name, dek, vault_id, epoch),
     })
     init.raise_for_status()
@@ -175,7 +194,8 @@ def zk_chunked_upload(client, vault_id, name, content, dek, epoch=1, mime="text/
         r = client.put(f"/vaults/{vault_id}/uploads/{sid}/chunks/{i}", data=part,
                        headers={"Content-Type": "application/octet-stream"})
         r.raise_for_status()
-    done = client.post(f"/vaults/{vault_id}/uploads/{sid}/complete")
+    done = client.post(f"/vaults/{vault_id}/uploads/{sid}/complete",
+                       json={"file_id": str(file_id)} if file_id else None)
     done.raise_for_status()
     return done.json()["id"]
 

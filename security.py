@@ -197,14 +197,20 @@ def decrypt_gcm_chunk_stream(file_handle, vault_id, file_id) -> bytes:
 #
 # ZK_NAME_PREFIX MUST match the prefix the browser writes (ecc_crypto.js encryptName):
 # enc_name/enc_mime for a ZK object = ZK_NAME_PREFIX + base64(iv||ciphertext+tag).
+# v1 ('zk1:') binds AAD vault|field|epoch; v2 ('zk2:') ALSO binds the object id, so a sealed
+# name can't be transposed between same-vault/same-epoch objects. Both are valid sealed blobs;
+# v1 stays readable (additive migration), new seals are v2.
 ZK_NAME_PREFIX = 'zk1:'
+ZK_NAME_PREFIX_V2 = 'zk2:'
+ZK_NAME_PREFIXES = (ZK_NAME_PREFIX, ZK_NAME_PREFIX_V2)
 
 
 def is_zk_sealed_name(token) -> bool:
     """True if an enc_name/enc_mime blob was sealed CLIENT-SIDE for a zero-knowledge
     vault (the server has no key for it). Lets the transparent-decrypt load events and
-    any server reader skip ZK blobs instead of treating them as server-decryptable."""
-    return bool(token) and str(token).startswith(ZK_NAME_PREFIX)
+    any server reader skip ZK blobs instead of treating them as server-decryptable.
+    Accepts BOTH the v1 (zk1:) and the obj-id-bound v2 (zk2:) formats."""
+    return bool(token) and str(token).startswith(ZK_NAME_PREFIXES)
 
 
 _NAME_ENC_ROOT = HKDF(

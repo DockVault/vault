@@ -5172,9 +5172,9 @@ async function zkDecryptListingNames(items, vault) {
         const epoch = zkNameEpoch(it);
         try {
             const dek = await zkGetVaultDek(vault.id, epoch);
-            it.name = await eccLib().decryptName(it.enc_name, dek, vault.id, 'name', epoch);
+            it.name = await eccLib().decryptName(it.enc_name, dek, vault.id, 'name', epoch, it.id);
             if (it.enc_mime) {
-                try { it.mime_type = await eccLib().decryptName(it.enc_mime, dek, vault.id, 'mime', epoch); }
+                try { it.mime_type = await eccLib().decryptName(it.enc_mime, dek, vault.id, 'mime', epoch, it.id); }
                 catch (_) { /* keep whatever the server returned for mime */ }
             }
             it.zkLocked = false;
@@ -5204,12 +5204,14 @@ async function zkSealLegacyNames(vault, items) {
             const dek = await zkGetVaultDek(vault.id, epoch);
             const entry = {
                 id: it.id, kind: it.type,
-                enc_name: await eccLib().encryptName(it.name, dek, vault.id, 'name', epoch),
+                // Seal bound to the existing row id (v2) — upgrades a legacy plaintext name
+                // straight to the obj-id-bound format.
+                enc_name: await eccLib().encryptName(it.name, dek, vault.id, 'name', epoch, it.id),
                 name_bi: await eccLib().nameBlindIndex(it.name, dek, vault.id, epoch),
             };
             if (it.type === 'folder') entry.name_key_version = epoch;
             if (it.type === 'file' && it.mime_type) {
-                entry.enc_mime = await eccLib().encryptName(it.mime_type, dek, vault.id, 'mime', epoch);
+                entry.enc_mime = await eccLib().encryptName(it.mime_type, dek, vault.id, 'mime', epoch, it.id);
             }
             payload.push(entry);
         } catch (_) { /* missing epoch DEK — leave for a member who has it */ }
@@ -5544,7 +5546,7 @@ async function renameVaultItem(itemId, currentName, type) {
                 const dek = await zkGetVaultDek(vid, epoch);
                 const lib = eccLib();
                 body = {
-                    enc_name: await lib.encryptName(newName.trim(), dek, vid, 'name', epoch),
+                    enc_name: await lib.encryptName(newName.trim(), dek, vid, 'name', epoch, itemId),
                     name_bi: await lib.nameBlindIndex(newName.trim(), dek, vid, epoch),
                 };
                 if (type === 'folder') body.name_key_version = epoch;
@@ -6714,7 +6716,10 @@ async function createFolder() {
                 const epoch = await zkGetCurrentDekVersion(vid);
                 const dek = await zkGetVaultDek(vid, epoch);
                 const lib = eccLib();
-                body.enc_name = await lib.encryptName(folderName, dek, vid, 'name', epoch);
+                // Client-generate the folder id so the name is sealed BOUND to it (v2, can't be
+                // transposed). The server uses this id for the row (validated + collision-checked).
+                body.id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : undefined;
+                body.enc_name = await lib.encryptName(folderName, dek, vid, 'name', epoch, body.id);
                 body.name_bi = await lib.nameBlindIndex(folderName, dek, vid, epoch);
                 body.name_key_version = epoch;
             } catch (e) {

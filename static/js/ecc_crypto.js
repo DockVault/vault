@@ -562,51 +562,69 @@ class ECCCryptoLibrary {
     // Marker prefix on every ZK-sealed name blob so the SERVER can tell a browser-encrypted
     // name from a Standard (server-key) one and never try to decrypt it. Must equal
     // security.ZK_NAME_PREFIX.
-    get ZK_NAME_PREFIX() { return 'zk1:'; }
+    get ZK_NAME_PREFIX() { return 'zk1:'; }        // legacy v1 blobs (decrypt-only; obj id NOT bound)
+    get ZK_NAME_PREFIX_V2() { return 'zk2:'; }     // v2 blobs: AAD also binds the object id
 
-    // AAD binds a name blob to its vault, field ('name'|'mime') and DEK epoch, so enc_name
-    // and enc_mime are not interchangeable and a blob can't be reused under another epoch.
-    // (The object id is NOT bound — the client doesn't know it before the row is created;
-    // this matches ZK content, which the server also can't bind to a file id.)
+    // v1 AAD binds a name blob to its vault, field ('name'|'mime') and DEK epoch. It does NOT
+    // bind the object id, so a v1 blob CAN be transposed between same-vault/same-epoch objects.
+    // Kept only to decrypt pre-existing v1 blobs.
     _zkNameAad(vaultId, field, epoch) {
         return new TextEncoder().encode(`dv-zk-name-v1|${vaultId}|${field}|${epoch}`);
     }
 
+    // v2 AAD ALSO binds the object id (file/folder UUID), so a sealed name can't be moved to a
+    // different object — the GCM auth fails on decrypt with the wrong id. New seals use this.
+    _zkNameAadV2(vaultId, field, epoch, objId) {
+        return new TextEncoder().encode(`dv-zk-name-v2|${vaultId}|${field}|${epoch}|${objId}`);
+    }
+
     /**
-     * Encrypt a file/folder name or MIME string for a zero-knowledge vault.
+     * Encrypt a file/folder name or MIME string for a zero-knowledge vault (v2: obj-id-bound).
      * @param {string} plaintext  the name (or MIME) to seal
      * @param {CryptoKey} vaultDEK the vault DEK (AES-GCM) at `epoch`
      * @param {string} vaultId
      * @param {string} field 'name' | 'mime'
      * @param {number} epoch the DEK epoch the name is sealed under
-     * @returns {Promise<string>} ZK_NAME_PREFIX + base64(iv || ciphertext+tag)
+     * @param {string} [objId] the file/folder id the name belongs to. When given, the name is
+     *   sealed v2 (obj-id-bound, can't be transposed); when omitted, legacy v1 (unbound).
+     * @returns {Promise<string>} (ZK_NAME_PREFIX_V2 for v2, else ZK_NAME_PREFIX) + base64(iv||ct+tag)
      */
-    async encryptName(plaintext, vaultDEK, vaultId, field, epoch) {
+    async encryptName(plaintext, vaultDEK, vaultId, field, epoch, objId) {
+        const bound = !(objId === undefined || objId === null || objId === '');
+        const aad = bound ? this._zkNameAadV2(vaultId, field, epoch, objId)
+                          : this._zkNameAad(vaultId, field, epoch);
+        const prefix = bound ? this.ZK_NAME_PREFIX_V2 : this.ZK_NAME_PREFIX;
         const iv = window.crypto.getRandomValues(new Uint8Array(this.AES_IV_LENGTH));
         const ct = await window.crypto.subtle.encrypt(
-            { name: this.AES_ALGORITHM, iv, tagLength: this.AES_TAG_LENGTH,
-              additionalData: this._zkNameAad(vaultId, field, epoch) },
+            { name: this.AES_ALGORITHM, iv, tagLength: this.AES_TAG_LENGTH, additionalData: aad },
             vaultDEK,
             new TextEncoder().encode(String(plaintext)),
         );
         const combined = new Uint8Array(iv.length + ct.byteLength);
         combined.set(iv, 0);
         combined.set(new Uint8Array(ct), iv.length);
-        return this.ZK_NAME_PREFIX + this._arrayBufferToBase64(combined.buffer);
+        return prefix + this._arrayBufferToBase64(combined.buffer);
     }
 
     /**
-     * Inverse of encryptName. Throws on a wrong DEK/epoch/field (GCM auth failure).
+     * Inverse of encryptName. Branches on the blob version: v2 (zk2:) binds objId; v1 (zk1:,
+     * legacy) does not. Throws on a wrong DEK/epoch/field/objId (GCM auth failure).
      */
-    async decryptName(token, vaultDEK, vaultId, field, epoch) {
-        let b64 = String(token);
-        if (b64.startsWith(this.ZK_NAME_PREFIX)) b64 = b64.slice(this.ZK_NAME_PREFIX.length);
+    async decryptName(token, vaultDEK, vaultId, field, epoch, objId) {
+        const t = String(token);
+        let b64, aad;
+        if (t.startsWith(this.ZK_NAME_PREFIX_V2)) {
+            b64 = t.slice(this.ZK_NAME_PREFIX_V2.length);
+            aad = this._zkNameAadV2(vaultId, field, epoch, objId);
+        } else {
+            b64 = t.startsWith(this.ZK_NAME_PREFIX) ? t.slice(this.ZK_NAME_PREFIX.length) : t;
+            aad = this._zkNameAad(vaultId, field, epoch);  // legacy v1 (obj id not bound)
+        }
         const data = new Uint8Array(this._base64ToArrayBuffer(b64));
         const iv = data.slice(0, this.AES_IV_LENGTH);
         const ct = data.slice(this.AES_IV_LENGTH);
         const pt = await window.crypto.subtle.decrypt(
-            { name: this.AES_ALGORITHM, iv, tagLength: this.AES_TAG_LENGTH,
-              additionalData: this._zkNameAad(vaultId, field, epoch) },
+            { name: this.AES_ALGORITHM, iv, tagLength: this.AES_TAG_LENGTH, additionalData: aad },
             vaultDEK,
             ct,
         );

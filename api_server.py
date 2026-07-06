@@ -1501,14 +1501,15 @@ async def zk_unsealed_count(
     reports 0. The read guards already MASK such rows from being served, so this is a re-seal
     to-do list for owners, not a live leak. Admin-only (fleet-wide across all ZK vaults)."""
     from models import Vault, File, Folder
-    from sqlalchemy import or_, not_
+    from sqlalchemy import or_, not_, and_
     zk_ids = [r[0] for r in db.query(Vault.id).filter(Vault.type == 'zero_knowledge').all()]
     if not zk_ids:
         return {"zk_vaults": 0, "files_unsealed": 0, "folders_unsealed": 0, "vaults_affected": 0}
 
     def _unsealed(col):
-        # NULL (never sealed) OR present-but-not-a-zk1: blob. Sealed rows (zk1:...) are excluded.
-        return or_(col.is_(None), not_(col.like('zk1:%')))
+        # NULL (never sealed) OR present-but-not a sealed blob. A sealed row is v1 (zk1:...) OR
+        # v2 (zk2:..., obj-id-bound) — both are excluded from the "unsealed" count.
+        return or_(col.is_(None), and_(not_(col.like('zk1:%')), not_(col.like('zk2:%'))))
 
     files_unsealed = db.query(File).filter(File.vault_id.in_(zk_ids), _unsealed(File.enc_name)).count()
     folders_unsealed = db.query(Folder).filter(Folder.vault_id.in_(zk_ids), _unsealed(Folder.enc_name)).count()
@@ -5514,6 +5515,20 @@ async def complete_chunked_upload(
     _reject_unreplaceable_upload(db, vault_id, folder_uuid, session.filename, current_user,
                                  name_bi=zk_name_bi)
 
+    # Zero-knowledge v2 name binding: the client may supply the file id it sealed the name
+    # under (so the sealed name binds the final row id and can't be transposed). Optional +
+    # backward-compatible — absent means the server assigns the id (legacy v1). Reject a
+    # collision cleanly (409) instead of a later 500.
+    client_file_id = None
+    try:
+        _cbody = await request.json()
+        if isinstance(_cbody, dict) and _cbody.get("file_id"):
+            client_file_id = uuid.UUID(str(_cbody["file_id"]))
+    except Exception:  # noqa: BLE001 — no/invalid body -> server assigns the id
+        client_file_id = None
+    if client_file_id is not None and db.query(File.id).filter(File.id == client_file_id).first():
+        raise HTTPException(status_code=409, detail="File id already in use")
+
     try:
         file_info, stream_ctx = vault_service.upload_file_streaming(
             vault_id=vault_id,
@@ -5521,6 +5536,7 @@ async def complete_chunked_upload(
             user=current_user,
             folder_id=folder_uuid,
             mime_type=session.mime_type,
+            file_id=client_file_id,
         )
         with stream_ctx as ctx:
             for i in range(session.total_chunks):
@@ -5594,6 +5610,15 @@ async def complete_chunked_upload(
             db.rollback()
         shutil.rmtree(sdir, ignore_errors=True)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except ValueError as e:
+        # A client-supplied file id that collided (a fresh-UUID race that slipped past the
+        # pre-check) -> a clean 409, not a 500. Any other ValueError keeps the generic handling.
+        if "id already in use" in str(e):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="File id already in use")
+        session.status = 'failed'
+        session.error_message = str(e)[:500]
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"Failed to finalize upload: {str(e)}")
     except Exception as e:
         session.status = 'failed'
         session.error_message = str(e)[:500]
@@ -6219,6 +6244,7 @@ async def create_folder(
         zk_enc_name = folder_data.get('enc_name')
         zk_name_bi = folder_data.get('name_bi')
         zk_name_kv = folder_data.get('name_key_version')
+        folder_client_id = None  # ZK v2: the client-supplied folder id (validated in the ZK branch)
         if is_zk:
             if not zk_enc_name or not zk_name_bi:
                 raise HTTPException(
@@ -6231,6 +6257,16 @@ async def create_folder(
                     detail="A zero-knowledge folder must not send a plaintext name.",
                 )
             _require_zk_sealed_names(zk_enc_name)
+            # Zero-knowledge v2 name binding: the client supplies the folder id it sealed the
+            # name under (so the sealed name binds the final row id). Optional + backward-compat;
+            # reject a bad/colliding id cleanly.
+            if folder_data.get('id') is not None:
+                try:
+                    folder_client_id = uuid.UUID(str(folder_data.get('id')))
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=400, detail="id must be a UUID")
+                if db.query(Folder.id).filter(Folder.id == folder_client_id).first():
+                    raise HTTPException(status_code=409, detail="Folder id already in use")
             # folder_data is a raw dict (untyped), so validate the client-supplied fields here
             # — a malformed value must be a clean 400, not a 500 (int()/DB DataError) below.
             if len(str(zk_name_bi)) > 64:
@@ -6265,6 +6301,7 @@ async def create_folder(
             zk_enc_name=zk_enc_name,
             zk_name_bi=zk_name_bi,
             zk_name_key_version=zk_name_kv,
+            folder_id=folder_client_id,
         )
         
         # Audit log
@@ -6297,6 +6334,11 @@ async def create_folder(
     except DuplicateNameError as e:
         # Same-name folder already exists in this parent (pre-check or unique-index race).
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except ValueError as e:
+        # A client-supplied folder id that collided (a fresh-UUID race past the pre-check) -> 409.
+        if "id already in use" in str(e):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Folder id already in use")
+        raise
     except HTTPException:
         # Deliberate 4xx (e.g. ZK plaintext-name rejection, missing name) must propagate
         # as-is rather than be re-wrapped into a generic 500 below.

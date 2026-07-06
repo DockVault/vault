@@ -529,6 +529,7 @@ class VaultService:
         zk_enc_name: Optional[str] = None,
         zk_name_bi: Optional[str] = None,
         zk_name_key_version: Optional[int] = None,
+        folder_id: Optional[uuid.UUID] = None,
     ) -> Folder:
         """
         Create a folder in a vault.
@@ -581,8 +582,13 @@ class VaultService:
         ).first() is not None:
             raise DuplicateNameError("A folder with that name already exists in this location")
 
+        # Folder ID: a CLIENT-supplied id (zero-knowledge v2 name binding — the browser seals
+        # the name bound to this id) or a server-generated one; assigned now so the at-rest name
+        # cipher key (per id) is available. The endpoint validates a client id is a fresh UUID.
+        if folder_id is not None and self.db.query(Folder.id).filter(Folder.id == folder_id).first():
+            raise ValueError("folder id already in use")
         folder = Folder(
-            id=uuid.uuid4(),  # assign now so the at-rest name cipher key (per id) is available
+            id=folder_id or uuid.uuid4(),
             # ZK: no plaintext name — store the browser-encrypted name + blind index + epoch.
             name=None if is_zk else sanitize_filename(name),
             vault_id=vault_id,
@@ -777,7 +783,8 @@ class VaultService:
         user: User,
         folder_id: Optional[uuid.UUID] = None,
         password: Optional[str] = None,
-        mime_type: Optional[str] = None
+        mime_type: Optional[str] = None,
+        file_id: Optional[uuid.UUID] = None,
     ) -> tuple[File, object]:
         """
         Start a streaming file upload.
@@ -809,9 +816,13 @@ class VaultService:
             folder = self.db.query(Folder).filter(Folder.id == folder_id).first()
             if not folder or folder.vault_id != vault_id:
                 raise FolderNotFoundError("Folder not found or not in vault")
-        
-        # Generate unique file ID and storage path
-        file_id = uuid.uuid4()
+
+        # File ID: a CLIENT-supplied id (zero-knowledge v2 name binding — the browser seals the
+        # name bound to this id before the row exists) or a server-generated one. The endpoint
+        # validates a client id is a fresh UUID; this is belt-and-suspenders against a collision.
+        if file_id is not None and self.db.query(File.id).filter(File.id == file_id).first():
+            raise ValueError("file id already in use")
+        file_id = file_id or uuid.uuid4()
         storage_path = self._get_file_storage_path(vault_id, file_id, folder_id)
         storage_path.parent.mkdir(parents=True, exist_ok=True)
         
