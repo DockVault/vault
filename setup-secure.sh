@@ -213,14 +213,20 @@ preflight_ports() {
   local _secopts
   _secopts="$(docker info --format '{{join .SecurityOptions ","}}' 2>/dev/null || true)"
   if printf '%s' "$_secopts" | grep -q 'rootless'; then
-    say ""
-    warn "this Docker engine is ROOTLESS — publishing host port 443 (a privileged"
-    warn "port <1024) will fail with an \"unable to listen on 443\" error unless you"
-    warn "either:"
-    warn "  * run against a ROOTFUL daemon:   docker context use default"
-    warn "  * OR allow the privileged bind:   sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443"
-    warn "    (persist: echo 'net.ipv4.ip_unprivileged_port_start=443' | sudo tee /etc/sysctl.d/99-vault.conf)"
-    say ""
+    # Only a real problem when the unprivileged-port floor is above 443; if the
+    # operator already lowered it, publishing 443 works fine on rootless.
+    local _floor
+    _floor="$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo 1024)"
+    if [ "${_floor:-1024}" -gt 443 ]; then
+      say ""
+      warn "this Docker engine is ROOTLESS and the unprivileged-port floor is $_floor (>443),"
+      warn "so publishing host port 443 WILL fail with \"unable to listen on 443\". Fix it"
+      warn "BEFORE this run (Redis/Postgres/SFTP would come up but the web app would not):"
+      warn "  * allow the privileged bind:   sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443"
+      warn "    (persist: echo 'net.ipv4.ip_unprivileged_port_start=443' | sudo tee /etc/sysctl.d/99-vault.conf)"
+      warn "  * OR run against a ROOTFUL daemon:   docker context use default"
+      say ""
+    fi
   fi
   if command -v ss >/dev/null 2>&1; then
     if ss -H -ltn 2>/dev/null | grep -Eq '[^0-9]:443[[:space:]]'; then
@@ -514,16 +520,53 @@ say ""
 say "Waiting for vault-api to become healthy (startup migrations run on first boot) ..."
 _status=starting
 for _i in $(seq 1 40); do
-  _status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' vault-api 2>/dev/null || echo starting)"
-  [ "$_status" = "healthy" ] && break
+  _status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' vault-api 2>/dev/null || echo missing)"
+  case "$_status" in
+    healthy)     break ;;
+    exited|dead) break ;;   # container gave up — stop waiting, diagnose now
+    restarting)             # crash-looping — bail once it's clearly not recovering
+      _rc="$(docker inspect -f '{{.RestartCount}}' vault-api 2>/dev/null || echo 0)"
+      [ "${_rc:-0}" -ge 3 ] && break ;;
+  esac
   sleep 3
 done
-if [ "$_status" = "healthy" ]; then
-  say "  vault-api is healthy."
-else
-  say "  WARNING: vault-api is '$_status' — inspect with:"
-  say "    docker compose -f $COMPOSE_FILE logs vault-api"
+
+# The web app is the whole point of this deploy, so a vault-api that isn't serving
+# on 443 is a HARD failure — surface the real cause (logs + the two usual culprits)
+# and exit non-zero, instead of printing a success summary for a stack that is down.
+if [ "$_status" != "healthy" ]; then
+  _l443="unknown"
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltn 2>/dev/null | grep -Eq '[^0-9]:443[[:space:]]' && _l443=yes || _l443=no
+  fi
+  say ""
+  warn "vault-api did NOT come up healthy (state: '$_status'; host :443 listening: $_l443)."
+  say ""
+  say "  ---- docker compose -f $COMPOSE_FILE logs --tail 40 vault-api ----"
+  docker compose -f "$COMPOSE_FILE" logs --tail 40 --no-color vault-api 2>&1 | sed 's/^/    /' || true
+  say "  ------------------------------------------------------------------"
+  _logs="$(docker compose -f "$COMPOSE_FILE" logs --no-color vault-api 2>&1 || true)"
+  _derr="$(docker inspect -f '{{.State.Error}}' vault-api 2>/dev/null || true)"
+  say ""
+  if printf '%s' "$_logs" | grep -Eqi 'permission denied.*(cert|key|\.pem)|ssl.*(cert|key)|could not.*(read|load).*(cert|key)|no such file.*\.pem'; then
+    warn "LIKELY CAUSE: the container can't read the TLS cert/key. On a rootless or"
+    warn "userns-remapped engine the host uid doesn't map into the container, so a"
+    warn "mode-600 key is unreadable. Fix:  sudo chmod 644 $CERT_DIR/key.pem"
+    warn "  (or regenerate:  sudo ./setup-secure.sh --certs-only), then re-run."
+    say ""
+  fi
+  if printf '%s %s' "$_logs" "$_derr" | grep -Eqi 'bind.*443|address already in use|listen tcp.*:443|:443.*permission denied|failed to bind'; then
+    warn "LIKELY CAUSE: host port 443 could not be bound. Either something already"
+    warn "holds it (find it:  sudo ss -ltnp 'sport = :443'), or this is a ROOTLESS"
+    warn "engine that can't bind a privileged port:"
+    warn "  sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443   (then re-run)"
+    warn "  or use a rootful daemon:  docker context use default"
+    say ""
+  fi
+  die "vault-api is not serving on https/443 — fix the cause above and re-run 'sudo ./setup-secure.sh'.
+       (Redis/Postgres/SFTP may be up, but no summary is printed because the web app is down.)"
 fi
+say "  vault-api is healthy."
 
 # ---------------------------------------------------------------- summary
 # Resolve the display name: shell var -> .env -> the cert's CN (covers an older

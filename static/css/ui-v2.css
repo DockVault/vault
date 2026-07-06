@@ -761,7 +761,14 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand-secondar
     border: 1px solid var(--line);
     border-radius: var(--radius-xl);
     box-shadow: var(--shadow-xl);
-    overflow: hidden;
+    /* Cap the height and scroll INSIDE the modal (matches the base/classic skin).
+       A bare `overflow: hidden` here clipped a tall modal (e.g. the "Generate
+       temporary credentials" form) with NO scrollbar, so its lower fields were
+       unreachable — and only on this skin, which is why it appeared browser- or
+       machine-dependent (it tracked the user's saved UI skin, not the browser).
+       `overflow-y: auto` still clips to the rounded corners, so the corners stay. */
+    max-height: 90vh;
+    overflow-y: auto;
 }
 .modal-header {
     padding: .75rem 1rem;
