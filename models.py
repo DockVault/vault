@@ -970,6 +970,27 @@ class ZKShareInvite(Base):
     )
 
 
+class ECCRegistrationChallenge(Base):
+    """A one-time proof-of-possession challenge for ECC public-key registration (ecc_pop.py).
+
+    Holds the server's EPHEMERAL private key + nonce so the register endpoint can verify the
+    client's ECDH key-confirmation MAC. NOT a user key and never a DEK — a transient,
+    single-use, short-TTL server challenge (deleted on verify; expired rows swept). This is
+    what stops a caller registering a public key whose private key they don't hold.
+    """
+    __tablename__ = 'ecc_registration_challenges'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    server_private_key = Column(Text, nullable=False)  # server ephemeral PKCS8 PEM (transient)
+    nonce = Column(Text, nullable=False)               # base64
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_ecc_challenge_user', 'user_id'),
+    )
+
+
 class VaultMemberKey(Base):
     """
     Stores per-member wrapped vault Data Encryption Keys (DEKs).

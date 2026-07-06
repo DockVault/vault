@@ -15,7 +15,8 @@ import os
 import json
 import uuid
 from database import get_db
-from models import User, Vault, UserKeyPair, VaultMemberKey, ZKShareInvite, vault_members, RoleEnum
+from models import User, Vault, UserKeyPair, VaultMemberKey, ZKShareInvite, ECCRegistrationChallenge, vault_members, RoleEnum
+import ecc_pop
 from ecc_crypto_service import ECCCryptoService
 from audit_logger import AuditLogger
 from rate_limiter import rate_limiter as _rate_limiter
@@ -32,12 +33,20 @@ security_scheme = HTTPBearer()
 # Pydantic Models
 # =============================================================================
 
+class RegistrationPoP(BaseModel):
+    """Proof-of-possession for key registration: the challenge id + the client's ECDH
+    key-confirmation MAC over (nonce || public_key). See ecc_pop.py."""
+    challenge_id: str
+    mac: str
+
+
 class KeypairRegisterRequest(BaseModel):
     """Request to register user's public key."""
     public_key: str = Field(..., description="PEM-encoded ECC P-384 public key")
     encrypted_private_key: Optional[str] = None  # Password-encrypted for recovery
     key_salt: Optional[str] = None  # Salt for password-derived encryption
     key_iterations: int = 600000  # PBKDF2 iterations
+    pop: Optional[RegistrationPoP] = None  # ECDH key-confirmation proof-of-possession
 
 
 class KeypairRegisterResponse(BaseModel):
@@ -367,6 +376,58 @@ async def decompress_point(
 # ECC Endpoints (Stub Implementation)
 # =============================================================================
 
+_POP_CHALLENGE_TTL_SECONDS = 300  # a registration challenge is single-use + short-lived
+
+
+@router.post("/keys/register/challenge")
+async def register_challenge(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Issue a one-time proof-of-possession challenge for key registration: a server
+    EPHEMERAL public key + nonce the client MACs with its private key (ECDH key-confirmation).
+    Bound to the current user, single-use, short-lived. See ecc_pop.py."""
+    _ecc_rate_limit(current_user, "register")
+    priv_pem, pub_pem, nonce_b64 = ecc_pop.generate_challenge()
+    # One live challenge per user: drop any prior ones so the table can't accrete.
+    db.query(ECCRegistrationChallenge).filter(
+        ECCRegistrationChallenge.user_id == current_user.id
+    ).delete(synchronize_session=False)
+    ch = ECCRegistrationChallenge(user_id=current_user.id, server_private_key=priv_pem, nonce=nonce_b64)
+    db.add(ch)
+    db.commit()
+    db.refresh(ch)
+    return {"challenge_id": str(ch.id), "server_ephemeral_public_key": pub_pem, "nonce": nonce_b64}
+
+
+def _verify_registration_pop(db: Session, user: User, request: "KeypairRegisterRequest") -> None:
+    """Enforce ECDH key-confirmation proof-of-possession for register_public_key. The challenge
+    is consumed (deleted) whether or not it verifies, so a failed MAC can't be replayed against
+    it. Raises 400 on a missing / malformed / unknown / expired challenge or a bad MAC."""
+    pop = request.pop
+    if pop is None or not pop.challenge_id or not pop.mac:
+        raise HTTPException(status_code=400, detail="Proof of possession is required to register a key.")
+    try:
+        cid = uuid.UUID(str(pop.challenge_id))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid proof-of-possession challenge.")
+    ch = db.query(ECCRegistrationChallenge).filter(
+        ECCRegistrationChallenge.id == cid,
+        ECCRegistrationChallenge.user_id == user.id,
+    ).first()
+    if ch is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired proof-of-possession challenge.")
+    # Consume it FIRST (single-use): capture the values, then delete + commit so a wrong MAC
+    # can't be brute-forced by retrying against the same challenge.
+    created_at, server_priv, nonce = ch.created_at, ch.server_private_key, ch.nonce
+    db.delete(ch)
+    db.commit()
+    if created_at is None or (datetime.utcnow() - created_at) > timedelta(seconds=_POP_CHALLENGE_TTL_SECONDS):
+        raise HTTPException(status_code=400, detail="Proof-of-possession challenge has expired; request a new one.")
+    if not ecc_pop.verify_pop(server_priv, request.public_key, nonce, pop.mac):
+        raise HTTPException(status_code=400, detail="Proof of possession failed for this public key.")
+
+
 @router.post("/keys/register", status_code=status.HTTP_201_CREATED, response_model=KeypairRegisterResponse)
 async def register_public_key(
     request: KeypairRegisterRequest,
@@ -405,6 +466,11 @@ async def register_public_key(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="An encryption key is already set up for this account.",
             )
+
+        # Proof-of-possession: the caller must prove they hold the PRIVATE key matching this
+        # public key (ECDH key-confirmation, via POST /keys/register/challenge), so a
+        # substituted / not-held key can't be registered. Raises 400 on missing/invalid/expired.
+        _verify_registration_pop(db, current_user, request)
 
         keypair = UserKeyPair(
             user_id=current_user.id,

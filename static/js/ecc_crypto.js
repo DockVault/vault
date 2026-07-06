@@ -356,6 +356,42 @@ class ECCCryptoLibrary {
         };
     }
 
+    /**
+     * Registration proof-of-possession (ECDH key-confirmation). Proves to the server that
+     * this client holds the PRIVATE key for the public key being registered, so a
+     * substituted / not-held key can't be registered. Does ECDH(userPrivateKey,
+     * serverEphemeralPublicKey) -> HKDF -> HMAC over (nonce || publicKeyPem). Exact mirror
+     * of the server's ecc_pop.py (salt 'dv-ecc-pop-v1', info 'registration-pop', SHA-256).
+     *
+     * @param {string} serverEphemeralPublicKeyPem - server ephemeral public key (SPKI PEM)
+     * @param {string} nonceBase64 - base64 nonce from the challenge
+     * @param {string} publicKeyPem - the PEM public key being registered (bound into the MAC)
+     * @param {CryptoKey} userPrivateKey - the user's ECDH private key (deriveBits)
+     * @returns {Promise<string>} base64 HMAC-SHA256
+     */
+    async computeRegistrationPoP(serverEphemeralPublicKeyPem, nonceBase64, publicKeyPem, userPrivateKey) {
+        const serverPub = await this.importPublicKeyPEM(serverEphemeralPublicKeyPem);
+        const shared = await window.crypto.subtle.deriveBits(
+            { name: 'ECDH', public: serverPub }, userPrivateKey, 384);
+        const hkdfKey = await window.crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+        const macKeyBits = await window.crypto.subtle.deriveBits(
+            {
+                name: 'HKDF', hash: 'SHA-256',
+                salt: new TextEncoder().encode('dv-ecc-pop-v1'),
+                info: new TextEncoder().encode('registration-pop'),
+            },
+            hkdfKey, 256);
+        const macKey = await window.crypto.subtle.importKey(
+            'raw', macKeyBits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+        const nonce = new Uint8Array(this._base64ToArrayBuffer(nonceBase64));
+        const pubBytes = new TextEncoder().encode(publicKeyPem);
+        const msg = new Uint8Array(nonce.byteLength + pubBytes.byteLength);
+        msg.set(nonce, 0);
+        msg.set(pubBytes, nonce.byteLength);
+        const mac = await window.crypto.subtle.sign('HMAC', macKey, msg);
+        return this._arrayBufferToBase64(mac);
+    }
+
     // =========================================================================
     // HIERARCHICAL MODE — wrap/unwrap a TEAM PRIVATE KEY to/from a member pubkey
     // =========================================================================

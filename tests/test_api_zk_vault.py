@@ -125,6 +125,20 @@ def _fresh_pubkey_pem():
     ).decode()
 
 
+def _register_fresh(client, blob: str):
+    """Register a fresh keypair WITH a valid proof-of-possession (the server now requires one)."""
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import serialization
+    from conftest import compute_registration_pop
+    priv = ec.generate_private_key(ec.SECP384R1())
+    pub = priv.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+    return client.post("/ecc/keys/register", json={
+        "public_key": pub, "encrypted_private_key": blob,
+        "pop": compute_registration_pop(client, priv, pub),
+    })
+
+
 def test_ecc_private_key_blob_roundtrip(admin):
     """The password-encrypted private key blob registered by the client is handed
     back verbatim by GET /ecc/keys/private (so another session can unlock it).
@@ -136,8 +150,7 @@ def test_ecc_private_key_blob_roundtrip(admin):
     client = ApiClient(); client.login(user["_username"], user["_password"])
     try:
         blob = json.dumps({"encrypted": unique("ct"), "salt": unique("s"), "iterations": 600000})
-        assert client.post("/ecc/keys/register",
-                           json={"public_key": _fresh_pubkey_pem(), "encrypted_private_key": blob}).status_code == 201
+        assert _register_fresh(client, blob).status_code == 201
         got = client.get("/ecc/keys/private").json()
         assert got["has_keypair"] is True
         assert got["encrypted_private_key"] == blob
@@ -156,8 +169,7 @@ def test_ecc_keypair_register_rejects_overwrite(admin):
     client = ApiClient(); client.login(user["_username"], user["_password"])
     try:
         first = json.dumps({"encrypted": unique("first"), "salt": unique("s"), "iterations": 600000})
-        assert client.post("/ecc/keys/register",
-                           json={"public_key": _fresh_pubkey_pem(), "encrypted_private_key": first}).status_code == 201
+        assert _register_fresh(client, first).status_code == 201
         # A second registration is rejected (409), not silently applied.
         r = client.post("/ecc/keys/register", json={
             "public_key": _fresh_pubkey_pem(),

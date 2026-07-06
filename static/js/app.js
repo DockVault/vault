@@ -4761,6 +4761,11 @@ async function zkRegisterNewKeypair() {
     const publicPem = await lib.exportPublicKeyPEM(kp.publicKey);
     const privatePem = await lib.exportPrivateKeyPEM(kp.privateKey);
     const enc = await lib.encryptPrivateKey(privatePem, pass);  // {encrypted, salt, iterations}
+    // Proof-of-possession: prove we hold this key's private half (ECDH key-confirmation) so the
+    // server won't accept a substituted/unheld public key.
+    const challenge = await apiRequest('/ecc/keys/register/challenge', { method: 'POST' });
+    const mac = await lib.computeRegistrationPoP(
+        challenge.server_ephemeral_public_key, challenge.nonce, publicPem, kp.privateKey);
     await apiRequest('/ecc/keys/register', {
         method: 'POST',
         body: JSON.stringify({
@@ -4770,6 +4775,7 @@ async function zkRegisterNewKeypair() {
             encrypted_private_key: JSON.stringify(enc),
             key_salt: enc.salt,
             key_iterations: enc.iterations,
+            pop: { challenge_id: challenge.challenge_id, mac },
         }),
     });
     // Hold a NON-extractable runtime copy (the generated key was extractable only

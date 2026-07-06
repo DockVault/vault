@@ -18,10 +18,14 @@ from conftest import create_zk_vault, ensure_ecc_keypair, ZK_WRAPPED_DEK_STUB, Z
 def _register(client, blob: str):
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives import serialization
+    from conftest import compute_registration_pop
     priv = ec.generate_private_key(ec.SECP384R1())
     pub_pem = priv.public_key().public_bytes(
         serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
-    client.post("/ecc/keys/register", json={"public_key": pub_pem, "encrypted_private_key": blob}).raise_for_status()
+    client.post("/ecc/keys/register", json={
+        "public_key": pub_pem, "encrypted_private_key": blob,
+        "pop": compute_registration_pop(client, priv, pub_pem),
+    }).raise_for_status()
     return pub_pem
 
 

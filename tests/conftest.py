@@ -55,13 +55,34 @@ def unique(prefix: str = "t") -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
+def compute_registration_pop(client, priv, public_key_pem: str) -> dict:
+    """Client-side registration proof-of-possession — a faithful Python mirror of
+    ecc_pop.py / ecc_crypto.js.computeRegistrationPoP. Fetches a challenge, does
+    ECDH(priv, server_ephemeral_pub) -> HKDF -> HMAC over (nonce || public_key_pem), and
+    returns the {challenge_id, mac} dict to send with POST /ecc/keys/register. `priv` is the
+    EC private key matching public_key_pem (proving possession). Salt/info/hash MUST match
+    the server + browser, or a real browser's PoP won't verify."""
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import serialization, hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    ch = client.post("/ecc/keys/register/challenge").json()
+    server_pub = serialization.load_pem_public_key(ch["server_ephemeral_public_key"].encode())
+    shared = priv.exchange(ec.ECDH(), server_pub)
+    mac_key = HKDF(algorithm=hashes.SHA256(), length=32,
+                   salt=b"dv-ecc-pop-v1", info=b"registration-pop").derive(shared)
+    msg = _base64.b64decode(ch["nonce"]) + public_key_pem.encode()
+    mac = _base64.b64encode(_hmac.new(mac_key, msg, _hashlib.sha256).digest()).decode()
+    return {"challenge_id": ch["challenge_id"], "mac": mac}
+
+
 def ensure_ecc_keypair(client) -> None:
     """Ensure the logged-in user has a registered ECC keypair (idempotent).
 
     Zero-knowledge vault creation now requires the owner to have one — the server
     wraps a fresh vault DEK to their public key at creation time. Registers a real
     P-384 public key with an OPAQUE encrypted-private-key blob (the server stores
-    the blob but can't read it, so this doesn't weaken the zero-knowledge model)."""
+    the blob but can't read it, so this doesn't weaken the zero-knowledge model),
+    with a valid proof-of-possession (the server now requires one)."""
     import json as _json
     if client.get("/ecc/keys/public").json().get("has_keypair"):
         return
@@ -77,6 +98,7 @@ def ensure_ecc_keypair(client) -> None:
         "encrypted_private_key": _json.dumps(
             {"encrypted": "opaque", "salt": "opaque", "iterations": 600000}
         ),
+        "pop": compute_registration_pop(client, priv, pub_pem),
     })
 
 
