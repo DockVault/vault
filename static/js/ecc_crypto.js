@@ -585,15 +585,18 @@ class ECCCryptoLibrary {
      * @param {string} vaultId
      * @param {string} field 'name' | 'mime'
      * @param {number} epoch the DEK epoch the name is sealed under
-     * @param {string} [objId] the file/folder id the name belongs to. When given, the name is
-     *   sealed v2 (obj-id-bound, can't be transposed); when omitted, legacy v1 (unbound).
-     * @returns {Promise<string>} (ZK_NAME_PREFIX_V2 for v2, else ZK_NAME_PREFIX) + base64(iv||ct+tag)
+     * @param {string} objId the file/folder id the name belongs to. REQUIRED — the name is
+     *   always sealed v2 (obj-id-bound, so a blob can't be transposed to a different object). A
+     *   missing id is a caller bug; legacy v1 blobs are read-only (decryptName still reads them).
+     * @returns {Promise<string>} ZK_NAME_PREFIX_V2 + base64(iv||ct+tag)
      */
     async encryptName(plaintext, vaultDEK, vaultId, field, epoch, objId) {
-        const bound = !(objId === undefined || objId === null || objId === '');
-        const aad = bound ? this._zkNameAadV2(vaultId, field, epoch, objId)
-                          : this._zkNameAad(vaultId, field, epoch);
-        const prefix = bound ? this.ZK_NAME_PREFIX_V2 : this.ZK_NAME_PREFIX;
+        // Every new sealed name MUST bind its object id (v2) so a blob can't be transposed to a
+        // different row. Refuse to emit an unbound (v1) blob — a missing id is a caller bug.
+        if (objId === undefined || objId === null || objId === '') {
+            throw new Error('encryptName requires objId (the file/folder id) to bind the sealed name');
+        }
+        const aad = this._zkNameAadV2(vaultId, field, epoch, objId);
         const iv = window.crypto.getRandomValues(new Uint8Array(this.AES_IV_LENGTH));
         const ct = await window.crypto.subtle.encrypt(
             { name: this.AES_ALGORITHM, iv, tagLength: this.AES_TAG_LENGTH, additionalData: aad },
@@ -603,7 +606,7 @@ class ECCCryptoLibrary {
         const combined = new Uint8Array(iv.length + ct.byteLength);
         combined.set(iv, 0);
         combined.set(new Uint8Array(ct), iv.length);
-        return prefix + this._arrayBufferToBase64(combined.buffer);
+        return this.ZK_NAME_PREFIX_V2 + this._arrayBufferToBase64(combined.buffer);
     }
 
     /**

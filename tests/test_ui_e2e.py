@@ -675,7 +675,9 @@ def test_zero_knowledge_vault_end_to_end(page: Page, admin):
         # client ciphertext, ZK-marked) so it can't read the filename either...
         listed = next(it for it in owner.get(f"/vaults/{vid}/files").json()["items"] if it["id"] == fid)
         assert not listed.get("name"), f"server exposed plaintext ZK name: {listed.get('name')!r}"
-        assert (listed.get("enc_name") or "").startswith("zk1:"), "ZK name not stored encrypted at rest"
+        # A browser upload seals the name BOUND to the file's own id (v2 / zk2:), so it can't be
+        # transposed to another row (the sealed id == this row id, which the browser passed at complete).
+        assert (listed.get("enc_name") or "").startswith("zk2:"), "ZK name not stored obj-id-bound at rest"
         assert fname not in (owner.get(f"/vaults/{vid}/files").text), "plaintext name leaked into listing"
         # ...yet the BROWSER decrypts it and shows the real name in the file row.
         page.wait_for_selector(f'.file-name[data-file-name="{fname}"]', timeout=10000)
@@ -745,15 +747,26 @@ def test_zero_knowledge_upload_resumes_across_reload(page: Page, admin):
         expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
 
         # The resumed upload finishes and the file lands.
-        fid = None
+        f_item = None
         for _ in range(60):
             items = owner.get(f"/vaults/{vid}/files").json()["items"]
             hit = [it for it in items if it["type"] == "file"]  # ZK name is server-opaque
             if hit:
-                fid = hit[0]["id"]
+                f_item = hit[0]
                 break
             page.wait_for_timeout(500)
-        assert fid, "resumed ZK upload never completed after reload"
+        assert f_item, "resumed ZK upload never completed after reload"
+        fid = f_item["id"]
+
+        # The resumed upload completed under the SAME client id the name was sealed with (v2),
+        # proving clientFileId survived the IndexedDB persist + rehydrate and was sent at complete.
+        # Had it been lost, the server would have assigned a fresh id and the v2 name would be
+        # undecryptable under the new row id.
+        assert fid == setup["clientFileId"], (
+            f"resumed file id {fid} != sealed client id {setup['clientFileId']} — the client "
+            "file id was lost across resume (the sealed name would be undecryptable)")
+        assert f_item.get("enc_name", "").startswith("zk2:"), (
+            f"a browser upload must seal an obj-id-bound (zk2:) name, got {f_item.get('enc_name')!r}")
 
         # Proof: the server stored the EXACT ciphertext (byte-for-byte), not plaintext.
         import base64
@@ -788,9 +801,12 @@ def _zk_start_partial_upload(page: Page, vid: str, fname: str, marker: str,
             const cipher = new Uint8Array(await eccLib().encryptFile(plain.buffer, dek));
             const total = cipher.byteLength;
             const totalChunks = Math.ceil(total / chunkSize);
-            // Zero-knowledge: encrypt the name/MIME in the browser; never send the plaintext.
-            const encName = await eccLib().encryptName(fname, dek, vid, 'name', kv);
-            const encMime = await eccLib().encryptName('text/plain', dek, vid, 'mime', kv);
+            // Zero-knowledge: client-generate the file id and SEAL the name/MIME BOUND to it (v2),
+            // exactly as the live uploader does; never send the plaintext. The id is persisted with
+            // the ciphertext so a resume can complete under the same id the name was sealed under.
+            const clientFileId = zkNewObjId();
+            const encName = await eccLib().encryptName(fname, dek, vid, 'name', kv, clientFileId);
+            const encMime = await eccLib().encryptName('text/plain', dek, vid, 'mime', kv, clientFileId);
             const nameBi = await eccLib().nameBlindIndex(fname, dek, vid, kv);
             const auth = { 'Authorization': 'Bearer ' + authToken };
             const initRes = await fetch(`${API_BASE}/vaults/${vid}/uploads`, {
@@ -809,10 +825,10 @@ def _zk_start_partial_upload(page: Page, vid: str, fname: str, marker: str,
                 await zkUploadStore.put({ sessionId: sid, vaultId: vid, fileName: fname,
                     totalSize: total, mimeType: 'text/plain', folderId: null, keyVersion: kv,
                     totalChunks, chunkSize, blob: new Blob([cipher], { type: 'text/plain' }),
-                    encName, encMime, nameBi, createdAt: Date.now() });
+                    encName, encMime, nameBi, clientFileId, createdAt: Date.now() });
             }
             let bin = ''; for (const b of cipher) bin += String.fromCharCode(b);
-            return { sid, totalChunks, cipherB64: btoa(bin),
+            return { sid, totalChunks, cipherB64: btoa(bin), clientFileId,
                      plainText: new TextDecoder().decode(plain) };
         }""",
         {"vid": vid, "fname": fname, "marker": marker, "chunkSize": chunk_size, "persist": persist},
@@ -860,6 +876,75 @@ def test_zero_knowledge_upload_not_resumable_without_local_ciphertext(page: Page
         assert not any(it["type"] == "file" for it in owner.get(f"/vaults/{vid}/files").json()["items"]), \
             "ZK upload completed without the local ciphertext — should be impossible"
         assert owner.get(f"/vaults/{vid}/uploads/{sid}").json()["received_chunks"] == [0]
+    finally:
+        if vid:
+            owner.delete_vault(vid)
+        admin.delete_user(user["id"])
+        admin.put("/settings", json={"zero_knowledge_enabled": False})
+
+
+def test_zero_knowledge_upload_init_persists_client_file_id(page: Page, admin):
+    """The production upload path (_init) MUST persist the client-generated file id to IndexedDB,
+    so a resume completes under the SAME id the v2 name was sealed with. This drives the real
+    uploadManager._init (not a hand-rolled persist) and asserts the record it writes carries that
+    id. Without it, a real UI upload interrupted by a reload would resume, complete under a fresh
+    server id, and leave the obj-id-bound (zk2:) name permanently undecryptable."""
+    from conftest import ApiClient
+
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    user = admin.create_user(role="admin")
+    owner = ApiClient()
+    owner.login(user["_username"], user["_password"])
+
+    vid = None
+    fname = _u("initpersist") + ".txt"
+    try:
+        _login(page, user["_username"], user["_password"])
+        vid = _create_zk_vault_via_ui(page, owner, "zk-initpersist-pass-1")
+        page.wait_for_selector(f'.open-vault-btn[data-vault-id="{vid}"]', timeout=10000)
+        page.click(f'.open-vault-btn[data-vault-id="{vid}"]')
+        expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
+
+        out = page.evaluate(
+            """async ({ vid, fname }) => {
+                const kv = await zkGetCurrentDekVersion(vid);
+                const dek = await zkGetVaultDek(vid, kv);
+                // Build the item exactly as the ZK seal loop + enqueueNamed do: a client-generated
+                // id, and a name/MIME SEALED bound to it (v2).
+                const clientFileId = zkNewObjId();
+                const cipher = new Uint8Array(await eccLib().encryptFile(
+                    new TextEncoder().encode('INIT-PERSIST ' + fname + ' ').buffer, dek));
+                const it = {
+                    id: uploadManager._newId(), file: new File([cipher], fname, { type: 'text/plain' }),
+                    vaultId: vid, folderId: null, fileName: fname,
+                    totalSize: cipher.byteLength, totalChunks: 1, chunkSize: 1 << 20,
+                    sessionId: null, received: new Set(),
+                    status: 'queued', error: null, paused: false, cancelled: false,
+                    zkKeyVersion: kv, isZk: true,
+                    encName: await eccLib().encryptName(fname, dek, vid, 'name', kv, clientFileId),
+                    encMime: await eccLib().encryptName('text/plain', dek, vid, 'mime', kv, clientFileId),
+                    nameBi: await eccLib().nameBlindIndex(fname, dek, vid, kv),
+                    clientFileId,
+                };
+                // Drive the PRODUCTION persist path: _init starts the server session and writes the
+                // resume record to IndexedDB (the line a resume depends on).
+                await uploadManager._init(it);
+                const rec = await zkUploadStore.get(it.sessionId);
+                // Clean up: abandon the server session + drop the record (we never complete it).
+                try {
+                    await fetch(`${API_BASE}/vaults/${vid}/uploads/${it.sessionId}`,
+                        { method: 'DELETE', headers: { 'Authorization': 'Bearer ' + authToken } });
+                } catch (_) { /* best effort */ }
+                await zkUploadStore.delete(it.sessionId);
+                return { expected: clientFileId, persisted: rec && rec.clientFileId,
+                         encName: rec && rec.encName };
+            }""",
+            {"vid": vid, "fname": fname},
+        )
+        assert out["persisted"] == out["expected"], (
+            "_init did not persist clientFileId to IndexedDB — a resumed UI upload would complete "
+            "under a fresh id and the v2 name would be undecryptable")
+        assert (out["encName"] or "").startswith("zk2:"), "the persisted resume record holds a non-v2 name"
     finally:
         if vid:
             owner.delete_vault(vid)
@@ -1079,8 +1164,9 @@ def test_zero_knowledge_upload_quota_fallback_completes_and_warns(page: Page, ad
                 const enc = new TextEncoder();
                 const plain = enc.encode(('QUOTA-FALLBACK ' + fname + ' ').repeat(25));
                 const cipher = new Uint8Array(await eccLib().encryptFile(plain.buffer, dek));
-                const encName = await eccLib().encryptName(fname, dek, vid, 'name', kv);
-                const encMime = await eccLib().encryptName('text/plain', dek, vid, 'mime', kv);
+                const clientFileId = zkNewObjId();
+                const encName = await eccLib().encryptName(fname, dek, vid, 'name', kv, clientFileId);
+                const encMime = await eccLib().encryptName('text/plain', dek, vid, 'mime', kv, clientFileId);
                 const nameBi = await eccLib().nameBlindIndex(fname, dek, vid, kv);
                 const chunkSize = 64;
                 const blob = new Blob([cipher], { type: 'text/plain' });
@@ -1099,7 +1185,7 @@ def test_zero_knowledge_upload_quota_fallback_completes_and_warns(page: Page, ad
                     totalChunks: Math.ceil(cipher.byteLength / chunkSize), chunkSize,
                     sessionId: null, received: new Set(),
                     status: 'queued', error: null, paused: false, cancelled: false,
-                    zkKeyVersion: kv, isZk: true, encName, encMime, nameBi };
+                    zkKeyVersion: kv, isZk: true, encName, encMime, nameBi, clientFileId };
                 uploadManager.items.set(id, it);
                 try {
                     await uploadManager.run(id);   // resolves when the upload finishes/fails
@@ -1112,7 +1198,8 @@ def test_zero_knowledge_upload_quota_fallback_completes_and_warns(page: Page, ad
                 let bin = ''; for (const b of cipher) bin += String.fromCharCode(b);
                 return { status: it.status, error: it.error, warned,
                          resumeWarning: it.resumeWarning, resumePersisted: it.resumePersisted,
-                         putCalls, sid: it.sessionId, persistedRec: rec, cipherB64: btoa(bin) };
+                         putCalls, sid: it.sessionId, persistedRec: rec, cipherB64: btoa(bin),
+                         clientFileId };
             }""",
             {"vid": vid, "fname": fname},
         )
@@ -1137,6 +1224,11 @@ def test_zero_knowledge_upload_quota_fallback_completes_and_warns(page: Page, ad
                 break
             page.wait_for_timeout(250)
         assert fid, "quota-fallback upload never landed on the server"
+        # Even on the quota (no-resume) fallback the upload still binds the sealed name to its id:
+        # the completed row id equals the client id the v2 name was sealed under (complete-send).
+        assert fid == out["clientFileId"], (
+            f"landed file id {fid} != sealed client id {out['clientFileId']} — the v2 name would "
+            "be undecryptable")
         raw = owner.get(f"/vaults/{vid}/files/{fid}/download").content
         assert raw == base64.b64decode(out["cipherB64"]), "stored bytes are not the original ciphertext"
     finally:

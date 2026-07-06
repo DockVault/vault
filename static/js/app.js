@@ -5161,6 +5161,21 @@ function zkNameEpoch(item) {
     return item.key_version != null ? item.key_version : 1;
 }
 
+// A client-generated UUID for a new zero-knowledge file/folder. It is bound INTO the sealed
+// name (v2 AAD) at seal time and sent back to the server as the row id, so the stored row id
+// always matches the id the name was sealed under (the anti-transposition binding). Prefer
+// crypto.randomUUID (secure contexts); fall back to a getRandomValues-based v4 so the id — and
+// therefore the binding — is always available, and never undefined (encryptName requires it).
+function zkNewObjId() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+    const b = new Uint8Array(16);
+    window.crypto.getRandomValues(b);
+    b[6] = (b[6] & 0x0f) | 0x40;  // version 4
+    b[8] = (b[8] & 0x3f) | 0x80;  // variant 10
+    const h = [...b].map(x => x.toString(16).padStart(2, '0'));
+    return `${h[0]}${h[1]}${h[2]}${h[3]}-${h[4]}${h[5]}-${h[6]}${h[7]}-${h[8]}${h[9]}-${h[10]}${h[11]}${h[12]}${h[13]}${h[14]}${h[15]}`;
+}
+
 // Decrypt the browser-encrypted names/MIME in a zero-knowledge listing IN PLACE, so the
 // rest of the UI keeps using item.name / item.mime_type unchanged. Rows still holding a
 // plaintext name (legacy, not yet sealed) are left as-is (and later sealed). A row whose
@@ -6013,7 +6028,7 @@ const uploadManager = {
         if (!entries || !entries.length || !state.currentVault) return;
         const vaultId = state.currentVault.id;
         const folderId = state.currentFolderId || null;
-        for (const { file, name, keyVersion, encName, encMime, nameBi } of entries) {
+        for (const { file, name, keyVersion, encName, encMime, nameBi, clientFileId } of entries) {
             const id = this._newId();
             const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
             this.items.set(id, {
@@ -6027,6 +6042,9 @@ const uploadManager = {
                 // ZK only: the browser-encrypted name/MIME + client blind index. Sent at init
                 // instead of the plaintext name (the server never sees the name).
                 encName: encName || null, encMime: encMime || null, nameBi: nameBi || null,
+                // ZK v2: the client-generated file id the name was sealed under. Persisted to
+                // IndexedDB and re-sent at complete so the final row id matches the sealed id.
+                clientFileId: clientFileId || null,
             });
             this.run(id);
         }
@@ -6092,6 +6110,8 @@ const uploadManager = {
                         zkKeyVersion: rec.keyVersion != null ? rec.keyVersion : null,
                         // Carry the encrypted name/blind index so a 410 re-init re-declares it.
                         encName: rec.encName || null, encMime: rec.encMime || null, nameBi: rec.nameBi || null,
+                        // Restore the v2 obj-id binding so complete finishes under the sealed id.
+                        clientFileId: rec.clientFileId || null,
                         needsServerSync: true,  // re-sync received chunks from the server before replaying
                     });
                     toResume.push(id);  // auto-resume below: replay the remaining ciphertext chunks
@@ -6191,6 +6211,9 @@ const uploadManager = {
                 encName: it.encName || null,
                 encMime: it.encMime || null,
                 nameBi: it.nameBi || null,
+                // ZK v2: the id the name was sealed under. Without it, a resumed upload would
+                // complete under a fresh server id and the v2 name would be undecryptable.
+                clientFileId: it.clientFileId || null,
                 createdAt: Date.now(),
             });
             this._noteResumePersistence(it, res);
@@ -6276,8 +6299,17 @@ const uploadManager = {
 
             it.status = 'completing';
             this.render();
+            // ZK v2: send the client-generated file id the name was sealed under, so the server
+            // uses it as the row id and the stored name binds the final row (anti-transposition).
+            // Standard uploads (and any legacy ZK item without a client id) stay bodyless — the
+            // server assigns the id.
+            const zkComplete = it.isZk && it.clientFileId;
             const c = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}/complete`, {
-                method: 'POST', headers: this._vaultHeaders(),
+                method: 'POST',
+                headers: zkComplete
+                    ? { ...this._vaultHeaders(), 'Content-Type': 'application/json' }
+                    : this._vaultHeaders(),
+                body: zkComplete ? JSON.stringify({ file_id: it.clientFileId }) : undefined,
             });
             if (!c.ok) {
                 const e = await c.json().catch(() => ({}));
@@ -6619,13 +6651,19 @@ async function uploadFiles(files) {
                 const lib = eccLib();
                 for (const entry of toUpload) {
                     const mime = entry.file.type || '';
+                    // Client-generate this file's id and SEAL its name/MIME bound to it (v2), so the
+                    // stored name can't be transposed to another row. The id is threaded through the
+                    // uploader (incl. IndexedDB resume) and re-sent at upload-complete, where the
+                    // server uses it as the row id — keeping the sealed id == the final row id.
+                    const clientFileId = zkNewObjId();
+                    entry.clientFileId = clientFileId;
                     const buf = await entry.file.arrayBuffer();
                     const enc = await lib.encryptFile(buf, dek);
                     entry.file = new File([enc], entry.name, { type: mime });
                     entry.keyVersion = keyVersion;
-                    entry.encName = await lib.encryptName(entry.name, dek, vid, 'name', keyVersion);
+                    entry.encName = await lib.encryptName(entry.name, dek, vid, 'name', keyVersion, clientFileId);
                     entry.nameBi = await lib.nameBlindIndex(entry.name, dek, vid, keyVersion);
-                    entry.encMime = mime ? await lib.encryptName(mime, dek, vid, 'mime', keyVersion) : null;
+                    entry.encMime = mime ? await lib.encryptName(mime, dek, vid, 'mime', keyVersion, clientFileId) : null;
                 }
             } catch (e) {
                 showError('Zero-knowledge encryption failed: ' + e.message);
@@ -6718,7 +6756,7 @@ async function createFolder() {
                 const lib = eccLib();
                 // Client-generate the folder id so the name is sealed BOUND to it (v2, can't be
                 // transposed). The server uses this id for the row (validated + collision-checked).
-                body.id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : undefined;
+                body.id = zkNewObjId();
                 body.enc_name = await lib.encryptName(folderName, dek, vid, 'name', epoch, body.id);
                 body.name_bi = await lib.nameBlindIndex(folderName, dek, vid, epoch);
                 body.name_key_version = epoch;

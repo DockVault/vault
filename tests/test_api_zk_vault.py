@@ -21,6 +21,7 @@ import pytest
 from conftest import (
     unique, ensure_ecc_keypair, create_zk_vault, ZK_WRAPPED_DEK_STUB,
     zk_encrypt_name, zk_decrypt_name, zk_name_blind_index, zk_chunked_upload, ZK_NAME_PREFIX,
+    ZK_NAME_PREFIX_V2,
 )
 
 
@@ -855,11 +856,12 @@ const ECC = require(process.env.ECC_JS);
   const rawDek = Buffer.from(process.env.DEK_HEX, 'hex');
   const dek = await webcrypto.subtle.importKey('raw', rawDek, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
   const vid = process.env.VID, nm = process.env.NM, epoch = Number(process.env.EPOCH);
-  const encName = await lib.encryptName(nm, dek, vid, 'name', epoch);
-  const encMime = await lib.encryptName('text/plain', dek, vid, 'mime', epoch);
+  const objId = process.env.OBJ_ID;   // v2 names bind the object id
+  const encName = await lib.encryptName(nm, dek, vid, 'name', epoch, objId);
+  const encMime = await lib.encryptName('text/plain', dek, vid, 'mime', epoch, objId);
   const bi = await lib.nameBlindIndex(nm, dek, vid, epoch);
   // Also prove JS can decrypt a blob the Python side produced (passed in via env).
-  const fromPy = await lib.decryptName(process.env.PY_ENC, dek, vid, 'name', epoch);
+  const fromPy = await lib.decryptName(process.env.PY_ENC, dek, vid, 'name', epoch, objId);
   process.stdout.write(JSON.stringify({ encName, encMime, bi, fromPy }));
 })().catch(e => { console.error(e); process.exit(1); });
 '''
@@ -877,19 +879,21 @@ def test_zk_name_crypto_parity_with_browser_lib():
     ecc_js = str((_Path(__file__).resolve().parent.parent / "static" / "js" / "ecc_crypto.js")).replace("\\", "/")
     dek = _os.urandom(32)
     vid = str(_uuid.uuid4())
+    obj_id = str(_uuid.uuid4())  # the object id the v2 name binds to
     nm = "pärity 文件.txt"  # unicode to exercise UTF-8 framing
     epoch = 3
-    py_enc = zk_encrypt_name(nm, dek, vid, "name", epoch)  # Python-sealed blob for JS to decrypt
+    py_enc = zk_encrypt_name(nm, dek, vid, "name", epoch, obj_id=obj_id)  # Python-sealed blob for JS to decrypt
     env = {**_os.environ, "ECC_JS": ecc_js, "DEK_HEX": dek.hex(),
-           "VID": vid, "NM": nm, "EPOCH": str(epoch), "PY_ENC": py_enc}
+           "VID": vid, "NM": nm, "EPOCH": str(epoch), "OBJ_ID": obj_id, "PY_ENC": py_enc}
     proc = _subprocess.run([node, "-"], input=_NODE_PARITY, capture_output=True, text=True,
                            encoding="utf-8", env=env, timeout=30)
     assert proc.returncode == 0, f"node parity script failed: {proc.stderr}"
     out = json.loads(proc.stdout)
-    # JS -> Python: JS-sealed name/mime decrypt with the Python mirror; blind indexes match.
-    assert out["encName"].startswith(ZK_NAME_PREFIX)
-    assert zk_decrypt_name(out["encName"], dek, vid, "name", epoch) == nm
-    assert zk_decrypt_name(out["encMime"], dek, vid, "mime", epoch) == "text/plain"
+    # JS -> Python: JS-sealed name/mime (now v2, obj-id-bound) decrypt with the Python mirror
+    # under the same obj id; blind indexes match.
+    assert out["encName"].startswith(ZK_NAME_PREFIX_V2)
+    assert zk_decrypt_name(out["encName"], dek, vid, "name", epoch, obj_id=obj_id) == nm
+    assert zk_decrypt_name(out["encMime"], dek, vid, "mime", epoch, obj_id=obj_id) == "text/plain"
     assert out["bi"] == zk_name_blind_index(nm, dek, vid, epoch), "blind index mismatch JS vs Python"
     # Python -> JS: a Python-sealed blob decrypts in the browser lib.
     assert out["fromPy"] == nm, "ecc_crypto.js could not decrypt a Python-sealed name"
