@@ -115,10 +115,20 @@ async def _authorization_error_handler(request: StarletteRequest, exc: Authoriza
     return JSONResponse(status_code=status_code, content={"detail": str(exc)})
 
 
-# Add CORS middleware (configure appropriately for production)
+# Add CORS middleware. Bearer-token auth (no cookies anywhere) already makes credentialed
+# cross-origin theft impossible, but don't bake a dev origin into a production image: read the
+# allow-list from CORS_ALLOW_ORIGINS (comma-separated) and fall back to the localhost dev origin
+# only in a development build (empty allow-list otherwise -> no cross-origin browser access).
+_cors_env = os.getenv('CORS_ALLOW_ORIGINS', '').strip()
+if _cors_env:
+    _cors_origins = [o.strip() for o in _cors_env.split(',') if o.strip()]
+elif settings.environment == 'development':
+    _cors_origins = ["http://localhost:3000"]
+else:
+    _cors_origins = []
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Update for production
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -152,15 +162,18 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             error_id = str(uuid.uuid4())
             print(f"[ERROR] Unhandled exception (ID: {error_id}): {exc}")
             print(traceback.format_exc())
-            
-            return JSONResponse(
+
+            # Fall through to the header-setting code below so 500s carry the same hardening
+            # headers (nosniff / XFO / no-store / Referrer-Policy / Permissions-Policy) as any
+            # other response, rather than returning early bare-headed.
+            response = JSONResponse(
                 status_code=500,
                 content={
                     "detail": "An internal error occurred. Please contact support if the problem persists.",
                     "error_id": error_id
                 }
             )
-        
+
         # Security Header: Prevent MIME type sniffing
         response.headers['X-Content-Type-Options'] = 'nosniff'
         
@@ -171,8 +184,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         if 'server' in response.headers:
             del response.headers['server']
         
-        # Security Header: XSS protection for legacy browsers
-        response.headers['X-XSS-Protection'] = '1; mode=block'
+        # Security Header: disable the legacy XSS auditor (OWASP guidance is '0'; the enabled
+        # value has historically been abusable for same-origin info leaks). CSP is the real control.
+        response.headers['X-XSS-Protection'] = '0'
         
         # Security Header: Referrer policy
         response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
@@ -298,11 +312,47 @@ class LoginResponse(BaseModel):
     is_scoped_temp: bool = False
 
 
+# --- Name-field input hygiene (defence in depth) ---------------------------
+# Names entered by low-privilege users (vault/file/group/user names) surface in operator and admin
+# UIs — the audit log, the dashboard activity feed, group chips. Every client render path escapes
+# them, but reject the HTML-markup characters ('<' and '>') at the source too so a hostile name can
+# never become markup in another user's DOM even if a sink is ever added without escaping. Angle
+# brackets are never legitimate in a display name. (Control characters are a separate concern,
+# already stripped at the file sinks by the sanitiser, so they are not rejected here.)
+def _reject_markup_chars(value: Optional[str], field: str) -> Optional[str]:
+    if value is not None and ('<' in value or '>' in value):
+        raise ValueError(f"{field} may not contain '<' or '>'")
+    return value
+
+
+# Group chip colours are interpolated into a CSS custom property on the client. Accept only a strict
+# #hex or one of the fixed palette preset names (the swatches in index.html); anything else (a
+# quote-carrying value, a CSS breakout) is rejected. Mirrors brand.js's colour validator.
+_GROUP_COLOR_PRESETS = frozenset(
+    {'teal', 'indigo', 'violet', 'rose', 'orange', 'sky', 'emerald', 'amber'}
+)
+
+
+def _validate_chip_color(value: Optional[str]) -> Optional[str]:
+    if value is None or value == '':
+        return value
+    if value in _GROUP_COLOR_PRESETS:
+        return value
+    if value[0] == '#' and len(value) in (4, 7) and all(c in '0123456789abcdefABCDEF' for c in value[1:]):
+        return value
+    raise ValueError("color must be a #hex value or a named preset")
+
+
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     email: EmailStr
     password: str = Field(..., min_length=8)
     role: RoleEnum = RoleEnum.USER
+
+    @field_validator('username')
+    @classmethod
+    def _clean_username(cls, v):
+        return _reject_markup_chars(v, 'username')
 
 
 class UserUpdate(BaseModel):
@@ -373,12 +423,32 @@ class GroupCreate(BaseModel):
     color: Optional[str] = Field(None, max_length=20)
     parent_id: Optional[uuid.UUID] = None
 
+    @field_validator('name')
+    @classmethod
+    def _clean_name(cls, v):
+        return _reject_markup_chars(v, 'name')
+
+    @field_validator('color')
+    @classmethod
+    def _clean_color(cls, v):
+        return _validate_chip_color(v)
+
 
 class GroupUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=120)
     description: Optional[str] = None
     color: Optional[str] = Field(None, max_length=20)
     parent_id: Optional[uuid.UUID] = None  # explicit null -> make it a root
+
+    @field_validator('name')
+    @classmethod
+    def _clean_name(cls, v):
+        return _reject_markup_chars(v, 'name')
+
+    @field_validator('color')
+    @classmethod
+    def _clean_color(cls, v):
+        return _validate_chip_color(v)
 
 
 class GroupMemberRef(BaseModel):
@@ -474,12 +544,24 @@ class VaultCreate(BaseModel):
     wrapped_team_privkey: Optional[str] = None
     team_privkey_ephemeral_public_key: Optional[str] = None
 
+    @field_validator('name')
+    @classmethod
+    def _clean_name(cls, v):
+        # The vault's own display name is plaintext even for ZK vaults (only file/folder names are
+        # client-encrypted), so this reject applies to it the same way and is regression-free.
+        return _reject_markup_chars(v, 'name')
+
 
 class VaultUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     description: Optional[str] = None
     password: Optional[str] = None
     expire_files_after_days: Optional[int] = Field(None, gt=0)
+
+    @field_validator('name')
+    @classmethod
+    def _clean_name(cls, v):
+        return _reject_markup_chars(v, 'name')
 
 
 class FileRename(BaseModel):
@@ -492,6 +574,12 @@ class FileRename(BaseModel):
     # For ZK FOLDER renames: the DEK epoch the name was encrypted under (folders carry their
     # own name epoch). Ignored for files (a file's name epoch follows its content epoch).
     name_key_version: Optional[int] = None
+
+    @field_validator('new_name')
+    @classmethod
+    def _clean_new_name(cls, v):
+        # Only the Standard plaintext path sets new_name; ZK renames use enc_name (untouched).
+        return _reject_markup_chars(v, 'new_name')
 
 
 class VaultResponse(BaseModel):

@@ -895,8 +895,7 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         storage.setItem('currentUser', JSON.stringify(currentUser));
         
         console.log('Login successful:', currentUser);
-        console.log('Auth token:', authToken);
-        
+
         // Load user permissions
         await loadUserPermissions();
 
@@ -1080,11 +1079,11 @@ async function loadRecentEvents() {
                 <div class="event-item ${eventClass}">
                     <div class="event-header">
                         <span class="event-icon">${iconSvg(iconName)}</span>
-                        <span class="event-user">${event.username || 'System'}</span>
-                        <span class="event-action">${event.description || event.action}</span>
+                        <span class="event-user">${escapeHtml(event.username || 'System')}</span>
+                        <span class="event-action">${escapeHtml(event.description || event.action)}</span>
                         <span class="event-time">${formatTimeAgo(event.timestamp)}</span>
                     </div>
-                    ${event.details ? `<div class="event-details">${event.details}</div>` : ''}
+                    ${event.details ? `<div class="event-details">${escapeHtml(event.details)}</div>` : ''}
                 </div>
             `;
         }).join('');
@@ -2670,9 +2669,13 @@ async function loadGroups() {
 
 // Named department colours -> hex (also accepts a raw #hex for custom colours).
 const CHIP_COLORS = { teal: '#14b8a6', indigo: '#6366f1', violet: '#8b5cf6', rose: '#f43f5e', orange: '#f97316', sky: '#0ea5e9', emerald: '#10b981', amber: '#f59e0b' };
+// The returned value is interpolated into a `style="--chip:…"` attribute, so only ever hand back
+// a strict #hex or a known preset — a raw `#`-prefixed value could carry a quote and break out of
+// the attribute. Non-hex `#` input falls back to the default swatch.
+const CHIP_HEX_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 function chipColorValue(color) {
     if (!color) return CHIP_COLORS.teal;
-    if (color.charAt(0) === '#') return color;
+    if (color.charAt(0) === '#') return CHIP_HEX_RE.test(color) ? color : CHIP_COLORS.teal;
     return CHIP_COLORS[color] || CHIP_COLORS.teal;
 }
 
@@ -3230,14 +3233,14 @@ function updateMonitorUI() {
                     <div class="flex-1">
                         <div class="flex items-center gap-md mb-xs">
                             <span class="font-semibold">${escapeHtml(event.user)}</span>
-                            <span class="badge badge-${badgeClass}">${event.type.replace('_', ' ')}</span>
+                            <span class="badge badge-${badgeClass}">${escapeHtml(event.type.replace('_', ' '))}</span>
                             <span class="text-xs text-secondary ml-auto">${timeStr}</span>
                         </div>
                         <p class="text-sm text-secondary">${escapeHtml(event.message || `${event.type} event`)}</p>
                         ${Object.keys(event.details).length > 0 ? `
                             <div class="text-xs text-secondary mt-xs">
-                                ${Object.entries(event.details).map(([key, value]) => 
-                                    `<span class="mr-md">${key}: ${escapeHtml(String(value))}</span>`
+                                ${Object.entries(event.details).map(([key, value]) =>
+                                    `<span class="mr-md">${escapeHtml(key)}: ${escapeHtml(String(value))}</span>`
                                 ).join('')}
                             </div>
                         ` : ''}
@@ -3953,13 +3956,13 @@ async function searchAuditLog() {
                 <tr>
                     <td>${timestamp.toLocaleString()}</td>
                     <td>${escapeHtml(log.username || '-')}</td>
-                    <td><span class="badge badge-secondary">${log.action.replace('_', ' ')}</span></td>
+                    <td><span class="badge badge-secondary">${escapeHtml(log.action.replace('_', ' '))}</span></td>
                     <td><span class="badge badge-${statusClass}">${log.status}</span></td>
                     <td>${escapeHtml(log.ip_address || '-')}</td>
                     <td>
                         <details>
                             <summary class="cursor-pointer text-primary">View</summary>
-                            <pre class="text-xs mt-sm">${JSON.stringify(log.details || {}, null, 2)}</pre>
+                            <pre class="text-xs mt-sm">${escapeHtml(JSON.stringify(log.details || {}, null, 2))}</pre>
                         </details>
                     </td>
                 </tr>
