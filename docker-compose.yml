@@ -14,7 +14,11 @@ services:
     container_name: vault-db
     environment:
       POSTGRES_USER: sftp_user
-      POSTGRES_PASSWORD: ${VAULT_DB_PASSWORD:-vault_local_dev_pw}
+      # VAULT_DB_PASSWORD is now REQUIRED (no shipped default). NB: postgres only applies this on
+      # FIRST init of the data volume — an existing dev volume created under the old hardcoded
+      # default keeps that password, so set VAULT_DB_PASSWORD to the old value (or recreate the
+      # volume) if you had relied on the default.
+      POSTGRES_PASSWORD: ${VAULT_DB_PASSWORD:?set VAULT_DB_PASSWORD in .env (see .env.example)}
       POSTGRES_DB: sftp_db
     volumes:
       - vault_pg_data:/var/lib/postgresql/data
@@ -30,6 +34,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    # Resource ceiling (no cap_drop: the official postgres entrypoint starts as root to chown the
+    # data dir + su-exec to the postgres user, so it needs its default init caps).
+    mem_limit: 1g
+    pids_limit: 256
     networks:
       - vault-network
     restart: unless-stopped
@@ -37,6 +45,16 @@ services:
   vault-redis:
     image: redis:7-alpine
     container_name: vault-redis
+    environment:
+      # Optional Redis auth. Empty (the default) => no password (unchanged behaviour). Set
+      # REDIS_PASSWORD in .env to require AUTH on the cache that backs the login/throttle counters +
+      # the session-hash store; the app reads the same REDIS_PASSWORD (config.redis_password) and
+      # authenticates. Also read by the auth-aware healthcheck below.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    # Array command (the official entrypoint still drops to the unprivileged redis user because $1 is
+    # 'redis-server'). An empty --requirepass "" is a no-op (no auth, exactly as before); a non-empty
+    # REDIS_PASSWORD enables AUTH.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-}"]
     # Hardening: read-only root fs (ephemeral cache -> /data is tmpfs) + no escalation.
     security_opt:
       - no-new-privileges:true
@@ -45,10 +63,14 @@ services:
       - /tmp
       - /data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # AUTH-aware: redis-cli -a "" skips AUTH on a no-password server (still PONG), so this works
+      # with and without a password.
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD:-}\" ping 2>/dev/null | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
+    mem_limit: 512m
+    pids_limit: 128
     networks:
       - vault-network
     restart: unless-stopped
@@ -61,7 +83,7 @@ services:
       - .env
     environment:
       DOCKER_CONTAINER: "true"
-      DATABASE_URL: postgresql://sftp_user:${VAULT_DB_PASSWORD:-vault_local_dev_pw}@vault-db:5432/sftp_db
+      DATABASE_URL: postgresql://sftp_user:${VAULT_DB_PASSWORD:?set VAULT_DB_PASSWORD in .env (see .env.example)}@vault-db:5432/sftp_db
       REDIS_HOST: vault-redis
       REDIS_PORT: "6379"
       API_HOST: 0.0.0.0
@@ -100,12 +122,34 @@ services:
     # (Docker Desktop defaults to 1777, so this is a no-op there).
     security_opt:
       - no-new-privileges:true
+    # Drop ALL Linux capabilities, then add back ONLY what docker-entrypoint.py needs during its
+    # brief root phase to chown the persistent volumes and setuid/setgid-drop to appuser (uid 10001):
+    # CHOWN/DAC_OVERRIDE/FOWNER (the volume-migration walk) + SETUID/SETGID (the privilege drop).
+    # The actual workload then runs as appuser with NO effective caps. This still removes the risky
+    # defaults (notably NET_RAW for raw-socket sniffing/spoofing, plus MKNOD/SYS_CHROOT/SETFCAP/…).
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
     read_only: true
     tmpfs:
       - /tmp:mode=1777
       - /app/certs:mode=1777
       - /app/run:mode=1777
       - /app/deployments:mode=1777
+    # Resource ceilings so a heavy/compromised vault can't exhaust the shared host (co-tenant DoS
+    # on the shared-worker SaaS topology). Generous dev/standalone defaults; the SaaS control plane
+    # sizes these per plan tier at provision time. NOTE: the download path materialises the whole
+    # decrypted file in RAM (the legacy Fernet codec briefly holds ~2x), so mem_limit must stay
+    # comfortably above ~2x max_file_size_mb (default 1024 MB) plus concurrency headroom — keep the
+    # two in step if you change either, or a legitimate max-size download will be OOM-killed.
+    mem_limit: 4g
+    pids_limit: 512
+    cpus: 2.0
     networks:
       - vault-network
     restart: unless-stopped
@@ -117,7 +161,7 @@ services:
       - .env
     environment:
       DOCKER_CONTAINER: "true"
-      DATABASE_URL: postgresql://sftp_user:${VAULT_DB_PASSWORD:-vault_local_dev_pw}@vault-db:5432/sftp_db
+      DATABASE_URL: postgresql://sftp_user:${VAULT_DB_PASSWORD:?set VAULT_DB_PASSWORD in .env (see .env.example)}@vault-db:5432/sftp_db
       REDIS_HOST: vault-redis
       REDIS_PORT: "6379"
       SFTP_HOST: 0.0.0.0
@@ -157,6 +201,16 @@ services:
     # mode=1777 so the non-root app can write on a Linux engine (see vault-api).
     security_opt:
       - no-new-privileges:true
+    # Drop ALL caps, add back only the entrypoint's root-phase needs (chown volumes + setuid/setgid
+    # drop to appuser); the SFTP workload then runs as appuser with no effective caps.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
     read_only: true
     tmpfs:
       - /tmp:mode=1777
@@ -164,6 +218,10 @@ services:
       - /app/certs:mode=1777
       - /app/run:mode=1777
       - /app/deployments:mode=1777
+    # SFTP also streams large files; keep headroom above max_file_size_mb (see vault-api note).
+    mem_limit: 2g
+    pids_limit: 512
+    cpus: 1.0
     networks:
       - vault-network
     restart: unless-stopped

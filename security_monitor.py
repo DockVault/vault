@@ -101,21 +101,18 @@ class SecurityMonitor:
         """
         now = time.time()
         identifier = f"{username}:{ip_address}"
-        
-        # Add to tracking
+
+        # Keep an in-memory trail purely as a Redis-outage fallback (see _windowed_count).
         self._login_attempts[identifier].append(now)
-        
-        # Also store in Redis for persistence
-        redis_key = f"security:failed_login:{identifier}"
-        self.redis.incr(redis_key)
-        self.redis.expire(redis_key, self.failed_login_window_minutes * 60)
-        
-        # Check thresholds
-        recent_attempts = self._count_recent_events(
+
+        # Threshold decision reads the DURABLE Redis counter (shared across the per-request
+        # monitor instances), not the fresh in-memory deque — otherwise it would always see 1.
+        recent_attempts = self._windowed_count(
+            f"security:failed_login:{identifier}",
+            self.failed_login_window_minutes * 60,
             self._login_attempts[identifier],
-            self.failed_login_window_minutes * 60
         )
-        
+
         if recent_attempts >= self.failed_login_threshold_critical:
             self._raise_alert(
                 event_type=SecurityEventType.BRUTE_FORCE_ATTEMPT,
@@ -199,17 +196,19 @@ class SecurityMonitor:
         """
         now = time.time()
         identifier = f"{user_id}:{vault_id}"
-        
-        # Track deletions
+
+        # In-memory trail is only the Redis-outage fallback (see _windowed_count).
         for _ in range(file_count):
             self._file_deletions[identifier].append(now)
-        
-        # Check for bulk deletion in time window
-        recent_deletions = self._count_recent_events(
+
+        # Durable, cross-request window count (Redis) — a fresh per-request deque never trips.
+        recent_deletions = self._windowed_count(
+            f"security:file_deletion:{identifier}",
+            self.bulk_deletion_window_seconds,
             self._file_deletions[identifier],
-            self.bulk_deletion_window_seconds
+            amount=file_count,
         )
-        
+
         if recent_deletions >= self.bulk_deletion_threshold:
             self._raise_alert(
                 event_type=SecurityEventType.BULK_FILE_DELETION,
@@ -236,16 +235,17 @@ class SecurityMonitor:
         """
         now = time.time()
         identifier = f"{user_id}:{vault_id}"
-        
-        # Track accesses
+
+        # In-memory trail is only the Redis-outage fallback (see _windowed_count).
         self._vault_accesses[identifier].append(now)
-        
-        # Check for rapid access
-        recent_accesses = self._count_recent_events(
+
+        # Durable, cross-request window count (Redis) — a fresh per-request deque never trips.
+        recent_accesses = self._windowed_count(
+            f"security:vault_access:{identifier}",
+            self.rapid_vault_access_window_seconds,
             self._vault_accesses[identifier],
-            self.rapid_vault_access_window_seconds
         )
-        
+
         if recent_accesses >= self.rapid_vault_access_threshold:
             self._raise_alert(
                 event_type=SecurityEventType.RAPID_VAULT_ACCESS,
@@ -271,6 +271,29 @@ class SecurityMonitor:
         now = time.time()
         cutoff = now - window_seconds
         return sum(1 for timestamp in event_deque if timestamp >= cutoff)
+
+    def _windowed_count(self, redis_key: str, window_seconds: int, fallback_deque: deque, amount: int = 1) -> int:
+        """Return the count of events in the current window from a shared Redis counter.
+
+        The threshold checks below MUST NOT read the per-instance in-memory deques: the monitor
+        is re-instantiated on every request (get_security_monitor returns a fresh SecurityMonitor
+        so its DB session stays request-scoped and thread-safe), so those deques only ever hold the
+        single event from THIS request and the thresholds could never trip. The durable count lives
+        in Redis, incremented once here per event with a window TTL. If Redis is unavailable we fall
+        back to the in-memory deque count (degrading to at-most-this-request rather than raising and
+        breaking the calling auth/delete path)."""
+        try:
+            count = self.redis.incrby(redis_key, amount)
+            # Set the TTL only when THIS increment created the key (its value equals the amount we
+            # just added) -> a true FIXED window that expires window_seconds after the FIRST event.
+            # Re-asserting the TTL on every hit would make it a "since the last event" window that
+            # over-counts events spaced wider than the window (false-positive alerts).
+            if count == amount:
+                self.redis.expire(redis_key, window_seconds)
+            return int(count)
+        except Exception as e:
+            logger.warning(f"Security monitor Redis counter unavailable ({redis_key}): {e}; using in-memory fallback")
+            return self._count_recent_events(fallback_deque, window_seconds)
     
     def analyze_user_activity(self, user_id: str, hours: int = 24) -> Dict[str, Any]:
         """

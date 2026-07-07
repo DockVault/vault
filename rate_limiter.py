@@ -276,16 +276,35 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     def _get_client_identifier(self, request: Request) -> str:
         """
         Extract client identifier from request.
-        
+
         Priority:
-        1. User ID from auth token (if authenticated)
-        2. IP address
+        1. User ID from request.state (if some earlier layer set it)
+        2. User ID decoded from the bearer token (best-effort, no DB hit)
+        3. IP address
+
+        Preferring the authenticated user means one user's traffic doesn't consume another's
+        budget just because they share a NAT / proxy egress IP; anonymous traffic (login, static)
+        still buckets by trusted-proxy-aware IP. The token decode is best-effort — a missing or
+        invalid token silently falls through to the IP bucket (the request will be rejected by the
+        real auth dependency downstream anyway).
         """
-        # Try to get user ID from request state (set by auth middleware)
+        # 1. Explicit request.state (kept for forward-compat with an auth middleware).
         if hasattr(request.state, "user_id") and request.state.user_id:
             return f"user:{request.state.user_id}"
 
-        # Fall back to IP — trusted-proxy aware (a direct client can't spoof X-Forwarded-For).
+        # 2. Best-effort identity from the bearer token (HS256 decode is cheap; no DB lookup).
+        auth = request.headers.get("Authorization") or request.headers.get("authorization")
+        if auth and auth.lower().startswith("bearer "):
+            try:
+                from security import verify_access_token
+                payload = verify_access_token(auth.split(" ", 1)[1].strip())
+                sub = payload.get("sub") if payload else None
+                if sub:
+                    return f"user:{sub}"
+            except Exception:
+                pass  # fall through to IP
+
+        # 3. Fall back to IP — trusted-proxy aware (a direct client can't spoof X-Forwarded-For).
         from net_utils import client_ip
         return f"ip:{client_ip(request)}"
     

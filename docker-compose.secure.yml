@@ -50,6 +50,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    # Resource ceiling (no cap_drop: the official postgres entrypoint starts as root to chown the
+    # data dir + su-exec to the postgres user).
+    mem_limit: 1g
+    pids_limit: 256
     networks:
       - vault-network
     restart: unless-stopped
@@ -57,6 +61,12 @@ services:
   vault-redis:
     image: redis:7-alpine
     container_name: vault-redis
+    environment:
+      # Optional Redis AUTH — set REDIS_PASSWORD in .env to require it on the shared cache. Empty
+      # (default) is a no-op. The app authenticates with the same REDIS_PASSWORD (config.redis_password).
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    # Array command keeps the entrypoint's drop to the unprivileged redis user; empty password = no auth.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-}"]
     # Hardening: read-only root fs (ephemeral cache -> /data is tmpfs) + no escalation.
     security_opt:
       - no-new-privileges:true
@@ -65,10 +75,13 @@ services:
       - /tmp
       - /data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # AUTH-aware: redis-cli -a "" skips AUTH on a no-password server, so this works either way.
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD:-}\" ping 2>/dev/null | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
+    mem_limit: 512m
+    pids_limit: 128
     networks:
       - vault-network
     restart: unless-stopped
@@ -147,11 +160,28 @@ services:
     # dev stack never hit this.) 1777 = world-writable + sticky, exactly like /tmp.
     security_opt:
       - no-new-privileges:true
+    # Drop ALL caps, add back only the entrypoint's root-phase needs (chown volumes + setuid/setgid
+    # drop to appuser uid 10001); the workload then runs as appuser with no effective caps. Removes
+    # the risky defaults (NET_RAW, MKNOD, SYS_CHROOT, SETFCAP, ...).
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
     read_only: true
     tmpfs:
       - /tmp:mode=1777
       - /app/run:mode=1777
       - /app/deployments:mode=1777
+    # Resource ceilings so one vault can't exhaust the host (co-tenant DoS). The download path
+    # materialises the whole decrypted file in RAM (legacy Fernet codec briefly ~2x), so mem_limit
+    # stays comfortably above ~2x max_file_size_mb (default 1024 MB) + concurrency; size per plan tier.
+    mem_limit: 4g
+    pids_limit: 512
+    cpus: 2.0
     networks:
       - vault-network
     restart: unless-stopped
@@ -211,6 +241,16 @@ services:
     # able to write these on a Linux engine that defaults compose tmpfs to root:0755.
     security_opt:
       - no-new-privileges:true
+    # Drop ALL caps, add back only the entrypoint's root-phase needs (chown volumes + setuid/setgid
+    # drop to appuser); the SFTP workload then runs as appuser with no effective caps.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
     read_only: true
     tmpfs:
       - /tmp:mode=1777
@@ -218,6 +258,10 @@ services:
       - /app/certs:mode=1777
       - /app/run:mode=1777
       - /app/deployments:mode=1777
+    # SFTP also streams large files; keep headroom above max_file_size_mb (see vault-api note).
+    mem_limit: 2g
+    pids_limit: 512
+    cpus: 1.0
     networks:
       - vault-network
     restart: unless-stopped

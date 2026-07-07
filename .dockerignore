@@ -34,3 +34,7 @@ setup.lock
 docker-compose*.yml
 .dockerignore
 .gitignore
+# Keep VCS metadata out of the shipped public image (a submodule .git is just a 58-byte gitdir
+# pointer, but it still leaks the internal submodule/monorepo path layout).
+.git
+.git/

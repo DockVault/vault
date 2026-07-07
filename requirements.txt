@@ -4,7 +4,11 @@
 # Web framework + server
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
-python-multipart==0.0.6
+# 0.0.7 fixes the Content-Type option-parsing ReDoS (CVE-2024-24762), which fires during body
+# parsing before an endpoint's auth check. Kept on the 0.0.x line compatible with starlette 0.27
+# (the module is still importable as `multipart`); a further bump to >=0.0.18 pairs with a
+# starlette/fastapi >=0.40 upgrade — tracked for a dedicated dependency-refresh pass.
+python-multipart==0.0.7
 
 # Config / validation
 pydantic==2.5.2
@@ -21,12 +25,15 @@ redis==5.0.1
 paramiko==3.4.0
 
 # Security / crypto
-cryptography==41.0.7
+# Refreshed off 41.0.7 (Nov 2023) to pick up bundled-OpenSSL + Python-layer security patches;
+# underpins the Fernet at-rest crypto and TLS on a crypto product, so it should not lag.
+cryptography==43.0.1
 argon2-cffi==23.1.0
 bcrypt==4.1.2
 python-jose[cryptography]==3.3.0
-PyJWT==2.8.0
 keyring==24.3.0
 
-# HTTP client
-requests==2.31.0
+# NOTE: PyJWT and requests were removed — neither has a call site in the shipped app. The JWT
+# path is python-jose (`from jose import jwt`), and the only outbound HTTP is a stdlib-urllib
+# localhost /health probe. (The test suite's own `requests` dependency lives in
+# tests/requirements-test.txt, which is not part of the image.)

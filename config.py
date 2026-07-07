@@ -163,6 +163,13 @@ class Settings(BaseSettings):
     # client-supplied XFF).
     trusted_proxies: str = Field(default="")
     trust_all_proxies: bool = Field(default=False)
+    # Optional Host-header allowlist (comma-separated hostnames; TrustedHostMiddleware supports
+    # a leading '*.' wildcard). EMPTY (the default) => permissive ('*', no Host validation), since a
+    # self-hosted vault's served hostname is deployment-specific and unknown at build time. Set it to
+    # the served name(s) to reject a forged/unexpected Host / X-Forwarded-Host (the classic primitive
+    # for link-poisoning / cache-poisoning). 'localhost'/'127.0.0.1' are always allowed in addition so
+    # the container's own /health probe keeps working.
+    allowed_hosts: str = Field(default="")
     rate_limit_vault_attempts: int = Field(default=5)  # Regular users
     rate_limit_vault_attempts_admin: int = Field(default=20)  # Admins get higher limit
     rate_limit_vault_window_seconds: int = Field(default=300)  # 5 minutes
@@ -248,3 +255,24 @@ if len(_jwt_secret) < 32 or _jwt_secret.lower() in _JWT_SECRET_PLACEHOLDERS:
     print("   A weak signing secret allows offline forgery of admin session tokens.")
     print("   Generate a strong secret and set JWT_SECRET_KEY:  openssl rand -hex 32")
     sys.exit(1)
+
+
+# --- Fail closed on a shipped sample / weak admin bootstrap password IN PRODUCTION ---
+# The first admin is seeded from ADMIN_PASSWORD; unlike the crypto-key placeholders (an invalid
+# ENCRYPTION_KEY fails fast), the shipped sample admin password is a WORKING credential. Refuse a
+# KNOWN sample/weak value when ENVIRONMENT=production so a self-hoster who copies .env.example
+# verbatim can't boot with a publicly known admin login. A BLANK ADMIN_PASSWORD is deliberately NOT
+# rejected — it is the legitimate post-bootstrap state (the admin exists; the seed is a no-op). Dev
+# stacks (ENVIRONMENT=development) are unaffected; setup-secure.sh / the SaaS provisioner inject a
+# strong password, so they pass.
+_ADMIN_PASSWORD_PLACEHOLDERS = {
+    "replace_me", "change_this_secure_password", "changeme", "change_me", "change_this",
+    "changethis", "password", "admin", "admin123", "your_admin_password", "your_password_here",
+}
+if (settings.environment or "").strip().lower() == "production":
+    _admin_pw = (settings.admin_password or "").strip()
+    if _admin_pw and _admin_pw.lower() in _ADMIN_PASSWORD_PLACEHOLDERS:
+        print("\n❌ FATAL: ADMIN_PASSWORD is a known sample/weak value while ENVIRONMENT=production.")
+        print("   The first admin would be created with a publicly known credential.")
+        print("   Set a strong ADMIN_PASSWORD:  openssl rand -base64 18")
+        sys.exit(1)

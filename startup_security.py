@@ -44,12 +44,17 @@ class CredentialManager:
         self._fernet_cipher = None
     
     def derive_key_from_password(self, password: str, salt: str) -> bytes:
-        """Derive encryption key from password using PBKDF2"""
+        """Derive encryption key from password using PBKDF2.
+
+        600k iterations per current OWASP guidance for PBKDF2-HMAC-SHA256 (was 100k). This KDF only
+        guards the OPTIONAL encrypted-.env master-password mode (not the Docker/SaaS plaintext-env
+        path, not user login which uses argon2/bcrypt), so raising it costs one extra ~0.5s unlock at
+        startup for that mode and nothing for the common deployments."""
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt.encode(),
-            iterations=100000
+            iterations=600000
         )
         return base64.urlsafe_b64encode(kdf.derive(password.encode()))
     

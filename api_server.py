@@ -157,6 +157,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _external_scheme(request: StarletteRequest) -> str:
+    """The externally-visible request scheme, honouring X-Forwarded-Proto only from a trusted proxy.
+
+    Behind a TLS-terminating reverse proxy (the common SaaS/orchestrator topology, and the dev
+    compose) uvicorn sees plain HTTP even though the client spoke HTTPS, so the in-process
+    request.url.scheme is 'http' and the strongest transport-security signals (HSTS +
+    upgrade-insecure-requests) would never be emitted. Trust X-Forwarded-Proto ONLY when the
+    immediate peer is a configured trusted proxy (reusing the net_utils trust set, empty/fail-closed
+    by default), so a direct client can't influence it. Falls back to the in-process scheme — which
+    is correctly 'https' in the standalone in-process-TLS (secure compose) deploy."""
+    try:
+        xfp = request.headers.get('x-forwarded-proto')
+        if xfp:
+            from net_utils import _is_trusted_peer
+            peer = request.client.host if request.client else None
+            if _is_trusted_peer(peer):
+                return (xfp.split(',')[0].strip().lower() or request.url.scheme)
+    except Exception:
+        pass
+    return request.url.scheme
+
+
 # Comprehensive security headers middleware
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """
@@ -217,6 +239,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # Security Header: Permissions policy (disable unnecessary features)
         response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
         
+        # Externally-visible scheme (honours X-Forwarded-Proto from a trusted proxy) so the
+        # transport-security signals below fire behind a TLS-terminating reverse proxy, not only
+        # when uvicorn terminates TLS in-process.
+        external_scheme = _external_scheme(request)
+
         # Content Security Policy (CSP) - for HTML responses only
         content_type = response.headers.get('content-type', '')
         if 'text/html' in content_type:
@@ -235,8 +262,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
                 "form-action 'self'",  # Forms only submit to same origin
             ]
             
-            # Add HTTPS upgrade directive if using HTTPS
-            if request.url.scheme == 'https':
+            # Add HTTPS upgrade directive if the external scheme is HTTPS
+            if external_scheme == 'https':
                 csp_directives.append("upgrade-insecure-requests")
             
             response.headers['Content-Security-Policy'] = '; '.join(csp_directives)
@@ -255,13 +282,47 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, private'
             response.headers['Pragma'] = 'no-cache'
         
-        # HSTS (HTTP Strict Transport Security) - only for HTTPS
-        if request.url.scheme == 'https':
+        # HSTS (HTTP Strict Transport Security) - only when the external scheme is HTTPS
+        # (honours X-Forwarded-Proto from a trusted proxy, so it fires behind a TLS-terminating
+        # reverse proxy too, not only for in-process TLS).
+        if external_scheme == 'https':
             response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
         
         return response
 
+# General API rate limiter. The sliding-window limiter in rate_limiter.py was fully implemented
+# but never attached to the app, so the documented RATE_LIMIT_API_* knobs were inert and the whole
+# API surface had no framework throttle (only the login path and /ecc/* self-throttled). Wire it
+# here, gated on the config flag. It buckets by authenticated user when a bearer token is present,
+# else by trusted-proxy-aware IP; excludes static assets / health / docs (one SPA page load pulls
+# many static files); and fails OPEN on a Redis outage (availability over a brief throttling gap —
+# the separate fail-CLOSED login throttle is unaffected). Registered BEFORE SecurityHeadersMiddleware
+# so it sits inside it and a 429 response still carries the hardening headers on the way out.
+if getattr(settings, 'rate_limit_api_enabled', True):
+    from rate_limiter import RateLimitMiddleware, rate_limiter as _api_rate_limiter
+    app.add_middleware(
+        RateLimitMiddleware,
+        rate_limiter=_api_rate_limiter,
+        default_limit=settings.rate_limit_api_default,
+        default_window=settings.rate_limit_api_default_window,
+        exclude_paths=["/health", "/static", "/favicon.ico", "/brand-assets",
+                       "/docs", "/redoc", "/openapi.json"],
+    )
+
 app.add_middleware(SecurityHeadersMiddleware)
+
+# Host-header allowlist (opt-in). Empty ALLOWED_HOSTS => permissive ['*'] (a self-hosted vault's
+# served hostname is deployment-specific and unknown at build time), so this is inert unless the
+# operator declares the served name(s) — then a forged Host / X-Forwarded-Host is rejected (a
+# link-/cache-poisoning primitive). 'localhost'/'127.0.0.1' are always kept so the container's own
+# /health probe still passes. Added last => OUTERMOST, so a bad Host is rejected before other work.
+_allowed_hosts = [h.strip() for h in (getattr(settings, 'allowed_hosts', '') or '').split(',') if h.strip()]
+if _allowed_hosts:
+    for _h in ('localhost', '127.0.0.1'):
+        if _h not in _allowed_hosts:
+            _allowed_hosts.append(_h)
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts)
 
 # Include routers
 app.include_router(user_management_router)
