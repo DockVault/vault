@@ -167,6 +167,23 @@ async def get_current_user(
             TemporaryCredential.id == session.temp_credential_id
         ).first()
 
+        # Bound the session by the credential's OWN stated lifetime (validity window
+        # deactivate_at / hard expiry expires_at), not just the inactivity grace
+        # window above — mirrors get_current_user in api_server.py. Stored naive (UTC).
+        if temp_cred is not None:
+            _now = datetime.now(timezone.utc)
+            for _limit in (temp_cred.deactivate_at, temp_cred.expires_at):
+                if _limit is None:
+                    continue
+                if _limit.tzinfo is None:
+                    _limit = _limit.replace(tzinfo=timezone.utc)
+                if _now > _limit:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Temporary credential has expired. Please login again.",
+                        headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
+                    )
+
     user = db.query(User).filter(User.id == uuid.UUID(user_id)).first()
     if not user:
         raise HTTPException(
@@ -728,10 +745,21 @@ async def list_user_temp_credentials(
     # Users can only view their own, admins can view any
     if current_user.role != RoleEnum.ADMIN and current_user.id != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    temp_creds = db.query(TemporaryCredential).filter(
-        TemporaryCredential.user_id == user_id
-    ).order_by(TemporaryCredential.created_at.desc()).all()
+
+    # A scoped temp session sees ONLY the credentials IT created — never the target
+    # user's full listing (whose id UUIDs are exactly what the by-id deactivate/delete
+    # endpoints consume). Mirrors the scoped-session discipline of api_server.py's
+    # /temp-creds/list; without it a scoped admin delegate (role==ADMIN, temp.view)
+    # could enumerate any user's credential ids via this parallel router.
+    if getattr(current_user, '_is_temp_session', False) and getattr(current_user, '_temp_scope', None) is not None:
+        temp_creds = db.query(TemporaryCredential).filter(
+            TemporaryCredential.user_id == user_id,
+            TemporaryCredential.created_by_temp_credential_id == current_user._temp_cred_id,
+        ).order_by(TemporaryCredential.created_at.desc()).all()
+    else:
+        temp_creds = db.query(TemporaryCredential).filter(
+            TemporaryCredential.user_id == user_id
+        ).order_by(TemporaryCredential.created_at.desc()).all()
     
     result = []
     for cred in temp_creds:
@@ -830,8 +858,16 @@ async def deactivate_temp_credential_by_id(
     # Users can only deactivate their own, admins can deactivate any
     if current_user.role != RoleEnum.ADMIN and temp_cred.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
-    
+    # Confine a scoped temp session to creds it created, matching the api_server.py
+    # sibling (POST /temp-creds/{u}/deactivate). Without this, a scoped admin delegate
+    # could deactivate the main account's or a sibling's credential via this parallel
+    # router — the confinement is enforced on one router and absent on the other.
+    from api_server import _guard_temp_session_cred_mutation, _revoke_sessions
+    _guard_temp_session_cred_mutation(current_user, temp_cred, 'invalidate')
+
     temp_cred.is_active = False
+    # Force-close any live session for this credential (parity with the api_server twin).
+    _revoke_sessions(db, temp_credential_id=temp_cred.id, actor_username=current_user.username)
     db.commit()
     
     # Log the action
@@ -867,8 +903,15 @@ async def delete_temp_credential_by_id(
     # Users can only delete their own, admins can delete any
     if current_user.role != RoleEnum.ADMIN and temp_cred.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
-    
+    # Confine a scoped temp session to creds it created, matching the api_server.py
+    # sibling (POST /temp-creds/{u}/delete). Absent here, a scoped admin delegate could
+    # destroy the main account's or a sibling's credential via this parallel router.
+    from api_server import _guard_temp_session_cred_mutation, _revoke_sessions
+    _guard_temp_session_cred_mutation(current_user, temp_cred, 'clear')
+
     temp_username = temp_cred.temp_username
+    # Force-close any live session before the row (and its cascaded sessions) go.
+    _revoke_sessions(db, temp_credential_id=temp_cred.id, actor_username=current_user.username)
     db.delete(temp_cred)
     db.commit()
     

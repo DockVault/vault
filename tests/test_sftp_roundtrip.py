@@ -491,6 +491,49 @@ def test_sftp_deactivated_temp_cred_is_revoked_mid_session(admin):
         admin.delete_vault(va["id"])
 
 
+def _backdate_deactivate_at(temp_username):
+    """Push a temp credential's validity window (deactivate_at) into the past via the
+    vault-db container, so its stated window is closed while the hard expiry is hours out.
+    Returns False if docker/vault-db isn't reachable (test skips)."""
+    import shutil
+    import subprocess
+    if not shutil.which("docker"):
+        return False
+    try:
+        u = subprocess.run(["docker", "exec", "vault-db", "printenv", "POSTGRES_USER"],
+                           capture_output=True, text=True, timeout=10)
+        d = subprocess.run(["docker", "exec", "vault-db", "printenv", "POSTGRES_DB"],
+                           capture_output=True, text=True, timeout=10)
+        if u.returncode != 0 or d.returncode != 0:
+            return False
+        r = subprocess.run(
+            ["docker", "exec", "vault-db", "psql", "-U", u.stdout.strip(), "-d", d.stdout.strip(),
+             "-c", "UPDATE temporary_credentials SET deactivate_at = NOW() - INTERVAL '5 minutes' "
+                   f"WHERE temp_username = '{temp_username}';"],
+            capture_output=True, text=True, timeout=15)
+        return r.returncode == 0 and "UPDATE 1" in r.stdout
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def test_sftp_temp_cred_past_validity_window_denied_mid_session(admin):
+    """A temp credential whose validity window (deactivate_at) has closed must stop working
+    over SFTP too — the per-op gate honors the credential's stated lifetime, not just the web
+    per-request check. (The hard expiry is hours out, so only the window closed.)"""
+    va = admin.create_vault(name=unique("window"))
+    try:
+        vname = va["name"]
+        tuser, tcred = _make_scoped_cred(admin, va["id"], ["vault.see_info", "vault.see_files"])
+        with sftp_session(tuser, tcred) as sftp:
+            sftp.listdir(f"/{vname}")  # works inside the validity window
+            if not _backdate_deactivate_at(tuser):
+                pytest.skip("cannot backdate deactivate_at (docker/vault-db unavailable)")
+            with pytest.raises(_REVOKED_EXC):
+                sftp.listdir(f"/{vname}")  # past the window -> denied on the live session
+    finally:
+        admin.delete_vault(va["id"])
+
+
 def test_sftp_locked_account_denied_mid_session(admin, temp_user):
     """Locking a user account revokes their already-open SFTP connection at the
     next operation (parity with the web get_current_user is_locked re-check)."""

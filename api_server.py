@@ -702,6 +702,24 @@ async def get_current_user(
             TemporaryCredential.id == session.temp_credential_id
         ).first()
 
+        # Bound the session by the credential's OWN stated lifetime, not just the
+        # inactivity grace window above: a temp cred past its validity window
+        # (deactivate_at) or hard expiry (expires_at) must stop authorizing requests
+        # even while its session row is still nominally active. Stored naive (UTC).
+        if temp_cred is not None:
+            _now = datetime.now(timezone.utc)
+            for _limit in (temp_cred.deactivate_at, temp_cred.expires_at):
+                if _limit is None:
+                    continue
+                if _limit.tzinfo is None:
+                    _limit = _limit.replace(tzinfo=timezone.utc)
+                if _now > _limit:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Temporary credential has expired. Please login again.",
+                        headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
+                    )
+
     user = db.query(User).filter(User.id == uuid.UUID(user_id)).first()
     if not user:
         raise HTTPException(
@@ -1756,8 +1774,17 @@ async def create_temp_credentials(
     created_by_temp_id = None
     if is_temp and scoped:
         actor_temp = (current_user._temp_scope or {}).get('temp', {})
-        # A child may only receive create/delegate if THIS cred holds delegate.
-        if req_scope is not None and not actor_temp.get('delegate'):
+        # A child may only receive create/delegate if THIS cred holds delegate. Force
+        # both off UNCONDITIONALLY when the parent lacks delegate — including when the
+        # caller OMITS scope. With req_scope=None, create_temporary_credential defaults
+        # the child's requested scope to the FULL parent scope (create/delegate
+        # included), so a create-but-not-delegate parent could otherwise mint
+        # create-capable children simply by leaving scope out, bypassing the delegate
+        # gate. Materialise the inherited scope first so the strip has something to write.
+        if not actor_temp.get('delegate'):
+            if req_scope is None:
+                import copy
+                req_scope = copy.deepcopy(current_user._temp_scope) or {}
             t = req_scope.setdefault('temp', {})
             t['create'] = False
             t['delegate'] = False
@@ -1899,9 +1926,26 @@ async def get_temp_credential_password(
     
     Performance: Supports ETag caching (password doesn't change).
     """
+    from models import TemporaryCredential
+    temp_cred = db.query(TemporaryCredential).filter(
+        TemporaryCredential.temp_username == temp_username
+    ).first()
+    if not temp_cred:
+        raise HTTPException(
+            status_code=404,
+            detail="Password not available (expired, used, or not found)"
+        )
+    # Same ownership + confinement guard as the sibling temp-cred mutations: a
+    # non-admin may only read its own credential; a scoped temp session only those it
+    # created. Defense-in-depth — retrieve_temp_password currently always returns None,
+    # but if that ever changes this endpoint must not become a cross-user password IDOR.
+    if current_user.role != RoleEnum.ADMIN and temp_cred.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    _guard_temp_session_cred_mutation(current_user, temp_cred, 'view')
+
     auth_service = AuthService(db)
     password = auth_service.retrieve_temp_password(temp_username)
-    
+
     if not password:
         raise HTTPException(
             status_code=404,

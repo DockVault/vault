@@ -298,7 +298,22 @@ class AuthService:
             temp_cred.is_active = False
             self.db.commit()
             raise InvalidCredentialsError("Temporary credential has expired")
-        
+
+        # A temp credential also carries a stated validity window: deactivate_at
+        # (= mint + validity) closes BEFORE the hard expiry expires_at (= mint +
+        # total_lifetime). It must stop authenticating once that window ends — an
+        # operator who mints one with validity=5m expects it dead in 5 minutes even
+        # when the hard expiry is hours out. Only expires_at was enforced before, so
+        # the advertised validity window was silently ignored. Stored naive (UTC).
+        deactivate_at = temp_cred.deactivate_at
+        if deactivate_at is not None:
+            if deactivate_at.tzinfo is None:
+                deactivate_at = deactivate_at.replace(tzinfo=timezone.utc)
+            if now > deactivate_at:
+                temp_cred.is_active = False
+                self.db.commit()
+                raise InvalidCredentialsError("Temporary credential has expired")
+
         # Verify credential
         if not verify_temporary_credential(credential, temp_cred.credential_hash):
             self._record_failed_login(temp_username, ip_address)
@@ -313,9 +328,24 @@ class AuthService:
             self._record_failed_login(temp_username, ip_address)
             raise InvalidCredentialsError("Invalid temporary credentials")
 
-        # Mark credential as used
-        temp_cred.is_used = True
-        temp_cred.used_at = datetime.now(timezone.utc)
+        # Atomically claim the one-time credential. A conditional UPDATE guarded by
+        # rowcount (UPDATE ... WHERE is_used = false) takes a row lock, so two
+        # concurrent logins for the same credential are serialised at the DB: exactly
+        # one flips is_used false->true and proceeds; the loser matches zero rows and
+        # is rejected. This replaces the check-then-set (is_used read far above, set
+        # here, committed later) that let a login racing the legitimate user obtain a
+        # second live session from a single one-time credential — which also defeated
+        # the single-active-session tripwire, since the whole flow gates on this claim.
+        used_at = datetime.now(timezone.utc)
+        claimed = self.db.query(TemporaryCredential).filter(
+            TemporaryCredential.id == temp_cred.id,
+            TemporaryCredential.is_used == False,  # noqa: E712
+        ).update(
+            {TemporaryCredential.is_used: True, TemporaryCredential.used_at: used_at},
+            synchronize_session=False,
+        )
+        if not claimed:
+            raise InvalidCredentialsError("Temporary credential has already been used")
 
         # Tag the principal with this credential's least-privilege scope so both
         # the web (get_current_user re-attaches on JWT replay) and SFTP paths

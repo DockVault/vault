@@ -268,6 +268,21 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                     if tc is None or not tc.is_active:
                         print(f"⛔ Session {token[:8]}... temp credential deactivated")
                         return False
+                    # The credential's stated lifetime must bind a LIVE SFTP session too, not
+                    # just login + the web per-request check: a cred past its validity window
+                    # (deactivate_at) or hard expiry (expires_at) stops working on the next SFTP
+                    # op. Without this, a short-validity cred stayed usable over SFTP until the
+                    # inactivity reaper (~65m), ignoring its advertised window. Stored naive (UTC).
+                    from datetime import datetime, timezone
+                    _now = datetime.now(timezone.utc)
+                    for _limit in (tc.deactivate_at, tc.expires_at):
+                        if _limit is None:
+                            continue
+                        if _limit.tzinfo is None:
+                            _limit = _limit.replace(tzinfo=timezone.utc)
+                        if _now > _limit:
+                            print(f"⛔ Session {token[:8]}... temp credential past its lifetime")
+                            return False
                 return True
         except Exception as e:  # noqa: BLE001
             print(f"❌ Error checking session validity: {e}")
@@ -528,8 +543,17 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             if vault is None:
                 return paramiko.SFTP_NO_SUCH_FILE
 
-            # The vault root directory itself.
+            # The vault root directory itself. Confirming its existence/mtime requires
+            # visibility into the vault — see_info (the gate the root LISTING enforces) OR
+            # see_files (which already lets the cred list the vault's contents, so it
+            # inherently reveals existence; gating on both keeps `stat`/`cd` working for a
+            # see_files cred without opening an oracle to one with neither). Return
+            # NO_SUCH_FILE (not PERMISSION_DENIED) so absence is indistinguishable from
+            # non-existence for a credential granted no visibility at all.
             if len(segments) == 1:
+                if not (self._has_cap(user, vault.id, "vault.see_info")
+                        or self._has_cap(user, vault.id, "vault.see_files")):
+                    return paramiko.SFTP_NO_SUCH_FILE
                 return self._dir_attr(self._vault_display_name(vault),
                                       mtime=self._ts(vault.updated_at))
 
