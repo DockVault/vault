@@ -33,11 +33,19 @@ class ECCCryptoService:
     def import_public_key(pem_str: str) -> ec.EllipticCurvePublicKey:
         """Import (and thereby validate) a PEM-encoded ECC public key. Used at
         POST /ecc/keys/register to reject malformed keys. Public keys are not secret; the server
-        never sees or handles the matching private key."""
-        return serialization.load_pem_public_key(
+        never sees or handles the matching private key.
+
+        Constrained to P-384 (secp384r1): the whole ZK wrap/unwrap stack assumes that curve, and
+        register stores every key labelled 'SECP384R1'. Without this a caller could register a key
+        on a different (or non-EC) curve that is then mislabeled and breaks every future DEK wrap."""
+        key = serialization.load_pem_public_key(
             pem_str.encode('utf-8'),
             backend=default_backend(),
         )
+        if not isinstance(key, ec.EllipticCurvePublicKey) or not isinstance(key.curve, ec.SECP384R1):
+            curve = getattr(getattr(key, 'curve', None), 'name', type(key).__name__)
+            raise ValueError(f"Public key must be on curve secp384r1 (got {curve})")
+        return key
 
 
 __all__ = ['ECCCryptoService']

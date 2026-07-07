@@ -2580,6 +2580,16 @@ async def update_user(
             if revoked:
                 print(f"🔒 Revoked {revoked} live session(s) for locked/deactivated user {user.username}")
 
+        # Deactivation also offboards the user's zero-knowledge key access — parity with the
+        # user-management deactivate/toggle paths. Blacklist their active wrapped-DEK rows (owner
+        # rows carved out) so the server can no longer hand them a ZK vault key; the affected
+        # vaults surface 'rekey owed' to managers. Idempotent (only active rows), committed below.
+        if user_update.is_active is False:
+            from user_management_api import _blacklist_user_vault_keys
+            n_bl = _blacklist_user_vault_keys(db, user.id, current_user.id)
+            if n_bl:
+                print(f"🔑 Blacklisted {n_bl} ZK key(s) for deactivated user {user.username}")
+
     user.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(user)
@@ -3991,16 +4001,16 @@ async def grant_vault_permission(
                 detail="Only the vault owner or a manager can grant permissions"
             )
 
-        # a per-user grant on a ZERO-KNOWLEDGE vault creates keyless, authz-only
-        # membership — the grantee gets access rights but no wrapped DEK, so they can see
-        # metadata / mutate ciphertext yet never decrypt. ZK vaults are shared through the
-        # zero-knowledge member endpoints (/ecc/vaults/{id}/members), which distribute the
-        # wrapped key. Reject the standard grant path for a ZK vault.
-        if getattr(vault, "type", "standard") == "zero_knowledge":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Share a zero-knowledge vault via its zero-knowledge member endpoints, not per-user permissions.",
-            )
+        # NOTE: a per-user AUTHZ grant IS legitimate on a zero-knowledge vault — it records the
+        # vault_members row (membership + read/write/delete/manage), while the wrapped DEK is
+        # distributed separately through POST /ecc/vaults/{id}/members. A Manager, in particular,
+        # may hold authz WITHOUT a decrypt key (they manage sharing, not necessarily read files),
+        # and the normal member-share flow grants the key then this authz row. So — unlike the
+        # GROUP path (grant_vault_group_access, which correctly 400s ZK because a group has no
+        # keys) — the per-user grant is NOT blocked here. (A prior over-broad block was reverted:
+        # it broke the ZK sharing flow; the "keyless membership" it targeted is the intended
+        # authz-vs-key separation, and metadata is ZK-encrypted / deletion is a normal delete
+        # grant, so there is no plaintext exposure to prevent.)
 
         # Check if user exists
         user = db.query(User).filter(User.id == permission.user_id).first()

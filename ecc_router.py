@@ -67,8 +67,10 @@ class PublicKeyResponse(BaseModel):
 
 class DecompressPointRequest(BaseModel):
     """Request to decompress an ECC point."""
-    compressed_point: str = Field(..., description="Base64-encoded compressed point")
-    curve: str = Field(default="P-384", description="ECC curve name")
+    # A compressed P-384 point is 49 bytes (~68 chars base64); cap the field so an authenticated
+    # caller can't post an unbounded body to force a large allocation before validation.
+    compressed_point: str = Field(..., max_length=256, description="Base64-encoded compressed point")
+    curve: str = Field(default="P-384", max_length=16, description="ECC curve name")
 
 
 class DecompressPointResponse(BaseModel):
@@ -259,6 +261,7 @@ _ECC_RATELIMIT = {
     "register": (15, 60),      # a user registers a keypair once (idempotent); no burst is legit
     "public_key": (100, 60),   # resolving recipients' keys while sharing to a team
     "mutate": (400, 60),       # grant / revoke / rekey / retire
+    "decompress": (200, 60),   # point-format conversion during key ops (bounded compute)
 }
 
 
@@ -300,21 +303,23 @@ def _manages_any_vault(db: Session, user: User) -> bool:
 
 @router.post("/decompress-point", response_model=DecompressPointResponse)
 async def decompress_point(
-    request: DecompressPointRequest
+    request: DecompressPointRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
     Decompress a compressed ECC point to uncompressed format.
-    
-    This endpoint helps bridge the gap between Python's cryptography library
-    (which uses compressed points) and JavaScript's Web Crypto API (which 
-    requires uncompressed points for raw import).
-    
-    No authentication required - this is a pure cryptographic utility function.
-    The compressed point itself contains no sensitive information.
-    
+
+    Bridges Python's cryptography library (compressed points) and the browser Web Crypto API
+    (which needs uncompressed points for raw import). The client already calls this with a bearer
+    token as part of an authenticated key operation, so it is authenticated + rate-limited (the
+    point itself carries no secret, but an unauthenticated, unbounded modular-sqrt endpoint is a
+    cheap CPU/alloc DoS surface).
+
     Compressed P-384: 49 bytes (0x02/0x03 + 48-byte x)
     Uncompressed P-384: 97 bytes (0x04 + 48-byte x + 48-byte y)
     """
+    _ecc_rate_limit(current_user, "decompress")
     try:
         # Decode the compressed point
         compressed_bytes = base64.b64decode(request.compressed_point)
@@ -359,7 +364,10 @@ async def decompress_point(
         uncompressed_base64 = base64.b64encode(uncompressed_bytes).decode('utf-8')
         
         return DecompressPointResponse(uncompressed_point=uncompressed_base64)
-        
+
+    except HTTPException:
+        # A deliberate 4xx (bad length / prefix) must surface as-is, not be swallowed into a 500.
+        raise
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -443,6 +451,16 @@ async def register_public_key(
     - Optionally stores password-encrypted private key for recovery
     """
     _ecc_rate_limit(current_user, "register")
+    # A delegated/temp session must NOT set the account's PERMANENT zero-knowledge identity.
+    # Registration is first-write-wins and irreversible (no key rotation; re-register 409s;
+    # recovery binds to the registered key), so a scoped temp cred could otherwise plant its own
+    # key, permanently lock the real owner out, and backdoor every future share. Mirrors the same
+    # refusal on PUT /keys/private.
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="A temporary session cannot register an account encryption key.",
+        )
     try:
         # Validate public key format by trying to import it
         public_key_obj = ECCCryptoService.import_public_key(request.public_key)
@@ -1218,6 +1236,14 @@ async def rekey_vault(
     # vault's guaranteed key-holder out and break the recovery story (applies to both modes).
     if request.revoke_user_id and str(request.revoke_user_id) == str(locked.owner_id):
         raise HTTPException(status_code=400, detail="Cannot revoke the vault owner")
+    # A Manager cannot unseat a PEER Manager via rekey either — that stays owner/admin-only,
+    # parity with revoke_member_key and DELETE /vaults/{id}/permissions. Without this a low-tier
+    # manager could strip a co-manager's ZK key access by omitting them from member_keys.
+    if request.revoke_user_id and not _is_owner_or_admin(locked, current_user):
+        peer = _member_row(db, vault_id, request.revoke_user_id)
+        if peer and peer.manage_permission:
+            raise HTTPException(status_code=403,
+                                detail="Only the vault owner or an admin can revoke a manager")
 
     now = datetime.now(timezone.utc)
 

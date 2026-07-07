@@ -1091,7 +1091,10 @@ class VaultService:
                 file_content = f.read()
             if not verify_file_integrity(file_content, file.checksum_sha256):
                 raise FileServiceError("File integrity check failed")
-            return file_content, file.original_name, file.mime_type or 'application/octet-stream'
+            # A ZK file's real MIME is client-encrypted (enc_mime); the server must never serve a
+            # plaintext mime_type — a legacy pre-seal row still holds one, which would leak via the
+            # download Content-Type. Always return a neutral type for ZK.
+            return file_content, file.original_name, 'application/octet-stream'
 
         # Auto-detect the at-rest format and decrypt accordingly:
         #  - AES-256-GCM chunked stream (MAGIC + version 0x10): the current format; each
