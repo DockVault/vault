@@ -81,6 +81,17 @@ _O_ACCMODE = getattr(os, "O_ACCMODE", 0o3)
 _O_CREAT = getattr(os, "O_CREAT", 0o100)
 
 
+def _strip_ctrl(name: str) -> str:
+    """Drop C0 control characters (incl. CR/LF) and DEL from an SFTP-supplied filename.
+
+    An SFTP path segment may hold any byte except '/', so a client can put/rename to a name
+    with embedded control chars; persisted verbatim into File.original_name, they later inject
+    into a web download's Content-Disposition header (that download sink is also hardened — this
+    is the SFTP source guard). Mirrors security.sanitize_filename's control-char rule but keeps
+    everything else, so a legitimate name (spaces, unicode) is preserved for display/download."""
+    return ''.join(c for c in (name or '') if ord(c) >= 32 and ord(c) != 127)
+
+
 def _user_requires_temp_cred_for_sftp(db, user) -> bool:
     """Org SFTP-auth policy (design §5): a user in any group listed under the global
     setting ``sftp_require_temp_cred_groups`` may ONLY use a temporary credential for
@@ -133,6 +144,11 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         self.writepath: Optional[str] = None
         self.writefile = None
         self.finalizer = None  # callable(temp_path) -> None
+        # In-stream upload bound: cap the plaintext buffered to the shared volume so a
+        # client can't fill it before the close-time size check. 0 = no bound. overlimit
+        # marks the upload for discard at close (an SFTP close can't signal failure).
+        self.max_bytes = 0
+        self.overlimit = False
         # shared
         self.attrs: Optional[paramiko.SFTPAttributes] = None
 
@@ -146,6 +162,13 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
     def write(self, offset: int, data: bytes):
         if self.writefile is None:
             return paramiko.SFTP_OP_UNSUPPORTED
+        # In-stream size bound: reject any write that would push the buffered file past the
+        # per-file max, BEFORE it lands on the shared storage volume — so an SFTP client can't
+        # stream unbounded plaintext into .sftp_tmp (filling the volume shared by every vault)
+        # before the close-time size check runs. Mark the handle so close() discards the upload.
+        if self.max_bytes and (offset + len(data)) > self.max_bytes:
+            self.overlimit = True
+            return paramiko.SFTP_FAILURE
         try:
             self.writefile.seek(offset)
             self.writefile.write(data)
@@ -168,7 +191,11 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
             except Exception:  # noqa: BLE001
                 pass
             self.writefile = None
-            if self.finalizer is not None and self.writepath:
+            if self.overlimit:
+                # The upload exceeded the per-file max mid-stream: discard it (don't persist),
+                # leaving any existing same-name file intact. The temp buffer is removed below.
+                print(f"⚠️ SFTP upload discarded: exceeded max file size ({self.max_bytes}B)")
+            elif self.finalizer is not None and self.writepath:
                 try:
                     self.finalizer(self.writepath)
                 except Exception as e:  # noqa: BLE001
@@ -229,6 +256,13 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                     setattr(user, attr, getattr(src, attr))
         else:
             user._is_temp_session = False
+        # Org policy (require temp cred for SFTP) re-evaluated per op, not just at auth entry:
+        # if the user's group(s) now mandate a temp credential and this is a DIRECT (non-temp)
+        # session, cut it on the next op — so adding a user to a require-temp-cred group takes
+        # effect on an already-live direct session (parity with lock/deactivate/sftp_enabled).
+        # _user_requires_temp_cred_for_sftp fails OPEN, so it never wrongly severs a session.
+        if not getattr(user, "_is_temp_session", False) and _user_requires_temp_cred_for_sftp(db, user):
+            return None
         return user
 
     def _has_cap(self, user, vault_id, cap: str) -> bool:
@@ -256,6 +290,19 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 if not session:
                     print(f"⛔ Session {token[:8]}... has been terminated")
                     return False
+                # Enforce the session's HARD expiry on every op, not just at login. Regular
+                # account sessions carry a NULL expires_at (no hard bound → skipped); a
+                # temp-credential session carries the credential's expires_at, so a cred with a
+                # short total lifetime can't keep operating over SFTP past it (the web path
+                # rejects per request; nothing on the SFTP path did). Stored naive (UTC).
+                from datetime import datetime, timezone
+                if session.expires_at is not None:
+                    _exp = session.expires_at
+                    if _exp.tzinfo is None:
+                        _exp = _exp.replace(tzinfo=timezone.utc)
+                    if datetime.now(timezone.utc) > _exp:
+                        print(f"⛔ Session {token[:8]}... past its hard expiry")
+                        return False
                 # A deactivated temporary credential must not keep a live SFTP
                 # session alive (deactivate revokes access immediately, like the
                 # web path). Covers the case where deactivation flips only the
@@ -268,20 +315,16 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                     if tc is None or not tc.is_active:
                         print(f"⛔ Session {token[:8]}... temp credential deactivated")
                         return False
-                    # The credential's stated lifetime must bind a LIVE SFTP session too, not
-                    # just login + the web per-request check: a cred past its validity window
-                    # (deactivate_at) or hard expiry (expires_at) stops working on the next SFTP
-                    # op. Without this, a short-validity cred stayed usable over SFTP until the
-                    # inactivity reaper (~65m), ignoring its advertised window. Stored naive (UTC).
-                    from datetime import datetime, timezone
-                    _now = datetime.now(timezone.utc)
-                    for _limit in (tc.deactivate_at, tc.expires_at):
-                        if _limit is None:
-                            continue
-                        if _limit.tzinfo is None:
-                            _limit = _limit.replace(tzinfo=timezone.utc)
-                        if _now > _limit:
-                            print(f"⛔ Session {token[:8]}... temp credential past its lifetime")
+                    # The credential's VALIDITY WINDOW (deactivate_at) is tighter than the hard
+                    # expiry enforced at the session level above; enforce it too so a
+                    # short-validity cred stops on the next SFTP op (else it stayed usable ~65m
+                    # until the inactivity reaper). deactivate_at is stored naive (UTC).
+                    _da = tc.deactivate_at
+                    if _da is not None:
+                        if _da.tzinfo is None:
+                            _da = _da.replace(tzinfo=timezone.utc)
+                        if datetime.now(timezone.utc) > _da:
+                            print(f"⛔ Session {token[:8]}... temp credential past its validity window")
                             return False
                 return True
         except Exception as e:  # noqa: BLE001
@@ -642,7 +685,8 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             return handle
 
     def _open_write(self, segments: List[str]):
-        filename = segments[-1]
+        # Strip control chars at the write sink so they never reach File.original_name.
+        filename = _strip_ctrl(segments[-1])
         with get_db_context() as db:
             user = self._load_principal(db)
             if user is None:
@@ -694,6 +738,9 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         handle = VaultSFTPHandle(flags=os.O_WRONLY)
         handle.writepath = tmp_path
         handle.writefile = wf
+        # Bound the buffered plaintext in-stream at the configured per-file max, so the write
+        # can't fill the shared .sftp_tmp volume before the close-time size check runs.
+        handle.max_bytes = (settings.max_file_size_mb or 0) * 1024 * 1024
         handle.finalizer = self._make_upload_finalizer(
             vault_id, folder_id, filename, can_overwrite
         )
@@ -883,7 +930,9 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 target_id = folder.id
             try:
                 # vault_id pins the rename to the resolved vault (cross-vault guard).
-                vault_service.rename_file(target_id, new_seg[-1], user, vault_id=vault.id)
+                # Strip control chars at the rename sink (parity with the upload sink) so a
+                # CRLF-laden new name can't be persisted into original_name.
+                vault_service.rename_file(target_id, _strip_ctrl(new_seg[-1]), user, vault_id=vault.id)
             except PermissionDeniedError:
                 return paramiko.SFTP_PERMISSION_DENIED
             except (VaultFileNotFoundError, FileNotFoundError):
@@ -947,13 +996,19 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             vault = self._resolve_vault(vault_service, user, segments[0])
             if vault is None:
                 return paramiko.SFTP_NO_SUCH_FILE
-            if not self._has_cap(user, vault.id, "folder.delete"):
+            # rmdir recursively wipes every file in the subtree, so it needs DELETE authority
+            # for FILES, not merely WRITE. The old gate (folder.delete cap + WRITE RBAC) let a
+            # write-but-no-delete member — or a folder.delete-only temp cred WITHOUT file.delete
+            # — destroy the owner's DELETE-protected files, because the per-file delete_file
+            # check below was swallowed. Mirror the web delete_folder handler: require DELETE
+            # RBAC + the file.delete cap UP FRONT, and never swallow a per-file PermissionDenied.
+            if not (self._has_cap(user, vault.id, "folder.delete")
+                    and self._has_cap(user, vault.id, "file.delete")):
                 return paramiko.SFTP_PERMISSION_DENIED
-            # Require WRITE membership exactly like the web folder-delete handler.
             try:
                 from models import VaultPermissionEnum
                 vault_service.permission_service.require_vault_permission(
-                    user, vault.id, VaultPermissionEnum.WRITE
+                    user, vault.id, VaultPermissionEnum.DELETE
                 )
             except PermissionDeniedError:
                 return paramiko.SFTP_PERMISSION_DENIED
@@ -970,6 +1025,10 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 for child in db.query(File).filter(File.folder_id == fid).all():
                     try:
                         vault_service.delete_file(child.id, user)
+                    except PermissionDeniedError:
+                        # Never destroy a file the caller can't delete — abort the whole
+                        # rmdir (defense-in-depth behind the vault-level DELETE gate above).
+                        raise
                     except Exception as ex:  # noqa: BLE001
                         print(f"⚠️ rmdir: failed to delete file {child.id}: {ex}")
                 for sub in db.query(Folder).filter(Folder.parent_folder_id == fid).all():
@@ -981,6 +1040,9 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 if folder is not None:
                     db.delete(folder)
                 db.commit()
+            except PermissionDeniedError:
+                db.rollback()
+                return paramiko.SFTP_PERMISSION_DENIED
             except Exception as e:  # noqa: BLE001
                 db.rollback()
                 print(f"❌ SFTP rmdir failed: {e}")
@@ -1394,8 +1456,20 @@ def handle_sftp_client(
     server = None
 
     try:
-        # Create SSH transport
-        transport = paramiko.Transport(client_socket)
+        # Create SSH transport. Refuse SWEET32-vulnerable 3DES-CBC, all CBC ciphers, and
+        # MD5/SHA1 (incl. truncated -96) MACs so an active downgrade or a hostile/misconfigured
+        # client can't weaken the file-transfer channel; the strong defaults (aes-ctr/gcm +
+        # hmac-sha2) are untouched, so conformant clients are unaffected.
+        transport = paramiko.Transport(
+            client_socket,
+            disabled_algorithms={
+                'ciphers': ['3des-cbc', 'aes128-cbc', 'aes192-cbc', 'aes256-cbc',
+                            'blowfish-cbc', 'cast128-cbc'],
+                'macs': ['hmac-md5', 'hmac-md5-96', 'hmac-sha1', 'hmac-sha1-96'],
+            },
+        )
+        # Neutral version banner — don't leak the exact paramiko library + version pre-auth.
+        transport.local_version = "SSH-2.0-DockVault"
         transport.add_server_key(host_key)
         transport.set_subsystem_handler(
             'sftp',

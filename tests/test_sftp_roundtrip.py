@@ -578,3 +578,130 @@ def test_sftp_deactivate_force_closes_live_transport(admin):
                 "transport was not force-closed after the temp credential was deactivated"
     finally:
         admin.delete_vault(va["id"])
+
+
+# ---------------------------------------------------------------------------
+# SFTP surface hardening: recursive-delete authority, session lifetime, upload
+# bound, filename sanitization, weak-cipher rejection.
+# ---------------------------------------------------------------------------
+def _psql(sql):
+    import shutil
+    import subprocess
+    if not shutil.which("docker"):
+        return None
+    try:
+        u = subprocess.run(["docker", "exec", "vault-db", "printenv", "POSTGRES_USER"],
+                           capture_output=True, text=True, timeout=10)
+        d = subprocess.run(["docker", "exec", "vault-db", "printenv", "POSTGRES_DB"],
+                           capture_output=True, text=True, timeout=10)
+        if u.returncode != 0 or d.returncode != 0:
+            return None
+        return subprocess.run(
+            ["docker", "exec", "vault-db", "psql", "-U", u.stdout.strip(), "-d", d.stdout.strip(),
+             "-c", sql], capture_output=True, text=True, timeout=15)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def test_sftp_rmdir_requires_delete_not_just_write(admin, temp_user):
+    """A write-but-no-delete member cannot rmdir a folder over SFTP: the subtree (the owner's
+    DELETE-protected file) survives. The old gate (folder.delete cap + WRITE RBAC, swallowed
+    per-file check) let a write-only member destroy it — the SFTP twin of the web recursive-delete
+    authority fix."""
+    uname, pw, uid = temp_user["_username"], temp_user["_password"], temp_user["id"]
+    va = admin.create_vault(name=unique("rmdirguard"))
+    try:
+        vname = va["name"]
+        assert admin.post(f"/vaults/{va['id']}/folders", json={"name": "sub"}).status_code == 200
+        # Owner places a file inside the subfolder.
+        with sftp_session(ADMIN_USER, ADMIN_PASS) as sftp:
+            _sftp_write(sftp, f"/{vname}/sub/keep.txt", b"owner data")
+        # Grant the member WRITE but NOT delete.
+        assert admin.post(f"/vaults/{va['id']}/permissions",
+                          json={"user_id": uid, "level": "write"}).status_code == 200
+        with sftp_session(uname, pw) as sftp:
+            with pytest.raises((IOError, OSError)):
+                sftp.rmdir(f"/{vname}/sub")   # denied — recursive delete needs DELETE
+        # The owner's file (and folder) must survive the blocked rmdir.
+        with sftp_session(ADMIN_USER, ADMIN_PASS) as sftp:
+            assert "keep.txt" in sftp.listdir(f"/{vname}/sub")
+        # And the owner (with DELETE) can still remove it.
+        with sftp_session(ADMIN_USER, ADMIN_PASS) as sftp:
+            sftp.remove(f"/{vname}/sub/keep.txt")
+            sftp.rmdir(f"/{vname}/sub")
+    finally:
+        admin.delete_vault(va["id"])
+
+
+def test_sftp_session_past_hard_expiry_denied_mid_session(admin):
+    """A live SFTP session whose ActiveSession.expires_at has passed is denied on the next op —
+    the SFTP per-op gate now honors the session's hard expiry (was only checked on the web)."""
+    va = admin.create_vault(name=unique("hardexp"))
+    try:
+        vname = va["name"]
+        tuser, tcred = _make_scoped_cred(admin, va["id"], ["vault.see_info", "vault.see_files"])
+        with sftp_session(tuser, tcred) as sftp:
+            sftp.listdir(f"/{vname}")  # works while the session is live
+            r = _psql(
+                "UPDATE active_sessions SET expires_at = NOW() - INTERVAL '5 minutes' "
+                "WHERE is_active = true AND temp_credential_id = "
+                f"(SELECT id FROM temporary_credentials WHERE temp_username = '{tuser}');")
+            if r is None or r.returncode != 0 or "UPDATE 1" not in (r.stdout or ""):
+                pytest.skip("cannot backdate ActiveSession.expires_at (docker/vault-db)")
+            with pytest.raises(_REVOKED_EXC):
+                sftp.listdir(f"/{vname}")  # past the hard expiry -> denied
+    finally:
+        admin.delete_vault(va["id"])
+
+
+def test_sftp_upload_over_max_file_size_is_rejected(admin, temp_vault):
+    """An SFTP write past the per-file max is rejected in-stream (SFTP_FAILURE) and the upload is
+    discarded — so a client can't fill the shared .sftp_tmp volume before the close-time size
+    check. A 1-byte write at a 1 TiB offset exceeds ANY sane deployment max deterministically
+    (the server rejects on offset+len > max_bytes, before it ever touches disk), so this exercises
+    the in-stream bound regardless of the configured max_file_size (prod default is 1 GiB)."""
+    vname = temp_vault["name"]
+    huge_offset = 1024 ** 4  # 1 TiB — beyond any realistic max_file_size
+    rejected = False
+    with sftp_session(ADMIN_USER, ADMIN_PASS) as sftp:
+        try:
+            with sftp.open(f"/{vname}/toobig.bin", "wb") as fh:
+                fh.seek(huge_offset)
+                fh.write(b"x")
+        except (IOError, OSError):
+            rejected = True  # the write was refused in-stream (SFTP_FAILURE)
+    with sftp_session(ADMIN_USER, ADMIN_PASS) as sftp:
+        present = "toobig.bin" in sftp.listdir(f"/{vname}")
+    assert rejected, "an over-max SFTP write must be rejected in-stream (SFTP_FAILURE)"
+    assert not present, "a rejected over-max SFTP upload must not be persisted"
+
+
+def test_sftp_put_strips_control_chars_from_filename(admin, temp_vault):
+    """A CR/LF-laden filename put over SFTP is stored with the control chars stripped from
+    original_name (the source guard behind the web download-header sink)."""
+    vname = temp_vault["name"]
+    with sftp_session(ADMIN_USER, ADMIN_PASS) as sftp:
+        # confirm=False: the post-upload stat would 404 because the server stores the
+        # control-char-stripped name, not the CRLF path we wrote to — which is the point.
+        sftp.putfo(io.BytesIO(b"payload"), f"/{vname}/clean\r\nInjected.txt", confirm=False)
+    items = _web_list(admin, temp_vault["id"])
+    f = next((x for x in items if x.get("type") == "file" and "Injected" in x.get("name", "")), None)
+    assert f is not None, f"uploaded file not found in {[i.get('name') for i in items]}"
+    assert "\r" not in f["name"] and "\n" not in f["name"], "control chars not stripped at the SFTP sink"
+    # And it still downloads (the header sink is safe).
+    assert _web_download(admin, temp_vault["id"], f["id"]).status_code == 200
+
+
+def test_sftp_rejects_weak_3des_cbc_cipher():
+    """The transport refuses SWEET32-vulnerable 3des-cbc: a client offering ONLY 3des-cbc fails
+    to negotiate. (The strong defaults still connect — every other test here proves that.)"""
+    sock = socket.create_connection((SFTP_HOST, SFTP_PORT), timeout=10)
+    t = paramiko.Transport(sock)
+    try:
+        t.get_security_options().ciphers = ("3des-cbc",)
+        with pytest.raises(paramiko.SSHException):
+            t.start_client(timeout=10)
+    finally:
+        t.close()
+        with contextlib.suppress(Exception):
+            sock.close()
