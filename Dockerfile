@@ -29,14 +29,21 @@ COPY . .
 # ownership, so the non-root process can write uploads into it.
 RUN mkdir -p storage logs keys certs brand
 
-# Run as a non-root user (defense-in-depth). This is the per-customer product
-# container handling untrusted uploads / SFTP / at-rest crypto, so root-in-container
-# is the most valuable to drop. chown /app so the runtime dirs (storage/logs/keys/
-# certs) stay writable, and a fresh named volume mounted over them inherits this
-# ownership. SFTP binds 2222 (>1024), so no privileged bind is needed.
+# The per-customer product container handling untrusted uploads / SFTP / at-rest crypto, so
+# root-in-container is the most valuable to drop. chown /app so the runtime dirs (storage/
+# logs/keys/certs) are appuser-owned, and a fresh named volume mounted over them inherits it.
 ENV PYTHONDONTWRITEBYTECODE=1
 RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
-USER appuser
+
+# NOTE: we deliberately do NOT `USER appuser`. The container starts as root so the entrypoint
+# (docker-entrypoint.py) can chown persistent volumes that an OLDER, root-era image may have
+# created root-owned — otherwise an in-place UPGRADE to this non-root image BRICKS the
+# container (the non-root app can't read its SSH host key, and worse, the customer's
+# /app/storage files). The entrypoint runs as root ONLY for that brief fixup, then DROPS to
+# appuser (uid 10001) before exec'ing the command — so the workload never runs as root
+# (the postgres/redis official-image pattern). SFTP needs no runtime root (paramiko
+# app-level server; no OS chroot/chown; binds 2222 > 1024). Defense-in-depth is preserved:
+# the actual web/SFTP processes run as appuser.
 
 # 8000 - FastAPI web UI / API
 # 2222 - SFTP
@@ -45,6 +52,10 @@ EXPOSE 8000 2222
 # Health check (stdlib only — does not depend on `requests`)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=5 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+
+# Root-init entrypoint: fix volume ownership, then drop to appuser and exec the CMD (below)
+# or any compose/worker-supplied command. Idempotent + cheap when volumes are already owned.
+ENTRYPOINT ["python", "/app/docker-entrypoint.py"]
 
 # Default: run BOTH the web/API process (8000) and the SFTP server (2222) in one
 # container, so a provisioned single-vault deployment exposes SFTP without needing a
