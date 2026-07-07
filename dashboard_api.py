@@ -195,6 +195,10 @@ async def get_recent_events(
     
     Performance: Supports ETag caching to reduce redundant event data transfer.
     """
+    # Clamp the client-supplied limit: an unbounded value over-fetches + serializes an arbitrarily
+    # large result set (memory/CPU/response-size DoS), and a negative value errors. Mirror the
+    # bounded audit-search sibling.
+    limit = max(1, min(limit, 100))
     query = db.query(AuditLog).order_by(desc(AuditLog.timestamp))
     
     if current_user.role != RoleEnum.ADMIN:

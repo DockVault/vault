@@ -15,7 +15,9 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.exception_handlers import http_exception_handler as fastapi_http_exception_handler
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request as StarletteRequest
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy.orm import Session
@@ -113,6 +115,27 @@ async def _authorization_error_handler(request: StarletteRequest, exc: Authoriza
     else:
         status_code = status.HTTP_403_FORBIDDEN
     return JSONResponse(status_code=status_code, content={"detail": str(exc)})
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_exception_handler(request: StarletteRequest, exc: StarletteHTTPException):
+    """Render HTTPExceptions with FastAPI's default behaviour, EXCEPT sanitize any 500 detail.
+
+    Many handlers wrap an underlying error as ``HTTPException(500, detail=f"…{str(e)}")``; that
+    detail can embed SQL text, DB schema, or storage paths. Those responses are produced inside
+    the ASGI exception layer and flow back out already-serialized, so the header middleware can't
+    rewrite them. Intercept here: for a 500, emit a generic message + a server-side-logged
+    correlation id and never the raw detail. Every other status renders exactly as before."""
+    if exc.status_code == 500:
+        error_id = str(uuid.uuid4())
+        print(f"[ERROR] Sanitized HTTP 500 (ID: {error_id}): {exc.detail}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "An internal error occurred. Please contact support if the problem persists.",
+                     "error_id": error_id},
+            headers=getattr(exc, "headers", None),
+        )
+    return await fastapi_http_exception_handler(request, exc)
 
 
 # Add CORS middleware. Bearer-token auth (no cookies anywhere) already makes credentialed
@@ -876,7 +899,8 @@ async def require_interactive_admin(current_user: User = Depends(require_admin))
 def get_client_ip(request: Request) -> str:
     """Get the client IP. Honours X-Forwarded-For ONLY from a trusted proxy peer, so a direct
     (untrusted) client can't spoof its IP to poison per-IP throttles or audit logs. See
-    net_utils.client_ip (trusted set = settings.trusted_proxies, default loopback+private)."""
+    net_utils.client_ip (trusted set = settings.trusted_proxies, EMPTY by default => XFF ignored,
+    peer used; the operator opts in by declaring their reverse-proxy network)."""
     from net_utils import client_ip
     return client_ip(request)
 
@@ -1097,6 +1121,17 @@ async def search_audit_log(
     return [_audit_row_to_dict(r) for r in rows]
 
 
+def _csv_formula_safe(value):
+    """Neutralise spreadsheet formula injection. A CSV cell that begins with =, +, -, @ (or a
+    leading tab / carriage return) is interpreted as a FORMULA by Excel / Google Sheets. Audit
+    cells carry attacker-influenced text (e.g. a failed-login username recorded verbatim), so a
+    value like ``=cmd|'/c calc'!A1`` would execute when an admin opens the export. Prefix any such
+    cell with a single quote so the spreadsheet treats it as literal text."""
+    if isinstance(value, str) and value[:1] in ('=', '+', '-', '@', '\t', '\r'):
+        return "'" + value
+    return value
+
+
 @app.get("/audit/export")
 async def export_audit_log(
     user_id: Optional[str] = None,
@@ -1120,7 +1155,7 @@ async def export_audit_log(
     writer.writerow(["Timestamp", "Username", "Action", "Status", "IP Address",
                      "Resource Type", "Resource ID", "Details"])
     for r in rows:
-        writer.writerow([
+        writer.writerow([_csv_formula_safe(cell) for cell in (
             r.timestamp.isoformat() if r.timestamp else "",
             r.username or "",
             r.action or "",
@@ -1129,7 +1164,7 @@ async def export_audit_log(
             r.resource_type or "",
             r.resource_id or "",
             json.dumps(r.details) if r.details else "",
-        ])
+        )])
     return Response(
         content=buf.getvalue(),
         media_type="text/csv",
@@ -2488,11 +2523,7 @@ async def create_user(
     auth_service = AuthService(db)
     audit_logger = AuditLogger(db)
     client_ip = get_client_ip(request)
-    
-    # Debug: Print raw request data
-    print(f"[DEBUG] UserCreate object: username={user_create.username}, role={user_create.role}, role_type={type(user_create.role)}")
-    print(f"[DEBUG] UserCreate dict: {user_create.model_dump()}")
-    
+
     # Plan cap on the number of user accounts in this deployment.
     _enforce_user_cap(db)
 
@@ -7115,17 +7146,28 @@ async def get_user_security_activity(
     
     Requires admin privileges.
     """
+    # Coerce the path id to a UUID up front: the param is typed `str` (so FastAPI does not 422),
+    # but it is compared against the UUID column audit_logs.user_id — a non-UUID string would cast
+    # `::UUID` inside the query and psycopg2's error text (the full SELECT + schema) would surface
+    # in the 500 detail below. Reject a malformed id with a 400 that carries no internal detail.
+    try:
+        user_id = str(uuid.UUID(str(user_id)))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid user id")
     try:
         from security_monitor import get_security_monitor
-        
+
         monitor = get_security_monitor(db)
         analysis = monitor.analyze_user_activity(user_id, hours=hours)
-        
+
         return analysis
     except Exception as e:
-        import traceback
+        # Never echo str(e) — it can embed SQL / schema / storage paths. Log server-side, return generic.
+        error_id = str(uuid.uuid4())
+        print(f"[ERROR] user-activity analysis failed (ID: {error_id}): {e}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error analyzing user activity: {str(e)}")
+        raise HTTPException(status_code=500,
+                            detail="An internal error occurred while analyzing user activity.")
 
 
 # ============================================================================

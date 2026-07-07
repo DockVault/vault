@@ -155,10 +155,12 @@ class Settings(BaseSettings):
     # auto-lock TTL (locks stay until cleared), preserving the old behaviour if ever wanted.
     account_lockout_minutes: int = Field(default=15)
     # Trust X-Forwarded-For ONLY when the immediate peer is one of these networks (CIDR /
-    # bare IP, comma-separated). Empty => the safe default set (loopback + RFC1918 private),
-    # i.e. trust the reverse proxy / ingress on the internal network but never a public peer
-    # that could spoof the header. Set trust_all_proxies=true to honour XFF from any peer
-    # (only behind a proxy that strips client-supplied XFF).
+    # bare IP, comma-separated). Empty (the default) => trust NO proxy: XFF is ignored and the
+    # immediate peer is used (fail-closed — the shipped direct-port-mapped topology has no
+    # fronting proxy, so a private-range default would let a direct client forge its IP). Behind
+    # a genuine reverse proxy, set this to that proxy's network to get real client IPs. Set
+    # trust_all_proxies=true to honour XFF from any peer (only behind a proxy that strips
+    # client-supplied XFF).
     trusted_proxies: str = Field(default="")
     trust_all_proxies: bool = Field(default=False)
     rate_limit_vault_attempts: int = Field(default=5)  # Regular users

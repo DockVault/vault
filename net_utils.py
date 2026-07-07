@@ -10,10 +10,14 @@ walk the chain RIGHT-TO-LEFT and return the first entry that is NOT itself a tru
 real client. This closes the spoof both for a direct public client (untrusted peer => XFF
 ignored) and behind a trusted proxy chain.
 
-Trust set (settings.trusted_proxies, CIDR or bare IP, comma-separated). Empty => the safe
-default of loopback + RFC1918 private ranges (the reverse proxy / ingress sits on the internal
-network; a public peer never does). settings.trust_all_proxies=true honours XFF from any peer
-(only correct behind a proxy that itself strips/normalises client-supplied XFF).
+Trust set (settings.trusted_proxies, CIDR or bare IP, comma-separated). It is EMPTY by default:
+no proxy is trusted, so X-Forwarded-For is ignored and the immediate TCP peer is used. This is
+fail-closed — the shipped topology maps the container port directly (no fronting proxy), so the
+peer is the Docker bridge gateway, which does NOT append XFF; trusting it (or any private range)
+by default would let a DIRECT client forge its audit IP / evade the per-IP throttle by sending
+its own X-Forwarded-For. To get real client IPs behind a genuine reverse proxy the operator must
+list that proxy's network(s) explicitly. settings.trust_all_proxies=true honours XFF from any
+peer (only correct behind a proxy that itself strips/normalises client-supplied XFF).
 """
 import ipaddress
 from functools import lru_cache
@@ -22,23 +26,18 @@ from typing import List, Optional
 from config import settings
 
 
-# Loopback + RFC1918 private ranges + link-local + unique-local (IPv6). A reverse proxy /
-# docker ingress fronting the app lives in one of these; a public client never does.
-_DEFAULT_TRUSTED = [
-    "127.0.0.0/8", "::1/128",
-    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    "169.254.0.0/16", "fc00::/7", "fe80::/10",
-]
-
-
 @lru_cache(maxsize=1)
 def _trusted_networks() -> List[ipaddress._BaseNetwork]:
-    """Parsed trusted-proxy networks (cached). settings.trusted_proxies overrides the default
-    private+loopback set; unparseable entries are skipped."""
+    """Parsed trusted-proxy networks (cached). An empty settings.trusted_proxies means NO proxy
+    is trusted (fail-closed: XFF ignored, peer used) — the operator must declare their proxy
+    network(s) to opt into X-Forwarded-For. Unparseable entries are skipped."""
     raw = (getattr(settings, "trusted_proxies", "") or "").strip()
-    specs = [s.strip() for s in raw.split(",") if s.strip()] if raw else _DEFAULT_TRUSTED
+    if not raw:
+        return []
     nets: List[ipaddress._BaseNetwork] = []
-    for spec in specs:
+    for spec in (s.strip() for s in raw.split(",")):
+        if not spec:
+            continue
         try:
             nets.append(ipaddress.ip_network(spec, strict=False))
         except ValueError:

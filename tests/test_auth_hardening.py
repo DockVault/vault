@@ -153,25 +153,43 @@ class _Req:
         self.headers = _Headers({"X-Forwarded-For": xff} if xff else {})
 
 ci = net_utils.client_ip
-# A trusted (private/loopback) peer is the reverse proxy -> honour XFF, taking the RIGHT-MOST
-# UNTRUSTED entry (append-style proxies append the connecting IP, so a forged LEFT-most value
-# must NOT win).
-assert ci(_Req("172.18.0.5", "203.0.113.50")) == "203.0.113.50", "single-hop XFF"
-assert ci(_Req("172.18.0.5", "9.9.9.9, 203.0.113.50")) == "203.0.113.50", "forged left-most XFF must be ignored"
-assert ci(_Req("127.0.0.1", "1.2.3.4")) == "1.2.3.4", "loopback peer must honour XFF"
-# Multiple trusted hops appended after the real client -> right-most untrusted is the client.
-assert ci(_Req("172.18.0.5", "203.0.113.50, 10.0.0.9, 172.18.0.5")) == "203.0.113.50"
-# An untrusted (public) peer is a direct client -> IGNORE its spoofable XFF, use the peer.
-assert ci(_Req("8.8.8.8", "203.0.113.9")) == "8.8.8.8", "untrusted peer must ignore XFF"
+
+# --- Default posture: trusted_proxies UNSET => NO proxy is trusted, X-Forwarded-For IGNORED ---
+# Fail-closed. The shipped compose maps the port directly (no fronting proxy), so the peer is the
+# Docker bridge gateway, which does NOT append XFF. A direct client must not be able to forge its
+# audit IP / evade the per-IP throttle by sending its own XFF — even a private/loopback peer is
+# NOT treated as a proxy unless the operator declares it.
+net_utils.settings.trusted_proxies = ""
+net_utils._trusted_networks.cache_clear()
+assert ci(_Req("172.18.0.5", "203.0.113.50")) == "172.18.0.5", "unset trust => ignore XFF, use the (private) peer"
+assert ci(_Req("127.0.0.1", "1.2.3.4")) == "127.0.0.1", "unset trust => ignore XFF, use the loopback peer"
+assert ci(_Req("8.8.8.8", "203.0.113.9")) == "8.8.8.8", "untrusted peer ignores XFF"
 assert ci(_Req("8.8.8.8")) == "8.8.8.8", "no XFF -> peer"
-# IPv4-mapped IPv6 trusted peer is recognised as trusted (dual-stack hosts).
-assert ci(_Req("::ffff:172.18.0.5", "203.0.113.50")) == "203.0.113.50", "mapped trusted peer"
-# Junk / host:port tokens are skipped, not fatal.
-assert ci(_Req("172.18.0.5", "garbage, 203.0.113.50")) == "203.0.113.50", "skip junk token"
-assert ci(_Req("172.18.0.5", "203.0.113.50:1234")) == "203.0.113.50", "strip :port"
-assert ci(_Req("127.0.0.1", "not-an-ip")) == "127.0.0.1", "all-junk XFF -> peer"
-# All-trusted chain -> the originating (left-most) internal address.
-assert ci(_Req("127.0.0.1", "10.0.0.7, 192.168.1.2")) == "10.0.0.7", "all-trusted -> left-most"
+
+# --- Opt-in: operator declares the proxy network(s) => XFF honoured, walked RIGHT-TO-LEFT ---
+# append-style proxies append the connecting IP, so a forged LEFT-most value must NOT win.
+net_utils.settings.trusted_proxies = "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
+net_utils._trusted_networks.cache_clear()
+try:
+    assert ci(_Req("172.18.0.5", "203.0.113.50")) == "203.0.113.50", "declared trusted peer honours single-hop XFF"
+    assert ci(_Req("172.18.0.5", "9.9.9.9, 203.0.113.50")) == "203.0.113.50", "forged left-most XFF must be ignored"
+    assert ci(_Req("127.0.0.1", "1.2.3.4")) == "1.2.3.4", "loopback proxy honours XFF"
+    # Multiple trusted hops appended after the real client -> right-most untrusted is the client.
+    assert ci(_Req("172.18.0.5", "203.0.113.50, 10.0.0.9, 172.18.0.5")) == "203.0.113.50"
+    # An untrusted (public) peer is a direct client -> IGNORE its spoofable XFF even when a trust set exists.
+    assert ci(_Req("8.8.8.8", "203.0.113.9")) == "8.8.8.8", "untrusted peer must ignore XFF"
+    # IPv4-mapped IPv6 trusted peer is recognised as trusted (dual-stack hosts).
+    assert ci(_Req("::ffff:172.18.0.5", "203.0.113.50")) == "203.0.113.50", "mapped trusted peer"
+    # Junk / host:port tokens are skipped, not fatal.
+    assert ci(_Req("172.18.0.5", "garbage, 203.0.113.50")) == "203.0.113.50", "skip junk token"
+    assert ci(_Req("172.18.0.5", "203.0.113.50:1234")) == "203.0.113.50", "strip :port"
+    assert ci(_Req("127.0.0.1", "not-an-ip")) == "127.0.0.1", "all-junk XFF -> peer"
+    # All-trusted chain -> the originating (left-most) internal address.
+    assert ci(_Req("127.0.0.1", "10.0.0.7, 192.168.1.2")) == "10.0.0.7", "all-trusted -> left-most"
+finally:
+    # Restore the process default so this throwaway interpreter leaks no config.
+    net_utils.settings.trusted_proxies = ""
+    net_utils._trusted_networks.cache_clear()
 print("NET_OK")
 '''
 
