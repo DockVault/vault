@@ -229,3 +229,20 @@ class Settings(BaseSettings):
 # Global settings instance
 settings = Settings()
 settings.ensure_directories()
+
+
+# --- Fail closed on a weak / empty / placeholder JWT signing secret ---
+# Token acceptance rests ENTIRELY on this HS256 secret (the algorithm is pinned in
+# verify_access_token, so there is no alg-confusion fallback). An empty default or the
+# copied .env.example placeholder would let anyone mint valid admin tokens offline. Reject
+# it at startup, mirroring the "no credentials configured" hard-exit above.
+_JWT_SECRET_PLACEHOLDERS = {
+    "your_jwt_secret_key_here", "changeme", "change_this", "changethis", "change_me",
+    "secret", "your_secret_key", "your-secret-key", "please_change_me", "jwt_secret",
+}
+_jwt_secret = (settings.jwt_secret_key or "").strip()
+if len(_jwt_secret) < 32 or _jwt_secret.lower() in _JWT_SECRET_PLACEHOLDERS:
+    print("\n❌ FATAL: JWT_SECRET_KEY is unset, too short (<32 chars), or a known placeholder.")
+    print("   A weak signing secret allows offline forgery of admin session tokens.")
+    print("   Generate a strong secret and set JWT_SECRET_KEY:  openssl rand -hex 32")
+    sys.exit(1)

@@ -92,6 +92,17 @@ async def get_current_user(
     # Check if this is a temporary credential session
     session_token = payload.get("session_token")
     is_temporary = payload.get("is_temporary", False)
+    temp_cred = None  # the TemporaryCredential row backing a temp session
+
+    # Every token this server mints carries a session_token; a token without one bypasses the
+    # revocation checks below and can only be a forgery/legacy token. Reject it so this
+    # admin-management router enforces the same revocability as api_server.
+    if not session_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
+        )
 
     # Revocation: a logged-out token is denylisted until it expires (all users, no
     # single-session side effect). Mirrors get_current_user in api_server.py.
@@ -130,17 +141,32 @@ async def get_current_user(
                 headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
             )
         
-        # Also check if session has expired based on grace period
+        # Also check if session has expired based on grace period. ActiveSession.last_activity
+        # is stored naive (UTC); make it tz-aware so this comparison doesn't raise "can't
+        # compare offset-naive and offset-aware datetimes" — that TypeError was 500-ing EVERY
+        # temp-credential request to this router (mirrors the same fix in api_server.py's
+        # get_current_user), which masked the require_interactive_admin gate behind a 500.
         grace_minutes = int(os.getenv('TEMP_CRED_SESSION_GRACE_MINUTES', '65'))
         grace_cutoff = datetime.now(timezone.utc) - timedelta(minutes=grace_minutes)
-        
-        if session.last_activity < grace_cutoff:
+
+        last_activity = session.last_activity
+        if last_activity is not None and last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+        if last_activity is not None and last_activity < grace_cutoff:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Session has expired due to inactivity.",
                 headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
             )
-    
+
+        # Load the credential backing this session so its scope (and the temp-session flag)
+        # can be attached below — WITHOUT this, _is_temp_session is never set on this router's
+        # principal and require_interactive_admin would be a no-op here.
+        from models import TemporaryCredential
+        temp_cred = db.query(TemporaryCredential).filter(
+            TemporaryCredential.id == session.temp_credential_id
+        ).first()
+
     user = db.query(User).filter(User.id == uuid.UUID(user_id)).first()
     if not user:
         raise HTTPException(
@@ -166,6 +192,16 @@ async def get_current_user(
             headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
         )
 
+    # Tag the temp-session context so require_interactive_admin (and the data layer) enforce
+    # least privilege on this router the same way api_server does. Any temp session is flagged
+    # even if its scope row can't be loaded, so it can never fall through as an interactive
+    # admin.
+    if is_temporary and session_token and temp_cred is not None:
+        from temp_scope import attach_scope
+        attach_scope(db, user, temp_cred)
+    else:
+        user._is_temp_session = bool(is_temporary and session_token)
+
     return user
 
 
@@ -175,6 +211,21 @@ async def require_admin(current_user: User = Depends(get_current_user)) -> User:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required"
+        )
+    return current_user
+
+
+async def require_interactive_admin(current_user: User = Depends(require_admin)) -> User:
+    """Admin dependency that ALSO rejects temporary-credential sessions.
+
+    An admin-minted temp credential keeps the admin ROLE (get_current_user returns the real
+    admin User; attach_scope never downgrades role), so require_admin alone would let a
+    tightly-scoped temp credential perform privilege-escalating admin-plane writes such as a
+    role change. Those must come from a real interactive admin session."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This action requires an interactive admin session, not a temporary credential.",
         )
     return current_user
 
@@ -518,10 +569,11 @@ def _blacklist_user_vault_keys(db: Session, user_id, revoked_by) -> int:
 async def update_user(
     user_id: uuid.UUID,
     update_data: UserUpdateRequest,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
-    """Update user information (admin only)"""
+    """Update user information (interactive admin only — sets role/is_active; a temp
+    credential must not escalate roles)."""
     
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
@@ -570,10 +622,10 @@ async def update_user(
 @require_endpoint_permission("USER_MANAGE")
 async def toggle_user_active(
     user_id: uuid.UUID,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
-    """Toggle user active status"""
+    """Toggle user active status (interactive admin only)"""
     
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
@@ -609,10 +661,10 @@ async def toggle_user_active(
 @require_endpoint_permission("USER_MANAGE")
 async def toggle_user_locked(
     user_id: uuid.UUID,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
-    """Toggle user locked status"""
+    """Toggle user locked status (interactive admin only)"""
     
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
@@ -721,10 +773,11 @@ async def list_user_temp_credentials(
 async def create_temp_credential_for_user(
     user_id: uuid.UUID,
     request_data: TempCredentialCreateRequest,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
-    """Admin creates temp credential for a user (password NOT shown to admin)"""
+    """Interactive admin creates a temp credential for a user (a temp session must not mint
+    further unrestricted credentials). Password NOT shown to admin."""
     
     # Verify user exists
     user = db.query(User).filter(User.id == user_id).first()
@@ -999,12 +1052,12 @@ async def get_role_definitions(
 async def change_user_role(
     user_id: uuid.UUID,
     request: ChangeRoleRequest,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
-    Change a user's role. Only admins can perform this action.
-    Prevents admins from changing their own role.
+    Change a user's role. Only an interactive admin can perform this action (a temp
+    credential must not escalate roles). Prevents admins changing their own role.
     """
     # Get target user
     target_user = db.query(User).filter(User.id == user_id).first()

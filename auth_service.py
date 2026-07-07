@@ -211,21 +211,25 @@ class AuthService:
             self._record_failed_login(username, ip_address)
             raise InvalidCredentialsError("Invalid username or password")
         
-        # Check if account is locked. A failed-login auto-lock auto-expires (locked_until in
-        # the past) — clear it and let the password be verified afresh; an admin lock stays.
-        if user.is_locked:
-            if account_locked(user):
-                raise AccountLockedError("Account is locked")
+        # A failed-login auto-lock auto-expires (locked_until in the past) — clear it so the
+        # password is verified afresh; an admin lock (locked_until NULL) stays in force.
+        if user.is_locked and not account_locked(user):
             clear_account_lock(user)  # committed on success below, or re-counted on failure
 
-        # Check if account is active
-        if not user.is_active:
-            raise InvalidCredentialsError("Account is not active")
-        
-        # Verify password
+        # Verify the password FIRST, before any account-state branch, so a caller who does
+        # NOT present valid credentials cannot distinguish existing/active/locked/deactivated
+        # accounts by response body or timing. Every non-success outcome returns the
+        # SAME generic message to the caller; the specific reason stays in the audit log only.
         if not verify_password(password, user.password_hash):
             self._record_failed_login(username, ip_address, user)
             raise InvalidCredentialsError("Invalid username or password")
+
+        # Credentials are valid — now enforce account state. (The distinct exception type is
+        # for audit / internal handling; the endpoint surfaces a generic message.)
+        if account_locked(user):
+            raise AccountLockedError("Account is locked")
+        if not user.is_active:
+            raise InvalidCredentialsError("Account is not active")
         
         # Check for existing active sessions (only 1 allowed)
         self._terminate_existing_sessions(user.id)
@@ -299,13 +303,19 @@ class AuthService:
         if not verify_temporary_credential(credential, temp_cred.credential_hash):
             self._record_failed_login(temp_username, ip_address)
             raise InvalidCredentialsError("Invalid temporary credentials")
-        
+
+        # The owning account must itself be active and unlocked. Otherwise a disabled/locked
+        # principal could still mint a temp session, emit a misleading login-success signal,
+        # and BURN this one-time credential. Check BEFORE marking it used so a deactivated
+        # owner does not consume it.
+        user = temp_cred.user
+        if user is None or not user.is_active or account_locked(user):
+            self._record_failed_login(temp_username, ip_address)
+            raise InvalidCredentialsError("Invalid temporary credentials")
+
         # Mark credential as used
         temp_cred.is_used = True
         temp_cred.used_at = datetime.now(timezone.utc)
-        
-        # Get the associated user
-        user = temp_cred.user
 
         # Tag the principal with this credential's least-privilege scope so both
         # the web (get_current_user re-attaches on JWT replay) and SFTP paths
@@ -903,7 +913,14 @@ class AuthService:
             # so it auto-unlocks — a permanent lock here is a trivial targeted DoS (5 wrong
             # passwords against a known username). account_lockout_minutes=0 keeps it
             # permanent (locked_until NULL) if a deployment ever wants the old behaviour.
-            if user.failed_login_attempts >= settings.rate_limit_login_attempts:
+            # Since now verifies the password even for an already-locked account, a
+            # failed login can reach this branch for a PERMANENT admin lock (is_locked=True,
+            # locked_until=NULL). Do NOT downgrade such a standing lock into an auto-expiring
+            # one — only arm a fresh auto-lock when the account is not already permanently
+            # locked (regression guard).
+            if user.failed_login_attempts >= settings.rate_limit_login_attempts and not (
+                user.is_locked and user.locked_until is None
+            ):
                 user.is_locked = True
                 ttl = getattr(settings, 'account_lockout_minutes', 0) or 0
                 user.locked_until = (

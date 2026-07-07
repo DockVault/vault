@@ -505,10 +505,14 @@ class VaultService:
         if not vault:
             raise VaultNotFoundError(f"Vault not found: {vault_id}")
         
-        # Only owner can delete vault
-        if vault.owner_id != user.id:
+        # Owner-or-admin deletion — a read-only / shared member must not delete. NOTE:
+        # the sole caller (the delete route) runs get_vault() first, which gates READ with no
+        # admin special-case, so a non-member admin is already blocked upstream; this admin arm
+        # covers an admin who is a member. Fails closed.
+        from models import RoleEnum
+        if vault.owner_id != user.id and user.role != RoleEnum.ADMIN:
             from authorization import PermissionDeniedError
-            raise PermissionDeniedError("Only vault owner can delete vault")
+            raise PermissionDeniedError("Only the vault owner or an admin can delete this vault")
         
         # Delete physical files
         vault_dir = self._get_vault_path(vault_id)
@@ -561,6 +565,18 @@ class VaultService:
 
             if not parent_folder or parent_folder.vault_id != vault_id:
                 raise FolderNotFoundError("Parent folder not found or not in vault")
+
+            # bound nesting depth so the tree can't grow deep enough to exhaust
+            # rows/inodes or blow Python's recursion limit in the recursive folder delete.
+            depth = 1
+            ancestor = parent_folder
+            while ancestor is not None and ancestor.parent_folder_id is not None:
+                depth += 1
+                if depth > 64:
+                    raise ValueError("Folder nesting too deep (max depth 64)")
+                ancestor = self.db.query(Folder).filter(
+                    Folder.id == ancestor.parent_folder_id
+                ).first()
 
         # Hash password if provided
         password_hash = hash_password(password) if password else None
@@ -1239,6 +1255,10 @@ class VaultService:
         # ---- Standard / legacy plaintext rename ----
         # Validate new name
         new_name = (new_name or '').strip()
+        # strip control chars (CR/LF etc.) so a renamed object's stored name can't
+        # corrupt logs or inject into the download Content-Disposition header — the
+        # invalid_chars list below omits them (the download-header sink is also defended).
+        new_name = ''.join(c for c in new_name if ord(c) >= 32 and ord(c) != 127)
         if not new_name:
             raise ValueError("File name cannot be empty")
 

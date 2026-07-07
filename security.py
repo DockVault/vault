@@ -634,7 +634,11 @@ def sanitize_filename(filename: str) -> str:
     """
     # Remove any path separators and null bytes
     filename = filename.replace('/', '').replace('\\', '').replace('\0', '')
-    
+
+    # Strip ALL control characters (C0 incl. CR/LF, and DEL) so a stored name can't later
+    # inject into a response header (Content-Disposition) or corrupt logs.
+    filename = ''.join(c for c in filename if ord(c) >= 32 and ord(c) != 127)
+
     # Remove leading/trailing dots and spaces
     filename = filename.strip('. ')
     

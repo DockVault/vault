@@ -623,6 +623,17 @@ async def get_current_user(
     is_temporary = payload.get("is_temporary", False)
     temp_cred = None  # the TemporaryCredential row backing a temp session
 
+    # Every token this server mints carries a session_token (login is the ONLY issuer —
+    # api_server.py create_access_token call site). A token WITHOUT one can only be a forgery
+    # or a stripped/legacy token, and it would bypass every revocation check below (all gated
+    # on session_token). Reject it so leaked/forged tokens remain revocable.
+    if not session_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
+        )
+
     # Revocation: a logged-out token is denylisted until it expires. This revokes the token
     # for ALL users WITHOUT enforcing single-session (re-login denylists nothing), so
     # concurrent sessions still work. See auth_service.denylist_token.
@@ -1328,7 +1339,7 @@ async def upload_brand_asset(
     slot: str,
     request: Request,
     file: UploadFile = FastAPIFile(...),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Admin-upload a brand logo or favicon. The type is sniffed by magic bytes (not the
@@ -1386,7 +1397,7 @@ async def upload_brand_asset(
 async def reset_brand_asset(
     slot: str,
     request: Request,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Reset a brand logo/favicon to the built-in default: drop the override key(s) from
@@ -1587,11 +1598,15 @@ async def login(
             # Don't fail the response if monitoring fails
             print(f"Warning: Failed to record security event: {monitor_error}")
         
+        # Uniform generic message for ALL credential-failure outcomes (nonexistent / wrong
+        # password / inactive / locked) so the response body can't enumerate accounts or
+        # their state. The specific reason is preserved in the audit log
+        # (log_login_failure above), never returned to the caller.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(e)
+            detail="Invalid username or password"
         )
-    
+
     except AuthRateLimitExceededError as e:
         # Log the rate limit event
         audit_logger.log_login_failure(
@@ -2169,7 +2184,34 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             
             if not user_id or not username:
                 raise ValueError("Invalid token payload")
-                
+
+            # Parity with get_current_user: verify_access_token only checks
+            # signature + exp, so without these a logged-out / revoked / locked / deactivated
+            # token could open a live-monitor socket and stream events until its natural exp
+            # (a revoked ADMIN token would stream the whole fleet feed).
+            session_token = payload.get("session_token")
+            is_temporary = payload.get("is_temporary", False)
+            if not session_token:
+                raise ValueError("Invalid token payload")
+            from database import SessionLocal
+            from auth_service import is_token_denylisted, account_locked
+            from models import ActiveSession as _WsAS, User as _WsUser
+            _wsdb = SessionLocal()
+            try:
+                if is_token_denylisted(session_token):
+                    raise ValueError("Session terminated")
+                if not is_temporary:
+                    _rev = _wsdb.query(_WsAS.revoked).filter(
+                        _WsAS.session_token == session_token
+                    ).first()
+                    if _rev is not None and _rev[0]:
+                        raise ValueError("Session terminated")
+                _wsuser = _wsdb.query(_WsUser).filter(_WsUser.id == uuid.UUID(user_id)).first()
+                if not _wsuser or not _wsuser.is_active or account_locked(_wsuser):
+                    raise ValueError("Account inactive or locked")
+            finally:
+                _wsdb.close()
+
         except Exception as e:
             await websocket.send_json({
                 "type": "error",
@@ -2304,7 +2346,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
 @require_endpoint_permission("USER_MANAGE")
 async def create_user(
     user_create: UserCreate,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
     request: Request = None
 ):
@@ -2417,10 +2459,13 @@ async def update_user(
             detail="User not found"
         )
     
-    # Check permissions
-    is_admin = current_user.role == RoleEnum.ADMIN
+    # Check permissions. A TEMP session keeps role==ADMIN but must not wield admin power here:
+    # treat it as non-admin so the admin-only branch (role/is_active/is_locked) AND any
+    # cross-user password reset are unreachable by a temp credential — a temp admin acting on
+    # ANOTHER user then fails the is_admin/is_self gate below and gets 403.
+    is_admin = current_user.role == RoleEnum.ADMIN and not getattr(current_user, "_is_temp_session", False)
     is_self = current_user.id == user_id
-    
+
     if not (is_admin or is_self):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -2525,9 +2570,20 @@ def _parse_ssh_public_key(line: str):
 
 
 def _ssh_key_target_user(user_id, current_user, db):
-    """Admin-or-self gate for SSH-key management; returns the target user."""
-    if current_user.role != RoleEnum.ADMIN and current_user.id != user_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    """Admin-or-self gate for SSH-key management; returns the target user.
+
+    A temp credential must not add/remove an SSH key on ANOTHER account — a stored key is a
+    persistent SFTP auth factor that outlives the credential's time-box. Self
+    management stays allowed; an admin acting on another user must be an INTERACTIVE admin."""
+    is_self = current_user.id == user_id
+    if not is_self:
+        if current_user.role != RoleEnum.ADMIN:
+            raise HTTPException(status_code=403, detail="Access denied")
+        if getattr(current_user, "_is_temp_session", False):
+            raise HTTPException(
+                status_code=403,
+                detail="This action requires an interactive admin session, not a temporary credential.",
+            )
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -2616,7 +2672,7 @@ async def delete_ssh_key(
 @require_endpoint_permission("USER_MANAGE")
 async def delete_user(
     user_id: uuid.UUID,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
     request: Request = None
 ):
@@ -2698,7 +2754,7 @@ async def list_groups(
 @app.post("/groups", response_model=GroupResponse)
 async def create_group(
     payload: GroupCreate,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """Create an organizational group (admin only)."""
@@ -2755,7 +2811,7 @@ async def get_group(
 async def update_group(
     group_id: uuid.UUID,
     payload: GroupUpdate,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """Rename / re-describe / re-color / re-parent a group (admin only)."""
@@ -2798,7 +2854,7 @@ async def update_group(
 @app.delete("/groups/{group_id}")
 async def delete_group(
     group_id: uuid.UUID,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """Delete a group. Children are reparented to this group's parent so the
@@ -2818,7 +2874,7 @@ async def delete_group(
 async def add_group_members(
     group_id: uuid.UUID,
     payload: GroupMembersAdd,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """Add one or more users to a group (idempotent)."""
@@ -2849,7 +2905,7 @@ async def add_group_members(
 async def remove_group_member(
     group_id: uuid.UUID,
     user_id: uuid.UUID,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """Remove a user from a group."""
@@ -3364,10 +3420,16 @@ async def set_vault_favorite(
     db: Session = Depends(get_db),
 ):
     """Star a vault for the current user (idempotent personal preference)."""
-    from models import vault_favorites, Vault
+    from models import vault_favorites, Vault, VaultPermissionEnum
     from sqlalchemy import insert as _insert
+    # require READ access before favoriting. Without this, favoriting is a cross-tenant
+    # existence oracle (200-vs-404 on any vault_id) plus an unauthorized write on a vault the
+    # caller cannot open. A uniform 404 for both "absent" and "exists-but-forbidden" keeps the
+    # oracle closed. (This checks the underlying user's real READ access, not temp-cred scope —
+    # a favorite is a personal bookmark keyed to the real user; temp-scope favorite discipline
+    # is out of scope here.)
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
-    if not vault:
+    if not vault or not PermissionService(db).can_access_vault(current_user, vault_id, VaultPermissionEnum.READ):
         raise HTTPException(status_code=404, detail="Vault not found")
     if not _is_vault_favorite(db, current_user.id, vault_id):
         try:
@@ -3422,17 +3484,39 @@ async def delete_vault(
         # require_password=True because we're deleting (destructive operation)
         vault = vault_service.get_vault(vault_id, current_user, vault_password, require_password=True)
         vault_name = str(vault.name)  # Convert to string
-        
-        # Delete vault (will cascade delete files)
-        db.delete(vault)
-        db.commit()
-        
+
+        # SECURITY: deletion is owner-or-admin, mirroring update_vault_info /
+        # change_vault_password. get_vault() above only checks READ, so without this guard a
+        # read-only / group-access member could destroy the whole vault. NOTE: get_vault gates
+        # READ first with no admin special-case, so the admin arm here only covers an admin who
+        # is a MEMBER of the vault; a tenant-wide "admin deletes any vault" would need a
+        # pre-get_vault admin bypass (a separate product decision, out of scope). Fails closed.
+        if vault.owner_id != current_user.id and current_user.role != RoleEnum.ADMIN:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only the vault owner or an admin can delete this vault"
+            )
+
+        # Delete via the service so the on-disk encrypted blobs are removed too — the
+        # route previously did a bare db.delete() that left {storage}/{vault_id}/ orphaned on
+        # disk forever (disk-exhaustion DoS + broken secure-delete). The service re-checks
+        # owner-or-admin and cascade-deletes the DB rows.
+        vault_service.delete_vault(vault_id, current_user)
+
         audit_logger.log_vault_deleted(
             vault_id, vault_name, current_user, get_client_ip(request)
         )
-        
+
         return {"message": f"Vault {vault_name} deleted successfully"}
-        
+
+    except HTTPException:
+        raise
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except VaultNotFoundError as e:
+        # A missing/already-deleted vault should be a clean 404, not a generic 500 (the
+        # VaultNotFoundError subclasses FileServiceError, not ResourceNotFoundError).
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except (PasswordRequiredError, InvalidPasswordError) as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -3863,6 +3947,17 @@ async def grant_vault_permission(
                 detail="Only the vault owner or a manager can grant permissions"
             )
 
+        # a per-user grant on a ZERO-KNOWLEDGE vault creates keyless, authz-only
+        # membership — the grantee gets access rights but no wrapped DEK, so they can see
+        # metadata / mutate ciphertext yet never decrypt. ZK vaults are shared through the
+        # zero-knowledge member endpoints (/ecc/vaults/{id}/members), which distribute the
+        # wrapped key. Reject the standard grant path for a ZK vault.
+        if getattr(vault, "type", "standard") == "zero_knowledge":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Share a zero-knowledge vault via its zero-knowledge member endpoints, not per-user permissions.",
+            )
+
         # Check if user exists
         user = db.query(User).filter(User.id == permission.user_id).first()
         if not user:
@@ -4205,7 +4300,16 @@ async def rotate_vault_encryption_key(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only vault owner can rotate encryption keys"
             )
-        
+
+        # server-side key rotation applies only to STANDARD vaults. A zero-knowledge
+        # vault's content key is client-side (the server never holds it), so rotating the
+        # server key here would touch an unused key and falsely report success — reject it.
+        if getattr(vault, "type", "standard") == "zero_knowledge":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Key rotation does not apply to zero-knowledge vaults; their keys are managed client-side (use the zero-knowledge rekey endpoint).",
+            )
+
         # Perform key rotation
         master_key = settings.encryption_key.encode()
         old_version = vault.key_version
@@ -4499,7 +4603,14 @@ def _content_disposition(file_name: str) -> str:
     on a non-Latin-1 character)."""
     from urllib.parse import quote
     name = file_name or 'download'
-    ascii_fallback = name.encode('ascii', 'ignore').decode('ascii').replace('"', '').strip() or 'download'
+    # Strip control chars (incl. CR/LF, which ARE ASCII and survive the ascii encode) plus
+    # quotes/backslashes, so a crafted filename can't inject header content, split the response,
+    # or (on uvicorn) make the whole download 500 on a malformed header. The UTF-8 filename*
+    # below is already safe (quote() percent-encodes control chars).
+    ascii_fallback = ''.join(
+        c for c in name.encode('ascii', 'ignore').decode('ascii')
+        if 32 <= ord(c) < 127 and c not in '"\\'
+    ).strip() or 'download'
     return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(name)}"
 
 
@@ -4560,6 +4671,12 @@ async def upload_file(
         # before the per-vault reservation so a customer can't exceed their plan by
         # spreading data across many vaults.
         _enforce_deployment_storage_quota(db, estimated_upload_size)
+
+        # the per-file ceiling (max_file_size_mb) is enforced IN-STREAM inside the
+        # per-file loop below (see the bytes_uploaded check) — matching chunked-init — so an
+        # oversized single file is aborted before it is fully buffered to transient disk,
+        # WITHOUT wrongly rejecting a legitimate multi-file upload on its aggregate size.
+        _max_upload_bytes = settings.max_file_size_mb * 1024 * 1024
 
         # Parse folder_id if provided
         folder_uuid = uuid.UUID(folder_id) if folder_id else None
@@ -4787,6 +4904,15 @@ async def upload_file(
                                     detail=f"Upload aborted: File exceeds vault size limit. {bytes_up_str} uploaded before detection. Limit: {limit_str}"
                                 )
                         
+                        # enforce the per-file ceiling in-stream (per-file, via the
+                        # per-file bytes_uploaded counter), aborting an oversized file before it
+                        # is fully buffered — the chunked path enforces max_file_size at init.
+                        if bytes_uploaded + len(chunk) > _max_upload_bytes:
+                            raise HTTPException(
+                                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                                detail=f"File '{upload_file.filename}' exceeds the maximum size of {settings.max_file_size_mb}MB",
+                            )
+
                         # Write and encrypt chunk immediately
                         ctx.write_chunk(chunk)
                         bytes_uploaded += len(chunk)
@@ -5196,6 +5322,11 @@ async def init_chunked_upload(
 
     if body.total_size <= 0 or body.total_chunks <= 0:
         raise HTTPException(status_code=400, detail="Invalid upload size")
+    # bound total_chunks so /complete's `range(total_chunks)` can't be forced to
+    # materialize a multi-billion-element list (memory/CPU DoS). A chunk is >= 1 byte, so the
+    # count can't exceed total_size; also cap it absolutely.
+    if body.total_chunks > body.total_size or body.total_chunks > 200_000:
+        raise HTTPException(status_code=400, detail="Invalid chunk count for the declared size")
 
     # Zero-knowledge name handling. ZK uploads must carry a browser-encrypted name + blind
     # index and MUST NOT carry a plaintext name/MIME (that would defeat zero-knowledge).
@@ -5216,6 +5347,10 @@ async def init_chunked_upload(
     else:
         if not body.file_name:
             raise HTTPException(status_code=400, detail="file_name is required")
+        # strip control chars (CR/LF etc.) from the stored name. The download-header
+        # sink is also defended, but keeping the at-rest name clean avoids log/listing
+        # corruption from a crafted chunked-upload file_name (this path skips sanitize_filename).
+        body.file_name = ''.join(c for c in body.file_name if ord(c) >= 32 and ord(c) != 127) or "download"
 
     max_size = settings.max_file_size_mb * 1024 * 1024
     if body.total_size > max_size:
@@ -5254,6 +5389,19 @@ async def init_chunked_upload(
     session = resume_q.order_by(ChunkedUploadSession.created_at.desc()).first()
 
     if session is None:
+        # bound concurrent open sessions per user so N half-open sessions can't buffer
+        # N*total_size of transient disk that the plan storage quota never counts. Resuming an
+        # existing session (above) is unaffected — only a NEW session is capped.
+        open_sessions = db.query(ChunkedUploadSession.id).filter(
+            ChunkedUploadSession.user_id == current_user.id,
+            ChunkedUploadSession.status == 'active',
+            ChunkedUploadSession.expires_at > now,
+        ).count()
+        if open_sessions >= 25:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many concurrent uploads in progress; complete or cancel some before starting another.",
+            )
         session = ChunkedUploadSession(
             vault_id=vault_id,
             user_id=current_user.id,
@@ -5740,7 +5888,7 @@ async def cancel_chunked_upload(
 
 @app.get("/api/maintenance/upload-sessions")
 async def inspect_upload_sessions(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Operator view of resumable-upload disk usage across the deployment: how many
@@ -5787,7 +5935,7 @@ async def cleanup_upload_sessions(
     request: Request,
     idle_minutes: Optional[int] = None,
     vault_id: Optional[uuid.UUID] = None,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Reclaim disk + rows for chunked-upload sessions no live upload needs.
@@ -6326,6 +6474,14 @@ async def delete_folder(
     audit_logger = AuditLogger(db)
     try:
         vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+        # folder deletion recursively wipes every file in the subtree — require DELETE
+        # permission, not the mere READ that get_vault checks. Without this a read-only member
+        # could destroy a whole folder tree (the per-file delete_file errors below were
+        # swallowed, so the folder records were removed regardless). Owner/admin/delete-member.
+        from models import VaultPermissionEnum
+        if not permission_service.can_access_vault(current_user, vault_id, VaultPermissionEnum.DELETE):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                detail="You do not have permission to delete folders in this vault")
         folder = db.query(Folder).filter(Folder.id == folder_id, Folder.vault_id == vault_id).first()
         if not folder:
             raise HTTPException(status_code=404, detail="Folder not found")
@@ -6337,6 +6493,10 @@ async def delete_folder(
             for f in db.query(File).filter(File.folder_id == fid).all():
                 try:
                     vault_service.delete_file(f.id, current_user)
+                except PermissionDeniedError:
+                    # Never destroy a file the caller can't delete — abort the whole operation
+                    # (defense-in-depth behind the vault-level DELETE gate above).
+                    raise
                 except Exception as ex:
                     print(f"Warning: failed to delete file {f.id} during folder delete: {ex}")
             for sub in db.query(Folder).filter(Folder.parent_folder_id == fid).all():
@@ -6357,6 +6517,9 @@ async def delete_folder(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
     except HTTPException:
         raise
+    except PermissionDeniedError as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to delete folder: {str(e)}")
@@ -6549,7 +6712,7 @@ async def logout(
 @app.get("/api/monitoring/metrics")
 async def get_monitoring_metrics(
     request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -6645,9 +6808,15 @@ async def cancel_operation(
     Requires authentication.
     """
     from activity_monitor import ProgressTracker
-    
+
     tracker = ProgressTracker()
-    if tracker.cancel_operation(operation_id):
+    # Only the operation's owner (or an admin) may cancel it — a leaked operation id must not
+    # let one user abort another principal's transfer.
+    if tracker.cancel_operation(
+        operation_id,
+        requester_id=str(current_user.id),
+        is_admin=(current_user.role == RoleEnum.ADMIN),
+    ):
         # Broadcast cancellation event with operation_id
         broadcast_event({
             "event": {
@@ -6916,7 +7085,7 @@ async def get_user_permissions(
 async def grant_user_permission(
     user_id: uuid.UUID,
     request: GrantPermissionRequest,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -6982,7 +7151,7 @@ async def grant_user_permission(
 async def revoke_user_permission(
     user_id: uuid.UUID,
     group_name: str,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """

@@ -98,17 +98,13 @@ class CredentialManager:
         password_hash = os.getenv("MASTER_PASSWORD_HASH")
         
         if not password_hash:
-            print("🐛 DEBUG: MASTER_PASSWORD_HASH not found in environment")
             return False
-        
+
         try:
-            result = bcrypt.checkpw(password.encode(), password_hash.encode())
-            if not result:
-                print("🐛 DEBUG: Password hash verification failed")
-                print(f"🐛 DEBUG: Hash starts with: {password_hash[:20]}...")
-            return result
-        except Exception as e:
-            print(f"🐛 DEBUG: Exception during password verification: {e}")
+            return bcrypt.checkpw(password.encode(), password_hash.encode())
+        except Exception:
+            # Do not log hash bytes or exception detail — the master-password hash /
+            # its salt must never reach container stdout.
             return False
     
     def check_legacy_mode(self) -> bool:

@@ -273,39 +273,51 @@ class ProgressTracker:
             print(f"Error checking cancellation: {e}")
             return False
     
-    def cancel_operation(self, operation_id: str) -> bool:
+    def cancel_operation(self, operation_id: str, requester_id=None, is_admin=False) -> bool:
         """
-        Mark operation as cancelled (admin action).
-        
+        Mark an operation as cancelled.
+
+        Authorization: the caller must OWN the operation (its stored user_id matches
+        requester_id) or be an admin — otherwise a user could cancel another principal's
+        in-flight transfer via a leaked/guessed operation id.
+
         Args:
             operation_id: Operation identifier
-        
+            requester_id: id of the calling principal (compared to the operation owner)
+            is_admin: True bypasses the ownership check
+
         Returns:
             True if successfully cancelled, False otherwise
         """
         try:
             key = self._get_operation_key(operation_id)
             data = self.redis.get(key)
-            
+
             if not data:
                 return False
-            
+
             operation = json.loads(data)
+
+            # Ownership / admin gate: only the owner or an admin may cancel.
+            owner_id = operation.get("user_id")
+            if not is_admin and (requester_id is None or str(owner_id) != str(requester_id)):
+                return False
+
             operation["cancelled"] = True
             operation["status"] = "cancelled"
-            
+
             # Update in Redis
             self.redis.setex(key, self.ttl, json.dumps(operation))
-            
+
             # Broadcast cancellation
             event = {
                 "type": "operation_cancelled",
                 "operation_id": operation_id,
-                "cancelled_by": "admin",
+                "cancelled_by": str(requester_id) if requester_id else "admin",
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
             self.broadcaster.broadcast_sync(event)
-            
+
             return True
             
         except Exception as e:

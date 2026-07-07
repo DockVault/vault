@@ -48,7 +48,34 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token payload"
         )
-    
+
+    # Revocation parity with the main auth dependency: reject a token with no
+    # session_token (unrevocable), a denylisted (logged-out) token, and a durably-revoked
+    # session — so a logged-out / forged token can't read dashboard aggregates.
+    session_token = payload.get("session_token")
+    is_temporary = payload.get("is_temporary", False)
+    if not session_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials"
+        )
+    from auth_service import is_token_denylisted
+    if is_token_denylisted(session_token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session has been terminated. Please login again."
+        )
+    if not is_temporary:
+        from models import ActiveSession
+        revoked = db.query(ActiveSession.revoked).filter(
+            ActiveSession.session_token == session_token
+        ).first()
+        if revoked is not None and revoked[0]:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session has been terminated. Please login again."
+            )
+
     # Get user from database
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
