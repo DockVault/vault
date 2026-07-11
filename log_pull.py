@@ -57,6 +57,19 @@ def validate_scope(scope):
     return out
 
 
+def pepper_ok(pepper):
+    """A usable pepper is a >=32-char string. A weak/absent pepper disables the endpoint (the
+    effective ceiling requires this) rather than bricking the vault."""
+    return isinstance(pepper, str) and len(pepper.strip()) >= 32
+
+
+def effective_ceiling(plan_log_pull, pepper):
+    """The REAL ceiling: the plan must allow the endpoint AND a strong pepper must be present.
+    So a control plane that injects PLAN_LOG_PULL without also injecting a pepper (or an
+    operator who forgets it) gets a SAFELY-DISABLED endpoint (404), never a dead container."""
+    return bool(plan_log_pull) and pepper_ok(pepper)
+
+
 def is_pull_enabled(ceiling, flags, component):
     """Two-layer gate as a pure function: the env CEILING (bool) AND the per-component DB flag.
     Default per-component OFF; unknown component -> False. Callers wrap this with the real

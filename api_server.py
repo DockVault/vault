@@ -1494,10 +1494,18 @@ def _set_logs_settings(db, updates: dict) -> None:
         row.value = merged
 
 
+def _log_ceiling_on() -> bool:
+    """The EFFECTIVE log-pull ceiling: the plan must allow it (settings.plan_log_pull) AND a
+    strong pepper must be configured. A weak/absent pepper DISABLES the endpoint (fail-safe)
+    rather than bricking the vault, so the control plane can inject PLAN_LOG_PULL and the pepper
+    in any order without a dead container in between."""
+    return log_pull.effective_ceiling(settings.plan_log_pull, settings.log_token_pepper)
+
+
 def _logs_pull_enabled(db, component: str) -> bool:
     """Env ceiling AND per-component DB flag. FAIL-CLOSED on error (unlike _zk_enabled, which
     fails toward the entitlement — for logs the unsafe direction is EXPOSURE)."""
-    if not settings.plan_log_pull:
+    if not _log_ceiling_on():
         return False
     try:
         return log_pull.is_pull_enabled(True, _load_logs_settings(db), component)
@@ -1542,7 +1550,7 @@ async def require_log_pull_token(
     - Header-only: HTTPBearer never reads a query param, so a token can't land in an access log.
     - Prefix-scoped lookup (indexed) then a constant-time peppered-hash compare. Fail-closed.
     """
-    if not settings.plan_log_pull:
+    if not _log_ceiling_on():
         raise HTTPException(status_code=404)
     if not credentials or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Log token required")
@@ -1610,7 +1618,7 @@ async def get_logs_settings(
     flags = _load_logs_settings(db)
     toks = db.query(LogPullToken).order_by(LogPullToken.created_at.desc()).all()
     return {
-        "ceiling": bool(settings.plan_log_pull),
+        "ceiling": _log_ceiling_on(),
         "components": list(log_pull.KNOWN_COMPONENTS),
         "serveable": list(log_pull.SERVEABLE_COMPONENTS),
         "flags": {c: bool(flags.get(c, False)) for c in log_pull.KNOWN_COMPONENTS},

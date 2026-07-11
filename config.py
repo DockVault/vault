@@ -291,16 +291,17 @@ if (settings.environment or "").strip().lower() == "production":
         sys.exit(1)
 
 
-# --- Fail closed on a weak/empty LOG_TOKEN_PEPPER when the log-pull endpoint is enabled ---
+# --- Warn (do NOT brick) on a weak/empty LOG_TOKEN_PEPPER when the plan enables log-pull ---
 # The pepper hardens stored log-pull token hashes (RO2-3). It is only load-bearing when the
-# endpoint can be reached, so this refusal is GATED on the ceiling: a default vault (ceiling
-# off, no pepper) still boots exactly as before. But once a plan turns PLAN_LOG_PULL on, an
-# unset/short pepper would weaken every token hash, so refuse to start — mirroring the JWT block.
+# endpoint can be reached. A DATA VAULT must never refuse to boot over a LOG-feature config
+# problem (that would deny the customer access to their FILES), and the control plane may set
+# PLAN_LOG_PULL a moment before the pepper reaches an existing/bundle container. So a
+# weak/absent pepper does NOT exit — the EFFECTIVE ceiling (log_pull.effective_ceiling, used by
+# the endpoint) simply requires a strong pepper, DISABLING the endpoint (404) until one is set.
+# Warn loudly so an operator notices the endpoint is off.
 if settings.plan_log_pull:
     _log_pepper = (settings.log_token_pepper or "").strip()
     if len(_log_pepper) < 32:
-        print("\n❌ FATAL: LOG_TOKEN_PEPPER is unset or too short (<32 chars) while the log-pull "
-              "endpoint is enabled (PLAN_LOG_PULL).")
-        print("   A weak pepper weakens every stored log-pull token hash.")
-        print("   Generate a strong pepper and set LOG_TOKEN_PEPPER:  openssl rand -hex 32")
-        sys.exit(1)
+        print("\n⚠️  WARNING: PLAN_LOG_PULL is on but LOG_TOKEN_PEPPER is unset or too short "
+              "(<32 chars) — the log-pull endpoint is DISABLED until a strong pepper is set.")
+        print("   Generate one and set LOG_TOKEN_PEPPER:  openssl rand -hex 32")

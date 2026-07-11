@@ -54,6 +54,26 @@ def test_validate_scope_keeps_known_dedupes_and_drops_junk():
 
 # ---- two-layer enable gate ------------------------------------------------------------------
 
+def test_pepper_ok_requires_32_chars():
+    assert log_pull.pepper_ok("x" * 32) is True
+    assert log_pull.pepper_ok("x" * 31) is False
+    assert log_pull.pepper_ok("") is False
+    assert log_pull.pepper_ok(None) is False
+    assert log_pull.pepper_ok("   " + "x" * 31 + "   ") is False  # stripped before length check
+
+
+def test_effective_ceiling_needs_plan_AND_strong_pepper():
+    strong = "a" * 40
+    # plan on + strong pepper -> ON
+    assert log_pull.effective_ceiling(True, strong) is True
+    # plan on but weak/absent pepper -> DISABLED (fail-safe, not bricked)
+    assert log_pull.effective_ceiling(True, "") is False
+    assert log_pull.effective_ceiling(True, "short") is False
+    assert log_pull.effective_ceiling(True, None) is False
+    # plan off -> off regardless of pepper
+    assert log_pull.effective_ceiling(False, strong) is False
+
+
 def test_is_pull_enabled_two_layer_and_fail_safe():
     # ceiling OFF -> always False, even if the flag is on.
     assert log_pull.is_pull_enabled(False, {"web": True}, "web") is False
