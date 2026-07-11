@@ -24,19 +24,63 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
-# (label, Popen) for each supervised child.
+# (script, Popen) for each supervised child.
 _PROCS: list = []
+
+# Serialize the tagging writers so a web line and an sftp line can never interleave mid-line
+# on the shared parent stdout.
+_STDOUT_LOCK = threading.Lock()
 
 
 def _truthy(v) -> bool:
     return str(v or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _spawn(script: str) -> None:
-    _PROCS.append((script, subprocess.Popen([sys.executable, script])))
+def _pump(label: str, stream) -> None:
+    """Continuously drain a child's merged stdout/stderr, re-emitting each line with a
+    ``[label]`` tag so ``docker logs`` (and the operator's per-service log view) can tell the
+    web and SFTP halves apart in the single combined container.
+
+    This reader MUST never stop draining while the child is alive: a child writes to a pipe
+    with a small kernel buffer (~64 KB), so if this loop blocked or died the child would hang
+    on its next write with the whole container wedged. Therefore every per-line write is
+    guarded and the loop only ends at EOF (child exit / stream close)."""
+    try:
+        for line in stream:  # text mode -> one line per newline, WITH the trailing '\n'
+            try:
+                with _STDOUT_LOCK:
+                    sys.stdout.write(f"[{label}] {line}")
+                    sys.stdout.flush()
+            except Exception:  # noqa: BLE001 — never stop draining because a write failed
+                pass
+    except Exception:  # noqa: BLE001 — stream closed/errored; the supervise loop handles exit
+        pass
+
+
+def _spawn(script: str, label: str) -> None:
+    """Start a supervised child, tagging each of its log lines ``[label]`` via a daemon reader
+    thread. stderr is merged into stdout so one reader tags everything the child emits;
+    PYTHONUNBUFFERED keeps lines timely (a per-block buffer would defeat the tag); text mode
+    with errors='replace' means a stray non-UTF-8 byte can't kill the reader (and risk a
+    pipe-fill hang)."""
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    p = subprocess.Popen(
+        [sys.executable, script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        bufsize=1,
+        encoding="utf-8",
+        errors="replace",
+    )
+    threading.Thread(target=_pump, args=(label, p.stdout), daemon=True).start()
+    _PROCS.append((script, p))
 
 
 def _wait_api_ready(timeout: float = 60.0) -> bool:
@@ -87,14 +131,14 @@ def main() -> None:
     signal.signal(signal.SIGINT, _on_signal)
     # Start the API first — its lifespan runs the schema create/migrations the SFTP
     # server relies on.
-    _spawn("api_server.py")
+    _spawn("api_server.py", "web")
     if _truthy(os.environ.get("RUN_SFTP")):
         # Wait for the API to be ready (schema migrated) before starting SFTP, so an
         # early SFTP client can't hit a not-yet-migrated DB. Bounded; falls through on
         # timeout (SFTP fails closed on DB errors rather than serving wrong data).
         if not _wait_api_ready():
             print("[run_combined] API not ready within timeout; starting SFTP anyway", flush=True)
-        _spawn("sftp_server.py")
+        _spawn("sftp_server.py", "sftp")
     # Supervise: if a running child exits, take the whole container down so it restarts
     # (don't limp along with only one half running).
     while True:
