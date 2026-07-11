@@ -1527,10 +1527,16 @@ def _log_redaction_secrets() -> list:
 
 def _read_sink_lines() -> list:
     """Read the active log-sink file (size-capped by run_combined). Best-effort -> [] if the
-    sink is absent/unreadable (e.g. the split dev-stack, which does not run run_combined)."""
+    sink is absent/unreadable (e.g. the split dev-stack, which does not run run_combined).
+
+    Split ONLY on '\\n' — the sink writer (run_combined `_pump`) delimits records by '\\n' and a
+    stored record can carry attacker-influenced content (an SFTP filename/username). str.splitlines()
+    would ALSO break on \\v \\f \\x1c-\\x1e \\x85 \\u2028 \\u2029, so a content byte like '\\u2028[web] ...'
+    inside an [sftp] record would be re-split into a fragment served under `?service=web`
+    (within-tenant tag smuggling). Splitting on '\\n' makes the read match the write exactly."""
     try:
         with open(_LOG_SINK_PATH, "r", encoding="utf-8", errors="replace") as f:
-            return f.read().splitlines()
+            return f.read().split("\n")
     except Exception:  # noqa: BLE001
         return []
 

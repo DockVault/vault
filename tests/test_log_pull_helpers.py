@@ -109,6 +109,20 @@ def test_filter_service_lines_unknown_service_is_empty():
     assert log_pull.filter_service_lines(lines, "db-diag") == []   # known but no such lines
 
 
+def test_exotic_separator_in_content_does_not_smuggle_across_services():
+    """The sink writer delimits records by '\\n' only, and api_server._read_sink_lines splits the
+    sink on '\\n' only (NOT str.splitlines()). So a [sftp] record whose (tenant-influenced) content
+    embeds a line/paragraph separator must NOT be re-split into a fragment served under
+    ?service=web. This locks the intent of the splitlines()->split('\\n') fix."""
+    content = "[sftp] uploaded  [web] SMUGGLED\n[web] legit\n"
+    # what _read_sink_lines now does: split on '\n' only -> the [sftp] record stays whole.
+    web_safe = log_pull.filter_service_lines(content.split("\n"), "web")
+    assert web_safe == ["[web] legit"], web_safe
+    assert "SMUGGLED" not in "\n".join(web_safe)
+    # contrast: str.splitlines() (the old behavior) WOULD have smuggled the fragment.
+    assert any("SMUGGLED" in ln for ln in log_pull.filter_service_lines(content.splitlines(), "web"))
+
+
 # ---- redaction ------------------------------------------------------------------------------
 
 def test_redaction_scrubs_known_secrets():
