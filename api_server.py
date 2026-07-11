@@ -39,6 +39,7 @@ from authorization import PermissionService, PermissionDeniedError, ResourceNotF
 from vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, _name_match_filter
 from sqlalchemy.exc import IntegrityError
 from audit_logger import AuditLogger
+import log_pull  # RO2-3: pure helpers for the authenticated log-pull endpoint
 from security import create_access_token, verify_access_token
 from config import settings
 from endpoint_permissions import require_endpoint_permission
@@ -1454,6 +1455,257 @@ async def update_settings(
         )
     except Exception:
         pass  # never fail the save just because the audit write did
+    return {"status": "ok"}
+
+
+# ===========================================================================
+# RO2-3 — authenticated, disableable log-PULL endpoint (GET /logs) + admin token mgmt.
+# Two-layer gate: the env CEILING (settings.plan_log_pull, HARD, default off) AND a
+# per-component DB flag in SystemSetting('logs'). A dedicated bearer dependency (NOT
+# require_endpoint_permission, whose catalog-miss fails OPEN) validates a LogPullToken by
+# peppered-HMAC constant-time compare. Every "off/unknown" path returns 404 so the feature is
+# undetectable when disabled, and the response is redacted. See docs/ro2-3-phase1-build-plan.md.
+# ===========================================================================
+LOGS_SETTINGS_KEY = "logs"
+_LOG_SINK_PATH = os.environ.get("LOG_PULL_SINK_PATH", "./logs/combined.log")
+
+
+def _load_logs_settings(db) -> dict:
+    """Per-component enable flags, in a DEDICATED SystemSetting('logs') row (like 'brand', not
+    the shared 'global' row). Fail-closed to {} (feature off) on any read error."""
+    try:
+        from models import SystemSetting
+        row = db.query(SystemSetting).filter(SystemSetting.key == LOGS_SETTINGS_KEY).first()
+        return dict(row.value) if (row and row.value) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _set_logs_settings(db, updates: dict) -> None:
+    """Merge per-component flags into SystemSetting('logs'). Reassigns row.value so SQLAlchemy
+    flags the JSON column dirty. Caller commits."""
+    from models import SystemSetting
+    row = db.query(SystemSetting).filter(SystemSetting.key == LOGS_SETTINGS_KEY).first()
+    existing = dict(row.value) if (row and row.value) else {}
+    merged = {**existing, **(updates or {})}
+    if row is None:
+        db.add(SystemSetting(key=LOGS_SETTINGS_KEY, value=merged))
+    else:
+        row.value = merged
+
+
+def _logs_pull_enabled(db, component: str) -> bool:
+    """Env ceiling AND per-component DB flag. FAIL-CLOSED on error (unlike _zk_enabled, which
+    fails toward the entitlement — for logs the unsafe direction is EXPOSURE)."""
+    if not settings.plan_log_pull:
+        return False
+    try:
+        return log_pull.is_pull_enabled(True, _load_logs_settings(db), component)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _hash_log_token(token: str) -> str:
+    return log_pull.hash_log_token(token, settings.log_token_pepper)
+
+
+def _log_redaction_secrets() -> list:
+    """The known-secret values scrubbed from any served log body (defense-in-depth on top of
+    the header-only + scoped design). getattr so a missing config attr is just skipped."""
+    return [getattr(settings, a, "") for a in
+            ("jwt_secret_key", "encryption_key", "admin_password", "database_url",
+             "redis_password", "log_token_pepper")]
+
+
+def _read_sink_lines() -> list:
+    """Read the active log-sink file (size-capped by run_combined). Best-effort -> [] if the
+    sink is absent/unreadable (e.g. the split dev-stack, which does not run run_combined)."""
+    try:
+        with open(_LOG_SINK_PATH, "r", encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()
+    except Exception:  # noqa: BLE001
+        return []
+
+
+_log_bearer = HTTPBearer(auto_error=False)
+
+
+async def require_log_pull_token(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_log_bearer),
+    db: Session = Depends(get_db),
+):
+    """Validate a log-pull bearer token.
+
+    - Ceiling-404 FIRST: when the feature is off, return 404 BEFORE inspecting the token, so a
+      caller cannot use the endpoint as an oracle (feature-off is indistinguishable from a bad path).
+    - Header-only: HTTPBearer never reads a query param, so a token can't land in an access log.
+    - Prefix-scoped lookup (indexed) then a constant-time peppered-hash compare. Fail-closed.
+    """
+    if not settings.plan_log_pull:
+        raise HTTPException(status_code=404)
+    if not credentials or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Log token required")
+    try:
+        from models import LogPullToken
+        presented = credentials.credentials
+        rows = db.query(LogPullToken).filter(
+            LogPullToken.token_prefix == log_pull.token_prefix(presented),
+            LogPullToken.disabled.is_(False),
+        ).all()
+        for r in rows:
+            if log_pull.tokens_match(presented, settings.log_token_pepper, r.token_hash):
+                return r
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=401, detail="Invalid log token")
+    raise HTTPException(status_code=401, detail="Invalid log token")
+
+
+@app.get("/logs")
+async def pull_logs(
+    service: Optional[str] = None,
+    tail: int = 500,
+    token=Depends(require_log_pull_token),
+    db: Session = Depends(get_db),
+):
+    """Authenticated per-component log pull (RO2-3). Returns JSON {service, lines, truncated}.
+
+    `service` is optional in the signature (default None) so a missing value returns the same
+    404 as an unknown one — no 422 that would reveal the endpoint exists when the ceiling is off.
+    (`since` filtering is deferred to Phase 2 — the sink lines carry no uniform timestamp.)
+    """
+    # per-component DB enable (unknown/None service -> 404; no oracle beyond the already-passed ceiling)
+    if not service or service not in log_pull.KNOWN_COMPONENTS or not _logs_pull_enabled(db, service):
+        raise HTTPException(status_code=404)
+    # valid token, but not scoped for this component
+    if service not in log_pull.validate_scope(token.scope):
+        raise HTTPException(status_code=403, detail="Token not scoped for this component")
+    # Phase 1 serves only web/sftp (from the sink); db-diag/redis-diag arrive in Phase 2.
+    if service not in log_pull.SERVEABLE_COMPONENTS:
+        raise HTTPException(status_code=404, detail="Component logs not available in this phase")
+    tail = max(1, min(int(tail or 500), 5000))
+    svc_lines = log_pull.filter_service_lines(_read_sink_lines(), service)
+    truncated = len(svc_lines) > tail
+    svc_lines = svc_lines[-tail:]
+    secretvals = _log_redaction_secrets()
+    redacted = [log_pull.redact_log_text(ln, secretvals) for ln in svc_lines]
+    try:
+        token.last_used_at = datetime.utcnow()
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+    return {"service": service, "lines": redacted, "truncated": truncated}
+
+
+@app.get("/settings/logs")
+async def get_logs_settings(
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Log-access admin view: the ceiling, per-component flags, and the token list. NEVER the
+    token hash or plaintext."""
+    from models import LogPullToken
+    flags = _load_logs_settings(db)
+    toks = db.query(LogPullToken).order_by(LogPullToken.created_at.desc()).all()
+    return {
+        "ceiling": bool(settings.plan_log_pull),
+        "components": list(log_pull.KNOWN_COMPONENTS),
+        "serveable": list(log_pull.SERVEABLE_COMPONENTS),
+        "flags": {c: bool(flags.get(c, False)) for c in log_pull.KNOWN_COMPONENTS},
+        "tokens": [{
+            "id": str(t.id), "name": t.name, "token_prefix": t.token_prefix,
+            "scope": log_pull.validate_scope(t.scope), "disabled": bool(t.disabled),
+            "last_used_at": t.last_used_at.isoformat() if t.last_used_at else None,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        } for t in toks],
+    }
+
+
+@app.put("/settings/logs")
+async def update_logs_settings(
+    payload: dict,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Set per-component enable flags. require_interactive_admin — a temp-cred admin must not
+    flip the exposure policy (mirrors PUT /settings)."""
+    flags = payload.get("flags") if isinstance(payload, dict) else None
+    if not isinstance(flags, dict):
+        raise HTTPException(status_code=400, detail="flags object required")
+    clean = {c: bool(flags[c]) for c in log_pull.KNOWN_COMPONENTS if c in flags}
+    if not clean:
+        raise HTTPException(status_code=400, detail="no known components in payload")
+    _set_logs_settings(db, clean)
+    db.commit()
+    try:
+        AuditLogger(db).log_action(
+            action="log_settings_updated", status="success", user=current_user,
+            ip_address=get_client_ip(request), details={"keys": sorted(clean.keys())})
+    except Exception:
+        pass
+    fresh = _load_logs_settings(db)
+    return {"status": "ok", "flags": {c: bool(fresh.get(c, False)) for c in log_pull.KNOWN_COMPONENTS}}
+
+
+@app.post("/settings/logs")
+async def create_log_token(
+    payload: dict,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Mint a log-pull token. Returns the plaintext EXACTLY ONCE (only the hash is stored). The
+    audit row records the name/scope/prefix — NEVER the plaintext."""
+    from models import LogPullToken
+    name = (payload.get("name") or "").strip() if isinstance(payload, dict) else ""
+    scope = log_pull.validate_scope(payload.get("scope") if isinstance(payload, dict) else None)
+    if not name or len(name) > 100:
+        raise HTTPException(status_code=400, detail="a token name (1-100 chars) is required")
+    if not scope:
+        raise HTTPException(status_code=400, detail="scope must include at least one known component")
+    plaintext, prefix = log_pull.mint_token()
+    tok = LogPullToken(name=name, token_prefix=prefix, token_hash=_hash_log_token(plaintext),
+                       scope=scope, created_by=current_user.id)
+    db.add(tok)
+    db.commit()
+    try:
+        AuditLogger(db).log_action(
+            action="log_token_generated", status="success", user=current_user,
+            ip_address=get_client_ip(request),
+            details={"name": name, "scope": scope, "token_prefix": prefix})
+    except Exception:
+        pass
+    return {"id": str(tok.id), "name": name, "scope": scope, "token_prefix": prefix, "token": plaintext}
+
+
+@app.post("/settings/logs/{token_id}/disable")
+async def disable_log_token(
+    token_id: str,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Disable a token (rotation = mint a new one, then disable the old). require_interactive_admin."""
+    from models import LogPullToken
+    try:
+        uuid.UUID(str(token_id))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="token not found")
+    tok = db.query(LogPullToken).filter(LogPullToken.id == token_id).first()
+    if not tok:
+        raise HTTPException(status_code=404, detail="token not found")
+    tok.disabled = True
+    db.commit()
+    try:
+        AuditLogger(db).log_action(
+            action="log_token_disabled", status="success", user=current_user,
+            ip_address=get_client_ip(request),
+            details={"name": tok.name, "token_prefix": tok.token_prefix})
+    except Exception:
+        pass
     return {"status": "ok"}
 
 
