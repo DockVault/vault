@@ -808,6 +808,34 @@ class SystemSetting(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class LogPullToken(Base):
+    """RO2-3: a named bearer token that may PULL the container logs via GET /logs.
+
+    Multiple tokens can coexist (zero-gap rotation = mint a new one, then disable the old).
+    Only the peppered HMAC-SHA256 hash is stored — the plaintext is shown ONCE at mint time and
+    never again. `token_prefix` (the first chars of the plaintext) is a public, indexed handle
+    so verification scans only same-prefix rows before the constant-time hash compare. `scope` is
+    a validated LIST of components the token may read (e.g. ['web','sftp']); it must be a list so
+    a scope check is exact membership, never a substring match. Created by create_all() — a whole
+    new table needs no lightweight migration entry.
+    """
+    __tablename__ = 'log_pull_tokens'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(100), nullable=False)
+    token_prefix = Column(String(16), nullable=False, index=True)          # public lookup handle
+    token_hash = Column(String(64), unique=True, nullable=False, index=True)  # HMAC-SHA256 hex
+    scope = Column(JSON, nullable=False, default=list)                     # ['web','sftp',...]
+    disabled = Column(Boolean, nullable=False, default=False, server_default='false')
+    last_used_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+
+    __table_args__ = (
+        Index('idx_logpulltoken_prefix', 'token_prefix'),
+    )
+
+
 class RateLimitRecord(Base):
     """Track rate limiting for login attempts."""
     __tablename__ = 'rate_limit_records'

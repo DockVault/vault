@@ -20,7 +20,10 @@ degraded with one half down (the image HEALTHCHECK only probes the HTTP /health)
 The dev stack and the bundle composer run the two processes as separate containers by
 overriding the command, so this default-CMD launcher does not affect them.
 """
+import logging
+import logging.handlers
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -35,9 +38,71 @@ _PROCS: list = []
 # on the shared parent stdout.
 _STDOUT_LOCK = threading.Lock()
 
+# --- RO2-3 log sink ---------------------------------------------------------------------
+# The API server that serves the RO2-3 pull endpoint runs as a SEPARATE child process; it
+# cannot read this launcher's stdout (where the tagged lines go for `docker logs`) nor the
+# other child's stdout. So we ALSO append every tagged line to a bounded, rotating FILE that
+# the in-container API can tail. Writing to that file must NEVER block a `_pump` reader — a
+# blocked reader lets the child's ~64 KB stdout pipe fill and wedges the whole container — so
+# the pumps only `put_nowait` onto a bounded queue (dropping on overflow), and a dedicated
+# daemon thread does the actual (potentially slow) disk write. The file is best-effort: if its
+# directory is not writable the sink is simply disabled and stdout tagging is unaffected.
+_SINK_PATH = os.environ.get("LOG_PULL_SINK_PATH", "./logs/combined.log")
+_SINK_MAX_BYTES = 5 * 1024 * 1024   # per file
+_SINK_BACKUPS = 2                   # + 2 rotations -> ~15 MB hard cap
+_SINK_QUEUE: "queue.Queue[str]" = queue.Queue(maxsize=20000)
+_sink_logger = None
+
 
 def _truthy(v) -> bool:
     return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _init_sink() -> None:
+    """Best-effort: set up the size-capped rotating sink file. Leaves the sink disabled
+    (``_sink_logger`` None) if the directory is not writable — the pumps then skip it and keep
+    tagging stdout, so a read-only-logs deployment degrades to 'operator docker-logs only'."""
+    global _sink_logger
+    try:
+        d = os.path.dirname(_SINK_PATH) or "."
+        os.makedirs(d, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            _SINK_PATH, maxBytes=_SINK_MAX_BYTES, backupCount=_SINK_BACKUPS, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(message)s"))  # store the raw tagged line
+        lg = logging.getLogger("dockvault.logsink")
+        lg.setLevel(logging.INFO)
+        lg.propagate = False
+        lg.handlers = [handler]
+        _sink_logger = lg
+    except Exception:  # noqa: BLE001 — sink is optional; never block startup on it
+        _sink_logger = None
+
+
+def _sink_writer_loop() -> None:
+    """Drain the sink queue to disk on a dedicated daemon thread, so the `_pump` readers never
+    block on file I/O. Ends when a ``None`` sentinel is enqueued (shutdown)."""
+    while True:
+        rec = _SINK_QUEUE.get()
+        if rec is None:
+            return
+        if _sink_logger is not None:
+            try:
+                _sink_logger.info(rec)
+            except Exception:  # noqa: BLE001 — a failed disk write must not kill the writer
+                pass
+
+
+def _sink_emit(label: str, line: str) -> None:
+    """Enqueue a tagged line for the sink WITHOUT blocking. Drops the line if the queue is full
+    (a slow/failed disk must never stall a pump). No-op when the sink is disabled."""
+    if _sink_logger is None:
+        return
+    try:
+        _SINK_QUEUE.put_nowait(f"[{label}] " + line.rstrip("\r\n"))
+    except queue.Full:
+        pass  # drop under sustained pressure rather than block the pump
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _pump(label: str, stream) -> None:
@@ -57,6 +122,7 @@ def _pump(label: str, stream) -> None:
                     sys.stdout.flush()
             except Exception:  # noqa: BLE001 — never stop draining because a write failed
                 pass
+            _sink_emit(label, line)  # non-blocking; the disk write happens on the writer thread
     except Exception:  # noqa: BLE001 — stream closed/errored; the supervise loop handles exit
         pass
 
@@ -129,6 +195,11 @@ def _on_signal(signum, _frame):
 def main() -> None:
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
+    # Set up the RO2-3 log sink (best-effort) and its writer thread BEFORE spawning children,
+    # so no tagged line is enqueued with no drainer running (the bounded queue would just fill
+    # and drop — safe — but starting the writer first captures early startup lines too).
+    _init_sink()
+    threading.Thread(target=_sink_writer_loop, daemon=True).start()
     # Start the API first — its lifespan runs the schema create/migrations the SFTP
     # server relies on.
     _spawn("api_server.py", "web")

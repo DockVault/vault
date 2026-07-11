@@ -111,6 +111,13 @@ class Settings(BaseSettings):
     # behaves exactly as before. Unrecognised entries are ignored; an all-invalid value is
     # treated as empty (permissive) so a typo can never brick all vault creation.
     plan_allowed_vault_types: str = Field(default="")
+    # RO2-3: may this deployment expose the authenticated log-PULL endpoint (GET /logs)?
+    # DELIBERATELY default FALSE — unlike the other PLAN_* ceilings (which default permissive so
+    # an un-gated vault behaves as before), exposing the log stream is the UNSAFE direction, and
+    # "as before" here means "no log endpoint at all". So the endpoint 404s everywhere until the
+    # control plane injects PLAN_LOG_PULL=1 (Phase 2 plan-tiering) AND an admin enables a
+    # component. Even then it is a HARD ceiling the customer's own admin cannot widen.
+    plan_log_pull: bool = Field(default=False)
 
     # Security Configuration (loaded from credential_manager)
     encryption_key: str = Field(
@@ -123,7 +130,13 @@ class Settings(BaseSettings):
     )
     jwt_algorithm: str = Field(default="HS256")
     jwt_access_token_expire_minutes: int = Field(default=30)
-    
+
+    # RO2-3: dedicated HMAC pepper for hashing log-pull tokens at rest (NOT derived from
+    # ENCRYPTION_KEY/JWT_SECRET_KEY — a distinct secret so a leak of one does not compromise
+    # stored token hashes). Plain env (not credential_manager) — it is only needed when the
+    # log-pull ceiling is on, and its weakness is caught by a startup refusal below.
+    log_token_pepper: str = Field(default="")
+
     # Temporary Credentials Configuration
     temp_cred_validity_minutes: int = Field(default=65)
     temp_cred_session_grace_minutes: int = Field(default=65)
@@ -275,4 +288,19 @@ if (settings.environment or "").strip().lower() == "production":
         print("\n❌ FATAL: ADMIN_PASSWORD is a known sample/weak value while ENVIRONMENT=production.")
         print("   The first admin would be created with a publicly known credential.")
         print("   Set a strong ADMIN_PASSWORD:  openssl rand -base64 18")
+        sys.exit(1)
+
+
+# --- Fail closed on a weak/empty LOG_TOKEN_PEPPER when the log-pull endpoint is enabled ---
+# The pepper hardens stored log-pull token hashes (RO2-3). It is only load-bearing when the
+# endpoint can be reached, so this refusal is GATED on the ceiling: a default vault (ceiling
+# off, no pepper) still boots exactly as before. But once a plan turns PLAN_LOG_PULL on, an
+# unset/short pepper would weaken every token hash, so refuse to start — mirroring the JWT block.
+if settings.plan_log_pull:
+    _log_pepper = (settings.log_token_pepper or "").strip()
+    if len(_log_pepper) < 32:
+        print("\n❌ FATAL: LOG_TOKEN_PEPPER is unset or too short (<32 chars) while the log-pull "
+              "endpoint is enabled (PLAN_LOG_PULL).")
+        print("   A weak pepper weakens every stored log-pull token hash.")
+        print("   Generate a strong pepper and set LOG_TOKEN_PEPPER:  openssl rand -hex 32")
         sys.exit(1)
