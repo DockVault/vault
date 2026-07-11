@@ -850,6 +850,7 @@
                         <button class="tab-btn" data-tab="storage">Storage</button>
                         <button class="tab-btn" data-tab="email">Email</button>
                         <button class="tab-btn" data-tab="sftp">SFTP &amp; Encryption</button>
+                        <button class="tab-btn" data-tab="logs">Log access</button>
                         <button class="tab-btn" data-tab="audit">Audit Log</button>
                     </div>
 
@@ -1268,6 +1269,51 @@
                                         </tr>
                                     </tbody>
                                 </table>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Log Access Tab (RO2-3) -->
+                    <div id="settings-tab-logs" class="settings-tab-content">
+                        <div class="card mb-lg">
+                            <div class="card-header"><h3>Log access</h3></div>
+                            <div class="p-lg">
+                                <p class="text-secondary mb-md">
+                                    Pull this deployment&apos;s container logs into your own
+                                    monitoring system via an authenticated endpoint
+                                    (<code>GET /logs</code>). Off by default &mdash; enable a
+                                    component below and mint a scoped token. The token is shown
+                                    once; only its hash is stored.
+                                </p>
+                                <div id="log-ceiling-note" class="text-secondary mb-md" style="display:none;"></div>
+                                <div class="form-group">
+                                    <label>Components exposed to <code>/logs</code></label>
+                                    <div id="log-flags"></div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card">
+                            <div class="card-header flex justify-between items-center">
+                                <h3>Pull tokens</h3>
+                                <button id="log-token-generate-btn" class="btn btn-primary" type="button">Generate token</button>
+                            </div>
+                            <div class="p-lg">
+                                <div id="log-token-generate-panel" style="display:none;" class="mb-lg">
+                                    <div class="form-group">
+                                        <label for="log-token-name">Token name</label>
+                                        <input type="text" id="log-token-name" class="form-control" maxlength="100" placeholder="e.g. Datadog, my Grafana">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Scope</label>
+                                        <div id="log-token-scope"></div>
+                                    </div>
+                                    <div class="flex gap-sm">
+                                        <button id="log-token-create-btn" class="btn btn-primary" type="button">Create</button>
+                                        <button id="log-token-cancel-btn" class="btn btn-outline" type="button">Cancel</button>
+                                    </div>
+                                </div>
+                                <div id="log-token-reveal" class="mb-lg" style="display:none;"></div>
+                                <div id="log-token-list"></div>
                             </div>
                         </div>
                     </div>

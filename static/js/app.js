@@ -3339,6 +3339,7 @@ async function initSettings() {
     
     // Setup tab switching
     setupSettingsTabs();
+    setupLogAccess();  // RO2-3 log-access tab wiring
 
     // Wire the branding color pickers <-> text inputs (A3) + logo/favicon uploads (A4)
     wireBrandColorInputs();
@@ -3346,6 +3347,7 @@ async function initSettings() {
 
     // Load current settings
     await loadSettings();
+    loadLogSettings();  // RO2-3 (silent; no-op for non-admins)
     
     // Attach event listeners
     attachSettingsListeners();
@@ -3556,8 +3558,210 @@ function setupSettingsTabs() {
             if (content) {
                 content.classList.add('active');
             }
+            if (tabId === 'logs') { loadLogSettings(); }  // RO2-3: refresh on tab open
         });
     });
+}
+
+// ---- RO2-3 Log access (admin Settings tab) ---------------------------------------------
+const LOG_COMPONENT_LABELS = {
+    'web': 'Web / API', 'sftp': 'SFTP',
+    'db-diag': 'DB diagnostics', 'redis-diag': 'Redis diagnostics',
+};
+
+function setupLogAccess() {
+    const gen = document.getElementById('log-token-generate-btn');
+    const create = document.getElementById('log-token-create-btn');
+    const cancel = document.getElementById('log-token-cancel-btn');
+    if (gen) gen.addEventListener('click', () => toggleLogTokenGenerate(true));
+    if (create) create.addEventListener('click', generateLogToken);
+    if (cancel) cancel.addEventListener('click', () => toggleLogTokenGenerate(false));
+}
+
+async function loadLogSettings() {
+    let data;
+    try {
+        data = await apiRequest('/settings/logs', { silent: true });
+    } catch (e) { return; }               // non-admin / feature absent -> leave the tab inert
+    if (!data || !Array.isArray(data.components)) return;
+    window._logSettings = data;
+    const note = document.getElementById('log-ceiling-note');
+    if (note) {
+        if (!data.ceiling) {
+            note.textContent = 'The log-pull endpoint is disabled for this deployment’s plan, '
+                + 'so tokens will not return logs until the plan enables it. You can still prepare '
+                + 'components and tokens here.';
+            note.style.display = '';
+        } else {
+            note.style.display = 'none';
+        }
+    }
+    renderLogFlags(data);
+    renderLogTokens(data.tokens || []);
+}
+
+function renderLogFlags(data) {
+    const host = document.getElementById('log-flags');
+    if (!host) return;
+    host.textContent = '';
+    const serveable = data.serveable || [];
+    (data.components || []).forEach(c => {
+        const row = document.createElement('label');
+        row.className = 'flex items-center gap-sm mb-sm';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = !!(data.flags || {})[c];
+        cb.dataset.component = c;
+        cb.addEventListener('change', () => saveLogFlag(c, cb.checked));
+        const span = document.createElement('span');
+        span.textContent = LOG_COMPONENT_LABELS[c] || c;
+        row.append(cb, span);
+        if (!serveable.includes(c)) {
+            const badge = document.createElement('span');
+            badge.className = 'badge badge-secondary';
+            badge.textContent = 'coming soon';
+            row.append(badge);
+        }
+        host.appendChild(row);
+    });
+}
+
+async function saveLogFlag(component, enabled) {
+    try {
+        const cur = (window._logSettings && window._logSettings.flags) || {};
+        const flags = { ...cur, [component]: enabled };
+        const res = await apiRequest('/settings/logs', { method: 'PUT', body: JSON.stringify({ flags }) });
+        if (res && res.flags && window._logSettings) { window._logSettings.flags = res.flags; }
+        showSuccess('Log access updated');
+    } catch (e) {
+        showError('Could not update log access');
+        loadLogSettings();  // resync the checkbox to the server truth
+    }
+}
+
+function renderLogTokens(tokens) {
+    const host = document.getElementById('log-token-list');
+    if (!host) return;
+    host.textContent = '';
+    if (!tokens.length) {
+        const p = document.createElement('p');
+        p.className = 'text-secondary';
+        p.textContent = 'No pull tokens yet. Generate one to connect a monitoring system.';
+        host.appendChild(p);
+        return;
+    }
+    tokens.forEach(t => {
+        const row = document.createElement('div');
+        row.className = 'flex justify-between items-center mb-sm';
+        const left = document.createElement('div');
+        const name = document.createElement('strong');
+        name.textContent = t.name;
+        const meta = document.createElement('div');
+        meta.className = 'text-secondary text-sm';
+        const scopeTxt = (t.scope || []).join(', ') || 'no scope';
+        let metaTxt = `${t.token_prefix}… · ${scopeTxt}`;
+        if (t.disabled) metaTxt += ' · disabled';
+        if (t.last_used_at) metaTxt += ` · last used ${t.last_used_at}`;
+        meta.textContent = metaTxt;
+        left.append(name, meta);
+        row.appendChild(left);
+        if (!t.disabled) {
+            const btn = document.createElement('button');
+            btn.className = 'btn btn-outline btn-sm';
+            btn.type = 'button';
+            btn.textContent = 'Disable';
+            btn.addEventListener('click', () => disableLogToken(t.id));
+            row.appendChild(btn);
+        } else {
+            const badge = document.createElement('span');
+            badge.className = 'badge badge-secondary';
+            badge.textContent = 'disabled';
+            row.appendChild(badge);
+        }
+        host.appendChild(row);
+    });
+}
+
+async function disableLogToken(id) {
+    if (!confirm('Disable this token? Any monitoring system using it will stop receiving logs.')) return;
+    try {
+        await apiRequest(`/settings/logs/${encodeURIComponent(id)}/disable`, { method: 'POST', body: '{}' });
+        showSuccess('Token disabled');
+        loadLogSettings();
+    } catch (e) {
+        showError('Could not disable token');
+    }
+}
+
+function toggleLogTokenGenerate(show) {
+    const panel = document.getElementById('log-token-generate-panel');
+    if (!panel) return;
+    panel.style.display = show ? '' : 'none';
+    if (!show) return;
+    const nameEl = document.getElementById('log-token-name');
+    if (nameEl) nameEl.value = '';
+    const scopeHost = document.getElementById('log-token-scope');
+    if (scopeHost) {
+        scopeHost.textContent = '';
+        // Only offer scopes we can actually SERVE (web/sftp) — minting a db-diag token that
+        // always 404s in this phase would mislead.
+        const serveable = (window._logSettings && window._logSettings.serveable) || ['web', 'sftp'];
+        serveable.forEach(c => {
+            const lbl = document.createElement('label');
+            lbl.className = 'flex items-center gap-sm mb-sm';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.value = c;
+            cb.checked = true;
+            const span = document.createElement('span');
+            span.textContent = LOG_COMPONENT_LABELS[c] || c;
+            lbl.append(cb, span);
+            scopeHost.appendChild(lbl);
+        });
+    }
+    const reveal = document.getElementById('log-token-reveal');
+    if (reveal) reveal.style.display = 'none';
+}
+
+async function generateLogToken() {
+    const name = (document.getElementById('log-token-name').value || '').trim();
+    const scope = Array.from(
+        document.querySelectorAll('#log-token-scope input[type=checkbox]:checked')).map(cb => cb.value);
+    if (!name) { showError('Give the token a name'); return; }
+    if (!scope.length) { showError('Select at least one component'); return; }
+    let res;
+    try {
+        res = await apiRequest('/settings/logs', { method: 'POST', body: JSON.stringify({ name, scope }) });
+    } catch (e) { showError('Could not create token'); return; }
+    if (!res || !res.token) { showError('Could not create token'); return; }
+    toggleLogTokenGenerate(false);
+    revealLogToken(res);
+    loadLogSettings();
+}
+
+function revealLogToken(res) {
+    const host = document.getElementById('log-token-reveal');
+    if (!host) return;
+    host.textContent = '';
+    host.style.display = '';
+    const warn = document.createElement('p');
+    warn.className = 'text-secondary mb-sm';
+    warn.textContent = 'Copy this token now — it is shown only once and cannot be retrieved later.';
+    const box = document.createElement('div');
+    box.className = 'flex items-center gap-sm';
+    const code = document.createElement('code');
+    code.id = 'log-token-value';
+    code.textContent = res.token;
+    code.style.wordBreak = 'break-all';
+    const copy = document.createElement('button');
+    copy.className = 'btn btn-outline btn-sm';
+    copy.type = 'button';
+    copy.textContent = 'Copy';
+    copy.addEventListener('click', () => {
+        navigator.clipboard.writeText(res.token).then(() => showSuccess('Copied')).catch(() => {});
+    });
+    box.append(code, copy);
+    host.append(warn, box);
 }
 
 // Load settings from API
