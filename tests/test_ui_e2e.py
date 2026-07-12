@@ -1461,8 +1461,9 @@ def test_zero_knowledge_revoke_rotates_dek(browser, admin):
 
 
 def test_create_vault_locked_to_zk_under_force_policy(logged_in: Page, admin):
-    """When the org forces zero-knowledge (no whitelist), the create-vault Type
-    selector is locked to zero-knowledge for a non-exempt user."""
+    """When the org forces zero-knowledge (no whitelist), the create-vault modal
+    shows a clear 'required' message for a non-exempt user — NOT a dead, disabled
+    dropdown — and the effective type submitted is zero-knowledge."""
     page = logged_in
     admin.put("/settings", json={"zero_knowledge_enabled": True, "force_zero_knowledge": True,
                                  "standard_vault_allowed_groups": []})
@@ -1470,10 +1471,12 @@ def test_create_vault_locked_to_zk_under_force_policy(logged_in: Page, admin):
         page.click('.sidebar-item[data-section="vaults"]')
         page.click("#create-vault-btn")
         expect(page.locator("#create-vault-modal")).to_be_visible()
-        sel = page.locator("#vault-type")
-        expect(sel).to_be_visible(timeout=5000)
-        expect(sel).to_have_value("zero_knowledge")
-        expect(sel).to_be_disabled()
+        # The interactive chooser is replaced by a clear required-message.
+        expect(page.locator("#vault-type-forced-note")).to_be_visible(timeout=5000)
+        expect(page.locator("#vault-type-choice")).to_be_hidden()
+        # The standard-only password field is hidden; the effective type is ZK.
+        expect(page.locator("#vault-password-group")).to_be_hidden()
+        assert page.evaluate("effectiveVaultType()") == "zero_knowledge"
     finally:
         admin.put("/settings", json={"force_zero_knowledge": False, "standard_vault_allowed_groups": [],
                                      "zero_knowledge_enabled": False})

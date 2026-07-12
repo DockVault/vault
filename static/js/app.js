@@ -899,6 +899,13 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         // Load user permissions
         await loadUserPermissions();
 
+        // Apply this account's server-saved UI preferences (theme/accent/skin) so a
+        // login on a fresh browser picks up the look they set elsewhere. May reload
+        // once if the saved skin differs; if so, stop — the reload restarts the flow.
+        let reloadingPrefs = false;
+        try { reloadingPrefs = await applyServerPreferences(); } catch (_) {}
+        if (reloadingPrefs) return;
+
         // Update profile UI
         updateProfileUI(currentUser);
 
@@ -965,6 +972,9 @@ function logout() {
     storage.removeItem('userPermissions');
     storage.removeItem('isScopedTemp');
 
+    // Clear the pre-paint boot state so the splash-override CSS releases and the
+    // login screen shows (matters when logout runs from the boot verify path).
+    document.documentElement.removeAttribute('data-auth');
     document.getElementById('login-form').reset();
     showScreen('login-screen');
 }
@@ -1290,51 +1300,96 @@ async function toggleVaultFavorite(vaultId) {
     }
 }
 
+// The effective vault type the create form will submit. When the type chooser
+// is hidden entirely, only standard is creatable; when zero-knowledge is forced
+// the chooser is replaced by a static note but the (hidden) select still carries
+// the effective 'zero_knowledge' value.
+function effectiveVaultType() {
+    const grp = document.getElementById('vault-type-group');
+    const sel = document.getElementById('vault-type');
+    if (!grp || grp.style.display === 'none') return 'standard';
+    return (sel && sel.value) || 'standard';
+}
+
+// Reflect the chosen vault type into the rest of the create form. The top-level
+// "Vault Password" is a web access gate that only applies to STANDARD vaults
+// (zero-knowledge vaults are unlocked by the browser passphrase flow in the
+// follow-up encryption-key modal), so it — and only it — is hidden for ZK.
+// Team mode is a zero-knowledge-only option, so it hides for standard.
+function syncCreateVaultForm() {
+    const isZk = effectiveVaultType() === 'zero_knowledge';
+    const pwGroup = document.getElementById('vault-password-group');
+    const pwInput = document.getElementById('vault-password');
+    const hierWrap = document.getElementById('vault-hierarchical-wrap');
+    if (pwGroup) pwGroup.style.display = isZk ? 'none' : '';
+    // Disable the hidden password field: a disabled control is barred from HTML5
+    // constraint validation (a too-short value on a display:none, non-focusable input
+    // would otherwise silently block "Create Vault") and is never submitted.
+    if (pwInput) pwInput.disabled = isZk;
+    if (hierWrap) hierWrap.style.display = isZk ? '' : 'none';
+}
+
 // Create Vault Modal
 async function showCreateVault() {
     // The zero-knowledge option is only offered when the deployment enables it.
     const grp = document.getElementById('vault-type-group');
     const sel = document.getElementById('vault-type');
     const note = document.getElementById('zk-unavailable-note');
-    const stdOpt = sel ? sel.querySelector('option[value="standard"]') : null;
+    const choice = document.getElementById('vault-type-choice');
+    const forcedNote = document.getElementById('vault-type-forced-note');
+
+    // Reset to the fail-safe default (standard only, real chooser, no notes) so a
+    // re-open never inherits a previous session's forced/hidden state.
+    if (sel) { sel.disabled = false; sel.value = 'standard'; }
+    if (choice) choice.style.display = '';
+    if (forcedNote) forcedNote.style.display = 'none';
+    if (note) note.style.display = 'none';
+
     if (grp) {
         try {
             const f = await apiRequest('/zk-enabled', { silent: true });
             const on = !!(f && f.zero_knowledge_enabled);
             const must = !!(f && f.must_use_zk);
             const planHasZk = !!(f && f.plan_zero_knowledge);
-            grp.style.display = (on || must) ? '' : 'none';
-            // When zero-knowledge isn't offered, say WHY — the plan doesn't include it vs an
-            // admin turned it off — instead of silently omitting the option (textContent, no HTML).
-            if (note) {
-                if (!on && !must) {
+            // Honour the operator allowlist: an allowlist present but omitting
+            // 'standard' means only zero-knowledge is creatable here (same UI
+            // effect as the force policy). An empty/absent list = no restriction.
+            const allowed = Array.isArray(f && f.allowed_vault_types) ? f.allowed_vault_types : [];
+            const standardBlocked = allowed.length > 0 && !allowed.includes('standard');
+            const forceZk = must || (on && standardBlocked);
+
+            if (!on && !must) {
+                // Zero-knowledge not offered — standard only. Say WHY (plan vs admin
+                // toggle) instead of silently omitting the option (textContent, no HTML).
+                grp.style.display = 'none';
+                if (note) {
                     note.textContent = planHasZk
                         ? 'Zero-knowledge vaults are turned off for this workspace. An administrator can enable them in Settings.'
                         : 'Zero-knowledge vaults are not available on your current plan.';
                     note.style.display = '';
-                } else {
-                    note.style.display = 'none';
                 }
-            }
-            if (sel) {
-                if (must) {
-                    // Org policy forces zero-knowledge for this user — lock the choice.
-                    sel.value = 'zero_knowledge';
-                    sel.disabled = true;
-                    if (stdOpt) stdOpt.disabled = true;
-                } else {
-                    sel.disabled = false;
-                    if (stdOpt) stdOpt.disabled = false;
-                    if (!on) sel.value = 'standard';
-                }
+            } else if (forceZk) {
+                // Zero-knowledge is required. Show a clear message rather than a dead,
+                // disabled dropdown that just reads "Zero-knowledge" and ignores clicks.
+                grp.style.display = '';
+                if (sel) sel.value = 'zero_knowledge';
+                if (choice) choice.style.display = 'none';
+                if (forcedNote) forcedNote.style.display = '';
+            } else {
+                // Both types creatable — offer the real, enabled choice.
+                grp.style.display = '';
+                if (sel) sel.value = 'standard';
             }
         } catch (e) {
             console.warn('Could not check zero-knowledge availability:', e);
-            grp.style.display = 'none';  // fail safe: hide the option if we can't confirm
+            grp.style.display = 'none';  // fail safe: standard only if we can't confirm
             if (note) note.style.display = 'none';
-            if (sel) { sel.disabled = false; sel.value = 'standard'; if (stdOpt) stdOpt.disabled = false; }
+            if (sel) sel.value = 'standard';
         }
     }
+
+    // Reflect the resolved type into password + team-mode visibility, then show.
+    syncCreateVaultForm();
     document.getElementById('create-vault-modal').classList.add('active');
 }
 
@@ -1344,14 +1399,15 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
     const name = document.getElementById('vault-name').value.trim();
     const description = document.getElementById('vault-desc').value.trim();
     const password = document.getElementById('vault-password').value;
-    const typeSel = document.getElementById('vault-type');
-    const vaultType = (typeSel && typeSel.value) || 'standard';
+    const vaultType = effectiveVaultType();
 
     try {
         const payload = {
             name,
             description: description || null,
-            password: password || null,
+            // The top-level password only applies to standard vaults; never send a
+            // stale value for a zero-knowledge vault (its field is hidden).
+            password: (vaultType === 'standard' ? (password || null) : null),
             expire_files_after_days: null
         };
 
@@ -1412,6 +1468,13 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
         showError('Failed to create vault: ' + error.message);
     }
 });
+
+// Keep the password + team-mode visibility in step with the vault-type choice.
+// (app.js runs after the DOM is parsed, so the select already exists here.)
+(function bindVaultTypeSync() {
+    const sel = document.getElementById('vault-type');
+    if (sel) sel.addEventListener('change', syncCreateVaultForm);
+})();
 
 // Open the modal that lets the user choose the credential's validity/expiry
 function showGenerateTempCreds() {
@@ -3820,6 +3883,24 @@ async function loadSettings() {
         if (zkEl) zkEl.checked = settings.zero_knowledge_enabled === true;
         const fzkEl = document.getElementById('setting-force-zero-knowledge');
         if (fzkEl) fzkEl.checked = settings.force_zero_knowledge === true;
+        // When the PLAN mandates zero-knowledge (Enterprise tier), the local toggles can't
+        // lower that floor — show ZK as allowed + required, checked and LOCKED, with an
+        // explanatory note, so an unchecked-but-forced box isn't contradictory. Best-effort:
+        // if the plan state can't be read, leave the local toggles as-is.
+        try {
+            const zk = await apiRequest('/zk-enabled', { silent: true });
+            const planForced = !!(zk && zk.plan_force_zero_knowledge);
+            const zkAllowEl = document.getElementById('setting-zero-knowledge-enabled');
+            const note = document.getElementById('force-zk-plan-note');
+            if (planForced) {
+                if (zkAllowEl) { zkAllowEl.checked = true; zkAllowEl.disabled = true; }
+                if (fzkEl) { fzkEl.checked = true; fzkEl.disabled = true; }
+            } else {
+                if (zkAllowEl) zkAllowEl.disabled = false;
+                if (fzkEl) fzkEl.disabled = false;
+            }
+            if (note) note.style.display = planForced ? '' : 'none';
+        } catch (_) { /* plan state unavailable — leave the toggles editable */ }
         sftpRequireTempCredGroups = (settings.sftp_require_temp_cred_groups || []).map(String);
         standardVaultAllowedGroups = (settings.standard_vault_allowed_groups || []).map(String);
         await loadSftpPolicyGroups();
@@ -7826,6 +7907,111 @@ function cleanupPreviousView(newSection) {
 }
 
 // ============================================================================
+// SESSION BOOT + PREFERENCE SYNC
+// ============================================================================
+
+// Verify a cached session token with the server, then reveal the dashboard. Runs
+// while the pre-paint boot splash (auth-boot.js) is showing, so an EXPIRED token
+// bounces straight to login without ever flashing the app shell.
+async function enterAuthedSession() {
+    try {
+        const resp = await fetch(`${API_BASE}/users/me`, {
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        if (!resp.ok) { logout(); return; }   // 401/403/etc -> login, no dashboard flash
+        const user = await resp.json();
+        currentUser = user;
+        try { storage.setItem('currentUser', JSON.stringify(user)); } catch (_) {}
+    } catch (e) {
+        // Couldn't reach the server to verify — fail safe to login rather than a
+        // half-loaded app on a dead/expired session.
+        console.error('Session verification failed:', e);
+        logout();
+        return;
+    }
+
+    console.log('Restoring session for:', currentUser.username);
+
+    // Apply this account's server-saved UI preferences (may reload once if the saved
+    // skin differs) BEFORE revealing, so the look is settled when the dashboard shows.
+    let reloading = false;
+    try { reloading = await applyServerPreferences(); } catch (_) {}
+    if (reloading) return;   // page is reloading under the splash; don't touch the DOM
+
+    // Token is valid — finish loading UNDER the splash, then release it and reveal the
+    // dashboard in the SAME synchronous tick so the default-active login screen never
+    // paints in the gap (removing data-auth before an await would flash it).
+    await loadUserPermissions();
+    updateProfileUI(currentUser);
+    document.documentElement.removeAttribute('data-auth');
+    showScreen('dashboard-screen');
+
+    // Restore the section/vault/folder the user was on before a refresh.
+    let restored = false;
+    try { restored = await restoreLastView(); } catch (e) { console.error('Restore failed:', e); }
+    if (!restored) loadDashboardStats();
+
+    // Restrict the sidebar for a scoped temp credential AFTER any restore.
+    await loadSessionAccess();
+
+    // Prompt a keyless user who's been invited to a ZK vault to set up a key.
+    zkMaybePromptPendingInvites();
+}
+
+// Pull the current user's server-saved UI preferences and apply them, so their
+// theme / accent / background / skin follow their ACCOUNT across browsers and
+// devices. localStorage stays the fast pre-paint cache; the server is the source
+// of truth once logged in. A skin change must happen pre-paint (ui-boot.js), so if
+// the saved skin differs from what booted we persist it locally and reload once.
+// Returns true when a reload was triggered — the caller MUST stop (don't touch the
+// DOM/screens) so no screen flashes before the page navigates away.
+async function applyServerPreferences() {
+    if (!authToken) return false;
+    let prefs = null;
+    try {
+        const resp = await fetch(`${API_BASE}/users/me/preferences`, {
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        if (!resp.ok) return false;
+        prefs = await resp.json();
+    } catch (_) { return false; }
+    if (!prefs || typeof prefs !== 'object') return false;
+
+    const tm = window.themeManager;
+    if (!tm) return false;
+    // apply* write through to localStorage (the cache) but do NOT re-POST to the
+    // server (only user actions persist), so there's no echo back.
+    if (prefs.theme) tm.applyTheme(prefs.theme);
+    if (prefs.accent) tm.applyAccent(prefs.accent);
+    if (prefs.background) tm.applyBackground(prefs.background);
+    if (prefs.ui && prefs.ui !== tm.currentUi) {
+        // Only reload if the choice actually persisted to localStorage — ui-boot.js reads
+        // localStorage pre-paint, so if the write is blocked (private mode) the skin can't
+        // be applied and reloading would loop forever. Skip the reload in that case.
+        let stored = false;
+        try { localStorage.setItem('ui', prefs.ui); stored = localStorage.getItem('ui') === prefs.ui; } catch (_) {}
+        if (stored) {
+            window.location.reload();   // ui-boot.js re-applies the skin pre-paint on reload
+            return true;                // reload pending — caller stops here
+        }
+    }
+    return false;
+}
+
+// Persist a UI preference change to the server (fire-and-forget) so it follows the
+// account. No-op when logged out — the pre-login theme is a local-only default.
+// Exposed on window so theme.js's pickers can call it without importing app.js.
+function saveUserPreference(patch) {
+    if (!authToken) return Promise.resolve();
+    return fetch(`${API_BASE}/users/me/preferences`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+        body: JSON.stringify(patch)
+    }).catch(() => {});   // best-effort; localStorage already holds the local copy
+}
+window.saveUserPreference = saveUserPreference;
+
+// ============================================================================
 // APPLICATION INITIALIZATION
 // ============================================================================
 
@@ -7835,45 +8021,17 @@ document.addEventListener('DOMContentLoaded', () => {
     // session TTL (+1h slack) so abandoned uploads can't accumulate in IndexedDB.
     try { zkUploadStore.pruneOlderThan(25 * 60 * 60 * 1000); } catch (_) {}
 
-    // Check for existing session BEFORE showing any screen
+    // Check for existing session BEFORE showing any screen.
     const hasSession = authToken && currentUser;
-    
+
     if (hasSession) {
-        console.log('Restoring session for:', currentUser.username);
-        
-        // Hide login screen immediately (before any rendering)
-        const loginScreen = document.getElementById('login-screen');
-        const dashboardScreen = document.getElementById('dashboard-screen');
-        if (loginScreen) loginScreen.style.display = 'none';
-        if (dashboardScreen) dashboardScreen.style.display = 'block';
-        
-        // Load user permissions
-        loadUserPermissions().then(async () => {
-            // Update profile UI
-            updateProfileUI(currentUser);
-
-            // Show dashboard screen
-            showScreen('dashboard-screen');
-
-            // Restore the section/vault/folder the user was on before a refresh.
-            // Falls back to the dashboard if there's nothing to restore.
-            let restored = false;
-            try { restored = await restoreLastView(); } catch (e) { console.error('Restore failed:', e); }
-            if (!restored) loadDashboardStats();
-
-            // Restrict the sidebar for a scoped temp credential AFTER any restore,
-            // so a restored-but-forbidden section is corrected to an allowed one.
-            await loadSessionAccess();
-
-            // Prompt a keyless user who's been invited to a ZK vault to set up a key.
-            zkMaybePromptPendingInvites();
-        });
+        // The pre-paint splash (auth-boot.js) is up. VERIFY the cached token with the
+        // server before revealing anything, so an expired token routes to login
+        // instead of flashing the dashboard shell.
+        enterAuthedSession();
     } else {
-        // No session, show login
-        const loginScreen = document.getElementById('login-screen');
-        const dashboardScreen = document.getElementById('dashboard-screen');
-        if (loginScreen) loginScreen.style.display = 'flex';
-        if (dashboardScreen) dashboardScreen.style.display = 'none';
+        // No session — release the boot splash (if any) and show login.
+        document.documentElement.removeAttribute('data-auth');
         showScreen('login-screen');
     }
     

@@ -3,10 +3,11 @@
  *
  * Two peer skins share the same base stylesheets (theme/components/utilities):
  *   v1 "Classic"  -> css/redesign.css   (link#skin-v1)
- *   v2 "Console"  -> css/ui-v2.css     (link#skin-v2, ships disabled)
- * The choice is persisted in localStorage key `ui` ('v1' default). This script
- * enables exactly one skin stylesheet and mirrors the choice as `data-ui` on
- * <html> so behavioural scripts (ui-v2.js) and CSS can key off it.
+ *   v2 "Console"  -> css/ui-v2.css     (link#skin-v2)
+ * The choice is persisted in localStorage key `ui` ('v2' Console is the default;
+ * only an explicit 'v1' opts back into Classic). This script enables exactly one
+ * skin stylesheet and mirrors the choice as `data-ui` on <html> so behavioural
+ * scripts (ui-v2.js) and CSS can key off it.
  *
  * ADOPTING v2 / REMOVING v1 later: make ui-v2.css the only skin <link>, delete
  * redesign.css + this file + the Interface switcher in the profile dropdown,
@@ -14,9 +15,9 @@
  */
 (function () {
     'use strict';
-    var ui = 'v1';
+    var ui = 'v2';
     try {
-        if (localStorage.getItem('ui') === 'v2') ui = 'v2';
+        if (localStorage.getItem('ui') === 'v1') ui = 'v1';
     } catch (e) { /* storage blocked -> default skin */ }
 
     var v1 = document.getElementById('skin-v1');

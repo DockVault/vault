@@ -64,6 +64,18 @@ class ThemeManager {
     toggle() {
         const newTheme = this.currentTheme === 'light' ? 'dark' : 'light';
         this.applyTheme(newTheme);
+        this.persist({ theme: newTheme });
+    }
+
+    // Persist a preference change to the server so it follows the account across
+    // devices (app.js defines window.saveUserPreference; no-op when logged out or
+    // when app.js hasn't loaded yet). localStorage remains the local cache either way.
+    persist(patch) {
+        try {
+            if (typeof window !== 'undefined' && typeof window.saveUserPreference === 'function') {
+                window.saveUserPreference(patch);
+            }
+        } catch (_) { /* best-effort */ }
     }
 
     // -- Accent color -----------------------------------------------------
@@ -93,7 +105,7 @@ class ThemeManager {
                 e.preventDefault();
                 e.stopPropagation();
                 const accent = swatch.getAttribute('data-accent');
-                if (accent) this.applyAccent(accent);
+                if (accent) { this.applyAccent(accent); this.persist({ accent }); }
             });
         });
         this.updateAccentPicker();
@@ -142,7 +154,7 @@ class ThemeManager {
                 e.preventDefault();
                 e.stopPropagation();
                 const bg = swatch.getAttribute('data-bg');
-                if (bg) this.applyBackground(bg);
+                if (bg) { this.applyBackground(bg); this.persist({ background: bg }); }
             });
         });
         this.updateBackgroundPicker();
@@ -168,13 +180,32 @@ class ThemeManager {
     getStoredUi() {
         let stored = null;
         try { stored = localStorage.getItem('ui'); } catch (_) {}
-        return UIS.includes(stored) ? stored : 'v1';
+        // Console (v2) is the default; only an explicit 'v1' opts back into Classic.
+        return UIS.includes(stored) ? stored : 'v2';
     }
 
     setUi(ui) {
         if (!UIS.includes(ui) || ui === this.currentUi) return;
         try { localStorage.setItem('ui', ui); } catch (_) { return; }
-        window.location.reload();
+        // Persist to the server FIRST so the skin choice survives on other devices,
+        // then reload (ui-boot.js re-applies the skin pre-paint). The reload would
+        // otherwise race the fire-and-forget PUT.
+        const reload = () => window.location.reload();
+        let saved = null;
+        try {
+            if (typeof window !== 'undefined' && typeof window.saveUserPreference === 'function') {
+                saved = window.saveUserPreference({ ui });
+            }
+        } catch (_) { /* best-effort */ }
+        if (saved && typeof saved.then === 'function') {
+            // Reload once the PUT settles, but don't let a slow/hung server delay the skin
+            // swap: reload after at most ~1.2s regardless (the choice is already persisted
+            // to localStorage, so the next boot applies it either way).
+            const cap = new Promise(res => setTimeout(res, 1200));
+            Promise.race([Promise.resolve(saved).catch(() => {}), cap]).then(reload, reload);
+        } else {
+            reload();
+        }
     }
 
     setupUiPicker() {

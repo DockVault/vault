@@ -13,16 +13,20 @@
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-sans-500.woff2" crossorigin>
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-mono-500.woff2" crossorigin>
     <!-- UI skins: exactly one of the two links below is active, chosen by
-         js/ui-boot.js from localStorage `ui` (v1 = Classic default, v2 = Console).
-         Deliberately NO rel=preload for the disabled v2 sheet: v1-default users
-         shouldn't pay ~90KB for a skin they never enable; v2 users take one
-         slower cold-cache first paint instead (the enabled sheet still blocks
-         render, so there is no unstyled flash).
+         js/ui-boot.js from localStorage `ui` (v2 = Console is the default; only an
+         explicit 'v1' opts back into Classic). The DEFAULT sheet (v2) ships enabled
+         so it is discovered at parse time; the Classic sheet ships disabled and is
+         enabled by ui-boot.js only for the v1-opt-in minority (the enabled sheet
+         still blocks render, so there is no unstyled flash either way).
          To adopt v2 permanently: keep only ui-v2.css, delete redesign.css +
          ui-boot.js + the Interface switcher in the profile dropdown. -->
-    <link rel="stylesheet" href="/static/css/redesign.css?v=20260703a" id="skin-v1">
-    <link rel="stylesheet" href="/static/css/ui-v2.css?v=20260703a" id="skin-v2" disabled>
+    <link rel="stylesheet" href="/static/css/redesign.css?v=20260703a" id="skin-v1" disabled>
+    <link rel="stylesheet" href="/static/css/ui-v2.css?v=20260703a" id="skin-v2">
     <script src="/static/js/ui-boot.js?v=20260703a"></script>
+    <!-- Auth boot: picks the first-paint screen from whether a session token is
+         cached, so an expired/logged-out load never flashes the app shell. See
+         static/js/auth-boot.js. -->
+    <script src="/static/js/auth-boot.js?v=20260713a"></script>
     <!-- Branding boot: applies effective /branding (name, logo, favicon, theme colours)
          to the shell, pre-paint after the skin boot. See static/js/brand.js. -->
     <script src="/static/js/brand.js?v=20260703a"></script>
@@ -114,6 +118,19 @@
                         powered by <a data-powered-by-link href="https://dockvault.io" target="_blank" rel="noopener noreferrer" style="color: inherit; font-weight: 600; text-decoration: none;"><span data-powered-by-name>DockVault</span></a>
                     </div>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Auth boot splash: shown pre-paint when a session token is cached (see
+         auth-boot.js), until app.js verifies the token and reveals the dashboard.
+         Neutral on purpose so neither the login form nor the app shell flashes for
+         an expired/again-logged-out session. -->
+    <div id="boot-screen" class="screen">
+        <div class="flex items-center justify-center" style="min-height: 100vh; width: 100%;">
+            <div class="text-center">
+                <img src="/static/assets/logo-small.png" data-brand-logo alt="" style="height: 44px; opacity: 0.9;">
+                <div class="loading-spinner" style="margin: var(--space-lg) auto 0;" aria-hidden="true"></div>
             </div>
         </div>
     </div>
@@ -1191,6 +1208,11 @@
                                         <span>Require zero-knowledge for all new vaults</span>
                                     </label>
                                     <p class="text-secondary text-sm mt-sm">When enabled (and zero-knowledge is allowed above), new vaults must be zero-knowledge — except for members of the exempt departments below, who may still create standard vaults.</p>
+                                    <!-- Shown when the PLAN mandates zero-knowledge (Enterprise): the box above is
+                                         checked + locked, because the plan is a floor this local toggle can't lower. -->
+                                    <p class="alert alert-info mt-sm" id="force-zk-plan-note" style="display:none;">
+                                        Zero-knowledge is <strong>required by your plan</strong> — every new vault is encrypted in the browser and this can’t be turned off here.
+                                    </p>
                                 </div>
                                 <div class="form-group mt-md">
                                     <label>Departments exempt from the requirement</label>
@@ -1354,22 +1376,38 @@
                                     <label for="vault-desc">Description</label>
                                     <textarea id="vault-desc" class="form-control" rows="3"></textarea>
                                 </div>
-                                <div class="form-group">
+                                <!-- The top-level vault password is a web access gate for STANDARD
+                                     vaults only; zero-knowledge vaults are unlocked by the browser-side
+                                     passphrase flow, so this group is hidden when the effective type is
+                                     zero-knowledge (see syncCreateVaultForm in app.js). -->
+                                <div class="form-group" id="vault-password-group">
                                     <label for="vault-password">Vault Password <span class="text-tertiary">(optional)</span></label>
                                     <input type="password" id="vault-password" class="form-control" minlength="8" autocomplete="new-password">
                                     <small class="form-help">Leave empty for no password. If set (min 8 characters), it adds a web access prompt before files can be viewed — it is <strong>not encryption</strong> and does not restrict SFTP. For confidentiality the server itself cannot read, use a Zero-Knowledge vault.</small>
                                 </div>
                                 <div class="form-group" id="vault-type-group" style="display:none;">
-                                    <label for="vault-type">Vault Type</label>
-                                    <select id="vault-type" class="form-control">
-                                        <option value="standard">Standard (server-encrypted)</option>
-                                        <option value="zero_knowledge">Zero-knowledge (encrypted in your browser)</option>
-                                    </select>
-                                    <small class="form-help">Zero-knowledge vaults are encrypted client-side with your passphrase — the server can never read them. Web-only (not available over SFTP).</small>
-                                    <label class="checkbox-label" style="margin-top:8px; display:block;">
-                                        <input type="checkbox" id="vault-hierarchical"> Team mode (hierarchical key)
-                                    </label>
-                                    <small class="form-help">For large teams: the vault key is wrapped once to a shared team key, so adding members and routine key rotation stay fast (O(1)). Removing a member still rotates the team key. Zero-knowledge — the server never sees the key.</small>
+                                    <!-- The interactive chooser: shown when both types are creatable. -->
+                                    <div id="vault-type-choice">
+                                        <label for="vault-type">Vault Type</label>
+                                        <select id="vault-type" class="form-control">
+                                            <option value="standard">Standard (server-encrypted)</option>
+                                            <option value="zero_knowledge">Zero-knowledge (encrypted in your browser)</option>
+                                        </select>
+                                        <small class="form-help">Zero-knowledge vaults are encrypted client-side with your passphrase — the server can never read them. Web-only (not available over SFTP).</small>
+                                    </div>
+                                    <!-- Shown instead of the chooser when this workspace requires
+                                         zero-knowledge (plan/admin force policy, or an allowlist that
+                                         omits standard) — clearer than a dead, disabled dropdown. -->
+                                    <div id="vault-type-forced-note" class="alert alert-info" style="display:none;">
+                                        This workspace requires <strong>zero-knowledge</strong> vaults — files are encrypted in your browser and the server can never read them.
+                                    </div>
+                                    <!-- Team mode is a zero-knowledge-only option; hidden for standard. -->
+                                    <div id="vault-hierarchical-wrap">
+                                        <label class="checkbox-label" style="margin-top:8px; display:block;">
+                                            <input type="checkbox" id="vault-hierarchical"> Team mode (hierarchical key)
+                                        </label>
+                                        <small class="form-help">For large teams: the vault key is wrapped once to a shared team key, so adding members and routine key rotation stay fast (O(1)). Removing a member still rotates the team key. Zero-knowledge — the server never sees the key.</small>
+                                    </div>
                                 </div>
                                 <small class="form-help" id="zk-unavailable-note" style="display:none;"></small>
                             </div>

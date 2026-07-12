@@ -808,6 +808,24 @@ class SystemSetting(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class UserPreference(Base):
+    """Per-user UI preferences (light/dark theme, accent, background, skin) so a
+    user's look-and-feel follows their ACCOUNT across browsers and devices instead
+    of living only in one browser's localStorage.
+
+    One row per user holds the whole prefs dict as JSON. A WHOLE NEW TABLE (not a
+    users column) is used deliberately: init_db() only runs create_all(), which
+    creates missing tables but never ALTERs existing ones — so a new table migrates
+    cleanly on already-deployed vaults, whereas a new column would not. Created
+    lazily on the first PUT; a user with no row simply has no stored preferences.
+    """
+    __tablename__ = 'user_preferences'
+
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), primary_key=True)
+    preferences = Column(JSON, nullable=False, default=dict)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class LogPullToken(Base):
     """RO2-3: a named bearer token that may PULL the container logs via GET /logs.
 

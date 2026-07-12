@@ -288,6 +288,13 @@ code {
     display: block !important;
 }
 
+/* Auth boot: when a session token is cached (auth-boot.js sets data-auth="pending"
+   pre-paint), show the neutral #boot-screen splash INSTEAD of the default-active
+   login screen, until app.js verifies the token and reveals the dashboard — so an
+   expired/again-logged-out session never flashes the app shell or a stale login. */
+html[data-auth="pending"] #login-screen.active { display: none !important; }
+html[data-auth="pending"] #boot-screen { display: flex !important; }
+
 /* ============================================================================
    CONTINUED IN NEXT MESSAGE...
    ============================================================================ */

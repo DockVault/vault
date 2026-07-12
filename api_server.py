@@ -28,7 +28,7 @@ import traceback
 from pathlib import Path
 
 from database import get_db, init_db, check_db_connection, check_redis_connection
-from models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession
+from models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference
 # NOTE: auth_service and vault_service BOTH define a class named RateLimitExceededError
 # (unrelated: one subclasses AuthenticationError, the other FileServiceError). Import the
 # auth one under an alias so the later vault import below can't shadow it — otherwise the
@@ -1946,6 +1946,11 @@ async def get_zk_enabled(
         "zero_knowledge_enabled": _zk_enabled(db) and zk_allowed,
         "must_use_zk": zk_allowed and _user_must_use_zk(db, current_user),
         "plan_zero_knowledge": bool(settings.plan_zero_knowledge),
+        # Whether the PLAN itself mandates zero-knowledge (Enterprise tier) — distinct from
+        # the local admin 'force_zero_knowledge' toggle. Lets the Settings page show that the
+        # requirement is imposed by the plan (a floor the local toggle can't drop below),
+        # instead of an unchecked box that looks contradictory when ZK is already forced.
+        "plan_force_zero_knowledge": bool(settings.plan_force_zero_knowledge and settings.plan_zero_knowledge),
         "max_zk_vaults": settings.plan_max_zk_vaults,
         "zk_vault_count": _zk_vault_count(db),
         "allowed_vault_types": sorted(allowed),
@@ -2922,6 +2927,87 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
     Get current user information.
     """
     return UserResponse.model_validate(current_user)
+
+
+# -- Per-user UI preferences (theme / accent / background / skin) --------------
+# Values mirror the client's ThemeManager (static/js/theme.js). Everything is
+# whitelisted on the way in AND out, so a stored preference can never carry a value
+# the client wouldn't itself produce (the client writes these straight into DOM
+# attributes/localStorage, so an untrusted value there is a defensive concern).
+_PREF_ALLOWED = {
+    "theme": {"light", "dark"},
+    "accent": {"teal", "indigo", "violet", "rose", "orange", "sky"},
+    "background": {"slate", "graphite", "navy", "warm", "forest", "plum"},
+    "ui": {"v1", "v2"},
+}
+
+
+def _sanitize_preferences(data) -> dict:
+    """Keep only known keys whose value is in that key's whitelist; drop the rest."""
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: data[key]
+        for key, allowed in _PREF_ALLOWED.items()
+        if isinstance(data.get(key), str) and data[key] in allowed
+    }
+
+
+class PreferencesUpdate(BaseModel):
+    """Partial update of the current user's UI preferences. Every field is
+    optional — only the ones provided change; the rest are left as stored."""
+    theme: Optional[str] = None
+    accent: Optional[str] = None
+    background: Optional[str] = None
+    ui: Optional[str] = None
+
+
+@app.get("/users/me/preferences")
+async def get_my_preferences(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The current user's saved UI preferences (empty object if none set yet)."""
+    row = db.query(UserPreference).filter(UserPreference.user_id == current_user.id).first()
+    return _sanitize_preferences(row.preferences if row else {})
+
+
+@app.put("/users/me/preferences")
+async def update_my_preferences(
+    update: PreferencesUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Merge the provided (whitelisted) preferences into the current user's saved
+    set and return the merged result. Creates the row lazily on first use."""
+    incoming = _sanitize_preferences(update.model_dump(exclude_none=True))
+    # Lock the row for the read-modify-write so two concurrent partial updates can't
+    # lose a field (last-writer-wins on the whole JSON blob).
+    row = (db.query(UserPreference)
+             .filter(UserPreference.user_id == current_user.id)
+             .with_for_update().first())
+    merged = dict(_sanitize_preferences(row.preferences) if row else {})
+    merged.update(incoming)
+    if row:
+        row.preferences = merged  # reassign (not in-place mutate) so SQLAlchemy tracks the change
+    else:
+        db.add(UserPreference(user_id=current_user.id, preferences=merged))
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent first-write created the row — lock + merge onto it instead.
+        db.rollback()
+        row = (db.query(UserPreference)
+                 .filter(UserPreference.user_id == current_user.id)
+                 .with_for_update().first())
+        merged = dict(_sanitize_preferences(row.preferences) if row else {})
+        merged.update(incoming)
+        if row:
+            row.preferences = merged
+        else:
+            db.add(UserPreference(user_id=current_user.id, preferences=merged))
+        db.commit()
+    return merged
 
 
 @app.get("/users/{user_id}", response_model=UserResponse)

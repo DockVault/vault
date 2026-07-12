@@ -63,3 +63,15 @@ def test_zk_off_states_are_distinguishable(admin):
         assert admin.get("/settings").json().get("zero_knowledge_enabled") is False
     finally:
         admin.put("/settings", json={"zero_knowledge_enabled": bool(original)})
+
+
+def test_zk_enabled_reports_plan_force(admin):
+    """/zk-enabled surfaces whether the PLAN itself mandates zero-knowledge (distinct from
+    the local force_zero_knowledge toggle), so the Settings page can show a plan-imposed
+    requirement instead of an unchecked, contradictory-looking box."""
+    z = admin.get("/zk-enabled").json()
+    assert "plan_force_zero_knowledge" in z
+    assert isinstance(z["plan_force_zero_knowledge"], bool)
+    # It's an AND of plan-force and plan-grants-ZK: a plan can't force what it doesn't grant.
+    if z["plan_force_zero_knowledge"]:
+        assert z["plan_zero_knowledge"] is True
