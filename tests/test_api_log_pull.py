@@ -40,9 +40,10 @@ def _disable(admin, token_id):
 
 def test_admin_view_shape(admin):
     body = admin.get("/settings/logs").json()
-    assert set(["ceiling", "components", "serveable", "flags", "tokens"]).issubset(body)
+    assert set(["ceiling", "components", "serveable", "flags", "tokens", "stealth_404"]).issubset(body)
     assert "web" in body["components"] and "sftp" in body["serveable"]
     assert isinstance(body["tokens"], list)
+    assert isinstance(body["stealth_404"], bool)
 
 
 def test_mint_returns_plaintext_once_and_list_never_leaks_it(admin):
@@ -110,6 +111,56 @@ def test_flags_round_trip(admin, restore_flags):
 def test_flags_rejects_empty_and_unknown_only(admin, restore_flags):
     assert admin.put("/settings/logs", json={}).status_code == 400
     assert admin.put("/settings/logs", json={"flags": {"bogus": True}}).status_code == 400
+
+
+# ---- stealth-404 policy ---------------------------------------------------------------------
+
+@pytest.fixture
+def restore_stealth(admin):
+    before = bool(admin.get("/settings/logs").json().get("stealth_404", False))
+    yield
+    admin.put("/settings/logs", json={"stealth_404": before})
+
+
+def test_stealth_flag_round_trip(admin, restore_stealth):
+    assert admin.put("/settings/logs", json={"stealth_404": True}).status_code == 200
+    assert admin.get("/settings/logs").json().get("stealth_404") is True
+    assert admin.put("/settings/logs", json={"stealth_404": False}).status_code == 200
+    assert admin.get("/settings/logs").json().get("stealth_404") is False
+
+
+def test_put_accepts_stealth_without_flags(admin, restore_stealth):
+    # stealth can be set alone (no 'flags' key) — the PUT no longer requires a component.
+    assert admin.put("/settings/logs", json={"stealth_404": True}).status_code == 200
+
+
+def test_stealth_requires_admin(anon):
+    assert anon.put("/settings/logs", json={"stealth_404": True}).status_code in (401, 403)
+
+
+def test_stealth_hides_endpoint_when_ceiling_on(admin, restore_flags, restore_stealth):
+    """Ceiling ON: an unauthenticated GET /logs returns 401 with stealth OFF, but a bodyless 404
+    with stealth ON (indistinguishable from feature-off). A VALID token still works either way —
+    stealth only rewrites the auth-FAILURE status. Probe-skipped when the ceiling is off (then
+    /logs is always 404 and the 401/404 distinction can't be observed)."""
+    admin.put("/settings/logs", json={"flags": {"web": True}})
+    admin.put("/settings/logs", json={"stealth_404": False})
+    m = _mint(admin, scope=("web",))
+    try:
+        if _get_logs(m["token"], "web").status_code == 404:
+            pytest.skip("ceiling PLAN_LOG_PULL is off on this build — 401/404 not distinguishable")
+        # stealth OFF: no token -> a helpful 401
+        assert requests.get(f"{BASE_URL}/logs", params={"service": "web"}, timeout=15).status_code == 401
+        # stealth ON: no token -> bodyless 404
+        admin.put("/settings/logs", json={"stealth_404": True})
+        hidden = requests.get(f"{BASE_URL}/logs", params={"service": "web"}, timeout=15)
+        assert hidden.status_code == 404, hidden.text
+        # a bad token is likewise hidden as 404
+        assert _get_logs("deadbeefdeadbeef-not-real", "web").status_code == 404
+        # a VALID scoped token still returns 200 with stealth on
+        assert _get_logs(m["token"], "web").status_code == 200
+    finally:
+        _disable(admin, m["id"])
 
 
 # ---- auth boundaries on the admin surface ---------------------------------------------------

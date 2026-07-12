@@ -1513,6 +1513,18 @@ def _logs_pull_enabled(db, component: str) -> bool:
         return False
 
 
+def _log_stealth_on(db) -> bool:
+    """Stealth policy: when the admin turns this on, an auth failure on /logs returns 404 (not
+    401) so the endpoint is indistinguishable from the feature being off — the vault never admits
+    the endpoint exists to an unauthenticated caller. Default OFF (a plain 401 helps a tenant who
+    is wiring up log collection); stealth is for deployments that want /logs fully undetectable.
+    Fail to OFF on any read error (the 401 default reveals only existence, never access)."""
+    try:
+        return bool(_load_logs_settings(db).get("stealth_404", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _hash_log_token(token: str) -> str:
     return log_pull.hash_log_token(token, settings.log_token_pepper)
 
@@ -1553,13 +1565,21 @@ async def require_log_pull_token(
 
     - Ceiling-404 FIRST: when the feature is off, return 404 BEFORE inspecting the token, so a
       caller cannot use the endpoint as an oracle (feature-off is indistinguishable from a bad path).
+    - Stealth: when the admin enables it, an auth failure returns a bodyless 404 (not 401) so an
+      unauthenticated caller cannot even tell the endpoint exists. Default off (plain 401).
     - Header-only: HTTPBearer never reads a query param, so a token can't land in an access log.
     - Prefix-scoped lookup (indexed) then a constant-time peppered-hash compare. Fail-closed.
     """
     if not _log_ceiling_on():
         raise HTTPException(status_code=404)
+    stealth = _log_stealth_on(db)
+
+    def _deny(detail):
+        # stealth -> bodyless 404 (same shape as ceiling-off); otherwise a helpful 401.
+        return HTTPException(status_code=404) if stealth else HTTPException(status_code=401, detail=detail)
+
     if not credentials or not credentials.credentials:
-        raise HTTPException(status_code=401, detail="Log token required")
+        raise _deny("Log token required")
     try:
         from models import LogPullToken
         presented = credentials.credentials
@@ -1573,8 +1593,8 @@ async def require_log_pull_token(
     except HTTPException:
         raise
     except Exception:  # noqa: BLE001
-        raise HTTPException(status_code=401, detail="Invalid log token")
-    raise HTTPException(status_code=401, detail="Invalid log token")
+        raise _deny("Invalid log token")
+    raise _deny("Invalid log token")
 
 
 @app.get("/logs")
@@ -1628,6 +1648,7 @@ async def get_logs_settings(
         "components": list(log_pull.KNOWN_COMPONENTS),
         "serveable": list(log_pull.SERVEABLE_COMPONENTS),
         "flags": {c: bool(flags.get(c, False)) for c in log_pull.KNOWN_COMPONENTS},
+        "stealth_404": bool(flags.get("stealth_404", False)),
         "tokens": [{
             "id": str(t.id), "name": t.name, "token_prefix": t.token_prefix,
             "scope": log_pull.validate_scope(t.scope), "disabled": bool(t.disabled),
@@ -1644,24 +1665,28 @@ async def update_logs_settings(
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
-    """Set per-component enable flags. require_interactive_admin — a temp-cred admin must not
-    flip the exposure policy (mirrors PUT /settings)."""
+    """Set per-component enable flags and/or the stealth-404 policy. require_interactive_admin —
+    a temp-cred admin must not flip the exposure policy (mirrors PUT /settings)."""
     flags = payload.get("flags") if isinstance(payload, dict) else None
-    if not isinstance(flags, dict):
-        raise HTTPException(status_code=400, detail="flags object required")
-    clean = {c: bool(flags[c]) for c in log_pull.KNOWN_COMPONENTS if c in flags}
-    if not clean:
-        raise HTTPException(status_code=400, detail="no known components in payload")
-    _set_logs_settings(db, clean)
+    updates = {}
+    if isinstance(flags, dict):
+        updates.update({c: bool(flags[c]) for c in log_pull.KNOWN_COMPONENTS if c in flags})
+    if isinstance(payload, dict) and "stealth_404" in payload:
+        updates["stealth_404"] = bool(payload["stealth_404"])
+    if not updates:
+        raise HTTPException(status_code=400, detail="no known components or stealth_404 in payload")
+    _set_logs_settings(db, updates)
     db.commit()
     try:
         AuditLogger(db).log_action(
             action="log_settings_updated", status="success", user=current_user,
-            ip_address=get_client_ip(request), details={"keys": sorted(clean.keys())})
+            ip_address=get_client_ip(request), details={"keys": sorted(updates.keys())})
     except Exception:
         pass
     fresh = _load_logs_settings(db)
-    return {"status": "ok", "flags": {c: bool(fresh.get(c, False)) for c in log_pull.KNOWN_COMPONENTS}}
+    return {"status": "ok",
+            "flags": {c: bool(fresh.get(c, False)) for c in log_pull.KNOWN_COMPONENTS},
+            "stealth_404": bool(fresh.get("stealth_404", False))}
 
 
 @app.post("/settings/logs")

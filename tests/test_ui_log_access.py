@@ -98,3 +98,29 @@ def test_flag_toggle_persists(page: Page, admin_creds, admin):
         assert got == target, f"flag toggle did not persist (wanted {target}, server has {got})"
     finally:
         admin.put("/settings/logs", json={"flags": before})
+
+
+def test_stealth_toggle_persists(page: Page, admin_creds, admin):
+    if not _endpoint_present(admin):
+        pytest.skip("running vault image predates the RO2-3 log-pull endpoint")
+    import time
+    before = bool(admin.get("/settings/logs").json().get("stealth_404", False))
+    try:
+        _login(page, admin_creds["username"], admin_creds["password"])
+        _open_log_tab(page)
+        toggle = page.locator('#log-stealth-toggle')
+        expect(toggle).to_be_visible(timeout=10000)
+        # the toggle reflects the current server state on load
+        assert toggle.is_checked() == before
+        target = not before
+        toggle.check() if target else toggle.uncheck()
+        deadline = time.time() + 10
+        got = None
+        while time.time() < deadline:
+            got = bool(admin.get("/settings/logs").json().get("stealth_404", False))
+            if got == target:
+                break
+            time.sleep(0.3)
+        assert got == target, f"stealth toggle did not persist (wanted {target}, server has {got})"
+    finally:
+        admin.put("/settings/logs", json={"stealth_404": before})

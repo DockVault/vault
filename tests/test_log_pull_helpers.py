@@ -160,3 +160,88 @@ def test_redaction_scrubs_the_pull_token_if_it_echoes_in_a_bearer_line():
     text = f"[web] 127.0.0.1 - Authorization: Bearer {pull_token} GET /logs"
     out = log_pull.redact_log_text(text, [])
     assert pull_token not in out
+
+
+# ---- comprehensive credential redaction (owner: "disclosing password is a strict no go") -----
+
+def test_redaction_scrubs_prefixed_and_styled_passwords():
+    """The KV regex used to require a word boundary before the keyword (so `temp_password=` and
+    JSON `"password": "x"` slipped through). A password must never survive redaction regardless
+    of prefix, SUFFIX (SECRET_KEY, api_key_id), quoting style, or in-value special chars."""
+    cases = [
+        ("[web] password=hunter2secret done", "hunter2secret"),
+        ("[web] temp_password=throwaway9x end", "throwaway9x"),           # prefixed
+        ("[sftp] admin_password: SuperSekret1 login", "SuperSekret1"),    # prefix + colon + space
+        ('[web] {"password": "jsonpw123"} loaded', "jsonpw123"),         # JSON quoted
+        ("[web] DB_PASSWORD=envpw456 injected", "envpw456"),             # uppercase prefixed
+        ("[web] passphrase=correct-horse-battery ok", "correct-horse-battery"),
+        ("[web] client_secret=cs_live_abc789 rotated", "cs_live_abc789"),
+        ("[web] private_key=pk_zzz999 stored", "pk_zzz999"),
+        ("[web] pwd=shortpw11 set", "shortpw11"),
+        ("[web] GET /reset?token=leakytok123 next", "leakytok123"),
+        # --- keyword + trailing suffix (the A1 bypass class) ---
+        ("[web] SECRET_KEY=djangosecret123 loaded", "djangosecret123"),
+        ("[web] secret_key=flasksecret9 ok", "flasksecret9"),
+        ('[web] {"secret_key": "abcd1234efgh"} cfg', "abcd1234efgh"),
+        ("[web] api_key_id=akid_998877 used", "akid_998877"),
+        ("[web] password_field=pf_secret1 bound", "pf_secret1"),
+        ("[web] session_key=sk_abc123 set", "sk_abc123"),
+        # --- in-value special chars that must NOT leak the tail (the A2 class) ---
+        ("[web] password=ab&cd done", "ab&cd"),
+        ("[web] password=P@ss;w0rd! login", ";w0rd!"),   # the tail after ';' must not survive
+        ("[web] api_key=abc,def used", ",def"),
+        ("[web] password=a}b}c end", "}b}c"),            # '}' in value must not leak the tail
+    ]
+    for text, secret in cases:
+        out = log_pull.redact_log_text(text, [])
+        assert secret not in out, f"leaked {secret!r} from {text!r} -> {out!r}"
+        assert "«redacted»" in out, out
+
+
+def test_redaction_scrubs_password_in_connection_string():
+    for text, secret, keep in [
+        ("[web] connect postgres://appuser:pgSecret9@db.local:5432/app", "pgSecret9", "appuser"),
+        ("[web] redis://:redisPass8@cache:6379/0 ping", "redisPass8", "cache"),
+        ("[web] mongodb://u:pa/ss/wd@host/db conn", "pa/ss/wd", "host"),  # A3: '/' in password
+    ]:
+        out = log_pull.redact_log_text(text, [])
+        assert secret not in out, out
+        assert keep in out, out          # user/host are not secrets — kept for usefulness
+        assert "«redacted»" in out, out
+
+
+def test_redaction_is_linear_on_a_long_hostile_line():
+    """B (ReDoS): a long separator-free run of word chars — even one ending in a separator with no
+    value — must redact in well under a second (the old `[\\w.\\-]*`-prefixed regex was O(n^2):
+    ~5.6s at 8k chars, blocking the async event loop). Bounded by the keyword-anchored regex +
+    the per-line truncation cap."""
+    import time
+    hostile = "[sftp] uploaded " + ("a" * 60000) + "="  # keyword-free run + a trailing separator
+    t0 = time.monotonic()
+    out = log_pull.redact_log_text(hostile, [])
+    elapsed = time.monotonic() - t0
+    assert elapsed < 0.5, f"redaction took {elapsed:.2f}s — possible ReDoS regression"
+    assert out is not None
+
+
+def test_conn_regex_is_linear_on_scheme_dense_line():
+    """B (ReDoS #2): a `://X:`-dense line with no '@' must not go quadratic. An unbounded password
+    class `[^@\\s]+` overlapped the `://…:` structural chars and was O(n^2) (~11s at 200k / ~7s per
+    truncated line, blocking the event loop). Bounded to {1,256} it is linear."""
+    import time
+    hostile = "://a:" * 40000  # ~200k of scheme-colon tokens, no '@' anywhere
+    t0 = time.monotonic()
+    log_pull.redact_log_text(hostile, [])
+    elapsed = time.monotonic() - t0
+    assert elapsed < 0.5, f"connection-string redaction took {elapsed:.2f}s — ReDoS regression"
+
+
+def test_redaction_leaves_benign_lines_intact():
+    # No credential keyword + separator -> untouched. "tokens" without a separator is not a secret.
+    for text in [
+        "[web] GET /health 200 in 5ms",
+        "[web] processed 5 tokens for user alice",
+        "[sftp] uploaded report-2026.pdf (1.2 MB)",
+        "[web] listening on 0.0.0.0:8000",
+    ]:
+        assert log_pull.redact_log_text(text, []) == text

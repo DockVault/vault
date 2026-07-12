@@ -1290,6 +1290,19 @@
                                     <label>Components exposed to <code>/logs</code></label>
                                     <div id="log-flags"></div>
                                 </div>
+                                <div class="form-group">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="log-stealth-toggle">
+                                        <span>Hide the endpoint from unauthenticated callers</span>
+                                    </label>
+                                    <p class="text-secondary text-sm" style="margin-top:.25rem;">
+                                        When on, an unauthenticated or invalid request to
+                                        <code>/logs</code> returns <code>404</code> instead of
+                                        <code>401</code>, so the endpoint is undetectable without a
+                                        valid token. Leave off if a monitoring system needs the
+                                        standard &ldquo;unauthorized&rdquo; response.
+                                    </p>
+                                </div>
                             </div>
                         </div>
                         <div class="card">

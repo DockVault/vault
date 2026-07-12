@@ -17,8 +17,42 @@ KNOWN_COMPONENTS = ("web", "sftp", "db-diag", "redis-diag")
 SERVEABLE_COMPONENTS = ("web", "sftp")
 
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
-_BEARER_RE = re.compile(r"(?i)(authorization:\s*bearer\s+)\S+")
-_KV_SECRET_RE = re.compile(r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key)\s*[=:]\s*\S+")
+_BEARER_RE = re.compile(r"(?i)(authorization\s*:\s*bearer\s+)\S+")
+
+# A credential keyword. Prefix-tolerant (temp_password, admin_password, DB_PASSWORD — the prefix
+# sits BEFORE the match and is left untouched) and suffix-tolerant (SECRET_KEY, api_key_id,
+# password_field — a bounded `[\w.\-]{0,40}` run after the keyword) and style-tolerant (kv
+# `password=x`, JSON `"password": "x"`, YAML `password: x`). Deliberately broad and
+# fail-toward-redaction: over-scrubbing a non-secret ("token: expired") is acceptable; leaking a
+# password is not. Bearer/JWT tokens are handled by their own passes.
+#
+# The pattern is ANCHORED on the keyword literal (no leading variable-length `[\w.\-]*` prefix)
+# so the regex engine scans start positions in O(n): a non-keyword char fails the first token
+# immediately, and the only backtracking is the bounded {0,40} suffix. (An earlier `[\w.\-]*`
+# prefix was O(n^2) on a long separator-free line — an event-loop-blocking ReDoS.)
+_CRED_KEY = (
+    r"passwords?|passwd|pwd|passphrase|secrets?|api[-_]?keys?|apikey|"
+    r"access[-_]?keys?|access[-_]?tokens?|auth[-_]?tokens?|refresh[-_]?tokens?|"
+    r"client[-_]?secrets?|private[-_]?keys?|signing[-_]?keys?|session[-_]?keys?|"
+    r"encryption[-_]?keys?|master[-_]?keys?|credentials?|tokens?"
+)
+# group(1) = keyword + bounded suffix + optional quote + separator; group(2) = the value.
+# Only the value is replaced, so the key stays readable in the log. The value class excludes only
+# whitespace and quotes (a JSON value ends at its closing quote) — NOT `& ; , }`, so a secret
+# CONTAINING those does not leak its tail (over-redacts the rest of a token instead).
+_CRED_RE = re.compile(
+    r"(?i)((?:" + _CRED_KEY + r")[\w.\-]{0,40}[\"']?\s*[:=]\s*)[\"']?([^\s\"']+)"
+)
+# A password embedded in a connection string / URL: scheme://user:PASSWORD@host (the user part
+# is optional so redis://:pass@host is caught too). The password class stops only at `@`/space, so
+# a `/` inside the password does not break the match. Keeps the user and host, scrubs the secret.
+# The password run is BOUNDED to {1,256}: an unbounded `[^@\s]+` overlaps the `://…:` structural
+# chars, so a line with many `://X:` tokens and no `@` scans O(n) from each of O(n) starts — O(n^2)
+# (a ~7s/line event-loop-blocking ReDoS even under the truncation cap). The bound makes it O(n).
+_CONN_RE = re.compile(r"(?i)(://[^:/@\s]*:)([^@\s]{1,256})(@)")
+# Bound the (str/regex) work per line: a pathological single line is truncated. Truncation only
+# DROPS trailing content, so it can never reveal more of a secret than was already there.
+_MAX_REDACT_LINE = 65536
 _REDACTED = "«redacted»"
 
 
@@ -97,19 +131,31 @@ def redact_log_text(text, secret_values):
     """Best-effort scrub of KNOWN secrets and secret-shaped tokens from a log body before it is
     served. Phase 1 has ONE consumer — the tenant/self-hoster who owns this vault — so their own
     SFTP filenames pass; the job here is to stop SECRET leakage (signing keys, DB creds, bearer
-    tokens, JWTs), NOT tenant PII. Phase 2 adds an 'untrusted' profile that also blanks paths.
+    tokens, JWTs, and ANY credential/password), NOT tenant PII. Phase 2 adds an 'untrusted'
+    profile that also blanks paths.
 
+    A password reaching a log consumer is unacceptable regardless of where this vault is deployed,
+    so credential redaction is deliberately broad and fails toward redaction:
     - Exact replace of each provided secret with len >= 8 (the guard stops an empty secret from
       inserting the placeholder between every character via str.replace('', ...)).
-    - Regex passes for `Authorization: Bearer <x>`, `password=/token=/secret=/api_key=<x>`, and
-      JWT-shaped tokens (incl. the pull token itself if it ever echoes back — feedback-leak guard).
+    - `Authorization: Bearer <x>`.
+    - Any credential key/value: `password=`, `temp_password=`, `"password": "x"`, `passphrase:`,
+      `secret=`, `api_key=`, `client_secret=`, `private_key=`, `token=`, ... (prefix- and
+      quote-style-tolerant; the value is scrubbed, the key stays readable).
+    - Passwords embedded in connection strings / URLs: `scheme://user:PASSWORD@host`.
+    - JWT-shaped tokens (incl. the pull token itself if it ever echoes back — feedback-leak guard).
     """
     if not text:
         return text
+    # Exact-scrub known secret VALUES on the FULL line first (linear str.replace) so the truncation
+    # boundary below can never split a known secret and leak its head.
     for s in (secret_values or []):
         if isinstance(s, str) and len(s) >= 8:
             text = text.replace(s, _REDACTED)
+    if len(text) > _MAX_REDACT_LINE:
+        text = text[:_MAX_REDACT_LINE] + " …[truncated]"
     text = _BEARER_RE.sub(lambda m: m.group(1) + _REDACTED, text)
-    text = _KV_SECRET_RE.sub(lambda m: m.group(1) + "=" + _REDACTED, text)
+    text = _CRED_RE.sub(lambda m: m.group(1) + _REDACTED, text)
+    text = _CONN_RE.sub(lambda m: m.group(1) + _REDACTED + m.group(3), text)
     text = _JWT_RE.sub("«redacted-jwt»", text)
     return text

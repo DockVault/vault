@@ -3576,6 +3576,8 @@ function setupLogAccess() {
     if (gen) gen.addEventListener('click', () => toggleLogTokenGenerate(true));
     if (create) create.addEventListener('click', generateLogToken);
     if (cancel) cancel.addEventListener('click', () => toggleLogTokenGenerate(false));
+    const stealth = document.getElementById('log-stealth-toggle');
+    if (stealth) stealth.addEventListener('change', () => saveLogStealth(stealth.checked));
 }
 
 async function loadLogSettings() {
@@ -3597,6 +3599,8 @@ async function loadLogSettings() {
         }
     }
     renderLogFlags(data);
+    const stealth = document.getElementById('log-stealth-toggle');
+    if (stealth) stealth.checked = !!data.stealth_404;
     renderLogTokens(data.tokens || []);
 }
 
@@ -3636,6 +3640,17 @@ async function saveLogFlag(component, enabled) {
     } catch (e) {
         showError('Could not update log access');
         loadLogSettings();  // resync the checkbox to the server truth
+    }
+}
+
+async function saveLogStealth(enabled) {
+    try {
+        const res = await apiRequest('/settings/logs', { method: 'PUT', body: JSON.stringify({ stealth_404: enabled }) });
+        if (res && window._logSettings) { window._logSettings.stealth_404 = !!res.stealth_404; }
+        showSuccess(enabled ? 'Endpoint hidden from unauthenticated callers' : 'Endpoint returns the standard 401');
+    } catch (e) {
+        showError('Could not update log visibility');
+        loadLogSettings();  // resync the toggle to the server truth
     }
 }
 
