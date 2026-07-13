@@ -92,6 +92,59 @@ def test_production_allows_blank_admin_password_post_bootstrap():
     assert proc.returncode == 0, "blank admin password must not fail startup (post-bootstrap)"
 
 
+def test_development_rejects_env_example_placeholder():
+    # The shipped .env.example placeholder is a publicly known credential and must be refused in
+    # EVERY environment — a bare `docker compose up` ships ENVIRONMENT=development and previously
+    # seeded admin/REPLACE_ME on a plaintext listener.
+    proc = _import_config({"ENVIRONMENT": "development", "ADMIN_PASSWORD": "REPLACE_ME"})
+    assert proc.returncode == 1, f"shipped placeholder must fail-closed even in development\n{proc.stdout}\n{proc.stderr}"
+
+
+def test_production_rejects_short_admin_password():
+    # A weak-but-unlisted value below the 12-char floor must not boot a reachable (production) deploy.
+    proc = _import_config({"ENVIRONMENT": "production", "ADMIN_PASSWORD": "weakpass"})
+    assert proc.returncode == 1, f"a <12-char admin password should fail-closed in production\n{proc.stdout}\n{proc.stderr}"
+
+
+def test_nonstandard_env_rejects_weak_admin_password():
+    # Fail-safe: any non-development environment ("staging", "prod", a typo) is treated as reachable
+    # and gets the strict blocklist + length tier — not only the literal "production".
+    proc = _import_config({"ENVIRONMENT": "staging", "ADMIN_PASSWORD": "password"})
+    assert proc.returncode == 1, f"a weak password must fail-closed in any non-development env\n{proc.stdout}\n{proc.stderr}"
+
+
+def test_development_allows_short_nonplaceholder_password():
+    # Dev convenience preserved: only the shipped placeholder is blocked in development; a short,
+    # non-placeholder value still boots (the blocklist + length floor apply outside development).
+    proc = _import_config({"ENVIRONMENT": "development", "ADMIN_PASSWORD": "devpass1"})
+    assert proc.returncode == 0, f"development must allow a short non-placeholder password\n{proc.stdout}\n{proc.stderr}"
+
+
+def test_dev_compose_publishes_loopback_only():
+    # The plaintext trial must bind to loopback so it isn't reachable off-host.
+    dc = _read("docker-compose.yml")
+    assert '- "127.0.0.1:8200:8000"' in dc, "trial API port must publish on loopback (127.0.0.1)"
+    assert '- "8200:8000"' not in dc, "trial API port must not publish on all interfaces"
+
+
+_PLAINTEXT_WARN_SELFTEST = r'''
+import api_server as a
+f = a._should_warn_plaintext_transport
+assert f(False, "production", "") is True, "plaintext + production + no proxy should warn"
+assert f(False, "staging", "") is True, "plaintext + any non-dev + no proxy should warn"
+assert f(False, "development", "") is False, "development suppresses the warning"
+assert f(True, "production", "") is False, "in-process HTTPS does not warn"
+assert f(False, "production", "10.0.0.0/8") is False, "a configured trusted proxy suppresses the warning"
+print("PLAINTEXT_WARN_OK")
+'''
+
+
+def test_plaintext_transport_warning_condition():
+    # Locks the net-new startup-warning logic (plaintext AND non-development AND no trusted proxy).
+    proc = _in_container(args=["python", "-"], stdin=_PLAINTEXT_WARN_SELFTEST)
+    assert "PLAINTEXT_WARN_OK" in proc.stdout, f"{proc.stdout}\n{proc.stderr}"
+
+
 _SCHEME_SELFTEST = r'''
 import api_server, net_utils
 sc = api_server._external_scheme

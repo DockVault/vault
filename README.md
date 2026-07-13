@@ -45,10 +45,13 @@ account. No license key, no activation.
 
 ### Local trial (HTTP, no TLS)
 
-For a quick test on your machine without certificates:
+For a quick test on your own machine without certificates. This binds to **loopback only**
+(`127.0.0.1:8200`) because it serves the product over plaintext HTTP — don't expose it to a network;
+use the HTTPS quick start above for anything reachable.
 
 ```bash
-cp .env.example .env      # fill in the secrets
+cp .env.example .env      # then edit it: set ENCRYPTION_KEY, JWT_SECRET_KEY, VAULT_DB_PASSWORD, and
+                          # a strong ADMIN_PASSWORD (boot is refused with the shipped placeholder)
 docker compose up -d      # web/API on http://localhost:8200
 ```
 

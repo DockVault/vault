@@ -7929,7 +7929,9 @@ def _seed_admin_user():
         from auth_service import AuthService
         from models import RoleEnum, User
 
-        if not settings.admin_password:
+        # Match the config.py guard's emptiness definition: a whitespace-only value is "blank"
+        # (the post-bootstrap no-op state), not a credential to seed.
+        if not (settings.admin_password or "").strip():
             return
         with get_db_context() as db:
             if db.query(User).filter(User.username == settings.admin_username).first():
@@ -8279,9 +8281,18 @@ if os.path.exists(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
+def _should_warn_plaintext_transport(use_https, environment, trusted_proxies):
+    """True when serving plaintext HTTP on a reachable (non-development) deploy with no TLS-terminating
+    proxy configured — the operator should enable TLS or front the app with an HTTPS proxy. A dev stack
+    (ENVIRONMENT=development, loopback) is expected to run plaintext, so this stays False there."""
+    return (not use_https
+            and (environment or "").strip().lower() != "development"
+            and not (trusted_proxies or "").strip())
+
+
 if __name__ == "__main__":
     import uvicorn
-    
+
     # Configure SSL if enabled
     ssl_config = {}
     if settings.api_use_https:
@@ -8292,7 +8303,18 @@ if __name__ == "__main__":
         print(f"🔒 HTTPS enabled")
         print(f"📁 Certificate: {settings.api_ssl_certfile}")
         print(f"🔑 Private Key: {settings.api_ssl_keyfile}")
-    
+
+    # --- Warn (do NOT brick) on a plaintext listener outside local development ---
+    # The default/trial compose binds this to loopback, but a self-rolled `docker run`, or a compose
+    # edited to publish on 0.0.0.0, could expose the plaintext API — login credentials and bearer
+    # tokens would then cross the network in cleartext. Terminate TLS in-process (API_USE_HTTPS=true
+    # + certs) or front the app with an HTTPS reverse proxy (set TRUSTED_PROXIES).
+    if _should_warn_plaintext_transport(settings.api_use_https, settings.environment, settings.trusted_proxies):
+        print("\n⚠️  WARNING: serving PLAINTEXT HTTP with ENVIRONMENT != development and no TRUSTED_PROXIES set.")
+        print("   Login credentials and bearer tokens cross the network in cleartext if this port is")
+        print("   reachable off-host. Enable TLS (API_USE_HTTPS=true) or front the app with an HTTPS")
+        print("   reverse proxy (docker-compose.secure.yml / setup-secure.sh do this for you).")
+
     uvicorn.run(
         app,
         host=settings.api_host,

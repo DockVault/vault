@@ -270,23 +270,46 @@ if len(_jwt_secret) < 32 or _jwt_secret.lower() in _JWT_SECRET_PLACEHOLDERS:
     sys.exit(1)
 
 
-# --- Fail closed on a shipped sample / weak admin bootstrap password IN PRODUCTION ---
+# --- Fail closed on a shipped sample / weak admin bootstrap password ---
 # The first admin is seeded from ADMIN_PASSWORD; unlike the crypto-key placeholders (an invalid
-# ENCRYPTION_KEY fails fast), the shipped sample admin password is a WORKING credential. Refuse a
-# KNOWN sample/weak value when ENVIRONMENT=production so a self-hoster who copies .env.example
-# verbatim can't boot with a publicly known admin login. A BLANK ADMIN_PASSWORD is deliberately NOT
-# rejected — it is the legitimate post-bootstrap state (the admin exists; the seed is a no-op). Dev
-# stacks (ENVIRONMENT=development) are unaffected; setup-secure.sh / the SaaS provisioner inject a
-# strong password, so they pass.
+# ENCRYPTION_KEY fails fast), the shipped sample admin password is a WORKING credential. A BLANK
+# ADMIN_PASSWORD is deliberately NOT rejected — it is the legitimate post-bootstrap state (the admin
+# exists; the seed is a no-op).
+#
+# Two tiers, so a PUBLICLY KNOWN credential can never seed an admin while a local dev stack stays
+# convenient:
+#   * ALWAYS (every environment): refuse the exact shipped .env.example placeholder. A bare
+#     `docker compose up` that copies .env.example verbatim would otherwise seed admin/REPLACE_ME —
+#     a credential published in this public repo — even in development on a plaintext listener. The
+#     sibling JWT-secret guard above is likewise unconditional.
+#   * ANY REACHABLE (non-"development") deploy additionally: reject the full known-weak blocklist AND
+#     enforce a minimum length, mirroring the JWT guard, so a weak-but-unlisted value (e.g.
+#     "vault2024", "Password1") can't boot the account that reads every non-ZK vault server-side.
+#     Fail SAFE: only an explicit ENVIRONMENT=development is lenient — "production" (the default),
+#     "staging", "prod", or a typo all get the strict tier, matching the plaintext-transport warning.
+# setup-secure.sh forces production, so it passes both tiers. The SaaS control plane runs its vault
+# containers in development (their admin password is generated + length-validated upstream before
+# provisioning), so only the always-on placeholder check applies to them.
+_ADMIN_PASSWORD_SHIPPED_PLACEHOLDERS = {"replace_me"}
 _ADMIN_PASSWORD_PLACEHOLDERS = {
     "replace_me", "change_this_secure_password", "changeme", "change_me", "change_this",
     "changethis", "password", "admin", "admin123", "your_admin_password", "your_password_here",
 }
-if (settings.environment or "").strip().lower() == "production":
-    _admin_pw = (settings.admin_password or "").strip()
-    if _admin_pw and _admin_pw.lower() in _ADMIN_PASSWORD_PLACEHOLDERS:
-        print("\n❌ FATAL: ADMIN_PASSWORD is a known sample/weak value while ENVIRONMENT=production.")
-        print("   The first admin would be created with a publicly known credential.")
+_ADMIN_PASSWORD_MIN_LENGTH = 12
+_admin_pw = (settings.admin_password or "").strip()
+if _admin_pw:
+    _admin_pw_lower = _admin_pw.lower()
+    _admin_pw_strict = (settings.environment or "").strip().lower() != "development"
+    _admin_pw_reject = None
+    if _admin_pw_lower in _ADMIN_PASSWORD_SHIPPED_PLACEHOLDERS:
+        _admin_pw_reject = "is the shipped .env.example placeholder (a publicly known value)"
+    elif _admin_pw_strict and _admin_pw_lower in _ADMIN_PASSWORD_PLACEHOLDERS:
+        _admin_pw_reject = "is a known sample/weak value outside ENVIRONMENT=development"
+    elif _admin_pw_strict and len(_admin_pw) < _ADMIN_PASSWORD_MIN_LENGTH:
+        _admin_pw_reject = f"is shorter than {_ADMIN_PASSWORD_MIN_LENGTH} characters outside ENVIRONMENT=development"
+    if _admin_pw_reject:
+        print(f"\n❌ FATAL: ADMIN_PASSWORD {_admin_pw_reject}.")
+        print("   The first admin would be created with a weak or publicly known credential.")
         print("   Set a strong ADMIN_PASSWORD:  openssl rand -base64 18")
         sys.exit(1)
 
