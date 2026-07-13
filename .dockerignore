@@ -13,6 +13,16 @@ logs/
 uploads/
 temp/
 tmp/
+# Stray keys/certs/DBs/logs dropped at the build-context root (defense-in-depth:
+# the certs/ and keys/ dirs above are already excluded; these catch a loose file
+# a working checkout might contain, since the Dockerfile does `COPY . .`).
+*.pem
+*.key
+*.crt
+*.cert
+*.db
+*.sqlite3
+*.log
 
 # Build hygiene (never needed inside the image)
 tests/
@@ -27,8 +37,23 @@ node_modules/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+# Local virtualenvs (routinely created to run tests/) + dev/build/IDE artifacts
+.venv/
+venv/
+env/
+ENV/
+.coverage
+htmlcov/
+dist/
+build/
+.vscode/
+.idea/
 *.backup
 *.bak
+*.old
+*.swp
+*.swo
+*~
 setup_state.json
 setup.lock
 docker-compose*.yml

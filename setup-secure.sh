@@ -243,7 +243,7 @@ command -v openssl >/dev/null 2>&1 || die "openssl not found"
 command -v docker  >/dev/null 2>&1 || die "docker not found (install: curl -fsSL https://get.docker.com | sh)"
 docker compose version >/dev/null 2>&1 || die "the 'docker compose' plugin is not available"
 docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon (is it running? are you on the right 'docker context'?)"
-[ -f "$COMPOSE_FILE" ] || die "$COMPOSE_FILE not found — run this script from 'worker/vault service container/'"
+[ -f "$COMPOSE_FILE" ] || die "$COMPOSE_FILE not found — run this script from the repository root (where $COMPOSE_FILE lives)"
 
 HAVE_ENV=0
 [ -f .env ] && HAVE_ENV=1

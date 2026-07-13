@@ -2,8 +2,8 @@
 Shared pytest fixtures for the DockVault vault-service integration suite.
 
 These tests run on the HOST and exercise the live container at
-http://localhost:8200 (bring it up with `scripts/up.ps1` or the vault
-docker-compose). Nothing here imports the application code — everything goes
+http://localhost:8200 (bring it up with `docker compose up -d`). Nothing here
+imports the application code — everything goes
 over HTTP, so the suite tests the real, deployed surface.
 
 Config (all optional, sensible defaults):
@@ -313,7 +313,7 @@ def _require_running_container():
     except Exception as exc:  # noqa: BLE001
         pytest.skip(
             f"Vault container not reachable at {BASE_URL} ({exc}). "
-            f"Bring it up with scripts/up.ps1 first.",
+            f"Bring it up with 'docker compose up -d' first.",
             allow_module_level=True,
         )
     if health.get("database") != "connected":

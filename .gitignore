@@ -69,17 +69,3 @@ setup.lock
 htmlcov/
 .tox/
 .hypothesis/
-
-# Database
-*.db
-*.sqlite3
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-
-# OS
-.DS_Store
-Thumbs.db

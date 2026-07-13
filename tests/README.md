@@ -24,7 +24,7 @@ imports the app — it tests the deployed surface.
 ## Setup (once)
 
 ```powershell
-cd "worker/vault service container/tests"
+cd tests   # from the repository root
 python -m venv .venv
 .venv\Scripts\pip install -r requirements-test.txt
 .venv\Scripts\playwright install chromium
@@ -32,7 +32,7 @@ python -m venv .venv
 
 ## Run
 
-Make sure the stack is up first (`scripts\up.ps1`), then:
+Make sure the stack is up first (`docker compose up -d`), then:
 
 ```powershell
 # everything
