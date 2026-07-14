@@ -40,7 +40,7 @@ VAULT_CAPS = {
     "folder.create", "folder.delete",
     "file.rename", "file.delete",
     "vault.see_permissions", "vault.change_permissions",
-    "vault.change_info", "vault.change_password", "vault.change_expiry",
+    "vault.change_info", "vault.change_password", "vault.change_expiry", "vault.rotate_key",
     "vault.delete",
 }
 # Global (non-per-vault) capabilities, stored in scope.caps. `vault.create` is the legacy,
@@ -94,6 +94,21 @@ def effective_vault_caps(user, vault_id) -> List[str]:
     return list((getattr(user, "_temp_vault_caps", {}) or {}).get(str(vault_id), []))
 
 
+def has_scoped_vault_cap(user, cap: str) -> bool:
+    """True if a SCOPED temp session holds `cap` on ANY vault it can reach (or as a global cap).
+    Returns False for non-scoped principals — use this ONLY to RESTRICT a scoped session (e.g. gate a
+    cross-vault "am I a sharer?" check), never to grant a session more than it has."""
+    if not is_scoped(user):
+        return False
+    scope = _scope(user) or {}
+    if cap in set(scope.get("caps", [])):
+        return True
+    if getattr(user, "_temp_vault_mode", "selected") == "all":
+        return cap in set(scope.get("vault_caps_default", []))
+    caps_map = getattr(user, "_temp_vault_caps", {}) or {}
+    return any(cap in set(v or []) for v in caps_map.values())
+
+
 def attach_scope(db, user, temp_cred) -> None:
     """Tag a principal (User) with its temp credential's scope context so every
     enforcement helper here can read it. Used by BOTH the auth path (web login +
@@ -127,15 +142,21 @@ def temp_session_allows_group(user, group_name: str, kwargs: dict) -> bool:
     """Decorator-level coarse gate: page access + a few global/temp caps. Per-vault
     capability and vault-membership are enforced downstream (enforce_vault /
     require_cap). Returns True for legacy (unscoped) credentials."""
-    scope = _scope(user)
-    if scope is None:
-        return True  # legacy / not a scoped temp session
-
+    # __infra__ (health/login) is always allowed; __deny__ (admin-only groups: USER_*, AUDIT_VIEW) is
+    # NEVER available to ANY temporary credential — scoped OR legacy/NULL-scope. Evaluate these BEFORE
+    # the NULL-scope early-return so a legacy "unrestricted" temp cred can't reach an admin group via
+    # @require_endpoint_permission (keeping this consistent with require_interactive_admin, which
+    # rejects every temp session). For all other groups a NULL-scope cred stays unrestricted (legacy).
     page = GROUP_PAGE.get(group_name, "__deny__")
     if page == "__infra__":
         return True
     if page == "__deny__":
         return False
+
+    scope = _scope(user)
+    if scope is None:
+        return True  # legacy / not a scoped temp session (non-deny, non-infra groups)
+
     if page not in set(scope.get("pages", [])):
         return False
 
@@ -237,11 +258,18 @@ def normalize_scope(raw: Optional[dict]) -> Optional[dict]:
     if not isinstance(raw, dict):
         return None
     temp_in = raw.get("temp", {}) if isinstance(raw.get("temp"), dict) else {}
+
+    def _as_list(v):
+        # A client can send {"pages": null} or {"caps": 5} -> without this guard the comprehensions
+        # below iterate a non-list and raise TypeError -> unhandled 500. Coerce to [] (scope only
+        # ever narrows, so dropping a malformed field is safe).
+        return v if isinstance(v, list) else []
+
     return {
         "v": 1,
-        "pages": sorted(p for p in raw.get("pages", []) if p in PAGES),
-        "caps": sorted(c for c in raw.get("caps", []) if c in GLOBAL_CAPS),
-        "vault_caps_default": sorted(c for c in raw.get("vault_caps_default", []) if c in VAULT_CAPS),
+        "pages": sorted(p for p in _as_list(raw.get("pages")) if p in PAGES),
+        "caps": sorted(c for c in _as_list(raw.get("caps")) if c in GLOBAL_CAPS),
+        "vault_caps_default": sorted(c for c in _as_list(raw.get("vault_caps_default")) if c in VAULT_CAPS),
         "temp": {k: bool(temp_in.get(k, False)) for k in TEMP_PERMS},
     }
 

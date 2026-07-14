@@ -99,12 +99,18 @@ def check_if_none_match(request: Request, current_hash: str) -> bool:
         ...     return Response(status_code=304)
     """
     if_none_match = request.headers.get('If-None-Match')
-    
-    if if_none_match:
-        # Remove quotes if present (ETags are quoted per RFC 7232)
-        if_none_match = if_none_match.strip('"')
-        return if_none_match == current_hash
-    
+    if not if_none_match:
+        return False
+    # Parse per RFC 7232 §3.2: "*" matches any current representation; otherwise it's a
+    # comma-separated list of (possibly weak, W/-prefixed) quoted ETags -- match if any equals ours.
+    if if_none_match.strip() == '*':
+        return True
+    for tag in if_none_match.split(','):
+        tag = tag.strip()
+        if tag.startswith('W/'):
+            tag = tag[2:].strip()
+        if tag.strip('"') == current_hash:
+            return True
     return False
 
 

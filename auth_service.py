@@ -275,21 +275,31 @@ class AuthService:
         ).first()
         
         if not temp_cred:
+            # Equalize timing with the real verify path so an absent temp_username isn't
+            # distinguishable by response time (temp-credential-enumeration oracle). Mirrors
+            # authenticate_user's dummy verify. verify_temporary_credential wraps verify_password.
+            verify_temporary_credential(credential, _DUMMY_PASSWORD_HASH)
             self._record_failed_login(temp_username, ip_address)
             raise InvalidCredentialsError("Invalid temporary credentials")
-        
-        # Check if credential is active
+
+        # Verify the credential FIRST, before any state branch, so a caller who does NOT present a
+        # valid credential cannot distinguish a live credential from an inactive/used/expired/
+        # deactivated one by response time (same discipline as authenticate_user). Every non-success
+        # outcome returns the same generic message; the specific reason is for internal handling only.
+        if not verify_temporary_credential(credential, temp_cred.credential_hash):
+            self._record_failed_login(temp_username, ip_address)
+            raise InvalidCredentialsError("Invalid temporary credentials")
+
+        # Credential is valid — now enforce credential state.
         if not temp_cred.is_active:
             raise InvalidCredentialsError("Temporary credential is no longer active")
-        
-        # Check if credential has been used
+
         if temp_cred.is_used:
             raise InvalidCredentialsError("Temporary credential has already been used")
-        
-        # Check if credential has expired. expires_at is read back from the DB
-        # as a naive datetime (TIMESTAMP WITHOUT TIME ZONE), while `now` is
-        # tz-aware UTC — comparing the two directly raises TypeError, so treat
-        # the stored value as UTC.
+
+        # Check if credential has expired. expires_at is read back from the DB as a naive datetime
+        # (TIMESTAMP WITHOUT TIME ZONE), while `now` is tz-aware UTC — comparing them directly raises
+        # TypeError, so treat the stored value as UTC.
         now = datetime.now(timezone.utc)
         expires_at = temp_cred.expires_at
         if expires_at.tzinfo is None:
@@ -299,12 +309,9 @@ class AuthService:
             self.db.commit()
             raise InvalidCredentialsError("Temporary credential has expired")
 
-        # A temp credential also carries a stated validity window: deactivate_at
-        # (= mint + validity) closes BEFORE the hard expiry expires_at (= mint +
-        # total_lifetime). It must stop authenticating once that window ends — an
-        # operator who mints one with validity=5m expects it dead in 5 minutes even
-        # when the hard expiry is hours out. Only expires_at was enforced before, so
-        # the advertised validity window was silently ignored. Stored naive (UTC).
+        # A temp credential also carries a stated validity window: deactivate_at (= mint + validity)
+        # closes BEFORE the hard expiry expires_at (= mint + total_lifetime). It must stop
+        # authenticating once that window ends. Stored naive (UTC).
         deactivate_at = temp_cred.deactivate_at
         if deactivate_at is not None:
             if deactivate_at.tzinfo is None:
@@ -313,11 +320,6 @@ class AuthService:
                 temp_cred.is_active = False
                 self.db.commit()
                 raise InvalidCredentialsError("Temporary credential has expired")
-
-        # Verify credential
-        if not verify_temporary_credential(credential, temp_cred.credential_hash):
-            self._record_failed_login(temp_username, ip_address)
-            raise InvalidCredentialsError("Invalid temporary credentials")
 
         # The owning account must itself be active and unlocked. Otherwise a disabled/locked
         # principal could still mint a temp session, emit a misleading login-success signal,
@@ -869,7 +871,8 @@ class AuthService:
         return {'limit': user_limit, 'remaining': max(0, user_limit - 1),
                 'reset': int(time.time()) + window}
 
-    def _db_throttle_hit(self, identifier: str, action: str, limit: int, window: int):
+    @staticmethod
+    def _db_throttle_hit(identifier: str, action: str, limit: int, window: int):
         """Count one login attempt against a fixed DB window (RateLimitRecord).
 
         Returns (allowed, retry_after_seconds). Coarser than the Redis sliding
@@ -881,8 +884,12 @@ class AuthService:
         never touch the surrounding auth transaction, and the attempt is counted
         regardless of whether that auth transaction later succeeds.
 
-        Fails OPEN to the DB account-lockout backstop on its own error so a
-        transient DB hiccup can never deny every login.
+        Fails CLOSED (deny with a SHORT retry) on its own error. This fallback
+        runs precisely when Redis is already down, so a simultaneous DB-throttle
+        failure must not silently disable login throttling (which would let one IP
+        spray across usernames unbounded). The retry is short so a transient DB
+        hiccup briefly denies and recovers, rather than blocking legitimate users
+        for the whole window; the DB account lockout remains the final backstop.
 
         Timestamps are naive UTC to match the column type (TIMESTAMP WITHOUT TIME
         ZONE) and so the window comparison happens entirely inside Postgres.
@@ -912,17 +919,22 @@ class AuthService:
             )
             with get_db_context() as db:
                 row = db.execute(stmt).first()  # get_db_context commits on exit
+            # A short deny used when the fallback can't establish the count -- long
+            # enough to bound a spray during the Redis+DB double-failure, short
+            # enough that a transient hiccup recovers quickly.
+            fail_closed_retry = max(1, min(window, 5))
             if row is None:
-                return True, 0
+                return False, fail_closed_retry
             count, win_start = row[0], row[1]
             if count > limit:
                 elapsed = (now - win_start).total_seconds() if win_start else 0
                 return False, max(1, int(window - elapsed))
             return True, 0
         except Exception:
-            # Never let the fallback's own failure lock everyone out; the DB
-            # account lockout still applies as the backstop.
-            return True, 0
+            # Fail CLOSED: with Redis already down, silently allowing here would
+            # disable login throttling entirely. Deny briefly; the DB account
+            # lockout remains the final backstop.
+            return False, max(1, min(window, 5))
     
     def _record_failed_login(
         self,

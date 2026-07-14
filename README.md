@@ -23,17 +23,34 @@ Licensed under **AGPL-3.0** — self-host it freely.
 
 ## Quick start — production (HTTPS)
 
-On a Linux host with Docker, one script sets up everything for production:
+DockVault is meant to run in **production**: HTTPS with a real (or self-signed) TLS certificate,
+`ENVIRONMENT=production`, and Postgres/Redis kept off the host network. One script does the whole
+setup — it writes `.env` with freshly generated secrets, provisions the TLS certificate, and starts
+the HTTPS-only stack (web UI/API on port **443**, TLS terminated in-container, no plaintext
+listener; optional SFTP).
+
+**Linux** — interactive; collects your domain and TLS choice (Let's Encrypt, self-signed, or
+bring-your-own certificate):
 
 ```bash
 sudo ./setup-secure.sh
 ```
 
-It is interactive and idempotent: it collects your domain and TLS choice (Let's Encrypt,
-self-signed, or bring-your-own certificate), writes `.env` with freshly generated secrets,
-provisions the certificates, and starts the HTTPS-only stack — the web UI/API on port **443**
-(TLS terminated in-container, no plaintext listener) plus optional SFTP. Re-run it any time to
-rebuild; it **reuses your existing `.env`** and keeps your data.
+**Windows** (Docker Desktop) — self-signed by default, or point it at your own certificate:
+
+```powershell
+./setup-secure.ps1 -ServerName vault.example.com
+# ...or bring your own certificate (recommended for anything public):
+./setup-secure.ps1 -ServerName vault.example.com -CertMode byo -CertPath fullchain.pem -KeyPath privkey.pem
+```
+
+Both are idempotent — re-run any time to rebuild; they **reuse your existing `.env`** and keep your
+data. Both start `docker-compose.secure.yml`, which you can also run directly once `./.env` and
+`./certs/{cert.pem,key.pem}` exist:
+
+```bash
+docker compose -f docker-compose.secure.yml up -d --build
+```
 
 Then open `https://<your-domain>` and complete the first-run setup wizard to create your admin
 account. No license key, no activation.
@@ -43,12 +60,15 @@ account. No license key, no activation.
 > `docker compose -f docker-compose.secure.yml down -v` then re-run the script. This destroys
 > stored data, so only do it before you have real vaults.
 
-### Local trial (HTTP, no TLS)
+### Local trial only (HTTP, no TLS) — not for real use
 
-For a quick test on your machine without certificates:
+A throwaway way to click around on your own machine. It serves the product over **plaintext HTTP**
+bound to **loopback only** (`127.0.0.1:8200`) and runs in development mode, so it is **not a
+supported way to hold real data** — use the production setup above for anything reachable or real.
 
 ```bash
-cp .env.example .env      # fill in the secrets
+cp .env.example .env      # then edit it: set ENCRYPTION_KEY, JWT_SECRET_KEY, VAULT_DB_PASSWORD, and
+                          # a strong ADMIN_PASSWORD (boot is refused with the shipped placeholder)
 docker compose up -d      # web/API on http://localhost:8200
 ```
 
@@ -64,10 +84,27 @@ docker compose up -d      # web/API on http://localhost:8200
   new privileges; login throttling and account lockout are built in.
 - **Secrets:** all keys and passwords come from `.env`. Use fresh encryption/JWT keys per deployment.
 
+## Production checklist
+
+If you front the vault yourself (your own reverse proxy, k8s, `docker run`) rather than using
+`setup-secure.sh`, confirm all of these — `setup-secure.sh` handles or prompts you for most of them, but a
+README-only reader can miss them (the off-host key backup is always yours to do):
+
+- **Back up `ENCRYPTION_KEY` off the host** (e.g. a password manager). Without it, every stored file — and any
+  backup of the storage volume — is **permanently unrecoverable**.
+- **Change the seeded admin password.** Boot is refused with the shipped placeholder, but pick a strong one.
+- **Terminate TLS** in front of the app (or run it with `API_USE_HTTPS=true` + certs). Never expose plaintext.
+- **Restrict network exposure:** publish only the web/API (and SFTP if used) ports; keep Postgres/Redis on the
+  internal network. Set `REDIS_PASSWORD` and `ALLOWED_HOSTS` for defense-in-depth.
+- **Use fresh `ENCRYPTION_KEY` / `JWT_SECRET_KEY` per deployment.** You can rotate `JWT_SECRET_KEY` (it just
+  forces re-login) and passwords on a schedule, but **NEVER rotate `ENCRYPTION_KEY` on a vault that already
+  holds data** — it makes every stored file permanently undecryptable.
+
 ## Configuration
 
 Every setting lives in `.env`. Copy `.env.example`, which documents each key — database,
-Redis, encryption/JWT secrets, SFTP, rate limits, SMTP, and more.
+Redis, encryption/JWT secrets, SFTP, rate limits, and more. (Email/SMTP is configured in the
+admin UI → Settings, not in `.env`.)
 
 ## License
 

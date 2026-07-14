@@ -153,6 +153,16 @@ def test_rotate_key_and_history(admin, temp_vault):
     assert "current_key_version" in r.json()
 
 
+def test_rotate_key_rejected_for_password_vault(admin, temp_vault_pw):
+    # A password-protected vault's DEK is password-wrapped; server-side rotate-key can't re-wrap it with
+    # the password, so it must be rejected rather than write an inconsistent master-key-wrapped row.
+    # (File content is keyed off the deployment secret, not the wrapped DEK, so access is unaffected.)
+    vid = temp_vault_pw["id"]
+    r = admin.post(f"/vaults/{vid}/rotate-key")
+    assert r.status_code == 400, r.text
+    assert "password-protected" in r.json()["detail"].lower()
+
+
 def test_delete_vault(admin):
     vault = admin.create_vault()
     r = admin.post(f"/vaults/{vault['id']}/delete")

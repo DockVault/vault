@@ -177,6 +177,50 @@ put_cert() { # put_cert <src-cert(fullchain).pem> <src-key.pem>
   apply_cert_owner
 }
 
+# Pick a LOCALLY-PRESENT image (with /bin/sh + /bin/cat) for the cert-permission helper below. We do
+# NOT pull (air-gap friendly); prints nothing + returns non-zero if none is present, so the caller
+# keeps the world-readable fallback.
+_local_helper_image() {
+  local _i
+  for _i in dockvault-vault:latest busybox alpine postgres:15-alpine redis:7-alpine; do
+    docker image inspect "$_i" >/dev/null 2>&1 && { printf '%s' "$_i"; return 0; }
+  done
+  return 1
+}
+
+# Best-effort: the HOST uid that the container's APP_UID maps to under a userns-REMAP engine, resolved
+# from /etc/subuid. A container CANNOT chown a host-root-owned bind-mounted file (it shows as `nobody`
+# inside the userns), so the chown must be done here by host root — which needs the mapped uid. Only the
+# userns-remap case is resolvable from the host (rootless needs the daemon-user's subuid + a different
+# offset and is deliberately left to the world-readable fallback). Prints the uid, or nothing on failure.
+_remapped_key_owner() {
+  docker info --format '{{join .SecurityOptions ","}}' 2>/dev/null | grep -q 'name=userns' || return 1
+  local _u=dockremap _base _v
+  if [ -r /etc/docker/daemon.json ]; then
+    _v="$(sed -nE 's/.*"userns-remap"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' /etc/docker/daemon.json 2>/dev/null | head -n1)"
+    case "$_v" in ""|default) _u=dockremap ;; *:*) _u="${_v%%:*}" ;; *) _u="$_v" ;; esac
+  fi
+  _base="$(awk -F: -v u="$_u" '$1==u{print $2; exit}' /etc/subuid 2>/dev/null)"
+  case "$_base" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_base" -ge 1000 ] || return 1     # sanity: a subuid base is never a low/system uid
+  printf '%s' "$(( _base + APP_UID ))"
+}
+
+# On a userns-remap engine, chown the certs (as host root) to the container's MAPPED host uid + keep the
+# key at mode 600 (dir 700), then VERIFY — by running a container as APP_UID that cat's the key — that the
+# vault process can actually read it. Returns 0 ONLY if that is proven; every failure path (unresolvable
+# mapping, rootless, chown fails, no local image to verify, verify fails) returns non-zero, so the caller
+# falls back to the world-readable key and TLS can never break. $1 = absolute certs dir.
+_tighten_certs_for_remapped_engine() {
+  local _cd="$1" _muid _img
+  _muid="$(_remapped_key_owner)" || return 1
+  chown "$_muid:$_muid" "$_cd" "$_cd/key.pem" "$_cd/cert.pem" 2>/dev/null || return 1
+  chmod 700 "$_cd" && chmod 600 "$_cd/key.pem" && chmod 644 "$_cd/cert.pem" || return 1
+  _img="$(_local_helper_image)" || return 1   # require verification; don't trust an unproven mapping
+  docker run --rm -u "$APP_UID" --entrypoint /bin/cat -v "$_cd:/c:ro" "$_img" /c/key.pem >/dev/null 2>&1 || return 1
+  return 0
+}
+
 # Give the cert dir + files to uid 10001 (numeric), else fall back to
 # world-readable so the container can read them regardless. Idempotent, so a
 # re-run also REPAIRS certs left root-owned by an older/failed install.
@@ -185,15 +229,20 @@ apply_cert_owner() {
   chmod 644 "$CERT_DIR/cert.pem" 2>/dev/null || true
   chmod 600 "$CERT_DIR/key.pem"  2>/dev/null || true
   if _remapped_engine; then
-    # Rootless / userns-remapped engine: the container's appuser is a REMAPPED
-    # subordinate uid, not host uid 10001, so a host-10001-owned mode-600 key would
-    # be unreadable in the container and TLS would silently not start. chown-to-10001
-    # "succeeds" here yet leaves the key unreadable, so we must NOT take that path —
-    # deliberately widen the key to world-readable (single-tenant host) instead.
-    chmod 755 "$CERT_DIR"
-    chmod 644 "$CERT_DIR/key.pem"
-    warn "rootless/userns-remapped Docker detected: set $CERT_DIR/key.pem world-readable (644)"
-    warn "so the container's remapped uid can read it (host assumed single-tenant)."
+    # Rootless / userns-remapped engine: the container's appuser is a REMAPPED subordinate uid, not
+    # host uid 10001, so chowning to HOST 10001 leaves the key unreadable in the container. Prefer to
+    # have a container chown the key to APP_UID (engine-translated to the right host uid) and KEEP mode
+    # 600, verified readable; only if that can't be proven do we widen the key to world-readable.
+    if _tighten_certs_for_remapped_engine "$APP_DIR/$CERT_DIR"; then
+      say "  certs owned by the container's mapped uid (key mode 600, NOT world-readable)"
+    else
+      chmod 755 "$CERT_DIR"
+      chmod 644 "$CERT_DIR/key.pem"
+      warn "rootless/userns Docker: could not tighten the TLS key to the container's mapped uid (no local"
+      warn "helper image yet, or the engine refused), so $CERT_DIR/key.pem is world-readable (644). Host"
+      warn "assumed SINGLE-TENANT; on a shared host restrict $CERT_DIR (dedicated user + ACLs) or use"
+      warn "rootful Docker. Re-run 'sudo ./setup-secure.sh --certs-only' once the stack is up to retry."
+    fi
   elif chown "$APP_UID:$APP_UID" "$CERT_DIR" "$CERT_DIR/cert.pem" "$CERT_DIR/key.pem" 2>/dev/null \
        && [ "$(stat -c '%u' "$CERT_DIR/key.pem" 2>/dev/null || echo x)" = "$APP_UID" ]; then
     say "  certs owned by uid $APP_UID (key mode 600)"
@@ -243,7 +292,7 @@ command -v openssl >/dev/null 2>&1 || die "openssl not found"
 command -v docker  >/dev/null 2>&1 || die "docker not found (install: curl -fsSL https://get.docker.com | sh)"
 docker compose version >/dev/null 2>&1 || die "the 'docker compose' plugin is not available"
 docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon (is it running? are you on the right 'docker context'?)"
-[ -f "$COMPOSE_FILE" ] || die "$COMPOSE_FILE not found — run this script from 'worker/vault service container/'"
+[ -f "$COMPOSE_FILE" ] || die "$COMPOSE_FILE not found — run this script from the repository root (where $COMPOSE_FILE lives)"
 
 HAVE_ENV=0
 [ -f .env ] && HAVE_ENV=1
@@ -350,15 +399,15 @@ set -e
 CD="$APP_DIR/$CERT_DIR"
 install -m 644 "/etc/letsencrypt/live/$SERVER_NAME/fullchain.pem" "\$CD/.new-cert.pem"
 install -m 600 "/etc/letsencrypt/live/$SERVER_NAME/privkey.pem"   "\$CD/.new-key.pem"
-if docker info --format '{{join .SecurityOptions ","}}' 2>/dev/null | grep -Eq 'rootless|name=userns'; then
-  chmod 644 "\$CD/.new-key.pem"   # remapped engine: container uid can't read a host-$APP_UID 600 key
-  logger -t dockvault-vault "renewed TLS key set world-readable (remapped Docker engine)" 2>/dev/null || true
-else
-  chown $APP_UID:$APP_UID "\$CD/.new-cert.pem" "\$CD/.new-key.pem" 2>/dev/null || {
-    chmod 644 "\$CD/.new-key.pem"   # fall back to world-readable (single-tenant host)
-    logger -t dockvault-vault "renewed TLS key set world-readable (chown to $APP_UID failed)" 2>/dev/null || true
-  }
-fi
+# Preserve whatever ownership + mode apply_cert_owner already established on the LIVE key onto the
+# renewed key, so a renewal keeps the tightened (mode 600, mapped-uid-owned) OR the world-readable
+# fallback state without re-resolving the userns mapping here. cert.pem is public -> always 644.
+_own="\$(stat -c '%u:%g' "\$CD/key.pem" 2>/dev/null || echo 0:0)"
+_mode="\$(stat -c '%a' "\$CD/key.pem" 2>/dev/null || echo 644)"
+chown "\$_own" "\$CD/.new-key.pem" "\$CD/.new-cert.pem" 2>/dev/null || true
+chmod "\$_mode" "\$CD/.new-key.pem" 2>/dev/null || chmod 644 "\$CD/.new-key.pem"
+chmod 644 "\$CD/.new-cert.pem"
+logger -t dockvault-vault "renewed TLS key perms mirrored from live key (mode \$_mode)" 2>/dev/null || true
 [ "\$(openssl x509 -in "\$CD/.new-cert.pem" -pubkey -noout)" = "\$(openssl pkey -in "\$CD/.new-key.pem" -pubout)" ]
 mv "\$CD/.new-key.pem"  "\$CD/key.pem"
 mv "\$CD/.new-cert.pem" "\$CD/cert.pem"
@@ -463,6 +512,7 @@ else
   ENCRYPTION_KEY="$(gen_fernet_key)"
   JWT_SECRET_KEY="$(openssl rand -hex 32)"
   VAULT_DB_PASSWORD="$(openssl rand -hex 16)"
+  REDIS_PASSWORD="$(openssl rand -hex 24)"
 
   umask 077
   {
@@ -477,6 +527,12 @@ else
     printf '%s\n' "ADMIN_USERNAME='$ADMIN_USERNAME'"
     printf '%s\n' "ADMIN_EMAIL='$ADMIN_EMAIL'"
     printf '%s\n' "ADMIN_PASSWORD='$ADMIN_PASSWORD'"
+    printf '%s\n' "# Redis AUTH on the login-throttle / lockout / session-hash store. Redis is on the"
+    printf '%s\n' "# internal network only, but this is defense-in-depth against a co-tenant on the bridge."
+    printf '%s\n' "REDIS_PASSWORD='$REDIS_PASSWORD'"
+    printf '%s\n' "# Reject requests carrying an unexpected Host header (defense-in-depth if you later"
+    printf '%s\n' "# front the vault with a shared reverse proxy / CDN)."
+    printf '%s\n' "ALLOWED_HOSTS='$SERVER_NAME'"
     printf '%s\n' "# Remembered so a re-run / --certs-only can regenerate certs without asking."
     printf '%s\n' "# (The app ignores these — pydantic Settings uses extra='ignore'.)"
     printf '%s\n' "SERVER_NAME='$SERVER_NAME'"
@@ -514,6 +570,16 @@ if [ "$NO_CACHE" -eq 1 ]; then
   docker compose -f "$COMPOSE_FILE" up -d --force-recreate --remove-orphans
 else
   docker compose -f "$COMPOSE_FILE" up -d --build --force-recreate --remove-orphans
+fi
+
+# The tighten-to-mode-600 TLS-key helper in apply_cert_owner needs a local image to VERIFY the key is
+# readable, and the first pass above ran BEFORE this build — so on a remapped engine it fell back to
+# world-readable. Now that the image exists, re-apply (idempotent; transparent to the running container,
+# whose key content is unchanged) so a fresh install lands the mode-600 key in a single pass.
+if [ "$HAVE_CERTS" -eq 0 ] && _remapped_engine; then
+  say ""
+  say "Re-applying certificate ownership now the image is built (tightening the TLS key perms) ..."
+  apply_cert_owner
 fi
 
 say ""

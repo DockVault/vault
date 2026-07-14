@@ -14,7 +14,6 @@ from sqlalchemy import func, desc, select
 
 from database import get_db
 from models import User, Vault, vault_members, TemporaryCredential, AuditLog, ActiveSession, RoleEnum
-from security import verify_access_token
 from response_hash_utils import handle_conditional_response
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -29,68 +28,26 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security_scheme),
     db: Session = Depends(get_db)
 ) -> User:
-    """
-    Dependency to get current authenticated user from JWT token.
-    """
-    token = credentials.credentials
-    
-    payload = verify_access_token(token)
-    if not payload:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload"
-        )
+    """Dependency to get the current authenticated user for the /api/dashboard plane.
 
-    # Revocation parity with the main auth dependency: reject a token with no
-    # session_token (unrevocable), a denylisted (logged-out) token, and a durably-revoked
-    # session — so a logged-out / forged token can't read dashboard aggregates.
-    session_token = payload.get("session_token")
-    is_temporary = payload.get("is_temporary", False)
-    if not session_token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials"
-        )
-    from auth_service import is_token_denylisted
-    if is_token_denylisted(session_token):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session has been terminated. Please login again."
-        )
-    if not is_temporary:
-        from models import ActiveSession
-        revoked = db.query(ActiveSession.revoked).filter(
-            ActiveSession.session_token == session_token
-        ).first()
-        if revoked is not None and revoked[0]:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Session has been terminated. Please login again."
-            )
+    Delegates to the ONE hardened dependency (api_server.get_current_user) so there is a single
+    source of truth for authentication: the token denylist + durable ActiveSession.revoked check,
+    temp-session is_active/grace/lifetime validation, account_locked, and attach_scope (which sets
+    _is_temp_session — read by _is_interactive_admin below). The previous bespoke copy OMITTED the
+    temp-session lifetime + account_locked checks, so a deactivated/locked temp credential kept
+    reading the dashboard aggregates until its token expired.
 
-    # Get user from database
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found"
-        )
-    
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is disabled"
-        )
-    
-    return user
+    The import is LAZY (inside the body): api_server imports this module at load time to mount the
+    router, so a module-level import would be circular. By request time api_server is fully loaded.
+    """
+    from api_server import get_current_user as _hardened_get_current_user
+    return await _hardened_get_current_user(credentials, db)
+
+
+def _is_interactive_admin(user) -> bool:
+    """A real admin session, excluding admin-minted temporary credentials (a temp cred is a scoped
+    delegation, not a full interactive admin)."""
+    return user.role == RoleEnum.ADMIN and not getattr(user, "_is_temp_session", False)
 
 
 @router.get("/stats")
@@ -110,7 +67,7 @@ async def get_dashboard_stats(
     """
     stats = {}
     
-    if current_user.role == RoleEnum.ADMIN:
+    if _is_interactive_admin(current_user):
         # Admin sees everything
         stats["vaults"] = db.query(Vault).count()
         stats["users"] = db.query(User).filter(User.is_active == True).count()
@@ -124,8 +81,9 @@ async def get_dashboard_stats(
         total_storage = db.query(func.sum(Vault.total_size_bytes)).scalar() or 0
         stats["storage_mb"] = round(total_storage / (1024 * 1024), 2)
         
-    elif current_user.role == RoleEnum.USER:
-        # User sees their own statistics
+    elif current_user.role in (RoleEnum.USER, RoleEnum.ADMIN):
+        # A non-interactive-admin principal (a regular USER, or an admin-minted temp credential whose
+        # principal is the owning admin) sees only their OWN statistics — never deployment-wide.
         # Vaults they own
         owned_vaults = db.query(Vault).filter(Vault.owner_id == current_user.id).count()
         
@@ -201,8 +159,9 @@ async def get_recent_events(
     limit = max(1, min(limit, 100))
     query = db.query(AuditLog).order_by(desc(AuditLog.timestamp))
     
-    if current_user.role != RoleEnum.ADMIN:
-        # Non-admins only see their own events
+    if not _is_interactive_admin(current_user):
+        # Non-admins — including admin-minted temp credentials — only see their own events, never the
+        # deployment-wide audit trail.
         query = query.filter(AuditLog.user_id == current_user.id)
     
     events = query.limit(limit).all()
@@ -236,7 +195,7 @@ async def get_active_connections(
     
     Performance: Supports ETag caching for connection list.
     """
-    if current_user.role != RoleEnum.ADMIN:
+    if not _is_interactive_admin(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can view active connections"

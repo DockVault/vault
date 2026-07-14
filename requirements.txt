@@ -2,13 +2,15 @@
 # Pins align with the orchestrator's proven pydantic-v2 stack where shared.
 
 # Web framework + server
-fastapi==0.104.1
+# fastapi 0.115 / starlette >=0.40 close CVE-2024-47874 (unbounded multipart buffering -> OOM DoS on
+# the upload endpoints). starlette is pinned explicitly for reproducibility (it arrives via fastapi).
+fastapi==0.115.6
+starlette==0.41.3
 uvicorn[standard]==0.24.0
-# 0.0.7 fixes the Content-Type option-parsing ReDoS (CVE-2024-24762), which fires during body
-# parsing before an endpoint's auth check. Kept on the 0.0.x line compatible with starlette 0.27
-# (the module is still importable as `multipart`); a further bump to >=0.0.18 pairs with a
-# starlette/fastapi >=0.40 upgrade — tracked for a dedicated dependency-refresh pass.
-python-multipart==0.0.7
+# 0.0.18 closes CVE-2024-53981 (many-part malformed multipart -> CPU-exhaustion DoS) on top of the
+# earlier 0.0.7 Content-Type option-parsing ReDoS fix (CVE-2024-24762). Pairs with the fastapi/starlette
+# >=0.40 upgrade above (the module imports as `python_multipart`, which fastapi 0.115 resolves).
+python-multipart==0.0.18
 
 # Config / validation
 pydantic==2.5.2
@@ -25,15 +27,17 @@ redis==5.0.1
 paramiko==3.4.0
 
 # Security / crypto
-# Refreshed off 41.0.7 (Nov 2023) to pick up bundled-OpenSSL + Python-layer security patches;
-# underpins the Fernet at-rest crypto and TLS on a crypto product, so it should not lag.
-cryptography==43.0.1
+# 44.0.1 picks up CVE-2024-12797 (and bundled-OpenSSL patches); underpins the Fernet at-rest crypto
+# and TLS on a crypto product, so it should not lag.
+cryptography==44.0.1
 argon2-cffi==23.1.0
 bcrypt==4.1.2
-python-jose[cryptography]==3.3.0
+# JWTs are HS256 (symmetric) only. Migrated off the unmaintained python-jose (CVE-2024-33663/33664 —
+# not reachable here since decode pins a single-element algorithms allowlist and the app is JWS-only)
+# to the maintained PyJWT. config.py rejects a non-HMAC jwt_algorithm at startup, defeating any
+# alg-confusion regardless of library.
+PyJWT==2.10.1
 keyring==24.3.0
 
-# NOTE: PyJWT and requests were removed — neither has a call site in the shipped app. The JWT
-# path is python-jose (`from jose import jwt`), and the only outbound HTTP is a stdlib-urllib
-# localhost /health probe. (The test suite's own `requests` dependency lives in
-# tests/requirements-test.txt, which is not part of the image.)
+# NOTE: `requests` was removed — the only outbound HTTP is a stdlib-urllib localhost /health probe.
+# (The test suite's own `requests` dependency lives in tests/requirements-test.txt, not in the image.)

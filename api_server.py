@@ -181,6 +181,13 @@ def _external_scheme(request: StarletteRequest) -> str:
 
 
 # Comprehensive security headers middleware
+# Absolute ceiling on a single request body (defense-in-depth vs a multipart/JSON DoS, on top of the
+# starlette >=0.40 multipart-parser fix). Generous: it must exceed the largest legitimate direct upload
+# (max_file_size_mb) plus multipart overhead, so it only trips on abusive multi-GB bodies — the
+# per-endpoint upload checks still enforce the real file-size limit.
+_MAX_REQUEST_BODY_BYTES = (settings.max_file_size_mb + 256) * 1024 * 1024
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """
     Security headers middleware addressing multiple OWASP findings:
@@ -193,8 +200,23 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """
     
     async def dispatch(self, request: StarletteRequest, call_next):
+        # Defense-in-depth request-body cap on a DECLARED Content-Length. MULTIPART uploads are EXEMPT:
+        # they are metered per-file in-stream and bounded by the target vault's own size limit (and the
+        # multipart parser itself is bounded by starlette >=0.40), so an aggregate cap here would wrongly
+        # reject a legitimate multi-file batch. A missing/chunked Content-Length is metered downstream.
+        # The rejection is assigned to `response` (not returned early) so it still flows through the
+        # hardening-header code below.
+        _oversize_response = None
+        _cl = request.headers.get("content-length")
+        _ctype = request.headers.get("content-type", "").lower()
+        if _cl is not None and not _ctype.startswith("multipart/"):
+            try:
+                if int(_cl) > _MAX_REQUEST_BODY_BYTES:
+                    _oversize_response = JSONResponse(status_code=413, content={"detail": "Request body too large."})
+            except ValueError:
+                _oversize_response = JSONResponse(status_code=400, content={"detail": "Invalid Content-Length header."})
         try:
-            response = await call_next(request)
+            response = _oversize_response if _oversize_response is not None else await call_next(request)
         except HTTPException:
             # Re-raise HTTPExceptions (they're handled by FastAPI)
             raise
@@ -381,8 +403,17 @@ security = HTTPBearer()
 # Pydantic Models (Request/Response Schemas)
 
 class LoginRequest(BaseModel):
-    username: str
+    # Bound + markup-reject the attempted username the same way UserCreate does: it is echoed into
+    # the failed-login SecurityAlert record that the admin API returns, so a hostile value must not
+    # be able to carry markup into an admin surface. (Control characters are stripped defensively at
+    # the alert/log sink too.)
+    username: str = Field(..., max_length=254)
     password: str
+
+    @field_validator('username')
+    @classmethod
+    def _clean_username(cls, v):
+        return _reject_markup_chars(v, 'username')
 
 
 class LoginResponse(BaseModel):
@@ -875,6 +906,18 @@ async def get_current_user(
             TemporaryCredential.id == session.temp_credential_id
         ).first()
 
+        # Fail CLOSED: an ACTIVE temp session whose backing credential row is missing (a broken DB
+        # invariant — the FK is ON DELETE CASCADE and every deletion revokes the session in the same
+        # commit, so this is not reachable via a normal app flow) must NOT run as an unrestricted
+        # principal. Denying here is safer than proceeding as an unscoped session, which would no-op
+        # is_scoped() and every per-vault capability gate.
+        if temp_cred is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session has been terminated. Please login again.",
+                headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
+            )
+
         # Bound the session by the credential's OWN stated lifetime, not just the
         # inactivity grace window above: a temp cred past its validity window
         # (deactivate_at) or hard expiry (expires_at) must stop authorizing requests
@@ -927,7 +970,9 @@ async def get_current_user(
         from temp_scope import attach_scope
         attach_scope(db, user, temp_cred)
     else:
-        user._is_temp_session = False
+        # Fail SAFE: a temp session (is_temporary + session_token) whose scope row can't be loaded must
+        # still be flagged, so it can never fall through require_interactive_admin as an interactive admin.
+        user._is_temp_session = bool(is_temporary and session_token)
     return user
 
 
@@ -1099,7 +1144,7 @@ async def health_check():
 @app.get("/audit/events")
 async def recent_audit_events(
     limit: int = 10,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """Recent audit-log entries for the dashboard activity feed (admin only)."""
@@ -1168,7 +1213,7 @@ async def search_audit_log(
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
     limit: int = 500,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Filtered audit-log search for the admin Audit page (admin only)."""
@@ -1200,7 +1245,7 @@ async def export_audit_log(
     action: Optional[str] = None,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Export the filtered audit log as CSV (admin only)."""
@@ -1394,7 +1439,7 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
 
 @app.get("/settings")
 async def get_settings(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Return stored global settings (sensitive fields stripped)."""
@@ -1635,7 +1680,7 @@ async def pull_logs(
 
 @app.get("/settings/logs")
 async def get_logs_settings(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Log-access admin view: the ceiling, per-component flags, and the token list. NEVER the
@@ -1959,7 +2004,7 @@ async def get_zk_enabled(
 
 @app.get("/zk/unsealed")
 async def zk_unsealed_count(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Operator migration signal: how many zero-knowledge file/folder rows still carry an UNSEALED
@@ -2251,7 +2296,11 @@ async def create_temp_credentials(
     req_mode = (payload.vault_access_mode if (payload and payload.vault_access_mode) else 'selected')
     req_vaults = payload.selected_vaults if payload else None
     parent_scope = parent_mode = parent_vault_ids = parent_vault_caps = None
-    created_by_temp_id = None
+    # Stamp the creating temp session on every child (scoped OR legacy NULL-scope) so the child
+    # lands in the creator's confinement subtree and stays visible/manageable by it. Without this a
+    # legacy temp session would mint children with a NULL creator that its own confined list/guard
+    # (which match created_by == this session's cred id) could never see or manage.
+    created_by_temp_id = getattr(current_user, '_temp_cred_id', None) if is_temp else None
     if is_temp and scoped:
         actor_temp = (current_user._temp_scope or {}).get('temp', {})
         # A child may only receive create/delegate if THIS cred holds delegate. Force
@@ -2272,7 +2321,6 @@ async def create_temp_credentials(
         parent_mode = getattr(current_user, '_temp_vault_mode', 'selected')
         parent_vault_caps = getattr(current_user, '_temp_vault_caps', {}) or {}
         parent_vault_ids = list(parent_vault_caps.keys())
-        created_by_temp_id = getattr(current_user, '_temp_cred_id', None)
 
     temp_creds = auth_service.create_temporary_credential(
         current_user.id,
@@ -2318,12 +2366,18 @@ async def list_temp_credentials(
     from models import TemporaryCredential, ActiveSession
     from datetime import datetime
     
-    # A scoped temp session sees only the credentials IT created (never the main
-    # account's). Otherwise: admins see all, users see their own.
-    if getattr(current_user, '_is_temp_session', False) and getattr(current_user, '_temp_scope', None) is not None:
-        temp_creds = db.query(TemporaryCredential).filter(
-            TemporaryCredential.created_by_temp_credential_id == current_user._temp_cred_id
-        ).order_by(TemporaryCredential.created_at.desc()).all()
+    # A temp session (scoped OR legacy NULL-scope) sees only the credentials IT created —
+    # never the whole deployment's, even though a NULL-scope temp cred keeps the admin role.
+    # A degraded temp session whose cred id could not be loaded fails closed (empty).
+    # Otherwise: admins see all, users see their own.
+    if getattr(current_user, '_is_temp_session', False):
+        _my_cred_id = getattr(current_user, '_temp_cred_id', None)
+        temp_creds = (
+            db.query(TemporaryCredential).filter(
+                TemporaryCredential.created_by_temp_credential_id == _my_cred_id
+            ).order_by(TemporaryCredential.created_at.desc()).all()
+            if _my_cred_id is not None else []
+        )
     elif current_user.role == RoleEnum.ADMIN:
         temp_creds = db.query(TemporaryCredential).order_by(TemporaryCredential.created_at.desc()).all()
     else:
@@ -2443,17 +2497,22 @@ async def get_temp_credential_password(
 
 
 def _guard_temp_session_cred_mutation(current_user, temp_cred, perm: str):
-    """For a scoped temp session: require the temp.<perm> sub-permission and limit
-    the target to credentials THIS temp cred created (never the main account's or a
-    sibling's). No-op for normal sessions and legacy temp creds. Also closes the
-    admin-bypass leak: a temp session of an admin is still restricted here."""
+    """For a temp session (scoped OR legacy NULL-scope): limit the target to credentials
+    THIS temp cred created — never the main account's or a sibling's. A scoped session
+    additionally needs the temp.<perm> sub-permission; a legacy NULL-scope session keeps
+    its broader in-subtree latitude (no sub-perm gate) but is still confined to its own
+    subtree. No-op for normal (non-temp) sessions. Closes the admin-bypass leak: a temp
+    session of an admin is still restricted here."""
     if not getattr(current_user, '_is_temp_session', False):
         return
-    if getattr(current_user, '_temp_scope', None) is None:
-        return  # legacy temp cred keeps prior behavior
-    from temp_scope import require_temp_perm
-    require_temp_perm(current_user, perm)
-    if temp_cred.created_by_temp_credential_id != getattr(current_user, '_temp_cred_id', None):
+    if getattr(current_user, '_temp_scope', None) is not None:
+        from temp_scope import require_temp_perm
+        require_temp_perm(current_user, perm)
+    # Confine to credentials this temp session created. A degraded temp session whose cred id
+    # could not be loaded (the fail-safe branch in get_current_user) has no subtree of its own,
+    # so it fails closed rather than matching credentials with a NULL creator.
+    _my_cred_id = getattr(current_user, '_temp_cred_id', None)
+    if _my_cred_id is None or temp_cred.created_by_temp_credential_id != _my_cred_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="A temporary account may only manage credentials it created."
@@ -2736,10 +2795,22 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             finally:
                 _wsdb.close()
 
-        except Exception as e:
+        except ValueError as e:
+            # Our own controlled auth-status messages (invalid payload / session terminated /
+            # account inactive) are safe to surface to the client.
             await websocket.send_json({
                 "type": "error",
-                "message": f"Invalid token: {str(e)}"
+                "message": str(e)
+            })
+            await websocket.close(code=1008)
+            return
+        except Exception as e:
+            # Anything else (token-decode / DB / infra fault) must not leak internals over the
+            # WebSocket — those frames bypass the HTTP 500-sanitizer. Log server-side, send generic.
+            print(f"[WS] token validation failed: {e}")
+            await websocket.send_json({
+                "type": "error",
+                "message": "Authentication failed"
             })
             await websocket.close(code=1008)
             return
@@ -2761,7 +2832,10 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             from models import User as _WSUser, RoleEnum as _WSRole
             with get_db_context() as _wsdb:
                 _wsu = _wsdb.query(_WSUser).filter(_WSUser.id == uuid.UUID(user_id)).first()
-                is_admin_conn = bool(_wsu and _wsu.role == _WSRole.ADMIN)
+                # A temporary credential — even an admin's — is NOT a full admin here: it receives
+                # only its OWN activity events, never the deployment-wide fleet feed (mirrors the
+                # /api/dashboard confinement).
+                is_admin_conn = bool(_wsu and _wsu.role == _WSRole.ADMIN and not is_temporary)
         except Exception:
             is_admin_conn = False
 
@@ -2836,11 +2910,13 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         print(f"WebSocket disconnected for user {username if 'username' in locals() else 'unknown'}")
     except Exception as e:
+        # str(e) can carry SQL/schema/host internals; log it server-side but never frame it to the
+        # client (WebSocket frames don't pass through the HTTP 500-sanitizer).
         print(f"WebSocket error: {e}")
         try:
             await websocket.send_json({
                 "type": "error",
-                "message": str(e)
+                "message": "Internal error"
             })
         except:
             pass
@@ -2911,7 +2987,7 @@ async def create_user(
 @app.get("/users", response_model=List[UserResponse])
 @require_endpoint_permission("USER_VIEW")
 async def list_users(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -3020,21 +3096,22 @@ async def get_user(
     """
     Get user by ID (admin or self).
     """
-    user = db.query(User).filter(User.id == user_id).first()
-    
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
-    
-    # Only admin or self can view
+    # Own-or-admin, checked BEFORE the existence lookup to avoid an enumeration oracle (mirrors
+    # user_management_api.get_user_detail — a non-admin granted USER_VIEW must not distinguish an
+    # existing from a nonexistent user id).
     if current_user.role != RoleEnum.ADMIN and current_user.id != user_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied"
         )
-    
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
     return UserResponse.model_validate(user)
 
 
@@ -3304,7 +3381,18 @@ async def delete_user(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete your own account"
         )
-    
+
+    # A user who still owns vaults can't be hard-deleted: Vault.owner_id is NOT NULL and the
+    # vaults_owned relationship nullifies-the-FK-then-fails, so db.delete would raise IntegrityError
+    # and surface as an opaque 500 (the delete is safely rolled back, but the admin gets no guidance).
+    # Return a clear 409 so the admin reassigns/deletes those vaults first.
+    owned_vaults = db.query(Vault).filter(Vault.owner_id == user.id).count()
+    if owned_vaults:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"User owns {owned_vaults} vault(s); reassign or delete them before deleting the user.",
+        )
+
     username = user.username
     db.delete(user)
     db.commit()
@@ -3353,7 +3441,7 @@ def _group_to_response(g: Group, members_map: dict, children_map: dict) -> Group
 
 @app.get("/groups", response_model=List[GroupResponse])
 async def list_groups(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """List all organizational groups (admin only)."""
@@ -3391,7 +3479,7 @@ async def create_group(
 @app.get("/groups/{group_id}", response_model=GroupDetailResponse)
 async def get_group(
     group_id: uuid.UUID,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """Group detail: members (with their per-group role) and direct sub-groups."""
@@ -4599,15 +4687,8 @@ async def grant_vault_permission(
                 detail="Only the vault owner or an admin can modify a manager"
             )
 
-        # Check if user already has access
         from models import vault_members
-        from sqlalchemy import select, insert, update
-
-        stmt = select(vault_members).where(
-            vault_members.c.vault_id == vault_id,
-            vault_members.c.user_id == permission.user_id
-        )
-        existing = db.execute(stmt).fetchone()
+        from sqlalchemy.dialects.postgresql import insert as _pg_insert
 
         # Set permissions based on level. 'manage' implies full read/write/delete.
         manage_perm = permission.level == 'manage'
@@ -4615,32 +4696,28 @@ async def grant_vault_permission(
         write_perm = permission.level in ['write', 'delete', 'manage']
         delete_perm = permission.level in ['delete', 'manage']
 
-        if existing:
-            # Update existing permissions
-            stmt = update(vault_members).where(
-                vault_members.c.vault_id == vault_id,
-                vault_members.c.user_id == permission.user_id
-            ).values(
-                read_permission=read_perm,
-                write_permission=write_perm,
-                delete_permission=delete_perm,
-                manage_permission=manage_perm
-            )
-            db.execute(stmt)
-        else:
-            # Insert new permission
-            stmt = insert(vault_members).values(
-                vault_id=vault_id,
-                user_id=permission.user_id,
-                read_permission=read_perm,
-                write_permission=write_perm,
-                delete_permission=delete_perm,
-                manage_permission=manage_perm,
-                added_at=datetime.now(timezone.utc),
-                added_by=current_user.id
-            )
-            db.execute(stmt)
-
+        # Atomic upsert (race-safe): a concurrent double-grant for the same (vault, user) can no longer
+        # create divergent duplicate rows — the uq_vault_members_vault_user constraint funnels both to
+        # the same row. Replaces the previous non-atomic check-then-insert.
+        _ins = _pg_insert(vault_members).values(
+            vault_id=vault_id,
+            user_id=permission.user_id,
+            read_permission=read_perm,
+            write_permission=write_perm,
+            delete_permission=delete_perm,
+            manage_permission=manage_perm,
+            added_at=datetime.now(timezone.utc),
+            added_by=current_user.id,
+        )
+        db.execute(_ins.on_conflict_do_update(
+            index_elements=['vault_id', 'user_id'],
+            set_={
+                'read_permission': read_perm,
+                'write_permission': write_perm,
+                'delete_permission': delete_perm,
+                'manage_permission': manage_perm,
+            },
+        ))
         db.commit()
         
         return {
@@ -4919,6 +4996,17 @@ async def rotate_vault_encryption_key(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Key rotation does not apply to zero-knowledge vaults; their keys are managed client-side (use the zero-knowledge rekey endpoint).",
+            )
+
+        # A password-protected Standard vault wraps its DEK under a password-derived KEK + salt.
+        # rotate_vault_key can only re-wrap under the MASTER key (it has no password parameter), which
+        # would write method='master_key' / key_salt=NULL while leaving password_hash set — an internally
+        # inconsistent row. Re-wrap-with-password isn't supported here, so reject rather than corrupt the
+        # row. (File content is keyed off the deployment secret, not this wrapped DEK, so no access change.)
+        if getattr(vault, "password_hash", None):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Key rotation is not supported for password-protected vaults (the password-wrapped key cannot be re-wrapped here).",
             )
 
         # Perform key rotation
@@ -5412,7 +5500,8 @@ async def upload_file(
                 file_name=upload_file.filename,
                 total_size=0  # Unknown at start for streaming uploads
             )
-            
+            _op_ok = False  # set True only after the file is fully committed (drives complete_operation)
+
             # Wrap entire upload in try-finally to ensure reservation cleanup
             try:
                 # Same-name policy = replace; reject up front if the uploader can't.
@@ -5594,7 +5683,8 @@ async def upload_file(
                     'size': file.size_bytes,
                     'mime_type': file.mime_type
                 })
-                
+                _op_ok = True  # fully committed -> complete_operation reports success in the finally
+
                 # Audit log
                 audit_logger.log_action(
                     action='file_upload',
@@ -5662,6 +5752,14 @@ async def upload_file(
                     except Exception as e:
                         print(f"⚠️ Failed to cleanup reservation in finally: {e}")
                 
+                # Mark the Redis progress record complete + clear it (it was never completed before, so
+                # every finished/failed upload used to leave a dangling operation:* record until TTL).
+                # Best-effort: cleanup must never fail the request.
+                try:
+                    tracker.complete_operation(operation_id, success=_op_ok)
+                except Exception:
+                    pass
+
                 # Always end operation tracking
                 end_operation(operation_id)
         
@@ -6140,20 +6238,35 @@ async def upload_chunk(
         f.write(data)
     os.replace(tmp_path, chunk_path)
 
-    if not already:
-        session.chunks_received = (session.chunks_received or 0) + 1
-    # Keep the byte counter accurate even when a chunk is re-sent at a different size.
-    session.bytes_received = base_bytes + len(data)
-    session.last_chunk_at = datetime.utcnow()
+    # Serialize the counter update per session (SELECT ... FOR UPDATE) and recompute the counters from
+    # the AUTHORITATIVE on-disk chunk set, so concurrent PUTs — even a same-index re-send — converge to
+    # the true total instead of racing a read-modify-write (a blind += double-counts a same-index race;
+    # an absolute assignment clobbers a concurrent different-index write). Mirrors the disk-authoritative
+    # /complete and the ZK-path locking.
+    _total = session.total_chunks
+    locked = db.query(ChunkedUploadSession).filter(
+        ChunkedUploadSession.id == session.id
+    ).with_for_update().first()
+    _present = sorted(sdir.glob("chunk_*"))
+    _bytes = 0
+    for _p in _present:
+        try:
+            _bytes += _p.stat().st_size
+        except OSError:
+            pass
+    received = len(_present)
+    if locked is not None:
+        locked.bytes_received = _bytes
+        locked.chunks_received = received
+        locked.last_chunk_at = datetime.utcnow()
     db.commit()
 
-    received = session.chunks_received or 0
     return {
         'received': received,
-        'total': session.total_chunks,
-        'bytes_received': session.bytes_received,
-        'percent': round(received * 100 / session.total_chunks, 1) if session.total_chunks else 0,
-        'complete': received >= session.total_chunks,
+        'total': _total,
+        'bytes_received': _bytes,
+        'percent': round(received * 100 / _total, 1) if _total else 0,
+        'complete': received >= _total,
     }
 
 
@@ -6246,6 +6359,19 @@ async def complete_chunked_upload(
     if client_file_id is not None and db.query(File.id).filter(File.id == client_file_id).first():
         raise HTTPException(status_code=409, detail="File id already in use")
 
+    # After a clean `with stream_ctx` exit the assembled blob PERSISTS; the post-assembly checks
+    # (size-limit, deployment quota, ZK stale-epoch) and finalize below run OUTSIDE that block and can
+    # raise, which would orphan a full-size ciphertext blob (the periodic sweep only touches _uploads/
+    # chunk dirs, never the final blob). Best-effort remove it on ANY failure. No-op if never assembled.
+    file_info = None
+
+    def _remove_orphan_blob():
+        try:
+            if file_info and file_info.get('storage_path'):
+                vault_service._remove_blobs([file_info['storage_path']])
+        except Exception:
+            pass
+
     try:
         file_info, stream_ctx = vault_service.upload_file_streaming(
             vault_id=vault_id,
@@ -6313,8 +6439,10 @@ async def complete_chunked_upload(
             replace_same_name=_principal_can_replace_file(db, current_user, vault_id),
         )
     except HTTPException:
+        _remove_orphan_blob()
         raise
     except DuplicateNameError as e:
+        _remove_orphan_blob()   # (finalize already removed it on this path; no-op safety net)
         # Lost a same-name replace race against the name unique index — a clean 409. finalize
         # already rolled back, but the session ROW survives intact (status='active') and for a
         # Standard vault still holds the plaintext filename/MIME as working state; the chunk
@@ -6328,6 +6456,7 @@ async def complete_chunked_upload(
         shutil.rmtree(sdir, ignore_errors=True)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
+        _remove_orphan_blob()
         # A client-supplied file id that collided (a fresh-UUID race that slipped past the
         # pre-check) -> a clean 409, not a 500. Any other ValueError keeps the generic handling.
         if "id already in use" in str(e):
@@ -6337,6 +6466,7 @@ async def complete_chunked_upload(
         db.commit()
         raise HTTPException(status_code=500, detail=f"Failed to finalize upload: {str(e)}")
     except Exception as e:
+        _remove_orphan_blob()
         session.status = 'failed'
         session.error_message = str(e)[:500]
         db.commit()
@@ -6791,6 +6921,14 @@ async def delete_file(
             ip_address=get_client_ip(request)
         )
 
+        # Feed the bulk-deletion detector (rapid single-file API deletions raise a BULK_FILE_DELETION
+        # alert). Best-effort: monitoring must never fail the delete.
+        try:
+            from security_monitor import get_security_monitor
+            get_security_monitor(db).record_file_deletion(str(current_user.id), str(vault_id), file_count=1)
+        except Exception:
+            pass
+
         return {'message': f'File "{disp_name}" deleted successfully'}
         
     except (PasswordRequiredError, InvalidPasswordError) as e:
@@ -7099,11 +7237,13 @@ async def delete_folder(
         folder_name = folder.name
 
         # Recurse: securely delete each file (storage + record + vault stats),
-        # then remove sub-folders, then the folder itself.
+        # then remove sub-folders, then the folder itself. Returns the count of files deleted.
         def _purge(fid):
+            n = 0
             for f in db.query(File).filter(File.folder_id == fid).all():
                 try:
                     vault_service.delete_file(f.id, current_user)
+                    n += 1
                 except PermissionDeniedError:
                     # Never destroy a file the caller can't delete — abort the whole operation
                     # (defense-in-depth behind the vault-level DELETE gate above).
@@ -7111,9 +7251,10 @@ async def delete_folder(
                 except Exception as ex:
                     print(f"Warning: failed to delete file {f.id} during folder delete: {ex}")
             for sub in db.query(Folder).filter(Folder.parent_folder_id == fid).all():
-                _purge(sub.id)
+                n += _purge(sub.id)
                 db.delete(sub)
-        _purge(folder_id)
+            return n
+        deleted_count = _purge(folder_id)
         db.delete(folder)
         db.commit()
 
@@ -7123,6 +7264,17 @@ async def delete_folder(
             details={'vault_id': str(vault_id), 'folder_name': folder_name},
             ip_address=get_client_ip(request)
         )
+
+        # A folder delete is the highest-throughput deletion vector — feed the whole subtree to the
+        # bulk-deletion detector as ONE record (not per-file, to avoid hammering the alert row).
+        # Best-effort: monitoring must never fail the delete.
+        if deleted_count:
+            try:
+                from security_monitor import get_security_monitor
+                get_security_monitor(db).record_file_deletion(str(current_user.id), str(vault_id), file_count=deleted_count)
+            except Exception:
+                pass
+
         return {'message': f'Folder "{folder_name}" deleted'}
     except (PasswordRequiredError, InvalidPasswordError) as e:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
@@ -7184,7 +7336,14 @@ async def zk_seal_names(
     if not _is_zk_vault(vault):
         raise HTTPException(status_code=400, detail="Name sealing applies only to zero-knowledge vaults")
     permission_service.require_vault_permission(current_user, vault_id, VaultPermissionEnum.WRITE)
-    current_epoch = getattr(vault, 'dek_version', 1) or 1
+    # Serialize the seal-epoch read + the seal writes against retire_dek_versions (which holds the SAME
+    # Vault-row lock): without it a name sealed at an old epoch could land in retire's scan->delete
+    # window and lose its member key -> a permanently undecryptable name. Same lock order (Vault row
+    # first) as retire / rename / upload-complete -> no deadlock. Held through the commit below.
+    locked_vault = db.query(Vault).filter(Vault.id == vault_id).with_for_update().first()
+    # Fall back to the already-validated vault object if the row vanished between fetch and lock
+    # (concurrent delete) so the epoch read keeps its original non-None semantics.
+    current_epoch = getattr(locked_vault or vault, 'dek_version', 1) or 1
 
     sealed = 0
     for it in body.items:
@@ -7227,7 +7386,7 @@ async def zk_seal_names(
 
 @app.get("/dashboard/stats", response_model=DashboardStats)
 async def get_dashboard_stats(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -7323,7 +7482,7 @@ async def logout(
 @app.get("/api/monitoring/metrics")
 async def get_monitoring_metrics(
     request: Request,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -7426,7 +7585,8 @@ async def cancel_operation(
     if tracker.cancel_operation(
         operation_id,
         requester_id=str(current_user.id),
-        is_admin=(current_user.role == RoleEnum.ADMIN),
+        # A temp credential is not a full admin: it may cancel only its own operations.
+        is_admin=(current_user.role == RoleEnum.ADMIN and not getattr(current_user, "_is_temp_session", False)),
     ):
         # Broadcast cancellation event with operation_id
         broadcast_event({
@@ -7457,7 +7617,7 @@ async def cancel_operation(
 @app.get("/api/security/metrics")
 async def get_security_metrics(
     hours: int = 24,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -7489,7 +7649,7 @@ async def get_security_metrics(
 async def get_security_alerts(
     limit: int = 50,
     severity: Optional[str] = None,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -7506,8 +7666,21 @@ async def get_security_alerts(
         from security_monitor import get_security_monitor
         
         monitor = get_security_monitor(db)
+
+        # Opportunistically prune old RESOLVED alerts (throttled process-wide to once/hour, reads the
+        # retention setting). Do it BEFORE fetching: cleanup commits, and expire_on_commit would
+        # otherwise expire the fetched rows -> a just-deleted one raises ObjectDeletedError on
+        # serialization. Best-effort: never let cleanup fail the alerts view.
+        try:
+            monitor.cleanup_old_alerts()
+        except Exception:
+            # A failed cleanup DELETE/commit aborts the transaction; roll back so the shared session
+            # stays usable for the fetch below (mirrors _raise_alert's except pattern) -- else the
+            # next SELECT raises "current transaction is aborted" and 500s the view.
+            db.rollback()
+
         alerts = monitor.get_recent_alerts(limit=limit, severity=severity)
-        
+
         # Convert to dict for JSON response
         return {
             "alerts": [
@@ -7537,7 +7710,7 @@ async def get_security_alerts(
 async def resolve_security_alert(
     alert_id: str,
     notes: Optional[str] = None,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -7567,7 +7740,7 @@ async def resolve_security_alert(
 async def get_user_security_activity(
     user_id: str,
     hours: int = 24,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -7614,7 +7787,7 @@ async def get_user_security_activity(
 
 @app.get("/permissions/groups", response_model=List[EndpointPermissionGroupResponse])
 async def get_permission_groups(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -7667,8 +7840,11 @@ async def get_user_permissions(
     from endpoint_permissions import get_user_permissions as get_perms
     from api_catalog import API_CATALOG
     
-    # Authorization: Users can only see their own permissions, admins can see anyone's
-    if current_user.role != RoleEnum.ADMIN and current_user.id != user_id:
+    # Authorization: users see only their own permissions; a real (interactive) admin can see anyone's.
+    # A temporary credential — even one owned by an admin — is treated as non-admin here, so it can
+    # only read its OWN permission set (consistent with require_interactive_admin).
+    _perms_is_admin = current_user.role == RoleEnum.ADMIN and not getattr(current_user, "_is_temp_session", False)
+    if not _perms_is_admin and current_user.id != user_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You can only view your own permissions"
@@ -7929,7 +8105,9 @@ def _seed_admin_user():
         from auth_service import AuthService
         from models import RoleEnum, User
 
-        if not settings.admin_password:
+        # Match the config.py guard's emptiness definition: a whitespace-only value is "blank"
+        # (the post-bootstrap no-op state), not a credential to seed.
+        if not (settings.admin_password or "").strip():
             return
         with get_db_context() as db:
             if db.query(User).filter(User.username == settings.admin_username).first():
@@ -8080,6 +8258,18 @@ def _run_lightweight_migrations():
                    DROP INDEX IF EXISTS idx_vault_member_key_active;
                    CREATE INDEX IF NOT EXISTS idx_vault_member_key_active
                        ON vault_member_keys (vault_id, user_id, key_version, is_active);
+               END $$;""",
+            # A member has at most one vault_members row per (vault, user). Dedup any pre-existing
+            # duplicate rows (from a concurrent double-grant race) keeping one deterministically, then
+            # add the composite unique so the grant upsert can funnel concurrent grants to a single row.
+            # One DO block = one transaction (no constraint gap between the dedup and the ADD).
+            """DO $$ BEGIN
+                   DELETE FROM vault_members a USING vault_members b
+                       WHERE a.ctid < b.ctid AND a.vault_id = b.vault_id AND a.user_id = b.user_id;
+                   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_vault_members_vault_user') THEN
+                       ALTER TABLE vault_members
+                           ADD CONSTRAINT uq_vault_members_vault_user UNIQUE (vault_id, user_id);
+                   END IF;
                END $$;""",
         ]
         with get_db_context() as db:
@@ -8279,9 +8469,18 @@ if os.path.exists(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
+def _should_warn_plaintext_transport(use_https, environment, trusted_proxies):
+    """True when serving plaintext HTTP on a reachable (non-development) deploy with no TLS-terminating
+    proxy configured — the operator should enable TLS or front the app with an HTTPS proxy. A dev stack
+    (ENVIRONMENT=development, loopback) is expected to run plaintext, so this stays False there."""
+    return (not use_https
+            and (environment or "").strip().lower() != "development"
+            and not (trusted_proxies or "").strip())
+
+
 if __name__ == "__main__":
     import uvicorn
-    
+
     # Configure SSL if enabled
     ssl_config = {}
     if settings.api_use_https:
@@ -8292,7 +8491,18 @@ if __name__ == "__main__":
         print(f"🔒 HTTPS enabled")
         print(f"📁 Certificate: {settings.api_ssl_certfile}")
         print(f"🔑 Private Key: {settings.api_ssl_keyfile}")
-    
+
+    # --- Warn (do NOT brick) on a plaintext listener outside local development ---
+    # The default/trial compose binds this to loopback, but a self-rolled `docker run`, or a compose
+    # edited to publish on 0.0.0.0, could expose the plaintext API — login credentials and bearer
+    # tokens would then cross the network in cleartext. Terminate TLS in-process (API_USE_HTTPS=true
+    # + certs) or front the app with an HTTPS reverse proxy (set TRUSTED_PROXIES).
+    if _should_warn_plaintext_transport(settings.api_use_https, settings.environment, settings.trusted_proxies):
+        print("\n⚠️  WARNING: serving PLAINTEXT HTTP with ENVIRONMENT != development and no TRUSTED_PROXIES set.")
+        print("   Login credentials and bearer tokens cross the network in cleartext if this port is")
+        print("   reachable off-host. Enable TLS (API_USE_HTTPS=true) or front the app with an HTTPS")
+        print("   reverse proxy (docker-compose.secure.yml / setup-secure.sh do this for you).")
+
     uvicorn.run(
         app,
         host=settings.api_host,

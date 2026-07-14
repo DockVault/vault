@@ -2,12 +2,8 @@
 Real-time Security Monitoring and Alerting System
 
 Monitors security events and detects suspicious patterns:
-- Failed login attempts
-- Rate limit violations
-- Unusual access patterns
-- Bulk file operations
-- Rapid file deletions
-- Multiple vault access attempts
+- Failed login attempts (brute force)
+- Bulk file deletions
 
 Provides alerts through multiple channels:
 - Logging (always enabled)
@@ -30,18 +26,42 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+# Process-wide throttle for the "threat detection degraded" alert (see _signal_detection_degraded):
+# emit at most once per cooldown window per process during a Redis outage. None = never emitted yet, so
+# the FIRST emit always runs (monotonic() can be < the window on a freshly-booted host).
+_last_degraded_signal_at = None
+
+# Process-wide throttle for opportunistic old-alert cleanup (see cleanup_old_alerts): run at most once
+# per hour per process. None = never run yet, so the first cleanup always runs.
+_last_alert_cleanup_at = None
+
+
+def _sanitize_for_log(value: Optional[str], max_len: int = 256) -> Optional[str]:
+    """Neutralise a user-controlled value before it is embedded in a persisted SecurityAlert
+    message/field (returned by the admin alerts API) or written to a log line. Strips control
+    characters — including CR/LF, so a value can't forge log lines (CWE-117) — and bounds the
+    length. Angle brackets are rejected at the input boundary (LoginRequest / UserCreate); this is
+    the sink-side defence covering every ingress path."""
+    if value is None:
+        return value
+    s = ''.join(ch for ch in str(value) if ch.isprintable())
+    if len(s) > max_len:
+        s = s[:max_len] + '...'
+    return s
+
 
 class SecurityEventType:
     """Security event type constants."""
     FAILED_LOGIN = "failed_login"
-    RATE_LIMIT_EXCEEDED = "rate_limit_exceeded"
     MULTIPLE_FAILED_LOGINS = "multiple_failed_logins"
     BRUTE_FORCE_ATTEMPT = "brute_force_attempt"
     SUSPICIOUS_DOWNLOAD = "suspicious_download"
     BULK_FILE_DELETION = "bulk_file_deletion"
-    RAPID_VAULT_ACCESS = "rapid_vault_access"
     ACCOUNT_LOCKOUT = "account_lockout"
     UNUSUAL_ACCESS_PATTERN = "unusual_access_pattern"
+    # Raised when the durable Redis event counter is unavailable, so threshold-based detection
+    # (brute-force / bulk-operation) is effectively blind -- operators must see this.
+    DETECTION_DEGRADED = "detection_degraded"
 
 
 class SecurityAlertLevel:
@@ -71,20 +91,16 @@ class SecurityMonitor:
         self.failed_login_threshold_critical = getattr(settings, 'security_failed_login_critical', 10)
         self.failed_login_window_minutes = getattr(settings, 'security_failed_login_window', 10)
         
-        self.rate_limit_threshold_warning = getattr(settings, 'security_rate_limit_warning', 5)
-        self.rate_limit_threshold_critical = getattr(settings, 'security_rate_limit_critical', 10)
+        # Alert dedup/cooldown: within this window, repeats of the same (event_type, username,
+        # ip_address) collapse into one row (bumping a repeat counter) instead of flooding the table.
+        self.alert_cooldown_seconds = getattr(settings, 'security_alert_cooldown_seconds', 300)
         
         self.bulk_deletion_threshold = getattr(settings, 'security_bulk_deletion_threshold', 10)
         self.bulk_deletion_window_seconds = getattr(settings, 'security_bulk_deletion_window', 60)
         
-        self.rapid_vault_access_threshold = getattr(settings, 'security_rapid_vault_threshold', 5)
-        self.rapid_vault_access_window_seconds = getattr(settings, 'security_rapid_vault_window', 30)
-        
-        # In-memory tracking for performance
+        # In-memory tracking for performance (Redis-outage fallback for the windowed counters)
         self._login_attempts = defaultdict(lambda: deque(maxlen=100))
-        self._rate_limit_violations = defaultdict(int)
         self._file_deletions = defaultdict(lambda: deque(maxlen=100))
-        self._vault_accesses = defaultdict(lambda: deque(maxlen=100))
     
     # ========================================================================
     # Event Recording
@@ -112,6 +128,12 @@ class SecurityMonitor:
             self.failed_login_window_minutes * 60,
             self._login_attempts[identifier],
         )
+
+        # Counting above keyed off the raw values; from here on only embed sanitized copies in the
+        # persisted alert record and the logs (a CRLF-carrying username must not forge log lines or
+        # ride into the admin alerts JSON).
+        username = _sanitize_for_log(username)
+        ip_address = _sanitize_for_log(ip_address)
 
         if recent_attempts >= self.failed_login_threshold_critical:
             self._raise_alert(
@@ -141,49 +163,6 @@ class SecurityMonitor:
             )
         
         logger.info(f"Failed login recorded: {username} from {ip_address} ({recent_attempts} recent attempts)")
-    
-    def record_rate_limit_violation(self, identifier: str, ip_address: str, endpoint: str):
-        """
-        Record a rate limit violation.
-        
-        Args:
-            identifier: User identifier or IP
-            ip_address: Source IP address
-            endpoint: API endpoint that was rate limited
-        """
-        self._rate_limit_violations[identifier] += 1
-        
-        # Store in Redis
-        redis_key = f"security:rate_limit:{identifier}"
-        count = self.redis.incr(redis_key)
-        self.redis.expire(redis_key, 3600)  # 1 hour
-        
-        if count >= self.rate_limit_threshold_critical:
-            self._raise_alert(
-                event_type=SecurityEventType.RATE_LIMIT_EXCEEDED,
-                severity=SecurityAlertLevel.CRITICAL,
-                ip_address=ip_address,
-                details={
-                    'violations': count,
-                    'endpoint': endpoint,
-                    'identifier': identifier
-                },
-                message=f"CRITICAL: Excessive rate limit violations - {count} violations from {ip_address} (endpoint: {endpoint})"
-            )
-        elif count >= self.rate_limit_threshold_warning:
-            self._raise_alert(
-                event_type=SecurityEventType.RATE_LIMIT_EXCEEDED,
-                severity=SecurityAlertLevel.WARNING,
-                ip_address=ip_address,
-                details={
-                    'violations': count,
-                    'endpoint': endpoint,
-                    'identifier': identifier
-                },
-                message=f"WARNING: Rate limit violations detected - {count} violations from {ip_address}"
-            )
-        
-        logger.info(f"Rate limit violation recorded: {identifier} from {ip_address} at {endpoint}")
     
     def record_file_deletion(self, user_id: str, vault_id: str, file_count: int = 1):
         """
@@ -224,44 +203,6 @@ class SecurityMonitor:
         
         logger.info(f"File deletion recorded: {file_count} file(s) from vault {vault_id} by user {user_id}")
     
-    def record_vault_access(self, user_id: str, vault_id: str, action: str):
-        """
-        Record vault access and detect rapid access patterns.
-        
-        Args:
-            user_id: User accessing vault
-            vault_id: Vault ID
-            action: Action performed (open, read, write, etc.)
-        """
-        now = time.time()
-        identifier = f"{user_id}:{vault_id}"
-
-        # In-memory trail is only the Redis-outage fallback (see _windowed_count).
-        self._vault_accesses[identifier].append(now)
-
-        # Durable, cross-request window count (Redis) — a fresh per-request deque never trips.
-        recent_accesses = self._windowed_count(
-            f"security:vault_access:{identifier}",
-            self.rapid_vault_access_window_seconds,
-            self._vault_accesses[identifier],
-        )
-
-        if recent_accesses >= self.rapid_vault_access_threshold:
-            self._raise_alert(
-                event_type=SecurityEventType.RAPID_VAULT_ACCESS,
-                severity=SecurityAlertLevel.INFO,
-                user_id=user_id,
-                details={
-                    'accesses': recent_accesses,
-                    'vault_id': vault_id,
-                    'action': action,
-                    'window_seconds': self.rapid_vault_access_window_seconds
-                },
-                message=f"INFO: Rapid vault access detected - {recent_accesses} accesses to vault {vault_id} by user {user_id} in {self.rapid_vault_access_window_seconds} seconds"
-            )
-        
-        logger.debug(f"Vault access recorded: {action} on vault {vault_id} by user {user_id}")
-    
     # ========================================================================
     # Analysis and Detection
     # ========================================================================
@@ -293,6 +234,9 @@ class SecurityMonitor:
             return int(count)
         except Exception as e:
             logger.warning(f"Security monitor Redis counter unavailable ({redis_key}): {e}; using in-memory fallback")
+            # The in-memory deque only holds THIS request's events (the monitor is per-request), so
+            # thresholds can no longer trip -> detection is effectively blind. Surface that to operators.
+            self._signal_detection_degraded()
             return self._count_recent_events(fallback_deque, window_seconds)
     
     def analyze_user_activity(self, user_id: str, hours: int = 24) -> Dict[str, Any]:
@@ -502,6 +446,41 @@ class SecurityMonitor:
             ip_address: IP address involved (optional)
             details: Additional details dictionary
         """
+        # Dedup / cooldown: within the cooldown window, collapse a repeat of the SAME
+        # (event_type, username, ip_address) into the existing alert -- bump a repeat counter instead
+        # of inserting a new row -- so a sustained attack can't flood the alerts table or bury real
+        # alerts. WARNING and CRITICAL use distinct event_types, so an escalation still opens its own
+        # alert rather than being hidden inside a lower-severity row.
+        try:
+            since = datetime.now(timezone.utc) - timedelta(seconds=self.alert_cooldown_seconds)
+            existing = self.db.query(SecurityAlert).filter(
+                SecurityAlert.event_type == event_type,
+                SecurityAlert.severity == severity,       # a CRITICAL escalation must open its OWN row,
+                                                          # even when a path reuses one event_type for both
+                SecurityAlert.username == username,
+                SecurityAlert.ip_address == ip_address,
+                SecurityAlert.user_id == user_id,         # events keyed by user_id (bulk-delete / rapid
+                                                          # vault access) set no username/ip -> without this
+                                                          # they'd all share a (type, NULL, NULL) key and
+                                                          # collapse DIFFERENT users into one row
+                SecurityAlert.resolved == False,          # never fold repeats into an already-resolved
+                                                          # alert -> a renewed attack raises a fresh one
+                SecurityAlert.timestamp >= since,
+            ).order_by(SecurityAlert.timestamp.desc()).first()
+        except Exception:
+            self.db.rollback()
+            existing = None
+        if existing is not None:
+            try:
+                d = dict(existing.details or {})
+                d['repeat_count'] = int(d.get('repeat_count', 1)) + 1
+                d['last_repeat'] = datetime.now(timezone.utc).isoformat()
+                existing.details = d
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+            return existing
+
         # Create alert in database
         alert = SecurityAlert(
             event_type=event_type,
@@ -532,7 +511,40 @@ class SecurityMonitor:
         
         # Broadcast to monitoring dashboard via Redis pub/sub
         self._broadcast_alert(alert)
-    
+        return alert
+
+    def _signal_detection_degraded(self) -> None:
+        """Emit a (deduped) WARNING so operators know threat detection is running BLIND: with the
+        Redis event counter unavailable, the per-request in-memory fallback can never reach a
+        brute-force / bulk-operation threshold, so those alerts silently stop firing. Best-effort:
+        never let the degraded signal break the calling auth/delete path."""
+        # Process-wide throttle: during a Redis outage EVERY request hits _windowed_count's fallback,
+        # and each call here would be a SELECT+UPDATE+COMMIT contending on one hot alert row. Emit at
+        # most once per cooldown window PER PROCESS (the _raise_alert DB dedup still collapses the row
+        # across processes) so a high-volume outage doesn't hammer the DB.
+        global _last_degraded_signal_at
+        now = time.monotonic()  # interval throttle -> monotonic, immune to NTP / wall-clock steps
+        if _last_degraded_signal_at is not None and now - _last_degraded_signal_at < self.alert_cooldown_seconds:
+            return
+        try:
+            self._raise_alert(
+                event_type=SecurityEventType.DETECTION_DEGRADED,
+                severity=SecurityAlertLevel.WARNING,
+                message=("Threat detection degraded: the Redis event counter is unavailable, so "
+                         "brute-force / bulk-operation thresholds cannot be evaluated. Preventive "
+                         "controls (account lockout, rate-limit DB fallback) still apply."),
+                details={'reason': 'redis_counter_unavailable'},
+            )
+            # Advance the throttle only AFTER a successful emit, so a transient DB failure during the
+            # outage retries on the next fallback request rather than suppressing the operator's
+            # "detection blind" signal for a whole cooldown window.
+            _last_degraded_signal_at = now
+        except Exception:
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+
     def _broadcast_alert(self, alert: SecurityAlert):
         """Broadcast alert to monitoring dashboard."""
         try:
@@ -576,26 +588,39 @@ class SecurityMonitor:
     # Cleanup
     # ========================================================================
     
-    def cleanup_old_alerts(self, days: int = 90):
+    def cleanup_old_alerts(self, days: Optional[int] = None):
         """
-        Clean up old resolved alerts.
-        
+        Delete old RESOLVED alerts beyond the retention window (unresolved alerts are always kept).
+        Process-wide throttled to at most once per hour so it can be wired into a frequently-hit
+        endpoint without issuing a DELETE per request.
+
         Args:
-            days: Keep alerts from last N days
+            days: retention window; defaults to settings.security_alert_retention_days.
         """
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        
+        global _last_alert_cleanup_at
+        now = time.monotonic()
+        if _last_alert_cleanup_at is not None and now - _last_alert_cleanup_at < 3600:
+            return 0
+        _last_alert_cleanup_at = now
+
+        if days is None:
+            days = getattr(settings, 'security_alert_retention_days', 90)
+        # Naive UTC to match the TIMESTAMP-WITHOUT-TIME-ZONE column, and synchronize_session=False so
+        # the DELETE runs entirely in Postgres (the default 'evaluate' would compare the naive column
+        # value against the cutoff in Python and raise on naive-vs-aware).
+        cutoff = datetime.utcnow() - timedelta(days=days)
+
         deleted = self.db.query(SecurityAlert).filter(
             and_(
                 SecurityAlert.resolved == True,
                 SecurityAlert.timestamp < cutoff
             )
-        ).delete()
-        
+        ).delete(synchronize_session=False)
+
         self.db.commit()
-        
-        logger.info(f"Cleaned up {deleted} old security alerts")
-        
+
+        logger.info(f"Cleaned up {deleted} old security alerts (retention {days}d)")
+
         return deleted
 
 

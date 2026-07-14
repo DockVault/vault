@@ -111,7 +111,11 @@ vault_members = Table(
     # destructive/ownership actions: delete vault, rotate keys, change password).
     Column('manage_permission', Boolean, default=False),
     Column('added_at', DateTime, default=datetime.utcnow),
-    Column('added_by', UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    Column('added_by', UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True),
+    # A member has at most one row per vault: stops a concurrent double-grant from creating divergent
+    # duplicate rows (the permission read would otherwise resolve an arbitrary one). Mirrors the
+    # composite keys on the sibling association tables (user_groups, vault_group_access, temp-cred access).
+    UniqueConstraint('vault_id', 'user_id', name='uq_vault_members_vault_user'),
 )
 
 

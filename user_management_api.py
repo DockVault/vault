@@ -21,7 +21,6 @@ from models import User, TemporaryCredential, RoleEnum, AuditLog, ActiveSession
 from auth_service import AuthService
 from audit_logger import AuditLogger
 from endpoint_permissions import require_endpoint_permission
-from security import verify_access_token
 
 security_scheme = HTTPBearer()
 
@@ -50,10 +49,17 @@ def check_if_none_match(request: Request, current_hash: str) -> bool:
     Returns True if content hasn't changed (should return 304).
     """
     if_none_match = request.headers.get('If-None-Match')
-    if if_none_match:
-        # Remove quotes if present (ETag format)
-        if_none_match = if_none_match.strip('"')
-        return if_none_match == current_hash
+    if not if_none_match:
+        return False
+    # RFC 7232 §3.2: "*" matches any; otherwise a comma list of (weak-prefixed) quoted ETags.
+    if if_none_match.strip() == '*':
+        return True
+    for tag in if_none_match.split(','):
+        tag = tag.strip()
+        if tag.startswith('W/'):
+            tag = tag[2:].strip()
+        if tag.strip('"') == current_hash:
+            return True
     return False
 
 # =============================================================================
@@ -64,162 +70,19 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security_scheme),
     db: Session = Depends(get_db)
 ) -> User:
+    """Dependency to get the current authenticated user for the user-management router.
+
+    Delegates to the ONE hardened dependency (api_server.get_current_user) so there is a single
+    source of truth for authentication: the token denylist + durable ActiveSession.revoked check,
+    temp-session is_active/grace/lifetime validation, account_locked, and attach_scope (temp-cred
+    least privilege / the _is_temp_session flag require_interactive_admin relies on). This replaces
+    a hand-synced copy that had to be kept in lock-step by hand.
+
+    The import is LAZY (inside the body): api_server imports this module at load time to mount the
+    router, so a module-level import would be circular. By request time api_server is fully loaded.
     """
-    Dependency to get current authenticated user from JWT token.
-    For temporary credentials, validates that the session is still active.
-    """
-    token = credentials.credentials
-    
-    payload = verify_access_token(token)
-    if not payload:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={
-                "WWW-Authenticate": "Bearer",
-                "Clear-Site-Data": '"cache", "cookies", "storage"'
-            },
-        )
-    
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload",
-            headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
-        )
-    
-    # Check if this is a temporary credential session
-    session_token = payload.get("session_token")
-    is_temporary = payload.get("is_temporary", False)
-    temp_cred = None  # the TemporaryCredential row backing a temp session
-
-    # Every token this server mints carries a session_token; a token without one bypasses the
-    # revocation checks below and can only be a forgery/legacy token. Reject it so this
-    # admin-management router enforces the same revocability as api_server.
-    if not session_token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
-        )
-
-    # Revocation: a logged-out token is denylisted until it expires (all users, no
-    # single-session side effect). Mirrors get_current_user in api_server.py.
-    from auth_service import is_token_denylisted
-    if session_token and is_token_denylisted(session_token):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session has been terminated. Please login again.",
-            headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
-        )
-
-    # Durable revocation for regular-user tokens (Redis-outage resilient; mirrors
-    # get_current_user in api_server.py).
-    if session_token and not is_temporary:
-        revoked_session = db.query(ActiveSession.revoked).filter(
-            ActiveSession.session_token == session_token
-        ).first()
-        if revoked_session is not None and revoked_session[0]:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Session has been terminated. Please login again.",
-                headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
-            )
-
-    if is_temporary and session_token:
-        # Validate that the session is still active
-        session = db.query(ActiveSession).filter(
-            ActiveSession.session_token == session_token,
-            ActiveSession.is_active == True
-        ).first()
-        
-        if not session:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Session has been terminated. Please login again.",
-                headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
-            )
-        
-        # Also check if session has expired based on grace period. ActiveSession.last_activity
-        # is stored naive (UTC); make it tz-aware so this comparison doesn't raise "can't
-        # compare offset-naive and offset-aware datetimes" — that TypeError was 500-ing EVERY
-        # temp-credential request to this router (mirrors the same fix in api_server.py's
-        # get_current_user), which masked the require_interactive_admin gate behind a 500.
-        grace_minutes = int(os.getenv('TEMP_CRED_SESSION_GRACE_MINUTES', '65'))
-        grace_cutoff = datetime.now(timezone.utc) - timedelta(minutes=grace_minutes)
-
-        last_activity = session.last_activity
-        if last_activity is not None and last_activity.tzinfo is None:
-            last_activity = last_activity.replace(tzinfo=timezone.utc)
-        if last_activity is not None and last_activity < grace_cutoff:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Session has expired due to inactivity.",
-                headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
-            )
-
-        # Load the credential backing this session so its scope (and the temp-session flag)
-        # can be attached below — WITHOUT this, _is_temp_session is never set on this router's
-        # principal and require_interactive_admin would be a no-op here.
-        from models import TemporaryCredential
-        temp_cred = db.query(TemporaryCredential).filter(
-            TemporaryCredential.id == session.temp_credential_id
-        ).first()
-
-        # Bound the session by the credential's OWN stated lifetime (validity window
-        # deactivate_at / hard expiry expires_at), not just the inactivity grace
-        # window above — mirrors get_current_user in api_server.py. Stored naive (UTC).
-        if temp_cred is not None:
-            _now = datetime.now(timezone.utc)
-            for _limit in (temp_cred.deactivate_at, temp_cred.expires_at):
-                if _limit is None:
-                    continue
-                if _limit.tzinfo is None:
-                    _limit = _limit.replace(tzinfo=timezone.utc)
-                if _now > _limit:
-                    raise HTTPException(
-                        status_code=status.HTTP_401_UNAUTHORIZED,
-                        detail="Temporary credential has expired. Please login again.",
-                        headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
-                    )
-
-    user = db.query(User).filter(User.id == uuid.UUID(user_id)).first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
-            headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
-        )
-    
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is inactive",
-            headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
-        )
-
-    # A locked account is rejected on every request (admin lock = permanent; failed-login
-    # auto-lock auto-expires per its TTL — account_locked honours locked_until).
-    from auth_service import account_locked
-    if account_locked(user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is locked",
-            headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
-        )
-
-    # Tag the temp-session context so require_interactive_admin (and the data layer) enforce
-    # least privilege on this router the same way api_server does. Any temp session is flagged
-    # even if its scope row can't be loaded, so it can never fall through as an interactive
-    # admin.
-    if is_temporary and session_token and temp_cred is not None:
-        from temp_scope import attach_scope
-        attach_scope(db, user, temp_cred)
-    else:
-        user._is_temp_session = bool(is_temporary and session_token)
-
-    return user
+    from api_server import get_current_user as _hardened_get_current_user
+    return await _hardened_get_current_user(credentials, db)
 
 
 async def require_admin(current_user: User = Depends(get_current_user)) -> User:
@@ -418,6 +281,12 @@ async def list_users(
     db: Session = Depends(get_db)
 ):
     """List all users with filtering and search (supports ETag for conditional updates)"""
+
+    # USER_VIEW is admin-only by default; a fleet-wide user listing has no "own" subset, so if an
+    # operator grants USER_VIEW to a non-admin, restrict the listing to admins (mirrors the
+    # own-or-admin guard on the per-user detail route).
+    if current_user.role != RoleEnum.ADMIN:
+        raise HTTPException(status_code=403, detail="Listing all users requires an administrator")
     
     query = db.query(User)
     
@@ -497,6 +366,13 @@ async def get_user_detail(
     db: Session = Depends(get_db)
 ):
     """Get detailed user information (supports ETag for conditional updates)"""
+
+    # Own-or-admin (checked BEFORE the existence lookup to avoid an enumeration oracle): USER_VIEW is
+    # admin-only by default, but the catalog's requires_ownership flag is display-only and NOT enforced
+    # by require_endpoint_permission — so if an operator grants USER_VIEW to a non-admin, enforce
+    # ownership here, mirroring the temp-cred / activity siblings.
+    if current_user.role != RoleEnum.ADMIN and current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="You can only view your own user record")
     
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
@@ -651,7 +527,16 @@ async def toggle_user_active(
     # Prevent self-deactivation
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot deactivate your own account")
-    
+
+    # Reactivating a user consumes a seat, so enforce the plan's user cap on the
+    # inactive->active transition here too (mirrors the PATCH /users/{id} path). create_user
+    # and that PATCH are otherwise the only checkpoints, which an admin at the cap could
+    # sidestep by deactivating a user, creating a replacement (allowed — a seat freed up),
+    # then reactivating the original via this toggle to land above the cap.
+    if not user.is_active:
+        from api_server import _enforce_user_cap
+        _enforce_user_cap(db)
+
     user.is_active = not user.is_active
     # Offboarding: deactivating a user blacklists their zero-knowledge vault keys.
     if not user.is_active:
@@ -746,16 +631,20 @@ async def list_user_temp_credentials(
     if current_user.role != RoleEnum.ADMIN and current_user.id != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # A scoped temp session sees ONLY the credentials IT created — never the target
-    # user's full listing (whose id UUIDs are exactly what the by-id deactivate/delete
-    # endpoints consume). Mirrors the scoped-session discipline of api_server.py's
-    # /temp-creds/list; without it a scoped admin delegate (role==ADMIN, temp.view)
-    # could enumerate any user's credential ids via this parallel router.
-    if getattr(current_user, '_is_temp_session', False) and getattr(current_user, '_temp_scope', None) is not None:
-        temp_creds = db.query(TemporaryCredential).filter(
-            TemporaryCredential.user_id == user_id,
-            TemporaryCredential.created_by_temp_credential_id == current_user._temp_cred_id,
-        ).order_by(TemporaryCredential.created_at.desc()).all()
+    # A temp session (scoped OR legacy NULL-scope) sees ONLY the credentials IT created — never
+    # the target user's full listing (whose id UUIDs are exactly what the by-id deactivate/delete
+    # endpoints consume). Mirrors api_server.py's /temp-creds/list; without it a legacy admin-minted
+    # temp credential (role==ADMIN, _temp_scope==None) could enumerate any user's credential ids via
+    # this parallel router. A degraded temp session with no cred id fails closed (empty).
+    if getattr(current_user, '_is_temp_session', False):
+        _my_cred_id = getattr(current_user, '_temp_cred_id', None)
+        temp_creds = (
+            db.query(TemporaryCredential).filter(
+                TemporaryCredential.user_id == user_id,
+                TemporaryCredential.created_by_temp_credential_id == _my_cred_id,
+            ).order_by(TemporaryCredential.created_at.desc()).all()
+            if _my_cred_id is not None else []
+        )
     else:
         temp_creds = db.query(TemporaryCredential).filter(
             TemporaryCredential.user_id == user_id

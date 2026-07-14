@@ -21,7 +21,9 @@ from ecc_crypto_service import ECCCryptoService
 from audit_logger import AuditLogger
 from rate_limiter import rate_limiter as _rate_limiter
 from endpoint_permissions import require_endpoint_permission
-from temp_scope import require_vault_cap, enforce_vault
+from temp_scope import (
+    require_vault_cap, enforce_vault, is_scoped, has_scoped_vault_cap, effective_vault_caps,
+)
 from cryptography.hazmat.primitives import serialization
 from datetime import datetime, timezone, timedelta
 
@@ -76,13 +78,6 @@ class DecompressPointRequest(BaseModel):
 class DecompressPointResponse(BaseModel):
     """Response with decompressed point."""
     uncompressed_point: str = Field(..., description="Base64-encoded uncompressed point")
-
-
-class CreateVaultRequest(BaseModel):
-    """Request to create a vault with ECC."""
-    name: str
-    description: Optional[str] = None
-    password: Optional[str] = None
 
 
 class VaultKeysResponse(BaseModel):
@@ -284,6 +279,12 @@ def _manages_any_vault(db: Session, user: User) -> bool:
     Scopes the public-key lookup so it is not a has-a-keypair enumeration oracle for arbitrary
     accounts. Does NOT break onboarding: the browser share/rekey flows always run as a manager
     of the vault they're sharing, and they fetch a not-yet-member recipient's key from here."""
+    # A SCOPED temp credential is confined to its scope, NOT the underlying admin's blanket
+    # role/ownership: it counts as a potential sharer (and may look up a recipient's public key) only
+    # if it actually holds a permissions-management capability on some granted vault. This stops the
+    # public-key lookup from being a has-a-keypair enumeration oracle any scoped credential could sweep.
+    if is_scoped(user):
+        return has_scoped_vault_cap(user, "vault.change_permissions")
     if getattr(user, 'role', None) == RoleEnum.ADMIN:
         return True
     if db.query(Vault.id).filter(Vault.owner_id == user.id).first():
@@ -368,12 +369,15 @@ async def decompress_point(
     except HTTPException:
         # A deliberate 4xx (bad length / prefix) must surface as-is, not be swallowed into a 500.
         raise
-    except ValueError as e:
+    except ValueError:
+        # Caller-supplied point failed to parse. Don't echo the crypto-library text back at 400
+        # (a non-500 status bypasses the global 500-sanitizer).
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid compressed point: {str(e)}"
+            detail="Invalid compressed point"
         )
     except Exception as e:
+        # 500 detail is scrubbed + server-logged by the global handler, so keeping str(e) here is safe.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Point decompression failed: {str(e)}"
@@ -528,14 +532,34 @@ async def register_public_key(
         )
 
     except HTTPException:
-        # Don't let the 409 conflict get rewrapped as a generic 400 below.
+        # Don't let the 409 conflict get rewrapped below.
         db.rollback()
         raise
-    except Exception as e:
+    except IntegrityError:
+        # Two concurrent registrations for the same user race past the precheck and both commit;
+        # the loser violates the user_keypairs unique constraint. Surface a generic conflict, never
+        # the raw INSERT SQL / bound params / constraint names.
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A public key is already registered for this account"
+        )
+    except ValueError:
+        # Genuine client validation failure (malformed PEM or wrong curve). State the fixed
+        # requirement -- the curve is a public standard, useful feedback -- but don't echo the
+        # crypto-library parse text (str(e)) at a 400 (which bypasses the 500-sanitizer).
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid public key format: {str(e)}"
+            detail="Invalid public key: must be a PEM-encoded secp384r1 public key"
+        )
+    except Exception as e:
+        # Anything else is unexpected: route it through the 500-sanitizer (generic client message
+        # + server-side log + correlation id) instead of leaking str(e) at a mislabeled 400.
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Public key registration failed: {str(e)}"
         )
 
 
@@ -731,6 +755,14 @@ async def get_vault_keys(
     # read path applies (vault_service.get_vault -> enforce_vault). Without it a cred scoped
     # to vault A could still read vault B's wrapped DEK here. No-op for normal principals.
     enforce_vault(current_user, vault_id)
+    # A scoped temp credential must also hold a capability, not just vault membership: reading the
+    # wrapped-DEK routing blob is a "see the vault's contents" action. Accept see_files OR
+    # change_permissions — the ZK SHARE (add-member) flow reads this to re-wrap the DEK for a new
+    # recipient, so a manage-permissions cred must be able to read it. No-op for normal principals.
+    if is_scoped(current_user) and not (
+        {"vault.see_files", "vault.change_permissions"} & set(effective_vault_caps(current_user, vault_id))
+    ):
+        raise HTTPException(status_code=403, detail="Temporary credential scope does not permit this action")
 
     # Close any authz/crypto divergence before handing out a key.
     _reconcile_orphan_member_keys(db, vault)
@@ -1145,6 +1177,13 @@ async def list_member_keys(
     # Confine a scoped temp credential to its granted vaults (parity with the standard read
     # path). Without it a cred scoped to vault A could enumerate vault B's member roster here.
     enforce_vault(current_user, vault_id)
+    # A scoped temp credential must also hold a permission-view (or -change) capability to enumerate
+    # the member roster (user ids) — a see_files-only cred should not read the permission surface, but
+    # a legitimate rekey cred (change_permissions) must. No-op for normal principals.
+    if is_scoped(current_user) and not (
+        {"vault.see_permissions", "vault.change_permissions"} & set(effective_vault_caps(current_user, vault_id))
+    ):
+        raise HTTPException(status_code=403, detail="Temporary credential scope does not permit this action")
 
     caller_key = db.query(VaultMemberKey).filter(
         VaultMemberKey.vault_id == vault_id,

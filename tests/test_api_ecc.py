@@ -18,7 +18,9 @@ def test_public_key_for_user_without_keypair(admin):
 
 def test_register_invalid_public_key_rejected(admin):
     r = admin.post("/ecc/keys/register", json={"public_key": "not a PEM key"})
-    assert r.status_code in (400, 422, 500)
+    # malformed input must be a clean client error, never a 500 (an unhandled
+    # crash accepted as a "pass" is exactly the regression this test exists to catch)
+    assert r.status_code in (400, 422)
 
 
 def test_decompress_point_requires_field(admin):

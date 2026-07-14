@@ -41,7 +41,7 @@ def derive_key_from_password(password: str, salt: str) -> bytes:
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt.encode(),
-        iterations=100000  # OWASP recommended minimum
+        iterations=600000  # OWASP 2023 guidance for PBKDF2-HMAC-SHA256; MUST match the runtime decryptor
     )
     return base64.urlsafe_b64encode(kdf.derive(password.encode()))
 
@@ -170,7 +170,7 @@ def create_secure_env(password: str, secrets: dict) -> tuple[str, str, str]:
         f"API_SSL_CERTFILE={os.getenv('API_SSL_CERTFILE', './certs/cert.pem')}",
         f"API_SSL_KEYFILE={os.getenv('API_SSL_KEYFILE', './certs/key.pem')}",
         "",
-        f"ENVIRONMENT={os.getenv('ENVIRONMENT', 'development')}",
+        f"ENVIRONMENT={os.getenv('ENVIRONMENT', 'production')}",
         "",
         f"JWT_ALGORITHM={os.getenv('JWT_ALGORITHM', 'HS256')}",
         f"JWT_ACCESS_TOKEN_EXPIRE_MINUTES={os.getenv('JWT_ACCESS_TOKEN_EXPIRE_MINUTES', '30')}",
@@ -215,24 +215,30 @@ def main():
     print("\n🔒 Encrypting credentials...")
     secure_content, salt, password_hash = create_secure_env(password, secrets)
     
-    # Backup current .env
+    # Backup current .env, and restrict it to 0600 -- it still holds PLAINTEXT secrets until the
+    # operator confirms the encrypted .env works and removes it.
     backup_path = Path(".env.backup")
     if Path(".env").exists():
-        print(f"\n💾 Backing up current .env to {backup_path}")
+        print(f"\n💾 Backing up current .env to {backup_path} (mode 0600)")
         Path(".env").rename(backup_path)
-    
-    # Write new .env.secure
+        os.chmod(backup_path, 0o600)
+
+    # Write new .env.secure (0600 -- it holds the master-password hash + salt).
     secure_path = Path(".env.secure")
     with open(secure_path, 'w') as f:
         f.write(secure_content)
-    
+    os.chmod(secure_path, 0o600)
+
     print(f"✅ Created {secure_path}")
-    
-    # Write new .env (same as .env.secure)
+
+    # Write new .env (same as .env.secure), 0600.
     with open(".env", 'w') as f:
         f.write(secure_content)
-    
-    print(f"✅ Created new .env")
+    os.chmod(".env", 0o600)
+
+    print("✅ Created new .env (mode 0600).")
+    print("   NOTE: .env.backup still holds your PLAINTEXT secrets — delete it once you've confirmed")
+    print("   the encrypted .env unlocks.")
     
     # Summary
     print("\n" + "="*60)

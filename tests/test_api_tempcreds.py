@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import uuid
 
 import pytest
+import requests
 
 
 def _u(prefix: str) -> str:
@@ -91,10 +92,12 @@ def test_deactivate_then_login_fails(admin):
     body = admin.post("/auth/temp-credentials", json={"validity_minutes": 60}).json()
     r = admin.post(f"/temp-creds/{body['temp_username']}/deactivate")
     assert r.status_code == 200
-    # a deactivated credential can no longer authenticate
+    # a deactivated credential can no longer authenticate -> a clean 401,
+    # not a 500 (pin the status so a crash can't masquerade as "rejected")
     anon = admin.clone_anonymous()
-    with pytest.raises(Exception):
+    with pytest.raises(requests.HTTPError) as exc_info:
         anon.login(body["temp_username"], body["credential"])
+    assert exc_info.value.response.status_code == 401
 
 
 def test_terminate_sessions(admin):
@@ -123,9 +126,10 @@ def test_admin_creates_temp_cred_for_user(admin, temp_user):
 
 
 def test_temp_create_requires_permission(temp_user_client):
-    # default 'user' role lacks TEMP_CREDS_MANAGE
+    # the default 'user' role is granted TEMP_CREDS_MANAGE (see api_catalog), so a
+    # regular non-admin user can mint their own temporary credentials -> 200.
     r = temp_user_client.post("/auth/temp-credentials", json={"validity_minutes": 30})
-    assert r.status_code in (200, 403)  # depends on default role grants
+    assert r.status_code == 200
 
 
 def _temp_client(admin, **kw):

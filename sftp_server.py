@@ -887,6 +887,12 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 return paramiko.SFTP_FAILURE
             self._audit(user, "file_delete", str(fid),
                         {"vault_id": str(vault.id), "via": "sftp"})
+            # Feed the bulk-deletion detector (best-effort; must never fail the delete).
+            try:
+                from security_monitor import get_security_monitor
+                get_security_monitor(db).record_file_deletion(str(user.id), str(vault.id), file_count=1)
+            except Exception:
+                pass
             return paramiko.SFTP_OK
 
     def rename(self, oldpath: str, newpath: str):
@@ -1022,9 +1028,11 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             # Recursively wipe contained files (storage + rows + stats), then
             # sub-folders, then the folder — mirrors the web delete_folder handler.
             def _purge(fid):
+                n = 0
                 for child in db.query(File).filter(File.folder_id == fid).all():
                     try:
                         vault_service.delete_file(child.id, user)
+                        n += 1
                     except PermissionDeniedError:
                         # Never destroy a file the caller can't delete — abort the whole
                         # rmdir (defense-in-depth behind the vault-level DELETE gate above).
@@ -1032,14 +1040,23 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                     except Exception as ex:  # noqa: BLE001
                         print(f"⚠️ rmdir: failed to delete file {child.id}: {ex}")
                 for sub in db.query(Folder).filter(Folder.parent_folder_id == fid).all():
-                    _purge(sub.id)
+                    n += _purge(sub.id)
                     db.delete(sub)
+                return n
             try:
-                _purge(folder_id)
+                _rmdir_deleted = _purge(folder_id)
                 folder = db.query(Folder).filter(Folder.id == folder_id).first()
                 if folder is not None:
                     db.delete(folder)
                 db.commit()
+                # Feed the whole subtree to the bulk-deletion detector as ONE record (SFTP rmdir is a
+                # high-throughput deletion vector). Best-effort: monitoring must never fail the rmdir.
+                if _rmdir_deleted:
+                    try:
+                        from security_monitor import get_security_monitor
+                        get_security_monitor(db).record_file_deletion(str(user.id), str(vault.id), file_count=_rmdir_deleted)
+                    except Exception:
+                        pass
             except PermissionDeniedError:
                 db.rollback()
                 return paramiko.SFTP_PERMISSION_DENIED
@@ -1081,32 +1098,57 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
 # (ip, username) — not ip alone — means many users behind one NAT/bastion/CGNAT egress IP don't
 # share a single counter (which would false-positive-lock unrelated clients), and a success
 # only clears that principal's budget. It rides the rate-limiter's circuit breaker and fails
-# OPEN on a Redis outage — the account lockout + is_active/is_locked checks stay the primary
-# controls; this is a DoS/enumeration bound, not a credential control.
+# CLOSED to a durable DB fallback on a Redis outage (a successful auth clears both counters), so
+# the bound survives an outage without locking out a healthy client — the account lockout +
+# is_active/is_locked checks stay the primary controls; this is a DoS/enumeration bound, not a
+# credential control.
 def _sftp_key_id(ip: str, username: str) -> str:
     return f"sftp_pk:{ip}:{username}"
 
 
 def _sftp_key_throttled(ip: str, username: str) -> bool:
-    """True if (ip, username) has exceeded its SSH-key offer budget in the current window."""
+    """True if (ip, username) has exceeded its SSH-key offer budget in the current window.
+
+    Fails CLOSED to a durable DB fallback on a Redis outage (mirroring the password login throttle
+    in AuthService): a Redis outage must not silently lift the flood / username-enumeration bound on
+    key offers, which is exactly what returning "not throttled" here used to do."""
+    from rate_limiter import rate_limiter, RateLimiterUnavailable
+    limit = settings.rate_limit_sftp_key_attempts
+    window = settings.rate_limit_login_window_seconds
     try:
-        from rate_limiter import rate_limiter
         allowed, _, _ = rate_limiter.check_rate_limit(
-            _sftp_key_id(ip, username),
-            settings.rate_limit_sftp_key_attempts,
-            settings.rate_limit_login_window_seconds,
-            fail_open=True,
+            _sftp_key_id(ip, username), limit, window, fail_open=False,
         )
         return not allowed
+    except RateLimiterUnavailable:
+        # Redis down / breaker open -> the same durable DB throttle the password path uses.
+        allowed, _ = AuthService._db_throttle_hit(f"{ip}:{username}", "sftp_pk", limit, window)
+        return not allowed
     except Exception:
-        return False  # never let the throttle itself break auth
+        # Any other unexpected error: fail CLOSED (treat as throttled) rather than lift the bound.
+        return True
 
 
 def _sftp_key_clear(ip: str, username: str) -> None:
-    """Reset this principal's key-offer counter after a successful key auth."""
+    """Reset this principal's key-offer counter after a successful key auth -- BOTH the Redis counter
+    and the durable DB-fallback row -- so a healthy (frequently reconnecting, multi-key) client never
+    trips the throttle, including while Redis is down and the DB fallback is doing the counting."""
     try:
         from database import redis_client
         redis_client.delete(f"rate_limit:{_sftp_key_id(ip, username)}")
+    except Exception:
+        pass
+    # The Redis-outage fallback (_sftp_key_throttled) counts offers in a durable RateLimitRecord row;
+    # clear it on success too, or a legitimate client that keeps authenticating would accumulate offers
+    # it never resets and eventually lock itself out mid-window. Best-effort, own short-lived session.
+    try:
+        from database import get_db_context
+        from models import RateLimitRecord
+        with get_db_context() as db:
+            db.query(RateLimitRecord).filter(
+                RateLimitRecord.identifier == f"{ip}:{username}",
+                RateLimitRecord.action == "sftp_pk",
+            ).delete(synchronize_session=False)
     except Exception:
         pass
 
@@ -1210,7 +1252,8 @@ class SFTPServer(paramiko.ServerInterface):
             return paramiko.AUTH_FAILED
         # Per-(IP, username) throttle: bound a flood of key offers / key-and-username
         # enumeration. Each offer counts; a successful auth clears this principal's counter
-        # (below) so a healthy client never trips it. Fails open on a Redis outage.
+        # (below) so a healthy client never trips it. Fails CLOSED to a durable DB fallback on a
+        # Redis outage.
         if _sftp_key_throttled(self.client_address, username):
             return paramiko.AUTH_FAILED
         try:
@@ -1306,15 +1349,31 @@ def listen_for_terminations():
                 port=settings.redis_port,
                 db=settings.redis_db,
                 password=settings.redis_password if settings.redis_password else None,
-                decode_responses=True
+                decode_responses=True,
+                # Match the shared client settings (database.py) so a HALF-OPEN socket — a Redis blip
+                # that drops the TCP connection WITHOUT a clean close — is detected instead of blocking
+                # forever, which would silently disable live SFTP revocation until the process restarts.
+                # socket_keepalive + health_check_interval actively probe an idle pub/sub connection;
+                # socket_timeout bounds every read (incl. the health-check PONG) and socket_connect_timeout
+                # bounds reconnects.
+                socket_connect_timeout=settings.redis_connect_timeout,
+                socket_timeout=settings.redis_socket_timeout,
+                socket_keepalive=True,
+                health_check_interval=30,
             )
             pubsub = r.pubsub()
             pubsub.subscribe('session_terminations')
 
             print("👂 Listening for session termination signals...")
 
-            for message in pubsub.listen():
-                if message['type'] == 'message':
+            while True:
+                # Bounded poll, never an unbounded listen(): returns None on an idle tick, so
+                # health_check_interval can fire a PING and surface a dead/half-open socket promptly
+                # (raising into the reconnect loop below) instead of hanging.
+                message = pubsub.get_message(timeout=1.0)
+                if message is None:
+                    continue
+                if message.get('type') == 'message':
                     try:
                         data = json.loads(message['data'])
                         session_token = data.get('session_token')
@@ -1333,8 +1392,9 @@ def listen_for_terminations():
                         print(f"❌ Error processing termination signal: {e}")
 
         except Exception as e:
-            # Connection lost (e.g. Redis restarted) — back off briefly, then
-            # reconnect and resubscribe so revocation self-heals after the outage.
+            # Connection lost / health-check failed (Redis restarted, or a half-open socket surfaced
+            # by health_check_interval) — back off briefly, then reconnect + resubscribe so revocation
+            # self-heals after the outage.
             print(f"❌ Termination listener connection lost; reconnecting in 5s: {e}")
             time.sleep(5)
 

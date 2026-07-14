@@ -64,6 +64,18 @@ def test_admin_cannot_delete_self(admin):
     assert r.status_code == 400
 
 
+def test_delete_user_owning_vault_returns_409(admin, temp_user, temp_user_client):
+    # A user who still owns a vault can't be hard-deleted (Vault.owner_id is NOT NULL) -> a clear 409
+    # with guidance, not an opaque 500.
+    v = temp_user_client.create_vault()
+    try:
+        r = admin.post(f"/users/{temp_user['id']}/delete")
+        assert r.status_code == 409, r.text
+        assert "vault" in r.json()["detail"].lower()
+    finally:
+        temp_user_client.delete_vault(v["id"])
+
+
 # ---- authorization: non-admin is forbidden on admin endpoints -------------
 def test_non_admin_cannot_list_users(temp_user_client):
     r = temp_user_client.get("/users")
@@ -145,3 +157,19 @@ def test_etag_conditional_on_users_list(admin):
         return  # endpoint may not emit an ETag in all builds
     r2 = admin.get("/api/user-management/users", headers={"If-None-Match": etag})
     assert r2.status_code in (200, 304)
+
+
+def test_etag_star_and_weak_match_304(admin):
+    # RFC 7232: If-None-Match "*" and a weak (W/) validator must both yield 304 on an unchanged
+    # resource, and a comma-list where one tag matches must too.
+    r1 = admin.get("/api/user-management/users")
+    etag = r1.headers.get("ETag")
+    if not etag:
+        return
+    # Only meaningful if this build actually 304s on an exact match.
+    if admin.get("/api/user-management/users", headers={"If-None-Match": etag}).status_code != 304:
+        return
+    assert admin.get("/api/user-management/users", headers={"If-None-Match": "*"}).status_code == 304
+    assert admin.get("/api/user-management/users", headers={"If-None-Match": f"W/{etag}"}).status_code == 304
+    assert admin.get("/api/user-management/users",
+                     headers={"If-None-Match": f'"deadbeef", {etag}'}).status_code == 304
