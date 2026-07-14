@@ -23,17 +23,34 @@ Licensed under **AGPL-3.0** — self-host it freely.
 
 ## Quick start — production (HTTPS)
 
-On a Linux host with Docker, one script sets up everything for production:
+DockVault is meant to run in **production**: HTTPS with a real (or self-signed) TLS certificate,
+`ENVIRONMENT=production`, and Postgres/Redis kept off the host network. One script does the whole
+setup — it writes `.env` with freshly generated secrets, provisions the TLS certificate, and starts
+the HTTPS-only stack (web UI/API on port **443**, TLS terminated in-container, no plaintext
+listener; optional SFTP).
+
+**Linux** — interactive; collects your domain and TLS choice (Let's Encrypt, self-signed, or
+bring-your-own certificate):
 
 ```bash
 sudo ./setup-secure.sh
 ```
 
-It is interactive and idempotent: it collects your domain and TLS choice (Let's Encrypt,
-self-signed, or bring-your-own certificate), writes `.env` with freshly generated secrets,
-provisions the certificates, and starts the HTTPS-only stack — the web UI/API on port **443**
-(TLS terminated in-container, no plaintext listener) plus optional SFTP. Re-run it any time to
-rebuild; it **reuses your existing `.env`** and keeps your data.
+**Windows** (Docker Desktop) — self-signed by default, or point it at your own certificate:
+
+```powershell
+./setup-secure.ps1 -ServerName vault.example.com
+# ...or bring your own certificate (recommended for anything public):
+./setup-secure.ps1 -ServerName vault.example.com -CertMode byo -CertPath fullchain.pem -KeyPath privkey.pem
+```
+
+Both are idempotent — re-run any time to rebuild; they **reuse your existing `.env`** and keep your
+data. Both start `docker-compose.secure.yml`, which you can also run directly once `./.env` and
+`./certs/{cert.pem,key.pem}` exist:
+
+```bash
+docker compose -f docker-compose.secure.yml up -d --build
+```
 
 Then open `https://<your-domain>` and complete the first-run setup wizard to create your admin
 account. No license key, no activation.
@@ -43,11 +60,11 @@ account. No license key, no activation.
 > `docker compose -f docker-compose.secure.yml down -v` then re-run the script. This destroys
 > stored data, so only do it before you have real vaults.
 
-### Local trial (HTTP, no TLS)
+### Local trial only (HTTP, no TLS) — not for real use
 
-For a quick test on your own machine without certificates. This binds to **loopback only**
-(`127.0.0.1:8200`) because it serves the product over plaintext HTTP — don't expose it to a network;
-use the HTTPS quick start above for anything reachable.
+A throwaway way to click around on your own machine. It serves the product over **plaintext HTTP**
+bound to **loopback only** (`127.0.0.1:8200`) and runs in development mode, so it is **not a
+supported way to hold real data** — use the production setup above for anything reachable or real.
 
 ```bash
 cp .env.example .env      # then edit it: set ENCRYPTION_KEY, JWT_SECRET_KEY, VAULT_DB_PASSWORD, and

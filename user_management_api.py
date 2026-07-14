@@ -527,7 +527,16 @@ async def toggle_user_active(
     # Prevent self-deactivation
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot deactivate your own account")
-    
+
+    # Reactivating a user consumes a seat, so enforce the plan's user cap on the
+    # inactive->active transition here too (mirrors the PATCH /users/{id} path). create_user
+    # and that PATCH are otherwise the only checkpoints, which an admin at the cap could
+    # sidestep by deactivating a user, creating a replacement (allowed — a seat freed up),
+    # then reactivating the original via this toggle to land above the cap.
+    if not user.is_active:
+        from api_server import _enforce_user_cap
+        _enforce_user_cap(db)
+
     user.is_active = not user.is_active
     # Offboarding: deactivating a user blacklists their zero-knowledge vault keys.
     if not user.is_active:
@@ -622,16 +631,20 @@ async def list_user_temp_credentials(
     if current_user.role != RoleEnum.ADMIN and current_user.id != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # A scoped temp session sees ONLY the credentials IT created — never the target
-    # user's full listing (whose id UUIDs are exactly what the by-id deactivate/delete
-    # endpoints consume). Mirrors the scoped-session discipline of api_server.py's
-    # /temp-creds/list; without it a scoped admin delegate (role==ADMIN, temp.view)
-    # could enumerate any user's credential ids via this parallel router.
-    if getattr(current_user, '_is_temp_session', False) and getattr(current_user, '_temp_scope', None) is not None:
-        temp_creds = db.query(TemporaryCredential).filter(
-            TemporaryCredential.user_id == user_id,
-            TemporaryCredential.created_by_temp_credential_id == current_user._temp_cred_id,
-        ).order_by(TemporaryCredential.created_at.desc()).all()
+    # A temp session (scoped OR legacy NULL-scope) sees ONLY the credentials IT created — never
+    # the target user's full listing (whose id UUIDs are exactly what the by-id deactivate/delete
+    # endpoints consume). Mirrors api_server.py's /temp-creds/list; without it a legacy admin-minted
+    # temp credential (role==ADMIN, _temp_scope==None) could enumerate any user's credential ids via
+    # this parallel router. A degraded temp session with no cred id fails closed (empty).
+    if getattr(current_user, '_is_temp_session', False):
+        _my_cred_id = getattr(current_user, '_temp_cred_id', None)
+        temp_creds = (
+            db.query(TemporaryCredential).filter(
+                TemporaryCredential.user_id == user_id,
+                TemporaryCredential.created_by_temp_credential_id == _my_cred_id,
+            ).order_by(TemporaryCredential.created_at.desc()).all()
+            if _my_cred_id is not None else []
+        )
     else:
         temp_creds = db.query(TemporaryCredential).filter(
             TemporaryCredential.user_id == user_id

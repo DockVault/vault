@@ -157,6 +157,22 @@ def test_login_and_sftp_throttles_fail_closed():
         "the SFTP throttle must not swallow errors to 'not throttled'"
 
 
+def test_toggle_active_enforces_seat_cap_on_reactivation():
+    # Re-activating a user consumes a seat, so the toggle-active endpoint must enforce the plan's
+    # user cap on the inactive->active transition -- otherwise an admin at the cap could deactivate
+    # a user, create a replacement (a seat freed up), then reactivate the original via the toggle to
+    # land above the cap. The cap can't be exercised against an uncapped live instance, so this
+    # static guard locks the wiring (mirrors the already-guarded PATCH /users/{id} path).
+    src = _read("user_management_api.py")
+    body = src[src.index("async def toggle_user_active"):src.index("async def toggle_user_locked")]
+    assert "_enforce_user_cap" in body, \
+        "toggle-active must enforce the seat cap on reactivation"
+    assert "if not user.is_active:" in body, \
+        "the seat-cap check must gate on the inactive->active (reactivation) transition"
+    assert body.index("_enforce_user_cap") < body.index("user.is_active = not user.is_active"), \
+        "the seat-cap check must run BEFORE is_active is flipped (so the active count excludes this user)"
+
+
 def test_sftp_revocation_subscriber_survives_half_open_redis():
     # The SFTP session-termination pub/sub subscriber must bound its socket and actively
     # health-check, so a HALF-OPEN Redis connection (TCP dropped without a clean close) is detected
@@ -448,11 +464,15 @@ def test_deploy_scripts_hardened():
     assert "ALLOWED_HOSTS" in ss, "setup-secure.sh must write ALLOWED_HOSTS"
 
 
-def test_public_docs_do_not_reference_windows_dev_scripts():
-    # This repo ships no scripts/ dir; operator docs must not point a self-hoster at a Windows-only
-    # dev helper (a .ps1 file), which doesn't exist here and only misdirects.
+def test_public_docs_reference_only_shipped_windows_scripts():
+    # Operator docs MAY reference a Windows helper that actually ships in this repo (e.g.
+    # setup-secure.ps1), but must never point a self-hoster at a .ps1 that isn't part of this repo
+    # (a dev-only helper that doesn't ship here), which would only misdirect.
+    import re
     for name in (".env.example", "docker-compose.yml", "README.md"):
-        assert ".ps1" not in _read(name), f"{name} references a nonexistent Windows dev script"
+        for script in re.findall(r"[A-Za-z0-9_-]+\.ps1", _read(name)):
+            assert (ROOT / script).exists(), \
+                f"{name} references a Windows script that is not shipped here: {script}"
 
 
 def test_user_detail_endpoints_enforce_ownership():

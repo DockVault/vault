@@ -258,6 +258,70 @@ def test_interactive_admin_still_reads_admin_routes(admin):
     assert admin.get("/groups").status_code == 200
 
 
+def test_null_scope_temp_cred_confined_to_own_subtree(admin, temp_admin_client):
+    # A NULL-scope (legacy) temp credential keeps role==ADMIN, but must be confined to its OWN
+    # subtree: it must not see or manage temp credentials it did not create (owner decision to
+    # confine the legacy "NULL scope = unrestricted" contract). Uses the admin as a control: the
+    # real interactive admin still sees/manages the sibling; the NULL-scope temp cred does not.
+    sibling = admin.post("/auth/temp-credentials", json={"note": unique("sibling")}).json()
+    try:
+        # Control: the real admin sees the sibling in the deployment-wide list.
+        admin_usernames = {c["temp_username"] for c in admin.get("/temp-creds/list").json()}
+        assert sibling["temp_username"] in admin_usernames, "admin should see the sibling (control)"
+
+        # READ confinement: the NULL-scope temp admin must NOT see a credential it didn't create.
+        listed = temp_admin_client.get("/temp-creds/list")
+        assert listed.status_code in (200, 304), listed.text
+        temp_usernames = {c["temp_username"] for c in listed.json()}
+        assert sibling["temp_username"] not in temp_usernames, \
+            "a NULL-scope temp cred must not see a credential it did not create"
+
+        # MUTATE confinement: nor deactivate/delete it (before the fix the guard was a NULL-scope no-op).
+        assert temp_admin_client.post(
+            f"/temp-creds/{sibling['temp_username']}/deactivate").status_code == 403
+        assert temp_admin_client.post(
+            f"/temp-creds/{sibling['temp_username']}/delete").status_code == 403
+        # The parallel user-management router endpoint must be confined too (it lists a user's temp
+        # creds by id; a legacy temp admin keeps role==ADMIN so the ownership guard alone lets it read).
+        admin_id = admin.get("/users/me").json()["id"]
+        assert sibling["temp_username"] in {
+            c["temp_username"] for c in admin.get(f"/api/user-management/users/{admin_id}/temp-credentials").json()
+        }, "admin should see the sibling via the router (control)"
+        router_view = temp_admin_client.get(f"/api/user-management/users/{admin_id}/temp-credentials")
+        assert router_view.status_code in (200, 304), router_view.text
+        assert sibling["temp_username"] not in {c["temp_username"] for c in router_view.json()}, \
+            "a NULL-scope temp cred must not enumerate a sibling via the user-management router either"
+
+        # ...and the sibling is still there afterwards (the 403s did not mutate it).
+        assert sibling["temp_username"] in {c["temp_username"] for c in admin.get("/temp-creds/list").json()}
+    finally:
+        admin.post(f"/temp-creds/{sibling['temp_username']}/delete")
+
+
+def test_null_scope_temp_cred_manages_its_own_children(admin):
+    # Confinement stamps the creating session on each child (scoped OR legacy NULL-scope), so a legacy
+    # temp cred that can delegate still SEES and MANAGES the credentials it creates (its own subtree is
+    # not empty). Without the stamping fix its children would carry a NULL creator it could never match.
+    parent = admin.post("/auth/temp-credentials", json={
+        "note": unique("parent"), "can_create_temp_credentials": True,
+    }).json()
+    pc = ApiClient(BASE_URL)
+    pc.login(parent["temp_username"], parent["credential"])
+    child_r = pc.post("/auth/temp-credentials", json={"note": unique("child")})
+    if child_r.status_code != 200:
+        pytest.skip(f"a legacy temp cred cannot create children here ({child_r.status_code})")
+    child = child_r.json()
+    try:
+        listed = pc.get("/temp-creds/list")
+        assert listed.status_code in (200, 304), listed.text
+        assert child["temp_username"] in {c["temp_username"] for c in listed.json()}, \
+            "a legacy temp cred must see the child it created"
+        # It may manage its own child (deactivate -> 200, not the confinement 403).
+        assert pc.post(f"/temp-creds/{child['temp_username']}/deactivate").status_code == 200
+    finally:
+        admin.post(f"/temp-creds/{child['temp_username']}/delete")
+
+
 def test_user_view_grant_does_not_permit_reading_another_users_record(admin, temp_user):
     # IDOR guard: granting the (admin-default) USER_VIEW permission to a non-admin must NOT let them
     # read ANOTHER user's record — the catalog's requires_ownership flag is display-only, so the

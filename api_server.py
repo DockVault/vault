@@ -2296,7 +2296,11 @@ async def create_temp_credentials(
     req_mode = (payload.vault_access_mode if (payload and payload.vault_access_mode) else 'selected')
     req_vaults = payload.selected_vaults if payload else None
     parent_scope = parent_mode = parent_vault_ids = parent_vault_caps = None
-    created_by_temp_id = None
+    # Stamp the creating temp session on every child (scoped OR legacy NULL-scope) so the child
+    # lands in the creator's confinement subtree and stays visible/manageable by it. Without this a
+    # legacy temp session would mint children with a NULL creator that its own confined list/guard
+    # (which match created_by == this session's cred id) could never see or manage.
+    created_by_temp_id = getattr(current_user, '_temp_cred_id', None) if is_temp else None
     if is_temp and scoped:
         actor_temp = (current_user._temp_scope or {}).get('temp', {})
         # A child may only receive create/delegate if THIS cred holds delegate. Force
@@ -2317,7 +2321,6 @@ async def create_temp_credentials(
         parent_mode = getattr(current_user, '_temp_vault_mode', 'selected')
         parent_vault_caps = getattr(current_user, '_temp_vault_caps', {}) or {}
         parent_vault_ids = list(parent_vault_caps.keys())
-        created_by_temp_id = getattr(current_user, '_temp_cred_id', None)
 
     temp_creds = auth_service.create_temporary_credential(
         current_user.id,
@@ -2363,12 +2366,18 @@ async def list_temp_credentials(
     from models import TemporaryCredential, ActiveSession
     from datetime import datetime
     
-    # A scoped temp session sees only the credentials IT created (never the main
-    # account's). Otherwise: admins see all, users see their own.
-    if getattr(current_user, '_is_temp_session', False) and getattr(current_user, '_temp_scope', None) is not None:
-        temp_creds = db.query(TemporaryCredential).filter(
-            TemporaryCredential.created_by_temp_credential_id == current_user._temp_cred_id
-        ).order_by(TemporaryCredential.created_at.desc()).all()
+    # A temp session (scoped OR legacy NULL-scope) sees only the credentials IT created —
+    # never the whole deployment's, even though a NULL-scope temp cred keeps the admin role.
+    # A degraded temp session whose cred id could not be loaded fails closed (empty).
+    # Otherwise: admins see all, users see their own.
+    if getattr(current_user, '_is_temp_session', False):
+        _my_cred_id = getattr(current_user, '_temp_cred_id', None)
+        temp_creds = (
+            db.query(TemporaryCredential).filter(
+                TemporaryCredential.created_by_temp_credential_id == _my_cred_id
+            ).order_by(TemporaryCredential.created_at.desc()).all()
+            if _my_cred_id is not None else []
+        )
     elif current_user.role == RoleEnum.ADMIN:
         temp_creds = db.query(TemporaryCredential).order_by(TemporaryCredential.created_at.desc()).all()
     else:
@@ -2488,17 +2497,22 @@ async def get_temp_credential_password(
 
 
 def _guard_temp_session_cred_mutation(current_user, temp_cred, perm: str):
-    """For a scoped temp session: require the temp.<perm> sub-permission and limit
-    the target to credentials THIS temp cred created (never the main account's or a
-    sibling's). No-op for normal sessions and legacy temp creds. Also closes the
-    admin-bypass leak: a temp session of an admin is still restricted here."""
+    """For a temp session (scoped OR legacy NULL-scope): limit the target to credentials
+    THIS temp cred created — never the main account's or a sibling's. A scoped session
+    additionally needs the temp.<perm> sub-permission; a legacy NULL-scope session keeps
+    its broader in-subtree latitude (no sub-perm gate) but is still confined to its own
+    subtree. No-op for normal (non-temp) sessions. Closes the admin-bypass leak: a temp
+    session of an admin is still restricted here."""
     if not getattr(current_user, '_is_temp_session', False):
         return
-    if getattr(current_user, '_temp_scope', None) is None:
-        return  # legacy temp cred keeps prior behavior
-    from temp_scope import require_temp_perm
-    require_temp_perm(current_user, perm)
-    if temp_cred.created_by_temp_credential_id != getattr(current_user, '_temp_cred_id', None):
+    if getattr(current_user, '_temp_scope', None) is not None:
+        from temp_scope import require_temp_perm
+        require_temp_perm(current_user, perm)
+    # Confine to credentials this temp session created. A degraded temp session whose cred id
+    # could not be loaded (the fail-safe branch in get_current_user) has no subtree of its own,
+    # so it fails closed rather than matching credentials with a NULL creator.
+    _my_cred_id = getattr(current_user, '_temp_cred_id', None)
+    if _my_cred_id is None or temp_cred.created_by_temp_credential_id != _my_cred_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="A temporary account may only manage credentials it created."
