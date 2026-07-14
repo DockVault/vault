@@ -100,6 +100,63 @@ def test_error_paths_do_not_leak_exception_text():
         "the duplicate-register race must map to a generic 409, not a str(e) 400"
 
 
+def test_db_throttle_hit_counts_and_denies():
+    # The durable DB-fallback throttle (now shared by the password login path AND the SFTP key-offer
+    # path) must count attempts and deny over its limit. Also proves it is a reusable @staticmethod
+    # callable without an AuthService instance.
+    proc = _in_container(args=[
+        "python", "-c",
+        "import uuid; from auth_service import AuthService; "
+        "k='thr-'+uuid.uuid4().hex; "
+        "res=[AuthService._db_throttle_hit(k,'thr_probe',2,60) for _ in range(3)]; "
+        "print('ALLOWED='+str([a for a,_ in res])); print('RETRY3='+str(res[2][1]))"
+    ])
+    assert "ALLOWED=[True, True, False]" in proc.stdout, f"{proc.stdout}\n{proc.stderr}"
+    assert "RETRY3=0" not in proc.stdout, "an over-limit deny must carry a positive retry-after"
+
+
+def test_sftp_key_clear_resets_db_fallback_row():
+    # A successful SSH key auth must clear the DURABLE DB-fallback counter (not only the Redis one),
+    # or a legitimate multi-key client would accumulate offers it never resets and lock itself out
+    # mid-window while Redis is down (the counting fallback path). ip in TEST-NET-3 so no collision.
+    script = "\n".join([
+        "import uuid",
+        "from auth_service import AuthService",
+        "from sftp_server import _sftp_key_clear",
+        "from database import get_db_context",
+        "from models import RateLimitRecord",
+        "ip = '203.0.113.7'",
+        "u = 'probe-' + uuid.uuid4().hex[:8]",
+        "ident = ip + ':' + u",
+        "for _ in range(3):",
+        "    AuthService._db_throttle_hit(ident, 'sftp_pk', 2, 300)",
+        "with get_db_context() as db:",
+        "    before = db.query(RateLimitRecord).filter(RateLimitRecord.identifier==ident, RateLimitRecord.action=='sftp_pk').count()",
+        "_sftp_key_clear(ip, u)",
+        "with get_db_context() as db:",
+        "    after = db.query(RateLimitRecord).filter(RateLimitRecord.identifier==ident, RateLimitRecord.action=='sftp_pk').count()",
+        "print('BEFORE=%d AFTER=%d' % (before, after))",
+    ])
+    proc = _in_container(args=["python", "-"], stdin=script)
+    assert "BEFORE=1 AFTER=0" in proc.stdout, f"{proc.stdout}\n{proc.stderr}"
+
+
+def test_login_and_sftp_throttles_fail_closed():
+    # Both the DB-fallback login throttle and the SFTP key-offer throttle must fail CLOSED on a Redis
+    # outage -- they used to fail OPEN (silently disabling throttling while Redis was down).
+    auth = _read("auth_service.py")
+    assert "Fails CLOSED" in auth, "the DB throttle fallback docstring should state fail-closed"
+    assert "return False, max(1, min(window, 5))" in auth, \
+        "the DB throttle must deny (not allow) on its own error"
+    sftp = _read("sftp_server.py")
+    body = sftp[sftp.index("def _sftp_key_throttled"):sftp.index("def _sftp_key_clear")]
+    assert "fail_open=False" in body, "the SFTP key throttle must ask the limiter to fail closed"
+    assert "except RateLimiterUnavailable" in body, "the SFTP key throttle must drop to the DB fallback"
+    assert "_db_throttle_hit" in body, "the SFTP key throttle must reuse the durable DB fallback"
+    assert "return False  # never let the throttle itself break auth" not in sftp, \
+        "the SFTP throttle must not swallow errors to 'not throttled'"
+
+
 def _import_config(env_overrides):
     return _in_container(env_overrides=env_overrides, args=["python", "-c", "import config"])
 

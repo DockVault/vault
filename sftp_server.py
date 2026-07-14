@@ -1081,32 +1081,57 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
 # (ip, username) — not ip alone — means many users behind one NAT/bastion/CGNAT egress IP don't
 # share a single counter (which would false-positive-lock unrelated clients), and a success
 # only clears that principal's budget. It rides the rate-limiter's circuit breaker and fails
-# OPEN on a Redis outage — the account lockout + is_active/is_locked checks stay the primary
-# controls; this is a DoS/enumeration bound, not a credential control.
+# CLOSED to a durable DB fallback on a Redis outage (a successful auth clears both counters), so
+# the bound survives an outage without locking out a healthy client — the account lockout +
+# is_active/is_locked checks stay the primary controls; this is a DoS/enumeration bound, not a
+# credential control.
 def _sftp_key_id(ip: str, username: str) -> str:
     return f"sftp_pk:{ip}:{username}"
 
 
 def _sftp_key_throttled(ip: str, username: str) -> bool:
-    """True if (ip, username) has exceeded its SSH-key offer budget in the current window."""
+    """True if (ip, username) has exceeded its SSH-key offer budget in the current window.
+
+    Fails CLOSED to a durable DB fallback on a Redis outage (mirroring the password login throttle
+    in AuthService): a Redis outage must not silently lift the flood / username-enumeration bound on
+    key offers, which is exactly what returning "not throttled" here used to do."""
+    from rate_limiter import rate_limiter, RateLimiterUnavailable
+    limit = settings.rate_limit_sftp_key_attempts
+    window = settings.rate_limit_login_window_seconds
     try:
-        from rate_limiter import rate_limiter
         allowed, _, _ = rate_limiter.check_rate_limit(
-            _sftp_key_id(ip, username),
-            settings.rate_limit_sftp_key_attempts,
-            settings.rate_limit_login_window_seconds,
-            fail_open=True,
+            _sftp_key_id(ip, username), limit, window, fail_open=False,
         )
         return not allowed
+    except RateLimiterUnavailable:
+        # Redis down / breaker open -> the same durable DB throttle the password path uses.
+        allowed, _ = AuthService._db_throttle_hit(f"{ip}:{username}", "sftp_pk", limit, window)
+        return not allowed
     except Exception:
-        return False  # never let the throttle itself break auth
+        # Any other unexpected error: fail CLOSED (treat as throttled) rather than lift the bound.
+        return True
 
 
 def _sftp_key_clear(ip: str, username: str) -> None:
-    """Reset this principal's key-offer counter after a successful key auth."""
+    """Reset this principal's key-offer counter after a successful key auth -- BOTH the Redis counter
+    and the durable DB-fallback row -- so a healthy (frequently reconnecting, multi-key) client never
+    trips the throttle, including while Redis is down and the DB fallback is doing the counting."""
     try:
         from database import redis_client
         redis_client.delete(f"rate_limit:{_sftp_key_id(ip, username)}")
+    except Exception:
+        pass
+    # The Redis-outage fallback (_sftp_key_throttled) counts offers in a durable RateLimitRecord row;
+    # clear it on success too, or a legitimate client that keeps authenticating would accumulate offers
+    # it never resets and eventually lock itself out mid-window. Best-effort, own short-lived session.
+    try:
+        from database import get_db_context
+        from models import RateLimitRecord
+        with get_db_context() as db:
+            db.query(RateLimitRecord).filter(
+                RateLimitRecord.identifier == f"{ip}:{username}",
+                RateLimitRecord.action == "sftp_pk",
+            ).delete(synchronize_session=False)
     except Exception:
         pass
 
@@ -1210,7 +1235,8 @@ class SFTPServer(paramiko.ServerInterface):
             return paramiko.AUTH_FAILED
         # Per-(IP, username) throttle: bound a flood of key offers / key-and-username
         # enumeration. Each offer counts; a successful auth clears this principal's counter
-        # (below) so a healthy client never trips it. Fails open on a Redis outage.
+        # (below) so a healthy client never trips it. Fails CLOSED to a durable DB fallback on a
+        # Redis outage.
         if _sftp_key_throttled(self.client_address, username):
             return paramiko.AUTH_FAILED
         try:
