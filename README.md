@@ -67,10 +67,27 @@ docker compose up -d      # web/API on http://localhost:8200
   new privileges; login throttling and account lockout are built in.
 - **Secrets:** all keys and passwords come from `.env`. Use fresh encryption/JWT keys per deployment.
 
+## Production checklist
+
+If you front the vault yourself (your own reverse proxy, k8s, `docker run`) rather than using
+`setup-secure.sh`, confirm all of these — `setup-secure.sh` handles or prompts you for most of them, but a
+README-only reader can miss them (the off-host key backup is always yours to do):
+
+- **Back up `ENCRYPTION_KEY` off the host** (e.g. a password manager). Without it, every stored file — and any
+  backup of the storage volume — is **permanently unrecoverable**.
+- **Change the seeded admin password.** Boot is refused with the shipped placeholder, but pick a strong one.
+- **Terminate TLS** in front of the app (or run it with `API_USE_HTTPS=true` + certs). Never expose plaintext.
+- **Restrict network exposure:** publish only the web/API (and SFTP if used) ports; keep Postgres/Redis on the
+  internal network. Set `REDIS_PASSWORD` and `ALLOWED_HOSTS` for defense-in-depth.
+- **Use fresh `ENCRYPTION_KEY` / `JWT_SECRET_KEY` per deployment.** You can rotate `JWT_SECRET_KEY` (it just
+  forces re-login) and passwords on a schedule, but **NEVER rotate `ENCRYPTION_KEY` on a vault that already
+  holds data** — it makes every stored file permanently undecryptable.
+
 ## Configuration
 
 Every setting lives in `.env`. Copy `.env.example`, which documents each key — database,
-Redis, encryption/JWT secrets, SFTP, rate limits, SMTP, and more.
+Redis, encryption/JWT secrets, SFTP, rate limits, and more. (Email/SMTP is configured in the
+admin UI → Settings, not in `.env`.)
 
 ## License
 

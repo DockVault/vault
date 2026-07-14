@@ -428,6 +428,22 @@ def test_deploy_scripts_hardened():
     assert "ALLOWED_HOSTS" in ss, "setup-secure.sh must write ALLOWED_HOSTS"
 
 
+def test_public_docs_do_not_reference_windows_dev_scripts():
+    # This repo ships no scripts/ dir; operator docs must not point a self-hoster at a Windows-only
+    # dev helper (a .ps1 file), which doesn't exist here and only misdirects.
+    for name in (".env.example", "docker-compose.yml", "README.md"):
+        assert ".ps1" not in _read(name), f"{name} references a nonexistent Windows dev script"
+
+
+def test_user_detail_endpoints_enforce_ownership():
+    # The endpoint-permission catalog's requires_ownership flag is display-only and is NOT enforced by
+    # require_endpoint_permission, so the user-detail handlers must enforce own-or-admin themselves: a
+    # non-admin explicitly granted USER_VIEW must not be able to read another user's record.
+    for name in ("api_server.py", "user_management_api.py"):
+        src = _read(name)
+        assert "current_user.id != user_id" in src, f"{name}: user-detail must enforce own-or-admin ownership"
+
+
 def _import_config(env_overrides):
     return _in_container(env_overrides=env_overrides, args=["python", "-c", "import config"])
 
