@@ -21,7 +21,9 @@ from ecc_crypto_service import ECCCryptoService
 from audit_logger import AuditLogger
 from rate_limiter import rate_limiter as _rate_limiter
 from endpoint_permissions import require_endpoint_permission
-from temp_scope import require_vault_cap, enforce_vault
+from temp_scope import (
+    require_vault_cap, enforce_vault, is_scoped, has_scoped_vault_cap, effective_vault_caps,
+)
 from cryptography.hazmat.primitives import serialization
 from datetime import datetime, timezone, timedelta
 
@@ -284,6 +286,12 @@ def _manages_any_vault(db: Session, user: User) -> bool:
     Scopes the public-key lookup so it is not a has-a-keypair enumeration oracle for arbitrary
     accounts. Does NOT break onboarding: the browser share/rekey flows always run as a manager
     of the vault they're sharing, and they fetch a not-yet-member recipient's key from here."""
+    # A SCOPED temp credential is confined to its scope, NOT the underlying admin's blanket
+    # role/ownership: it counts as a potential sharer (and may look up a recipient's public key) only
+    # if it actually holds a permissions-management capability on some granted vault. This stops the
+    # public-key lookup from being a has-a-keypair enumeration oracle any scoped credential could sweep.
+    if is_scoped(user):
+        return has_scoped_vault_cap(user, "vault.change_permissions")
     if getattr(user, 'role', None) == RoleEnum.ADMIN:
         return True
     if db.query(Vault.id).filter(Vault.owner_id == user.id).first():
@@ -731,6 +739,14 @@ async def get_vault_keys(
     # read path applies (vault_service.get_vault -> enforce_vault). Without it a cred scoped
     # to vault A could still read vault B's wrapped DEK here. No-op for normal principals.
     enforce_vault(current_user, vault_id)
+    # A scoped temp credential must also hold a capability, not just vault membership: reading the
+    # wrapped-DEK routing blob is a "see the vault's contents" action. Accept see_files OR
+    # change_permissions — the ZK SHARE (add-member) flow reads this to re-wrap the DEK for a new
+    # recipient, so a manage-permissions cred must be able to read it. No-op for normal principals.
+    if is_scoped(current_user) and not (
+        {"vault.see_files", "vault.change_permissions"} & set(effective_vault_caps(current_user, vault_id))
+    ):
+        raise HTTPException(status_code=403, detail="Temporary credential scope does not permit this action")
 
     # Close any authz/crypto divergence before handing out a key.
     _reconcile_orphan_member_keys(db, vault)
@@ -1145,6 +1161,13 @@ async def list_member_keys(
     # Confine a scoped temp credential to its granted vaults (parity with the standard read
     # path). Without it a cred scoped to vault A could enumerate vault B's member roster here.
     enforce_vault(current_user, vault_id)
+    # A scoped temp credential must also hold a permission-view (or -change) capability to enumerate
+    # the member roster (user ids) — a see_files-only cred should not read the permission surface, but
+    # a legitimate rekey cred (change_permissions) must. No-op for normal principals.
+    if is_scoped(current_user) and not (
+        {"vault.see_permissions", "vault.change_permissions"} & set(effective_vault_caps(current_user, vault_id))
+    ):
+        raise HTTPException(status_code=403, detail="Temporary credential scope does not permit this action")
 
     caller_key = db.query(VaultMemberKey).filter(
         VaultMemberKey.vault_id == vault_id,

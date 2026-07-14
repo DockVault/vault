@@ -4192,7 +4192,10 @@ async function testEmail() {
 // Load users for audit filter dropdown
 async function loadAuditFilterUsers() {
     try {
-        const users = await apiRequest('/users');
+        // Silent: an unrestricted (NULL-scope) temp credential is still shown the admin nav even
+        // though the backend now 403s these admin routes; degrade quietly here instead of firing a
+        // permission-denied toast. (Full temp-cred nav alignment is a separate follow-up.)
+        const users = await apiRequest('/users', { silent: true });
         const select = document.getElementById('audit-filter-user');
         
         if (select && users.length > 0) {

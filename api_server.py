@@ -875,6 +875,18 @@ async def get_current_user(
             TemporaryCredential.id == session.temp_credential_id
         ).first()
 
+        # Fail CLOSED: an ACTIVE temp session whose backing credential row is missing (a broken DB
+        # invariant — the FK is ON DELETE CASCADE and every deletion revokes the session in the same
+        # commit, so this is not reachable via a normal app flow) must NOT run as an unrestricted
+        # principal. Denying here is safer than proceeding as an unscoped session, which would no-op
+        # is_scoped() and every per-vault capability gate.
+        if temp_cred is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session has been terminated. Please login again.",
+                headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
+            )
+
         # Bound the session by the credential's OWN stated lifetime, not just the
         # inactivity grace window above: a temp cred past its validity window
         # (deactivate_at) or hard expiry (expires_at) must stop authorizing requests

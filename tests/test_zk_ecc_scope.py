@@ -73,7 +73,8 @@ def test_ecc_reads_confined_to_scoped_vaults(admin):
         vb = create_zk_vault(admin)   # NOT granted; admin (the creator) owns it
     vida, vidb = va["id"], vb["id"]
     try:
-        cred = _scoped_client(admin, ["vault.see_info", "vault.see_files"], vida)
+        # see_permissions is required to read the member roster (see the read-capability test below).
+        cred = _scoped_client(admin, ["vault.see_info", "vault.see_files", "vault.see_permissions"], vida)
         # In-scope vault A: the cred can still read its own DEK + roster.
         assert cred.get(f"/ecc/vaults/{vida}/keys").status_code == 200
         assert cred.get(f"/ecc/vaults/{vida}/member-keys").status_code == 200
@@ -84,3 +85,62 @@ def test_ecc_reads_confined_to_scoped_vaults(admin):
     finally:
         admin.delete_vault(vida)
         admin.delete_vault(vidb)
+
+
+def test_ecc_reads_require_view_capability(admin):
+    """A scoped temp cred needs the view capability, not just vault membership: reading the wrapped
+    DEK needs vault.see_files, the member roster needs vault.see_permissions (or change_permissions),
+    and the cross-account public-key lookup needs a permissions-management cap so it isn't a
+    has-a-keypair enumeration oracle any scoped credential could sweep."""
+    with _zk_enabled(admin):
+        vz = create_zk_vault(admin)
+    vid = vz["id"]
+    try:
+        target = str(uuid.uuid4())
+
+        # Granted the vault but with NO capabilities: membership alone must not unlock the reads.
+        nocaps = _scoped_client(admin, [], vid)
+        assert nocaps.get(f"/ecc/vaults/{vid}/keys").status_code == 403          # needs see_files
+        assert nocaps.get(f"/ecc/vaults/{vid}/member-keys").status_code == 403   # needs see_permissions
+        assert nocaps.get(f"/ecc/users/{target}/public-key").status_code == 403  # not a sharer
+
+        # see_files unlocks the DEK read but NOT the roster (a permission surface).
+        rf = _scoped_client(admin, ["vault.see_info", "vault.see_files"], vid)
+        assert rf.get(f"/ecc/vaults/{vid}/keys").status_code == 200
+        assert rf.get(f"/ecc/vaults/{vid}/member-keys").status_code == 403
+
+        # change_permissions makes the cred a legitimate sharer -> the public-key lookup is allowed,
+        # AND it may read the wrapped DEK: the ZK add-member SHARE flow reads /keys to re-wrap the DEK
+        # for a recipient, so a manage-permissions cred (even without see_files) must be able to.
+        mgr = _scoped_client(admin, ["vault.see_info", "vault.change_permissions"], vid)
+        assert mgr.get(f"/ecc/users/{target}/public-key").status_code == 200
+        assert mgr.get(f"/ecc/vaults/{vid}/keys").status_code == 200
+    finally:
+        admin.delete_vault(vid)
+
+
+def test_ecc_public_key_scope_all_mode(admin):
+    """has_scoped_vault_cap's 'all' vault-access-mode branch: an all-mode scoped cred is a sharer
+    (may look up a public key) only if change_permissions is in its default caps."""
+    with _zk_enabled(admin):
+        vz = create_zk_vault(admin)
+    vid = vz["id"]
+    try:
+        target = str(uuid.uuid4())
+
+        def _all_mode(caps):
+            scope = {"v": 1, "pages": ["vaults"], "caps": [], "vault_caps_default": caps,
+                     "temp": {"view": False, "create": False, "invalidate": False, "clear": False, "delegate": False}}
+            body = admin.post("/auth/temp-credentials", json={
+                "validity_minutes": 60, "scope": scope, "vault_access_mode": "all",
+            }).json()
+            c = admin.clone_anonymous()
+            c.login(body["temp_username"], body["credential"])
+            return c
+
+        # all-mode WITHOUT change_permissions -> not a sharer -> 403 on the public-key oracle.
+        assert _all_mode(["vault.see_files"]).get(f"/ecc/users/{target}/public-key").status_code == 403
+        # all-mode WITH change_permissions -> sharer -> 200.
+        assert _all_mode(["vault.change_permissions"]).get(f"/ecc/users/{target}/public-key").status_code == 200
+    finally:
+        admin.delete_vault(vid)

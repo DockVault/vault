@@ -94,6 +94,21 @@ def effective_vault_caps(user, vault_id) -> List[str]:
     return list((getattr(user, "_temp_vault_caps", {}) or {}).get(str(vault_id), []))
 
 
+def has_scoped_vault_cap(user, cap: str) -> bool:
+    """True if a SCOPED temp session holds `cap` on ANY vault it can reach (or as a global cap).
+    Returns False for non-scoped principals — use this ONLY to RESTRICT a scoped session (e.g. gate a
+    cross-vault "am I a sharer?" check), never to grant a session more than it has."""
+    if not is_scoped(user):
+        return False
+    scope = _scope(user) or {}
+    if cap in set(scope.get("caps", [])):
+        return True
+    if getattr(user, "_temp_vault_mode", "selected") == "all":
+        return cap in set(scope.get("vault_caps_default", []))
+    caps_map = getattr(user, "_temp_vault_caps", {}) or {}
+    return any(cap in set(v or []) for v in caps_map.values())
+
+
 def attach_scope(db, user, temp_cred) -> None:
     """Tag a principal (User) with its temp credential's scope context so every
     enforcement helper here can read it. Used by BOTH the auth path (web login +
