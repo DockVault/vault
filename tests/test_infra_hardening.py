@@ -386,6 +386,20 @@ def test_normalize_scope_tolerates_bad_list_fields_and_rotate_key_cap():
     assert "OK=True ROTATE=True" in proc.stdout, f"{proc.stdout}\n{proc.stderr}"
 
 
+def test_temp_credential_auth_equalizes_timing():
+    # A missing / inactive / used / expired temp credential must not be distinguishable from a live
+    # one by response time: authenticate_temporary_credential does a dummy verify on the not-found
+    # branch and verifies the credential BEFORE any state branch (mirroring authenticate_user).
+    src = _read("auth_service.py")
+    start = src.index("def authenticate_temporary_credential")
+    body = src[start:src.index("\n    def ", start + 1)]
+    assert "verify_temporary_credential(credential, _DUMMY_PASSWORD_HASH)" in body, \
+        "the not-found branch must do a constant-cost dummy verify"
+    real = body.index("verify_temporary_credential(credential, temp_cred.credential_hash)")
+    state = body.index("temp_cred.is_active")
+    assert real < state, "the credential must be verified BEFORE the is_active/used/expired state checks"
+
+
 def _import_config(env_overrides):
     return _in_container(env_overrides=env_overrides, args=["python", "-c", "import config"])
 

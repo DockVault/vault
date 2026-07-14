@@ -275,21 +275,31 @@ class AuthService:
         ).first()
         
         if not temp_cred:
+            # Equalize timing with the real verify path so an absent temp_username isn't
+            # distinguishable by response time (temp-credential-enumeration oracle). Mirrors
+            # authenticate_user's dummy verify. verify_temporary_credential wraps verify_password.
+            verify_temporary_credential(credential, _DUMMY_PASSWORD_HASH)
             self._record_failed_login(temp_username, ip_address)
             raise InvalidCredentialsError("Invalid temporary credentials")
-        
-        # Check if credential is active
+
+        # Verify the credential FIRST, before any state branch, so a caller who does NOT present a
+        # valid credential cannot distinguish a live credential from an inactive/used/expired/
+        # deactivated one by response time (same discipline as authenticate_user). Every non-success
+        # outcome returns the same generic message; the specific reason is for internal handling only.
+        if not verify_temporary_credential(credential, temp_cred.credential_hash):
+            self._record_failed_login(temp_username, ip_address)
+            raise InvalidCredentialsError("Invalid temporary credentials")
+
+        # Credential is valid — now enforce credential state.
         if not temp_cred.is_active:
             raise InvalidCredentialsError("Temporary credential is no longer active")
-        
-        # Check if credential has been used
+
         if temp_cred.is_used:
             raise InvalidCredentialsError("Temporary credential has already been used")
-        
-        # Check if credential has expired. expires_at is read back from the DB
-        # as a naive datetime (TIMESTAMP WITHOUT TIME ZONE), while `now` is
-        # tz-aware UTC — comparing the two directly raises TypeError, so treat
-        # the stored value as UTC.
+
+        # Check if credential has expired. expires_at is read back from the DB as a naive datetime
+        # (TIMESTAMP WITHOUT TIME ZONE), while `now` is tz-aware UTC — comparing them directly raises
+        # TypeError, so treat the stored value as UTC.
         now = datetime.now(timezone.utc)
         expires_at = temp_cred.expires_at
         if expires_at.tzinfo is None:
@@ -299,12 +309,9 @@ class AuthService:
             self.db.commit()
             raise InvalidCredentialsError("Temporary credential has expired")
 
-        # A temp credential also carries a stated validity window: deactivate_at
-        # (= mint + validity) closes BEFORE the hard expiry expires_at (= mint +
-        # total_lifetime). It must stop authenticating once that window ends — an
-        # operator who mints one with validity=5m expects it dead in 5 minutes even
-        # when the hard expiry is hours out. Only expires_at was enforced before, so
-        # the advertised validity window was silently ignored. Stored naive (UTC).
+        # A temp credential also carries a stated validity window: deactivate_at (= mint + validity)
+        # closes BEFORE the hard expiry expires_at (= mint + total_lifetime). It must stop
+        # authenticating once that window ends. Stored naive (UTC).
         deactivate_at = temp_cred.deactivate_at
         if deactivate_at is not None:
             if deactivate_at.tzinfo is None:
@@ -313,11 +320,6 @@ class AuthService:
                 temp_cred.is_active = False
                 self.db.commit()
                 raise InvalidCredentialsError("Temporary credential has expired")
-
-        # Verify credential
-        if not verify_temporary_credential(credential, temp_cred.credential_hash):
-            self._record_failed_login(temp_username, ip_address)
-            raise InvalidCredentialsError("Invalid temporary credentials")
 
         # The owning account must itself be active and unlocked. Otherwise a disabled/locked
         # principal could still mint a temp session, emit a misleading login-success signal,
