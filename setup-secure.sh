@@ -512,6 +512,7 @@ else
   ENCRYPTION_KEY="$(gen_fernet_key)"
   JWT_SECRET_KEY="$(openssl rand -hex 32)"
   VAULT_DB_PASSWORD="$(openssl rand -hex 16)"
+  REDIS_PASSWORD="$(openssl rand -hex 24)"
 
   umask 077
   {
@@ -526,6 +527,12 @@ else
     printf '%s\n' "ADMIN_USERNAME='$ADMIN_USERNAME'"
     printf '%s\n' "ADMIN_EMAIL='$ADMIN_EMAIL'"
     printf '%s\n' "ADMIN_PASSWORD='$ADMIN_PASSWORD'"
+    printf '%s\n' "# Redis AUTH on the login-throttle / lockout / session-hash store. Redis is on the"
+    printf '%s\n' "# internal network only, but this is defense-in-depth against a co-tenant on the bridge."
+    printf '%s\n' "REDIS_PASSWORD='$REDIS_PASSWORD'"
+    printf '%s\n' "# Reject requests carrying an unexpected Host header (defense-in-depth if you later"
+    printf '%s\n' "# front the vault with a shared reverse proxy / CDN)."
+    printf '%s\n' "ALLOWED_HOSTS='$SERVER_NAME'"
     printf '%s\n' "# Remembered so a re-run / --certs-only can regenerate certs without asking."
     printf '%s\n' "# (The app ignores these — pydantic Settings uses extra='ignore'.)"
     printf '%s\n' "SERVER_NAME='$SERVER_NAME'"

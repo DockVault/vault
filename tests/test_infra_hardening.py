@@ -400,6 +400,34 @@ def test_temp_credential_auth_equalizes_timing():
     assert real < state, "the credential must be verified BEFORE the is_active/used/expired state checks"
 
 
+def test_entrypoint_privilege_drop_fails_closed():
+    # The container starts as root to chown volumes, then drops to appuser. An initgroups failure must
+    # NOT be swallowed (that would keep root's supplementary groups), and the drop must be verified.
+    src = _read("docker-entrypoint.py")
+    drop = src[src.index("os.initgroups"):src.index("os.execvp", src.index("os.initgroups"))]
+    assert "except OSError:\n            pass" not in drop, "initgroups failure must not be blindly swallowed"
+    assert "os.setgroups(" in drop, "must fall back to an explicit minimal group set"
+    assert "os.getgroups()" in drop and "sys.exit(1)" in drop, "must verify the drop and fail closed"
+
+
+def test_baked_healthcheck_is_scheme_aware():
+    # The baked HEALTHCHECK must honour API_USE_HTTPS, else an HTTPS deploy of the bare image reports
+    # perpetually unhealthy.
+    df = _read("Dockerfile")
+    assert "API_USE_HTTPS" in df, "the baked healthcheck must read API_USE_HTTPS"
+
+
+def test_deploy_scripts_hardened():
+    # Deploy-script hardening (owner-validated on-host; here we lock the source):
+    smp = _read("setup_master_password.py")
+    assert "iterations=600000" in smp, "PBKDF2 must use >=600k iterations (match the runtime decryptor)"
+    assert "'production'" in smp, "the ENVIRONMENT fallback must default to production, not development"
+    assert "0o600" in smp, "secret files must be written mode 0600"
+    ss = _read("setup-secure.sh")
+    assert "REDIS_PASSWORD" in ss, "setup-secure.sh must generate a REDIS_PASSWORD"
+    assert "ALLOWED_HOSTS" in ss, "setup-secure.sh must write ALLOWED_HOSTS"
+
+
 def _import_config(env_overrides):
     return _in_container(env_overrides=env_overrides, args=["python", "-c", "import config"])
 

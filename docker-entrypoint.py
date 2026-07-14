@@ -62,10 +62,23 @@ def main():
         os.environ["HOME"] = pw.pw_dir
         try:
             os.initgroups(_APP_USER, pw.pw_gid)
-        except OSError:
-            pass
+        except OSError as exc:
+            # NEVER silently keep root's supplementary group list (incl. gid 0): swallowing this and
+            # continuing would run the workload as appuser uid/gid but with root's groups. Log it and
+            # fall back to an explicit minimal group set; if THAT fails too, abort rather than run
+            # partially privileged.
+            sys.stderr.write(f"[entrypoint] initgroups failed ({exc}); falling back to setgroups([{pw.pw_gid}])\n")
+            try:
+                os.setgroups([pw.pw_gid])
+            except OSError as exc2:
+                sys.stderr.write(f"[entrypoint] setgroups fallback also failed ({exc2}); refusing to run with root groups\n")
+                sys.exit(1)
         os.setgid(pw.pw_gid)
         os.setuid(pw.pw_uid)
+        # Fail closed: verify the drop actually took effect before exec'ing the untrusted workload.
+        if os.getuid() != pw.pw_uid or os.getgid() != pw.pw_gid or 0 in os.getgroups():
+            sys.stderr.write("[entrypoint] privilege-drop verification failed (still uid/gid 0 or in group 0); aborting\n")
+            sys.exit(1)
     os.execvp(args[0], args)
 
 
