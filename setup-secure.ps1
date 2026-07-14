@@ -32,7 +32,11 @@ param(
     [switch] $NoStart
 )
 
-$ErrorActionPreference = 'Stop'
+# The native tools here (docker, openssl, icacls) write progress + warnings to STDERR even on a
+# fully successful run. Under ErrorActionPreference='Stop', Windows PowerShell 5.1 turns that stderr
+# into a TERMINATING error, so a healthy `docker info` (which prints cgroup/blkio warnings) would
+# abort the script. We therefore keep 'Continue' and check each native command's EXIT CODE explicitly.
+$ErrorActionPreference = 'Continue'
 Set-StrictMode -Version 2.0
 
 $Root    = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -50,7 +54,9 @@ function Die  ([string] $m) { Write-Host "ERROR: $m" -ForegroundColor Red; exit 
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     Die 'docker was not found on PATH. Install Docker Desktop (Linux containers) and retry.'
 }
-try { docker info *> $null } catch { Die 'the Docker engine is not reachable. Start Docker Desktop and retry.' }
+# Gate on the exit code, not on stderr: a healthy engine prints warnings to stderr but exits 0.
+docker info *> $null
+if ($LASTEXITCODE -ne 0) { Die 'the Docker engine is not reachable. Start Docker Desktop and retry.' }
 if (-not (Test-Path $Compose)) { Die 'docker-compose.secure.yml not found next to this script.' }
 
 if (-not $ServerName) {
@@ -63,7 +69,7 @@ if ($ServerName -notmatch '^[A-Za-z0-9.-]+$') {
     Die "invalid server name '$ServerName' (use letters, digits, dots and hyphens only)."
 }
 
-New-Item -ItemType Directory -Force -Path $CertDir | Out-Null
+New-Item -ItemType Directory -Force -Path $CertDir -ErrorAction Stop | Out-Null
 
 # --- secret generation (pure .NET; no OpenSSL needed) ---------------------------------------
 function New-RandomBytes ([int] $n) {
@@ -98,12 +104,12 @@ function Copy-ByoCert {
     if (-not $CertPath -or -not $KeyPath) { Die '-CertMode byo requires -CertPath and -KeyPath.' }
     if (-not (Test-Path $CertPath)) { Die "certificate not found: $CertPath" }
     if (-not (Test-Path $KeyPath))  { Die "private key not found: $KeyPath" }
-    $keyText = Get-Content -Raw $KeyPath
+    $keyText = Get-Content -Raw $KeyPath -ErrorAction Stop
     if ($keyText -match 'ENCRYPTED') {
         Die "the private key '$KeyPath' is passphrase-encrypted; the server cannot use it. Decrypt it first."
     }
-    Copy-Item -Force $CertPath (Join-Path $CertDir 'cert.pem')
-    Copy-Item -Force $KeyPath  (Join-Path $CertDir 'key.pem')
+    Copy-Item -Force $CertPath (Join-Path $CertDir 'cert.pem') -ErrorAction Stop
+    Copy-Item -Force $KeyPath  (Join-Path $CertDir 'key.pem')  -ErrorAction Stop
     # Best-effort: confirm the cert and key are a matching pair (a mismatch fails TLS at startup with
     # an opaque error). Enforced only when OpenSSL is reachable; otherwise warn rather than block.
     $certPub = Invoke-OpenSSL @('x509', '-in', 'cert.pem', '-pubkey', '-noout')
