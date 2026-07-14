@@ -224,6 +224,17 @@ def test_master_password_kdf_iterations_raised():
     assert "iterations=100000" not in ss, "the old 100k iteration count should be gone"
 
 
+def test_zk_seal_names_locks_vault_row():
+    # Parity: zk_seal_names must serialize its seal-epoch read + writes under the SAME Vault-row lock its
+    # siblings (rename_file / create_folder / retire_dek_versions) hold — otherwise a concurrent retire
+    # could strand a name's member key and make the name permanently undecryptable.
+    src = _read("api_server.py")
+    start = src.index("async def zk_seal_names")
+    end = src.index("\n@app.", start)   # up to the next route
+    assert "with_for_update()" in src[start:end], \
+        "zk_seal_names must lock the Vault row before reading the seal epoch (parity with its siblings)"
+
+
 def test_dev_compose_hardening():
     dc = _read("docker-compose.yml")
     assert "vault_local_dev_pw" not in dc, "the source-controlled default DB password must be dropped"

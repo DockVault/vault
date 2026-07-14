@@ -4639,15 +4639,8 @@ async def grant_vault_permission(
                 detail="Only the vault owner or an admin can modify a manager"
             )
 
-        # Check if user already has access
         from models import vault_members
-        from sqlalchemy import select, insert, update
-
-        stmt = select(vault_members).where(
-            vault_members.c.vault_id == vault_id,
-            vault_members.c.user_id == permission.user_id
-        )
-        existing = db.execute(stmt).fetchone()
+        from sqlalchemy.dialects.postgresql import insert as _pg_insert
 
         # Set permissions based on level. 'manage' implies full read/write/delete.
         manage_perm = permission.level == 'manage'
@@ -4655,32 +4648,28 @@ async def grant_vault_permission(
         write_perm = permission.level in ['write', 'delete', 'manage']
         delete_perm = permission.level in ['delete', 'manage']
 
-        if existing:
-            # Update existing permissions
-            stmt = update(vault_members).where(
-                vault_members.c.vault_id == vault_id,
-                vault_members.c.user_id == permission.user_id
-            ).values(
-                read_permission=read_perm,
-                write_permission=write_perm,
-                delete_permission=delete_perm,
-                manage_permission=manage_perm
-            )
-            db.execute(stmt)
-        else:
-            # Insert new permission
-            stmt = insert(vault_members).values(
-                vault_id=vault_id,
-                user_id=permission.user_id,
-                read_permission=read_perm,
-                write_permission=write_perm,
-                delete_permission=delete_perm,
-                manage_permission=manage_perm,
-                added_at=datetime.now(timezone.utc),
-                added_by=current_user.id
-            )
-            db.execute(stmt)
-
+        # Atomic upsert (race-safe): a concurrent double-grant for the same (vault, user) can no longer
+        # create divergent duplicate rows — the uq_vault_members_vault_user constraint funnels both to
+        # the same row. Replaces the previous non-atomic check-then-insert.
+        _ins = _pg_insert(vault_members).values(
+            vault_id=vault_id,
+            user_id=permission.user_id,
+            read_permission=read_perm,
+            write_permission=write_perm,
+            delete_permission=delete_perm,
+            manage_permission=manage_perm,
+            added_at=datetime.now(timezone.utc),
+            added_by=current_user.id,
+        )
+        db.execute(_ins.on_conflict_do_update(
+            index_elements=['vault_id', 'user_id'],
+            set_={
+                'read_permission': read_perm,
+                'write_permission': write_perm,
+                'delete_permission': delete_perm,
+                'manage_permission': manage_perm,
+            },
+        ))
         db.commit()
         
         return {
@@ -4959,6 +4948,17 @@ async def rotate_vault_encryption_key(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Key rotation does not apply to zero-knowledge vaults; their keys are managed client-side (use the zero-knowledge rekey endpoint).",
+            )
+
+        # A password-protected Standard vault wraps its DEK under a password-derived KEK + salt.
+        # rotate_vault_key can only re-wrap under the MASTER key (it has no password parameter), which
+        # would write method='master_key' / key_salt=NULL while leaving password_hash set — an internally
+        # inconsistent row. Re-wrap-with-password isn't supported here, so reject rather than corrupt the
+        # row. (File content is keyed off the deployment secret, not this wrapped DEK, so no access change.)
+        if getattr(vault, "password_hash", None):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Key rotation is not supported for password-protected vaults (the password-wrapped key cannot be re-wrapped here).",
             )
 
         # Perform key rotation
@@ -7256,7 +7256,14 @@ async def zk_seal_names(
     if not _is_zk_vault(vault):
         raise HTTPException(status_code=400, detail="Name sealing applies only to zero-knowledge vaults")
     permission_service.require_vault_permission(current_user, vault_id, VaultPermissionEnum.WRITE)
-    current_epoch = getattr(vault, 'dek_version', 1) or 1
+    # Serialize the seal-epoch read + the seal writes against retire_dek_versions (which holds the SAME
+    # Vault-row lock): without it a name sealed at an old epoch could land in retire's scan->delete
+    # window and lose its member key -> a permanently undecryptable name. Same lock order (Vault row
+    # first) as retire / rename / upload-complete -> no deadlock. Held through the commit below.
+    locked_vault = db.query(Vault).filter(Vault.id == vault_id).with_for_update().first()
+    # Fall back to the already-validated vault object if the row vanished between fetch and lock
+    # (concurrent delete) so the epoch read keeps its original non-None semantics.
+    current_epoch = getattr(locked_vault or vault, 'dek_version', 1) or 1
 
     sealed = 0
     for it in body.items:
@@ -8158,6 +8165,18 @@ def _run_lightweight_migrations():
                    DROP INDEX IF EXISTS idx_vault_member_key_active;
                    CREATE INDEX IF NOT EXISTS idx_vault_member_key_active
                        ON vault_member_keys (vault_id, user_id, key_version, is_active);
+               END $$;""",
+            # A member has at most one vault_members row per (vault, user). Dedup any pre-existing
+            # duplicate rows (from a concurrent double-grant race) keeping one deterministically, then
+            # add the composite unique so the grant upsert can funnel concurrent grants to a single row.
+            # One DO block = one transaction (no constraint gap between the dedup and the ADD).
+            """DO $$ BEGIN
+                   DELETE FROM vault_members a USING vault_members b
+                       WHERE a.ctid < b.ctid AND a.vault_id = b.vault_id AND a.user_id = b.user_id;
+                   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_vault_members_vault_user') THEN
+                       ALTER TABLE vault_members
+                           ADD CONSTRAINT uq_vault_members_vault_user UNIQUE (vault_id, user_id);
+                   END IF;
                END $$;""",
         ]
         with get_db_context() as db:
