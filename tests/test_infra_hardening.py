@@ -157,6 +157,26 @@ def test_login_and_sftp_throttles_fail_closed():
         "the SFTP throttle must not swallow errors to 'not throttled'"
 
 
+def test_sftp_revocation_subscriber_survives_half_open_redis():
+    # The SFTP session-termination pub/sub subscriber must bound its socket and actively
+    # health-check, so a HALF-OPEN Redis connection (TCP dropped without a clean close) is detected
+    # instead of blocking forever -- which would silently disable live SFTP session revocation until
+    # the process restarts. A static guard (no live outage harness needed) locks these settings on
+    # the exact client that subscribes to the revocation channel.
+    sftp = _read("sftp_server.py")
+    end = sftp.index("subscribe('session_terminations')")
+    start = sftp.rindex("redis.Redis(", 0, end)
+    block = sftp[start:end]
+    assert "socket_timeout=" in block, \
+        "the revocation subscriber must bound every read with a socket_timeout"
+    assert "socket_connect_timeout=" in block, \
+        "the revocation subscriber must bound reconnects with a socket_connect_timeout"
+    assert "socket_keepalive=True" in block, \
+        "the revocation subscriber must keepalive-probe the idle pub/sub socket"
+    assert "health_check_interval=" in block, \
+        "the revocation subscriber must actively health-check the pub/sub socket"
+
+
 def test_security_alerts_are_deduped_under_sustained_attack(admin, anon):
     # A sustained brute-force must NOT append a new alert row per attempt: repeats of the same
     # (event_type, username) within the cooldown window collapse into one row that records a

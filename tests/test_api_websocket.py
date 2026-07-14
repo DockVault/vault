@@ -109,3 +109,58 @@ def test_ws_invalid_token_closed(base_url):
             ws.close()
         except Exception:
             pass
+
+
+@pytest.mark.websocket
+def test_ws_revoked_token_closed(base_url, admin):
+    # A *syntactically valid* token whose session has been revoked (here: logout, which denylists
+    # the session token) must be rejected at the /ws/monitor handshake -- not merely a bogus token.
+    # Otherwise a logged-out (or, worse, a revoked admin) token could stream the live feed until its
+    # natural expiry. verify_access_token only checks signature+exp, so the handshake must re-check
+    # revocation state itself.
+    from conftest import ApiClient
+
+    user = admin.create_user(role="user")
+    try:
+        client = ApiClient()
+        client.login(user["_username"], user["_password"])
+        token = client.token
+
+        # Control: while the session is live the token authenticates (a "connected" frame),
+        # proving the token is otherwise valid (so the rejection below is due to revocation).
+        live = websocket.create_connection(_ws_url(base_url), timeout=10)
+        try:
+            live.send(json.dumps({"type": "auth", "token": token}))
+            live.settimeout(8)
+            first = json.loads(live.recv())
+            assert first.get("type") == "connected", \
+                "control: a live-session token should authenticate onto /ws/monitor"
+        finally:
+            try:
+                live.close()
+            except Exception:
+                pass
+
+        # Revoke the session: logout denylists the session token.
+        assert client.post("/api/logout").status_code == 200
+
+        # The now-revoked token must be rejected (an error frame) and the socket closed -- never
+        # authenticated, never streamed events.
+        ws = websocket.create_connection(_ws_url(base_url), timeout=10)
+        try:
+            ws.send(json.dumps({"type": "auth", "token": token}))
+            ws.settimeout(8)
+            first = json.loads(ws.recv())
+            assert first.get("type") == "error", \
+                "a revoked token must be rejected at the handshake, not authenticated"
+            with pytest.raises(Exception):
+                # after the error frame the server closes rather than streaming events
+                while True:
+                    ws.recv()
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+    finally:
+        admin.delete_user(user["id"])

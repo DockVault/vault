@@ -1,5 +1,6 @@
 """Authentication: login (success/failure), /users/me, logout, temp-cred login."""
 import pytest
+import requests
 
 from conftest import ApiClient
 
@@ -59,10 +60,12 @@ def test_temp_credential_can_log_in(admin):
     temp_client = admin.clone_anonymous()
     data = temp_client.login(creds["temp_username"], creds["credential"])
     assert data["access_token"]
-    # one-time: a second login with the same credential must fail
+    # one-time: a second login with the same credential must fail with a clean
+    # 401 (pin the status so a crash can't be mistaken for correct rejection)
     again = admin.clone_anonymous()
-    with pytest.raises(Exception):
+    with pytest.raises(requests.HTTPError) as exc_info:
         again.login(creds["temp_username"], creds["credential"])
+    assert exc_info.value.response.status_code == 401
 
 
 def test_logout(admin_creds, base_url):
