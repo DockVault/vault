@@ -1088,7 +1088,15 @@ class VaultService:
                 try:
                     file_size = storage_path.stat().st_size
                     with open(storage_path, 'wb') as f:
-                        f.write(os.urandom(file_size))
+                        # Overwrite in bounded 1 MB chunks (mirrors secure_delete) so a large blob
+                        # can't spike memory the way a single os.urandom(file_size) allocation would.
+                        remaining = file_size
+                        while remaining > 0:
+                            n = min(1024 * 1024, remaining)
+                            f.write(os.urandom(n))
+                            remaining -= n
+                        f.flush()
+                        os.fsync(f.fileno())
                     storage_path.unlink()
                 except Exception as fallback_error:
                     print(f"Warning: Fallback deletion also failed: {fallback_error}")
@@ -1294,14 +1302,11 @@ class VaultService:
             return
 
         # Rows are durably gone; now securely destroy the blobs (best-effort — an orphan blob is
-        # recoverable/GC-able, a dangling row is not).
+        # recoverable/GC-able, a dangling row is not). secure_delete overwrites in bounded 1 MB
+        # chunks (+ fsync) so a large blob can't spike memory, and is a no-op on an absent path.
         for storage_path in stale_paths:
             try:
-                if storage_path.exists():
-                    file_size = storage_path.stat().st_size
-                    with open(storage_path, 'wb') as f:
-                        f.write(os.urandom(file_size))
-                    storage_path.unlink()
+                self.encrypted_storage.secure_delete(storage_path)
             except Exception as e:
                 print(f"Error securely removing expired blob {storage_path}: {e}")
     
