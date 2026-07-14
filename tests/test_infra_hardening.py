@@ -157,6 +157,84 @@ def test_login_and_sftp_throttles_fail_closed():
         "the SFTP throttle must not swallow errors to 'not throttled'"
 
 
+def test_security_alerts_are_deduped_under_sustained_attack(admin, anon):
+    # A sustained brute-force must NOT append a new alert row per attempt: repeats of the same
+    # (event_type, username) within the cooldown window collapse into one row that records a
+    # repeat_count -- otherwise the table floods and real alerts get buried.
+    from collections import Counter
+    uniq = unique("dedup")
+    for i in range(12):
+        anon.post("/auth/login", json={"username": uniq, "password": f"wrong-{i}"})
+    alerts = admin.get("/api/security/alerts", params={"limit": 300}).json().get("alerts", [])
+    mine = [a for a in alerts if a.get("username") == uniq]
+    assert mine, f"expected at least one alert for {uniq}"
+    by_type = Counter(a.get("event_type") for a in mine)
+    for et, n in by_type.items():
+        assert n == 1, f"event_type {et!r} should be deduped to one row, got {n}"
+    assert any((a.get("details") or {}).get("repeat_count", 1) > 1 for a in mine), \
+        "the deduped alert should carry a repeat_count > 1 recording the collapsed repeats"
+
+
+def test_detection_degraded_signal_fires_and_is_throttled():
+    # When the Redis event counter is unavailable the monitor emits a DETECTION_DEGRADED alert so
+    # operators know threshold-based detection is blind. A rapid second signal is throttled IN-PROCESS
+    # (at most one DB write per cooldown per process), so an outage can't hammer a hot alert row.
+    script = "\n".join([
+        "from database import get_db_context",
+        "from security_monitor import SecurityMonitor, SecurityEventType",
+        "from models import SecurityAlert",
+        "with get_db_context() as db:",
+        "    m = SecurityMonitor(db)",
+        "    m._signal_detection_degraded()",
+        "    a1 = db.query(SecurityAlert).filter(SecurityAlert.event_type==SecurityEventType.DETECTION_DEGRADED).order_by(SecurityAlert.timestamp.desc()).first()",
+        "    ok = a1 is not None and (a1.details or {}).get('reason') == 'redis_counter_unavailable'",
+        "    id1 = str(a1.id); rc1 = int((a1.details or {}).get('repeat_count', 1))",
+        "    m._signal_detection_degraded()",
+        "    a2 = db.query(SecurityAlert).filter(SecurityAlert.event_type==SecurityEventType.DETECTION_DEGRADED).order_by(SecurityAlert.timestamp.desc()).first()",
+        "    id2 = str(a2.id); rc2 = int((a2.details or {}).get('repeat_count', 1))",
+        "    print('OK=%s SAME=%s THROTTLED=%s' % (ok, id1==id2, rc2==rc1))",
+    ])
+    proc = _in_container(args=["python", "-"], stdin=script)
+    assert "OK=True" in proc.stdout, f"the degraded signal must create a DETECTION_DEGRADED alert\n{proc.stdout}\n{proc.stderr}"
+    assert "SAME=True" in proc.stdout, f"the second signal must not create a duplicate row\n{proc.stdout}"
+    assert "THROTTLED=True" in proc.stdout, f"the rapid 2nd signal must be throttled in-process (no DB bump)\n{proc.stdout}"
+
+
+def test_alert_dedup_key_is_per_user_and_severity(admin):
+    # The dedup key must include user_id (so different users' user_id-keyed alerts -- bulk-delete /
+    # rapid-vault-access set no username/ip -- don't collapse into one (type, NULL, NULL) row) AND
+    # severity (so a CRITICAL escalation opens its own row even when a path reuses one event_type).
+    # security_alerts.user_id has a FK to users, so use two real users; the script cleans up its rows.
+    u1 = admin.create_user(role="user")
+    u2 = admin.create_user(role="user")
+    try:
+        script = "\n".join([
+            "from database import get_db_context",
+            "from security_monitor import SecurityMonitor, SecurityEventType, SecurityAlertLevel",
+            "from models import SecurityAlert",
+            f"ua = '{u1['id']}'; ub = '{u2['id']}'",
+            "ET = SecurityEventType.BULK_FILE_DELETION",
+            "with get_db_context() as db:",
+            "    m = SecurityMonitor(db)",
+            "    a1 = m._raise_alert(event_type=ET, severity=SecurityAlertLevel.WARNING, message='dedupkeytest', user_id=ua)",
+            "    b1 = m._raise_alert(event_type=ET, severity=SecurityAlertLevel.WARNING, message='dedupkeytest', user_id=ub)",
+            "    a2 = m._raise_alert(event_type=ET, severity=SecurityAlertLevel.WARNING, message='dedupkeytest', user_id=ua)",
+            "    ac = m._raise_alert(event_type=ET, severity=SecurityAlertLevel.CRITICAL, message='dedupkeytest', user_id=ua)",
+            "    out = 'DIFFUSER=%s DEDUP=%s DIFFSEV=%s' % (str(a1.id)!=str(b1.id), str(a1.id)==str(a2.id), str(a1.id)!=str(ac.id))",
+            "    for x in {str(a1.id), str(b1.id), str(ac.id)}:",
+            "        db.query(SecurityAlert).filter(SecurityAlert.id == x).delete()",
+            "    db.commit()",
+            "    print(out)",
+        ])
+        proc = _in_container(args=["python", "-"], stdin=script)
+        assert "DIFFUSER=True" in proc.stdout, f"different users must not collapse into one alert row\n{proc.stdout}\n{proc.stderr}"
+        assert "DEDUP=True" in proc.stdout, f"same (user, type, severity) within cooldown must dedup\n{proc.stdout}"
+        assert "DIFFSEV=True" in proc.stdout, f"a CRITICAL escalation must open its own row (severity in the key)\n{proc.stdout}"
+    finally:
+        admin.delete_user(u1["id"])
+        admin.delete_user(u2["id"])
+
+
 def _import_config(env_overrides):
     return _in_container(env_overrides=env_overrides, args=["python", "-c", "import config"])
 
