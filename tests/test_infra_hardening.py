@@ -304,6 +304,74 @@ def test_noisy_dead_recorders_stay_removed():
     assert "def record_failed_login" in src and "def record_file_deletion" in src
 
 
+def test_progress_complete_clears_dangling_record():
+    # complete_operation must delete the Redis operation:* record. Uploads used to call start_operation
+    # but never complete_operation, so every finished/failed upload left a dangling record until TTL.
+    script = "\n".join([
+        "import uuid",
+        "from activity_monitor import ProgressTracker",
+        "from database import redis_client",
+        "t = ProgressTracker()",
+        "oid = 'upload_' + uuid.uuid4().hex",
+        "t.start_operation(operation_id=oid, user_id='u', username='u', operation_type='upload', file_name='f', total_size=0)",
+        "key = t._get_operation_key(oid)",
+        "before = bool(redis_client.exists(key))",
+        "res_ok = t.complete_operation(oid, success=True)",
+        "after = bool(redis_client.exists(key))",
+        "oid2 = 'upload_' + uuid.uuid4().hex",
+        "t.start_operation(operation_id=oid2, user_id='u', username='u', operation_type='upload', file_name='f', total_size=0)",
+        "res_fail = t.complete_operation(oid2, success=False)",
+        "print('BEFORE=%s AFTER=%s OK=%s FAIL=%s' % (before, after, (res_ok or {}).get('status'), (res_fail or {}).get('status')))",
+    ])
+    proc = _in_container(args=["python", "-"], stdin=script)
+    assert "BEFORE=True AFTER=False" in proc.stdout, f"complete_operation must clear the record\n{proc.stdout}\n{proc.stderr}"
+    assert "OK=completed FAIL=failed" in proc.stdout, f"the success flag must drive the operation status\n{proc.stdout}"
+
+
+def test_activity_monitor_dead_code_removed_and_complete_wired():
+    # The dead progress/traffic code is gone; the live methods remain; and the upload finalizer now
+    # completes the operation record.
+    src = _read("activity_monitor.py")
+    for gone in ("class ActivityStats", "def update_progress", "def get_all_operations", "def get_operation"):
+        assert gone not in src, f"{gone} should have been removed"
+    for keep in ("def start_operation", "def complete_operation", "def is_cancelled", "def cancel_operation"):
+        assert keep in src, f"{keep} must remain"
+    api = _read("api_server.py")
+    assert "tracker.complete_operation(operation_id" in api, "the upload finalizer must complete the operation record"
+
+
+def test_cleanup_old_alerts_prunes_old_resolved(admin):
+    # cleanup_old_alerts must delete old RESOLVED alerts beyond the retention window (and keep recent
+    # ones + unresolved ones). Reads settings.security_alert_retention_days, not a hard-coded 90.
+    u = admin.create_user(role="user")
+    try:
+        script = "\n".join([
+            "import datetime",
+            "from database import get_db_context",
+            "import security_monitor",
+            "security_monitor._last_alert_cleanup_at = None  # ensure the once/hour throttle allows this run",
+            "from security_monitor import SecurityMonitor",
+            "from models import SecurityAlert",
+            f"uid = '{u['id']}'",
+            "with get_db_context() as db:",
+            "    m = SecurityMonitor(db)",
+            "    old = SecurityAlert(event_type='bulk_file_deletion', severity='warning', message='old', user_id=uid, resolved=True, timestamp=datetime.datetime(2000,1,1,tzinfo=datetime.timezone.utc), details={})",
+            "    recent = SecurityAlert(event_type='bulk_file_deletion', severity='warning', message='new', user_id=uid, resolved=True, timestamp=datetime.datetime.now(datetime.timezone.utc), details={})",
+            "    db.add(old); db.add(recent); db.commit()",
+            "    old_id=str(old.id); recent_id=str(recent.id)",
+            "    m.cleanup_old_alerts()",
+            "    old_gone = db.query(SecurityAlert).filter(SecurityAlert.id==old_id).first() is None",
+            "    recent_kept = db.query(SecurityAlert).filter(SecurityAlert.id==recent_id).first() is not None",
+            "    db.query(SecurityAlert).filter(SecurityAlert.id==recent_id).delete(); db.commit()",
+            "    print('OLD_GONE=%s RECENT_KEPT=%s' % (old_gone, recent_kept))",
+        ])
+        proc = _in_container(args=["python", "-"], stdin=script)
+        assert "OLD_GONE=True" in proc.stdout, f"old resolved alert should be pruned\n{proc.stdout}\n{proc.stderr}"
+        assert "RECENT_KEPT=True" in proc.stdout, f"recent alert should be kept\n{proc.stdout}"
+    finally:
+        admin.delete_user(u["id"])
+
+
 def _import_config(env_overrides):
     return _in_container(env_overrides=env_overrides, args=["python", "-c", "import config"])
 

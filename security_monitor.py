@@ -27,8 +27,13 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 # Process-wide throttle for the "threat detection degraded" alert (see _signal_detection_degraded):
-# emit at most once per cooldown window per process during a Redis outage.
-_last_degraded_signal_at = 0.0
+# emit at most once per cooldown window per process during a Redis outage. None = never emitted yet, so
+# the FIRST emit always runs (monotonic() can be < the window on a freshly-booted host).
+_last_degraded_signal_at = None
+
+# Process-wide throttle for opportunistic old-alert cleanup (see cleanup_old_alerts): run at most once
+# per hour per process. None = never run yet, so the first cleanup always runs.
+_last_alert_cleanup_at = None
 
 
 def _sanitize_for_log(value: Optional[str], max_len: int = 256) -> Optional[str]:
@@ -519,7 +524,7 @@ class SecurityMonitor:
         # across processes) so a high-volume outage doesn't hammer the DB.
         global _last_degraded_signal_at
         now = time.monotonic()  # interval throttle -> monotonic, immune to NTP / wall-clock steps
-        if now - _last_degraded_signal_at < self.alert_cooldown_seconds:
+        if _last_degraded_signal_at is not None and now - _last_degraded_signal_at < self.alert_cooldown_seconds:
             return
         try:
             self._raise_alert(
@@ -583,26 +588,39 @@ class SecurityMonitor:
     # Cleanup
     # ========================================================================
     
-    def cleanup_old_alerts(self, days: int = 90):
+    def cleanup_old_alerts(self, days: Optional[int] = None):
         """
-        Clean up old resolved alerts.
-        
+        Delete old RESOLVED alerts beyond the retention window (unresolved alerts are always kept).
+        Process-wide throttled to at most once per hour so it can be wired into a frequently-hit
+        endpoint without issuing a DELETE per request.
+
         Args:
-            days: Keep alerts from last N days
+            days: retention window; defaults to settings.security_alert_retention_days.
         """
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        
+        global _last_alert_cleanup_at
+        now = time.monotonic()
+        if _last_alert_cleanup_at is not None and now - _last_alert_cleanup_at < 3600:
+            return 0
+        _last_alert_cleanup_at = now
+
+        if days is None:
+            days = getattr(settings, 'security_alert_retention_days', 90)
+        # Naive UTC to match the TIMESTAMP-WITHOUT-TIME-ZONE column, and synchronize_session=False so
+        # the DELETE runs entirely in Postgres (the default 'evaluate' would compare the naive column
+        # value against the cutoff in Python and raise on naive-vs-aware).
+        cutoff = datetime.utcnow() - timedelta(days=days)
+
         deleted = self.db.query(SecurityAlert).filter(
             and_(
                 SecurityAlert.resolved == True,
                 SecurityAlert.timestamp < cutoff
             )
-        ).delete()
-        
+        ).delete(synchronize_session=False)
+
         self.db.commit()
-        
-        logger.info(f"Cleaned up {deleted} old security alerts")
-        
+
+        logger.info(f"Cleaned up {deleted} old security alerts (retention {days}d)")
+
         return deleted
 
 

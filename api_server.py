@@ -5475,7 +5475,8 @@ async def upload_file(
                 file_name=upload_file.filename,
                 total_size=0  # Unknown at start for streaming uploads
             )
-            
+            _op_ok = False  # set True only after the file is fully committed (drives complete_operation)
+
             # Wrap entire upload in try-finally to ensure reservation cleanup
             try:
                 # Same-name policy = replace; reject up front if the uploader can't.
@@ -5657,7 +5658,8 @@ async def upload_file(
                     'size': file.size_bytes,
                     'mime_type': file.mime_type
                 })
-                
+                _op_ok = True  # fully committed -> complete_operation reports success in the finally
+
                 # Audit log
                 audit_logger.log_action(
                     action='file_upload',
@@ -5725,6 +5727,14 @@ async def upload_file(
                     except Exception as e:
                         print(f"⚠️ Failed to cleanup reservation in finally: {e}")
                 
+                # Mark the Redis progress record complete + clear it (it was never completed before, so
+                # every finished/failed upload used to leave a dangling operation:* record until TTL).
+                # Best-effort: cleanup must never fail the request.
+                try:
+                    tracker.complete_operation(operation_id, success=_op_ok)
+                except Exception:
+                    pass
+
                 # Always end operation tracking
                 end_operation(operation_id)
         
@@ -7631,8 +7641,21 @@ async def get_security_alerts(
         from security_monitor import get_security_monitor
         
         monitor = get_security_monitor(db)
+
+        # Opportunistically prune old RESOLVED alerts (throttled process-wide to once/hour, reads the
+        # retention setting). Do it BEFORE fetching: cleanup commits, and expire_on_commit would
+        # otherwise expire the fetched rows -> a just-deleted one raises ObjectDeletedError on
+        # serialization. Best-effort: never let cleanup fail the alerts view.
+        try:
+            monitor.cleanup_old_alerts()
+        except Exception:
+            # A failed cleanup DELETE/commit aborts the transaction; roll back so the shared session
+            # stays usable for the fetch below (mirrors _raise_alert's except pattern) -- else the
+            # next SELECT raises "current transaction is aborted" and 500s the view.
+            db.rollback()
+
         alerts = monitor.get_recent_alerts(limit=limit, severity=severity)
-        
+
         # Convert to dict for JSON response
         return {
             "alerts": [
