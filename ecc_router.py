@@ -80,13 +80,6 @@ class DecompressPointResponse(BaseModel):
     uncompressed_point: str = Field(..., description="Base64-encoded uncompressed point")
 
 
-class CreateVaultRequest(BaseModel):
-    """Request to create a vault with ECC."""
-    name: str
-    description: Optional[str] = None
-    password: Optional[str] = None
-
-
 class VaultKeysResponse(BaseModel):
     """Response with encrypted vault keys."""
     vault_id: str

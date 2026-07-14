@@ -4,7 +4,6 @@ Implements Role-Based Access Control (RBAC) with fine-grained permissions.
 """
 from typing import List, Optional, Set
 import uuid
-from functools import wraps
 
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, select
@@ -484,38 +483,3 @@ class PermissionService:
             )
         )
         self.db.commit()
-
-
-def require_permission(permission: PermissionEnum):
-    """
-    Decorator to require a specific permission.
-    
-    Usage:
-        @require_permission(PermissionEnum.VAULT_CREATE)
-        def create_vault(user: User, ...):
-            ...
-    """
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            # Try to find user in args or kwargs
-            user = kwargs.get('user')
-            if not user:
-                for arg in args:
-                    if isinstance(arg, User):
-                        user = arg
-                        break
-            
-            if not user:
-                raise AuthorizationError("No user context found")
-            
-            # This would typically be done with db session from context
-            # For now, just check if user has permission attribute
-            if hasattr(user, '_permission_service'):
-                user._permission_service.require_permission(user, permission)
-            
-            return func(*args, **kwargs)
-        
-        return wrapper
-    
-    return decorator

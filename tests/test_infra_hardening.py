@@ -224,6 +224,35 @@ def test_master_password_kdf_iterations_raised():
     assert "iterations=100000" not in ss, "the old 100k iteration count should be gone"
 
 
+def test_dead_fail_open_permission_code_stays_removed():
+    # Regression guard: two dead, fail-open permission paths were removed because they would
+    # silently allow-all if ever wired in. They must not creep back:
+    #   - the module-level `require_permission` decorator (allowed through when the user object
+    #     had no _permission_service attribute), and
+    #   - the EndpointPermissionChecker / get_endpoint_info catalog checker ("endpoint not in
+    #     catalog -> allow"), which the live require_endpoint_permission never consulted.
+    authz = _read("authorization.py")
+    assert "\ndef require_permission(" not in authz, \
+        "the fail-open module-level require_permission decorator must stay removed"
+    # the live, non-fail-open PermissionService.require_permission METHOD must remain
+    assert "    def require_permission(" in authz
+
+    ep = _read("endpoint_permissions.py")
+    assert "class EndpointPermissionChecker" not in ep, "dead fail-open EndpointPermissionChecker must stay removed"
+    assert "def get_endpoint_info" not in ep, "dead get_endpoint_info (only the checker used it) must stay removed"
+    assert "def require_endpoint_permission(" in ep, "the live endpoint gate must remain"
+
+
+def test_broken_whole_file_crypto_stays_removed():
+    # The whole-file AES-GCM writer had a 9-byte magic vs a 5-byte header field, so every
+    # round-trip always failed -- a latent foot-gun if re-wired. It was removed; only the live
+    # secure-delete helper remains. Guard against reintroduction.
+    src = _read("encrypted_file_storage.py")
+    for gone in ("def encrypt_and_save", "def load_and_decrypt", "def verify_file_format", "MAGIC_BYTES"):
+        assert gone not in src, f"removed whole-file crypto symbol reappeared: {gone}"
+    assert "def secure_delete" in src, "the live secure_delete helper must remain"
+
+
 def test_zk_seal_names_locks_vault_row():
     # Parity: zk_seal_names must serialize its seal-epoch read + writes under the SAME Vault-row lock its
     # siblings (rename_file / create_folder / retire_dek_versions) hold — otherwise a concurrent retire

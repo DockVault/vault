@@ -62,10 +62,9 @@ _GCM_STREAM_ROOT_KEY = HKDF(
     info=b'at-rest-content',
 ).derive(settings.encryption_key.encode())
 
-# Full magic (the legacy EncryptedFileStorage compares only header[:5] to a 9-byte
-# constant, so its detector never matches; we compare the FULL magic here).
+# Detected by comparing the FULL magic (all of GCM_STREAM_MAGIC), not a fixed-length prefix.
 GCM_STREAM_MAGIC = b'DockVault'
-GCM_STREAM_VERSION = 0x10  # distinct from the (dead) whole-file GCM version 0x01
+GCM_STREAM_VERSION = 0x10  # stream-format version byte
 _GCM_STREAM_HEADER = GCM_STREAM_MAGIC + bytes([GCM_STREAM_VERSION]) + b'\x00\x00'  # +2 reserved
 _GCM_NONCE_SIZE = 12
 _CHUNK_AAD_DOMAIN = b'dockvault-chunk-aad-v1'
