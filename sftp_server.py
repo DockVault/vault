@@ -887,6 +887,12 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 return paramiko.SFTP_FAILURE
             self._audit(user, "file_delete", str(fid),
                         {"vault_id": str(vault.id), "via": "sftp"})
+            # Feed the bulk-deletion detector (best-effort; must never fail the delete).
+            try:
+                from security_monitor import get_security_monitor
+                get_security_monitor(db).record_file_deletion(str(user.id), str(vault.id), file_count=1)
+            except Exception:
+                pass
             return paramiko.SFTP_OK
 
     def rename(self, oldpath: str, newpath: str):
@@ -1022,9 +1028,11 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             # Recursively wipe contained files (storage + rows + stats), then
             # sub-folders, then the folder — mirrors the web delete_folder handler.
             def _purge(fid):
+                n = 0
                 for child in db.query(File).filter(File.folder_id == fid).all():
                     try:
                         vault_service.delete_file(child.id, user)
+                        n += 1
                     except PermissionDeniedError:
                         # Never destroy a file the caller can't delete — abort the whole
                         # rmdir (defense-in-depth behind the vault-level DELETE gate above).
@@ -1032,14 +1040,23 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                     except Exception as ex:  # noqa: BLE001
                         print(f"⚠️ rmdir: failed to delete file {child.id}: {ex}")
                 for sub in db.query(Folder).filter(Folder.parent_folder_id == fid).all():
-                    _purge(sub.id)
+                    n += _purge(sub.id)
                     db.delete(sub)
+                return n
             try:
-                _purge(folder_id)
+                _rmdir_deleted = _purge(folder_id)
                 folder = db.query(Folder).filter(Folder.id == folder_id).first()
                 if folder is not None:
                     db.delete(folder)
                 db.commit()
+                # Feed the whole subtree to the bulk-deletion detector as ONE record (SFTP rmdir is a
+                # high-throughput deletion vector). Best-effort: monitoring must never fail the rmdir.
+                if _rmdir_deleted:
+                    try:
+                        from security_monitor import get_security_monitor
+                        get_security_monitor(db).record_file_deletion(str(user.id), str(vault.id), file_count=_rmdir_deleted)
+                    except Exception:
+                        pass
             except PermissionDeniedError:
                 db.rollback()
                 return paramiko.SFTP_PERMISSION_DENIED

@@ -202,12 +202,8 @@ class Settings(BaseSettings):
     security_failed_login_warning: int = Field(default=5)  # Failed logins before WARNING alert
     security_failed_login_critical: int = Field(default=10)  # Failed logins before CRITICAL alert
     security_failed_login_window: int = Field(default=10)  # Time window in minutes
-    security_rate_limit_warning: int = Field(default=5)  # Rate limit violations before WARNING
-    security_rate_limit_critical: int = Field(default=10)  # Rate limit violations before CRITICAL
     security_bulk_deletion_threshold: int = Field(default=10)  # Files deleted in time window
     security_bulk_deletion_window: int = Field(default=60)  # Time window in seconds
-    security_rapid_vault_threshold: int = Field(default=5)  # Vault accesses in time window
-    security_rapid_vault_window: int = Field(default=30)  # Time window in seconds
     security_alert_retention_days: int = Field(default=90)  # How long to keep resolved alerts
     
     # Logging

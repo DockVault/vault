@@ -6886,6 +6886,14 @@ async def delete_file(
             ip_address=get_client_ip(request)
         )
 
+        # Feed the bulk-deletion detector (rapid single-file API deletions raise a BULK_FILE_DELETION
+        # alert). Best-effort: monitoring must never fail the delete.
+        try:
+            from security_monitor import get_security_monitor
+            get_security_monitor(db).record_file_deletion(str(current_user.id), str(vault_id), file_count=1)
+        except Exception:
+            pass
+
         return {'message': f'File "{disp_name}" deleted successfully'}
         
     except (PasswordRequiredError, InvalidPasswordError) as e:
@@ -7194,11 +7202,13 @@ async def delete_folder(
         folder_name = folder.name
 
         # Recurse: securely delete each file (storage + record + vault stats),
-        # then remove sub-folders, then the folder itself.
+        # then remove sub-folders, then the folder itself. Returns the count of files deleted.
         def _purge(fid):
+            n = 0
             for f in db.query(File).filter(File.folder_id == fid).all():
                 try:
                     vault_service.delete_file(f.id, current_user)
+                    n += 1
                 except PermissionDeniedError:
                     # Never destroy a file the caller can't delete — abort the whole operation
                     # (defense-in-depth behind the vault-level DELETE gate above).
@@ -7206,9 +7216,10 @@ async def delete_folder(
                 except Exception as ex:
                     print(f"Warning: failed to delete file {f.id} during folder delete: {ex}")
             for sub in db.query(Folder).filter(Folder.parent_folder_id == fid).all():
-                _purge(sub.id)
+                n += _purge(sub.id)
                 db.delete(sub)
-        _purge(folder_id)
+            return n
+        deleted_count = _purge(folder_id)
         db.delete(folder)
         db.commit()
 
@@ -7218,6 +7229,17 @@ async def delete_folder(
             details={'vault_id': str(vault_id), 'folder_name': folder_name},
             ip_address=get_client_ip(request)
         )
+
+        # A folder delete is the highest-throughput deletion vector — feed the whole subtree to the
+        # bulk-deletion detector as ONE record (not per-file, to avoid hammering the alert row).
+        # Best-effort: monitoring must never fail the delete.
+        if deleted_count:
+            try:
+                from security_monitor import get_security_monitor
+                get_security_monitor(db).record_file_deletion(str(current_user.id), str(vault_id), file_count=deleted_count)
+            except Exception:
+                pass
+
         return {'message': f'Folder "{folder_name}" deleted'}
     except (PasswordRequiredError, InvalidPasswordError) as e:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))

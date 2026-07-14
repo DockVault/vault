@@ -2,12 +2,8 @@
 Real-time Security Monitoring and Alerting System
 
 Monitors security events and detects suspicious patterns:
-- Failed login attempts
-- Rate limit violations
-- Unusual access patterns
-- Bulk file operations
-- Rapid file deletions
-- Multiple vault access attempts
+- Failed login attempts (brute force)
+- Bulk file deletions
 
 Provides alerts through multiple channels:
 - Logging (always enabled)
@@ -52,12 +48,10 @@ def _sanitize_for_log(value: Optional[str], max_len: int = 256) -> Optional[str]
 class SecurityEventType:
     """Security event type constants."""
     FAILED_LOGIN = "failed_login"
-    RATE_LIMIT_EXCEEDED = "rate_limit_exceeded"
     MULTIPLE_FAILED_LOGINS = "multiple_failed_logins"
     BRUTE_FORCE_ATTEMPT = "brute_force_attempt"
     SUSPICIOUS_DOWNLOAD = "suspicious_download"
     BULK_FILE_DELETION = "bulk_file_deletion"
-    RAPID_VAULT_ACCESS = "rapid_vault_access"
     ACCOUNT_LOCKOUT = "account_lockout"
     UNUSUAL_ACCESS_PATTERN = "unusual_access_pattern"
     # Raised when the durable Redis event counter is unavailable, so threshold-based detection
@@ -92,9 +86,6 @@ class SecurityMonitor:
         self.failed_login_threshold_critical = getattr(settings, 'security_failed_login_critical', 10)
         self.failed_login_window_minutes = getattr(settings, 'security_failed_login_window', 10)
         
-        self.rate_limit_threshold_warning = getattr(settings, 'security_rate_limit_warning', 5)
-        self.rate_limit_threshold_critical = getattr(settings, 'security_rate_limit_critical', 10)
-
         # Alert dedup/cooldown: within this window, repeats of the same (event_type, username,
         # ip_address) collapse into one row (bumping a repeat counter) instead of flooding the table.
         self.alert_cooldown_seconds = getattr(settings, 'security_alert_cooldown_seconds', 300)
@@ -102,14 +93,9 @@ class SecurityMonitor:
         self.bulk_deletion_threshold = getattr(settings, 'security_bulk_deletion_threshold', 10)
         self.bulk_deletion_window_seconds = getattr(settings, 'security_bulk_deletion_window', 60)
         
-        self.rapid_vault_access_threshold = getattr(settings, 'security_rapid_vault_threshold', 5)
-        self.rapid_vault_access_window_seconds = getattr(settings, 'security_rapid_vault_window', 30)
-        
-        # In-memory tracking for performance
+        # In-memory tracking for performance (Redis-outage fallback for the windowed counters)
         self._login_attempts = defaultdict(lambda: deque(maxlen=100))
-        self._rate_limit_violations = defaultdict(int)
         self._file_deletions = defaultdict(lambda: deque(maxlen=100))
-        self._vault_accesses = defaultdict(lambda: deque(maxlen=100))
     
     # ========================================================================
     # Event Recording
@@ -173,55 +159,6 @@ class SecurityMonitor:
         
         logger.info(f"Failed login recorded: {username} from {ip_address} ({recent_attempts} recent attempts)")
     
-    def record_rate_limit_violation(self, identifier: str, ip_address: str, endpoint: str):
-        """
-        Record a rate limit violation.
-        
-        Args:
-            identifier: User identifier or IP
-            ip_address: Source IP address
-            endpoint: API endpoint that was rate limited
-        """
-        self._rate_limit_violations[identifier] += 1
-        
-        # Store in Redis
-        redis_key = f"security:rate_limit:{identifier}"
-        count = self.redis.incr(redis_key)
-        self.redis.expire(redis_key, 3600)  # 1 hour
-
-        # The counter above used the raw identifier as its key; sanitize before embedding these
-        # caller-controlled values in the persisted alert + logs.
-        identifier = _sanitize_for_log(identifier)
-        ip_address = _sanitize_for_log(ip_address)
-        endpoint = _sanitize_for_log(endpoint)
-
-        if count >= self.rate_limit_threshold_critical:
-            self._raise_alert(
-                event_type=SecurityEventType.RATE_LIMIT_EXCEEDED,
-                severity=SecurityAlertLevel.CRITICAL,
-                ip_address=ip_address,
-                details={
-                    'violations': count,
-                    'endpoint': endpoint,
-                    'identifier': identifier
-                },
-                message=f"CRITICAL: Excessive rate limit violations - {count} violations from {ip_address} (endpoint: {endpoint})"
-            )
-        elif count >= self.rate_limit_threshold_warning:
-            self._raise_alert(
-                event_type=SecurityEventType.RATE_LIMIT_EXCEEDED,
-                severity=SecurityAlertLevel.WARNING,
-                ip_address=ip_address,
-                details={
-                    'violations': count,
-                    'endpoint': endpoint,
-                    'identifier': identifier
-                },
-                message=f"WARNING: Rate limit violations detected - {count} violations from {ip_address}"
-            )
-        
-        logger.info(f"Rate limit violation recorded: {identifier} from {ip_address} at {endpoint}")
-    
     def record_file_deletion(self, user_id: str, vault_id: str, file_count: int = 1):
         """
         Record file deletion and detect bulk deletion patterns.
@@ -260,44 +197,6 @@ class SecurityMonitor:
             )
         
         logger.info(f"File deletion recorded: {file_count} file(s) from vault {vault_id} by user {user_id}")
-    
-    def record_vault_access(self, user_id: str, vault_id: str, action: str):
-        """
-        Record vault access and detect rapid access patterns.
-        
-        Args:
-            user_id: User accessing vault
-            vault_id: Vault ID
-            action: Action performed (open, read, write, etc.)
-        """
-        now = time.time()
-        identifier = f"{user_id}:{vault_id}"
-
-        # In-memory trail is only the Redis-outage fallback (see _windowed_count).
-        self._vault_accesses[identifier].append(now)
-
-        # Durable, cross-request window count (Redis) — a fresh per-request deque never trips.
-        recent_accesses = self._windowed_count(
-            f"security:vault_access:{identifier}",
-            self.rapid_vault_access_window_seconds,
-            self._vault_accesses[identifier],
-        )
-
-        if recent_accesses >= self.rapid_vault_access_threshold:
-            self._raise_alert(
-                event_type=SecurityEventType.RAPID_VAULT_ACCESS,
-                severity=SecurityAlertLevel.INFO,
-                user_id=user_id,
-                details={
-                    'accesses': recent_accesses,
-                    'vault_id': vault_id,
-                    'action': action,
-                    'window_seconds': self.rapid_vault_access_window_seconds
-                },
-                message=f"INFO: Rapid vault access detected - {recent_accesses} accesses to vault {vault_id} by user {user_id} in {self.rapid_vault_access_window_seconds} seconds"
-            )
-        
-        logger.debug(f"Vault access recorded: {action} on vault {vault_id} by user {user_id}")
     
     # ========================================================================
     # Analysis and Detection

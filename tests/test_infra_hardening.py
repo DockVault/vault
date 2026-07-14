@@ -235,6 +235,75 @@ def test_alert_dedup_key_is_per_user_and_severity(admin):
         admin.delete_user(u2["id"])
 
 
+def test_bulk_file_deletion_raises_alert(admin, temp_user_client):
+    # Rapidly deleting many files must raise a BULK_FILE_DELETION alert (the recorder is now wired
+    # into the delete route). Threshold 10 / 60s window. A FRESH user does the deletes so the
+    # per-user alert dedup can't collapse this run into a prior bulk-delete alert with another vault;
+    # admin views the (admin-only) alerts and filters to this vault.
+    v = temp_user_client.create_vault()
+    vid = v["id"]
+    try:
+        fids = []
+        for i in range(10):
+            r = temp_user_client.post(f"/vaults/{vid}/files",
+                                      files=[("files", (f"bulk{i}.bin", b"xxxxxxxx", "application/octet-stream"))])
+            assert r.status_code == 200, r.text
+            fids.append(r.json()["files"][0]["id"])
+        for fid in fids:
+            r = temp_user_client.post(f"/vaults/{vid}/files/{fid}/delete")
+            assert r.status_code == 200, r.text
+        alerts = admin.get("/api/security/alerts", params={"limit": 300}).json().get("alerts", [])
+        bulk = [a for a in alerts
+                if a.get("event_type") == "bulk_file_deletion" and (a.get("details") or {}).get("vault_id") == vid]
+        assert bulk, "deleting 10 files should raise a bulk_file_deletion alert for this vault"
+    finally:
+        temp_user_client.delete_vault(vid)
+
+
+def test_folder_delete_raises_bulk_alert(admin, temp_user_client):
+    # A folder delete wipes its whole subtree in ONE request -- the highest-throughput deletion
+    # vector. It must feed the bulk-deletion detector as one N-file record, not go undetected.
+    v = temp_user_client.create_vault()
+    vid = v["id"]
+    try:
+        fr = temp_user_client.post(f"/vaults/{vid}/folders", json={"name": "bulkdir"})
+        assert fr.status_code == 200, fr.text
+        folder_id = fr.json()["folder"]["id"]
+        for i in range(10):
+            r = temp_user_client.post(f"/vaults/{vid}/files?folder_id={folder_id}",
+                                      files=[("files", (f"ff{i}.bin", b"xxxx", "application/octet-stream"))])
+            assert r.status_code == 200, r.text
+        dr = temp_user_client.post(f"/vaults/{vid}/folders/{folder_id}/delete")
+        assert dr.status_code == 200, dr.text
+        alerts = admin.get("/api/security/alerts", params={"limit": 300}).json().get("alerts", [])
+        bulk = [a for a in alerts
+                if a.get("event_type") == "bulk_file_deletion" and (a.get("details") or {}).get("vault_id") == vid]
+        assert bulk, "deleting a folder of 10 files should raise a bulk_file_deletion alert"
+    finally:
+        temp_user_client.delete_vault(vid)
+
+
+def test_all_delete_paths_feed_bulk_detector():
+    # Bulk-deletion detection must cover every deletion vector, not just single-file web deletes: the
+    # folder-delete _purge, SFTP rmdir _purge, and SFTP single-file remove call vault_service.delete_file
+    # directly, so each must also feed record_file_deletion (SFTP is not behaviorally testable here).
+    api = _read("api_server.py")
+    sftp = _read("sftp_server.py")
+    assert api.count("record_file_deletion(") >= 2, "web single-file AND folder delete must record deletions"
+    assert sftp.count("record_file_deletion(") >= 2, "SFTP remove AND rmdir must record deletions"
+
+
+def test_noisy_dead_recorders_stay_removed():
+    # record_vault_access (INFO rapid-vault-access = normal browsing noise on a hot read path) and
+    # record_rate_limit_violation (login rate-limits are already recorded via record_failed_login;
+    # no single clean chokepoint) were removed as dead. Guard against reintroduction.
+    src = _read("security_monitor.py")
+    assert "def record_vault_access" not in src, "record_vault_access was removed as noisy/dead"
+    assert "def record_rate_limit_violation" not in src, "record_rate_limit_violation was removed as dead"
+    # the live recorders remain
+    assert "def record_failed_login" in src and "def record_file_deletion" in src
+
+
 def _import_config(env_overrides):
     return _in_container(env_overrides=env_overrides, args=["python", "-c", "import config"])
 
