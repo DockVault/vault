@@ -49,10 +49,17 @@ def check_if_none_match(request: Request, current_hash: str) -> bool:
     Returns True if content hasn't changed (should return 304).
     """
     if_none_match = request.headers.get('If-None-Match')
-    if if_none_match:
-        # Remove quotes if present (ETag format)
-        if_none_match = if_none_match.strip('"')
-        return if_none_match == current_hash
+    if not if_none_match:
+        return False
+    # RFC 7232 §3.2: "*" matches any; otherwise a comma list of (weak-prefixed) quoted ETags.
+    if if_none_match.strip() == '*':
+        return True
+    for tag in if_none_match.split(','):
+        tag = tag.strip()
+        if tag.startswith('W/'):
+            tag = tag[2:].strip()
+        if tag.strip('"') == current_hash:
+            return True
     return False
 
 # =============================================================================

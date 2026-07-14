@@ -40,7 +40,7 @@ VAULT_CAPS = {
     "folder.create", "folder.delete",
     "file.rename", "file.delete",
     "vault.see_permissions", "vault.change_permissions",
-    "vault.change_info", "vault.change_password", "vault.change_expiry",
+    "vault.change_info", "vault.change_password", "vault.change_expiry", "vault.rotate_key",
     "vault.delete",
 }
 # Global (non-per-vault) capabilities, stored in scope.caps. `vault.create` is the legacy,
@@ -258,11 +258,18 @@ def normalize_scope(raw: Optional[dict]) -> Optional[dict]:
     if not isinstance(raw, dict):
         return None
     temp_in = raw.get("temp", {}) if isinstance(raw.get("temp"), dict) else {}
+
+    def _as_list(v):
+        # A client can send {"pages": null} or {"caps": 5} -> without this guard the comprehensions
+        # below iterate a non-list and raise TypeError -> unhandled 500. Coerce to [] (scope only
+        # ever narrows, so dropping a malformed field is safe).
+        return v if isinstance(v, list) else []
+
     return {
         "v": 1,
-        "pages": sorted(p for p in raw.get("pages", []) if p in PAGES),
-        "caps": sorted(c for c in raw.get("caps", []) if c in GLOBAL_CAPS),
-        "vault_caps_default": sorted(c for c in raw.get("vault_caps_default", []) if c in VAULT_CAPS),
+        "pages": sorted(p for p in _as_list(raw.get("pages")) if p in PAGES),
+        "caps": sorted(c for c in _as_list(raw.get("caps")) if c in GLOBAL_CAPS),
+        "vault_caps_default": sorted(c for c in _as_list(raw.get("vault_caps_default")) if c in VAULT_CAPS),
         "temp": {k: bool(temp_in.get(k, False)) for k in TEMP_PERMS},
     }
 

@@ -3367,7 +3367,18 @@ async def delete_user(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete your own account"
         )
-    
+
+    # A user who still owns vaults can't be hard-deleted: Vault.owner_id is NOT NULL and the
+    # vaults_owned relationship nullifies-the-FK-then-fails, so db.delete would raise IntegrityError
+    # and surface as an opaque 500 (the delete is safely rolled back, but the admin gets no guidance).
+    # Return a clear 409 so the admin reassigns/deletes those vaults first.
+    owned_vaults = db.query(Vault).filter(Vault.owner_id == user.id).count()
+    if owned_vaults:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"User owns {owned_vaults} vault(s); reassign or delete them before deleting the user.",
+        )
+
     username = user.username
     db.delete(user)
     db.commit()

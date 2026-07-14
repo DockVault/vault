@@ -372,6 +372,20 @@ def test_cleanup_old_alerts_prunes_old_resolved(admin):
         admin.delete_user(u["id"])
 
 
+def test_normalize_scope_tolerates_bad_list_fields_and_rotate_key_cap():
+    # normalize_scope must not 500 on a null/scalar list field (it should coerce to []), and
+    # vault.rotate_key must be a recognized cap (else scoped temp creds can never rotate a vault key).
+    script = "\n".join([
+        "from temp_scope import normalize_scope, VAULT_CAPS",
+        "s = normalize_scope({'pages': None, 'caps': 5, 'vault_caps_default': None})",
+        "ok = isinstance(s, dict) and s['pages']==[] and s['caps']==[] and s['vault_caps_default']==[]",
+        "rk = 'vault.rotate_key' in VAULT_CAPS",
+        "print('OK=%s ROTATE=%s' % (ok, rk))",
+    ])
+    proc = _in_container(args=["python", "-"], stdin=script)
+    assert "OK=True ROTATE=True" in proc.stdout, f"{proc.stdout}\n{proc.stderr}"
+
+
 def _import_config(env_overrides):
     return _in_container(env_overrides=env_overrides, args=["python", "-c", "import config"])
 
