@@ -403,8 +403,17 @@ security = HTTPBearer()
 # Pydantic Models (Request/Response Schemas)
 
 class LoginRequest(BaseModel):
-    username: str
+    # Bound + markup-reject the attempted username the same way UserCreate does: it is echoed into
+    # the failed-login SecurityAlert record that the admin API returns, so a hostile value must not
+    # be able to carry markup into an admin surface. (Control characters are stripped defensively at
+    # the alert/log sink too.)
+    username: str = Field(..., max_length=254)
     password: str
+
+    @field_validator('username')
+    @classmethod
+    def _clean_username(cls, v):
+        return _reject_markup_chars(v, 'username')
 
 
 class LoginResponse(BaseModel):
@@ -2772,10 +2781,22 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             finally:
                 _wsdb.close()
 
-        except Exception as e:
+        except ValueError as e:
+            # Our own controlled auth-status messages (invalid payload / session terminated /
+            # account inactive) are safe to surface to the client.
             await websocket.send_json({
                 "type": "error",
-                "message": f"Invalid token: {str(e)}"
+                "message": str(e)
+            })
+            await websocket.close(code=1008)
+            return
+        except Exception as e:
+            # Anything else (token-decode / DB / infra fault) must not leak internals over the
+            # WebSocket — those frames bypass the HTTP 500-sanitizer. Log server-side, send generic.
+            print(f"[WS] token validation failed: {e}")
+            await websocket.send_json({
+                "type": "error",
+                "message": "Authentication failed"
             })
             await websocket.close(code=1008)
             return
@@ -2875,11 +2896,13 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         print(f"WebSocket disconnected for user {username if 'username' in locals() else 'unknown'}")
     except Exception as e:
+        # str(e) can carry SQL/schema/host internals; log it server-side but never frame it to the
+        # client (WebSocket frames don't pass through the HTTP 500-sanitizer).
         print(f"WebSocket error: {e}")
         try:
             await websocket.send_json({
                 "type": "error",
-                "message": str(e)
+                "message": "Internal error"
             })
         except:
             pass

@@ -63,6 +63,43 @@ def test_repeated_failed_logins_raise_brute_force_alerts(admin, anon):
     assert "critical" in severities, f"expected a CRITICAL brute-force alert for {uniq}; got {mine}"
 
 
+def test_failed_login_username_is_sanitized_in_alerts(admin, anon):
+    # A CRLF-carrying login username must not survive into the persisted SecurityAlert (which the
+    # admin alerts API returns) or the logs -- otherwise it forges log lines (CWE-117). Drive the
+    # brute-force path (as the sibling test does) with a hostile username and assert the stored
+    # alert message/username carry no CR/LF.
+    base = unique("crlf")
+    hostile = base + "\r\nInjectedForgedLogLine"
+    for i in range(12):
+        anon.post("/auth/login", json={"username": hostile, "password": f"wrong-{i}"})
+    alerts = admin.get("/api/security/alerts", params={"limit": 200}).json().get("alerts", [])
+    mine = [a for a in alerts
+            if base in (a.get("message") or "") or base in (a.get("username") or "")]
+    assert mine, f"expected an alert recording the hostile username {base!r}"
+    for a in mine:
+        msg = a.get("message") or ""
+        uname = a.get("username") or ""
+        assert "\r" not in msg and "\n" not in msg, f"CRLF survived into alert message: {msg!r}"
+        assert "\r" not in uname and "\n" not in uname, f"CRLF survived into alert username: {uname!r}"
+
+
+def test_error_paths_do_not_leak_exception_text():
+    # WebSocket frames bypass the HTTP 500-sanitizer, and a non-500 HTTPException renders its detail
+    # verbatim -- so neither the /ws auth path nor the ECC register/decompress paths may echo str(e).
+    api = _read("api_server.py")
+    assert 'f"Invalid token: {str(e)}"' not in api, "WS token error must not frame str(e) to the client"
+    assert '"message": "Authentication failed"' in api, "WS token failure should send a generic frame"
+    ecc = _read("ecc_router.py")
+    assert 'f"Invalid public key format: {str(e)}"' not in ecc, "ECC register must not echo str(e) at 400"
+    assert 'f"Invalid compressed point: {str(e)}"' not in ecc, "decompress-point must not echo str(e) at 400"
+    # Lock the NEW register duplicate-race branch specifically: this exact detail string is unique to
+    # the IntegrityError->409 mapping (distinct from the precheck's "encryption key is already set up"),
+    # so removing/weakening that branch actually fails this assertion (a whole-file "IntegrityError"
+    # substring would not -- it also occurs in the unrelated ZK share-invite handler).
+    assert "A public key is already registered for this account" in ecc, \
+        "the duplicate-register race must map to a generic 409, not a str(e) 400"
+
+
 def _import_config(env_overrides):
     return _in_container(env_overrides=env_overrides, args=["python", "-c", "import config"])
 

@@ -369,12 +369,15 @@ async def decompress_point(
     except HTTPException:
         # A deliberate 4xx (bad length / prefix) must surface as-is, not be swallowed into a 500.
         raise
-    except ValueError as e:
+    except ValueError:
+        # Caller-supplied point failed to parse. Don't echo the crypto-library text back at 400
+        # (a non-500 status bypasses the global 500-sanitizer).
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid compressed point: {str(e)}"
+            detail="Invalid compressed point"
         )
     except Exception as e:
+        # 500 detail is scrubbed + server-logged by the global handler, so keeping str(e) here is safe.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Point decompression failed: {str(e)}"
@@ -529,14 +532,34 @@ async def register_public_key(
         )
 
     except HTTPException:
-        # Don't let the 409 conflict get rewrapped as a generic 400 below.
+        # Don't let the 409 conflict get rewrapped below.
         db.rollback()
         raise
-    except Exception as e:
+    except IntegrityError:
+        # Two concurrent registrations for the same user race past the precheck and both commit;
+        # the loser violates the user_keypairs unique constraint. Surface a generic conflict, never
+        # the raw INSERT SQL / bound params / constraint names.
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A public key is already registered for this account"
+        )
+    except ValueError:
+        # Genuine client validation failure (malformed PEM or wrong curve). State the fixed
+        # requirement -- the curve is a public standard, useful feedback -- but don't echo the
+        # crypto-library parse text (str(e)) at a 400 (which bypasses the 500-sanitizer).
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid public key format: {str(e)}"
+            detail="Invalid public key: must be a PEM-encoded secp384r1 public key"
+        )
+    except Exception as e:
+        # Anything else is unexpected: route it through the 500-sanitizer (generic client message
+        # + server-side log + correlation id) instead of leaking str(e) at a mislabeled 400.
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Public key registration failed: {str(e)}"
         )
 
 

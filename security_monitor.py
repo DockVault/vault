@@ -31,6 +31,20 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_for_log(value: Optional[str], max_len: int = 256) -> Optional[str]:
+    """Neutralise a user-controlled value before it is embedded in a persisted SecurityAlert
+    message/field (returned by the admin alerts API) or written to a log line. Strips control
+    characters — including CR/LF, so a value can't forge log lines (CWE-117) — and bounds the
+    length. Angle brackets are rejected at the input boundary (LoginRequest / UserCreate); this is
+    the sink-side defence covering every ingress path."""
+    if value is None:
+        return value
+    s = ''.join(ch for ch in str(value) if ch.isprintable())
+    if len(s) > max_len:
+        s = s[:max_len] + '...'
+    return s
+
+
 class SecurityEventType:
     """Security event type constants."""
     FAILED_LOGIN = "failed_login"
@@ -113,6 +127,12 @@ class SecurityMonitor:
             self._login_attempts[identifier],
         )
 
+        # Counting above keyed off the raw values; from here on only embed sanitized copies in the
+        # persisted alert record and the logs (a CRLF-carrying username must not forge log lines or
+        # ride into the admin alerts JSON).
+        username = _sanitize_for_log(username)
+        ip_address = _sanitize_for_log(ip_address)
+
         if recent_attempts >= self.failed_login_threshold_critical:
             self._raise_alert(
                 event_type=SecurityEventType.BRUTE_FORCE_ATTEMPT,
@@ -157,7 +177,13 @@ class SecurityMonitor:
         redis_key = f"security:rate_limit:{identifier}"
         count = self.redis.incr(redis_key)
         self.redis.expire(redis_key, 3600)  # 1 hour
-        
+
+        # The counter above used the raw identifier as its key; sanitize before embedding these
+        # caller-controlled values in the persisted alert + logs.
+        identifier = _sanitize_for_log(identifier)
+        ip_address = _sanitize_for_log(ip_address)
+        endpoint = _sanitize_for_log(endpoint)
+
         if count >= self.rate_limit_threshold_critical:
             self._raise_alert(
                 event_type=SecurityEventType.RATE_LIMIT_EXCEEDED,

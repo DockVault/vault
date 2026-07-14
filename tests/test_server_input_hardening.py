@@ -77,6 +77,14 @@ def test_audit_export_neutralises_formula_username(admin, anon):
     assert ("," + formula) not in text, "un-neutralised formula cell present in export"
 
 
+def test_login_rejects_markup_username(anon):
+    # The attempted login username is echoed into the failed-login SecurityAlert the admin API
+    # returns; reject angle brackets at the boundary (mirrors UserCreate.username) so a hostile
+    # value can never carry markup into an admin surface. A malformed username is a 422, not a 401.
+    r = anon.post("/auth/login", json={"username": "a<script>b", "password": "wrong-Passw0rd!"})
+    assert r.status_code == 422, r.text
+
+
 # --------------------------------------------------------------------------------------------------
 # Unbounded dashboard limit
 # --------------------------------------------------------------------------------------------------
