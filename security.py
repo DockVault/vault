@@ -17,7 +17,7 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from jose import JWTError, jwt
+import jwt  # PyJWT (maintained); HS256-only. jwt.encode/decode signatures match the prior jose usage.
 
 from config import settings
 
@@ -592,7 +592,7 @@ def verify_access_token(token: str) -> Optional[dict]:
             algorithms=[settings.jwt_algorithm]
         )
         return payload
-    except JWTError:
+    except jwt.PyJWTError:
         return None
 
 

@@ -181,6 +181,13 @@ def _external_scheme(request: StarletteRequest) -> str:
 
 
 # Comprehensive security headers middleware
+# Absolute ceiling on a single request body (defense-in-depth vs a multipart/JSON DoS, on top of the
+# starlette >=0.40 multipart-parser fix). Generous: it must exceed the largest legitimate direct upload
+# (max_file_size_mb) plus multipart overhead, so it only trips on abusive multi-GB bodies — the
+# per-endpoint upload checks still enforce the real file-size limit.
+_MAX_REQUEST_BODY_BYTES = (settings.max_file_size_mb + 256) * 1024 * 1024
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """
     Security headers middleware addressing multiple OWASP findings:
@@ -193,8 +200,23 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """
     
     async def dispatch(self, request: StarletteRequest, call_next):
+        # Defense-in-depth request-body cap on a DECLARED Content-Length. MULTIPART uploads are EXEMPT:
+        # they are metered per-file in-stream and bounded by the target vault's own size limit (and the
+        # multipart parser itself is bounded by starlette >=0.40), so an aggregate cap here would wrongly
+        # reject a legitimate multi-file batch. A missing/chunked Content-Length is metered downstream.
+        # The rejection is assigned to `response` (not returned early) so it still flows through the
+        # hardening-header code below.
+        _oversize_response = None
+        _cl = request.headers.get("content-length")
+        _ctype = request.headers.get("content-type", "").lower()
+        if _cl is not None and not _ctype.startswith("multipart/"):
+            try:
+                if int(_cl) > _MAX_REQUEST_BODY_BYTES:
+                    _oversize_response = JSONResponse(status_code=413, content={"detail": "Request body too large."})
+            except ValueError:
+                _oversize_response = JSONResponse(status_code=400, content={"detail": "Invalid Content-Length header."})
         try:
-            response = await call_next(request)
+            response = _oversize_response if _oversize_response is not None else await call_next(request)
         except HTTPException:
             # Re-raise HTTPExceptions (they're handled by FastAPI)
             raise

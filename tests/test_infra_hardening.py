@@ -92,6 +92,15 @@ def test_production_allows_blank_admin_password_post_bootstrap():
     assert proc.returncode == 0, "blank admin password must not fail startup (post-bootstrap)"
 
 
+def test_jwt_algorithm_must_be_canonical_hmac():
+    # A non-HMAC or mis-cased JWT_ALGORITHM must fail closed at BOOT (defeats alg-confusion and the
+    # PyJWT case-sensitivity 500). Only the exact canonical HMAC names boot.
+    assert _import_config({"JWT_ALGORITHM": "HS256"}).returncode == 0
+    for bad in ("RS256", "none", "hs256", "ES256"):
+        proc = _import_config({"JWT_ALGORITHM": bad})
+        assert proc.returncode == 1, f"JWT_ALGORITHM={bad!r} must fail-closed at boot\n{proc.stdout}"
+
+
 def test_development_rejects_env_example_placeholder():
     # The shipped .env.example placeholder is a publicly known credential and must be refused in
     # EVERY environment — a bare `docker compose up` ships ENVIRONMENT=development and previously
@@ -188,13 +197,16 @@ def test_requirements_drop_unused_and_refresh_crypto():
               if l.strip() and not l.strip().startswith("#")]
     names = {l.split("==")[0].split("[")[0].strip().lower() for l in active}
     assert "requests" not in names, "unused requests should be removed from the image deps"
-    assert "pyjwt" not in names, "unused PyJWT should be removed (the JWT path is python-jose)"
-    assert "cryptography==43.0.1" in active, "cryptography should be refreshed off 41.0.7"
-    assert "python-multipart==0.0.7" in active, "python-multipart should be bumped for the ReDoS fix"
+    assert "python-jose" not in names, "the unmaintained python-jose should be dropped in favour of PyJWT"
+    assert "pyjwt" in names, "the JWT path is now the maintained PyJWT"
+    assert "cryptography==44.0.1" in active, "cryptography should carry the CVE-2024-12797 fix"
+    assert "python-multipart==0.0.18" in active, "python-multipart should carry the multipart-DoS fix"
+    assert "fastapi==0.115.6" in active, "fastapi should pair with starlette>=0.40 (CVE-2024-47874)"
+    assert "starlette==0.41.3" in active, "starlette should be >=0.40 (CVE-2024-47874)"
 
 
 def test_no_stray_import_of_dropped_libs_in_shipped_code():
-    patt = "^import requests|^import jwt|^from jwt "
+    patt = "^import requests|^from jose\\b|^import jose\\b"
     hits = subprocess.run(["git", "grep", "-lE", patt], cwd=str(ROOT),
                           capture_output=True, text=True)
     prod = [p for p in hits.stdout.splitlines() if p and not p.startswith("tests/")]

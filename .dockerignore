@@ -63,3 +63,5 @@ docker-compose*.yml
 # pointer, but it still leaks the internal submodule/monorepo path layout).
 .git
 .git/
+# CI / repo config (Dependabot etc.) — not part of the runtime image.
+.github/

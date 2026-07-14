@@ -1,0 +1,18 @@
+# Automated dependency scanning + update PRs. Keeps the Python deps and the Docker base image
+# current so security patches (e.g. the multipart / cryptography CVEs) are surfaced automatically
+# instead of the stack silently freezing. Only active on the public GitHub repo.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      python-deps:
+        patterns:
+          - "*"
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"

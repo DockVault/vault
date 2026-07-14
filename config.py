@@ -270,6 +270,18 @@ if len(_jwt_secret) < 32 or _jwt_secret.lower() in _JWT_SECRET_PLACEHOLDERS:
     sys.exit(1)
 
 
+# --- Fail closed on a non-HMAC / mis-cased JWT algorithm ---
+# Token verification pins algorithms=[jwt_algorithm] (a single-element allowlist) and this deployment
+# is JWS-only — no RSA/EC verification key is configured. Require the EXACT canonical HMAC name: PyJWT
+# looks algorithms up case-sensitively, so a mis-cased value like "hs256" would clear a loose check yet
+# 500 at the first token mint. An exact allowlist fails closed at boot for BOTH an asymmetric algorithm
+# (alg-confusion) and a mis-cased one — regardless of the JWT library.
+if (settings.jwt_algorithm or "").strip() not in {"HS256", "HS384", "HS512"}:
+    print(f"\n❌ FATAL: JWT_ALGORITHM must be exactly one of HS256/HS384/HS512; got {settings.jwt_algorithm!r}.")
+    print("   This deployment is symmetric (JWS-only); an asymmetric or mis-cased algorithm is a forgery/500 risk.")
+    sys.exit(1)
+
+
 # --- Fail closed on a shipped sample / weak admin bootstrap password ---
 # The first admin is seeded from ADMIN_PASSWORD; unlike the crypto-key placeholders (an invalid
 # ENCRYPTION_KEY fails fast), the shipped sample admin password is a WORKING credential. A BLANK
