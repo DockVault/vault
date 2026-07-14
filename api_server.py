@@ -6180,20 +6180,35 @@ async def upload_chunk(
         f.write(data)
     os.replace(tmp_path, chunk_path)
 
-    if not already:
-        session.chunks_received = (session.chunks_received or 0) + 1
-    # Keep the byte counter accurate even when a chunk is re-sent at a different size.
-    session.bytes_received = base_bytes + len(data)
-    session.last_chunk_at = datetime.utcnow()
+    # Serialize the counter update per session (SELECT ... FOR UPDATE) and recompute the counters from
+    # the AUTHORITATIVE on-disk chunk set, so concurrent PUTs — even a same-index re-send — converge to
+    # the true total instead of racing a read-modify-write (a blind += double-counts a same-index race;
+    # an absolute assignment clobbers a concurrent different-index write). Mirrors the disk-authoritative
+    # /complete and the ZK-path locking.
+    _total = session.total_chunks
+    locked = db.query(ChunkedUploadSession).filter(
+        ChunkedUploadSession.id == session.id
+    ).with_for_update().first()
+    _present = sorted(sdir.glob("chunk_*"))
+    _bytes = 0
+    for _p in _present:
+        try:
+            _bytes += _p.stat().st_size
+        except OSError:
+            pass
+    received = len(_present)
+    if locked is not None:
+        locked.bytes_received = _bytes
+        locked.chunks_received = received
+        locked.last_chunk_at = datetime.utcnow()
     db.commit()
 
-    received = session.chunks_received or 0
     return {
         'received': received,
-        'total': session.total_chunks,
-        'bytes_received': session.bytes_received,
-        'percent': round(received * 100 / session.total_chunks, 1) if session.total_chunks else 0,
-        'complete': received >= session.total_chunks,
+        'total': _total,
+        'bytes_received': _bytes,
+        'percent': round(received * 100 / _total, 1) if _total else 0,
+        'complete': received >= _total,
     }
 
 
@@ -6286,6 +6301,19 @@ async def complete_chunked_upload(
     if client_file_id is not None and db.query(File.id).filter(File.id == client_file_id).first():
         raise HTTPException(status_code=409, detail="File id already in use")
 
+    # After a clean `with stream_ctx` exit the assembled blob PERSISTS; the post-assembly checks
+    # (size-limit, deployment quota, ZK stale-epoch) and finalize below run OUTSIDE that block and can
+    # raise, which would orphan a full-size ciphertext blob (the periodic sweep only touches _uploads/
+    # chunk dirs, never the final blob). Best-effort remove it on ANY failure. No-op if never assembled.
+    file_info = None
+
+    def _remove_orphan_blob():
+        try:
+            if file_info and file_info.get('storage_path'):
+                vault_service._remove_blobs([file_info['storage_path']])
+        except Exception:
+            pass
+
     try:
         file_info, stream_ctx = vault_service.upload_file_streaming(
             vault_id=vault_id,
@@ -6353,8 +6381,10 @@ async def complete_chunked_upload(
             replace_same_name=_principal_can_replace_file(db, current_user, vault_id),
         )
     except HTTPException:
+        _remove_orphan_blob()
         raise
     except DuplicateNameError as e:
+        _remove_orphan_blob()   # (finalize already removed it on this path; no-op safety net)
         # Lost a same-name replace race against the name unique index — a clean 409. finalize
         # already rolled back, but the session ROW survives intact (status='active') and for a
         # Standard vault still holds the plaintext filename/MIME as working state; the chunk
@@ -6368,6 +6398,7 @@ async def complete_chunked_upload(
         shutil.rmtree(sdir, ignore_errors=True)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
+        _remove_orphan_blob()
         # A client-supplied file id that collided (a fresh-UUID race that slipped past the
         # pre-check) -> a clean 409, not a 500. Any other ValueError keeps the generic handling.
         if "id already in use" in str(e):
@@ -6377,6 +6408,7 @@ async def complete_chunked_upload(
         db.commit()
         raise HTTPException(status_code=500, detail=f"Failed to finalize upload: {str(e)}")
     except Exception as e:
+        _remove_orphan_blob()
         session.status = 'failed'
         session.error_message = str(e)[:500]
         db.commit()

@@ -514,14 +514,17 @@ class VaultService:
             from authorization import PermissionDeniedError
             raise PermissionDeniedError("Only the vault owner or an admin can delete this vault")
         
-        # Delete physical files
         vault_dir = self._get_vault_path(vault_id)
-        if vault_dir.exists():
-            shutil.rmtree(vault_dir)
-        
-        # Database cascade will handle related records
+        # Commit the DB delete (cascade) BEFORE removing the physical dir: a rmtree sequenced before a
+        # FAILED commit would zombify the whole vault (rows survive, files gone). After a successful
+        # commit the dir is safely orphaned and best-effort removed.
         self.db.delete(vault)
         self.db.commit()
+        if vault_dir.exists():
+            try:
+                shutil.rmtree(vault_dir)
+            except Exception as _e:
+                print(f"Warning: vault dir removal after delete failed (recoverable orphan dir): {_e}")
     
     def create_folder(
         self,
@@ -1031,7 +1034,14 @@ class VaultService:
             self.db.rollback()
             self._remove_blobs([file_info['storage_path']])
             raise DuplicateNameError("A file with that name already exists in this folder.")
-        self.db.refresh(file)
+        # A refresh failure AFTER a successful commit is non-fatal — the row is already durable. Guard
+        # it so finalize never raises past the commit: otherwise the exception would reach a caller's
+        # except handler (e.g. /complete's orphan-blob cleanup) and destroy the just-committed blob,
+        # leaving a live File row with no blob.
+        try:
+            self.db.refresh(file)
+        except Exception:
+            pass
         # Commit succeeded: the prior same-name rows are gone, so it is now safe to remove
         # their on-disk blobs (deferred until here so a rollback never destroys the old file).
         self._remove_blobs(stale_blobs)
@@ -1151,10 +1161,18 @@ class VaultService:
         )
         
         vault = file.vault
-        
-        # ✅ ENHANCED: Use EncryptedFileStorage secure deletion
         storage_path = self.storage_path / file.storage_path
-        
+
+        # Update stats, delete the row, and COMMIT before touching the blob. An irreversible
+        # secure_delete sequenced BEFORE the commit would, on a commit failure, leave a live row
+        # pointing at a destroyed blob (every download then 500s with FileNotFoundError). Destroying
+        # the blob AFTER a successful commit leaves at most a recoverable/GC-able orphan on failure
+        # (mirrors the _remove_blobs-after-commit ordering in finalize_streaming_upload).
+        vault.total_size_bytes -= file.size_bytes
+        vault.file_count -= 1
+        self.db.delete(file)
+        self.db.commit()
+
         if storage_path.exists():
             try:
                 # Secure delete with overwrite
@@ -1169,16 +1187,11 @@ class VaultService:
                     storage_path.unlink()
                 except Exception as fallback_error:
                     print(f"Warning: Fallback deletion also failed: {fallback_error}")
-                    # Last resort: just delete
-                    storage_path.unlink()
-        
-        # Update vault statistics
-        vault.total_size_bytes -= file.size_bytes
-        vault.file_count -= 1
-        
-        # Delete database record
-        self.db.delete(file)
-        self.db.commit()
+                    # Last resort: just delete (best-effort — the row is already gone)
+                    try:
+                        storage_path.unlink()
+                    except Exception:
+                        pass
     
     def rename_file(self, file_id: uuid.UUID, new_name: str, user: User,
                     vault_id: Optional[uuid.UUID] = None, *,
@@ -1351,32 +1364,41 @@ class VaultService:
             )
         ).all()
         
+        # Delete the rows + update stats and COMMIT before destroying any blob: an irreversible
+        # overwrite/unlink sequenced before the commit would, on a commit failure, leave live rows
+        # pointing at gone blobs. Capture each path only after its delete is staged.
+        stale_paths = []
         for file in expired_files:
             try:
-                # Securely delete physical file
-                storage_path = self.storage_path / file.storage_path
-                
-                if storage_path.exists():
-                    file_size = storage_path.stat().st_size
-                    with open(storage_path, 'wb') as f:
-                        f.write(os.urandom(file_size))
-                    
-                    storage_path.unlink()
-                
-                # Update vault statistics
+                _path = self.storage_path / file.storage_path
                 vault = file.vault
                 if vault:
                     vault.total_size_bytes -= file.size_bytes
                     vault.file_count -= 1
-                
-                # Delete database record
                 self.db.delete(file)
-            
+                stale_paths.append(_path)
             except Exception as e:
                 print(f"Error deleting expired file {file.id}: {e}")
                 continue
-        
-        self.db.commit()
+
+        try:
+            self.db.commit()
+        except Exception as e:
+            self.db.rollback()
+            print(f"Error committing expired-file cleanup (blobs kept): {e}")
+            return
+
+        # Rows are durably gone; now securely destroy the blobs (best-effort — an orphan blob is
+        # recoverable/GC-able, a dangling row is not).
+        for storage_path in stale_paths:
+            try:
+                if storage_path.exists():
+                    file_size = storage_path.stat().st_size
+                    with open(storage_path, 'wb') as f:
+                        f.write(os.urandom(file_size))
+                    storage_path.unlink()
+            except Exception as e:
+                print(f"Error securely removing expired blob {storage_path}: {e}")
     
     def _get_vault_path(self, vault_id: uuid.UUID) -> Path:
         """Get physical path for vault directory."""
