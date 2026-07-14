@@ -1306,15 +1306,31 @@ def listen_for_terminations():
                 port=settings.redis_port,
                 db=settings.redis_db,
                 password=settings.redis_password if settings.redis_password else None,
-                decode_responses=True
+                decode_responses=True,
+                # Match the shared client settings (database.py) so a HALF-OPEN socket — a Redis blip
+                # that drops the TCP connection WITHOUT a clean close — is detected instead of blocking
+                # forever, which would silently disable live SFTP revocation until the process restarts.
+                # socket_keepalive + health_check_interval actively probe an idle pub/sub connection;
+                # socket_timeout bounds every read (incl. the health-check PONG) and socket_connect_timeout
+                # bounds reconnects.
+                socket_connect_timeout=settings.redis_connect_timeout,
+                socket_timeout=settings.redis_socket_timeout,
+                socket_keepalive=True,
+                health_check_interval=30,
             )
             pubsub = r.pubsub()
             pubsub.subscribe('session_terminations')
 
             print("👂 Listening for session termination signals...")
 
-            for message in pubsub.listen():
-                if message['type'] == 'message':
+            while True:
+                # Bounded poll, never an unbounded listen(): returns None on an idle tick, so
+                # health_check_interval can fire a PING and surface a dead/half-open socket promptly
+                # (raising into the reconnect loop below) instead of hanging.
+                message = pubsub.get_message(timeout=1.0)
+                if message is None:
+                    continue
+                if message.get('type') == 'message':
                     try:
                         data = json.loads(message['data'])
                         session_token = data.get('session_token')
@@ -1333,8 +1349,9 @@ def listen_for_terminations():
                         print(f"❌ Error processing termination signal: {e}")
 
         except Exception as e:
-            # Connection lost (e.g. Redis restarted) — back off briefly, then
-            # reconnect and resubscribe so revocation self-heals after the outage.
+            # Connection lost / health-check failed (Redis restarted, or a half-open socket surfaced
+            # by health_check_interval) — back off briefly, then reconnect + resubscribe so revocation
+            # self-heals after the outage.
             print(f"❌ Termination listener connection lost; reconnecting in 5s: {e}")
             time.sleep(5)
 

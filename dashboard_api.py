@@ -14,7 +14,6 @@ from sqlalchemy import func, desc, select
 
 from database import get_db
 from models import User, Vault, vault_members, TemporaryCredential, AuditLog, ActiveSession, RoleEnum
-from security import verify_access_token
 from response_hash_utils import handle_conditional_response
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -29,72 +28,20 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security_scheme),
     db: Session = Depends(get_db)
 ) -> User:
+    """Dependency to get the current authenticated user for the /api/dashboard plane.
+
+    Delegates to the ONE hardened dependency (api_server.get_current_user) so there is a single
+    source of truth for authentication: the token denylist + durable ActiveSession.revoked check,
+    temp-session is_active/grace/lifetime validation, account_locked, and attach_scope (which sets
+    _is_temp_session — read by _is_interactive_admin below). The previous bespoke copy OMITTED the
+    temp-session lifetime + account_locked checks, so a deactivated/locked temp credential kept
+    reading the dashboard aggregates until its token expired.
+
+    The import is LAZY (inside the body): api_server imports this module at load time to mount the
+    router, so a module-level import would be circular. By request time api_server is fully loaded.
     """
-    Dependency to get current authenticated user from JWT token.
-    """
-    token = credentials.credentials
-    
-    payload = verify_access_token(token)
-    if not payload:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload"
-        )
-
-    # Revocation parity with the main auth dependency: reject a token with no
-    # session_token (unrevocable), a denylisted (logged-out) token, and a durably-revoked
-    # session — so a logged-out / forged token can't read dashboard aggregates.
-    session_token = payload.get("session_token")
-    is_temporary = payload.get("is_temporary", False)
-    if not session_token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials"
-        )
-    from auth_service import is_token_denylisted
-    if is_token_denylisted(session_token):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session has been terminated. Please login again."
-        )
-    if not is_temporary:
-        from models import ActiveSession
-        revoked = db.query(ActiveSession.revoked).filter(
-            ActiveSession.session_token == session_token
-        ).first()
-        if revoked is not None and revoked[0]:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Session has been terminated. Please login again."
-            )
-
-    # Get user from database
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found"
-        )
-    
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is disabled"
-        )
-
-    # Flag temp-credential sessions so the admin-scoped routes below treat them as non-admin: a temp
-    # cred gets its OWN dashboard data, never deployment-wide aggregates or the full audit trail. Set
-    # the flag even if a scope row can't be loaded, so a temp token can't fall through as a full admin.
-    user._is_temp_session = bool(is_temporary and session_token)
-    return user
+    from api_server import get_current_user as _hardened_get_current_user
+    return await _hardened_get_current_user(credentials, db)
 
 
 def _is_interactive_admin(user) -> bool:

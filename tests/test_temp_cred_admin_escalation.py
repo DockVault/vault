@@ -211,6 +211,23 @@ def test_temp_admin_denied_active_connections(temp_admin_client):
     assert temp_admin_client.get("/api/dashboard/active-connections").status_code == 403
 
 
+def test_deactivated_temp_cred_is_401_on_dashboard(admin):
+    # A deactivated temp credential must not keep reading /api/dashboard/* — the dashboard router now
+    # shares the hardened auth dependency (which rejects a revoked/deactivated temp session), instead
+    # of a drifted copy that only checked the token denylist.
+    tc = admin.post("/auth/temp-credentials", json={"note": unique("r4-deact")}).json()
+    c = ApiClient(BASE_URL)
+    c.login(tc["temp_username"], tc["credential"])
+    # Active: the temp cred can read its own dashboard.
+    assert c.get("/api/dashboard/stats").status_code in (200, 304)
+    # Deactivate it (revokes the active session).
+    assert admin.post(f"/temp-creds/{tc['temp_username']}/deactivate").status_code == 200
+    # Now every /api/dashboard/* read is 401 (auth fails before any role/scope check).
+    assert c.get("/api/dashboard/stats").status_code == 401
+    assert c.get("/api/dashboard/recent-events").status_code == 401
+    assert c.get("/api/dashboard/active-connections").status_code == 401
+
+
 def test_temp_admin_dashboard_stats_is_own_scoped(temp_admin_client):
     # A temp cred's /api/dashboard/stats must be OWN-scoped: the deployment-wide admin branch uniquely
     # sets 'users' and 'active_sessions', so those keys must be absent for a temp credential.
