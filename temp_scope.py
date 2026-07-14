@@ -127,15 +127,21 @@ def temp_session_allows_group(user, group_name: str, kwargs: dict) -> bool:
     """Decorator-level coarse gate: page access + a few global/temp caps. Per-vault
     capability and vault-membership are enforced downstream (enforce_vault /
     require_cap). Returns True for legacy (unscoped) credentials."""
-    scope = _scope(user)
-    if scope is None:
-        return True  # legacy / not a scoped temp session
-
+    # __infra__ (health/login) is always allowed; __deny__ (admin-only groups: USER_*, AUDIT_VIEW) is
+    # NEVER available to ANY temporary credential — scoped OR legacy/NULL-scope. Evaluate these BEFORE
+    # the NULL-scope early-return so a legacy "unrestricted" temp cred can't reach an admin group via
+    # @require_endpoint_permission (keeping this consistent with require_interactive_admin, which
+    # rejects every temp session). For all other groups a NULL-scope cred stays unrestricted (legacy).
     page = GROUP_PAGE.get(group_name, "__deny__")
     if page == "__infra__":
         return True
     if page == "__deny__":
         return False
+
+    scope = _scope(user)
+    if scope is None:
+        return True  # legacy / not a scoped temp session (non-deny, non-infra groups)
+
     if page not in set(scope.get("pages", [])):
         return False
 

@@ -927,7 +927,9 @@ async def get_current_user(
         from temp_scope import attach_scope
         attach_scope(db, user, temp_cred)
     else:
-        user._is_temp_session = False
+        # Fail SAFE: a temp session (is_temporary + session_token) whose scope row can't be loaded must
+        # still be flagged, so it can never fall through require_interactive_admin as an interactive admin.
+        user._is_temp_session = bool(is_temporary and session_token)
     return user
 
 
@@ -1099,7 +1101,7 @@ async def health_check():
 @app.get("/audit/events")
 async def recent_audit_events(
     limit: int = 10,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """Recent audit-log entries for the dashboard activity feed (admin only)."""
@@ -1168,7 +1170,7 @@ async def search_audit_log(
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
     limit: int = 500,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Filtered audit-log search for the admin Audit page (admin only)."""
@@ -1200,7 +1202,7 @@ async def export_audit_log(
     action: Optional[str] = None,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Export the filtered audit log as CSV (admin only)."""
@@ -1394,7 +1396,7 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
 
 @app.get("/settings")
 async def get_settings(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Return stored global settings (sensitive fields stripped)."""
@@ -1635,7 +1637,7 @@ async def pull_logs(
 
 @app.get("/settings/logs")
 async def get_logs_settings(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Log-access admin view: the ceiling, per-component flags, and the token list. NEVER the
@@ -1959,7 +1961,7 @@ async def get_zk_enabled(
 
 @app.get("/zk/unsealed")
 async def zk_unsealed_count(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Operator migration signal: how many zero-knowledge file/folder rows still carry an UNSEALED
@@ -2761,7 +2763,10 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             from models import User as _WSUser, RoleEnum as _WSRole
             with get_db_context() as _wsdb:
                 _wsu = _wsdb.query(_WSUser).filter(_WSUser.id == uuid.UUID(user_id)).first()
-                is_admin_conn = bool(_wsu and _wsu.role == _WSRole.ADMIN)
+                # A temporary credential — even an admin's — is NOT a full admin here: it receives
+                # only its OWN activity events, never the deployment-wide fleet feed (mirrors the
+                # /api/dashboard confinement).
+                is_admin_conn = bool(_wsu and _wsu.role == _WSRole.ADMIN and not is_temporary)
         except Exception:
             is_admin_conn = False
 
@@ -2911,7 +2916,7 @@ async def create_user(
 @app.get("/users", response_model=List[UserResponse])
 @require_endpoint_permission("USER_VIEW")
 async def list_users(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -3020,21 +3025,22 @@ async def get_user(
     """
     Get user by ID (admin or self).
     """
-    user = db.query(User).filter(User.id == user_id).first()
-    
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
-    
-    # Only admin or self can view
+    # Own-or-admin, checked BEFORE the existence lookup to avoid an enumeration oracle (mirrors
+    # user_management_api.get_user_detail — a non-admin granted USER_VIEW must not distinguish an
+    # existing from a nonexistent user id).
     if current_user.role != RoleEnum.ADMIN and current_user.id != user_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied"
         )
-    
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
     return UserResponse.model_validate(user)
 
 
@@ -3353,7 +3359,7 @@ def _group_to_response(g: Group, members_map: dict, children_map: dict) -> Group
 
 @app.get("/groups", response_model=List[GroupResponse])
 async def list_groups(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """List all organizational groups (admin only)."""
@@ -3391,7 +3397,7 @@ async def create_group(
 @app.get("/groups/{group_id}", response_model=GroupDetailResponse)
 async def get_group(
     group_id: uuid.UUID,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """Group detail: members (with their per-group role) and direct sub-groups."""
@@ -7227,7 +7233,7 @@ async def zk_seal_names(
 
 @app.get("/dashboard/stats", response_model=DashboardStats)
 async def get_dashboard_stats(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -7323,7 +7329,7 @@ async def logout(
 @app.get("/api/monitoring/metrics")
 async def get_monitoring_metrics(
     request: Request,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -7426,7 +7432,8 @@ async def cancel_operation(
     if tracker.cancel_operation(
         operation_id,
         requester_id=str(current_user.id),
-        is_admin=(current_user.role == RoleEnum.ADMIN),
+        # A temp credential is not a full admin: it may cancel only its own operations.
+        is_admin=(current_user.role == RoleEnum.ADMIN and not getattr(current_user, "_is_temp_session", False)),
     ):
         # Broadcast cancellation event with operation_id
         broadcast_event({
@@ -7457,7 +7464,7 @@ async def cancel_operation(
 @app.get("/api/security/metrics")
 async def get_security_metrics(
     hours: int = 24,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -7489,7 +7496,7 @@ async def get_security_metrics(
 async def get_security_alerts(
     limit: int = 50,
     severity: Optional[str] = None,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -7537,7 +7544,7 @@ async def get_security_alerts(
 async def resolve_security_alert(
     alert_id: str,
     notes: Optional[str] = None,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -7567,7 +7574,7 @@ async def resolve_security_alert(
 async def get_user_security_activity(
     user_id: str,
     hours: int = 24,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -7614,7 +7621,7 @@ async def get_user_security_activity(
 
 @app.get("/permissions/groups", response_model=List[EndpointPermissionGroupResponse])
 async def get_permission_groups(
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
     """
@@ -7667,8 +7674,11 @@ async def get_user_permissions(
     from endpoint_permissions import get_user_permissions as get_perms
     from api_catalog import API_CATALOG
     
-    # Authorization: Users can only see their own permissions, admins can see anyone's
-    if current_user.role != RoleEnum.ADMIN and current_user.id != user_id:
+    # Authorization: users see only their own permissions; a real (interactive) admin can see anyone's.
+    # A temporary credential — even one owned by an admin — is treated as non-admin here, so it can
+    # only read its OWN permission set (consistent with require_interactive_admin).
+    _perms_is_admin = current_user.role == RoleEnum.ADMIN and not getattr(current_user, "_is_temp_session", False)
+    if not _perms_is_admin and current_user.id != user_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You can only view your own permissions"

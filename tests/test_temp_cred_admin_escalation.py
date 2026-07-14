@@ -122,3 +122,136 @@ def test_temp_admin_cannot_cleanup_upload_sessions(temp_admin_client):
     # a temp cred must not be able to purge every tenant's in-flight uploads.
     r = temp_admin_client.post("/api/maintenance/upload-sessions/cleanup", params={"idle_minutes": 999999})
     assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Admin-only READ + monitoring-integrity routes that were on bare require_admin.
+# A temp admin credential keeps role==ADMIN, so it reached the deployment-wide audit
+# trail, security dashboards, settings, groups and user list with no scope enforcement.
+# These now require an interactive admin and MUST 403 for any temp session (scoped OR
+# NULL-scope), while a real interactive admin is unaffected.
+# ---------------------------------------------------------------------------
+_ADMIN_ONLY_READ_ROUTES = [
+    "/audit/events",
+    "/audit/log",
+    "/audit/export",
+    "/api/security/metrics",
+    "/api/security/alerts",
+    "/dashboard/stats",
+    "/settings",
+    "/settings/logs",
+    "/zk/unsealed",
+    "/groups",
+    "/users",
+    "/permissions/groups",
+    "/api/monitoring/metrics",
+]
+
+
+@pytest.mark.parametrize("path", _ADMIN_ONLY_READ_ROUTES)
+def test_temp_admin_denied_admin_only_read_routes(temp_admin_client, path):
+    r = temp_admin_client.get(path)
+    assert r.status_code == 403, f"GET {path} -> {r.status_code} (expected 403)\n{r.text[:300]}"
+
+
+def test_temp_admin_cannot_resolve_security_alert(temp_admin_client):
+    # a monitoring-integrity WRITE (suppress a security alert) must not be reachable by a temp cred.
+    r = temp_admin_client.post("/api/security/alerts/00000000-0000-0000-0000-000000000000/resolve")
+    assert r.status_code == 403
+
+
+def test_temp_admin_cannot_read_user_activity(temp_admin_client, temp_user):
+    r = temp_admin_client.get(f"/api/security/user-activity/{temp_user['id']}")
+    assert r.status_code == 403
+
+
+@pytest.fixture
+def scoped_temp_admin_client(admin):
+    """An admin-minted SCOPED temp credential (vaults page only). It carries role==ADMIN but a
+    non-null scope; it must be 403 on every admin-plane route just like the NULL-scope one."""
+    r = admin.post("/auth/temp-credentials", json={
+        "note": unique("r3-scoped"),
+        "scope": {"pages": ["vaults"], "caps": [], "vault_caps_default": ["vault.see_files"]},
+        "vault_access_mode": "all",
+    })
+    assert r.status_code == 200, r.text
+    tc = r.json()
+    c = ApiClient(BASE_URL)
+    c.login(tc["temp_username"], tc["credential"])
+    sess = c.get("/auth/session").json()
+    assert sess.get("is_temp_session") is True and sess.get("is_scoped_temp") is True, sess
+    return c
+
+
+def test_scoped_temp_admin_denied_audit_and_security(scoped_temp_admin_client):
+    assert scoped_temp_admin_client.get("/audit/export").status_code == 403
+    assert scoped_temp_admin_client.get("/api/security/alerts").status_code == 403
+    assert scoped_temp_admin_client.get("/users").status_code == 403
+
+
+def test_temp_admin_denied_user_directory_and_audit_reads(temp_admin_client, temp_user):
+    # A NULL-scope temp admin must ALSO be denied the admin READ surfaces reachable via
+    # @require_endpoint_permission(USER_VIEW/AUDIT_VIEW) — the __deny__ gate now applies to legacy
+    # (unscoped) temp creds too — plus the un-decorated own-or-admin per-user permission read.
+    uid = temp_user["id"]
+    for path in [
+        "/api/user-management/users",
+        f"/api/user-management/users/{uid}",
+        "/api/user-management/metrics",
+        f"/api/user-management/users/{uid}/activity",
+        f"/users/{uid}",                    # api_server GET /users/{id}
+        f"/permissions/users/{uid}",        # per-user permission read (another user)
+    ]:
+        r = temp_admin_client.get(path)
+        assert r.status_code == 403, f"GET {path} -> {r.status_code} (expected 403)\n{r.text[:200]}"
+
+
+def test_temp_admin_denied_active_connections(temp_admin_client):
+    # The parallel /api/dashboard router must not expose deployment-wide data to a temp cred.
+    assert temp_admin_client.get("/api/dashboard/active-connections").status_code == 403
+
+
+def test_temp_admin_dashboard_stats_is_own_scoped(temp_admin_client):
+    # A temp cred's /api/dashboard/stats must be OWN-scoped: the deployment-wide admin branch uniquely
+    # sets 'users' and 'active_sessions', so those keys must be absent for a temp credential.
+    r = temp_admin_client.get("/api/dashboard/stats")
+    assert r.status_code in (200, 304), r.text
+    if r.status_code == 200:
+        data = r.json()
+        assert "users" not in data and "active_sessions" not in data, f"temp cred got deployment-wide stats: {data}"
+
+
+def test_temp_admin_recent_events_excludes_other_users(admin, temp_admin_client, temp_user):
+    # /api/dashboard/recent-events must be OWN-scoped for a temp cred (whose principal is the owning
+    # admin) — it must NOT return the full deployment audit trail. Trigger an event owned by ANOTHER
+    # user and confirm the interactive admin sees it while the temp admin does not.
+    ApiClient().login(temp_user["_username"], temp_user["_password"])  # a login audit event for temp_user
+    all_ev = admin.get("/api/dashboard/recent-events?limit=100").json()
+    own_ev = temp_admin_client.get("/api/dashboard/recent-events?limit=100").json()
+    all_usernames = {e.get("username") for e in all_ev}
+    own_usernames = {e.get("username") for e in own_ev}
+    assert temp_user["_username"] in all_usernames, "a real admin should see the other user's event"
+    assert temp_user["_username"] not in own_usernames, "a temp admin must NOT see another user's audit events"
+
+
+def test_interactive_admin_still_reads_admin_routes(admin):
+    # Guard: the require_interactive_admin swaps must NOT block a real interactive admin.
+    assert admin.get("/dashboard/stats").status_code == 200
+    assert admin.get("/api/security/alerts").status_code == 200
+    assert admin.get("/groups").status_code == 200
+
+
+def test_user_view_grant_does_not_permit_reading_another_users_record(admin, temp_user):
+    # IDOR guard: granting the (admin-default) USER_VIEW permission to a non-admin must NOT let them
+    # read ANOTHER user's record — the catalog's requires_ownership flag is display-only, so the
+    # handler enforces own-or-admin. The user may still read their OWN record.
+    other = admin.create_user(role="user")
+    try:
+        g = admin.post(f"/permissions/users/{temp_user['id']}/grant", json={"endpoint_group": "USER_VIEW"})
+        assert g.status_code == 200, g.text
+        c = ApiClient()
+        c.login(temp_user["_username"], temp_user["_password"])
+        assert c.get(f"/api/user-management/users/{other['id']}").status_code == 403
+        assert c.get(f"/api/user-management/users/{temp_user['id']}").status_code == 200
+    finally:
+        admin.delete_user(other["id"])

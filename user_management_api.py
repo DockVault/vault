@@ -418,6 +418,12 @@ async def list_users(
     db: Session = Depends(get_db)
 ):
     """List all users with filtering and search (supports ETag for conditional updates)"""
+
+    # USER_VIEW is admin-only by default; a fleet-wide user listing has no "own" subset, so if an
+    # operator grants USER_VIEW to a non-admin, restrict the listing to admins (mirrors the
+    # own-or-admin guard on the per-user detail route).
+    if current_user.role != RoleEnum.ADMIN:
+        raise HTTPException(status_code=403, detail="Listing all users requires an administrator")
     
     query = db.query(User)
     
@@ -497,6 +503,13 @@ async def get_user_detail(
     db: Session = Depends(get_db)
 ):
     """Get detailed user information (supports ETag for conditional updates)"""
+
+    # Own-or-admin (checked BEFORE the existence lookup to avoid an enumeration oracle): USER_VIEW is
+    # admin-only by default, but the catalog's requires_ownership flag is display-only and NOT enforced
+    # by require_endpoint_permission — so if an operator grants USER_VIEW to a non-admin, enforce
+    # ownership here, mirroring the temp-cred / activity siblings.
+    if current_user.role != RoleEnum.ADMIN and current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="You can only view your own user record")
     
     user = db.query(User).filter(User.id == user_id).first()
     if not user:

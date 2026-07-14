@@ -89,8 +89,18 @@ async def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="User account is disabled"
         )
-    
+
+    # Flag temp-credential sessions so the admin-scoped routes below treat them as non-admin: a temp
+    # cred gets its OWN dashboard data, never deployment-wide aggregates or the full audit trail. Set
+    # the flag even if a scope row can't be loaded, so a temp token can't fall through as a full admin.
+    user._is_temp_session = bool(is_temporary and session_token)
     return user
+
+
+def _is_interactive_admin(user) -> bool:
+    """A real admin session, excluding admin-minted temporary credentials (a temp cred is a scoped
+    delegation, not a full interactive admin)."""
+    return user.role == RoleEnum.ADMIN and not getattr(user, "_is_temp_session", False)
 
 
 @router.get("/stats")
@@ -110,7 +120,7 @@ async def get_dashboard_stats(
     """
     stats = {}
     
-    if current_user.role == RoleEnum.ADMIN:
+    if _is_interactive_admin(current_user):
         # Admin sees everything
         stats["vaults"] = db.query(Vault).count()
         stats["users"] = db.query(User).filter(User.is_active == True).count()
@@ -124,8 +134,9 @@ async def get_dashboard_stats(
         total_storage = db.query(func.sum(Vault.total_size_bytes)).scalar() or 0
         stats["storage_mb"] = round(total_storage / (1024 * 1024), 2)
         
-    elif current_user.role == RoleEnum.USER:
-        # User sees their own statistics
+    elif current_user.role in (RoleEnum.USER, RoleEnum.ADMIN):
+        # A non-interactive-admin principal (a regular USER, or an admin-minted temp credential whose
+        # principal is the owning admin) sees only their OWN statistics — never deployment-wide.
         # Vaults they own
         owned_vaults = db.query(Vault).filter(Vault.owner_id == current_user.id).count()
         
@@ -201,8 +212,9 @@ async def get_recent_events(
     limit = max(1, min(limit, 100))
     query = db.query(AuditLog).order_by(desc(AuditLog.timestamp))
     
-    if current_user.role != RoleEnum.ADMIN:
-        # Non-admins only see their own events
+    if not _is_interactive_admin(current_user):
+        # Non-admins — including admin-minted temp credentials — only see their own events, never the
+        # deployment-wide audit trail.
         query = query.filter(AuditLog.user_id == current_user.id)
     
     events = query.limit(limit).all()
@@ -236,7 +248,7 @@ async def get_active_connections(
     
     Performance: Supports ETag caching for connection list.
     """
-    if current_user.role != RoleEnum.ADMIN:
+    if not _is_interactive_admin(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can view active connections"
