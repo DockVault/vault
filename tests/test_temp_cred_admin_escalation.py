@@ -62,6 +62,7 @@ def test_temp_admin_cannot_update_or_delete_user(temp_admin_client, temp_user):
     # cross-user password reset must also be denied
     assert temp_admin_client.patch(f"/users/{uid}", json={"password": "N3wPassw0rd!"}).status_code == 403
     assert temp_admin_client.post(f"/users/{uid}/delete").status_code == 403
+    assert temp_admin_client.post(f"/users/{uid}/terminate-sessions").status_code == 403
 
 
 def test_temp_admin_cannot_toggle_account_state(temp_admin_client, temp_user):
@@ -157,6 +158,12 @@ def test_temp_admin_denied_admin_only_read_routes(temp_admin_client, path):
 def test_temp_admin_cannot_resolve_security_alert(temp_admin_client):
     # a monitoring-integrity WRITE (suppress a security alert) must not be reachable by a temp cred.
     r = temp_admin_client.post("/api/security/alerts/00000000-0000-0000-0000-000000000000/resolve")
+    assert r.status_code == 403
+
+
+def test_temp_admin_cannot_send_test_email(temp_admin_client):
+    # a temp credential must not be able to trigger outbound mail via the admin test-email endpoint.
+    r = temp_admin_client.post("/settings/test-email")
     assert r.status_code == 403
 
 

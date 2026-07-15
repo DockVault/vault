@@ -236,6 +236,52 @@ def test_scoped_delete_cap_required(admin):
         admin.delete_vault(va["id"])
 
 
+def test_download_cap_implies_see_info_and_see_files(admin):
+    """Granting only file.download must auto-include the prerequisites (vault.see_info,
+    vault.see_files) so the credential can actually open the vault + list + download."""
+    va = admin.create_vault(name=_u("dlonly"))
+    try:
+        admin.post(f"/vaults/{va['id']}/files", files=[("files", ("f.txt", b"hi", "text/plain"))])
+        fid = admin.get(f"/vaults/{va['id']}/files").json()["items"][0]["id"]
+        caps = ["file.download"]  # ONLY download — the prerequisites must be implied
+        scope = {"v": 1, "pages": ["vaults"], "caps": [], "vault_caps_default": caps, "temp": {}}
+        c, _ = _scoped_client(admin, scope, "selected", [{"vault_id": va["id"], "caps": caps}])
+        assert c.get(f"/vaults/{va['id']}").status_code == 200            # see_info implied
+        assert c.get(f"/vaults/{va['id']}/files").status_code == 200      # see_files implied
+        assert c.get(f"/vaults/{va['id']}/files/{fid}/download").status_code == 200
+    finally:
+        admin.delete_vault(va["id"])
+
+
+def test_selected_mode_zero_vaults_with_vault_scope_rejected(admin):
+    # a vault-scoped credential with no vaults selected can access nothing -> rejected
+    scope = {"v": 1, "pages": ["vaults"], "caps": [], "vault_caps_default": ["vault.see_info"], "temp": {}}
+    r = admin.post("/auth/temp-credentials", json={
+        "validity_minutes": 60, "scope": scope, "vault_access_mode": "selected", "selected_vaults": []})
+    assert r.status_code == 400, r.text
+
+
+def test_temp_creds_only_credential_needs_no_vaults(admin):
+    # a credential scoped ONLY to temp-cred management (no 'vaults' page) is fine with 0 vaults —
+    # and must stay fine even though the real UI always sends the default vault caps checked.
+    scope = {"v": 1, "pages": ["temp_creds"], "caps": [],
+             "vault_caps_default": ["vault.see_info", "vault.see_files", "file.download"],
+             "temp": {"view": True, "create": False, "invalidate": False, "clear": False, "delegate": False}}
+    r = admin.post("/auth/temp-credentials", json={
+        "validity_minutes": 60, "scope": scope, "vault_access_mode": "selected", "selected_vaults": []})
+    assert r.status_code == 200, r.text
+
+
+def test_selected_mode_only_unresolvable_vaults_rejected(admin):
+    # a vaults-scoped credential whose selected_vaults are all unusable (bad id / no id) persists
+    # no access grant, so it must be rejected like the empty case.
+    scope = {"v": 1, "pages": ["vaults"], "caps": [], "vault_caps_default": ["vault.see_info"], "temp": {}}
+    r = admin.post("/auth/temp-credentials", json={
+        "validity_minutes": 60, "scope": scope, "vault_access_mode": "selected",
+        "selected_vaults": [{"vault_id": "not-a-uuid"}, {}]})
+    assert r.status_code == 400, r.text
+
+
 def test_delegation_intersects_child_scope(admin):
     """A delegated child can never exceed its parent, and the parent can later
     invalidate it (provenance)."""

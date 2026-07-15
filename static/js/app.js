@@ -1013,23 +1013,40 @@ async function loadDashboardStats() {
             console.log('Temp creds endpoint not accessible:', error);
         }
         
-        // Load users count
-        try {
-            const users = await apiRequest('/users', { silent: true });
-            const usersCountEl = document.getElementById('dashboard-users-count');
-            if (usersCountEl) {
-                const activeUsers = users.filter(u => u.is_active).length;
-                usersCountEl.textContent = activeUsers;
+        // Load users count — the /users list is admin-only (require_interactive_admin), so a
+        // non-admin dashboard shouldn't fire it and eat a 403 (and the browser's console error).
+        if (currentUser && currentUser.role === 'admin') {
+            try {
+                const users = await apiRequest('/users', { silent: true });
+                const usersCountEl = document.getElementById('dashboard-users-count');
+                if (usersCountEl) {
+                    const activeUsers = users.filter(u => u.is_active).length;
+                    usersCountEl.textContent = activeUsers;
+                }
+            } catch (error) {
+                console.log('Users endpoint not accessible:', error);
             }
-        } catch (error) {
-            console.log('Users endpoint not accessible:', error);
         }
-        
-        // Load recent events
-        try {
-            await loadRecentEvents();
-        } catch (error) {
-            console.log('Events endpoint not available:', error);
+
+        // Recent events are admin-only — skip (and show a proper message) for non-admins instead
+        // of a 403 that renders the misleading "Event logging not configured".
+        if (currentUser && currentUser.role === 'admin') {
+            try {
+                await loadRecentEvents();
+            } catch (error) {
+                console.log('Events endpoint not available:', error);
+            }
+        } else {
+            const eventsFeed = document.getElementById('events-feed');
+            if (eventsFeed) {
+                const box = document.createElement('div');
+                box.className = 'empty-state text-center p-lg';
+                const p = document.createElement('p');
+                p.className = 'text-secondary';
+                p.textContent = 'Activity log is available to administrators.';
+                box.appendChild(p);
+                eventsFeed.replaceChildren(box);
+            }
         }
         
         // Update system status
@@ -1100,14 +1117,15 @@ async function loadRecentEvents() {
         
     } catch (error) {
         console.log('Failed to load events:', error);
-        // If audit endpoint doesn't exist, show placeholder
         const eventsFeed = document.getElementById('events-feed');
         if (eventsFeed) {
-            eventsFeed.innerHTML = `
-                <div class="empty-state text-center p-lg">
-                    <p class="text-secondary">Event logging not configured</p>
-                </div>
-            `;
+            const box = document.createElement('div');
+            box.className = 'empty-state text-center p-lg';
+            const p = document.createElement('p');
+            p.className = 'text-secondary';
+            p.textContent = "Couldn't load recent events.";
+            box.appendChild(p);
+            eventsFeed.replaceChildren(box);
         }
     }
 }
@@ -1740,12 +1758,13 @@ function showTempCredsModal(creds) {
     modal.querySelector('#close-temp-creds-x').addEventListener('click', closeTempCredsModal);
 
     // Fill in the SFTP host-key fingerprint (so the customer can verify it on first connect).
+    const _hostKeyPending = 'not generated yet — created when the SFTP service first starts';
     apiRequest('/sftp/host-key', { silent: true }).then(r => {
         const el = document.getElementById('tc-hostkey-fp');
-        if (el) el.textContent = (r && r.available && r.fingerprint_sha256) ? r.fingerprint_sha256 : 'unavailable';
+        if (el) el.textContent = (r && r.available && r.fingerprint_sha256) ? r.fingerprint_sha256 : _hostKeyPending;
     }).catch(() => {
         const el = document.getElementById('tc-hostkey-fp');
-        if (el) el.textContent = 'unavailable';
+        if (el) el.textContent = _hostKeyPending;
     });
 }
 
@@ -2284,6 +2303,7 @@ function renderUserDetail(u) {
                     : `<button class="btn btn-sm btn-warning lock-user-btn" data-user-id="${u.id}">${iconSvg('lock', 'icon-sm')} Lock</button>`}
                 <button class="btn btn-sm btn-secondary change-password-btn" data-user-id="${u.id}">${iconSvg('key', 'icon-sm')} Change Password</button>
                 ${currentUser.role === 'admin' && u.role !== 'admin' ? `<button class="btn btn-sm btn-secondary manage-perms-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('shield', 'icon-sm')} Permissions</button>` : ''}
+                ${currentUser.role === 'admin' && u.username !== currentUser.username ? `<button class="btn btn-sm btn-warning terminate-user-sessions-btn" data-user-id="${u.id}">${iconSvg('alert-triangle', 'icon-sm')} Terminate Sessions</button>` : ''}
                 ${u.username !== currentUser.username ? `<button class="btn btn-sm btn-danger delete-user-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('trash', 'icon-sm')} Delete</button>` : ''}
             </div>
         </div>`;
@@ -3006,6 +3026,7 @@ async function submitGroupForm(e) {
 // ============================================================================
 
 let monitorWebSocket = null;
+let monitorReconnectTimer = null;   // single pending reconnect timer (coalesced; never stacks)
 let monitorEvents = [];
 let monitorCurrentFilter = 'all';
 let monitorMetrics = {
@@ -3033,8 +3054,22 @@ function initMonitor() {
     fetchMonitorStats();
 }
 
+// Schedule at most ONE pending reconnect. Any newer schedule (or a direct connect) cancels the prior
+// timer, so repeated failures across the several entry points (init, reconnect button, onclose, and a
+// WebSocket-constructor throw) can't stack into a burst of connection attempts.
+function scheduleMonitorReconnect() {
+    clearTimeout(monitorReconnectTimer);
+    monitorReconnectTimer = setTimeout(() => {
+        monitorReconnectTimer = null;
+        if (authToken) connectMonitorWebSocket();
+    }, 5000);
+}
+
 // Connect to WebSocket
 function connectMonitorWebSocket() {
+    // A direct (re)connect supersedes any pending auto-reconnect — don't let them stack.
+    clearTimeout(monitorReconnectTimer);
+    monitorReconnectTimer = null;
     // Close existing connection if any
     if (monitorWebSocket) {
         monitorWebSocket.close();
@@ -3048,22 +3083,31 @@ function connectMonitorWebSocket() {
     updateMonitorStatus('connecting', 'Connecting...');
     
     try {
-        monitorWebSocket = new WebSocket(wsUrl);
-        
-        monitorWebSocket.onopen = () => {
+        // Capture this specific socket so its handlers can tell whether they still belong to the
+        // current connection: connect() may close a live socket and immediately open a new one, and a
+        // close/open handshake has no ordering guarantee — a stale event from a superseded socket must
+        // not touch shared state (re-arm the reconnect, flash "Disconnected") for the live one.
+        const ws = new WebSocket(wsUrl);
+        monitorWebSocket = ws;
+
+        ws.onopen = () => {
+            if (monitorWebSocket !== ws) return;   // superseded by a newer connect
             console.log('✓ WebSocket connected');
+            // Connected — cancel any pending reconnect scheduled by a prior close/error.
+            clearTimeout(monitorReconnectTimer);
+            monitorReconnectTimer = null;
             updateMonitorStatus('connected', 'Connected');
-            
+
             // Send authentication token
             if (authToken) {
-                monitorWebSocket.send(JSON.stringify({
+                ws.send(JSON.stringify({
                     type: 'auth',
                     token: authToken
                 }));
             }
         };
-        
-        monitorWebSocket.onmessage = (event) => {
+
+        ws.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
                 handleMonitorEvent(data);
@@ -3071,66 +3115,31 @@ function connectMonitorWebSocket() {
                 console.error('Failed to parse WebSocket message:', error);
             }
         };
-        
-        monitorWebSocket.onerror = (error) => {
+
+        ws.onerror = (error) => {
+            if (monitorWebSocket !== ws) return;   // superseded by a newer connect
             console.error('WebSocket error:', error);
             updateMonitorStatus('error', 'Connection Error');
         };
-        
-        monitorWebSocket.onclose = () => {
+
+        ws.onclose = () => {
+            // A stale close from a socket we've already replaced must not re-arm the reconnect (it
+            // would tear down the healthy replacement 5s later) or flash a false "Disconnected".
+            if (monitorWebSocket !== ws) return;
             console.log('WebSocket closed');
             updateMonitorStatus('disconnected', 'Disconnected');
-            
+
             // Auto-reconnect while logged in (the socket is app-wide so the owner
             // keeps receiving temp-credential login notifications on any page).
-            setTimeout(() => {
-                if (authToken) {
-                    connectMonitorWebSocket();
-                }
-            }, 5000);
+            scheduleMonitorReconnect();
         };
-        
+
     } catch (error) {
         console.error('Failed to create WebSocket:', error);
-        updateMonitorStatus('error', 'Failed to connect');
-        
-        // Fall back to polling if WebSocket not available
-        console.log('Falling back to polling mode...');
-        startMonitorPolling();
-    }
-}
-
-// Fallback: Poll for events if WebSocket not available
-let monitorPollingInterval = null;
-function startMonitorPolling() {
-    if (monitorPollingInterval) {
-        clearInterval(monitorPollingInterval);
-    }
-    
-    updateMonitorStatus('polling', 'Polling Mode');
-    
-    // Poll every 5 seconds
-    monitorPollingInterval = setInterval(async () => {
-        try {
-            const events = await apiRequest('/monitor/events?limit=50');
-            
-            // Process new events
-            events.forEach(event => {
-                // Check if event already exists (by timestamp + type + user)
-                const eventKey = `${event.timestamp}-${event.type}-${event.user}`;
-                if (!monitorEvents.some(e => `${e.timestamp}-${e.type}-${e.user}` === eventKey)) {
-                    handleMonitorEvent(event);
-                }
-            });
-            
-        } catch (error) {
-            console.error('Failed to poll events:', error);
-        }
-    }, 5000);
-    
-    // Register interval with sessionManager if available
-    if (window.sessionManager && typeof window.sessionManager.registerInterval === 'function') {
-        window.sessionManager.registerInterval(monitorPollingInterval);
+        updateMonitorStatus('error', 'Reconnecting…');
+        // The live event feed is WebSocket-only; retry the connection shortly (mirrors the
+        // onclose reconnect) rather than polling a non-existent endpoint.
+        scheduleMonitorReconnect();
     }
 }
 
@@ -3378,11 +3387,6 @@ function cleanupMonitor() {
     if (monitorWebSocket) {
         monitorWebSocket.close();
         monitorWebSocket = null;
-    }
-    
-    if (monitorPollingInterval) {
-        clearInterval(monitorPollingInterval);
-        monitorPollingInterval = null;
     }
 }
 
@@ -5488,6 +5492,20 @@ function zkNewObjId() {
 // name epoch we lack a DEK for (e.g. a member added after a rotation) is shown as locked
 // rather than failing the whole listing.
 async function zkDecryptListingNames(items, vault) {
+    // Nothing encrypted to decrypt (empty vault or only legacy plaintext rows) — don't prompt.
+    if (!items.some(it => it.enc_name)) return;
+    // Unlock the account key ONCE up front. A wrong passphrase (or a corrupt/absent key) throws
+    // here; surface it as a single clear error instead of letting the per-item catch below swallow
+    // it, which used to leave every row silently showing "Encrypted name" with no explanation.
+    try {
+        await zkEnsureUnlocked();
+    } catch (e) {
+        for (const it of items) {
+            if (it.enc_name) { it.name = '🔒 Encrypted name'; it.zkLocked = true; }
+        }
+        if (!/cancel/i.test(e.message || '')) showError(e.message);
+        return;
+    }
     for (const it of items) {
         if (!it.enc_name) continue;  // legacy plaintext row (it.name already set) — leave it
         const epoch = zkNameEpoch(it);
@@ -6807,7 +6825,9 @@ const uploadManager = {
               </div>`;
         }).join('');
 
-        const active = items.filter(i => i.status !== 'done' && i.status !== 'needs-file').length;
+        // A failed item (e.g. a rejected 0-byte upload) is finished, not active — exclude 'error'
+        // so it doesn't stick in the tray header as "N active" forever.
+        const active = items.filter(i => i.status !== 'done' && i.status !== 'needs-file' && i.status !== 'error').length;
         tray.innerHTML = `
           <div class="up-tray-head">
             <span>Uploads${active ? ` · ${active} active` : ''}</span>
@@ -7387,14 +7407,59 @@ async function removeVaultGroupAccess(groupId) {
 }
 
 // --- Searchable "Grant access" modal for individual users -------------------
-const vaultGrantState = { users: [], groups: [] };
+const vaultGrantState = { results: [], groups: [], excluded: new Set() };
+let vaultGrantSearchTimer = null;
+let vaultGrantSearchSeq = 0;   // drops a stale/out-of-order search response (modal reopen, fast typing)
+
+// Show a plain-text status message in the grant list (safe DOM, no innerHTML).
+function grantListMessage(msg) {
+    const el = document.getElementById('vault-grant-list');
+    if (!el) return;
+    const d = document.createElement('div');
+    d.className = 'text-tertiary text-sm p-sm';
+    d.textContent = msg;
+    el.replaceChildren(d);
+}
+
+// Server-side user search (a non-admin owner can't read the admin-only /users list), scoped +
+// rate-limited backend-side. Debounced by onVaultGrantSearchInput.
+async function runVaultGrantSearch() {
+    const seq = ++vaultGrantSearchSeq;
+    const q = (document.getElementById('vault-grant-search')?.value || '').trim();
+    if (q.length < 2) {
+        vaultGrantState.results = [];
+        grantListMessage('Type at least 2 characters to search for a user.');
+        updateVaultGrantCount();
+        return;
+    }
+    try {
+        const users = await apiRequest(`/users/search?q=${encodeURIComponent(q)}`, { silent: true });
+        if (seq !== vaultGrantSearchSeq) return;  // a newer search (or modal reopen) superseded this one
+        vaultGrantState.results = (Array.isArray(users) ? users : []).filter(u => !vaultGrantState.excluded.has(u.id));
+        renderVaultGrantList();
+    } catch (e) {
+        if (seq !== vaultGrantSearchSeq) return;
+        vaultGrantState.results = [];
+        // A thrown error means the search itself failed (permission, rate-limit, server, network) —
+        // NOT an empty result. The toast is suppressed (silent), so surface the reason here instead of
+        // the "No matching users." copy the empty-success path uses (which would look like "no such user").
+        grantListMessage(e && e.message ? e.message : 'Search failed.');
+        updateVaultGrantCount();
+    }
+}
+
+function onVaultGrantSearchInput() {
+    clearTimeout(vaultGrantSearchTimer);
+    vaultGrantSearchTimer = setTimeout(runVaultGrantSearch, 250);
+}
 
 async function openVaultGrantModal() {
     if (!state.currentVault) return;
     const modal = document.getElementById('vault-grant-modal');
     if (!modal) return;
     document.getElementById('vault-grant-search').value = '';
-    document.getElementById('vault-grant-list').innerHTML = '<div class="spinner"></div>';
+    vaultGrantSearchSeq++;   // invalidate any in-flight search from a previous open
+    grantListMessage('Type at least 2 characters to search for a user.');
     // Only the owner / a global admin may grant the Manager role — managers can
     // delegate read/write but not mint peer managers.
     const isOwnerOrAdmin = (state.currentVault.owner_id === currentUser.id) || currentUser.role === 'admin';
@@ -7406,20 +7471,22 @@ async function openVaultGrantModal() {
     try {
         const headers = {};
         if (state.currentVault.has_password && state.vaultPassword) headers['X-Vault-Password'] = state.vaultPassword;
-        const [users, groups, perms] = await Promise.all([
-            apiRequest('/users', { silent: true }).catch(() => []),
+        // Non-admins can't read the admin-only /users list; the recipient picker searches the
+        // scoped /users/search endpoint on input instead of preloading the whole directory.
+        const [groups, perms] = await Promise.all([
             apiRequest('/groups', { silent: true }).catch(() => []),
             apiRequest(`/vaults/${state.currentVault.id}/permissions`, { headers, silent: true }).catch(() => [])
         ]);
-        const excluded = new Set((Array.isArray(perms) ? perms : []).map(p => p.user_id));
-        if (state.currentVault.owner_id) excluded.add(state.currentVault.owner_id);
-        vaultGrantState.users = (Array.isArray(users) ? users : []).filter(u => !excluded.has(u.id));
+        vaultGrantState.excluded = new Set((Array.isArray(perms) ? perms : []).map(p => p.user_id));
+        if (state.currentVault.owner_id) vaultGrantState.excluded.add(state.currentVault.owner_id);
+        vaultGrantState.results = [];
         vaultGrantState.groups = Array.isArray(groups) ? groups : [];
         const groupSel = document.getElementById('vault-grant-group-filter');
         groupSel.innerHTML = `<option value="all">All departments</option>` +
             vaultGrantState.groups.slice().sort((a, b) => a.name.localeCompare(b.name))
                 .map(g => `<option value="${g.id}">${escapeHtml(g.name)}</option>`).join('');
-        renderVaultGrantList();
+        // Group filtering doesn't apply to the server-side search results — hide the control.
+        if (groupSel) groupSel.style.display = 'none';
         setTimeout(() => document.getElementById('vault-grant-search').focus(), 60);
     } catch (e) {
         document.getElementById('vault-grant-list').innerHTML = `<div class="alert alert-error">Failed to load users: ${escapeHtml(e.message)}</div>`;
@@ -7429,19 +7496,28 @@ async function openVaultGrantModal() {
 function renderVaultGrantList() {
     const listEl = document.getElementById('vault-grant-list');
     if (!listEl) return;
-    const q = (document.getElementById('vault-grant-search')?.value || '').trim().toLowerCase();
-    const groupF = document.getElementById('vault-grant-group-filter')?.value || 'all';
-    let list = vaultGrantState.users;
-    if (groupF !== 'all') list = list.filter(u => (u.groups || []).some(g => g.id === groupF));
-    if (q) list = list.filter(u => u.username.toLowerCase().includes(q) || (u.email || '').toLowerCase().includes(q));
-    if (!list.length) { listEl.innerHTML = `<div class="text-tertiary text-sm p-sm">No matching users.</div>`; updateVaultGrantCount(); return; }
-    listEl.innerHTML = list.map(u => `
-        <label class="pick-row">
-            <input type="checkbox" value="${u.id}">
-            <span class="avatar-sm">${(u.username || '?').substring(0, 2).toUpperCase()}</span>
-            <div class="cell-user-text"><span class="cell-user-name">${escapeHtml(u.username)}</span><span class="cell-user-sub">${escapeHtml(u.email || '')}</span></div>
-            <div class="chip-row">${(u.groups || []).map(g => groupChip(g)).join('')}</div>
-        </label>`).join('');
+    const list = vaultGrantState.results;
+    if (!list.length) { grantListMessage('No matching users.'); updateVaultGrantCount(); return; }
+    const frag = document.createDocumentFragment();
+    for (const u of list) {
+        const label = document.createElement('label');
+        label.className = 'pick-row';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.value = u.id;
+        const avatar = document.createElement('span');
+        avatar.className = 'avatar-sm';
+        avatar.textContent = (u.username || '?').substring(0, 2).toUpperCase();
+        const textWrap = document.createElement('div');
+        textWrap.className = 'cell-user-text';
+        const nameEl = document.createElement('span');
+        nameEl.className = 'cell-user-name';
+        nameEl.textContent = u.username || '';
+        textWrap.appendChild(nameEl);
+        label.append(cb, avatar, textWrap);
+        frag.appendChild(label);
+    }
+    listEl.replaceChildren(frag);
     updateVaultGrantCount();
 }
 
@@ -7631,10 +7707,34 @@ async function deleteVault(vaultId) {
         'Delete this vault?'
     );
     if (!confirmed) return;
-    
+
+    // The real route is POST /vaults/{id}/delete (there is no DELETE /vaults/{id}).
+    // A password-protected vault needs its password proven for the destructive delete; send it
+    // via the X-Vault-Password header (matching every other password-gated vault route). Reuse
+    // the cached password when deleting the currently-open vault; otherwise (e.g. the card trash
+    // button on a vault we haven't unlocked) prompt for it.
+    // Prefer state.currentVault when it's the target: it's kept in sync on an in-session password
+    // add/remove, whereas the state.allVaults snapshot is only refreshed by a full loadVaults().
+    const vault = (state.currentVault && state.currentVault.id === vaultId ? state.currentVault : null)
+        || (state.allVaults || []).find(v => v.id === vaultId);
+    const headers = {};
+    if (vault && vault.has_password) {
+        let pw = (state.currentVault && state.currentVault.id === vaultId) ? state.vaultPassword : null;
+        if (!pw) {
+            pw = await showPrompt(
+                'This vault is password-protected. Enter its password to permanently delete it.',
+                'Vault password',
+                { password: true }
+            );
+            if (pw === null) return; // cancelled
+        }
+        headers['X-Vault-Password'] = pw;
+    }
+
     try {
-        await apiRequest(`/vaults/${vaultId}`, {
-            method: 'DELETE'
+        await apiRequest(`/vaults/${vaultId}/delete`, {
+            method: 'POST',
+            headers
         });
         showSuccess('Vault deleted successfully');
         loadVaults();
@@ -7710,6 +7810,10 @@ async function handleChangeVaultPassword(e) {
         // Update local state + the remembered password so the new one is reused
         // (and a removed password is forgotten).
         state.currentVault.has_password = !!newPassword;
+        // Keep the vaults-grid snapshot in sync so a later card action (e.g. delete)
+        // reads the correct has_password without a full reload.
+        const snap = (state.allVaults || []).find(v => v.id === state.currentVault.id);
+        if (snap) snap.has_password = !!newPassword;
         if (newPassword) {
             state.setVaultPassword(newPassword);
             state.rememberVaultPassword(state.currentVault.id, newPassword, state.currentVault.unlock_remember_minutes);
@@ -8288,6 +8392,15 @@ document.addEventListener('DOMContentLoaded', () => {
             const note = (document.getElementById('temp-cred-note')?.value || '').trim();
             const canCreate = !!(document.getElementById('temp-cred-can-create') && document.getElementById('temp-cred-can-create').checked);
             const scopeData = collectTempScope();
+            // A credential scoped to the Vaults page but with no vaults selected can access
+            // nothing — warn instead of silently minting a dead credential (mirrors the server
+            // guard; keyed on the Vaults page, the only signal that governs selected-mode reach).
+            if (scopeData && scopeData.vault_access_mode === 'selected'
+                && scopeData.selected_vaults.length === 0
+                && (scopeData.scope.pages || []).includes('vaults')) {
+                showError("Select at least one vault, or switch to 'All vaults' — a credential scoped to vaults with none selected can't access anything.");
+                return;
+            }
             closeModal();
             generateTempCreds({
                 validity_minutes: validityMinutes, note, can_create_temp_credentials: canCreate,
@@ -8332,14 +8445,14 @@ document.addEventListener('DOMContentLoaded', () => {
             
             try {
                 await apiRequest(`/users/${userId}`, {
-                    method: 'PUT',
+                    method: 'PATCH',
                     body: JSON.stringify({
                         email,
                         role,
                         is_active: isActive
                     })
                 });
-                
+
                 showSuccess('User updated successfully');
                 closeModal();
                 loadUsers();
@@ -8514,9 +8627,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Searchable "Grant vault access" modal
     const vgSearch = document.getElementById('vault-grant-search');
-    if (vgSearch) vgSearch.addEventListener('input', renderVaultGrantList);
-    const vgGroup = document.getElementById('vault-grant-group-filter');
-    if (vgGroup) vgGroup.addEventListener('change', renderVaultGrantList);
+    if (vgSearch) vgSearch.addEventListener('input', onVaultGrantSearchInput);
     const vgList = document.getElementById('vault-grant-list');
     if (vgList) vgList.addEventListener('change', updateVaultGrantCount);
     const vgConfirm = document.getElementById('vault-grant-confirm');

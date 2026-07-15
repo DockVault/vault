@@ -1503,6 +1503,115 @@ async def update_settings(
     return {"status": "ok"}
 
 
+@app.post("/settings/test-email")
+async def send_test_email(
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Send a test email to the requesting admin using the stored SMTP settings, to verify the
+    Settings -> Email configuration end to end. Fails cleanly (not a 500) when SMTP isn't
+    configured, and never echoes the stored SMTP password."""
+    import smtplib
+    from email.message import EmailMessage
+    from rate_limiter import rate_limiter as _rl
+    from models import SystemSetting
+
+    # Sending mail is an outbound side effect — cap it per admin.
+    allowed, _, reset = _rl.check_rate_limit(
+        identifier=str(current_user.id), limit=5, window=60, prefix="test_email")
+    if not allowed:
+        import time as _t
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many test emails; please wait a moment.",
+            headers={"Retry-After": str(max(1, reset - int(_t.time())))},
+        )
+
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    cfg = dict(row.value) if row and row.value else {}
+    host = (cfg.get("smtp_server") or "").strip()
+    from_email = (cfg.get("from_email") or "").strip()
+    if not host or not from_email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="SMTP is not configured. Set the SMTP server and From address in Settings → Email first.",
+        )
+
+    to_addr = (current_user.email or "").strip() or from_email
+    try:
+        port = int(cfg.get("smtp_port") or 587)
+    except (TypeError, ValueError):
+        port = 587
+    username = (cfg.get("smtp_username") or "").strip()
+    password = cfg.get("smtp_password") or ""
+    from_name = (cfg.get("from_name") or "").strip()
+
+    try:
+        # EmailMessage encodes headers safely (rejects CRLF header injection). Building it INSIDE
+        # the try means a control-char From name/address (saveable via PUT /settings, which doesn't
+        # validate these fields) surfaces as a clean 400 below rather than an unhandled 500.
+        msg = EmailMessage()
+        msg["Subject"] = "DockVault test email"
+        msg["From"] = f"{from_name} <{from_email}>" if from_name else from_email
+        msg["To"] = to_addr
+        msg.set_content(
+            "This is a test email from your vault's SMTP configuration.\n"
+            "If you received it, outbound email delivery is working."
+        )
+
+        if port == 465:
+            server = smtplib.SMTP_SSL(host, port, timeout=15)
+        else:
+            server = smtplib.SMTP(host, port, timeout=15)
+        with server:
+            server.ehlo()
+            encrypted = port == 465
+            if port != 465 and server.has_extn("starttls"):
+                server.starttls()
+                server.ehlo()
+                encrypted = True
+            if username and not encrypted:
+                # STARTTLS-strip defense: never send credentials over an unencrypted connection
+                # (an on-path attacker can remove the STARTTLS advertisement from a plaintext EHLO).
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="The SMTP server does not offer STARTTLS; refusing to send credentials over an unencrypted connection.",
+                )
+            if username:
+                server.login(username, password)
+            server.send_message(msg)
+    except smtplib.SMTPAuthenticationError:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="SMTP authentication failed — check the username and password.",
+        )
+    except (ValueError, UnicodeError) as e:
+        # Malformed From name/address (control chars) or SMTP host (bad IDNA) — a configuration
+        # problem, returned cleanly instead of propagating as an unhandled 500.
+        print(f"test-email config invalid: {type(e).__name__}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The SMTP configuration is invalid — check the server address and the From name/address.",
+        )
+    except (smtplib.SMTPException, OSError) as e:
+        # Log the detail server-side; never surface it (or the password) to the client.
+        print(f"test-email send failed: {type(e).__name__}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not send the test email — check the SMTP server, port, and TLS settings.",
+        )
+
+    try:
+        AuditLogger(db).log_action(
+            action="test_email_sent", status="success", user=current_user,
+            ip_address=get_client_ip(request), details={"to": to_addr},
+        )
+    except Exception:
+        pass
+    return {"message": f"Test email sent to {to_addr}"}
+
+
 # ===========================================================================
 # RO2-3 — authenticated, disableable log-PULL endpoint (GET /logs) + admin token mgmt.
 # Two-layer gate: the env CEILING (settings.plan_log_pull, HARD, default off) AND a
@@ -2141,10 +2250,29 @@ async def login(
             # Don't fail the response if monitoring fails
             print(f"Warning: Failed to record security event: {monitor_error}")
         
-        # Uniform generic message for ALL credential-failure outcomes (nonexistent / wrong
-        # password / inactive / locked) so the response body can't enumerate accounts or
-        # their state. The specific reason is preserved in the audit log
-        # (log_login_failure above), never returned to the caller.
+        # A lock is only raised AFTER the password verified (verify-first ordering in
+        # authenticate_user), so the caller has already proven they know the credential — telling
+        # them the account is locked (and when it frees) reveals nothing an attacker couldn't
+        # already determine, and unlike the generic message it tells a legitimate user why they're
+        # stuck. Wrong password / nonexistent / inactive still get the uniform generic 401 so the
+        # response body can't enumerate accounts or their state.
+        if isinstance(e, AccountLockedError):
+            locked_until = getattr(e, 'locked_until', None)
+            if locked_until is not None:
+                if locked_until.tzinfo is None:
+                    locked_until = locked_until.replace(tzinfo=timezone.utc)
+                secs = max(0, int((locked_until - datetime.now(timezone.utc)).total_seconds()))
+                mins = max(1, (secs + 59) // 60)
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Your account is temporarily locked after too many failed attempts. "
+                           f"Try again in about {mins} minute(s).",
+                    headers={"Retry-After": str(secs)},
+                )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your account is locked. Contact your administrator to unlock it.",
+            )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password"
@@ -2702,6 +2830,43 @@ async def terminate_temp_credential_sessions(
     }
 
 
+@app.get("/monitor/stats")
+async def monitor_stats(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db)
+):
+    """Live-monitor headline counts: users and sessions active in the last hour."""
+    from sqlalchemy import func, distinct
+    from models import ActiveSession
+    grace_cutoff = datetime.now(timezone.utc) - timedelta(minutes=65)
+    active_filter = (
+        ActiveSession.is_active == True,  # noqa: E712
+        ActiveSession.last_activity >= grace_cutoff,
+    )
+    active_users = db.query(func.count(distinct(ActiveSession.user_id))).filter(*active_filter).scalar() or 0
+    active_sessions = db.query(func.count(ActiveSession.id)).filter(*active_filter).scalar() or 0
+    return {"active_users": active_users, "active_sessions": active_sessions}
+
+
+@app.get("/storage/stats")
+async def storage_stats(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db)
+):
+    """Storage usage for this deployment: bytes stored across active vaults, plus the
+    capacity of the underlying storage volume."""
+    from vault_service import deployment_storage_used
+    used = deployment_storage_used(db)
+    total = available = 0
+    try:
+        usage = shutil.disk_usage(settings.file_storage_path)
+        total, available = usage.total, usage.free
+    except OSError as e:
+        # Capacity is best-effort — never fail the panel if the path can't be stat'd.
+        print(f"storage_stats: disk_usage unavailable: {e}")
+    return {"total": total, "used": used, "available": available}
+
+
 # ==============================================================================
 # WebSocket Endpoint for Live Monitoring
 # ==============================================================================
@@ -3086,6 +3251,62 @@ async def update_my_preferences(
     return merged
 
 
+@app.get("/users/search")
+async def search_users(
+    q: str = "",
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Minimal user lookup so a vault sharer can find a recipient by username/email prefix.
+
+    Deliberately NOT the admin directory listing, but note the boundary: the caller must be able
+    to share SOME vault (own/manage one, or admin — a scoped temp credential only if it holds
+    vault.change_permissions), which in practice is most active users, since creating a vault is
+    self-service. The disclosure is bounded to id + username of active, non-EXTERNAL accounts, on a
+    >=2-char prefix, LIKE-wildcards escaped, result set capped, and rate-limited (fail-closed). This
+    matches the existing /ecc/users/{id}/public-key scoping and feeds the share/grant picker for
+    non-admin owners (who cannot read the admin-only /users list). Scoping the search to the
+    specific vault being shared (rather than the whole directory) is a possible future refinement."""
+    from ecc_router import _manages_any_vault
+    from rate_limiter import rate_limiter as _rl
+    from rate_limiter import RateLimiterUnavailable
+    from sqlalchemy import or_
+
+    q = (q or "").strip()
+    if len(q) < 2:
+        return []  # require a real prefix — don't let 1 char / empty enumerate the directory
+
+    # Fail CLOSED: a Redis outage must not silently disable the anti-enumeration throttle.
+    try:
+        allowed, _, reset = _rl.check_rate_limit(
+            identifier=str(current_user.id), limit=60, window=60, prefix="user_search", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Search is temporarily unavailable.")
+    if not allowed:
+        import time as _t
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many searches; please slow down.",
+            headers={"Retry-After": str(max(1, reset - int(_t.time())))},
+        )
+
+    if not _manages_any_vault(db, current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only a vault owner or manager may search for users to share with.",
+        )
+
+    # Prefix match; escape the LIKE wildcards so a query like "%" can't sweep the directory.
+    esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    like = esc + "%"
+    rows = db.query(User.id, User.username).filter(
+        User.is_active == True,  # noqa: E712
+        User.role != RoleEnum.EXTERNAL,
+        or_(User.username.ilike(like, escape="\\"), User.email.ilike(like, escape="\\")),
+    ).order_by(User.username).limit(10).all()
+    return [{"id": str(uid), "username": uname} for uid, uname in rows]
+
+
 @app.get("/users/{user_id}", response_model=UserResponse)
 @require_endpoint_permission("USER_VIEW")
 async def get_user(
@@ -3404,6 +3625,58 @@ async def delete_user(
     )
     
     return {"message": f"User {username} deleted successfully"}
+
+
+@app.post("/users/{user_id}/terminate-sessions")
+@require_endpoint_permission("USER_MANAGE")
+async def terminate_user_sessions(
+    user_id: uuid.UUID,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+    request: Request = None
+):
+    """
+    Terminate all active sessions for a user (admin only). Durably revokes the user's
+    web tokens and force-closes any live web/SFTP transports immediately.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
+    # Prevent self-termination (durable revocation would log the admin out mid-request);
+    # mirrors delete_user's self-guard. An admin ends their own session via logout.
+    if user.id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot terminate your own sessions; use logout instead."
+        )
+
+    terminated_count = _revoke_sessions(
+        db, user_id=user_id, actor_username=current_user.username, durable=True
+    )
+    db.commit()
+
+    audit_logger = AuditLogger(db)
+    audit_logger.log_action(
+        action="terminate_session",
+        status="success",
+        user_id=current_user.id,
+        resource_type="user",
+        resource_id=str(user_id),
+        details={
+            "username": user.username,
+            "terminated_count": terminated_count,
+            "ip_address": get_client_ip(request),
+        }
+    )
+
+    return {
+        "message": f"Terminated {terminated_count} active session(s)",
+        "terminated_count": terminated_count
+    }
 
 
 # ============================================================================
@@ -4167,6 +4440,7 @@ async def delete_vault(
     vault_id: uuid.UUID,
     request: Request,
     vault_password: Optional[str] = None,
+    x_vault_password: Optional[str] = Header(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -4177,11 +4451,16 @@ async def delete_vault(
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
-    
+
+    # Accept the vault password via the X-Vault-Password header (the convention every other
+    # password-gated vault route uses) OR the legacy query param, so a password never has to
+    # ride the URL query string (where it would land in access logs).
+    effective_vault_password = x_vault_password or vault_password
+
     # Get vault first to check permissions and validate password
     try:
         # require_password=True because we're deleting (destructive operation)
-        vault = vault_service.get_vault(vault_id, current_user, vault_password, require_password=True)
+        vault = vault_service.get_vault(vault_id, current_user, effective_vault_password, require_password=True)
         vault_name = str(vault.name)  # Convert to string
 
         # SECURITY: deletion is owner-or-admin, mirroring update_vault_info /
@@ -5229,6 +5508,8 @@ async def list_vault_files(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(e)
         )
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -5724,6 +6005,10 @@ async def upload_file(
                 # Lost a same-name replace race against the name unique index — a clean 409.
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
+            except PermissionDeniedError as e:
+                # A write-permission denial is a 403, not a 500 (the broad handler below).
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
             except Exception as e:
                 # Log error
                 print(f"Error during upload: {e}")
@@ -5782,6 +6067,8 @@ async def upload_file(
         # Deliberate HTTP errors raised inside (size reservation 413, same-name
         # replace 409, cancellations) must propagate as-is, not be re-wrapped to 500.
         raise
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         db.rollback()
         # Broadcast error event
@@ -6465,6 +6752,10 @@ async def complete_chunked_upload(
         session.error_message = str(e)[:500]
         db.commit()
         raise HTTPException(status_code=500, detail=f"Failed to finalize upload: {str(e)}")
+    except PermissionDeniedError as e:
+        # A permission denial is a 403, not a 500 — and it isn't a corrupt upload, so leave
+        # the session/blob for the TTL cleanup rather than force-failing it here.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         _remove_orphan_blob()
         session.status = 'failed'
@@ -6845,6 +7136,8 @@ async def download_file(
         # Explicit HTTP errors (e.g. 404 file-not-found) must propagate as-is
         # rather than be re-wrapped into a generic 500 below.
         raise
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         # Broadcast error event
         try:
@@ -6940,6 +7233,8 @@ async def delete_file(
         # Explicit HTTP errors (e.g. 404 cross-vault file) must propagate as-is
         # rather than be re-wrapped into a generic 500 below.
         raise
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         db.rollback()
         raise HTTPException(
@@ -7198,6 +7493,8 @@ async def create_folder(
         # Deliberate 4xx (e.g. ZK plaintext-name rejection, missing name) must propagate
         # as-is rather than be re-wrapped into a generic 500 below.
         raise
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         db.rollback()
         raise HTTPException(

@@ -43,6 +43,48 @@ VAULT_CAPS = {
     "vault.change_info", "vault.change_password", "vault.change_expiry", "vault.rotate_key",
     "vault.delete",
 }
+# Implied prerequisite capabilities. Enforcement checks these lower caps first — opening a vault
+# needs vault.see_info, then vault.see_files, before any per-file op is reachable — so a credential
+# that holds only a higher cap (e.g. file.download) without them is unusable ("scope does not
+# permit"). expand_vault_caps() adds the prerequisites so any granted combination actually works.
+CAP_IMPLIES = {
+    "vault.see_files":          {"vault.see_info"},
+    # Ops that act on a LISTED item need to open the vault (see_info) AND see its listing
+    # (see_files) to reach the target.
+    "file.download":            {"vault.see_files", "vault.see_info"},
+    "file.rename":              {"vault.see_files", "vault.see_info"},
+    "file.delete":              {"vault.see_files", "vault.see_info"},
+    "folder.delete":            {"vault.see_files", "vault.see_info"},
+    # Creating/uploading doesn't require the listing — just the ability to open the vault.
+    "file.upload":              {"vault.see_info"},
+    "folder.create":            {"vault.see_info"},
+    # Vault-level ops only need to open the vault.
+    "vault.see_permissions":    {"vault.see_info"},
+    "vault.change_permissions": {"vault.see_info"},
+    "vault.change_info":        {"vault.see_info"},
+    "vault.change_password":    {"vault.see_info"},
+    "vault.change_expiry":      {"vault.see_info"},
+    "vault.rotate_key":         {"vault.see_info"},
+    "vault.delete":             {"vault.see_info"},
+}
+
+
+def expand_vault_caps(caps) -> List[str]:
+    """Add the implied prerequisite caps (CAP_IMPLIES) so a granted combination is actually
+    usable — e.g. file.download pulls in vault.see_files + vault.see_info. Idempotent; bounded to
+    the VAULT_CAPS vocabulary."""
+    out = {c for c in (caps or []) if c in VAULT_CAPS}
+    changed = True
+    while changed:
+        changed = False
+        for c in list(out):
+            imp = CAP_IMPLIES.get(c)
+            if imp and not imp <= out:
+                out |= imp
+                changed = True
+    return sorted(out)
+
+
 # Global (non-per-vault) capabilities, stored in scope.caps. `vault.create` is the legacy,
 # type-agnostic create cap (any vault type); the per-type caps let an operator mint a credential
 # that may create ONLY standard OR ONLY zero-knowledge vaults. Holding `vault.create` implies both.
@@ -269,7 +311,9 @@ def normalize_scope(raw: Optional[dict]) -> Optional[dict]:
         "v": 1,
         "pages": sorted(p for p in _as_list(raw.get("pages")) if p in PAGES),
         "caps": sorted(c for c in _as_list(raw.get("caps")) if c in GLOBAL_CAPS),
-        "vault_caps_default": sorted(c for c in _as_list(raw.get("vault_caps_default")) if c in VAULT_CAPS),
+        # Add implied prerequisite caps so e.g. file.download is actually usable (pulls in
+        # vault.see_files + vault.see_info) rather than silently unusable.
+        "vault_caps_default": expand_vault_caps(_as_list(raw.get("vault_caps_default"))),
         "temp": {k: bool(temp_in.get(k, False)) for k in TEMP_PERMS},
     }
 
