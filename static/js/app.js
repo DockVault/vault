@@ -3026,6 +3026,7 @@ async function submitGroupForm(e) {
 // ============================================================================
 
 let monitorWebSocket = null;
+let monitorReconnectTimer = null;   // single pending reconnect timer (coalesced; never stacks)
 let monitorEvents = [];
 let monitorCurrentFilter = 'all';
 let monitorMetrics = {
@@ -3053,8 +3054,22 @@ function initMonitor() {
     fetchMonitorStats();
 }
 
+// Schedule at most ONE pending reconnect. Any newer schedule (or a direct connect) cancels the prior
+// timer, so repeated failures across the several entry points (init, reconnect button, onclose, and a
+// WebSocket-constructor throw) can't stack into a burst of connection attempts.
+function scheduleMonitorReconnect() {
+    clearTimeout(monitorReconnectTimer);
+    monitorReconnectTimer = setTimeout(() => {
+        monitorReconnectTimer = null;
+        if (authToken) connectMonitorWebSocket();
+    }, 5000);
+}
+
 // Connect to WebSocket
 function connectMonitorWebSocket() {
+    // A direct (re)connect supersedes any pending auto-reconnect — don't let them stack.
+    clearTimeout(monitorReconnectTimer);
+    monitorReconnectTimer = null;
     // Close existing connection if any
     if (monitorWebSocket) {
         monitorWebSocket.close();
@@ -3068,22 +3083,31 @@ function connectMonitorWebSocket() {
     updateMonitorStatus('connecting', 'Connecting...');
     
     try {
-        monitorWebSocket = new WebSocket(wsUrl);
-        
-        monitorWebSocket.onopen = () => {
+        // Capture this specific socket so its handlers can tell whether they still belong to the
+        // current connection: connect() may close a live socket and immediately open a new one, and a
+        // close/open handshake has no ordering guarantee — a stale event from a superseded socket must
+        // not touch shared state (re-arm the reconnect, flash "Disconnected") for the live one.
+        const ws = new WebSocket(wsUrl);
+        monitorWebSocket = ws;
+
+        ws.onopen = () => {
+            if (monitorWebSocket !== ws) return;   // superseded by a newer connect
             console.log('✓ WebSocket connected');
+            // Connected — cancel any pending reconnect scheduled by a prior close/error.
+            clearTimeout(monitorReconnectTimer);
+            monitorReconnectTimer = null;
             updateMonitorStatus('connected', 'Connected');
-            
+
             // Send authentication token
             if (authToken) {
-                monitorWebSocket.send(JSON.stringify({
+                ws.send(JSON.stringify({
                     type: 'auth',
                     token: authToken
                 }));
             }
         };
-        
-        monitorWebSocket.onmessage = (event) => {
+
+        ws.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
                 handleMonitorEvent(data);
@@ -3091,31 +3115,31 @@ function connectMonitorWebSocket() {
                 console.error('Failed to parse WebSocket message:', error);
             }
         };
-        
-        monitorWebSocket.onerror = (error) => {
+
+        ws.onerror = (error) => {
+            if (monitorWebSocket !== ws) return;   // superseded by a newer connect
             console.error('WebSocket error:', error);
             updateMonitorStatus('error', 'Connection Error');
         };
-        
-        monitorWebSocket.onclose = () => {
+
+        ws.onclose = () => {
+            // A stale close from a socket we've already replaced must not re-arm the reconnect (it
+            // would tear down the healthy replacement 5s later) or flash a false "Disconnected".
+            if (monitorWebSocket !== ws) return;
             console.log('WebSocket closed');
             updateMonitorStatus('disconnected', 'Disconnected');
-            
+
             // Auto-reconnect while logged in (the socket is app-wide so the owner
             // keeps receiving temp-credential login notifications on any page).
-            setTimeout(() => {
-                if (authToken) {
-                    connectMonitorWebSocket();
-                }
-            }, 5000);
+            scheduleMonitorReconnect();
         };
-        
+
     } catch (error) {
         console.error('Failed to create WebSocket:', error);
         updateMonitorStatus('error', 'Reconnecting…');
         // The live event feed is WebSocket-only; retry the connection shortly (mirrors the
         // onclose reconnect) rather than polling a non-existent endpoint.
-        setTimeout(() => { if (authToken) connectMonitorWebSocket(); }, 5000);
+        scheduleMonitorReconnect();
     }
 }
 
@@ -7416,7 +7440,10 @@ async function runVaultGrantSearch() {
     } catch (e) {
         if (seq !== vaultGrantSearchSeq) return;
         vaultGrantState.results = [];
-        grantListMessage('No matching users.');
+        // A thrown error means the search itself failed (permission, rate-limit, server, network) —
+        // NOT an empty result. The toast is suppressed (silent), so surface the reason here instead of
+        // the "No matching users." copy the empty-success path uses (which would look like "no such user").
+        grantListMessage(e && e.message ? e.message : 'Search failed.');
         updateVaultGrantCount();
     }
 }
