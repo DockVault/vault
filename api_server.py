@@ -3232,6 +3232,62 @@ async def update_my_preferences(
     return merged
 
 
+@app.get("/users/search")
+async def search_users(
+    q: str = "",
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Minimal user lookup so a vault sharer can find a recipient by username/email prefix.
+
+    Deliberately NOT the admin directory listing, but note the boundary: the caller must be able
+    to share SOME vault (own/manage one, or admin — a scoped temp credential only if it holds
+    vault.change_permissions), which in practice is most active users, since creating a vault is
+    self-service. The disclosure is bounded to id + username of active, non-EXTERNAL accounts, on a
+    >=2-char prefix, LIKE-wildcards escaped, result set capped, and rate-limited (fail-closed). This
+    matches the existing /ecc/users/{id}/public-key scoping and feeds the share/grant picker for
+    non-admin owners (who cannot read the admin-only /users list). Scoping the search to the
+    specific vault's context is an owner-gated follow-up (see the review notes)."""
+    from ecc_router import _manages_any_vault
+    from rate_limiter import rate_limiter as _rl
+    from rate_limiter import RateLimiterUnavailable
+    from sqlalchemy import or_
+
+    q = (q or "").strip()
+    if len(q) < 2:
+        return []  # require a real prefix — don't let 1 char / empty enumerate the directory
+
+    # Fail CLOSED: a Redis outage must not silently disable the anti-enumeration throttle.
+    try:
+        allowed, _, reset = _rl.check_rate_limit(
+            identifier=str(current_user.id), limit=60, window=60, prefix="user_search", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Search is temporarily unavailable.")
+    if not allowed:
+        import time as _t
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many searches; please slow down.",
+            headers={"Retry-After": str(max(1, reset - int(_t.time())))},
+        )
+
+    if not _manages_any_vault(db, current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only a vault owner or manager may search for users to share with.",
+        )
+
+    # Prefix match; escape the LIKE wildcards so a query like "%" can't sweep the directory.
+    esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    like = esc + "%"
+    rows = db.query(User.id, User.username).filter(
+        User.is_active == True,  # noqa: E712
+        User.role != RoleEnum.EXTERNAL,
+        or_(User.username.ilike(like, escape="\\"), User.email.ilike(like, escape="\\")),
+    ).order_by(User.username).limit(10).all()
+    return [{"id": str(uid), "username": uname} for uid, uname in rows]
+
+
 @app.get("/users/{user_id}", response_model=UserResponse)
 @require_endpoint_permission("USER_VIEW")
 async def get_user(

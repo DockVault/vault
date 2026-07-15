@@ -7348,14 +7348,56 @@ async function removeVaultGroupAccess(groupId) {
 }
 
 // --- Searchable "Grant access" modal for individual users -------------------
-const vaultGrantState = { users: [], groups: [] };
+const vaultGrantState = { results: [], groups: [], excluded: new Set() };
+let vaultGrantSearchTimer = null;
+let vaultGrantSearchSeq = 0;   // drops a stale/out-of-order search response (modal reopen, fast typing)
+
+// Show a plain-text status message in the grant list (safe DOM, no innerHTML).
+function grantListMessage(msg) {
+    const el = document.getElementById('vault-grant-list');
+    if (!el) return;
+    const d = document.createElement('div');
+    d.className = 'text-tertiary text-sm p-sm';
+    d.textContent = msg;
+    el.replaceChildren(d);
+}
+
+// Server-side user search (a non-admin owner can't read the admin-only /users list), scoped +
+// rate-limited backend-side. Debounced by onVaultGrantSearchInput.
+async function runVaultGrantSearch() {
+    const seq = ++vaultGrantSearchSeq;
+    const q = (document.getElementById('vault-grant-search')?.value || '').trim();
+    if (q.length < 2) {
+        vaultGrantState.results = [];
+        grantListMessage('Type at least 2 characters to search for a user.');
+        updateVaultGrantCount();
+        return;
+    }
+    try {
+        const users = await apiRequest(`/users/search?q=${encodeURIComponent(q)}`, { silent: true });
+        if (seq !== vaultGrantSearchSeq) return;  // a newer search (or modal reopen) superseded this one
+        vaultGrantState.results = (Array.isArray(users) ? users : []).filter(u => !vaultGrantState.excluded.has(u.id));
+        renderVaultGrantList();
+    } catch (e) {
+        if (seq !== vaultGrantSearchSeq) return;
+        vaultGrantState.results = [];
+        grantListMessage('No matching users.');
+        updateVaultGrantCount();
+    }
+}
+
+function onVaultGrantSearchInput() {
+    clearTimeout(vaultGrantSearchTimer);
+    vaultGrantSearchTimer = setTimeout(runVaultGrantSearch, 250);
+}
 
 async function openVaultGrantModal() {
     if (!state.currentVault) return;
     const modal = document.getElementById('vault-grant-modal');
     if (!modal) return;
     document.getElementById('vault-grant-search').value = '';
-    document.getElementById('vault-grant-list').innerHTML = '<div class="spinner"></div>';
+    vaultGrantSearchSeq++;   // invalidate any in-flight search from a previous open
+    grantListMessage('Type at least 2 characters to search for a user.');
     // Only the owner / a global admin may grant the Manager role — managers can
     // delegate read/write but not mint peer managers.
     const isOwnerOrAdmin = (state.currentVault.owner_id === currentUser.id) || currentUser.role === 'admin';
@@ -7367,20 +7409,22 @@ async function openVaultGrantModal() {
     try {
         const headers = {};
         if (state.currentVault.has_password && state.vaultPassword) headers['X-Vault-Password'] = state.vaultPassword;
-        const [users, groups, perms] = await Promise.all([
-            apiRequest('/users', { silent: true }).catch(() => []),
+        // Non-admins can't read the admin-only /users list; the recipient picker searches the
+        // scoped /users/search endpoint on input instead of preloading the whole directory.
+        const [groups, perms] = await Promise.all([
             apiRequest('/groups', { silent: true }).catch(() => []),
             apiRequest(`/vaults/${state.currentVault.id}/permissions`, { headers, silent: true }).catch(() => [])
         ]);
-        const excluded = new Set((Array.isArray(perms) ? perms : []).map(p => p.user_id));
-        if (state.currentVault.owner_id) excluded.add(state.currentVault.owner_id);
-        vaultGrantState.users = (Array.isArray(users) ? users : []).filter(u => !excluded.has(u.id));
+        vaultGrantState.excluded = new Set((Array.isArray(perms) ? perms : []).map(p => p.user_id));
+        if (state.currentVault.owner_id) vaultGrantState.excluded.add(state.currentVault.owner_id);
+        vaultGrantState.results = [];
         vaultGrantState.groups = Array.isArray(groups) ? groups : [];
         const groupSel = document.getElementById('vault-grant-group-filter');
         groupSel.innerHTML = `<option value="all">All departments</option>` +
             vaultGrantState.groups.slice().sort((a, b) => a.name.localeCompare(b.name))
                 .map(g => `<option value="${g.id}">${escapeHtml(g.name)}</option>`).join('');
-        renderVaultGrantList();
+        // Group filtering doesn't apply to the server-side search results — hide the control.
+        if (groupSel) groupSel.style.display = 'none';
         setTimeout(() => document.getElementById('vault-grant-search').focus(), 60);
     } catch (e) {
         document.getElementById('vault-grant-list').innerHTML = `<div class="alert alert-error">Failed to load users: ${escapeHtml(e.message)}</div>`;
@@ -7390,19 +7434,28 @@ async function openVaultGrantModal() {
 function renderVaultGrantList() {
     const listEl = document.getElementById('vault-grant-list');
     if (!listEl) return;
-    const q = (document.getElementById('vault-grant-search')?.value || '').trim().toLowerCase();
-    const groupF = document.getElementById('vault-grant-group-filter')?.value || 'all';
-    let list = vaultGrantState.users;
-    if (groupF !== 'all') list = list.filter(u => (u.groups || []).some(g => g.id === groupF));
-    if (q) list = list.filter(u => u.username.toLowerCase().includes(q) || (u.email || '').toLowerCase().includes(q));
-    if (!list.length) { listEl.innerHTML = `<div class="text-tertiary text-sm p-sm">No matching users.</div>`; updateVaultGrantCount(); return; }
-    listEl.innerHTML = list.map(u => `
-        <label class="pick-row">
-            <input type="checkbox" value="${u.id}">
-            <span class="avatar-sm">${(u.username || '?').substring(0, 2).toUpperCase()}</span>
-            <div class="cell-user-text"><span class="cell-user-name">${escapeHtml(u.username)}</span><span class="cell-user-sub">${escapeHtml(u.email || '')}</span></div>
-            <div class="chip-row">${(u.groups || []).map(g => groupChip(g)).join('')}</div>
-        </label>`).join('');
+    const list = vaultGrantState.results;
+    if (!list.length) { grantListMessage('No matching users.'); updateVaultGrantCount(); return; }
+    const frag = document.createDocumentFragment();
+    for (const u of list) {
+        const label = document.createElement('label');
+        label.className = 'pick-row';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.value = u.id;
+        const avatar = document.createElement('span');
+        avatar.className = 'avatar-sm';
+        avatar.textContent = (u.username || '?').substring(0, 2).toUpperCase();
+        const textWrap = document.createElement('div');
+        textWrap.className = 'cell-user-text';
+        const nameEl = document.createElement('span');
+        nameEl.className = 'cell-user-name';
+        nameEl.textContent = u.username || '';
+        textWrap.appendChild(nameEl);
+        label.append(cb, avatar, textWrap);
+        frag.appendChild(label);
+    }
+    listEl.replaceChildren(frag);
     updateVaultGrantCount();
 }
 
@@ -8503,9 +8556,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Searchable "Grant vault access" modal
     const vgSearch = document.getElementById('vault-grant-search');
-    if (vgSearch) vgSearch.addEventListener('input', renderVaultGrantList);
-    const vgGroup = document.getElementById('vault-grant-group-filter');
-    if (vgGroup) vgGroup.addEventListener('change', renderVaultGrantList);
+    if (vgSearch) vgSearch.addEventListener('input', onVaultGrantSearchInput);
     const vgList = document.getElementById('vault-grant-list');
     if (vgList) vgList.addEventListener('change', updateVaultGrantCount);
     const vgConfirm = document.getElementById('vault-grant-confirm');

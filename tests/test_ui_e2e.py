@@ -1308,6 +1308,8 @@ def test_zero_knowledge_vault_sharing_two_users(browser, admin):
         pageA.click('[data-vault-tab="permissions"]')
         pageA.click("#add-permission-btn")
         expect(pageA.locator("#vault-grant-modal")).to_be_visible(timeout=5000)
+        # the picker is search-driven: type the recipient's username to load their row
+        pageA.fill("#vault-grant-search", ub["_username"])
         pageA.wait_for_selector(f'#vault-grant-list input[value="{ub["id"]}"]', timeout=8000)
         pageA.check(f'#vault-grant-list input[value="{ub["id"]}"]')
         pageA.click("#vault-grant-confirm")
@@ -1387,6 +1389,8 @@ def test_zero_knowledge_revoke_rotates_dek(browser, admin):
         pageA.click('[data-vault-tab="permissions"]')
         pageA.click("#add-permission-btn")
         expect(pageA.locator("#vault-grant-modal")).to_be_visible(timeout=5000)
+        # the picker is search-driven: type the recipient's username to load their row
+        pageA.fill("#vault-grant-search", ub["_username"])
         pageA.wait_for_selector(f'#vault-grant-list input[value="{ub["id"]}"]', timeout=8000)
         pageA.check(f'#vault-grant-list input[value="{ub["id"]}"]')
         pageA.click("#vault-grant-confirm")
