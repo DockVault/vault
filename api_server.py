@@ -1503,6 +1503,115 @@ async def update_settings(
     return {"status": "ok"}
 
 
+@app.post("/settings/test-email")
+async def send_test_email(
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Send a test email to the requesting admin using the stored SMTP settings, to verify the
+    Settings -> Email configuration end to end. Fails cleanly (not a 500) when SMTP isn't
+    configured, and never echoes the stored SMTP password."""
+    import smtplib
+    from email.message import EmailMessage
+    from rate_limiter import rate_limiter as _rl
+    from models import SystemSetting
+
+    # Sending mail is an outbound side effect — cap it per admin.
+    allowed, _, reset = _rl.check_rate_limit(
+        identifier=str(current_user.id), limit=5, window=60, prefix="test_email")
+    if not allowed:
+        import time as _t
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many test emails; please wait a moment.",
+            headers={"Retry-After": str(max(1, reset - int(_t.time())))},
+        )
+
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    cfg = dict(row.value) if row and row.value else {}
+    host = (cfg.get("smtp_server") or "").strip()
+    from_email = (cfg.get("from_email") or "").strip()
+    if not host or not from_email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="SMTP is not configured. Set the SMTP server and From address in Settings → Email first.",
+        )
+
+    to_addr = (current_user.email or "").strip() or from_email
+    try:
+        port = int(cfg.get("smtp_port") or 587)
+    except (TypeError, ValueError):
+        port = 587
+    username = (cfg.get("smtp_username") or "").strip()
+    password = cfg.get("smtp_password") or ""
+    from_name = (cfg.get("from_name") or "").strip()
+
+    try:
+        # EmailMessage encodes headers safely (rejects CRLF header injection). Building it INSIDE
+        # the try means a control-char From name/address (saveable via PUT /settings, which doesn't
+        # validate these fields) surfaces as a clean 400 below rather than an unhandled 500.
+        msg = EmailMessage()
+        msg["Subject"] = "DockVault test email"
+        msg["From"] = f"{from_name} <{from_email}>" if from_name else from_email
+        msg["To"] = to_addr
+        msg.set_content(
+            "This is a test email from your vault's SMTP configuration.\n"
+            "If you received it, outbound email delivery is working."
+        )
+
+        if port == 465:
+            server = smtplib.SMTP_SSL(host, port, timeout=15)
+        else:
+            server = smtplib.SMTP(host, port, timeout=15)
+        with server:
+            server.ehlo()
+            encrypted = port == 465
+            if port != 465 and server.has_extn("starttls"):
+                server.starttls()
+                server.ehlo()
+                encrypted = True
+            if username and not encrypted:
+                # STARTTLS-strip defense: never send credentials over an unencrypted connection
+                # (an on-path attacker can remove the STARTTLS advertisement from a plaintext EHLO).
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="The SMTP server does not offer STARTTLS; refusing to send credentials over an unencrypted connection.",
+                )
+            if username:
+                server.login(username, password)
+            server.send_message(msg)
+    except smtplib.SMTPAuthenticationError:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="SMTP authentication failed — check the username and password.",
+        )
+    except (ValueError, UnicodeError) as e:
+        # Malformed From name/address (control chars) or SMTP host (bad IDNA) — a configuration
+        # problem, returned cleanly instead of propagating as an unhandled 500.
+        print(f"test-email config invalid: {type(e).__name__}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The SMTP configuration is invalid — check the server address and the From name/address.",
+        )
+    except (smtplib.SMTPException, OSError) as e:
+        # Log the detail server-side; never surface it (or the password) to the client.
+        print(f"test-email send failed: {type(e).__name__}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not send the test email — check the SMTP server, port, and TLS settings.",
+        )
+
+    try:
+        AuditLogger(db).log_action(
+            action="test_email_sent", status="success", user=current_user,
+            ip_address=get_client_ip(request), details={"to": to_addr},
+        )
+    except Exception:
+        pass
+    return {"message": f"Test email sent to {to_addr}"}
+
+
 # ===========================================================================
 # RO2-3 — authenticated, disableable log-PULL endpoint (GET /logs) + admin token mgmt.
 # Two-layer gate: the env CEILING (settings.plan_log_pull, HARD, default off) AND a

@@ -161,6 +161,12 @@ def test_temp_admin_cannot_resolve_security_alert(temp_admin_client):
     assert r.status_code == 403
 
 
+def test_temp_admin_cannot_send_test_email(temp_admin_client):
+    # a temp credential must not be able to trigger outbound mail via the admin test-email endpoint.
+    r = temp_admin_client.post("/settings/test-email")
+    assert r.status_code == 403
+
+
 def test_temp_admin_cannot_read_user_activity(temp_admin_client, temp_user):
     r = temp_admin_client.get(f"/api/security/user-activity/{temp_user['id']}")
     assert r.status_code == 403
