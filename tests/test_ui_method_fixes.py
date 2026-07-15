@@ -30,7 +30,7 @@ def admin_page(page: Page, admin_creds):
 def test_vault_delete_from_card_works(admin_page: Page, admin):
     """Deleting a (password-less) vault from its card removes it — no 405."""
     page = admin_page
-    v = admin.create_vault(name="uir-del-target")
+    v = admin.create_vault(name="del-target")
     vid = v["id"]
     try:
         page.click('.sidebar-item[data-section="vaults"]')
@@ -52,7 +52,7 @@ def test_password_vault_delete_from_card_prompts_and_works(admin_page: Page, adm
     (via showPrompt) and sends it as the X-Vault-Password header — no 405, no 401."""
     page = admin_page
     vpw = "CardDelPass!123long"
-    v = admin.create_vault(name="uir-pw-del-target", password=vpw)
+    v = admin.create_vault(name="pw-del-target", password=vpw)
     vid = v["id"]
     try:
         page.click('.sidebar-item[data-section="vaults"]')
@@ -103,7 +103,7 @@ def test_user_edit_saves(admin_page: Page, admin):
     page = admin_page
     u = admin.create_user(role="user")
     uid = u["id"]
-    new_email = "uir-edited@example.com"
+    new_email = "edited-addr@example.com"
     try:
         page.click('.sidebar-item[data-section="users"]')
         row = page.locator(f'tr.exp-row[data-id="{uid}"]')

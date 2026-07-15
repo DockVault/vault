@@ -30,12 +30,12 @@ def test_search_denied_to_non_sharer(admin):
 
 def test_manager_can_search_and_gets_id_username_only(admin):
     u, c, v = _sharer(admin)
-    target = admin.create_user(username="uir-search-target")
+    target = admin.create_user(username="findme-recipient")
     try:
-        r = c.get("/users/search?q=uir-search")
+        r = c.get("/users/search?q=findme")
         assert r.status_code == 200, r.text
         results = r.json()
-        assert any(x["username"] == "uir-search-target" for x in results)
+        assert any(x["username"] == "findme-recipient" for x in results)
         for x in results:
             assert set(x) == {"id", "username"}  # no email / role / directory leak
     finally:

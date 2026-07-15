@@ -17,8 +17,8 @@ def _login(page: Page, username: str, password: str):
 
 
 def test_share_picker_searches_server_and_renders(page: Page, admin, admin_creds):
-    v = admin.create_vault(name="uir-share-vault")
-    target = admin.create_user(username="uir-picktarget")
+    v = admin.create_vault(name="share-picker-vault")
+    target = admin.create_user(username="picker-recipient")
     try:
         _login(page, admin_creds["username"], admin_creds["password"])
         page.click('.sidebar-item[data-section="vaults"]')
@@ -31,8 +31,8 @@ def test_share_picker_searches_server_and_renders(page: Page, admin, admin_creds
         expect(page.locator("#vault-grant-list")).to_contain_text("Type at least 2")
         # typing fires the scoped /users/search and renders the match
         with page.expect_response(lambda r: "/users/search" in r.url):
-            page.fill("#vault-grant-search", "uir-pick")
-        expect(page.locator("#vault-grant-list")).to_contain_text("uir-picktarget", timeout=8000)
+            page.fill("#vault-grant-search", "picker")
+        expect(page.locator("#vault-grant-list")).to_contain_text("picker-recipient", timeout=8000)
     finally:
         admin.delete_user(target["id"])
         admin.delete_vault(v["id"])
