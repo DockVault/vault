@@ -3266,7 +3266,7 @@ async def search_users(
     >=2-char prefix, LIKE-wildcards escaped, result set capped, and rate-limited (fail-closed). This
     matches the existing /ecc/users/{id}/public-key scoping and feeds the share/grant picker for
     non-admin owners (who cannot read the admin-only /users list). Scoping the search to the
-    specific vault's context is an owner-gated follow-up (see the review notes)."""
+    specific vault being shared (rather than the whole directory) is a possible future refinement."""
     from ecc_router import _manages_any_vault
     from rate_limiter import rate_limiter as _rl
     from rate_limiter import RateLimiterUnavailable
