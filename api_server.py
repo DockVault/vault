@@ -2702,6 +2702,43 @@ async def terminate_temp_credential_sessions(
     }
 
 
+@app.get("/monitor/stats")
+async def monitor_stats(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db)
+):
+    """Live-monitor headline counts: users and sessions active in the last hour."""
+    from sqlalchemy import func, distinct
+    from models import ActiveSession
+    grace_cutoff = datetime.now(timezone.utc) - timedelta(minutes=65)
+    active_filter = (
+        ActiveSession.is_active == True,  # noqa: E712
+        ActiveSession.last_activity >= grace_cutoff,
+    )
+    active_users = db.query(func.count(distinct(ActiveSession.user_id))).filter(*active_filter).scalar() or 0
+    active_sessions = db.query(func.count(ActiveSession.id)).filter(*active_filter).scalar() or 0
+    return {"active_users": active_users, "active_sessions": active_sessions}
+
+
+@app.get("/storage/stats")
+async def storage_stats(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db)
+):
+    """Storage usage for this deployment: bytes stored across active vaults, plus the
+    capacity of the underlying storage volume."""
+    from vault_service import deployment_storage_used
+    used = deployment_storage_used(db)
+    total = available = 0
+    try:
+        usage = shutil.disk_usage(settings.file_storage_path)
+        total, available = usage.total, usage.free
+    except OSError as e:
+        # Capacity is best-effort — never fail the panel if the path can't be stat'd.
+        print(f"storage_stats: disk_usage unavailable: {e}")
+    return {"total": total, "used": used, "available": available}
+
+
 # ==============================================================================
 # WebSocket Endpoint for Live Monitoring
 # ==============================================================================

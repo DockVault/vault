@@ -3093,45 +3093,10 @@ function connectMonitorWebSocket() {
         
     } catch (error) {
         console.error('Failed to create WebSocket:', error);
-        updateMonitorStatus('error', 'Failed to connect');
-        
-        // Fall back to polling if WebSocket not available
-        console.log('Falling back to polling mode...');
-        startMonitorPolling();
-    }
-}
-
-// Fallback: Poll for events if WebSocket not available
-let monitorPollingInterval = null;
-function startMonitorPolling() {
-    if (monitorPollingInterval) {
-        clearInterval(monitorPollingInterval);
-    }
-    
-    updateMonitorStatus('polling', 'Polling Mode');
-    
-    // Poll every 5 seconds
-    monitorPollingInterval = setInterval(async () => {
-        try {
-            const events = await apiRequest('/monitor/events?limit=50');
-            
-            // Process new events
-            events.forEach(event => {
-                // Check if event already exists (by timestamp + type + user)
-                const eventKey = `${event.timestamp}-${event.type}-${event.user}`;
-                if (!monitorEvents.some(e => `${e.timestamp}-${e.type}-${e.user}` === eventKey)) {
-                    handleMonitorEvent(event);
-                }
-            });
-            
-        } catch (error) {
-            console.error('Failed to poll events:', error);
-        }
-    }, 5000);
-    
-    // Register interval with sessionManager if available
-    if (window.sessionManager && typeof window.sessionManager.registerInterval === 'function') {
-        window.sessionManager.registerInterval(monitorPollingInterval);
+        updateMonitorStatus('error', 'Reconnecting…');
+        // The live event feed is WebSocket-only; retry the connection shortly (mirrors the
+        // onclose reconnect) rather than polling a non-existent endpoint.
+        setTimeout(() => { if (authToken) connectMonitorWebSocket(); }, 5000);
     }
 }
 
@@ -3379,11 +3344,6 @@ function cleanupMonitor() {
     if (monitorWebSocket) {
         monitorWebSocket.close();
         monitorWebSocket = null;
-    }
-    
-    if (monitorPollingInterval) {
-        clearInterval(monitorPollingInterval);
-        monitorPollingInterval = null;
     }
 }
 
