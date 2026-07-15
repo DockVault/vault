@@ -1265,6 +1265,49 @@ def _create_zk_vault_via_ui(page: Page, owner_client, passphrase: str) -> str:
     return m[0]["id"]
 
 
+def test_zero_knowledge_wrong_passphrase_surfaces_error(browser, admin):
+    """Opening a ZK vault with the WRONG passphrase must surface a clear error, instead of
+    silently showing every file as 'Encrypted name' with the failure only in the console."""
+    from conftest import ApiClient, BASE_URL
+
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    owner = admin.create_user(role="admin")
+    c = ApiClient(); c.login(owner["_username"], owner["_password"])
+    vid = None
+    ctx1 = browser.new_context(base_url=BASE_URL); p1 = ctx1.new_page()
+    ctx2 = browser.new_context(base_url=BASE_URL); p2 = ctx2.new_page()
+    try:
+        # context 1: create the ZK vault (keypair set up under the passphrase) + upload a file
+        _login(p1, owner["_username"], owner["_password"])
+        vid = _create_zk_vault_via_ui(p1, c, "correct-zk-pass-123")
+        p1.click('.sidebar-item[data-section="vaults"]')
+        p1.click(f'.open-vault-btn[data-vault-id="{vid}"]')
+        expect(p1.locator("#vault-view-section")).to_be_visible(timeout=10000)
+        fname = _u("zk") + ".txt"
+        p1.set_input_files("#file-upload-input", files=[{"name": fname, "mimeType": "text/plain", "buffer": b"secret data"}])
+        for _ in range(40):
+            if any(it["type"] == "file" for it in c.get(f"/vaults/{vid}/files").json()["items"]):
+                break
+            p1.wait_for_timeout(500)
+
+        # context 2: a fresh browser — the private key isn't unlocked, so opening the vault prompts.
+        _login(p2, owner["_username"], owner["_password"])
+        p2.click('.sidebar-item[data-section="vaults"]')
+        p2.click(f'.open-vault-btn[data-vault-id="{vid}"]')
+        expect(p2.locator("#confirm-modal-input")).to_be_visible(timeout=10000)
+        p2.fill("#confirm-modal-input", "totally-wrong-passphrase")
+        p2.click("#confirm-modal-confirm-btn")
+        # the wrong passphrase now surfaces a clear error (was swallowed before)
+        expect(p2.locator(".toast-error")).to_be_visible(timeout=10000)
+        expect(p2.locator(".toast-error")).to_contain_text("passphrase")
+    finally:
+        if vid:
+            c.delete_vault(vid)
+        admin.delete_user(owner["id"])
+        ctx1.close()
+        ctx2.close()
+
+
 def test_zero_knowledge_vault_sharing_two_users(browser, admin):
     """User A wraps the vault DEK in their browser for user B; B unwraps it in
     their browser and reads the file. The definitive proof that client-side ECDH

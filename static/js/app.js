@@ -5449,6 +5449,20 @@ function zkNewObjId() {
 // name epoch we lack a DEK for (e.g. a member added after a rotation) is shown as locked
 // rather than failing the whole listing.
 async function zkDecryptListingNames(items, vault) {
+    // Nothing encrypted to decrypt (empty vault or only legacy plaintext rows) — don't prompt.
+    if (!items.some(it => it.enc_name)) return;
+    // Unlock the account key ONCE up front. A wrong passphrase (or a corrupt/absent key) throws
+    // here; surface it as a single clear error instead of letting the per-item catch below swallow
+    // it, which used to leave every row silently showing "Encrypted name" with no explanation.
+    try {
+        await zkEnsureUnlocked();
+    } catch (e) {
+        for (const it of items) {
+            if (it.enc_name) { it.name = '🔒 Encrypted name'; it.zkLocked = true; }
+        }
+        if (!/cancel/i.test(e.message || '')) showError(e.message);
+        return;
+    }
     for (const it of items) {
         if (!it.enc_name) continue;  // legacy plaintext row (it.name already set) — leave it
         const epoch = zkNameEpoch(it);
