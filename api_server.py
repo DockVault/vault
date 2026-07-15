@@ -5287,6 +5287,8 @@ async def list_vault_files(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(e)
         )
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -5782,6 +5784,10 @@ async def upload_file(
                 # Lost a same-name replace race against the name unique index — a clean 409.
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
+            except PermissionDeniedError as e:
+                # A write-permission denial is a 403, not a 500 (the broad handler below).
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
             except Exception as e:
                 # Log error
                 print(f"Error during upload: {e}")
@@ -5840,6 +5846,8 @@ async def upload_file(
         # Deliberate HTTP errors raised inside (size reservation 413, same-name
         # replace 409, cancellations) must propagate as-is, not be re-wrapped to 500.
         raise
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         db.rollback()
         # Broadcast error event
@@ -6523,6 +6531,10 @@ async def complete_chunked_upload(
         session.error_message = str(e)[:500]
         db.commit()
         raise HTTPException(status_code=500, detail=f"Failed to finalize upload: {str(e)}")
+    except PermissionDeniedError as e:
+        # A permission denial is a 403, not a 500 — and it isn't a corrupt upload, so leave
+        # the session/blob for the TTL cleanup rather than force-failing it here.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         _remove_orphan_blob()
         session.status = 'failed'
@@ -6903,6 +6915,8 @@ async def download_file(
         # Explicit HTTP errors (e.g. 404 file-not-found) must propagate as-is
         # rather than be re-wrapped into a generic 500 below.
         raise
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         # Broadcast error event
         try:
@@ -6998,6 +7012,8 @@ async def delete_file(
         # Explicit HTTP errors (e.g. 404 cross-vault file) must propagate as-is
         # rather than be re-wrapped into a generic 500 below.
         raise
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         db.rollback()
         raise HTTPException(
@@ -7256,6 +7272,8 @@ async def create_folder(
         # Deliberate 4xx (e.g. ZK plaintext-name rejection, missing name) must propagate
         # as-is rather than be re-wrapped into a generic 500 below.
         raise
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         db.rollback()
         raise HTTPException(
