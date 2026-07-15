@@ -100,7 +100,6 @@ async def get_features():
     This endpoint returns which features are enabled in this deployment:
     - User signup availability
     - Trial period settings
-    - 2FA support
     - API access
     - SFTP server status
     - SSO support

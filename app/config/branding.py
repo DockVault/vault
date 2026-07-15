@@ -271,8 +271,10 @@ class BrandingConfig(BaseSettings):
     )
     
     enable_2fa: bool = Field(
-        default=True,
-        description="Enable Two-Factor Authentication"
+        default=False,
+        description="Advertise Two-Factor Authentication support (no built-in TOTP yet; kept as a "
+                    "forward-compatible flag / for a front-door MFA proxy). Defaults off so a stock "
+                    "deployment doesn't advertise a capability it doesn't provide."
     )
     
     enable_api: bool = Field(

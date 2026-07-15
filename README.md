@@ -17,7 +17,7 @@ Licensed under **AGPL-3.0** — self-host it freely.
 - **Temporary, scoped credentials** — hand out time-limited, least-privilege access to a
   vault or path.
 - **Organizational groups**, per-user storage quotas, role-based access, and an audit log.
-- **2FA (TOTP)**, login rate-limiting, and durable session revocation.
+- **Login rate-limiting** and durable session revocation.
 - **Single standalone image** — needs only its bundled PostgreSQL + Redis; no external
   services required.
 
