@@ -4167,6 +4167,7 @@ async def delete_vault(
     vault_id: uuid.UUID,
     request: Request,
     vault_password: Optional[str] = None,
+    x_vault_password: Optional[str] = Header(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -4177,11 +4178,16 @@ async def delete_vault(
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
-    
+
+    # Accept the vault password via the X-Vault-Password header (the convention every other
+    # password-gated vault route uses) OR the legacy query param, so a password never has to
+    # ride the URL query string (where it would land in access logs).
+    effective_vault_password = x_vault_password or vault_password
+
     # Get vault first to check permissions and validate password
     try:
         # require_password=True because we're deleting (destructive operation)
-        vault = vault_service.get_vault(vault_id, current_user, vault_password, require_password=True)
+        vault = vault_service.get_vault(vault_id, current_user, effective_vault_password, require_password=True)
         vault_name = str(vault.name)  # Convert to string
 
         # SECURITY: deletion is owner-or-admin, mirroring update_vault_info /

@@ -7631,10 +7631,34 @@ async function deleteVault(vaultId) {
         'Delete this vault?'
     );
     if (!confirmed) return;
-    
+
+    // The real route is POST /vaults/{id}/delete (there is no DELETE /vaults/{id}).
+    // A password-protected vault needs its password proven for the destructive delete; send it
+    // via the X-Vault-Password header (matching every other password-gated vault route). Reuse
+    // the cached password when deleting the currently-open vault; otherwise (e.g. the card trash
+    // button on a vault we haven't unlocked) prompt for it.
+    // Prefer state.currentVault when it's the target: it's kept in sync on an in-session password
+    // add/remove, whereas the state.allVaults snapshot is only refreshed by a full loadVaults().
+    const vault = (state.currentVault && state.currentVault.id === vaultId ? state.currentVault : null)
+        || (state.allVaults || []).find(v => v.id === vaultId);
+    const headers = {};
+    if (vault && vault.has_password) {
+        let pw = (state.currentVault && state.currentVault.id === vaultId) ? state.vaultPassword : null;
+        if (!pw) {
+            pw = await showPrompt(
+                'This vault is password-protected. Enter its password to permanently delete it.',
+                'Vault password',
+                { password: true }
+            );
+            if (pw === null) return; // cancelled
+        }
+        headers['X-Vault-Password'] = pw;
+    }
+
     try {
-        await apiRequest(`/vaults/${vaultId}`, {
-            method: 'DELETE'
+        await apiRequest(`/vaults/${vaultId}/delete`, {
+            method: 'POST',
+            headers
         });
         showSuccess('Vault deleted successfully');
         loadVaults();
@@ -7710,6 +7734,10 @@ async function handleChangeVaultPassword(e) {
         // Update local state + the remembered password so the new one is reused
         // (and a removed password is forgotten).
         state.currentVault.has_password = !!newPassword;
+        // Keep the vaults-grid snapshot in sync so a later card action (e.g. delete)
+        // reads the correct has_password without a full reload.
+        const snap = (state.allVaults || []).find(v => v.id === state.currentVault.id);
+        if (snap) snap.has_password = !!newPassword;
         if (newPassword) {
             state.setVaultPassword(newPassword);
             state.rememberVaultPassword(state.currentVault.id, newPassword, state.currentVault.unlock_remember_minutes);
@@ -8332,14 +8360,14 @@ document.addEventListener('DOMContentLoaded', () => {
             
             try {
                 await apiRequest(`/users/${userId}`, {
-                    method: 'PUT',
+                    method: 'PATCH',
                     body: JSON.stringify({
                         email,
                         role,
                         is_active: isActive
                     })
                 });
-                
+
                 showSuccess('User updated successfully');
                 closeModal();
                 loadUsers();
