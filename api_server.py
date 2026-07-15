@@ -3406,6 +3406,58 @@ async def delete_user(
     return {"message": f"User {username} deleted successfully"}
 
 
+@app.post("/users/{user_id}/terminate-sessions")
+@require_endpoint_permission("USER_MANAGE")
+async def terminate_user_sessions(
+    user_id: uuid.UUID,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+    request: Request = None
+):
+    """
+    Terminate all active sessions for a user (admin only). Durably revokes the user's
+    web tokens and force-closes any live web/SFTP transports immediately.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
+    # Prevent self-termination (durable revocation would log the admin out mid-request);
+    # mirrors delete_user's self-guard. An admin ends their own session via logout.
+    if user.id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot terminate your own sessions; use logout instead."
+        )
+
+    terminated_count = _revoke_sessions(
+        db, user_id=user_id, actor_username=current_user.username, durable=True
+    )
+    db.commit()
+
+    audit_logger = AuditLogger(db)
+    audit_logger.log_action(
+        action="terminate_session",
+        status="success",
+        user_id=current_user.id,
+        resource_type="user",
+        resource_id=str(user_id),
+        details={
+            "username": user.username,
+            "terminated_count": terminated_count,
+            "ip_address": get_client_ip(request),
+        }
+    )
+
+    return {
+        "message": f"Terminated {terminated_count} active session(s)",
+        "terminated_count": terminated_count
+    }
+
+
 # ============================================================================
 # Organizational Groups (departments) — hierarchical, organizational-only.
 # Admin-guarded. Membership writes go straight to the user_groups table (so we

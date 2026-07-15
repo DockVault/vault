@@ -62,6 +62,7 @@ def test_temp_admin_cannot_update_or_delete_user(temp_admin_client, temp_user):
     # cross-user password reset must also be denied
     assert temp_admin_client.patch(f"/users/{uid}", json={"password": "N3wPassw0rd!"}).status_code == 403
     assert temp_admin_client.post(f"/users/{uid}/delete").status_code == 403
+    assert temp_admin_client.post(f"/users/{uid}/terminate-sessions").status_code == 403
 
 
 def test_temp_admin_cannot_toggle_account_state(temp_admin_client, temp_user):

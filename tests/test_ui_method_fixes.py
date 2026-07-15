@@ -73,6 +73,31 @@ def test_password_vault_delete_from_card_prompts_and_works(admin_page: Page, adm
             admin.delete_vault(vid, vault_password=vpw)
 
 
+def test_terminate_user_sessions_button_renders_and_works(admin_page: Page, admin):
+    """The admin per-user 'Terminate Sessions' button renders and actually terminates
+    the target user's live session (the button markup + backend route were both missing)."""
+    page = admin_page
+    u = admin.create_user(role="user")
+    uid = u["id"]
+    uc = admin.clone_anonymous()
+    uc.login(u["_username"], u["_password"])
+    try:
+        assert uc.get("/vaults").status_code == 200  # the user has a live session
+        page.click('.sidebar-item[data-section="users"]')
+        row = page.locator(f'tr.exp-row[data-id="{uid}"]')
+        expect(row).to_be_visible(timeout=10000)
+        row.click()  # expand
+        term_btn = page.locator(f'.terminate-user-sessions-btn[data-user-id="{uid}"]')
+        expect(term_btn).to_be_visible(timeout=10000)  # the button now renders
+        term_btn.click()
+        page.click("#confirm-modal-confirm-btn")  # confirm dialog
+        expect(page.locator(".toast-success")).to_be_visible(timeout=10000)
+        # authoritative: the user's session was actually revoked
+        assert uc.get("/vaults").status_code == 401
+    finally:
+        admin.delete_user(uid)
+
+
 def test_user_edit_saves(admin_page: Page, admin):
     """Editing a user's email persists — no 405."""
     page = admin_page
