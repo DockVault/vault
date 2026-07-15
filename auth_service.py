@@ -98,8 +98,10 @@ class InvalidCredentialsError(AuthenticationError):
 
 
 class AccountLockedError(AuthenticationError):
-    """Raised when account is locked."""
-    pass
+    """Raised when account is locked. Carries locked_until (None = a permanent/admin lock)."""
+    def __init__(self, message: str = "Account is locked", locked_until=None):
+        super().__init__(message)
+        self.locked_until = locked_until
 
 
 class RateLimitExceededError(AuthenticationError):
@@ -227,7 +229,7 @@ class AuthService:
         # Credentials are valid — now enforce account state. (The distinct exception type is
         # for audit / internal handling; the endpoint surfaces a generic message.)
         if account_locked(user):
-            raise AccountLockedError("Account is locked")
+            raise AccountLockedError("Account is locked", locked_until=user.locked_until)
         if not user.is_active:
             raise InvalidCredentialsError("Account is not active")
         

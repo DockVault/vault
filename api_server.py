@@ -2250,10 +2250,29 @@ async def login(
             # Don't fail the response if monitoring fails
             print(f"Warning: Failed to record security event: {monitor_error}")
         
-        # Uniform generic message for ALL credential-failure outcomes (nonexistent / wrong
-        # password / inactive / locked) so the response body can't enumerate accounts or
-        # their state. The specific reason is preserved in the audit log
-        # (log_login_failure above), never returned to the caller.
+        # A lock is only raised AFTER the password verified (verify-first ordering in
+        # authenticate_user), so the caller has already proven they know the credential — telling
+        # them the account is locked (and when it frees) reveals nothing an attacker couldn't
+        # already determine, and unlike the generic message it tells a legitimate user why they're
+        # stuck. Wrong password / nonexistent / inactive still get the uniform generic 401 so the
+        # response body can't enumerate accounts or their state.
+        if isinstance(e, AccountLockedError):
+            locked_until = getattr(e, 'locked_until', None)
+            if locked_until is not None:
+                if locked_until.tzinfo is None:
+                    locked_until = locked_until.replace(tzinfo=timezone.utc)
+                secs = max(0, int((locked_until - datetime.now(timezone.utc)).total_seconds()))
+                mins = max(1, (secs + 59) // 60)
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Your account is temporarily locked after too many failed attempts. "
+                           f"Try again in about {mins} minute(s).",
+                    headers={"Retry-After": str(secs)},
+                )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your account is locked. Contact your administrator to unlock it.",
+            )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password"

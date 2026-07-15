@@ -1013,23 +1013,40 @@ async function loadDashboardStats() {
             console.log('Temp creds endpoint not accessible:', error);
         }
         
-        // Load users count
-        try {
-            const users = await apiRequest('/users', { silent: true });
-            const usersCountEl = document.getElementById('dashboard-users-count');
-            if (usersCountEl) {
-                const activeUsers = users.filter(u => u.is_active).length;
-                usersCountEl.textContent = activeUsers;
+        // Load users count — the /users list is admin-only (require_interactive_admin), so a
+        // non-admin dashboard shouldn't fire it and eat a 403 (and the browser's console error).
+        if (currentUser && currentUser.role === 'admin') {
+            try {
+                const users = await apiRequest('/users', { silent: true });
+                const usersCountEl = document.getElementById('dashboard-users-count');
+                if (usersCountEl) {
+                    const activeUsers = users.filter(u => u.is_active).length;
+                    usersCountEl.textContent = activeUsers;
+                }
+            } catch (error) {
+                console.log('Users endpoint not accessible:', error);
             }
-        } catch (error) {
-            console.log('Users endpoint not accessible:', error);
         }
-        
-        // Load recent events
-        try {
-            await loadRecentEvents();
-        } catch (error) {
-            console.log('Events endpoint not available:', error);
+
+        // Recent events are admin-only — skip (and show a proper message) for non-admins instead
+        // of a 403 that renders the misleading "Event logging not configured".
+        if (currentUser && currentUser.role === 'admin') {
+            try {
+                await loadRecentEvents();
+            } catch (error) {
+                console.log('Events endpoint not available:', error);
+            }
+        } else {
+            const eventsFeed = document.getElementById('events-feed');
+            if (eventsFeed) {
+                const box = document.createElement('div');
+                box.className = 'empty-state text-center p-lg';
+                const p = document.createElement('p');
+                p.className = 'text-secondary';
+                p.textContent = 'Activity log is available to administrators.';
+                box.appendChild(p);
+                eventsFeed.replaceChildren(box);
+            }
         }
         
         // Update system status
@@ -1100,14 +1117,15 @@ async function loadRecentEvents() {
         
     } catch (error) {
         console.log('Failed to load events:', error);
-        // If audit endpoint doesn't exist, show placeholder
         const eventsFeed = document.getElementById('events-feed');
         if (eventsFeed) {
-            eventsFeed.innerHTML = `
-                <div class="empty-state text-center p-lg">
-                    <p class="text-secondary">Event logging not configured</p>
-                </div>
-            `;
+            const box = document.createElement('div');
+            box.className = 'empty-state text-center p-lg';
+            const p = document.createElement('p');
+            p.className = 'text-secondary';
+            p.textContent = "Couldn't load recent events.";
+            box.appendChild(p);
+            eventsFeed.replaceChildren(box);
         }
     }
 }
@@ -1740,12 +1758,13 @@ function showTempCredsModal(creds) {
     modal.querySelector('#close-temp-creds-x').addEventListener('click', closeTempCredsModal);
 
     // Fill in the SFTP host-key fingerprint (so the customer can verify it on first connect).
+    const _hostKeyPending = 'not generated yet — created when the SFTP service first starts';
     apiRequest('/sftp/host-key', { silent: true }).then(r => {
         const el = document.getElementById('tc-hostkey-fp');
-        if (el) el.textContent = (r && r.available && r.fingerprint_sha256) ? r.fingerprint_sha256 : 'unavailable';
+        if (el) el.textContent = (r && r.available && r.fingerprint_sha256) ? r.fingerprint_sha256 : _hostKeyPending;
     }).catch(() => {
         const el = document.getElementById('tc-hostkey-fp');
-        if (el) el.textContent = 'unavailable';
+        if (el) el.textContent = _hostKeyPending;
     });
 }
 
@@ -6782,7 +6801,9 @@ const uploadManager = {
               </div>`;
         }).join('');
 
-        const active = items.filter(i => i.status !== 'done' && i.status !== 'needs-file').length;
+        // A failed item (e.g. a rejected 0-byte upload) is finished, not active — exclude 'error'
+        // so it doesn't stick in the tray header as "N active" forever.
+        const active = items.filter(i => i.status !== 'done' && i.status !== 'needs-file' && i.status !== 'error').length;
         tray.innerHTML = `
           <div class="up-tray-head">
             <span>Uploads${active ? ` · ${active} active` : ''}</span>
