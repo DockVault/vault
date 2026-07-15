@@ -8344,6 +8344,15 @@ document.addEventListener('DOMContentLoaded', () => {
             const note = (document.getElementById('temp-cred-note')?.value || '').trim();
             const canCreate = !!(document.getElementById('temp-cred-can-create') && document.getElementById('temp-cred-can-create').checked);
             const scopeData = collectTempScope();
+            // A credential scoped to the Vaults page but with no vaults selected can access
+            // nothing — warn instead of silently minting a dead credential (mirrors the server
+            // guard; keyed on the Vaults page, the only signal that governs selected-mode reach).
+            if (scopeData && scopeData.vault_access_mode === 'selected'
+                && scopeData.selected_vaults.length === 0
+                && (scopeData.scope.pages || []).includes('vaults')) {
+                showError("Select at least one vault, or switch to 'All vaults' — a credential scoped to vaults with none selected can't access anything.");
+                return;
+            }
             closeModal();
             generateTempCreds({
                 validity_minutes: validityMinutes, note, can_create_temp_credentials: canCreate,

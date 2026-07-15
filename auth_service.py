@@ -448,7 +448,7 @@ class AuthService:
         # Resolve the least-privilege scope. None = legacy/unrestricted. When a
         # temp session delegates (parent_scope set), intersect so the child can
         # never exceed its parent.
-        from temp_scope import intersect_scope, VAULT_CAPS
+        from temp_scope import intersect_scope, VAULT_CAPS, expand_vault_caps
         is_delegated = parent_scope is not None
         if scope is None and not is_delegated:
             effective_scope = None
@@ -459,6 +459,34 @@ class AuthService:
             mode = 'all' if vault_access_mode == 'all' else 'selected'
             if is_delegated and parent_vault_mode == 'selected':
                 mode = 'selected'  # a child cannot broaden vault access to 'all'
+
+        # A 'selected'-mode credential scoped to the vaults page but with no vaults that will
+        # actually resolve to an access grant can reach nothing — reject rather than silently mint
+        # a dead credential. Keyed on the 'vaults' page (the only signal that governs selected-mode
+        # reachability — vault_caps_default is unused in 'selected' mode) and on the vaults that
+        # will really persist (a valid id, and for a delegated child one the parent itself holds),
+        # so a dashboard/temp-creds-only credential and a request full of unusable ids are both
+        # judged correctly.
+        if mode == 'selected' and effective_scope is not None and 'vaults' in effective_scope.get('pages', []):
+            _parent_ids = set(str(v) for v in (parent_vault_ids or []))
+            _resolvable = []
+            for _sv in (selected_vaults or []):
+                _vid = _sv.get('vault_id') if isinstance(_sv, dict) else None
+                if not _vid:
+                    continue
+                try:
+                    uuid.UUID(str(_vid))
+                except (ValueError, AttributeError):
+                    continue
+                if is_delegated and parent_vault_mode == 'selected' and str(_vid) not in _parent_ids:
+                    continue
+                _resolvable.append(str(_vid))
+            if not _resolvable:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="This credential is scoped to vaults but no reachable vaults are "
+                           "selected — select at least one vault, or switch to 'All vaults'.",
+                )
 
         # Proof-of-knowledge gate: minting a 'selected'-scope credential that includes a
         # password-protected vault REQUIRES that vault's CURRENT password (passed per-vault
@@ -522,7 +550,9 @@ class AuthService:
                     continue
                 if is_delegated and parent_vault_mode == 'selected' and str(vid) not in parent_ids:
                     continue  # child cannot reach a vault the parent could not
-                caps = [c for c in (sv.get('caps') or []) if c in VAULT_CAPS]
+                # Add implied prerequisite caps so the granted combination is usable, then (for a
+                # delegated child) clamp to what the parent held so expansion can't broaden scope.
+                caps = expand_vault_caps(sv.get('caps') or [])
                 if is_delegated:
                     if parent_vault_mode == 'all':
                         parent_caps = set((parent_scope or {}).get('vault_caps_default', []))
