@@ -19,7 +19,7 @@ from pydantic import BaseModel, EmailStr, Field
 from database import get_db
 from models import User, TemporaryCredential, RoleEnum, AuditLog, ActiveSession
 from auth_service import AuthService
-from audit_logger import AuditLogger
+from app.services.audit_logger import AuditLogger
 from endpoint_permissions import require_endpoint_permission
 
 security_scheme = HTTPBearer()

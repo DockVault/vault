@@ -361,7 +361,7 @@ class ECCCryptoLibrary {
      * this client holds the PRIVATE key for the public key being registered, so a
      * substituted / not-held key can't be registered. Does ECDH(userPrivateKey,
      * serverEphemeralPublicKey) -> HKDF -> HMAC over (nonce || publicKeyPem). Exact mirror
-     * of the server's ecc_pop.py (salt 'dv-ecc-pop-v1', info 'registration-pop', SHA-256).
+     * of the server's app/services/ecc_pop.py (salt 'dv-ecc-pop-v1', info 'registration-pop', SHA-256).
      *
      * @param {string} serverEphemeralPublicKeyPem - server ephemeral public key (SPKI PEM)
      * @param {string} nonceBase64 - base64 nonce from the challenge

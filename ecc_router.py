@@ -16,9 +16,9 @@ import json
 import uuid
 from database import get_db
 from models import User, Vault, UserKeyPair, VaultMemberKey, ZKShareInvite, ECCRegistrationChallenge, vault_members, RoleEnum
-import ecc_pop
-from ecc_crypto_service import ECCCryptoService
-from audit_logger import AuditLogger
+from app.services import ecc_pop
+from app.services.ecc_crypto_service import ECCCryptoService
+from app.services.audit_logger import AuditLogger
 from rate_limiter import rate_limiter as _rate_limiter
 from endpoint_permissions import require_endpoint_permission
 from temp_scope import (
@@ -37,7 +37,7 @@ security_scheme = HTTPBearer()
 
 class RegistrationPoP(BaseModel):
     """Proof-of-possession for key registration: the challenge id + the client's ECDH
-    key-confirmation MAC over (nonce || public_key). See ecc_pop.py."""
+    key-confirmation MAC over (nonce || public_key). See app/services/ecc_pop.py."""
     challenge_id: str
     mac: str
 
@@ -398,7 +398,7 @@ async def register_challenge(
 ):
     """Issue a one-time proof-of-possession challenge for key registration: a server
     EPHEMERAL public key + nonce the client MACs with its private key (ECDH key-confirmation).
-    Bound to the current user, single-use, short-lived. See ecc_pop.py."""
+    Bound to the current user, single-use, short-lived. See app/services/ecc_pop.py."""
     _ecc_rate_limit(current_user, "register")
     priv_pem, pub_pem, nonce_b64 = ecc_pop.generate_challenge()
     # One live challenge per user: drop any prior ones so the table can't accrete.

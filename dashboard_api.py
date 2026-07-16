@@ -14,7 +14,7 @@ from sqlalchemy import func, desc, select
 
 from database import get_db
 from models import User, Vault, vault_members, TemporaryCredential, AuditLog, ActiveSession, RoleEnum
-from response_hash_utils import handle_conditional_response
+from app.core.response_hash_utils import handle_conditional_response
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 security_scheme = HTTPBearer()

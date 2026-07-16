@@ -327,7 +327,7 @@ if _admin_pw:
 # endpoint can be reached. A DATA VAULT must never refuse to boot over a LOG-feature config
 # problem (that would deny the customer access to their FILES), and the control plane may set
 # PLAN_LOG_PULL a moment before the pepper reaches an existing/bundle container. So a
-# weak/absent pepper does NOT exit — the EFFECTIVE ceiling (log_pull.effective_ceiling, used by
+# weak/absent pepper does NOT exit — the EFFECTIVE ceiling (app/services/log_pull.py effective_ceiling, used by
 # the endpoint) simply requires a strong pepper, DISABLING the endpoint (404) until one is set.
 # Warn loudly so an operator notices the endpoint is off.
 if settings.plan_log_pull:

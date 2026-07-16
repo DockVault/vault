@@ -345,7 +345,7 @@ def test_progress_complete_clears_dangling_record():
     # but never complete_operation, so every finished/failed upload left a dangling record until TTL.
     script = "\n".join([
         "import uuid",
-        "from activity_monitor import ProgressTracker",
+        "from app.services.activity_monitor import ProgressTracker",
         "from database import redis_client",
         "t = ProgressTracker()",
         "oid = 'upload_' + uuid.uuid4().hex",
@@ -367,7 +367,7 @@ def test_progress_complete_clears_dangling_record():
 def test_activity_monitor_dead_code_removed_and_complete_wired():
     # The dead progress/traffic code is gone; the live methods remain; and the upload finalizer now
     # completes the operation record.
-    src = _read("activity_monitor.py")
+    src = _read("app/services/activity_monitor.py")
     for gone in ("class ActivityStats", "def update_progress", "def get_all_operations", "def get_operation"):
         assert gone not in src, f"{gone} should have been removed"
     for keep in ("def start_operation", "def complete_operation", "def is_cancelled", "def cancel_operation"):
@@ -578,7 +578,8 @@ def test_plaintext_transport_warning_condition():
 
 
 _SCHEME_SELFTEST = r'''
-import api_server, net_utils
+import api_server
+from app.core import net_utils
 sc = api_server._external_scheme
 
 class _H(dict):
@@ -670,7 +671,7 @@ def test_broken_whole_file_crypto_stays_removed():
     # The whole-file AES-GCM writer had a 9-byte magic vs a 5-byte header field, so every
     # round-trip always failed -- a latent foot-gun if re-wired. It was removed; only the live
     # secure-delete helper remains. Guard against reintroduction.
-    src = _read("encrypted_file_storage.py")
+    src = _read("app/services/encrypted_file_storage.py")
     for gone in ("def encrypt_and_save", "def load_and_decrypt", "def verify_file_format", "MAGIC_BYTES"):
         assert gone not in src, f"removed whole-file crypto symbol reappeared: {gone}"
     assert "def secure_delete" in src, "the live secure_delete helper must remain"

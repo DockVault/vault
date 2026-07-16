@@ -1,4 +1,4 @@
-"""RO2-3 Phase 1 — pure helpers behind GET /logs (log_pull.py). Security-critical: token
+"""RO2-3 Phase 1 — pure helpers behind GET /logs (app/services/log_pull.py). Security-critical: token
 hashing, scope validation, per-service filtering, the enable gate, and redaction. Pure stdlib,
 no app import, no running vault.
 """
@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import log_pull  # noqa: E402
+from app.services import log_pull  # noqa: E402
 
 
 # ---- token mint / hash / match --------------------------------------------------------------

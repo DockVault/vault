@@ -38,14 +38,14 @@ from auth_service import AuthService, InvalidCredentialsError, AccountLockedErro
 from authorization import PermissionService, PermissionDeniedError, ResourceNotFoundError, AuthorizationError
 from vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, _name_match_filter
 from sqlalchemy.exc import IntegrityError
-from audit_logger import AuditLogger
-import log_pull  # RO2-3: pure helpers for the authenticated log-pull endpoint
+from app.services.audit_logger import AuditLogger
+from app.services import log_pull  # RO2-3: pure helpers for the authenticated log-pull endpoint
 from security import create_access_token, verify_access_token
 from config import settings
 from endpoint_permissions import require_endpoint_permission
 from temp_scope import require_vault_cap
 from user_management_api import router as user_management_router
-from response_hash_utils import handle_conditional_response, compute_response_hash, check_if_none_match, create_cached_response, create_not_modified_response
+from app.core.response_hash_utils import handle_conditional_response, compute_response_hash, check_if_none_match, create_cached_response, create_not_modified_response
 
 # Global tracking for active operations
 import threading
@@ -171,7 +171,7 @@ def _external_scheme(request: StarletteRequest) -> str:
     try:
         xfp = request.headers.get('x-forwarded-proto')
         if xfp:
-            from net_utils import _is_trusted_peer
+            from app.core.net_utils import _is_trusted_peer
             peer = request.client.host if request.client else None
             if _is_trusted_peer(peer):
                 return (xfp.split(',')[0].strip().lower() or request.url.scheme)
@@ -1008,7 +1008,7 @@ def get_client_ip(request: Request) -> str:
     (untrusted) client can't spoof its IP to poison per-IP throttles or audit logs. See
     net_utils.client_ip (trusted set = settings.trusted_proxies, EMPTY by default => XFF ignored,
     peer used; the operator opts in by declaring their reverse-proxy network)."""
-    from net_utils import client_ip
+    from app.core.net_utils import client_ip
     return client_ip(request)
 
 
@@ -2568,7 +2568,7 @@ async def list_temp_credentials(
         result.append(item)
     
     # Use conditional response with ETag to reduce traffic
-    from response_hash_utils import handle_conditional_response
+    from app.core.response_hash_utils import handle_conditional_response
     return handle_conditional_response(request, result)
 
 
@@ -2620,7 +2620,7 @@ async def get_temp_credential_password(
     }
     
     # Use conditional response with ETag (password doesn't change)
-    from response_hash_utils import handle_conditional_response
+    from app.core.response_hash_utils import handle_conditional_response
     return handle_conditional_response(request, data)
 
 
@@ -5771,7 +5771,7 @@ async def upload_file(
             start_operation(operation_id)
             
             # Track in Redis for cancellation and progress
-            from activity_monitor import ProgressTracker
+            from app.services.activity_monitor import ProgressTracker
             tracker = ProgressTracker()
             tracker.start_operation(
                 operation_id=operation_id,
@@ -7874,7 +7874,7 @@ async def cancel_operation(
     Cancel an active operation (upload/download).
     Requires authentication.
     """
-    from activity_monitor import ProgressTracker
+    from app.services.activity_monitor import ProgressTracker
 
     tracker = ProgressTracker()
     # Only the operation's owner (or an admin) may cancel it — a leaked operation id must not
@@ -8091,7 +8091,7 @@ async def get_permission_groups(
     Get all available functionality groups (admin only).
     Returns comprehensive list of all endpoint groups that can be granted to users.
     """
-    from api_catalog import API_CATALOG, RoleRequirement
+    from app.core.api_catalog import API_CATALOG, RoleRequirement
     
     groups = []
     for group_name, group in API_CATALOG.items():
@@ -8135,7 +8135,7 @@ async def get_user_permissions(
     For admin users, returns all permission groups as granted.
     """
     from endpoint_permissions import get_user_permissions as get_perms
-    from api_catalog import API_CATALOG
+    from app.core.api_catalog import API_CATALOG
     
     # Authorization: users see only their own permissions; a real (interactive) admin can see anyone's.
     # A temporary credential — even one owned by an admin — is treated as non-admin here, so it can
@@ -8187,7 +8187,7 @@ async def grant_user_permission(
     Grant a functionality group to a user (admin only).
     """
     from endpoint_permissions import grant_endpoint_permission
-    from api_catalog import API_CATALOG
+    from app.core.api_catalog import API_CATALOG
     
     # Validate user exists
     target_user = db.query(User).filter(User.id == user_id).first()
@@ -8253,7 +8253,7 @@ async def revoke_user_permission(
     Revoke a functionality group from a user (admin only).
     """
     from endpoint_permissions import revoke_endpoint_permission
-    from api_catalog import API_CATALOG
+    from app.core.api_catalog import API_CATALOG
     
     # Validate user exists
     target_user = db.query(User).filter(User.id == user_id).first()

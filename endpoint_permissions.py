@@ -1,7 +1,7 @@
 """
 Endpoint Permission System for granular access control.
 This module provides decorators and utilities for checking endpoint-level permissions.
-Uses api_catalog.py for comprehensive endpoint definitions.
+Uses app/core/api_catalog.py for comprehensive endpoint definitions.
 """
 from functools import wraps
 from datetime import datetime, timezone
@@ -10,7 +10,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from models import User, UserEndpointPermission, RoleEnum
-from api_catalog import API_CATALOG
+from app.core.api_catalog import API_CATALOG
 
 
 def require_endpoint_permission(group_name: str):
@@ -137,7 +137,7 @@ def grant_default_permissions_for_role(
         role: User role ('user' or 'admin')
         db: Database session
     """
-    from api_catalog import API_CATALOG
+    from app.core.api_catalog import API_CATALOG
     
     # Normalize role
     role_str = str(role).lower().replace('roleenum.', '').replace('role.', '')

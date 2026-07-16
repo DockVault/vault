@@ -23,7 +23,7 @@ from security import (
 from authorization import PermissionService
 from config import settings
 from database import redis_client
-from encrypted_file_storage import EncryptedFileStorage
+from app.services.encrypted_file_storage import EncryptedFileStorage
 
 
 def _seal_named_object(vault, obj, is_file: bool) -> None:
@@ -725,7 +725,7 @@ class VaultService:
         Returns:
             Tuple of (File object, StreamingUploadContext)
         """
-        from streaming_upload import StreamingUploadContext
+        from app.services.streaming_upload import StreamingUploadContext
         from security import GcmChunkStreamCodec, IdentityChunkCodec, calculate_file_checksum
         
         # Verify vault access

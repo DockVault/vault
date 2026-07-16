@@ -21,7 +21,7 @@ from security import (
     hash_password, verify_password, generate_temporary_credentials,
     verify_temporary_credential, generate_session_token, vault_password_fingerprint
 )
-from session_hash_utils import hash_session_token
+from app.core.session_hash_utils import hash_session_token
 from database import redis_client, get_db_context
 from config import settings
 

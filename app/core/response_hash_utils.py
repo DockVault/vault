@@ -13,7 +13,7 @@ Performance Benefits:
 - Particularly effective for frequently-polled endpoints
 
 Usage:
-    from response_hash_utils import compute_response_hash, check_if_none_match, create_cached_response
+    from app.core.response_hash_utils import compute_response_hash, check_if_none_match, create_cached_response
     
     @app.get("/api/data")
     async def get_data(request: Request):

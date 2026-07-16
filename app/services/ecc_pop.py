@@ -14,7 +14,7 @@ ECDH key-confirmation (no signing key, no user private key on the server):
 Only a holder of the user private key can produce the correct MAC, so the MAC proves
 possession. This module handles ONLY server-generated EPHEMERAL keys used for the
 challenge — it never touches a user private key or a vault DEK (the zero-knowledge
-invariant), which is why it lives here and not in ecc_crypto_service.py.
+invariant), which is why it lives here and not in app/services/ecc_crypto_service.py.
 """
 import base64
 import hashlib

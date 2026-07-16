@@ -305,7 +305,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 pass  # fall through to IP
 
         # 3. Fall back to IP — trusted-proxy aware (a direct client can't spoof X-Forwarded-For).
-        from net_utils import client_ip
+        from app.core.net_utils import client_ip
         return f"ip:{client_ip(request)}"
     
     def _should_rate_limit(self, path: str) -> bool:
@@ -400,7 +400,7 @@ def rate_limit(
                 return await func(*args, **kwargs)
             
             # Get identifier based on 'per' parameter (trusted-proxy-aware client IP).
-            from net_utils import client_ip as _client_ip
+            from app.core.net_utils import client_ip as _client_ip
             if per == "user" and hasattr(request.state, "user_id") and request.state.user_id:
                 identifier = f"user:{request.state.user_id}"
             else:

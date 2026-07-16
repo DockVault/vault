@@ -60,7 +60,7 @@ from vault_service import (
     InvalidPasswordError,
 )
 from vault_service import FileNotFoundError as VaultFileNotFoundError
-from audit_logger import AuditLogger
+from app.services.audit_logger import AuditLogger
 from config import settings
 from temp_scope import is_scoped, effective_vault_caps
 from security import name_blind_index

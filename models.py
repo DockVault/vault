@@ -1021,7 +1021,7 @@ class ZKShareInvite(Base):
 
 
 class ECCRegistrationChallenge(Base):
-    """A one-time proof-of-possession challenge for ECC public-key registration (ecc_pop.py).
+    """A one-time proof-of-possession challenge for ECC public-key registration (app/services/ecc_pop.py).
 
     Holds the server's EPHEMERAL private key + nonce so the register endpoint can verify the
     client's ECDH key-confirmation MAC. NOT a user key and never a DEK — a transient,

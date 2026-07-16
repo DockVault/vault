@@ -141,7 +141,7 @@ def test_logout_sets_durable_revoked_flag(admin, temp_user):
 # Trusted-proxy X-Forwarded-For handling — exercised INSIDE the container (net_utils imports
 # config, which needs the credential manager). Mirrors the docker-exec self-test pattern.
 _NET_SELFTEST = r'''
-import net_utils
+from app.core import net_utils
 
 class _Headers(dict):
     def get(self, k, d=None):
