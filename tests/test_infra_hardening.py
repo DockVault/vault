@@ -455,7 +455,7 @@ def test_baked_healthcheck_is_scheme_aware():
 
 def test_deploy_scripts_hardened():
     # Deploy-script hardening (owner-validated on-host; here we lock the source):
-    smp = _read("setup_master_password.py")
+    smp = _read("scripts/setup_master_password.py")
     assert "iterations=600000" in smp, "PBKDF2 must use >=600k iterations (match the runtime decryptor)"
     assert "'production'" in smp, "the ENVIRONMENT fallback must default to production, not development"
     assert "0o600" in smp, "secret files must be written mode 0600"

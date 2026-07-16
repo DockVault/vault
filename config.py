@@ -36,7 +36,7 @@ if has_encrypted_creds or has_plain_creds:
             print("   Please ensure you have the correct master password.")
             print("\n💡 If you need to reset security:")
             print("   1. Restore .env from .env.backup")
-            print("   2. Run: python setup_master_password.py")
+            print("   2. Run: python scripts/setup_master_password.py")
         sys.exit(1)
     print("✅ Credentials unlocked successfully\n")
 else:

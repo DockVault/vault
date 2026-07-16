@@ -4,8 +4,8 @@ DockVault Master Password Setup
 ---------------------------
 This script encrypts ALL sensitive credentials with a master password.
 
-Usage:
-    python setup_master_password.py
+Usage (run from the repository root, where .env lives):
+    python scripts/setup_master_password.py
 
 What it does:
     1. Prompts for a master password (min 16 chars)

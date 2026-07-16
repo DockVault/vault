@@ -145,7 +145,7 @@ class CredentialManager:
             print("This is a SECURITY RISK!")
             print()
             print("🔒 To enable encryption protection:")
-            print("   python setup_master_password.py")
+            print("   python scripts/setup_master_password.py")
             print()
             print("Continuing with plaintext credentials...")
             print()
@@ -205,7 +205,7 @@ class CredentialManager:
             print(f"  MASTER_PASSWORD_HASH: {'SET' if os.getenv('MASTER_PASSWORD_HASH') else 'NOT SET'}")
             print()
             print("To set up encrypted credentials:")
-            print("   python setup_master_password.py")
+            print("   python scripts/setup_master_password.py")
             print()
             return False
         
