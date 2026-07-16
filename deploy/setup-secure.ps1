@@ -1,21 +1,22 @@
 # setup-secure.ps1 - one-command PRODUCTION (HTTPS) setup for DockVault on Windows.
 #
-# The Windows counterpart of setup-secure.sh: it writes ./.env with freshly generated
+# The Windows counterpart of deploy/setup-secure.sh: it writes ./.env with freshly generated
 # secrets, provisions TLS certificates into ./certs, and starts the HTTPS-only stack from
-# docker-compose.secure.yml (web UI/API on https://<name>, TLS terminated in-container; no
+# deploy/docker-compose.secure.yml (web UI/API on https://<name>, TLS terminated in-container; no
 # plaintext listener). Postgres + Redis stay internal to the compose network.
 #
-# Requires Docker Desktop (Linux containers). Run it from the repo root in PowerShell:
+# Requires Docker Desktop (Linux containers). The script lives in deploy/ but anchors
+# itself at the repo root (where .env + certs/ live). Run it from the repo root in PowerShell:
 #
-#   ./setup-secure.ps1 -ServerName vault.example.com                 # self-signed (default)
-#   ./setup-secure.ps1 -ServerName vault.example.com -CertMode byo `
-#                      -CertPath C:\certs\fullchain.pem -KeyPath C:\certs\privkey.pem
-#   ./setup-secure.ps1 -ServerName vault.example.com -EnableSftp     # also expose SFTP
-#   ./setup-secure.ps1 -ServerName vault.example.com -NoStart        # set up, do not start
+#   ./deploy/setup-secure.ps1 -ServerName vault.example.com                 # self-signed (default)
+#   ./deploy/setup-secure.ps1 -ServerName vault.example.com -CertMode byo `
+#                             -CertPath C:\certs\fullchain.pem -KeyPath C:\certs\privkey.pem
+#   ./deploy/setup-secure.ps1 -ServerName vault.example.com -EnableSftp     # also expose SFTP
+#   ./deploy/setup-secure.ps1 -ServerName vault.example.com -NoStart        # set up, do not start
 #
 # Idempotent: re-running reuses an existing ./.env (keeps your data + secrets) and only
-# (re)builds/starts. Delete ./.env (and `docker compose -f docker-compose.secure.yml down -v`)
-# to start completely fresh.
+# (re)builds/starts. To start completely fresh, run
+# `docker compose --env-file .env -f deploy/docker-compose.secure.yml down -v`, then delete ./.env.
 #
 # For a real public certificate use -CertMode byo with a cert you obtained yourself (your CA,
 # a reverse proxy, or Let's Encrypt on a Linux host / via win-acme). Let's Encrypt issuance is
@@ -39,12 +40,17 @@ param(
 $ErrorActionPreference = 'Continue'
 Set-StrictMode -Version 2.0
 
-$Root    = Split-Path -Parent $MyInvocation.MyCommand.Path
-$EnvFile = Join-Path $Root '.env'
-$CertDir = Join-Path $Root 'certs'
-# Absolute path so `docker compose` finds the file (and anchors .env + `build: .` to $Root)
-# no matter which directory the script is invoked from.
-$Compose = Join-Path $Root 'docker-compose.secure.yml'
+# This script lives in deploy/ - the repo ROOT (parent dir) is where .env and certs/ live.
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root      = Split-Path -Parent $ScriptDir
+$EnvFile   = Join-Path $Root '.env'
+$CertDir   = Join-Path $Root 'certs'
+# Absolute path so `docker compose` finds the file no matter which directory the script is
+# invoked from. NB: compose's default project directory is the -f file's dir (deploy/), so
+# every invocation below passes --env-file $EnvFile to anchor .env interpolation and
+# COMPOSE_PROFILES at the repo root; the compose file's own relative paths (build context,
+# env_file, certs bind) are written relative to deploy/ and resolve to the root by themselves.
+$Compose = Join-Path $Root 'deploy\docker-compose.secure.yml'
 
 function Say  ([string] $m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Warn ([string] $m) { Write-Host "WARNING: $m" -ForegroundColor Yellow }
@@ -57,7 +63,7 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 # Gate on the exit code, not on stderr: a healthy engine prints warnings to stderr but exits 0.
 docker info *> $null
 if ($LASTEXITCODE -ne 0) { Die 'the Docker engine is not reachable. Start Docker Desktop and retry.' }
-if (-not (Test-Path $Compose)) { Die 'docker-compose.secure.yml not found next to this script.' }
+if (-not (Test-Path $Compose)) { Die 'deploy/docker-compose.secure.yml not found - run this script from its repository checkout.' }
 
 if (-not $ServerName) {
     $ServerName = Read-Host 'Server name (DNS name or IP clients will use, e.g. vault.example.com)'
@@ -86,7 +92,7 @@ function New-FernetKey {
 
 # --- certificates ---------------------------------------------------------------------------
 # On Docker Desktop a bind-mounted ./certs is readable by the in-container app user, so no
-# ownership fix-up is needed (unlike the Linux userns-remap case setup-secure.sh handles).
+# ownership fix-up is needed (unlike the Linux userns-remap case deploy/setup-secure.sh handles).
 
 # Run OpenSSL from the host if present, otherwise via a throwaway container so the host needs
 # nothing but Docker. Args run with the certs dir as the working directory.
@@ -174,13 +180,13 @@ if (Test-Path $EnvFile) {
 
 # --- start ----------------------------------------------------------------------------------
 if ($NoStart) {
-    Say 'setup complete (-NoStart): start it with'
-    Write-Host "    docker compose -f $Compose up -d --build"
+    Say 'setup complete (-NoStart): start it from the repo root with'
+    Write-Host "    docker compose --env-file .env -f deploy/docker-compose.secure.yml up -d --build"
     exit 0
 }
 
 Say 'building and starting the HTTPS stack'
-docker compose -f $Compose up -d --build
+docker compose --env-file $EnvFile -f $Compose up -d --build
 if ($LASTEXITCODE -ne 0) { Die 'docker compose failed to start the stack.' }
 
 Write-Host ''

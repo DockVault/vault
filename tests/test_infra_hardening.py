@@ -459,19 +459,21 @@ def test_deploy_scripts_hardened():
     assert "iterations=600000" in smp, "PBKDF2 must use >=600k iterations (match the runtime decryptor)"
     assert "'production'" in smp, "the ENVIRONMENT fallback must default to production, not development"
     assert "0o600" in smp, "secret files must be written mode 0600"
-    ss = _read("setup-secure.sh")
-    assert "REDIS_PASSWORD" in ss, "setup-secure.sh must generate a REDIS_PASSWORD"
-    assert "ALLOWED_HOSTS" in ss, "setup-secure.sh must write ALLOWED_HOSTS"
+    ss = _read("deploy/setup-secure.sh")
+    assert "REDIS_PASSWORD" in ss, "deploy/setup-secure.sh must generate a REDIS_PASSWORD"
+    assert "ALLOWED_HOSTS" in ss, "deploy/setup-secure.sh must write ALLOWED_HOSTS"
 
 
 def test_public_docs_reference_only_shipped_windows_scripts():
     # Operator docs MAY reference a Windows helper that actually ships in this repo (e.g.
-    # setup-secure.ps1), but must never point a self-hoster at a .ps1 that isn't part of this repo
+    # deploy/setup-secure.ps1), but must never point a self-hoster at a .ps1 that isn't part of this repo
     # (a dev-only helper that doesn't ship here), which would only misdirect.
     import re
-    for name in (".env.example", "docker-compose.yml", "README.md"):
+    for name in (".env.example", "docker-compose.yml", "deploy/docker-compose.yml", "README.md"):
         for script in re.findall(r"[A-Za-z0-9_-]+\.ps1", _read(name)):
-            assert (ROOT / script).exists(), \
+            # Shipped helpers live under deploy/ (the docs reference them as deploy/<name>.ps1;
+            # the regex extracts the bare basename).
+            assert (ROOT / script).exists() or (ROOT / "deploy" / script).exists(), \
                 f"{name} references a Windows script that is not shipped here: {script}"
 
 
@@ -552,7 +554,7 @@ def test_development_allows_short_nonplaceholder_password():
 
 def test_dev_compose_publishes_loopback_only():
     # The plaintext trial must bind to loopback so it isn't reachable off-host.
-    dc = _read("docker-compose.yml")
+    dc = _read("deploy/docker-compose.yml")
     assert '- "127.0.0.1:8200:8000"' in dc, "trial API port must publish on loopback (127.0.0.1)"
     assert '- "8200:8000"' not in dc, "trial API port must not publish on all interfaces"
 
@@ -686,7 +688,7 @@ def test_zk_seal_names_locks_vault_row():
 
 
 def test_dev_compose_hardening():
-    dc = _read("docker-compose.yml")
+    dc = _read("deploy/docker-compose.yml")
     assert "vault_local_dev_pw" not in dc, "the source-controlled default DB password must be dropped"
     assert dc.count("- ALL") >= 2, "cap_drop [ALL] expected on both app services"
     assert "mem_limit:" in dc, "container memory ceilings expected"
@@ -695,7 +697,7 @@ def test_dev_compose_hardening():
 
 
 def test_secure_compose_hardening():
-    sc = _read("docker-compose.secure.yml")
+    sc = _read("deploy/docker-compose.secure.yml")
     assert sc.count("- ALL") >= 2, "cap_drop [ALL] expected on both app services"
     assert "mem_limit:" in sc
     assert "--requirepass" in sc

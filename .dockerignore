@@ -56,7 +56,10 @@ build/
 *~
 setup_state.json
 setup.lock
+# NB: .dockerignore patterns are filepath.Match-style, NOT gitignore-style — a bare
+# pattern matches at the context root only, so the deploy/ copies need their own line.
 docker-compose*.yml
+deploy/docker-compose*.yml
 .dockerignore
 .gitignore
 # Keep VCS metadata out of the shipped public image (a submodule .git is just a 58-byte gitdir

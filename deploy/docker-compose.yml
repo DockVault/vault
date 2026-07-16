@@ -1,0 +1,251 @@
+# Self-contained local stack for the vault service: the web/API process, the
+# SFTP process, and the Postgres + Redis it depends on. The built image is
+# tagged `dockvault-vault:latest` — the same image the container-manager is
+# meant to deploy as a customer container.
+#
+# This file lives in deploy/; the repo-root docker-compose.yml is a thin
+# `include:` pointer to it, so the documented quickstart stays
+# `docker compose up -d` from the repository root. Running THIS file directly
+# needs the interpolation env anchored at the repo-root .env explicitly:
+#   docker compose --env-file .env -f deploy/docker-compose.yml up -d
+#
+# Secrets come from the repo-root .env (copy .env.example and fill it in).
+# DATABASE_URL and REDIS_HOST are overridden here to point at the sidecars
+# regardless of .env. Relative paths below (build context, env_file) are
+# written relative to THIS file's directory per the compose spec.
+
+name: dockvault-vault
+
+services:
+  vault-db:
+    image: postgres:15-alpine
+    container_name: vault-db
+    environment:
+      POSTGRES_USER: sftp_user
+      # VAULT_DB_PASSWORD is now REQUIRED (no shipped default). NB: postgres only applies this on
+      # FIRST init of the data volume — an existing dev volume created under the old hardcoded
+      # default keeps that password, so set VAULT_DB_PASSWORD to the old value (or recreate the
+      # volume) if you had relied on the default.
+      POSTGRES_PASSWORD: ${VAULT_DB_PASSWORD:?set VAULT_DB_PASSWORD in .env (see .env.example)}
+      POSTGRES_DB: sftp_db
+    volumes:
+      - vault_pg_data:/var/lib/postgresql/data
+    # Hardening: read-only root fs (data in the volume) + no privilege escalation.
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sftp_user -d sftp_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Resource ceiling (no cap_drop: the official postgres entrypoint starts as root to chown the
+    # data dir + su-exec to the postgres user, so it needs its default init caps).
+    mem_limit: 1g
+    pids_limit: 256
+    networks:
+      - vault-network
+    restart: unless-stopped
+
+  vault-redis:
+    image: redis:7-alpine
+    container_name: vault-redis
+    environment:
+      # Optional Redis auth. Empty (the default) => no password (unchanged behaviour). Set
+      # REDIS_PASSWORD in .env to require AUTH on the cache that backs the login/throttle counters +
+      # the session-hash store; the app reads the same REDIS_PASSWORD (config.redis_password) and
+      # authenticates. Also read by the auth-aware healthcheck below.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    # Array command (the official entrypoint still drops to the unprivileged redis user because $1 is
+    # 'redis-server'). An empty --requirepass "" is a no-op (no auth, exactly as before); a non-empty
+    # REDIS_PASSWORD enables AUTH.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-}"]
+    # Hardening: read-only root fs (ephemeral cache -> /data is tmpfs) + no escalation.
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /data
+    healthcheck:
+      # AUTH-aware: redis-cli -a "" skips AUTH on a no-password server (still PONG), so this works
+      # with and without a password.
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD:-}\" ping 2>/dev/null | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 512m
+    pids_limit: 128
+    networks:
+      - vault-network
+    restart: unless-stopped
+
+  vault-api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: dockvault-vault:latest
+    container_name: vault-api
+    env_file:
+      - ../.env
+    environment:
+      DOCKER_CONTAINER: "true"
+      DATABASE_URL: postgresql://sftp_user:${VAULT_DB_PASSWORD:?set VAULT_DB_PASSWORD in .env (see .env.example)}@vault-db:5432/sftp_db
+      REDIS_HOST: vault-redis
+      REDIS_PORT: "6379"
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+      API_USE_HTTPS: "false"
+      SFTP_HOST: 0.0.0.0
+      SFTP_PORT: "2222"
+      ENVIRONMENT: development
+      # Hours a resumable chunked-upload session lives before its buffered chunks become
+      # eligible for cleanup. Operators reclaim sooner via POST /api/maintenance/upload-sessions/cleanup.
+      CHUNK_SESSION_TTL_HOURS: "24"
+      # read-only root fs: the first-run setup wizard writes its state file; point it at a
+      # writable path (tmpfs /app/run below) instead of the read-only app root.
+      SETUP_STATE_FILE: /app/run/setup_state.json
+    command: ["python", "api_server.py"]
+    # Loopback-only by default: this trial serves the full product (login form, bearer tokens,
+    # server-side-decrypted files) over PLAINTEXT HTTP, so it must not be reachable off this host.
+    # Publish on all interfaces (drop the 127.0.0.1 prefix) only behind TLS / an HTTPS reverse proxy.
+    ports:
+      - "127.0.0.1:8200:8000"
+    depends_on:
+      vault-db:
+        condition: service_healthy
+      vault-redis:
+        condition: service_healthy
+    volumes:
+      - vault_storage:/app/storage
+      - vault_logs:/app/logs
+      - vault_keys:/app/keys
+      # Admin-uploaded logo/favicon assets (A4). A named volume (not tmpfs) so the
+      # brand survives a restart; the image pre-creates /app/brand as appuser so the
+      # non-root process can write here under the read-only root fs.
+      - vault_brand:/app/brand
+    # Hardening: non-root (Dockerfile USER) + no escalation + read-only root fs.
+    # storage/logs/keys/brand are volumes; /app/certs (unmounted), /app/run (setup-wizard
+    # state), /app/deployments (wizard-written .env/lock), + /tmp ride tmpfs.
+    # mode=1777 so the non-root app (uid 10001) can write these even on a Linux
+    # Docker engine that defaults compose tmpfs mounts to root-owned 0755
+    # (Docker Desktop defaults to 1777, so this is a no-op there).
+    security_opt:
+      - no-new-privileges:true
+    # Drop ALL Linux capabilities, then add back ONLY what docker-entrypoint.py needs during its
+    # brief root phase to chown the persistent volumes and setuid/setgid-drop to appuser (uid 10001):
+    # CHOWN/DAC_OVERRIDE/FOWNER (the volume-migration walk) + SETUID/SETGID (the privilege drop).
+    # The actual workload then runs as appuser with NO effective caps. This still removes the risky
+    # defaults (notably NET_RAW for raw-socket sniffing/spoofing, plus MKNOD/SYS_CHROOT/SETFCAP/…).
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+      - /app/certs:mode=1777
+      - /app/run:mode=1777
+      - /app/deployments:mode=1777
+    # Resource ceilings so a heavy/compromised vault can't exhaust the shared host (co-tenant DoS
+    # on the shared-worker SaaS topology). Generous dev/standalone defaults; the SaaS control plane
+    # sizes these per plan tier at provision time. NOTE: the download path materialises the whole
+    # decrypted file in RAM (the legacy Fernet codec briefly holds ~2x), so mem_limit must stay
+    # comfortably above ~2x max_file_size_mb (default 1024 MB) plus concurrency headroom — keep the
+    # two in step if you change either, or a legitimate max-size download will be OOM-killed.
+    mem_limit: 4g
+    pids_limit: 512
+    cpus: 2.0
+    networks:
+      - vault-network
+    restart: unless-stopped
+
+  vault-sftp:
+    image: dockvault-vault:latest
+    container_name: vault-sftp
+    env_file:
+      - ../.env
+    environment:
+      DOCKER_CONTAINER: "true"
+      DATABASE_URL: postgresql://sftp_user:${VAULT_DB_PASSWORD:?set VAULT_DB_PASSWORD in .env (see .env.example)}@vault-db:5432/sftp_db
+      REDIS_HOST: vault-redis
+      REDIS_PORT: "6379"
+      SFTP_HOST: 0.0.0.0
+      SFTP_PORT: "2222"
+      ENVIRONMENT: development
+      SETUP_STATE_FILE: /app/run/setup_state.json  # read-only root fs: writable state path
+    command: ["python", "sftp_server.py"]
+    # This service runs SFTP, not the HTTP API. Check the port is bound via
+    # /proc (port 2222 = hex 08AE) instead of opening a socket — a raw TCP
+    # connect makes paramiko log "Error reading SSH protocol banner" on every
+    # probe.
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q ':08AE' /proc/net/tcp"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    ports:
+      - "2322:2222"
+    depends_on:
+      vault-db:
+        condition: service_healthy
+      vault-redis:
+        condition: service_healthy
+      vault-api:
+        # Wait until the API is HEALTHY (its /health passes), not merely started, so the
+        # API's startup migrations (which add enc_name/name_bi etc. that SFTP queries)
+        # have run before SFTP serves. Mirrors run_combined.py's /health gate in prod.
+        # vault-api inherits the image HEALTHCHECK (/health), so service_healthy applies.
+        condition: service_healthy
+    volumes:
+      - vault_storage:/app/storage
+      - vault_keys:/app/keys
+    # Hardening: non-root (Dockerfile USER) + no escalation + read-only root fs.
+    # storage/keys are volumes; this service doesn't mount the logs volume, so
+    # /app/logs (+ /app/certs, /app/run + /app/deployments wizard state, /tmp) ride tmpfs.
+    # mode=1777 so the non-root app can write on a Linux engine (see vault-api).
+    security_opt:
+      - no-new-privileges:true
+    # Drop ALL caps, add back only the entrypoint's root-phase needs (chown volumes + setuid/setgid
+    # drop to appuser); the SFTP workload then runs as appuser with no effective caps.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+      - /app/logs:mode=1777
+      - /app/certs:mode=1777
+      - /app/run:mode=1777
+      - /app/deployments:mode=1777
+    # SFTP also streams large files; keep headroom above max_file_size_mb (see vault-api note).
+    mem_limit: 2g
+    pids_limit: 512
+    cpus: 1.0
+    networks:
+      - vault-network
+    restart: unless-stopped
+
+volumes:
+  vault_pg_data:
+  vault_storage:
+  vault_logs:
+  vault_keys:
+  vault_brand:
+
+networks:
+  vault-network:
+    driver: bridge
