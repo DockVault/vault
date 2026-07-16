@@ -11,5 +11,5 @@ __all__ = ['branding', 'BrandingConfig']
 
 # Note: settings is imported from the app/core/config.py module, not this package
 # Use: from app.core.config import settings
-# Use: from config.branding import branding (imports from config/branding.py)
+# Use: from app.config.branding import branding (imports from app/config/branding.py)
 

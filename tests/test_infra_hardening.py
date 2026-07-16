@@ -446,6 +446,20 @@ def test_entrypoint_privilege_drop_fails_closed():
     assert "os.getgroups()" in drop and "sys.exit(1)" in drop, "must verify the drop and fail closed"
 
 
+def test_launch_targets_use_module_form():
+    # Every live launch site must invoke the packaged servers via `python -m` —
+    # a script-path invocation would put the module's own directory (not the app
+    # root) on sys.path and break the absolute app.* imports.
+    rc = _read("run_combined.py")
+    assert '_spawn("app.api.api_server"' in rc, "run_combined must spawn the web server as a module"
+    assert '_spawn("app.sftp.sftp_server"' in rc, "run_combined must spawn the SFTP server as a module"
+    for compose in ("deploy/docker-compose.yml", "deploy/docker-compose.secure.yml"):
+        dc = _read(compose)
+        assert '["python", "-m", "app.api.api_server"]' in dc, f"{compose}: web command must use -m"
+        assert '["python", "-m", "app.sftp.sftp_server"]' in dc, f"{compose}: sftp command must use -m"
+        assert '"api_server.py"' not in dc and '"sftp_server.py"' not in dc, f"{compose}: no script-path launch"
+
+
 def test_static_and_brand_anchor_at_app_root(anon):
     # The server modules live under app/, but static/ and brand/ sit at the APP ROOT —
     # they are anchored via app.core.paths.PROJECT_ROOT, not the serving module's

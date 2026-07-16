@@ -133,7 +133,9 @@ def _spawn(target: str, label: str) -> None:
     PYTHONUNBUFFERED keeps lines timely (a per-block buffer would defeat the tag); text mode
     with errors='replace' means a stray non-UTF-8 byte can't kill the reader (and risk a
     pipe-fill hang). ``target`` is a module name run via ``python -m`` (the packaged
-    servers), or a script path when it ends in ``.py`` (kept for direct/test use)."""
+    servers), or a script path when it ends in ``.py`` (used by tests; note a script run by
+    path gets its OWN directory as sys.path[0], so package-importing modules under
+    app/ must use the module form)."""
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
     argv = [sys.executable, target] if target.endswith(".py") else [sys.executable, "-m", target]

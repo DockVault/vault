@@ -13,30 +13,31 @@ logs/
 uploads/
 temp/
 tmp/
-# Stray keys/certs/DBs/logs dropped at the build-context root (defense-in-depth:
-# the certs/ and keys/ dirs above are already excluded; these catch a loose file
+# Stray keys/certs/DBs/logs anywhere in the tree (defense-in-depth:
+# the certs/ and keys/ dirs above are already excluded; the **/ prefix catches a loose file
+# in ANY subdirectory (bare patterns only match at the context root),
 # a working checkout might contain, since the Dockerfile does `COPY . .`).
-*.pem
-*.key
-*.crt
-*.cert
-*.db
-*.sqlite3
-*.log
+**/*.pem
+**/*.key
+**/*.crt
+**/*.cert
+**/*.db
+**/*.sqlite3
+**/*.log
 
 # Build hygiene (never needed inside the image)
 tests/
 CLAUDE.md
 # TypeScript sources / JS build tooling: the served crypto is the hand-maintained
 # static/js/*.js; no .ts is compiled at build, so none of this belongs in the image.
-*.ts
+**/*.ts
 tsconfig.json
 package.json
 package-lock.json
 node_modules/
-__pycache__/
-*.py[cod]
-.pytest_cache/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
 # Local virtualenvs (routinely created to run tests/) + dev/build/IDE artifacts
 .venv/
 venv/
@@ -48,12 +49,12 @@ dist/
 build/
 .vscode/
 .idea/
-*.backup
-*.bak
-*.old
-*.swp
-*.swo
-*~
+**/*.backup
+**/*.bak
+**/*.old
+**/*.swp
+**/*.swo
+**/*~
 setup_state.json
 setup.lock
 # NB: .dockerignore patterns are filepath.Match-style, NOT gitignore-style — a bare
