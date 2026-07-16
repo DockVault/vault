@@ -44,7 +44,8 @@ from app.core.security import create_access_token, verify_access_token
 from app.core.config import settings
 from app.core.endpoint_permissions import require_endpoint_permission
 from app.core.temp_scope import require_vault_cap
-from user_management_api import router as user_management_router
+from app.api.user_management_api import router as user_management_router
+from app.core.paths import PROJECT_ROOT
 from app.core.response_hash_utils import handle_conditional_response, compute_response_hash, check_if_none_match, create_cached_response, create_not_modified_response
 
 # Global tracking for active operations
@@ -351,7 +352,7 @@ if _allowed_hosts:
 app.include_router(user_management_router)
 
 # Import and include dashboard router
-from dashboard_api import router as dashboard_router
+from app.api.dashboard_api import router as dashboard_router
 app.include_router(dashboard_router)
 
 # Import and include info router (branding/public info)
@@ -374,13 +375,13 @@ from app.config.effective import BRAND_SETTINGS_KEY, set_brand_overrides
 # means the instance is set up and must NOT re-open the wizard. Setup is done by the
 # provisioning script / portal, so the wizard is a first-run-only fallback for a bare deploy.
 # Import and include ECC router (Elliptic Curve Cryptography)
-from ecc_router import router as ecc_router
+from app.api.ecc_router import router as ecc_router
 app.include_router(ecc_router, prefix="/ecc")
 
 @app.get("/")
 async def root():
     """Root endpoint - serve the SPA dashboard."""
-    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    static_dir = str(PROJECT_ROOT / "static")
     index_path = os.path.join(static_dir, "index.html")
     if os.path.exists(index_path):
         response = FileResponse(index_path)
@@ -828,7 +829,7 @@ async def get_current_user(
     temp_cred = None  # the TemporaryCredential row backing a temp session
 
     # Every token this server mints carries a session_token (login is the ONLY issuer —
-    # api_server.py create_access_token call site). A token WITHOUT one can only be a forgery
+    # app/api/api_server.py create_access_token call site). A token WITHOUT one can only be a forgery
     # or a stripped/legacy token, and it would bypass every revocation check below (all gated
     # on session_token). Reject it so leaked/forged tokens remain revocable.
     if not session_token:
@@ -1909,7 +1910,7 @@ async def disable_log_token(
 # baked default returns. Env-level URLs (BRAND_LOGO_URL) still win as a deploy default.
 # ---------------------------------------------------------------------------
 BRAND_ASSET_DIR = os.environ.get(
-    "BRAND_ASSET_DIR", os.path.join(os.path.dirname(__file__), "brand"))
+    "BRAND_ASSET_DIR", str(PROJECT_ROOT / "brand"))
 BRAND_ASSET_MAX_BYTES = 2 * 1024 * 1024  # 2 MB
 # slot -> the BrandingConfig override keys it drives. A single uploaded logo drives all
 # three logo slots so it shows on the login screen, header AND sidebar at once.
@@ -3267,7 +3268,7 @@ async def search_users(
     matches the existing /ecc/users/{id}/public-key scoping and feeds the share/grant picker for
     non-admin owners (who cannot read the admin-only /users list). Scoping the search to the
     specific vault being shared (rather than the whole directory) is a possible future refinement."""
-    from ecc_router import _manages_any_vault
+    from app.api.ecc_router import _manages_any_vault
     from app.core.rate_limiter import rate_limiter as _rl
     from app.core.rate_limiter import RateLimiterUnavailable
     from sqlalchemy import or_
@@ -3440,7 +3441,7 @@ async def update_user(
         # rows carved out) so the server can no longer hand them a ZK vault key; the affected
         # vaults surface 'rekey owed' to managers. Idempotent (only active rows), committed below.
         if user_update.is_active is False:
-            from user_management_api import _blacklist_user_vault_keys
+            from app.api.user_management_api import _blacklist_user_vault_keys
             n_bl = _blacklist_user_vault_keys(db, user.id, current_user.id)
             if n_bl:
                 print(f"🔑 Blacklisted {n_bl} ZK key(s) for deactivated user {user.username}")
@@ -8761,7 +8762,7 @@ app.router.lifespan_context = lifespan
 
 
 # Mount static files for web interface
-static_dir = os.path.join(os.path.dirname(__file__), "static")
+static_dir = str(PROJECT_ROOT / "static")
 if os.path.exists(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 

@@ -75,7 +75,7 @@ transport_lock = threading.Lock()
 # the same filesystem as the final encrypted file.
 _SFTP_TMP_DIR = Path(settings.file_storage_path) / ".sftp_tmp"
 
-# POSIX open-flag access mode mask (sftp_server.py only runs inside the Linux
+# POSIX open-flag access mode mask (app/sftp/sftp_server.py only runs inside the Linux
 # container, but be defensive if os lacks the constant).
 _O_ACCMODE = getattr(os, "O_ACCMODE", 0o3)
 _O_CREAT = getattr(os, "O_CREAT", 0o100)

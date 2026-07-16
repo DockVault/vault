@@ -255,7 +255,7 @@ def main():
     print("  • Use a password manager (LastPass, 1Password, etc.)")
     print("  • DO NOT commit .env.backup to git")
     print("\n🚀 Next steps:")
-    print("  1. Test the app: python api_server.py")
+    print("  1. Test the app: python -m app.api.api_server")
     print("  2. It will prompt for your master password")
     print("  3. If successful, you can delete .env.backup")
     print("\n🔧 To store password in system keychain (optional):")

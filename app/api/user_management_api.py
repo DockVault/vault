@@ -81,7 +81,7 @@ async def get_current_user(
     The import is LAZY (inside the body): api_server imports this module at load time to mount the
     router, so a module-level import would be circular. By request time api_server is fully loaded.
     """
-    from api_server import get_current_user as _hardened_get_current_user
+    from app.api.api_server import get_current_user as _hardened_get_current_user
     return await _hardened_get_current_user(credentials, db)
 
 
@@ -534,7 +534,7 @@ async def toggle_user_active(
     # sidestep by deactivating a user, creating a replacement (allowed — a seat freed up),
     # then reactivating the original via this toggle to land above the cap.
     if not user.is_active:
-        from api_server import _enforce_user_cap
+        from app.api.api_server import _enforce_user_cap
         _enforce_user_cap(db)
 
     user.is_active = not user.is_active
@@ -591,7 +591,7 @@ async def toggle_user_locked(
         # Locking revokes the user's live sessions immediately + durably (durable web-token
         # revocation + force-close of any live SFTP transport), matching the PATCH path.
         try:
-            from api_server import _revoke_sessions
+            from app.api.api_server import _revoke_sessions
             _revoke_sessions(db, user_id=user.id, actor_username=current_user.username)
         except Exception as e:  # noqa: BLE001 — never let revoke break the lock
             print(f"⚠ toggle-lock session revoke failed: {e}")
@@ -633,7 +633,7 @@ async def list_user_temp_credentials(
 
     # A temp session (scoped OR legacy NULL-scope) sees ONLY the credentials IT created — never
     # the target user's full listing (whose id UUIDs are exactly what the by-id deactivate/delete
-    # endpoints consume). Mirrors api_server.py's /temp-creds/list; without it a legacy admin-minted
+    # endpoints consume). Mirrors app/api/api_server.py's /temp-creds/list; without it a legacy admin-minted
     # temp credential (role==ADMIN, _temp_scope==None) could enumerate any user's credential ids via
     # this parallel router. A degraded temp session with no cred id fails closed (empty).
     if getattr(current_user, '_is_temp_session', False):
@@ -747,11 +747,11 @@ async def deactivate_temp_credential_by_id(
     # Users can only deactivate their own, admins can deactivate any
     if current_user.role != RoleEnum.ADMIN and temp_cred.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
-    # Confine a scoped temp session to creds it created, matching the api_server.py
+    # Confine a scoped temp session to creds it created, matching the app/api/api_server.py
     # sibling (POST /temp-creds/{u}/deactivate). Without this, a scoped admin delegate
     # could deactivate the main account's or a sibling's credential via this parallel
     # router — the confinement is enforced on one router and absent on the other.
-    from api_server import _guard_temp_session_cred_mutation, _revoke_sessions
+    from app.api.api_server import _guard_temp_session_cred_mutation, _revoke_sessions
     _guard_temp_session_cred_mutation(current_user, temp_cred, 'invalidate')
 
     temp_cred.is_active = False
@@ -792,10 +792,10 @@ async def delete_temp_credential_by_id(
     # Users can only delete their own, admins can delete any
     if current_user.role != RoleEnum.ADMIN and temp_cred.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
-    # Confine a scoped temp session to creds it created, matching the api_server.py
+    # Confine a scoped temp session to creds it created, matching the app/api/api_server.py
     # sibling (POST /temp-creds/{u}/delete). Absent here, a scoped admin delegate could
     # destroy the main account's or a sibling's credential via this parallel router.
-    from api_server import _guard_temp_session_cred_mutation, _revoke_sessions
+    from app.api.api_server import _guard_temp_session_cred_mutation, _revoke_sessions
     _guard_temp_session_cred_mutation(current_user, temp_cred, 'clear')
 
     temp_username = temp_cred.temp_username

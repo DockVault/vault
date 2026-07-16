@@ -86,10 +86,10 @@ def test_failed_login_username_is_sanitized_in_alerts(admin, anon):
 def test_error_paths_do_not_leak_exception_text():
     # WebSocket frames bypass the HTTP 500-sanitizer, and a non-500 HTTPException renders its detail
     # verbatim -- so neither the /ws auth path nor the ECC register/decompress paths may echo str(e).
-    api = _read("api_server.py")
+    api = _read("app/api/api_server.py")
     assert 'f"Invalid token: {str(e)}"' not in api, "WS token error must not frame str(e) to the client"
     assert '"message": "Authentication failed"' in api, "WS token failure should send a generic frame"
-    ecc = _read("ecc_router.py")
+    ecc = _read("app/api/ecc_router.py")
     assert 'f"Invalid public key format: {str(e)}"' not in ecc, "ECC register must not echo str(e) at 400"
     assert 'f"Invalid compressed point: {str(e)}"' not in ecc, "decompress-point must not echo str(e) at 400"
     # Lock the NEW register duplicate-race branch specifically: this exact detail string is unique to
@@ -122,7 +122,7 @@ def test_sftp_key_clear_resets_db_fallback_row():
     script = "\n".join([
         "import uuid",
         "from app.services.auth_service import AuthService",
-        "from sftp_server import _sftp_key_clear",
+        "from app.sftp.sftp_server import _sftp_key_clear",
         "from app.core.database import get_db_context",
         "from app.core.models import RateLimitRecord",
         "ip = '203.0.113.7'",
@@ -148,7 +148,7 @@ def test_login_and_sftp_throttles_fail_closed():
     assert "Fails CLOSED" in auth, "the DB throttle fallback docstring should state fail-closed"
     assert "return False, max(1, min(window, 5))" in auth, \
         "the DB throttle must deny (not allow) on its own error"
-    sftp = _read("sftp_server.py")
+    sftp = _read("app/sftp/sftp_server.py")
     body = sftp[sftp.index("def _sftp_key_throttled"):sftp.index("def _sftp_key_clear")]
     assert "fail_open=False" in body, "the SFTP key throttle must ask the limiter to fail closed"
     assert "except RateLimiterUnavailable" in body, "the SFTP key throttle must drop to the DB fallback"
@@ -163,7 +163,7 @@ def test_toggle_active_enforces_seat_cap_on_reactivation():
     # a user, create a replacement (a seat freed up), then reactivate the original via the toggle to
     # land above the cap. The cap can't be exercised against an uncapped live instance, so this
     # static guard locks the wiring (mirrors the already-guarded PATCH /users/{id} path).
-    src = _read("user_management_api.py")
+    src = _read("app/api/user_management_api.py")
     body = src[src.index("async def toggle_user_active"):src.index("async def toggle_user_locked")]
     assert "_enforce_user_cap" in body, \
         "toggle-active must enforce the seat cap on reactivation"
@@ -179,7 +179,7 @@ def test_sftp_revocation_subscriber_survives_half_open_redis():
     # instead of blocking forever -- which would silently disable live SFTP session revocation until
     # the process restarts. A static guard (no live outage harness needed) locks these settings on
     # the exact client that subscribes to the revocation channel.
-    sftp = _read("sftp_server.py")
+    sftp = _read("app/sftp/sftp_server.py")
     end = sftp.index("subscribe('session_terminations')")
     start = sftp.rindex("redis.Redis(", 0, end)
     block = sftp[start:end]
@@ -323,8 +323,8 @@ def test_all_delete_paths_feed_bulk_detector():
     # Bulk-deletion detection must cover every deletion vector, not just single-file web deletes: the
     # folder-delete _purge, SFTP rmdir _purge, and SFTP single-file remove call vault_service.delete_file
     # directly, so each must also feed record_file_deletion (SFTP is not behaviorally testable here).
-    api = _read("api_server.py")
-    sftp = _read("sftp_server.py")
+    api = _read("app/api/api_server.py")
+    sftp = _read("app/sftp/sftp_server.py")
     assert api.count("record_file_deletion(") >= 2, "web single-file AND folder delete must record deletions"
     assert sftp.count("record_file_deletion(") >= 2, "SFTP remove AND rmdir must record deletions"
 
@@ -372,7 +372,7 @@ def test_activity_monitor_dead_code_removed_and_complete_wired():
         assert gone not in src, f"{gone} should have been removed"
     for keep in ("def start_operation", "def complete_operation", "def is_cancelled", "def cancel_operation"):
         assert keep in src, f"{keep} must remain"
-    api = _read("api_server.py")
+    api = _read("app/api/api_server.py")
     assert "tracker.complete_operation(operation_id" in api, "the upload finalizer must complete the operation record"
 
 
@@ -446,6 +446,22 @@ def test_entrypoint_privilege_drop_fails_closed():
     assert "os.getgroups()" in drop and "sys.exit(1)" in drop, "must verify the drop and fail closed"
 
 
+def test_static_and_brand_anchor_at_app_root(anon):
+    # The server modules live under app/, but static/ and brand/ sit at the APP ROOT —
+    # they are anchored via app.core.paths.PROJECT_ROOT, not the serving module's
+    # __file__. A wrong anchor silently 404s the SPA and orphans the brand volume
+    # (the named volume mounts at /app/brand while uploads would land elsewhere).
+    r = anon.get("/static/js/ecc_crypto.js")
+    assert r.status_code == 200, "static assets must be served from the app root"
+    proc = _in_container(args=["python", "-c",
+        "from app.core.paths import PROJECT_ROOT; from app.api import api_server; "
+        "print('ROOT=' + str(PROJECT_ROOT)); print('BRAND=' + api_server.BRAND_ASSET_DIR)"])
+    assert "ROOT=/app" in proc.stdout, \
+        f"PROJECT_ROOT must be /app in-container\n{proc.stdout}\n{proc.stderr}"
+    assert "BRAND=/app/brand" in proc.stdout, \
+        f"brand dir must stay on the mounted volume\n{proc.stdout}\n{proc.stderr}"
+
+
 def test_baked_healthcheck_is_scheme_aware():
     # The baked HEALTHCHECK must honour API_USE_HTTPS, else an HTTPS deploy of the bare image reports
     # perpetually unhealthy.
@@ -481,7 +497,7 @@ def test_user_detail_endpoints_enforce_ownership():
     # The endpoint-permission catalog's requires_ownership flag is display-only and is NOT enforced by
     # require_endpoint_permission, so the user-detail handlers must enforce own-or-admin themselves: a
     # non-admin explicitly granted USER_VIEW must not be able to read another user's record.
-    for name in ("api_server.py", "user_management_api.py"):
+    for name in ("app/api/api_server.py", "app/api/user_management_api.py"):
         src = _read(name)
         assert "current_user.id != user_id" in src, f"{name}: user-detail must enforce own-or-admin ownership"
 
@@ -560,7 +576,7 @@ def test_dev_compose_publishes_loopback_only():
 
 
 _PLAINTEXT_WARN_SELFTEST = r'''
-import api_server as a
+from app.api import api_server as a
 f = a._should_warn_plaintext_transport
 assert f(False, "production", "") is True, "plaintext + production + no proxy should warn"
 assert f(False, "staging", "") is True, "plaintext + any non-dev + no proxy should warn"
@@ -578,7 +594,7 @@ def test_plaintext_transport_warning_condition():
 
 
 _SCHEME_SELFTEST = r'''
-import api_server
+from app.api import api_server
 from app.core import net_utils
 sc = api_server._external_scheme
 
@@ -681,7 +697,7 @@ def test_zk_seal_names_locks_vault_row():
     # Parity: zk_seal_names must serialize its seal-epoch read + writes under the SAME Vault-row lock its
     # siblings (rename_file / create_folder / retire_dek_versions) hold — otherwise a concurrent retire
     # could strand a name's member key and make the name permanently undecryptable.
-    src = _read("api_server.py")
+    src = _read("app/api/api_server.py")
     start = src.index("async def zk_seal_names")
     end = src.index("\n@app.", start)   # up to the next route
     assert "with_for_update()" in src[start:end], \

@@ -170,7 +170,7 @@ _remapped_engine() {
 put_cert() { # put_cert <src-cert(fullchain).pem> <src-key.pem>
   local _cert="$1" _key="$2"
   # Refuse passphrase-protected keys up front: uvicorn is given no passphrase
-  # (api_server.py passes only ssl_certfile/ssl_keyfile), so an encrypted key can
+  # (app/api/api_server.py passes only ssl_certfile/ssl_keyfile), so an encrypted key can
   # never serve — and openssl would stop to prompt for it mid-script.
   if grep -q 'ENCRYPTED' "$_key"; then
     die "the private key '$_key' is passphrase-protected and uvicorn cannot load it.

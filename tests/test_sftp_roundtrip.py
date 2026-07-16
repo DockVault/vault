@@ -13,7 +13,7 @@ VaultService with the authenticated `self.server.user`.
 
 Auth model: SFTP logs in with the account username/password (or a temp
 credential's ``temp_*`` username + credential). The per-vault *web* password is
-not re-prompted over SFTP (see sftp_server.py header) — access is gated by
+not re-prompted over SFTP (see app/sftp/sftp_server.py header) — access is gated by
 account auth + vault membership + temp-credential scope.
 """
 import io

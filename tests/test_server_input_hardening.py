@@ -13,7 +13,7 @@ Covers four defence layers on the non-injection server surface:
    password) to stdout.
 
 The behavioural checks run against the live instance; two source-level locks read the shipped
-api_server.py so a future edit can't silently reintroduce the leak.
+app/api/api_server.py so a future edit can't silently reintroduce the leak.
 """
 import uuid
 from pathlib import Path
@@ -22,7 +22,7 @@ import pytest
 
 from conftest import unique
 
-API_SERVER = (Path(__file__).resolve().parent.parent / "api_server.py").read_text(
+API_SERVER = (Path(__file__).resolve().parent.parent / "app/api/api_server.py").read_text(
     encoding="utf-8", errors="ignore"
 )
 

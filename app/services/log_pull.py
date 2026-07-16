@@ -1,5 +1,5 @@
 """RO2-3 log-pull — the PURE, security-critical helpers behind the authenticated GET /logs
-endpoint, kept out of api_server.py so they unit-test without importing the whole app.
+endpoint, kept out of app/api/api_server.py so they unit-test without importing the whole app.
 
 Nothing here reads config/DB — the caller passes the pepper, the secret list, and the effective
 flags in. That keeps token hashing, scope validation, service filtering, the enable gate, and

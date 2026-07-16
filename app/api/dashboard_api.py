@@ -40,7 +40,7 @@ async def get_current_user(
     The import is LAZY (inside the body): api_server imports this module at load time to mount the
     router, so a module-level import would be circular. By request time api_server is fully loaded.
     """
-    from api_server import get_current_user as _hardened_get_current_user
+    from app.api.api_server import get_current_user as _hardened_get_current_user
     return await _hardened_get_current_user(credentials, db)
 
 

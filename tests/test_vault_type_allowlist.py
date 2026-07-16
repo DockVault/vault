@@ -23,7 +23,7 @@ def test_source_wires_the_allowlist_gate():
     a *deletion* of the gate would otherwise slip through green. Lock the enforcement in
     source, tied to the creation chokepoint, so removing it fails on ANY deployment.
     (The vault suite runs on the host with the app source right beside it.)"""
-    src = (Path(__file__).resolve().parent.parent / "api_server.py").read_text(encoding="utf-8")
+    src = (Path(__file__).resolve().parent.parent / "app/api/api_server.py").read_text(encoding="utf-8")
     start = src.index("def _resolve_vault_type_for_create")
     body = src[start:src.index("\n@app.", start)]  # up to create_vault's decorator
     assert "_allowed_vault_types()" in body, "allowlist gate removed from the create chokepoint"
