@@ -18,7 +18,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 from app.core.database import get_db
 from app.core.models import User, TemporaryCredential, RoleEnum, AuditLog, ActiveSession
-from auth_service import AuthService
+from app.services.auth_service import AuthService
 from app.services.audit_logger import AuditLogger
 from app.core.endpoint_permissions import require_endpoint_permission
 

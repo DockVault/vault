@@ -12,7 +12,7 @@ Back-compat rule (critical): a credential whose `scope` is None is LEGACY and is
 treated as fully unrestricted (it behaves exactly as before scoping existed). Every
 helper here no-ops when the principal is not a scoped temp session.
 
-The principal (a `User` object) is tagged elsewhere (auth_service /
+The principal (a `User` object) is tagged elsewhere (app/services/auth_service.py /
 get_current_user) with these transient attributes:
     _is_temp_session : bool
     _temp_scope      : dict | None     (the scope document, or None = legacy)

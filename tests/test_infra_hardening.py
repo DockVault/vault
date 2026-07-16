@@ -106,7 +106,7 @@ def test_db_throttle_hit_counts_and_denies():
     # callable without an AuthService instance.
     proc = _in_container(args=[
         "python", "-c",
-        "import uuid; from auth_service import AuthService; "
+        "import uuid; from app.services.auth_service import AuthService; "
         "k='thr-'+uuid.uuid4().hex; "
         "res=[AuthService._db_throttle_hit(k,'thr_probe',2,60) for _ in range(3)]; "
         "print('ALLOWED='+str([a for a,_ in res])); print('RETRY3='+str(res[2][1]))"
@@ -121,7 +121,7 @@ def test_sftp_key_clear_resets_db_fallback_row():
     # mid-window while Redis is down (the counting fallback path). ip in TEST-NET-3 so no collision.
     script = "\n".join([
         "import uuid",
-        "from auth_service import AuthService",
+        "from app.services.auth_service import AuthService",
         "from sftp_server import _sftp_key_clear",
         "from app.core.database import get_db_context",
         "from app.core.models import RateLimitRecord",
@@ -144,7 +144,7 @@ def test_sftp_key_clear_resets_db_fallback_row():
 def test_login_and_sftp_throttles_fail_closed():
     # Both the DB-fallback login throttle and the SFTP key-offer throttle must fail CLOSED on a Redis
     # outage -- they used to fail OPEN (silently disabling throttling while Redis was down).
-    auth = _read("auth_service.py")
+    auth = _read("app/services/auth_service.py")
     assert "Fails CLOSED" in auth, "the DB throttle fallback docstring should state fail-closed"
     assert "return False, max(1, min(window, 5))" in auth, \
         "the DB throttle must deny (not allow) on its own error"
@@ -426,7 +426,7 @@ def test_temp_credential_auth_equalizes_timing():
     # A missing / inactive / used / expired temp credential must not be distinguishable from a live
     # one by response time: authenticate_temporary_credential does a dummy verify on the not-found
     # branch and verifies the credential BEFORE any state branch (mirroring authenticate_user).
-    src = _read("auth_service.py")
+    src = _read("app/services/auth_service.py")
     start = src.index("def authenticate_temporary_credential")
     body = src[start:src.index("\n    def ", start + 1)]
     assert "verify_temporary_credential(credential, _DUMMY_PASSWORD_HASH)" in body, \

@@ -50,16 +50,16 @@ import json
 
 from app.core.database import get_db_context
 from app.core.models import User, ActiveSession, Vault, Folder, File
-from auth_service import AuthService
+from app.services.auth_service import AuthService
 from app.core.authorization import PermissionService, PermissionDeniedError
-from vault_service import (
+from app.services.vault_service import (
     VaultService,
     VaultNotFoundError,
     FolderNotFoundError,
     PasswordRequiredError,
     InvalidPasswordError,
 )
-from vault_service import FileNotFoundError as VaultFileNotFoundError
+from app.services.vault_service import FileNotFoundError as VaultFileNotFoundError
 from app.services.audit_logger import AuditLogger
 from app.core.config import settings
 from app.core.temp_scope import is_scoped, effective_vault_caps
@@ -246,7 +246,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         # -open SFTP connection at its next op (not just at the next login). Also
         # honour sftp_enabled here so turning SFTP off cuts a live session next op.
         # account_locked() honours the auto-unlock TTL (an expired failed-login lock = open).
-        from auth_service import account_locked
+        from app.services.auth_service import account_locked
         if user is None or not user.is_active or account_locked(user) or not user.sftp_enabled:
             return None
         src = getattr(self.server, "user", None)
@@ -795,7 +795,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                     return
                 # Deployment-wide plan storage ceiling (aggregate across all vaults) —
                 # same gate the web upload path enforces, so SFTP can't bypass the plan.
-                from vault_service import would_exceed_deployment_storage
+                from app.services.vault_service import would_exceed_deployment_storage
                 exceeds, _used, _cap = would_exceed_deployment_storage(db, buffered_size)
                 if exceeds:
                     print("⚠️ SFTP upload rejected: would exceed the plan storage limit — "
@@ -1259,7 +1259,7 @@ class SFTPServer(paramiko.ServerInterface):
         try:
             offered_b64 = key.get_base64()
             with get_db_context() as db:
-                from auth_service import account_locked
+                from app.services.auth_service import account_locked
                 user = db.query(User).filter(User.username == username).first()
                 if user is None or not user.is_active or account_locked(user) or not user.sftp_enabled:
                     return paramiko.AUTH_FAILED
@@ -1301,7 +1301,7 @@ class SFTPServer(paramiko.ServerInterface):
         if self.session_token is None and self.user_id is not None:
             try:
                 from datetime import datetime as _dt, timezone as _tz
-                from auth_service import account_locked
+                from app.services.auth_service import account_locked
                 with get_db_context() as db:
                     u = db.query(User).filter(User.id == self.user_id).first()
                     if u is None or not u.is_active or account_locked(u) or not u.sftp_enabled:

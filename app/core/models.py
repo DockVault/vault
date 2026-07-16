@@ -619,7 +619,7 @@ class File(Base):
         # Partial (WHERE name_bi IS NOT NULL) so legacy plaintext rows (name_bi NULL,
         # pre-encryption) are exempt until backfilled. The replace-on-clash upload path
         # deletes the prior same-name row in the SAME transaction as the new insert
-        # (see vault_service.finalize_streaming_upload) so a legitimate overwrite never
+        # (see app/services/vault_service.py finalize_streaming_upload) so a legitimate overwrite never
         # trips this; a lost race surfaces as a clean 409. Mirrored as a raw migration.
         Index(
             'uq_files_vault_folder_name_bi',

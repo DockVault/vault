@@ -34,9 +34,9 @@ from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum,
 # auth one under an alias so the later vault import below can't shadow it — otherwise the
 # login throttle's `except` would bind the wrong class and a throttled login would surface
 # as a 500 instead of a 429.
-from auth_service import AuthService, InvalidCredentialsError, AccountLockedError, RateLimitExceededError as AuthRateLimitExceededError
+from app.services.auth_service import AuthService, InvalidCredentialsError, AccountLockedError, RateLimitExceededError as AuthRateLimitExceededError
 from app.core.authorization import PermissionService, PermissionDeniedError, ResourceNotFoundError, AuthorizationError
-from vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, _name_match_filter
+from app.services.vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, _name_match_filter
 from sqlalchemy.exc import IntegrityError
 from app.services.audit_logger import AuditLogger
 from app.services import log_pull  # RO2-3: pure helpers for the authenticated log-pull endpoint
@@ -841,7 +841,7 @@ async def get_current_user(
     # Revocation: a logged-out token is denylisted until it expires. This revokes the token
     # for ALL users WITHOUT enforcing single-session (re-login denylists nothing), so
     # concurrent sessions still work. See auth_service.denylist_token.
-    from auth_service import is_token_denylisted
+    from app.services.auth_service import is_token_denylisted
     if session_token and is_token_denylisted(session_token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -955,7 +955,7 @@ async def get_current_user(
     # locking a user revokes their already-issued token immediately. A FAILED-LOGIN auto-lock
     # auto-expires (account_locked honours locked_until), so a brute-force on a victim's
     # username can't keep their valid session locked out beyond the TTL.
-    from auth_service import account_locked
+    from app.services.auth_service import account_locked
     if account_locked(user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -2855,7 +2855,7 @@ async def storage_stats(
 ):
     """Storage usage for this deployment: bytes stored across active vaults, plus the
     capacity of the underlying storage volume."""
-    from vault_service import deployment_storage_used
+    from app.services.vault_service import deployment_storage_used
     used = deployment_storage_used(db)
     total = available = 0
     try:
@@ -2942,7 +2942,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             if not session_token:
                 raise ValueError("Invalid token payload")
             from app.core.database import SessionLocal
-            from auth_service import is_token_denylisted, account_locked
+            from app.services.auth_service import is_token_denylisted, account_locked
             from app.core.models import ActiveSession as _WsAS, User as _WsUser
             _wsdb = SessionLocal()
             try:
@@ -4030,7 +4030,7 @@ def _enforce_deployment_storage_quota(db, additional_bytes: int) -> None:
     with the SFTP write path via vault_service.would_exceed_deployment_storage so a
     customer can't sidestep the per-vault size_limit by creating many vaults, on either
     transport. Permissive default (-1) leaves dev/un-gated deployments unrestricted."""
-    from vault_service import would_exceed_deployment_storage
+    from app.services.vault_service import would_exceed_deployment_storage
     exceeds, used, cap_bytes = would_exceed_deployment_storage(db, additional_bytes)
     if exceeds:
         raise HTTPException(
@@ -7744,7 +7744,7 @@ async def logout(
             # Denylist the token so it stops working IMMEDIATELY for the rest of its life
             # (regular-user JWTs aren't re-validated against the session row each request).
             import time as _time
-            from auth_service import denylist_token
+            from app.services.auth_service import denylist_token
             _ttl = int(payload.get("exp", 0) - _time.time())
             denylist_token(session_token, _ttl if _ttl > 0 else 1800)
         else:
@@ -8399,7 +8399,7 @@ def _seed_admin_user():
     """
     try:
         from app.core.database import get_db_context
-        from auth_service import AuthService
+        from app.services.auth_service import AuthService
         from app.core.models import RoleEnum, User
 
         # Match the app/core/config.py guard's emptiness definition: a whitespace-only value is "blank"
@@ -8589,7 +8589,7 @@ def _backfill_encrypted_names():
     try:
         from app.core.database import get_db_context
         from app.core.models import File, Folder, Vault
-        from vault_service import _seal_named_object
+        from app.services.vault_service import _seal_named_object
         BATCH = 500
         with get_db_context() as db:
             # Only STANDARD vaults are sealed (ZK names are deferred). Load just those

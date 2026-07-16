@@ -363,7 +363,7 @@ def get_vault_fernet(
         >>> encrypted_file = vault_fernet.encrypt(file_content)
         >>> decrypted_file = vault_fernet.decrypt(encrypted_file)
     
-    Usage in vault_service.py:
+    Usage in app/services/vault_service.py:
         # Upload file
         vault_fernet = get_vault_fernet(vault, password=vault_password)
         encrypted_content = vault_fernet.encrypt(file_content)

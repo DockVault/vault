@@ -752,7 +752,7 @@ async def get_vault_keys(
         raise HTTPException(status_code=404, detail="Vault not found")
 
     # Confine a scoped temp credential to its granted vaults — the SAME gate the standard
-    # read path applies (vault_service.get_vault -> enforce_vault). Without it a cred scoped
+    # read path applies (app/services/vault_service.py get_vault -> enforce_vault). Without it a cred scoped
     # to vault A could still read vault B's wrapped DEK here. No-op for normal principals.
     enforce_vault(current_user, vault_id)
     # A scoped temp credential must also hold a capability, not just vault membership: reading the
