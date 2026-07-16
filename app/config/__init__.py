@@ -2,14 +2,14 @@
 Configuration package for the vault service.
 
 This package contains branding configuration.
-The main application settings are still loaded from config.py (parent module).
+The main application settings are still loaded from app/core/config.py.
 """
 
 from .branding import branding, BrandingConfig
 
 __all__ = ['branding', 'BrandingConfig']
 
-# Note: settings is imported from the parent config.py module, not this package
-# Use: from config import settings (imports from config.py)
-# Use: from config.branding import branding (imports from config/branding.py)
+# Note: settings is imported from the app/core/config.py module, not this package
+# Use: from app.core.config import settings
+# Use: from app.config.branding import branding (imports from app/config/branding.py)
 

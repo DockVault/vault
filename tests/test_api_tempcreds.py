@@ -126,7 +126,7 @@ def test_admin_creates_temp_cred_for_user(admin, temp_user):
 
 
 def test_temp_create_requires_permission(temp_user_client):
-    # the default 'user' role is granted TEMP_CREDS_MANAGE (see api_catalog), so a
+    # the default 'user' role is granted TEMP_CREDS_MANAGE (see app/core/api_catalog.py), so a
     # regular non-admin user can mint their own temporary credentials -> 200.
     r = temp_user_client.post("/auth/temp-credentials", json={"validity_minutes": 30})
     assert r.status_code == 200

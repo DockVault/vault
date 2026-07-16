@@ -62,5 +62,5 @@ ENTRYPOINT ["python", "/app/docker-entrypoint.py"]
 # second container or a shared-volume bundle. run_combined.py supervises both and exits
 # if either dies, so the container's restart policy recreates the whole thing.
 # The dev stack and the bundle composer override this with an explicit
-# `command: ["python", "api_server.py"]` / `["python", "sftp_server.py"]`.
+# `command: ["python", "-m", "app.api.api_server"]` / `["python", "-m", "app.sftp.sftp_server"]`.
 CMD ["python", "run_combined.py"]

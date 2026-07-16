@@ -33,23 +33,23 @@ listener; optional SFTP).
 bring-your-own certificate):
 
 ```bash
-sudo ./setup-secure.sh
+sudo ./deploy/setup-secure.sh
 ```
 
 **Windows** (Docker Desktop) — self-signed by default, or point it at your own certificate:
 
 ```powershell
-./setup-secure.ps1 -ServerName vault.example.com
+./deploy/setup-secure.ps1 -ServerName vault.example.com
 # ...or bring your own certificate (recommended for anything public):
-./setup-secure.ps1 -ServerName vault.example.com -CertMode byo -CertPath fullchain.pem -KeyPath privkey.pem
+./deploy/setup-secure.ps1 -ServerName vault.example.com -CertMode byo -CertPath fullchain.pem -KeyPath privkey.pem
 ```
 
 Both are idempotent — re-run any time to rebuild; they **reuse your existing `.env`** and keep your
-data. Both start `docker-compose.secure.yml`, which you can also run directly once `./.env` and
-`./certs/{cert.pem,key.pem}` exist:
+data. Both start `deploy/docker-compose.secure.yml`, which you can also run directly (from the repo
+root, so `--env-file` finds the root `.env`) once `./.env` and `./certs/{cert.pem,key.pem}` exist:
 
 ```bash
-docker compose -f docker-compose.secure.yml up -d --build
+docker compose --env-file .env -f deploy/docker-compose.secure.yml up -d --build
 ```
 
 Then open `https://<your-domain>` and complete the first-run setup wizard to create your admin
@@ -57,8 +57,8 @@ account. No license key, no activation.
 
 > Re-running after changing `VAULT_DB_PASSWORD` (or starting fresh by removing `.env`) requires
 > resetting the database volume, or Postgres keeps the old password:
-> `docker compose -f docker-compose.secure.yml down -v` then re-run the script. This destroys
-> stored data, so only do it before you have real vaults.
+> `docker compose --env-file .env -f deploy/docker-compose.secure.yml down -v` then re-run the
+> script. This destroys stored data, so only do it before you have real vaults.
 
 ### Local trial only (HTTP, no TLS) — not for real use
 
@@ -71,6 +71,21 @@ cp .env.example .env      # then edit it: set ENCRYPTION_KEY, JWT_SECRET_KEY, VA
                           # a strong ADMIN_PASSWORD (boot is refused with the shipped placeholder)
 docker compose up -d      # web/API on http://localhost:8200
 ```
+
+## Repository layout
+
+| Path | What lives there |
+|------|------------------|
+| `app/` | The Python application — `app/api/` (web/API server + the user-management/dashboard/ECC routers), `app/sftp/` (SFTP server), `app/core/` (config, models, security primitives), `app/services/` (vault/auth/domain services), `app/config/` (branding), `app/routers/` (info endpoints) |
+| `deploy/` | Deployment files — `deploy/docker-compose.yml` (local trial), `deploy/docker-compose.secure.yml` + `deploy/setup-secure.sh` / `deploy/setup-secure.ps1` (production HTTPS) |
+| `scripts/` | Operator utilities (`scripts/setup_master_password.py`) |
+| `static/` | The self-hosted web UI (no CDN assets) |
+| `tests/` | pytest + Playwright integration suite (see `tests/README.md`) |
+| `run_combined.py`, `docker-entrypoint.py` | Container entrypoints, kept at the root (the image's ENTRYPOINT/CMD contract) |
+
+The root `docker-compose.yml` is a thin `include:` shim over `deploy/docker-compose.yml`, so
+`docker compose up -d` keeps working from the repository root (and existing deployments keep their
+project and volume names).
 
 ## Security model
 
@@ -87,8 +102,8 @@ docker compose up -d      # web/API on http://localhost:8200
 ## Production checklist
 
 If you front the vault yourself (your own reverse proxy, k8s, `docker run`) rather than using
-`setup-secure.sh`, confirm all of these — `setup-secure.sh` handles or prompts you for most of them, but a
-README-only reader can miss them (the off-host key backup is always yours to do):
+`deploy/setup-secure.sh`, confirm all of these — the setup script handles or prompts you for most of
+them, but a README-only reader can miss them (the off-host key backup is always yours to do):
 
 - **Back up `ENCRYPTION_KEY` off the host** (e.g. a password manager). Without it, every stored file — and any
   backup of the storage volume — is **permanently unrecoverable**.

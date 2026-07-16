@@ -4,7 +4,7 @@ Zero-knowledge requires ALL private-key and DEK crypto to run in the browser (st
 ecc_crypto.js); the server only ever stores a public key and browser-produced opaque ciphertext.
 This is a STATIC test — it scans the live server source as text (no imports, so it runs anywhere)
 and fails if a server-side private-key / plaintext-DEK helper is (re)introduced. It exists because
-such helpers previously lived in ecc_crypto_service.py with no live caller — a foot-gun a future
+such helpers previously lived in app/services/ecc_crypto_service.py with no live caller — a foot-gun a future
 wiring mistake could turn into a zero-knowledge-breaking server-side key path.
 """
 import re
@@ -52,7 +52,7 @@ def test_no_server_side_private_key_helpers_in_live_code():
 def test_ecc_crypto_service_does_no_private_key_or_dek_crypto():
     """The ECC service must not generate, import, serialize, encrypt, or decrypt any private key,
     nor wrap/unwrap a DEK — it is a public-key-only module."""
-    text = (_APP_DIR / "ecc_crypto_service.py").read_text(encoding="utf-8", errors="ignore")
+    text = (_APP_DIR / "app/services/ecc_crypto_service.py").read_text(encoding="utf-8", errors="ignore")
     for forbidden in ("private_bytes", "generate_private_key", "load_pem_private_key",
                       "PBKDF2HMAC", "aes_key_wrap", "aes_key_unwrap", "AESGCM"):
         assert forbidden not in text, f"ecc_crypto_service must not use {forbidden} (private-key/DEK crypto)"

@@ -1,8 +1,10 @@
 # Vault-service integration tests
 
 End-to-end tests that run on the **host** and exercise the live container at
-`http://localhost:8200` over HTTP (API) and a real browser (UI). Nothing here
-imports the app — it tests the deployed surface.
+`http://localhost:8200` over HTTP (API) and a real browser (UI). Apart from two
+pure-helper unit files (one imports `app.services.log_pull`, one imports the
+`run_combined` entrypoint), nothing here imports the app — it tests the deployed
+surface.
 
 ## Layout
 
@@ -20,6 +22,9 @@ imports the app — it tests the deployed surface.
 | `test_api_ecc.py` | `/ecc/*` crypto endpoints |
 | `test_api_websocket.py` | `/ws/monitor` auth handshake |
 | `test_ui_e2e.py` | Playwright: login, temp-cred validity, create vault/user, logout |
+
+…plus further per-feature suites (branding, lockout, ZK, SFTP round-trip, infra
+hardening, and more) — the table lists the core surfaces; see the file names.
 
 ## Setup (once)
 

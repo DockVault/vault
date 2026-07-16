@@ -361,7 +361,7 @@ class ECCCryptoLibrary {
      * this client holds the PRIVATE key for the public key being registered, so a
      * substituted / not-held key can't be registered. Does ECDH(userPrivateKey,
      * serverEphemeralPublicKey) -> HKDF -> HMAC over (nonce || publicKeyPem). Exact mirror
-     * of the server's ecc_pop.py (salt 'dv-ecc-pop-v1', info 'registration-pop', SHA-256).
+     * of the server's app/services/ecc_pop.py (salt 'dv-ecc-pop-v1', info 'registration-pop', SHA-256).
      *
      * @param {string} serverEphemeralPublicKeyPem - server ephemeral public key (SPKI PEM)
      * @param {string} nonceBase64 - base64 nonce from the challenge
@@ -556,7 +556,7 @@ class ECCCryptoLibrary {
     // the server in a zero-knowledge vault. They are encrypted here IN THE BROWSER under
     // the same per-vault DEK as the content, and the server stores only the opaque blob
     // plus a blind index it cannot reverse. The server keeps these verbatim and decrypts
-    // nothing. Format/AAD/HKDF here MUST match security.py (ZK_NAME_PREFIX) and the test
+    // nothing. Format/AAD/HKDF here MUST match app/core/security.py (ZK_NAME_PREFIX) and the test
     // helpers — changing any of them silently breaks decryption of existing names.
 
     // Marker prefix on every ZK-sealed name blob so the SERVER can tell a browser-encrypted

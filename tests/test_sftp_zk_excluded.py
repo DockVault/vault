@@ -4,7 +4,7 @@ SFTP serves ONLY Standard vaults: a zero-knowledge vault has no server-side key,
 server can neither list it nor open/upload/download its contents. This test LOCKS that
 (already-correct) behavior against a future SFTP regression — a ZK vault must be invisible
 in the SFTP root and unreachable by path, while a Standard vault the same user owns is
-visible. (Root skip: sftp_server.py; _resolve_vault returns None for non-standard vaults,
+visible. (Root skip: app/sftp/sftp_server.py; _resolve_vault returns None for non-standard vaults,
 which every file/dir op routes through.)
 """
 import contextlib

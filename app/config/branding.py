@@ -530,7 +530,7 @@ if __name__ == "__main__":
     Test the branding configuration.
     
     Run this file directly to see current branding settings:
-        python config/branding.py
+        python -m app.config.branding
     """
     import json
     

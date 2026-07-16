@@ -86,10 +86,10 @@ def test_failed_login_username_is_sanitized_in_alerts(admin, anon):
 def test_error_paths_do_not_leak_exception_text():
     # WebSocket frames bypass the HTTP 500-sanitizer, and a non-500 HTTPException renders its detail
     # verbatim -- so neither the /ws auth path nor the ECC register/decompress paths may echo str(e).
-    api = _read("api_server.py")
+    api = _read("app/api/api_server.py")
     assert 'f"Invalid token: {str(e)}"' not in api, "WS token error must not frame str(e) to the client"
     assert '"message": "Authentication failed"' in api, "WS token failure should send a generic frame"
-    ecc = _read("ecc_router.py")
+    ecc = _read("app/api/ecc_router.py")
     assert 'f"Invalid public key format: {str(e)}"' not in ecc, "ECC register must not echo str(e) at 400"
     assert 'f"Invalid compressed point: {str(e)}"' not in ecc, "decompress-point must not echo str(e) at 400"
     # Lock the NEW register duplicate-race branch specifically: this exact detail string is unique to
@@ -106,7 +106,7 @@ def test_db_throttle_hit_counts_and_denies():
     # callable without an AuthService instance.
     proc = _in_container(args=[
         "python", "-c",
-        "import uuid; from auth_service import AuthService; "
+        "import uuid; from app.services.auth_service import AuthService; "
         "k='thr-'+uuid.uuid4().hex; "
         "res=[AuthService._db_throttle_hit(k,'thr_probe',2,60) for _ in range(3)]; "
         "print('ALLOWED='+str([a for a,_ in res])); print('RETRY3='+str(res[2][1]))"
@@ -121,10 +121,10 @@ def test_sftp_key_clear_resets_db_fallback_row():
     # mid-window while Redis is down (the counting fallback path). ip in TEST-NET-3 so no collision.
     script = "\n".join([
         "import uuid",
-        "from auth_service import AuthService",
-        "from sftp_server import _sftp_key_clear",
-        "from database import get_db_context",
-        "from models import RateLimitRecord",
+        "from app.services.auth_service import AuthService",
+        "from app.sftp.sftp_server import _sftp_key_clear",
+        "from app.core.database import get_db_context",
+        "from app.core.models import RateLimitRecord",
         "ip = '203.0.113.7'",
         "u = 'probe-' + uuid.uuid4().hex[:8]",
         "ident = ip + ':' + u",
@@ -144,11 +144,11 @@ def test_sftp_key_clear_resets_db_fallback_row():
 def test_login_and_sftp_throttles_fail_closed():
     # Both the DB-fallback login throttle and the SFTP key-offer throttle must fail CLOSED on a Redis
     # outage -- they used to fail OPEN (silently disabling throttling while Redis was down).
-    auth = _read("auth_service.py")
+    auth = _read("app/services/auth_service.py")
     assert "Fails CLOSED" in auth, "the DB throttle fallback docstring should state fail-closed"
     assert "return False, max(1, min(window, 5))" in auth, \
         "the DB throttle must deny (not allow) on its own error"
-    sftp = _read("sftp_server.py")
+    sftp = _read("app/sftp/sftp_server.py")
     body = sftp[sftp.index("def _sftp_key_throttled"):sftp.index("def _sftp_key_clear")]
     assert "fail_open=False" in body, "the SFTP key throttle must ask the limiter to fail closed"
     assert "except RateLimiterUnavailable" in body, "the SFTP key throttle must drop to the DB fallback"
@@ -163,7 +163,7 @@ def test_toggle_active_enforces_seat_cap_on_reactivation():
     # a user, create a replacement (a seat freed up), then reactivate the original via the toggle to
     # land above the cap. The cap can't be exercised against an uncapped live instance, so this
     # static guard locks the wiring (mirrors the already-guarded PATCH /users/{id} path).
-    src = _read("user_management_api.py")
+    src = _read("app/api/user_management_api.py")
     body = src[src.index("async def toggle_user_active"):src.index("async def toggle_user_locked")]
     assert "_enforce_user_cap" in body, \
         "toggle-active must enforce the seat cap on reactivation"
@@ -179,7 +179,7 @@ def test_sftp_revocation_subscriber_survives_half_open_redis():
     # instead of blocking forever -- which would silently disable live SFTP session revocation until
     # the process restarts. A static guard (no live outage harness needed) locks these settings on
     # the exact client that subscribes to the revocation channel.
-    sftp = _read("sftp_server.py")
+    sftp = _read("app/sftp/sftp_server.py")
     end = sftp.index("subscribe('session_terminations')")
     start = sftp.rindex("redis.Redis(", 0, end)
     block = sftp[start:end]
@@ -216,9 +216,9 @@ def test_detection_degraded_signal_fires_and_is_throttled():
     # operators know threshold-based detection is blind. A rapid second signal is throttled IN-PROCESS
     # (at most one DB write per cooldown per process), so an outage can't hammer a hot alert row.
     script = "\n".join([
-        "from database import get_db_context",
-        "from security_monitor import SecurityMonitor, SecurityEventType",
-        "from models import SecurityAlert",
+        "from app.core.database import get_db_context",
+        "from app.services.security_monitor import SecurityMonitor, SecurityEventType",
+        "from app.core.models import SecurityAlert",
         "with get_db_context() as db:",
         "    m = SecurityMonitor(db)",
         "    m._signal_detection_degraded()",
@@ -245,9 +245,9 @@ def test_alert_dedup_key_is_per_user_and_severity(admin):
     u2 = admin.create_user(role="user")
     try:
         script = "\n".join([
-            "from database import get_db_context",
-            "from security_monitor import SecurityMonitor, SecurityEventType, SecurityAlertLevel",
-            "from models import SecurityAlert",
+            "from app.core.database import get_db_context",
+            "from app.services.security_monitor import SecurityMonitor, SecurityEventType, SecurityAlertLevel",
+            "from app.core.models import SecurityAlert",
             f"ua = '{u1['id']}'; ub = '{u2['id']}'",
             "ET = SecurityEventType.BULK_FILE_DELETION",
             "with get_db_context() as db:",
@@ -323,8 +323,8 @@ def test_all_delete_paths_feed_bulk_detector():
     # Bulk-deletion detection must cover every deletion vector, not just single-file web deletes: the
     # folder-delete _purge, SFTP rmdir _purge, and SFTP single-file remove call vault_service.delete_file
     # directly, so each must also feed record_file_deletion (SFTP is not behaviorally testable here).
-    api = _read("api_server.py")
-    sftp = _read("sftp_server.py")
+    api = _read("app/api/api_server.py")
+    sftp = _read("app/sftp/sftp_server.py")
     assert api.count("record_file_deletion(") >= 2, "web single-file AND folder delete must record deletions"
     assert sftp.count("record_file_deletion(") >= 2, "SFTP remove AND rmdir must record deletions"
 
@@ -333,7 +333,7 @@ def test_noisy_dead_recorders_stay_removed():
     # record_vault_access (INFO rapid-vault-access = normal browsing noise on a hot read path) and
     # record_rate_limit_violation (login rate-limits are already recorded via record_failed_login;
     # no single clean chokepoint) were removed as dead. Guard against reintroduction.
-    src = _read("security_monitor.py")
+    src = _read("app/services/security_monitor.py")
     assert "def record_vault_access" not in src, "record_vault_access was removed as noisy/dead"
     assert "def record_rate_limit_violation" not in src, "record_rate_limit_violation was removed as dead"
     # the live recorders remain
@@ -345,8 +345,8 @@ def test_progress_complete_clears_dangling_record():
     # but never complete_operation, so every finished/failed upload left a dangling record until TTL.
     script = "\n".join([
         "import uuid",
-        "from activity_monitor import ProgressTracker",
-        "from database import redis_client",
+        "from app.services.activity_monitor import ProgressTracker",
+        "from app.core.database import redis_client",
         "t = ProgressTracker()",
         "oid = 'upload_' + uuid.uuid4().hex",
         "t.start_operation(operation_id=oid, user_id='u', username='u', operation_type='upload', file_name='f', total_size=0)",
@@ -367,12 +367,12 @@ def test_progress_complete_clears_dangling_record():
 def test_activity_monitor_dead_code_removed_and_complete_wired():
     # The dead progress/traffic code is gone; the live methods remain; and the upload finalizer now
     # completes the operation record.
-    src = _read("activity_monitor.py")
+    src = _read("app/services/activity_monitor.py")
     for gone in ("class ActivityStats", "def update_progress", "def get_all_operations", "def get_operation"):
         assert gone not in src, f"{gone} should have been removed"
     for keep in ("def start_operation", "def complete_operation", "def is_cancelled", "def cancel_operation"):
         assert keep in src, f"{keep} must remain"
-    api = _read("api_server.py")
+    api = _read("app/api/api_server.py")
     assert "tracker.complete_operation(operation_id" in api, "the upload finalizer must complete the operation record"
 
 
@@ -383,11 +383,11 @@ def test_cleanup_old_alerts_prunes_old_resolved(admin):
     try:
         script = "\n".join([
             "import datetime",
-            "from database import get_db_context",
-            "import security_monitor",
+            "from app.core.database import get_db_context",
+            "from app.services import security_monitor",
             "security_monitor._last_alert_cleanup_at = None  # ensure the once/hour throttle allows this run",
-            "from security_monitor import SecurityMonitor",
-            "from models import SecurityAlert",
+            "from app.services.security_monitor import SecurityMonitor",
+            "from app.core.models import SecurityAlert",
             f"uid = '{u['id']}'",
             "with get_db_context() as db:",
             "    m = SecurityMonitor(db)",
@@ -412,7 +412,7 @@ def test_normalize_scope_tolerates_bad_list_fields_and_rotate_key_cap():
     # normalize_scope must not 500 on a null/scalar list field (it should coerce to []), and
     # vault.rotate_key must be a recognized cap (else scoped temp creds can never rotate a vault key).
     script = "\n".join([
-        "from temp_scope import normalize_scope, VAULT_CAPS",
+        "from app.core.temp_scope import normalize_scope, VAULT_CAPS",
         "s = normalize_scope({'pages': None, 'caps': 5, 'vault_caps_default': None})",
         "ok = isinstance(s, dict) and s['pages']==[] and s['caps']==[] and s['vault_caps_default']==[]",
         "rk = 'vault.rotate_key' in VAULT_CAPS",
@@ -426,7 +426,7 @@ def test_temp_credential_auth_equalizes_timing():
     # A missing / inactive / used / expired temp credential must not be distinguishable from a live
     # one by response time: authenticate_temporary_credential does a dummy verify on the not-found
     # branch and verifies the credential BEFORE any state branch (mirroring authenticate_user).
-    src = _read("auth_service.py")
+    src = _read("app/services/auth_service.py")
     start = src.index("def authenticate_temporary_credential")
     body = src[start:src.index("\n    def ", start + 1)]
     assert "verify_temporary_credential(credential, _DUMMY_PASSWORD_HASH)" in body, \
@@ -446,6 +446,36 @@ def test_entrypoint_privilege_drop_fails_closed():
     assert "os.getgroups()" in drop and "sys.exit(1)" in drop, "must verify the drop and fail closed"
 
 
+def test_launch_targets_use_module_form():
+    # Every live launch site must invoke the packaged servers via `python -m` —
+    # a script-path invocation would put the module's own directory (not the app
+    # root) on sys.path and break the absolute app.* imports.
+    rc = _read("run_combined.py")
+    assert '_spawn("app.api.api_server"' in rc, "run_combined must spawn the web server as a module"
+    assert '_spawn("app.sftp.sftp_server"' in rc, "run_combined must spawn the SFTP server as a module"
+    for compose in ("deploy/docker-compose.yml", "deploy/docker-compose.secure.yml"):
+        dc = _read(compose)
+        assert '["python", "-m", "app.api.api_server"]' in dc, f"{compose}: web command must use -m"
+        assert '["python", "-m", "app.sftp.sftp_server"]' in dc, f"{compose}: sftp command must use -m"
+        assert '"api_server.py"' not in dc and '"sftp_server.py"' not in dc, f"{compose}: no script-path launch"
+
+
+def test_static_and_brand_anchor_at_app_root(anon):
+    # The server modules live under app/, but static/ and brand/ sit at the APP ROOT —
+    # they are anchored via app.core.paths.PROJECT_ROOT, not the serving module's
+    # __file__. A wrong anchor silently 404s the SPA and orphans the brand volume
+    # (the named volume mounts at /app/brand while uploads would land elsewhere).
+    r = anon.get("/static/js/ecc_crypto.js")
+    assert r.status_code == 200, "static assets must be served from the app root"
+    proc = _in_container(args=["python", "-c",
+        "from app.core.paths import PROJECT_ROOT; from app.api import api_server; "
+        "print('ROOT=' + str(PROJECT_ROOT)); print('BRAND=' + api_server.BRAND_ASSET_DIR)"])
+    assert "ROOT=/app" in proc.stdout, \
+        f"PROJECT_ROOT must be /app in-container\n{proc.stdout}\n{proc.stderr}"
+    assert "BRAND=/app/brand" in proc.stdout, \
+        f"brand dir must stay on the mounted volume\n{proc.stdout}\n{proc.stderr}"
+
+
 def test_baked_healthcheck_is_scheme_aware():
     # The baked HEALTHCHECK must honour API_USE_HTTPS, else an HTTPS deploy of the bare image reports
     # perpetually unhealthy.
@@ -455,23 +485,25 @@ def test_baked_healthcheck_is_scheme_aware():
 
 def test_deploy_scripts_hardened():
     # Deploy-script hardening (owner-validated on-host; here we lock the source):
-    smp = _read("setup_master_password.py")
+    smp = _read("scripts/setup_master_password.py")
     assert "iterations=600000" in smp, "PBKDF2 must use >=600k iterations (match the runtime decryptor)"
     assert "'production'" in smp, "the ENVIRONMENT fallback must default to production, not development"
     assert "0o600" in smp, "secret files must be written mode 0600"
-    ss = _read("setup-secure.sh")
-    assert "REDIS_PASSWORD" in ss, "setup-secure.sh must generate a REDIS_PASSWORD"
-    assert "ALLOWED_HOSTS" in ss, "setup-secure.sh must write ALLOWED_HOSTS"
+    ss = _read("deploy/setup-secure.sh")
+    assert "REDIS_PASSWORD" in ss, "deploy/setup-secure.sh must generate a REDIS_PASSWORD"
+    assert "ALLOWED_HOSTS" in ss, "deploy/setup-secure.sh must write ALLOWED_HOSTS"
 
 
 def test_public_docs_reference_only_shipped_windows_scripts():
     # Operator docs MAY reference a Windows helper that actually ships in this repo (e.g.
-    # setup-secure.ps1), but must never point a self-hoster at a .ps1 that isn't part of this repo
+    # deploy/setup-secure.ps1), but must never point a self-hoster at a .ps1 that isn't part of this repo
     # (a dev-only helper that doesn't ship here), which would only misdirect.
     import re
-    for name in (".env.example", "docker-compose.yml", "README.md"):
+    for name in (".env.example", "docker-compose.yml", "deploy/docker-compose.yml", "README.md"):
         for script in re.findall(r"[A-Za-z0-9_-]+\.ps1", _read(name)):
-            assert (ROOT / script).exists(), \
+            # Shipped helpers live under deploy/ (the docs reference them as deploy/<name>.ps1;
+            # the regex extracts the bare basename).
+            assert (ROOT / script).exists() or (ROOT / "deploy" / script).exists(), \
                 f"{name} references a Windows script that is not shipped here: {script}"
 
 
@@ -479,13 +511,13 @@ def test_user_detail_endpoints_enforce_ownership():
     # The endpoint-permission catalog's requires_ownership flag is display-only and is NOT enforced by
     # require_endpoint_permission, so the user-detail handlers must enforce own-or-admin themselves: a
     # non-admin explicitly granted USER_VIEW must not be able to read another user's record.
-    for name in ("api_server.py", "user_management_api.py"):
+    for name in ("app/api/api_server.py", "app/api/user_management_api.py"):
         src = _read(name)
         assert "current_user.id != user_id" in src, f"{name}: user-detail must enforce own-or-admin ownership"
 
 
 def _import_config(env_overrides):
-    return _in_container(env_overrides=env_overrides, args=["python", "-c", "import config"])
+    return _in_container(env_overrides=env_overrides, args=["python", "-c", "from app.core import config"])
 
 
 def test_production_rejects_sample_admin_password():
@@ -552,13 +584,13 @@ def test_development_allows_short_nonplaceholder_password():
 
 def test_dev_compose_publishes_loopback_only():
     # The plaintext trial must bind to loopback so it isn't reachable off-host.
-    dc = _read("docker-compose.yml")
+    dc = _read("deploy/docker-compose.yml")
     assert '- "127.0.0.1:8200:8000"' in dc, "trial API port must publish on loopback (127.0.0.1)"
     assert '- "8200:8000"' not in dc, "trial API port must not publish on all interfaces"
 
 
 _PLAINTEXT_WARN_SELFTEST = r'''
-import api_server as a
+from app.api import api_server as a
 f = a._should_warn_plaintext_transport
 assert f(False, "production", "") is True, "plaintext + production + no proxy should warn"
 assert f(False, "staging", "") is True, "plaintext + any non-dev + no proxy should warn"
@@ -576,7 +608,8 @@ def test_plaintext_transport_warning_condition():
 
 
 _SCHEME_SELFTEST = r'''
-import api_server, net_utils
+from app.api import api_server
+from app.core import net_utils
 sc = api_server._external_scheme
 
 class _H(dict):
@@ -640,7 +673,7 @@ def test_dockerignore_excludes_git_metadata():
 
 
 def test_master_password_kdf_iterations_raised():
-    ss = _read("startup_security.py")
+    ss = _read("app/core/startup_security.py")
     assert "iterations=600000" in ss, "master-password KDF should use 600k iterations"
     assert "iterations=100000" not in ss, "the old 100k iteration count should be gone"
 
@@ -652,13 +685,13 @@ def test_dead_fail_open_permission_code_stays_removed():
     #     had no _permission_service attribute), and
     #   - the EndpointPermissionChecker / get_endpoint_info catalog checker ("endpoint not in
     #     catalog -> allow"), which the live require_endpoint_permission never consulted.
-    authz = _read("authorization.py")
+    authz = _read("app/core/authorization.py")
     assert "\ndef require_permission(" not in authz, \
         "the fail-open module-level require_permission decorator must stay removed"
     # the live, non-fail-open PermissionService.require_permission METHOD must remain
     assert "    def require_permission(" in authz
 
-    ep = _read("endpoint_permissions.py")
+    ep = _read("app/core/endpoint_permissions.py")
     assert "class EndpointPermissionChecker" not in ep, "dead fail-open EndpointPermissionChecker must stay removed"
     assert "def get_endpoint_info" not in ep, "dead get_endpoint_info (only the checker used it) must stay removed"
     assert "def require_endpoint_permission(" in ep, "the live endpoint gate must remain"
@@ -668,7 +701,7 @@ def test_broken_whole_file_crypto_stays_removed():
     # The whole-file AES-GCM writer had a 9-byte magic vs a 5-byte header field, so every
     # round-trip always failed -- a latent foot-gun if re-wired. It was removed; only the live
     # secure-delete helper remains. Guard against reintroduction.
-    src = _read("encrypted_file_storage.py")
+    src = _read("app/services/encrypted_file_storage.py")
     for gone in ("def encrypt_and_save", "def load_and_decrypt", "def verify_file_format", "MAGIC_BYTES"):
         assert gone not in src, f"removed whole-file crypto symbol reappeared: {gone}"
     assert "def secure_delete" in src, "the live secure_delete helper must remain"
@@ -678,7 +711,7 @@ def test_zk_seal_names_locks_vault_row():
     # Parity: zk_seal_names must serialize its seal-epoch read + writes under the SAME Vault-row lock its
     # siblings (rename_file / create_folder / retire_dek_versions) hold — otherwise a concurrent retire
     # could strand a name's member key and make the name permanently undecryptable.
-    src = _read("api_server.py")
+    src = _read("app/api/api_server.py")
     start = src.index("async def zk_seal_names")
     end = src.index("\n@app.", start)   # up to the next route
     assert "with_for_update()" in src[start:end], \
@@ -686,7 +719,7 @@ def test_zk_seal_names_locks_vault_row():
 
 
 def test_dev_compose_hardening():
-    dc = _read("docker-compose.yml")
+    dc = _read("deploy/docker-compose.yml")
     assert "vault_local_dev_pw" not in dc, "the source-controlled default DB password must be dropped"
     assert dc.count("- ALL") >= 2, "cap_drop [ALL] expected on both app services"
     assert "mem_limit:" in dc, "container memory ceilings expected"
@@ -695,7 +728,7 @@ def test_dev_compose_hardening():
 
 
 def test_secure_compose_hardening():
-    sc = _read("docker-compose.secure.yml")
+    sc = _read("deploy/docker-compose.secure.yml")
     assert sc.count("- ALL") >= 2, "cap_drop [ALL] expected on both app services"
     assert "mem_limit:" in sc
     assert "--requirepass" in sc

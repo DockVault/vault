@@ -31,7 +31,7 @@ import threading
 import time
 import urllib.request
 
-# (script, Popen) for each supervised child.
+# (target, Popen) for each supervised child.
 _PROCS: list = []
 
 # Serialize the tagging writers so a web line and an sftp line can never interleave mid-line
@@ -127,16 +127,20 @@ def _pump(label: str, stream) -> None:
         pass
 
 
-def _spawn(script: str, label: str) -> None:
+def _spawn(target: str, label: str) -> None:
     """Start a supervised child, tagging each of its log lines ``[label]`` via a daemon reader
     thread. stderr is merged into stdout so one reader tags everything the child emits;
     PYTHONUNBUFFERED keeps lines timely (a per-block buffer would defeat the tag); text mode
     with errors='replace' means a stray non-UTF-8 byte can't kill the reader (and risk a
-    pipe-fill hang)."""
+    pipe-fill hang). ``target`` is a module name run via ``python -m`` (the packaged
+    servers), or a script path when it ends in ``.py`` (used by tests; note a script run by
+    path gets its OWN directory as sys.path[0], so package-importing modules under
+    app/ must use the module form)."""
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
+    argv = [sys.executable, target] if target.endswith(".py") else [sys.executable, "-m", target]
     p = subprocess.Popen(
-        [sys.executable, script],
+        argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=env,
@@ -146,7 +150,7 @@ def _spawn(script: str, label: str) -> None:
         errors="replace",
     )
     threading.Thread(target=_pump, args=(label, p.stdout), daemon=True).start()
-    _PROCS.append((script, p))
+    _PROCS.append((target, p))
 
 
 def _wait_api_ready(timeout: float = 60.0) -> bool:
@@ -202,14 +206,14 @@ def main() -> None:
     threading.Thread(target=_sink_writer_loop, daemon=True).start()
     # Start the API first — its lifespan runs the schema create/migrations the SFTP
     # server relies on.
-    _spawn("api_server.py", "web")
+    _spawn("app.api.api_server", "web")
     if _truthy(os.environ.get("RUN_SFTP")):
         # Wait for the API to be ready (schema migrated) before starting SFTP, so an
         # early SFTP client can't hit a not-yet-migrated DB. Bounded; falls through on
         # timeout (SFTP fails closed on DB errors rather than serving wrong data).
         if not _wait_api_ready():
             print("[run_combined] API not ready within timeout; starting SFTP anyway", flush=True)
-        _spawn("sftp_server.py", "sftp")
+        _spawn("app.sftp.sftp_server", "sftp")
     # Supervise: if a running child exits, take the whole container down so it restarts
     # (don't limp along with only one half running).
     while True:

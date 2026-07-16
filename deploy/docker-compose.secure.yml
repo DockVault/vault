@@ -1,0 +1,281 @@
+# HTTPS-only variant of deploy/docker-compose.yml for a STANDALONE deployment of the
+# vault service (e.g. a personal Azure VM) with no unencrypted listener at all:
+#   - the web UI/API terminates TLS INSIDE the container (uvicorn ssl,
+#     API_USE_HTTPS=true) and is published on host port 443 only;
+#   - SFTP (SSH — already an encrypted protocol) is optional, behind the
+#     "sftp" compose profile, published on host port 2322;
+#   - Postgres and Redis are internal-only on the compose bridge network
+#     (never published to the host).
+#
+# Setup: from the repository root run  sudo ./deploy/setup-secure.sh  — it
+# collects the required settings, writes .env (secrets) at the repo root,
+# generates certs/{cert.pem,key.pem} there, and starts this file. Manual start
+# (from the repo root; --env-file anchors .env interpolation + COMPOSE_PROFILES):
+#   docker compose --env-file .env -f deploy/docker-compose.secure.yml up -d --build
+#
+# Differences from deploy/docker-compose.yml (the local dev stack):
+#   - vault-api publishes 443:8000 (not 8200:8000) and runs with
+#     API_USE_HTTPS=true + a ./certs bind mount at /app/certs (read-only) —
+#     so /app/certs is NOT on tmpfs here;
+#   - the healthcheck probes https:// (the image HEALTHCHECK probes plain
+#     http:// and would fail forever against a TLS listener);
+#   - ENVIRONMENT=production (disables /docs, /redoc, /openapi.json);
+#   - VAULT_DB_PASSWORD has NO dev default — it must come from ./.env;
+#   - vault-sftp is profile-gated (enable by COMPOSE_PROFILES=sftp in .env,
+#     written by deploy/setup-secure.sh, or --profile sftp on the CLI).
+#
+# Same project name as the dev compose ON PURPOSE: the fixed container_names
+# collide, so the two stacks can never run side by side on one host.
+
+name: dockvault-vault
+
+services:
+  vault-db:
+    image: postgres:15-alpine
+    container_name: vault-db
+    environment:
+      POSTGRES_USER: sftp_user
+      POSTGRES_PASSWORD: ${VAULT_DB_PASSWORD:?missing - run deploy/setup-secure.sh (writes .env)}
+      POSTGRES_DB: sftp_db
+    volumes:
+      - vault_pg_data:/var/lib/postgresql/data
+    # Hardening: read-only root fs (data in the volume) + no privilege escalation.
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sftp_user -d sftp_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Resource ceiling (no cap_drop: the official postgres entrypoint starts as root to chown the
+    # data dir + su-exec to the postgres user).
+    mem_limit: 1g
+    pids_limit: 256
+    networks:
+      - vault-network
+    restart: unless-stopped
+
+  vault-redis:
+    image: redis:7-alpine
+    container_name: vault-redis
+    environment:
+      # Optional Redis AUTH — set REDIS_PASSWORD in .env to require it on the shared cache. Empty
+      # (default) is a no-op. The app authenticates with the same REDIS_PASSWORD (config.redis_password).
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    # Array command keeps the entrypoint's drop to the unprivileged redis user; empty password = no auth.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-}"]
+    # Hardening: read-only root fs (ephemeral cache -> /data is tmpfs) + no escalation.
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /data
+    healthcheck:
+      # AUTH-aware: redis-cli -a "" skips AUTH on a no-password server, so this works either way.
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD:-}\" ping 2>/dev/null | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 512m
+    pids_limit: 128
+    networks:
+      - vault-network
+    restart: unless-stopped
+
+  vault-api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: dockvault-vault:latest
+    container_name: vault-api
+    env_file:
+      - ../.env
+    environment:
+      DOCKER_CONTAINER: "true"
+      DATABASE_URL: postgresql://sftp_user:${VAULT_DB_PASSWORD:?missing - run deploy/setup-secure.sh (writes .env)}@vault-db:5432/sftp_db
+      REDIS_HOST: vault-redis
+      REDIS_PORT: "6379"
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+      # TLS terminates in-process (uvicorn ssl_certfile/ssl_keyfile,
+      # app/api/api_server.py __main__ block) — no plain-HTTP listener exists.
+      API_USE_HTTPS: "true"
+      API_SSL_CERTFILE: /app/certs/cert.pem
+      API_SSL_KEYFILE: /app/certs/key.pem
+      SFTP_HOST: 0.0.0.0
+      SFTP_PORT: "2222"
+      # production disables the /docs, /redoc + /openapi.json endpoints.
+      ENVIRONMENT: production
+      # Hours a resumable chunked-upload session lives before its buffered chunks become
+      # eligible for cleanup. Operators reclaim sooner via POST /api/maintenance/upload-sessions/cleanup.
+      CHUNK_SESSION_TTL_HOURS: "24"
+      # read-only root fs: the first-run setup wizard writes its state file; point it at a
+      # writable path (tmpfs /app/run below) instead of the read-only app root.
+      SETUP_STATE_FILE: /app/run/setup_state.json
+    command: ["python", "-m", "app.api.api_server"]
+    ports:
+      # The ONLY published web port: HTTPS on 443. The container process stays
+      # unprivileged (binds 8000 as uid 10001); Docker maps host 443 onto it.
+      - "443:8000"
+    depends_on:
+      vault-db:
+        condition: service_healthy
+      vault-redis:
+        condition: service_healthy
+    volumes:
+      - vault_storage:/app/storage
+      - vault_logs:/app/logs
+      - vault_keys:/app/keys
+      # Admin-uploaded logo/favicon assets (served from /brand-assets/). A named
+      # volume (not tmpfs) so the brand survives a restart; the image pre-creates
+      # /app/brand as appuser so the non-root process can write here under the
+      # read-only root fs. Without this, admin brand-asset uploads fail on a secure deploy.
+      - vault_brand:/app/brand
+      # Certs generated by deploy/setup-secure.sh into the REPO-ROOT certs/ dir; must be
+      # readable by uid 10001 (the script chowns them). Read-only: renewals
+      # replace the files on the host, then `docker compose restart vault-api`
+      # (uvicorn does not hot-reload certs). Path is relative to THIS file (deploy/).
+      - ../certs:/app/certs:ro
+    # The image HEALTHCHECK probes http://localhost:8000/health, which a TLS
+    # listener rejects — override it to probe https. Verification is disabled
+    # because the cert may be self-signed and its SAN is the public name, not
+    # localhost; this is a same-container liveness probe, not a trust decision.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, ssl; ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE; urllib.request.urlopen('https://localhost:8000/health', context=ctx)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 5
+    # Hardening: non-root (Dockerfile USER) + no escalation + read-only root fs.
+    # storage/logs/keys are volumes and /app/certs is a read-only bind mount
+    # (NOT tmpfs here, unlike the dev compose); /app/run (setup-wizard state),
+    # /app/deployments (wizard-written .env/lock) + /tmp ride tmpfs.
+    #
+    # mode=1777 is REQUIRED, not cosmetic: on a real Linux Docker engine the
+    # Compose/API tmpfs mount path defaults to root-owned 0755, so the non-root
+    # app (uid 10001) gets "permission denied" writing /app/run/setup_state_*.json
+    # on first boot. (Docker Desktop happens to default to 1777, which is why the
+    # dev stack never hit this.) 1777 = world-writable + sticky, exactly like /tmp.
+    security_opt:
+      - no-new-privileges:true
+    # Drop ALL caps, add back only the entrypoint's root-phase needs (chown volumes + setuid/setgid
+    # drop to appuser uid 10001); the workload then runs as appuser with no effective caps. Removes
+    # the risky defaults (NET_RAW, MKNOD, SYS_CHROOT, SETFCAP, ...).
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+      - /app/run:mode=1777
+      - /app/deployments:mode=1777
+    # Resource ceilings so one vault can't exhaust the host (co-tenant DoS). The download path
+    # materialises the whole decrypted file in RAM (legacy Fernet codec briefly ~2x), so mem_limit
+    # stays comfortably above ~2x max_file_size_mb (default 1024 MB) + concurrency; size per plan tier.
+    mem_limit: 4g
+    pids_limit: 512
+    cpus: 2.0
+    networks:
+      - vault-network
+    restart: unless-stopped
+
+  vault-sftp:
+    # Optional: SFTP is SSH, i.e. encrypted transport. Enable with
+    # COMPOSE_PROFILES=sftp in .env (deploy/setup-secure.sh writes it) or
+    # `docker compose --profile sftp ...`.
+    profiles: ["sftp"]
+    image: dockvault-vault:latest
+    container_name: vault-sftp
+    env_file:
+      - ../.env
+    environment:
+      DOCKER_CONTAINER: "true"
+      DATABASE_URL: postgresql://sftp_user:${VAULT_DB_PASSWORD:?missing - run deploy/setup-secure.sh (writes .env)}@vault-db:5432/sftp_db
+      REDIS_HOST: vault-redis
+      REDIS_PORT: "6379"
+      SFTP_HOST: 0.0.0.0
+      SFTP_PORT: "2222"
+      ENVIRONMENT: production
+      SETUP_STATE_FILE: /app/run/setup_state.json  # read-only root fs: writable state path
+    command: ["python", "-m", "app.sftp.sftp_server"]
+    # This service runs SFTP, not the HTTP API. Check the port is bound via
+    # /proc (port 2222 = hex 08AE) instead of opening a socket — a raw TCP
+    # connect makes paramiko log "Error reading SSH protocol banner" on every
+    # probe.
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q ':08AE' /proc/net/tcp"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    ports:
+      # HOST-side SFTP port is configurable via SFTP_HOST_PORT in .env (default
+      # 2322); the container-internal port stays 2222 (the healthcheck greps
+      # ':08AE' = 2222, and the app binds SFTP_PORT=2222 below). Set e.g.
+      # SFTP_HOST_PORT=2200 in .env to avoid a clash and open it in the Azure NSG.
+      - "${SFTP_HOST_PORT:-2322}:2222"
+    depends_on:
+      vault-db:
+        condition: service_healthy
+      vault-redis:
+        condition: service_healthy
+      vault-api:
+        # Wait until the API is HEALTHY (its /health passes), not merely started, so the
+        # API's startup migrations (which add enc_name/name_bi etc. that SFTP queries)
+        # have run before SFTP serves. Mirrors run_combined.py's /health gate in prod.
+        condition: service_healthy
+    volumes:
+      - vault_storage:/app/storage
+      - vault_keys:/app/keys
+    # Hardening: non-root (Dockerfile USER) + no escalation + read-only root fs.
+    # storage/keys are volumes; this service doesn't mount the logs volume, so
+    # /app/logs (+ /app/certs, /app/run + /app/deployments wizard state, /tmp) ride tmpfs.
+    # mode=1777 for the same reason as vault-api above: a non-root process must be
+    # able to write these on a Linux engine that defaults compose tmpfs to root:0755.
+    security_opt:
+      - no-new-privileges:true
+    # Drop ALL caps, add back only the entrypoint's root-phase needs (chown volumes + setuid/setgid
+    # drop to appuser); the SFTP workload then runs as appuser with no effective caps.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+      - /app/logs:mode=1777
+      - /app/certs:mode=1777
+      - /app/run:mode=1777
+      - /app/deployments:mode=1777
+    # SFTP also streams large files; keep headroom above max_file_size_mb (see vault-api note).
+    mem_limit: 2g
+    pids_limit: 512
+    cpus: 1.0
+    networks:
+      - vault-network
+    restart: unless-stopped
+
+volumes:
+  vault_pg_data:
+  vault_storage:
+  vault_logs:
+  vault_keys:
+  vault_brand:
+
+networks:
+  vault-network:
+    driver: bridge

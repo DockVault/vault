@@ -42,7 +42,7 @@ def test_upload_download_roundtrip_binary(admin, temp_vault):
 # In-container self-test of the crypto module. Run with `docker exec -i <c> python -`.
 _CRYPTO_SELFTEST = r'''
 import os, struct, tempfile, uuid
-import security as S
+from app.core import security as S
 
 vid, fid = uuid.uuid4(), uuid.uuid4()
 data = bytes((i * 5 + 1) % 256 for i in range(200003))  # not chunk-aligned
@@ -401,8 +401,8 @@ def test_cross_vault_move_guard_layer(admin):
 
         script = (
             "import uuid\n"
-            "from database import get_db_context\n"
-            "from models import File\n"
+            "from app.core.database import get_db_context\n"
+            "from app.core.models import File\n"
             f"FID = '{fid}'\n"
             f"VB = '{vb['id']}'\n"
             # Each scenario uses its OWN session so the transient _allow_vault_reencrypt flag

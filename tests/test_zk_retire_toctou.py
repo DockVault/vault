@@ -97,7 +97,7 @@ def test_zk_rename_serializes_with_retire(admin):
 def test_zk_seal_writers_hold_vault_lock():
     """Source guard: both ZK name-seal writers take the Vault row lock before using the seal
     epoch (so a regression removing it fails here too, even without a live race)."""
-    src = open(os.path.join(_APP_DIR, "api_server.py"), encoding="utf-8").read()
+    src = open(os.path.join(_APP_DIR, "app/api/api_server.py"), encoding="utf-8").read()
     for fn in ("def create_folder", "def rename_file"):
         start = src.index(fn)
         body = src[start:src.index("\n@app.", start + 1)] if "\n@app." in src[start:] else src[start:start + 6000]

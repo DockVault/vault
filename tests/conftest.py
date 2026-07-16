@@ -57,7 +57,7 @@ def unique(prefix: str = "t") -> str:
 
 def compute_registration_pop(client, priv, public_key_pem: str) -> dict:
     """Client-side registration proof-of-possession — a faithful Python mirror of
-    ecc_pop.py / ecc_crypto.js.computeRegistrationPoP. Fetches a challenge, does
+    app/services/ecc_pop.py / ecc_crypto.js.computeRegistrationPoP. Fetches a challenge, does
     ECDH(priv, server_ephemeral_pub) -> HKDF -> HMAC over (nonce || public_key_pem), and
     returns the {challenge_id, mac} dict to send with POST /ecc/keys/register. `priv` is the
     EC private key matching public_key_pem (proving possession). Salt/info/hash MUST match
