@@ -72,6 +72,21 @@ cp .env.example .env      # then edit it: set ENCRYPTION_KEY, JWT_SECRET_KEY, VA
 docker compose up -d      # web/API on http://localhost:8200
 ```
 
+## Repository layout
+
+| Path | What lives there |
+|------|------------------|
+| `app/` | The Python application — `app/api/` (web/API server + the user-management/dashboard/ECC routers), `app/sftp/` (SFTP server), `app/core/` (config, models, security primitives), `app/services/` (vault/auth/domain services), `app/config/` (branding), `app/routers/` (info endpoints) |
+| `deploy/` | Deployment files — `deploy/docker-compose.yml` (local trial), `deploy/docker-compose.secure.yml` + `deploy/setup-secure.sh` / `deploy/setup-secure.ps1` (production HTTPS) |
+| `scripts/` | Operator utilities (`scripts/setup_master_password.py`) |
+| `static/` | The self-hosted web UI (no CDN assets) |
+| `tests/` | pytest + Playwright integration suite (see `tests/README.md`) |
+| `run_combined.py`, `docker-entrypoint.py` | Container entrypoints, kept at the root (the image's ENTRYPOINT/CMD contract) |
+
+The root `docker-compose.yml` is a thin `include:` shim over `deploy/docker-compose.yml`, so
+`docker compose up -d` keeps working from the repository root (and existing deployments keep their
+project and volume names).
+
 ## Security model
 
 - **Encryption at rest:** each vault has its own key; contents and file/folder names are
