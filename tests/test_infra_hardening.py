@@ -123,8 +123,8 @@ def test_sftp_key_clear_resets_db_fallback_row():
         "import uuid",
         "from auth_service import AuthService",
         "from sftp_server import _sftp_key_clear",
-        "from database import get_db_context",
-        "from models import RateLimitRecord",
+        "from app.core.database import get_db_context",
+        "from app.core.models import RateLimitRecord",
         "ip = '203.0.113.7'",
         "u = 'probe-' + uuid.uuid4().hex[:8]",
         "ident = ip + ':' + u",
@@ -216,9 +216,9 @@ def test_detection_degraded_signal_fires_and_is_throttled():
     # operators know threshold-based detection is blind. A rapid second signal is throttled IN-PROCESS
     # (at most one DB write per cooldown per process), so an outage can't hammer a hot alert row.
     script = "\n".join([
-        "from database import get_db_context",
-        "from security_monitor import SecurityMonitor, SecurityEventType",
-        "from models import SecurityAlert",
+        "from app.core.database import get_db_context",
+        "from app.services.security_monitor import SecurityMonitor, SecurityEventType",
+        "from app.core.models import SecurityAlert",
         "with get_db_context() as db:",
         "    m = SecurityMonitor(db)",
         "    m._signal_detection_degraded()",
@@ -245,9 +245,9 @@ def test_alert_dedup_key_is_per_user_and_severity(admin):
     u2 = admin.create_user(role="user")
     try:
         script = "\n".join([
-            "from database import get_db_context",
-            "from security_monitor import SecurityMonitor, SecurityEventType, SecurityAlertLevel",
-            "from models import SecurityAlert",
+            "from app.core.database import get_db_context",
+            "from app.services.security_monitor import SecurityMonitor, SecurityEventType, SecurityAlertLevel",
+            "from app.core.models import SecurityAlert",
             f"ua = '{u1['id']}'; ub = '{u2['id']}'",
             "ET = SecurityEventType.BULK_FILE_DELETION",
             "with get_db_context() as db:",
@@ -333,7 +333,7 @@ def test_noisy_dead_recorders_stay_removed():
     # record_vault_access (INFO rapid-vault-access = normal browsing noise on a hot read path) and
     # record_rate_limit_violation (login rate-limits are already recorded via record_failed_login;
     # no single clean chokepoint) were removed as dead. Guard against reintroduction.
-    src = _read("security_monitor.py")
+    src = _read("app/services/security_monitor.py")
     assert "def record_vault_access" not in src, "record_vault_access was removed as noisy/dead"
     assert "def record_rate_limit_violation" not in src, "record_rate_limit_violation was removed as dead"
     # the live recorders remain
@@ -346,7 +346,7 @@ def test_progress_complete_clears_dangling_record():
     script = "\n".join([
         "import uuid",
         "from app.services.activity_monitor import ProgressTracker",
-        "from database import redis_client",
+        "from app.core.database import redis_client",
         "t = ProgressTracker()",
         "oid = 'upload_' + uuid.uuid4().hex",
         "t.start_operation(operation_id=oid, user_id='u', username='u', operation_type='upload', file_name='f', total_size=0)",
@@ -383,11 +383,11 @@ def test_cleanup_old_alerts_prunes_old_resolved(admin):
     try:
         script = "\n".join([
             "import datetime",
-            "from database import get_db_context",
-            "import security_monitor",
+            "from app.core.database import get_db_context",
+            "from app.services import security_monitor",
             "security_monitor._last_alert_cleanup_at = None  # ensure the once/hour throttle allows this run",
-            "from security_monitor import SecurityMonitor",
-            "from models import SecurityAlert",
+            "from app.services.security_monitor import SecurityMonitor",
+            "from app.core.models import SecurityAlert",
             f"uid = '{u['id']}'",
             "with get_db_context() as db:",
             "    m = SecurityMonitor(db)",
@@ -412,7 +412,7 @@ def test_normalize_scope_tolerates_bad_list_fields_and_rotate_key_cap():
     # normalize_scope must not 500 on a null/scalar list field (it should coerce to []), and
     # vault.rotate_key must be a recognized cap (else scoped temp creds can never rotate a vault key).
     script = "\n".join([
-        "from temp_scope import normalize_scope, VAULT_CAPS",
+        "from app.core.temp_scope import normalize_scope, VAULT_CAPS",
         "s = normalize_scope({'pages': None, 'caps': 5, 'vault_caps_default': None})",
         "ok = isinstance(s, dict) and s['pages']==[] and s['caps']==[] and s['vault_caps_default']==[]",
         "rk = 'vault.rotate_key' in VAULT_CAPS",
@@ -487,7 +487,7 @@ def test_user_detail_endpoints_enforce_ownership():
 
 
 def _import_config(env_overrides):
-    return _in_container(env_overrides=env_overrides, args=["python", "-c", "import config"])
+    return _in_container(env_overrides=env_overrides, args=["python", "-c", "from app.core import config"])
 
 
 def test_production_rejects_sample_admin_password():
@@ -643,7 +643,7 @@ def test_dockerignore_excludes_git_metadata():
 
 
 def test_master_password_kdf_iterations_raised():
-    ss = _read("startup_security.py")
+    ss = _read("app/core/startup_security.py")
     assert "iterations=600000" in ss, "master-password KDF should use 600k iterations"
     assert "iterations=100000" not in ss, "the old 100k iteration count should be gone"
 
@@ -655,13 +655,13 @@ def test_dead_fail_open_permission_code_stays_removed():
     #     had no _permission_service attribute), and
     #   - the EndpointPermissionChecker / get_endpoint_info catalog checker ("endpoint not in
     #     catalog -> allow"), which the live require_endpoint_permission never consulted.
-    authz = _read("authorization.py")
+    authz = _read("app/core/authorization.py")
     assert "\ndef require_permission(" not in authz, \
         "the fail-open module-level require_permission decorator must stay removed"
     # the live, non-fail-open PermissionService.require_permission METHOD must remain
     assert "    def require_permission(" in authz
 
-    ep = _read("endpoint_permissions.py")
+    ep = _read("app/core/endpoint_permissions.py")
     assert "class EndpointPermissionChecker" not in ep, "dead fail-open EndpointPermissionChecker must stay removed"
     assert "def get_endpoint_info" not in ep, "dead get_endpoint_info (only the checker used it) must stay removed"
     assert "def require_endpoint_permission(" in ep, "the live endpoint gate must remain"

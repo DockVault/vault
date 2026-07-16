@@ -19,8 +19,8 @@ from fastapi import Request, HTTPException, status
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response, JSONResponse
 
-from database import redis_client
-from config import settings
+from app.core.database import redis_client
+from app.core.config import settings
 import logging
 
 logger = logging.getLogger(__name__)
@@ -296,7 +296,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         auth = request.headers.get("Authorization") or request.headers.get("authorization")
         if auth and auth.lower().startswith("bearer "):
             try:
-                from security import verify_access_token
+                from app.core.security import verify_access_token
                 payload = verify_access_token(auth.split(" ", 1)[1].strip())
                 sub = payload.get("sub") if payload else None
                 if sub:

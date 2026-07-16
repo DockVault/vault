@@ -8,7 +8,7 @@ import uuid
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, select
 
-from models import (
+from app.core.models import (
     User, RoleEnum, PermissionEnum, user_permissions,
     Vault, vault_members, VaultPermissionEnum, vault_group_access, user_groups
 )

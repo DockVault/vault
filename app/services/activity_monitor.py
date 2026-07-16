@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict
 from redis import Redis
 
-from database import redis_client
+from app.core.database import redis_client
 
 
 class ActivityBroadcaster:

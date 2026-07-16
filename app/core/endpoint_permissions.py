@@ -9,7 +9,7 @@ from typing import List, Optional, Callable
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from models import User, UserEndpointPermission, RoleEnum
+from app.core.models import User, UserEndpointPermission, RoleEnum
 from app.core.api_catalog import API_CATALOG
 
 
@@ -39,7 +39,7 @@ def require_endpoint_permission(group_name: str):
                     detail="Authentication required"
                 )
             
-            from models import UserEndpointPermission as UEP
+            from app.core.models import UserEndpointPermission as UEP
 
             def _creator_has_group():
                 return db.query(UEP).filter(
@@ -51,7 +51,7 @@ def require_endpoint_permission(group_name: str):
             # inherit the admin bypass (so an admin can mint a tightly-scoped temp
             # credential). A NULL scope is legacy and behaves as before.
             if getattr(current_user, '_is_temp_session', False):
-                from temp_scope import temp_session_allows_group
+                from app.core.temp_scope import temp_session_allows_group
                 if not temp_session_allows_group(current_user, group_name, kwargs):
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
@@ -102,7 +102,7 @@ def grant_endpoint_permission(
     
     from datetime import datetime
     import uuid as uuid_module
-    from models import UserEndpointPermission
+    from app.core.models import UserEndpointPermission
     
     # Check if permission already exists
     existing = db.query(UserEndpointPermission).filter(
@@ -171,7 +171,7 @@ def revoke_endpoint_permission(
         raise ValueError(f"Unknown endpoint group: {endpoint_group}")
     
     import uuid as uuid_module
-    from models import UserEndpointPermission
+    from app.core.models import UserEndpointPermission
     
     # Delete the permission
     perm = db.query(UserEndpointPermission).filter(
@@ -193,7 +193,7 @@ def get_user_permissions(user_id: str, db: Session) -> List[dict]:
     Returns:
         List of permission dicts with endpoint_group, granted_at, granted_by
     """
-    from models import UserEndpointPermission
+    from app.core.models import UserEndpointPermission
     import uuid
     
     # Query the new user_endpoint_permissions table

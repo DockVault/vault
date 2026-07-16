@@ -54,7 +54,7 @@ def load_brand_overrides(db) -> Dict[str, Any]:
     must never 500 on a branding read.
     """
     try:
-        from models import SystemSetting  # lazy import: keeps this module importable w/o the ORM
+        from app.core.models import SystemSetting  # lazy import: keeps this module importable w/o the ORM
         row = db.query(SystemSetting).filter(SystemSetting.key == BRAND_SETTINGS_KEY).first()
         value = row.value if (row and row.value) else {}
         return dict(value) if isinstance(value, dict) else {}
@@ -74,7 +74,7 @@ def set_brand_overrides(db, updates: Dict[str, Any] = None, remove_keys=None) ->
     same effective store. The caller commits (and is responsible for validating values;
     the read-time :func:`merge_branding` guard drops anything invalid as defence in depth).
     """
-    from models import SystemSetting  # lazy: keep this module importable without the ORM
+    from app.core.models import SystemSetting  # lazy: keep this module importable without the ORM
     row = db.query(SystemSetting).filter(SystemSetting.key == BRAND_SETTINGS_KEY).first()
     brand = dict(row.value) if (row and row.value) else {}
     for key, value in (updates or {}).items():

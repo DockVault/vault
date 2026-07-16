@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import jwt  # PyJWT (maintained); HS256-only. jwt.encode/decode signatures match the prior jose usage.
 
-from config import settings
+from app.core.config import settings
 
 
 # Argon2 password hasher (winner of Password Hashing Competition)

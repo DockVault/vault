@@ -48,10 +48,10 @@ import uuid
 import redis
 import json
 
-from database import get_db_context
-from models import User, ActiveSession, Vault, Folder, File
+from app.core.database import get_db_context
+from app.core.models import User, ActiveSession, Vault, Folder, File
 from auth_service import AuthService
-from authorization import PermissionService, PermissionDeniedError
+from app.core.authorization import PermissionService, PermissionDeniedError
 from vault_service import (
     VaultService,
     VaultNotFoundError,
@@ -61,9 +61,9 @@ from vault_service import (
 )
 from vault_service import FileNotFoundError as VaultFileNotFoundError
 from app.services.audit_logger import AuditLogger
-from config import settings
-from temp_scope import is_scoped, effective_vault_caps
-from security import name_blind_index
+from app.core.config import settings
+from app.core.temp_scope import is_scoped, effective_vault_caps
+from app.core.security import name_blind_index
 from sqlalchemy import or_
 
 # Global registry of active transports: session_token -> transport
@@ -99,7 +99,7 @@ def _user_requires_temp_cred_for_sftp(db, user) -> bool:
     global force would break SSH-key automation). Reads the admin Settings store
     (SystemSetting 'global'); fails OPEN (no extra restriction) on any error."""
     try:
-        from models import SystemSetting, user_groups
+        from app.core.models import SystemSetting, user_groups
         from sqlalchemy import select
         row = db.query(SystemSetting).filter(SystemSetting.key == "global").first()
         groups = (row.value or {}).get("sftp_require_temp_cred_groups") if (row and row.value) else None
@@ -308,7 +308,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 # web path). Covers the case where deactivation flips only the
                 # credential, not the session row.
                 if session.temp_credential_id is not None:
-                    from models import TemporaryCredential
+                    from app.core.models import TemporaryCredential
                     tc = db.query(TemporaryCredential).filter(
                         TemporaryCredential.id == session.temp_credential_id
                     ).first()
@@ -361,7 +361,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         SSH-key principals, and 'all'-scope or legacy temp credentials, carry no per-vault
         proof, so password-protected vaults stay hidden from them (parity with the
         zero-knowledge exclusion)."""
-        from security import vault_password_fingerprint
+        from app.core.security import vault_password_fingerprint
         if not getattr(user, "_is_temp_session", False):
             return False
         if getattr(user, "_temp_vault_mode", None) != "selected":
@@ -707,7 +707,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             # (RBAC). _has_cap alone is True for every non-scoped user (scope layer only), so
             # without the RBAC check a write-but-no-delete member could destroy files via an
             # SFTP put — mirror the web _principal_can_replace_file gate.
-            from models import VaultPermissionEnum
+            from app.core.models import VaultPermissionEnum
             can_overwrite = (self._has_cap(user, vault_id, "file.delete")
                              and vault_service.permission_service.can_access_vault(
                                  user, vault_id, VaultPermissionEnum.DELETE))
@@ -889,7 +889,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                         {"vault_id": str(vault.id), "via": "sftp"})
             # Feed the bulk-deletion detector (best-effort; must never fail the delete).
             try:
-                from security_monitor import get_security_monitor
+                from app.services.security_monitor import get_security_monitor
                 get_security_monitor(db).record_file_deletion(str(user.id), str(vault.id), file_count=1)
             except Exception:
                 pass
@@ -1012,7 +1012,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                     and self._has_cap(user, vault.id, "file.delete")):
                 return paramiko.SFTP_PERMISSION_DENIED
             try:
-                from models import VaultPermissionEnum
+                from app.core.models import VaultPermissionEnum
                 vault_service.permission_service.require_vault_permission(
                     user, vault.id, VaultPermissionEnum.DELETE
                 )
@@ -1053,7 +1053,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 # high-throughput deletion vector). Best-effort: monitoring must never fail the rmdir.
                 if _rmdir_deleted:
                     try:
-                        from security_monitor import get_security_monitor
+                        from app.services.security_monitor import get_security_monitor
                         get_security_monitor(db).record_file_deletion(str(user.id), str(vault.id), file_count=_rmdir_deleted)
                     except Exception:
                         pass
@@ -1112,7 +1112,7 @@ def _sftp_key_throttled(ip: str, username: str) -> bool:
     Fails CLOSED to a durable DB fallback on a Redis outage (mirroring the password login throttle
     in AuthService): a Redis outage must not silently lift the flood / username-enumeration bound on
     key offers, which is exactly what returning "not throttled" here used to do."""
-    from rate_limiter import rate_limiter, RateLimiterUnavailable
+    from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
     limit = settings.rate_limit_sftp_key_attempts
     window = settings.rate_limit_login_window_seconds
     try:
@@ -1134,7 +1134,7 @@ def _sftp_key_clear(ip: str, username: str) -> None:
     and the durable DB-fallback row -- so a healthy (frequently reconnecting, multi-key) client never
     trips the throttle, including while Redis is down and the DB fallback is doing the counting."""
     try:
-        from database import redis_client
+        from app.core.database import redis_client
         redis_client.delete(f"rate_limit:{_sftp_key_id(ip, username)}")
     except Exception:
         pass
@@ -1142,8 +1142,8 @@ def _sftp_key_clear(ip: str, username: str) -> None:
     # clear it on success too, or a legitimate client that keeps authenticating would accumulate offers
     # it never resets and eventually lock itself out mid-window. Best-effort, own short-lived session.
     try:
-        from database import get_db_context
-        from models import RateLimitRecord
+        from app.core.database import get_db_context
+        from app.core.models import RateLimitRecord
         with get_db_context() as db:
             db.query(RateLimitRecord).filter(
                 RateLimitRecord.identifier == f"{ip}:{username}",
@@ -1267,7 +1267,7 @@ class SFTPServer(paramiko.ServerInterface):
                 # SFTP, which refuses SSH-key (and password) auth.
                 if _user_requires_temp_cred_for_sftp(db, user):
                     return paramiko.AUTH_FAILED
-                from models import UserSSHKey
+                from app.core.models import UserSSHKey
                 matched = None
                 for k in db.query(UserSSHKey).filter(UserSSHKey.user_id == user.id).all():
                     parts = (k.public_key or "").split()
@@ -1309,7 +1309,7 @@ class SFTPServer(paramiko.ServerInterface):
                     self.session_token = AuthService(db).create_sftp_key_session(
                         u, self.client_address)
                     if self._key_id is not None:
-                        from models import UserSSHKey
+                        from app.core.models import UserSSHKey
                         k = db.query(UserSSHKey).filter(UserSSHKey.id == self._key_id).first()
                         if k is not None:
                             k.last_used = _dt.now(_tz.utc)
@@ -1350,7 +1350,7 @@ def listen_for_terminations():
                 db=settings.redis_db,
                 password=settings.redis_password if settings.redis_password else None,
                 decode_responses=True,
-                # Match the shared client settings (database.py) so a HALF-OPEN socket — a Redis blip
+                # Match the shared client settings (app/core/database.py) so a HALF-OPEN socket — a Redis blip
                 # that drops the TCP connection WITHOUT a clean close — is detected instead of blocking
                 # forever, which would silently disable live SFTP revocation until the process restarts.
                 # socket_keepalive + health_check_interval actively probe an idle pub/sub connection;

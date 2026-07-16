@@ -585,12 +585,12 @@ def rotate_vault_key(vault, master_key: bytes, db) -> int:
         VaultKeyError: If rotation fails
     
     Example:
-        >>> from config import settings
+        >>> from app.core.config import settings
         >>> master_key = settings.encryption_key.encode()
         >>> new_version = rotate_vault_key(vault, master_key, db)
         >>> print(f"Key rotated to version {new_version}")
     """
-    from models import VaultKeyHistory
+    from app.core.models import VaultKeyHistory
     from datetime import datetime
     import secrets
     
@@ -679,7 +679,7 @@ def get_vault_key_for_version(vault, key_version: int, master_key: bytes,
         >>> vault_key = get_vault_key_for_version(vault, file_key_version, master_key, None, db)
         >>> decrypted_content = decrypt_file(encrypted_content, vault_key)
     """
-    from models import VaultKeyHistory
+    from app.core.models import VaultKeyHistory
     
     # Case 1: Requested version is current
     if key_version == vault.key_version:
@@ -752,7 +752,7 @@ def get_vault_key_history(vault_id, db) -> List[Dict[str, Any]]:
         >>> for entry in history:
         >>>     print(f"Version {entry['key_version']}: {entry['active_duration_days']} days active")
     """
-    from models import VaultKeyHistory
+    from app.core.models import VaultKeyHistory
     
     history_entries = db.query(VaultKeyHistory).filter(
         VaultKeyHistory.vault_id == vault_id

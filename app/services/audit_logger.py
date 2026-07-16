@@ -9,7 +9,7 @@ import json
 
 from sqlalchemy.orm import Session
 
-from models import AuditLog, User
+from app.core.models import AuditLog, User
 
 
 class AuditLogger:

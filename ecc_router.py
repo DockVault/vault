@@ -14,14 +14,14 @@ import base64
 import os
 import json
 import uuid
-from database import get_db
-from models import User, Vault, UserKeyPair, VaultMemberKey, ZKShareInvite, ECCRegistrationChallenge, vault_members, RoleEnum
+from app.core.database import get_db
+from app.core.models import User, Vault, UserKeyPair, VaultMemberKey, ZKShareInvite, ECCRegistrationChallenge, vault_members, RoleEnum
 from app.services import ecc_pop
 from app.services.ecc_crypto_service import ECCCryptoService
 from app.services.audit_logger import AuditLogger
-from rate_limiter import rate_limiter as _rate_limiter
-from endpoint_permissions import require_endpoint_permission
-from temp_scope import (
+from app.core.rate_limiter import rate_limiter as _rate_limiter
+from app.core.endpoint_permissions import require_endpoint_permission
+from app.core.temp_scope import (
     require_vault_cap, enforce_vault, is_scoped, has_scoped_vault_cap, effective_vault_caps,
 )
 from cryptography.hazmat.primitives import serialization
@@ -1458,7 +1458,7 @@ async def retire_dek_versions(
     have no content epoch), so retiring a member key for that epoch would make the folder name
     permanently undecryptable for everyone — data loss."""
     _ecc_rate_limit(current_user, "mutate")
-    from models import File, Folder  # local import: avoid a heavier import at module load
+    from app.core.models import File, Folder  # local import: avoid a heavier import at module load
 
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
     if not vault:

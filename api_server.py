@@ -27,23 +27,23 @@ import shutil
 import traceback
 from pathlib import Path
 
-from database import get_db, init_db, check_db_connection, check_redis_connection
-from models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference
+from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
+from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference
 # NOTE: auth_service and vault_service BOTH define a class named RateLimitExceededError
 # (unrelated: one subclasses AuthenticationError, the other FileServiceError). Import the
 # auth one under an alias so the later vault import below can't shadow it — otherwise the
 # login throttle's `except` would bind the wrong class and a throttled login would surface
 # as a 500 instead of a 429.
 from auth_service import AuthService, InvalidCredentialsError, AccountLockedError, RateLimitExceededError as AuthRateLimitExceededError
-from authorization import PermissionService, PermissionDeniedError, ResourceNotFoundError, AuthorizationError
+from app.core.authorization import PermissionService, PermissionDeniedError, ResourceNotFoundError, AuthorizationError
 from vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, _name_match_filter
 from sqlalchemy.exc import IntegrityError
 from app.services.audit_logger import AuditLogger
 from app.services import log_pull  # RO2-3: pure helpers for the authenticated log-pull endpoint
-from security import create_access_token, verify_access_token
-from config import settings
-from endpoint_permissions import require_endpoint_permission
-from temp_scope import require_vault_cap
+from app.core.security import create_access_token, verify_access_token
+from app.core.config import settings
+from app.core.endpoint_permissions import require_endpoint_permission
+from app.core.temp_scope import require_vault_cap
 from user_management_api import router as user_management_router
 from app.core.response_hash_utils import handle_conditional_response, compute_response_hash, check_if_none_match, create_cached_response, create_not_modified_response
 
@@ -313,7 +313,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         
         return response
 
-# General API rate limiter. The sliding-window limiter in rate_limiter.py was fully implemented
+# General API rate limiter. The sliding-window limiter in app/core/rate_limiter.py was fully implemented
 # but never attached to the app, so the documented RATE_LIMIT_API_* knobs were inert and the whole
 # API surface had no framework throttle (only the login path and /ecc/* self-throttled). Wire it
 # here, gated on the config flag. It buckets by authenticated user when a bearer token is present,
@@ -322,7 +322,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 # the separate fail-CLOSED login throttle is unaffected). Registered BEFORE SecurityHeadersMiddleware
 # so it sits inside it and a 429 response still carries the hardening headers on the way out.
 if getattr(settings, 'rate_limit_api_enabled', True):
-    from rate_limiter import RateLimitMiddleware, rate_limiter as _api_rate_limiter
+    from app.core.rate_limiter import RateLimitMiddleware, rate_limiter as _api_rate_limiter
     app.add_middleware(
         RateLimitMiddleware,
         rate_limiter=_api_rate_limiter,
@@ -615,7 +615,7 @@ class TempCredentialCreate(BaseModel):
     total_lifetime_minutes: Optional[int] = Field(None, gt=0, le=43200)
     note: Optional[str] = Field(None, max_length=500)
     can_create_temp_credentials: bool = False
-    # Least-privilege scope (None = legacy/unrestricted). See temp_scope.py.
+    # Least-privilege scope (None = legacy/unrestricted). See app/core/temp_scope.py.
     scope: Optional[dict] = None
     vault_access_mode: Optional[str] = None          # 'all' | 'selected'
     selected_vaults: Optional[list] = None           # [{"vault_id":..., "caps":[...]}]
@@ -855,7 +855,7 @@ async def get_current_user(
     # session — a new login does NOT set `revoked`, so concurrent sessions keep working (no
     # single-session side effect). Temp sessions get a stricter is_active check below.
     if session_token and not is_temporary:
-        from models import ActiveSession
+        from app.core.models import ActiveSession
         revoked_session = db.query(ActiveSession.revoked).filter(
             ActiveSession.session_token == session_token
         ).first()
@@ -868,7 +868,7 @@ async def get_current_user(
 
     if is_temporary and session_token:
         # Validate that the session is still active
-        from models import ActiveSession, TemporaryCredential
+        from app.core.models import ActiveSession, TemporaryCredential
         from datetime import timedelta
 
         session = db.query(ActiveSession).filter(
@@ -967,7 +967,7 @@ async def get_current_user(
     # permission decorator and the data layer can enforce least privilege.
     # NULL scope = legacy credential = unrestricted (handled inside the helpers).
     if is_temporary and session_token and temp_cred is not None:
-        from temp_scope import attach_scope
+        from app.core.temp_scope import attach_scope
         attach_scope(db, user, temp_cred)
     else:
         # Fail SAFE: a temp session (is_temporary + session_token) whose scope row can't be loaded must
@@ -1017,9 +1017,9 @@ def get_current_metrics() -> dict:
     Get current system metrics for broadcasting.
     Called by broadcast_event to include real-time metrics with each event.
     """
-    from database import SessionLocal
+    from app.core.database import SessionLocal
     from sqlalchemy import func, distinct
-    from models import ActiveSession, TemporaryCredential, AuditLog, File
+    from app.core.models import ActiveSession, TemporaryCredential, AuditLog, File
     
     db = SessionLocal()
     try:
@@ -1093,7 +1093,7 @@ def broadcast_event(event_data: dict, include_metrics: bool = True) -> None:
             - operations: Optional active operations count
         include_metrics: If True, fetch and include current metrics (default: True)
     """
-    from database import redis_client
+    from app.core.database import redis_client
     try:
         # Add current metrics to the broadcast
         if include_metrics:
@@ -1148,7 +1148,7 @@ async def recent_audit_events(
     db: Session = Depends(get_db)
 ):
     """Recent audit-log entries for the dashboard activity feed (admin only)."""
-    from models import AuditLog
+    from app.core.models import AuditLog
     limit = max(1, min(limit, 50))
     rows = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).limit(limit).all()
     out = []
@@ -1171,7 +1171,7 @@ async def recent_audit_events(
 
 def _build_audit_query(db: Session, user_id=None, action=None, from_date=None, to_date=None):
     """Build the filtered AuditLog query shared by search + export."""
-    from models import AuditLog
+    from app.core.models import AuditLog
     q = db.query(AuditLog)
     if user_id:
         try:
@@ -1217,7 +1217,7 @@ async def search_audit_log(
     db: Session = Depends(get_db),
 ):
     """Filtered audit-log search for the admin Audit page (admin only)."""
-    from models import AuditLog
+    from app.core.models import AuditLog
     limit = max(1, min(limit, 2000))
     rows = (
         _build_audit_query(db, user_id, action, from_date, to_date)
@@ -1250,7 +1250,7 @@ async def export_audit_log(
 ):
     """Export the filtered audit log as CSV (admin only)."""
     import csv
-    from models import AuditLog
+    from app.core.models import AuditLog
     rows = (
         _build_audit_query(db, user_id, action, from_date, to_date)
         .order_by(AuditLog.timestamp.desc())
@@ -1396,7 +1396,7 @@ def _validate_group_id_list(payload: dict, key: str, db: Session) -> None:
     except (ValueError, AttributeError):
         raise HTTPException(status_code=400, detail=f"{key} contains an invalid group id")
     if wanted:
-        from models import Group
+        from app.core.models import Group
         existing = {row[0] for row in db.query(Group.id).filter(Group.id.in_(wanted)).all()}
         missing = wanted - existing
         if missing:
@@ -1443,7 +1443,7 @@ async def get_settings(
     db: Session = Depends(get_db),
 ):
     """Return stored global settings (sensitive fields stripped)."""
-    from models import SystemSetting
+    from app.core.models import SystemSetting
     row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
     data = dict(row.value) if row and row.value else {}
     for k in _SETTINGS_SENSITIVE:
@@ -1470,7 +1470,7 @@ async def update_settings(
     even one minted from an admin — must not rewrite the deployment's org policy
     (zero_knowledge_enabled / force_zero_knowledge / standard_vault_allowed_groups)."""
     _validate_settings_payload(payload, db)
-    from models import SystemSetting
+    from app.core.models import SystemSetting
     row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
     existing = dict(row.value) if row and row.value else {}
     merged = {**existing, **(payload or {})}
@@ -1514,8 +1514,8 @@ async def send_test_email(
     configured, and never echoes the stored SMTP password."""
     import smtplib
     from email.message import EmailMessage
-    from rate_limiter import rate_limiter as _rl
-    from models import SystemSetting
+    from app.core.rate_limiter import rate_limiter as _rl
+    from app.core.models import SystemSetting
 
     # Sending mail is an outbound side effect — cap it per admin.
     allowed, _, reset = _rl.check_rate_limit(
@@ -1628,7 +1628,7 @@ def _load_logs_settings(db) -> dict:
     """Per-component enable flags, in a DEDICATED SystemSetting('logs') row (like 'brand', not
     the shared 'global' row). Fail-closed to {} (feature off) on any read error."""
     try:
-        from models import SystemSetting
+        from app.core.models import SystemSetting
         row = db.query(SystemSetting).filter(SystemSetting.key == LOGS_SETTINGS_KEY).first()
         return dict(row.value) if (row and row.value) else {}
     except Exception:  # noqa: BLE001
@@ -1638,7 +1638,7 @@ def _load_logs_settings(db) -> dict:
 def _set_logs_settings(db, updates: dict) -> None:
     """Merge per-component flags into SystemSetting('logs'). Reassigns row.value so SQLAlchemy
     flags the JSON column dirty. Caller commits."""
-    from models import SystemSetting
+    from app.core.models import SystemSetting
     row = db.query(SystemSetting).filter(SystemSetting.key == LOGS_SETTINGS_KEY).first()
     existing = dict(row.value) if (row and row.value) else {}
     merged = {**existing, **(updates or {})}
@@ -1735,7 +1735,7 @@ async def require_log_pull_token(
     if not credentials or not credentials.credentials:
         raise _deny("Log token required")
     try:
-        from models import LogPullToken
+        from app.core.models import LogPullToken
         presented = credentials.credentials
         rows = db.query(LogPullToken).filter(
             LogPullToken.token_prefix == log_pull.token_prefix(presented),
@@ -1794,7 +1794,7 @@ async def get_logs_settings(
 ):
     """Log-access admin view: the ceiling, per-component flags, and the token list. NEVER the
     token hash or plaintext."""
-    from models import LogPullToken
+    from app.core.models import LogPullToken
     flags = _load_logs_settings(db)
     toks = db.query(LogPullToken).order_by(LogPullToken.created_at.desc()).all()
     return {
@@ -1852,7 +1852,7 @@ async def create_log_token(
 ):
     """Mint a log-pull token. Returns the plaintext EXACTLY ONCE (only the hash is stored). The
     audit row records the name/scope/prefix — NEVER the plaintext."""
-    from models import LogPullToken
+    from app.core.models import LogPullToken
     name = (payload.get("name") or "").strip() if isinstance(payload, dict) else ""
     scope = log_pull.validate_scope(payload.get("scope") if isinstance(payload, dict) else None)
     if not name or len(name) > 100:
@@ -1882,7 +1882,7 @@ async def disable_log_token(
     db: Session = Depends(get_db),
 ):
     """Disable a token (rotation = mint a new one, then disable the old). require_interactive_admin."""
-    from models import LogPullToken
+    from app.core.models import LogPullToken
     try:
         uuid.UUID(str(token_id))
     except (ValueError, TypeError):
@@ -2121,7 +2121,7 @@ async def zk_unsealed_count(
     from before client-side name sealing was enforced on the write paths. A healthy deployment
     reports 0. The read guards already MASK such rows from being served, so this is a re-seal
     to-do list for owners, not a live leak. Admin-only (fleet-wide across all ZK vaults)."""
-    from models import Vault, File, Folder
+    from app.core.models import Vault, File, Folder
     from sqlalchemy import or_, not_, and_
     zk_ids = [r[0] for r in db.query(Vault.id).filter(Vault.type == 'zero_knowledge').all()]
     if not zk_ids:
@@ -2230,7 +2230,7 @@ async def login(
             login_event["owner_user_id"] = str(user.id)
         broadcast_event({"event": login_event})
         
-        from temp_scope import is_scoped as _is_scoped
+        from app.core.temp_scope import is_scoped as _is_scoped
         return LoginResponse(
             access_token=access_token,
             user=UserResponse.model_validate(user),
@@ -2243,7 +2243,7 @@ async def login(
         
         # Record failed login in security monitor for threat detection
         try:
-            from security_monitor import get_security_monitor
+            from app.services.security_monitor import get_security_monitor
             monitor = get_security_monitor(db)
             monitor.record_failed_login(login_request.username, client_ip, str(e))
         except Exception as monitor_error:
@@ -2288,7 +2288,7 @@ async def login(
         
         # Record in security monitor
         try:
-            from security_monitor import get_security_monitor
+            from app.services.security_monitor import get_security_monitor
             monitor = get_security_monitor(db)
             monitor.record_failed_login(login_request.username, client_ip, f"Rate limit exceeded: {str(e)}")
         except Exception as monitor_error:
@@ -2330,7 +2330,7 @@ async def get_session_access(
     Non-scoped sessions (regular users, admins, and legacy unscoped temp creds)
     return accessible_sections=null and keep their normal role/permission nav.
     """
-    from temp_scope import is_scoped, temp_session_allows_group
+    from app.core.temp_scope import is_scoped, temp_session_allows_group
     scoped = is_scoped(current_user)
     sections = None
     if scoped:
@@ -2338,7 +2338,7 @@ async def get_session_access(
         # require_endpoint_permission applies at request time.
         creator_groups = None
         if current_user.role != RoleEnum.ADMIN:
-            from models import UserEndpointPermission as UEP
+            from app.core.models import UserEndpointPermission as UEP
             creator_groups = {
                 row[0] for row in db.query(UEP.endpoint_group)
                 .filter(UEP.user_id == current_user.id).all()
@@ -2410,7 +2410,7 @@ async def create_temp_credentials(
     # vault access from minting and handing out more accounts.
     if is_temp:
         if scoped:
-            from temp_scope import require_temp_perm
+            from app.core.temp_scope import require_temp_perm
             require_temp_perm(current_user, 'create')
         elif not getattr(current_user, '_temp_can_create', False):
             raise HTTPException(
@@ -2491,7 +2491,7 @@ async def list_temp_credentials(
     Performance: Supports ETag caching to reduce redundant data transfer.
     Returns 304 Not Modified when data unchanged.
     """
-    from models import TemporaryCredential, ActiveSession
+    from app.core.models import TemporaryCredential, ActiveSession
     from datetime import datetime
     
     # A temp session (scoped OR legacy NULL-scope) sees only the credentials IT created —
@@ -2588,7 +2588,7 @@ async def get_temp_credential_password(
     
     Performance: Supports ETag caching (password doesn't change).
     """
-    from models import TemporaryCredential
+    from app.core.models import TemporaryCredential
     temp_cred = db.query(TemporaryCredential).filter(
         TemporaryCredential.temp_username == temp_username
     ).first()
@@ -2634,7 +2634,7 @@ def _guard_temp_session_cred_mutation(current_user, temp_cred, perm: str):
     if not getattr(current_user, '_is_temp_session', False):
         return
     if getattr(current_user, '_temp_scope', None) is not None:
-        from temp_scope import require_temp_perm
+        from app.core.temp_scope import require_temp_perm
         require_temp_perm(current_user, perm)
     # Confine to credentials this temp session created. A degraded temp session whose cred id
     # could not be loaded (the fail-safe branch in get_current_user) has no subtree of its own,
@@ -2659,8 +2659,8 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
     web JWT is rejected per request even during a Redis outage. durable=False (e.g. disabling
     only SFTP) tears down live transports WITHOUT durably revoking the web token — the user's
     web session must keep working. Mutates session rows in `db` but does NOT commit."""
-    from models import ActiveSession
-    from database import redis_client
+    from app.core.models import ActiveSession
+    from app.core.database import redis_client
     q = db.query(ActiveSession).filter(ActiveSession.is_active == True)  # noqa: E712
     if user_id is not None:
         q = q.filter(ActiveSession.user_id == user_id)
@@ -2695,7 +2695,7 @@ async def deactivate_temp_credential(
     Deactivate a temporary credential. This action cannot be reversed.
     The user loses access immediately: live SFTP sessions are force-closed.
     """
-    from models import TemporaryCredential
+    from app.core.models import TemporaryCredential
 
     temp_cred = db.query(TemporaryCredential).filter(
         TemporaryCredential.temp_username == temp_username
@@ -2732,7 +2732,7 @@ async def delete_temp_credential(
     """
     Delete a temporary credential.
     """
-    from models import TemporaryCredential
+    from app.core.models import TemporaryCredential
     
     temp_cred = db.query(TemporaryCredential).filter(
         TemporaryCredential.temp_username == temp_username
@@ -2765,7 +2765,7 @@ async def terminate_temp_credential_sessions(
     Terminate all active sessions for a temporary credential.
     This will forcibly disconnect any active SFTP/SSH sessions.
     """
-    from models import TemporaryCredential, ActiveSession
+    from app.core.models import TemporaryCredential, ActiveSession
     
     temp_cred = db.query(TemporaryCredential).filter(
         TemporaryCredential.temp_username == temp_username
@@ -2789,7 +2789,7 @@ async def terminate_temp_credential_sessions(
     audit_logger = AuditLogger(db)
     
     # Get Redis connection for publishing termination signals
-    from database import redis_client
+    from app.core.database import redis_client
     
     for session in active_sessions:
         session.is_active = False
@@ -2837,7 +2837,7 @@ async def monitor_stats(
 ):
     """Live-monitor headline counts: users and sessions active in the last hour."""
     from sqlalchemy import func, distinct
-    from models import ActiveSession
+    from app.core.models import ActiveSession
     grace_cutoff = datetime.now(timezone.utc) - timedelta(minutes=65)
     active_filter = (
         ActiveSession.is_active == True,  # noqa: E712
@@ -2885,7 +2885,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
     Client must send: {"type": "auth", "token": "JWT_TOKEN_HERE"}
     """
     import asyncio
-    from database import redis_client
+    from app.core.database import redis_client
     
     # Accept the WebSocket connection
     await websocket.accept()
@@ -2941,9 +2941,9 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             is_temporary = payload.get("is_temporary", False)
             if not session_token:
                 raise ValueError("Invalid token payload")
-            from database import SessionLocal
+            from app.core.database import SessionLocal
             from auth_service import is_token_denylisted, account_locked
-            from models import ActiveSession as _WsAS, User as _WsUser
+            from app.core.models import ActiveSession as _WsAS, User as _WsUser
             _wsdb = SessionLocal()
             try:
                 if is_token_denylisted(session_token):
@@ -2993,8 +2993,8 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
         # open the socket app-wide for notifications without leaking others' activity.
         is_admin_conn = False
         try:
-            from database import get_db_context
-            from models import User as _WSUser, RoleEnum as _WSRole
+            from app.core.database import get_db_context
+            from app.core.models import User as _WSUser, RoleEnum as _WSRole
             with get_db_context() as _wsdb:
                 _wsu = _wsdb.query(_WSUser).filter(_WSUser.id == uuid.UUID(user_id)).first()
                 # A temporary credential — even an admin's — is NOT a full admin here: it receives
@@ -3135,7 +3135,7 @@ async def create_user(
         )
         
         # Grant default permissions based on role
-        from endpoint_permissions import grant_default_permissions_for_role
+        from app.core.endpoint_permissions import grant_default_permissions_for_role
         grant_default_permissions_for_role(str(new_user.id), new_user.role, db)
         
         audit_logger.log_user_created(new_user, current_user, client_ip)
@@ -3268,8 +3268,8 @@ async def search_users(
     non-admin owners (who cannot read the admin-only /users list). Scoping the search to the
     specific vault being shared (rather than the whole directory) is a possible future refinement."""
     from ecc_router import _manages_any_vault
-    from rate_limiter import rate_limiter as _rl
-    from rate_limiter import RateLimiterUnavailable
+    from app.core.rate_limiter import rate_limiter as _rl
+    from app.core.rate_limiter import RateLimiterUnavailable
     from sqlalchemy import or_
 
     q = (q or "").strip()
@@ -3348,7 +3348,7 @@ async def update_user(
     """
     Update user (admin or self for limited fields).
     """
-    from security import hash_password
+    from app.core.security import hash_password
     
     user = db.query(User).filter(User.id == user_id).first()
     
@@ -3506,7 +3506,7 @@ async def list_ssh_keys(
     db: Session = Depends(get_db),
 ):
     """List a user's authorized SSH public keys (admin or self)."""
-    from models import UserSSHKey
+    from app.core.models import UserSSHKey
     _ssh_key_target_user(user_id, current_user, db)
     keys = db.query(UserSSHKey).filter(UserSSHKey.user_id == user_id).order_by(UserSSHKey.created_at).all()
     return [SSHKeyResponse.model_validate(k) for k in keys]
@@ -3521,7 +3521,7 @@ async def add_ssh_key(
     db: Session = Depends(get_db),
 ):
     """Add an SSH public key authorizing this user's SFTP access (admin or self)."""
-    from models import UserSSHKey
+    from app.core.models import UserSSHKey
     _ssh_key_target_user(user_id, current_user, db)
     key_type, normalized, fingerprint = _parse_ssh_public_key(body.public_key)
     if db.query(UserSSHKey).filter(
@@ -3556,7 +3556,7 @@ async def delete_ssh_key(
     db: Session = Depends(get_db),
 ):
     """Remove an authorized SSH key (admin or self)."""
-    from models import UserSSHKey
+    from app.core.models import UserSSHKey
     _ssh_key_target_user(user_id, current_user, db)
     key = db.query(UserSSHKey).filter(
         UserSSHKey.id == key_id, UserSSHKey.user_id == user_id
@@ -3943,7 +3943,7 @@ def _require_zk_sealed_names(*tokens) -> None:
     The marker is a SERVER-enforced invariant: the model load events skip ZK blobs by it,
     the seal no-clobber guard keys on it, and enforcing it stops a buggy/hostile client from
     parking a plaintext (or otherwise non-conformant) name in the enc_name column."""
-    from security import is_zk_sealed_name
+    from app.core.security import is_zk_sealed_name
     for t in tokens:
         if t is not None and not is_zk_sealed_name(t):
             raise HTTPException(
@@ -3970,7 +3970,7 @@ def _zk_enabled(db) -> bool:
     if settings.plan_force_zero_knowledge:
         return True
     try:
-        from models import SystemSetting
+        from app.core.models import SystemSetting
         row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
         val = (row.value or {}) if (row and row.value) else {}
         override = val.get("zero_knowledge_enabled")
@@ -3995,7 +3995,7 @@ def _user_must_use_zk(db, user) -> bool:
     never boxed into 'must use ZK but ZK is off'."""
     plan_force = settings.plan_force_zero_knowledge and settings.plan_zero_knowledge
     try:
-        from models import SystemSetting, user_groups
+        from app.core.models import SystemSetting, user_groups
         from sqlalchemy import select
         row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
         val = (row.value or {}) if (row and row.value) else {}
@@ -4018,7 +4018,7 @@ def _user_must_use_zk(db, user) -> bool:
 def _zk_vault_count(db) -> int:
     """Active zero-knowledge vaults in this deployment (one deployment = one customer
     org). Used to enforce the plan's per-deployment ZK-vault cap."""
-    from models import Vault
+    from app.core.models import Vault
     return db.query(Vault).filter(
         Vault.type == "zero_knowledge", Vault.is_active == True  # noqa: E712
     ).count()
@@ -4050,7 +4050,7 @@ def _enforce_user_cap(db) -> None:
     cap = settings.plan_max_users
     if cap is None or cap < 0:
         return  # unlimited (-1); cap==0 falls through and blocks every create (freeze)
-    from models import User
+    from app.core.models import User
     count = db.query(User).filter(User.is_active == True).count()  # noqa: E712
     if count >= cap:
         raise HTTPException(
@@ -4140,7 +4140,7 @@ async def create_vault(
     vault_type = _resolve_vault_type_for_create(current_user, vault_create.type, db)
 
     # A scoped temp credential may be restricted to a specific vault type (standard vs ZK).
-    from temp_scope import require_create_vault_type
+    from app.core.temp_scope import require_create_vault_type
     require_create_vault_type(current_user, vault_type)
 
     vault = vault_service.create_vault(
@@ -4159,7 +4159,7 @@ async def create_vault(
     # the owner has no keypair or the client didn't supply a wrapped DEK, since that
     # would leave a vault nobody can decrypt.
     if vault_type == 'zero_knowledge':
-        from models import UserKeyPair, VaultMemberKey
+        from app.core.models import UserKeyPair, VaultMemberKey
         if not db.query(UserKeyPair).filter(UserKeyPair.user_id == current_user.id).first():
             db.delete(vault)
             db.commit()
@@ -4274,7 +4274,7 @@ async def list_vaults(
     vaults = vault_service.list_vaults(current_user)
 
     # Which of these vaults has the caller starred? (one query, not N)
-    from models import vault_favorites
+    from app.core.models import vault_favorites
     from sqlalchemy import select as _select
     fav_ids = {
         r[0] for r in db.execute(
@@ -4373,7 +4373,7 @@ async def get_vault(
 
 
 def _is_vault_favorite(db: Session, user_id: uuid.UUID, vault_id: uuid.UUID) -> bool:
-    from models import vault_favorites
+    from app.core.models import vault_favorites
     from sqlalchemy import select as _select
     return db.execute(
         _select(vault_favorites.c.vault_id).where(
@@ -4392,7 +4392,7 @@ async def set_vault_favorite(
     db: Session = Depends(get_db),
 ):
     """Star a vault for the current user (idempotent personal preference)."""
-    from models import vault_favorites, Vault, VaultPermissionEnum
+    from app.core.models import vault_favorites, Vault, VaultPermissionEnum
     from sqlalchemy import insert as _insert
     # require READ access before favoriting. Without this, favoriting is a cross-tenant
     # existence oracle (200-vs-404 on any vault_id) plus an unauthorized write on a vault the
@@ -4421,7 +4421,7 @@ async def unset_vault_favorite(
     db: Session = Depends(get_db),
 ):
     """Un-star a vault for the current user."""
-    from models import vault_favorites
+    from app.core.models import vault_favorites
     from sqlalchemy import delete as _delete
     db.execute(
         _delete(vault_favorites).where(
@@ -4644,7 +4644,7 @@ async def change_vault_password(
         
         # Update password
         if new_password:
-            from security import hash_password
+            from app.core.security import hash_password
             vault.password_hash = hash_password(new_password)
         else:
             vault.password_hash = None
@@ -4796,7 +4796,7 @@ def _is_vault_owner_or_admin(vault, current_user) -> bool:
 def _vault_member_manages(db, vault_id, user_id) -> bool:
     """True if the given user is a Manager of the vault (member row with
     manage_permission set)."""
-    from models import vault_members
+    from app.core.models import vault_members
     from sqlalchemy import select, and_
     row = db.execute(
         select(vault_members.c.manage_permission).where(and_(
@@ -4832,7 +4832,7 @@ async def list_vault_permissions(
     """
     try:
         # Get vault directly from database
-        from models import Vault
+        from app.core.models import Vault
         vault = db.query(Vault).filter(Vault.id == vault_id).first()
         
         if not vault:
@@ -4849,7 +4849,7 @@ async def list_vault_permissions(
             )
 
         # Query vault_members table
-        from models import vault_members
+        from app.core.models import vault_members
         from sqlalchemy import select
 
         stmt = select(
@@ -4909,7 +4909,7 @@ async def grant_vault_permission(
     """
     try:
         # Get vault directly from database
-        from models import Vault
+        from app.core.models import Vault
         vault = db.query(Vault).filter(Vault.id == vault_id).first()
         
         if not vault:
@@ -4966,7 +4966,7 @@ async def grant_vault_permission(
                 detail="Only the vault owner or an admin can modify a manager"
             )
 
-        from models import vault_members
+        from app.core.models import vault_members
         from sqlalchemy.dialects.postgresql import insert as _pg_insert
 
         # Set permissions based on level. 'manage' implies full read/write/delete.
@@ -5030,7 +5030,7 @@ async def revoke_vault_permission(
     """
     try:
         # Get vault directly from database
-        from models import Vault
+        from app.core.models import Vault
         vault = db.query(Vault).filter(Vault.id == vault_id).first()
         
         if not vault:
@@ -5054,7 +5054,7 @@ async def revoke_vault_permission(
             )
 
         # Delete permission entry
-        from models import vault_members
+        from app.core.models import vault_members
         from sqlalchemy import delete as sql_delete
 
         stmt = sql_delete(vault_members).where(
@@ -5072,7 +5072,7 @@ async def revoke_vault_permission(
         # the removed user could still fetch their current-epoch DEK until the reconciler
         # swept it. Keeps the authz and crypto planes consistent on every revoke path.
         if getattr(vault, 'type', 'standard') == 'zero_knowledge':
-            from models import VaultMemberKey
+            from app.core.models import VaultMemberKey
             now = datetime.now(timezone.utc)
             for mk in db.query(VaultMemberKey).filter(
                 VaultMemberKey.vault_id == vault_id,
@@ -5123,7 +5123,7 @@ async def list_vault_group_access(
     db: Session = Depends(get_db)
 ):
     """List departments (groups) granted access to a vault (owner/manager/admin)."""
-    from models import Vault, Group, vault_group_access
+    from app.core.models import Vault, Group, vault_group_access
     from sqlalchemy import select
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
     if not vault:
@@ -5151,7 +5151,7 @@ async def grant_vault_group_access(
     db: Session = Depends(get_db)
 ):
     """Grant a department access to a vault (owner or admin)."""
-    from models import Vault, Group, vault_group_access
+    from app.core.models import Vault, Group, vault_group_access
     from sqlalchemy import select, insert, update
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
     if not vault:
@@ -5205,7 +5205,7 @@ async def revoke_vault_group_access(
     db: Session = Depends(get_db)
 ):
     """Revoke a department's access to a vault (owner or admin)."""
-    from models import Vault, vault_group_access
+    from app.core.models import Vault, vault_group_access
     from sqlalchemy import delete as sql_delete
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
     if not vault:
@@ -5248,9 +5248,9 @@ async def rotate_vault_encryption_key(
     Only vault owner can rotate keys.
     """
     try:
-        from models import Vault
-        from vault_key_utils import rotate_vault_key
-        from config import settings
+        from app.core.models import Vault
+        from app.core.vault_key_utils import rotate_vault_key
+        from app.core.config import settings
         
         # Get vault
         vault = db.query(Vault).filter(Vault.id == vault_id).first()
@@ -5329,8 +5329,8 @@ async def get_vault_key_history(
     Only vault owner and members can view key history.
     """
     try:
-        from models import Vault
-        from vault_key_utils import get_vault_key_history
+        from app.core.models import Vault
+        from app.core.vault_key_utils import get_vault_key_history
         
         # Get vault
         vault = db.query(Vault).filter(Vault.id == vault_id).first()
@@ -5443,7 +5443,7 @@ async def list_vault_files(
         # NULL); a legacy/UNSEALED row (enc_name NULL but a plaintext name left over from
         # before client-side sealing was enforced on the write paths) gets masked with a
         # neutral placeholder so cleartext the ZK contract says we don't hold is never served.
-        from security import is_zk_sealed_name as _zk_sealed
+        from app.core.security import is_zk_sealed_name as _zk_sealed
         _ZK_UNSEALED = "[encrypted - re-seal required]"
 
         # Add folders
@@ -5520,7 +5520,7 @@ async def list_vault_files(
 def _has_vault_cap(user, vault_id, cap: str) -> bool:
     """Non-raising per-vault temp-credential capability check (True for normal
     users / legacy creds). Mirrors temp_scope.require_cap."""
-    from temp_scope import is_scoped, effective_vault_caps
+    from app.core.temp_scope import is_scoped, effective_vault_caps
     if not is_scoped(user):
         return True
     scope = getattr(user, "_temp_scope", None) or {}
@@ -5622,7 +5622,7 @@ async def upload_file(
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
-    from database import redis_client
+    from app.core.database import redis_client
     
     try:
         # Verify vault access and password (from header for security)
@@ -7217,7 +7217,7 @@ async def delete_file(
         # Feed the bulk-deletion detector (rapid single-file API deletions raise a BULK_FILE_DELETION
         # alert). Best-effort: monitoring must never fail the delete.
         try:
-            from security_monitor import get_security_monitor
+            from app.services.security_monitor import get_security_monitor
             get_security_monitor(db).record_file_deletion(str(current_user.id), str(vault_id), file_count=1)
         except Exception:
             pass
@@ -7524,7 +7524,7 @@ async def delete_folder(
         # permission, not the mere READ that get_vault checks. Without this a read-only member
         # could destroy a whole folder tree (the per-file delete_file errors below were
         # swallowed, so the folder records were removed regardless). Owner/admin/delete-member.
-        from models import VaultPermissionEnum
+        from app.core.models import VaultPermissionEnum
         if not permission_service.can_access_vault(current_user, vault_id, VaultPermissionEnum.DELETE):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
                                 detail="You do not have permission to delete folders in this vault")
@@ -7567,7 +7567,7 @@ async def delete_folder(
         # Best-effort: monitoring must never fail the delete.
         if deleted_count:
             try:
-                from security_monitor import get_security_monitor
+                from app.services.security_monitor import get_security_monitor
                 get_security_monitor(db).record_file_deletion(str(current_user.id), str(vault_id), file_count=deleted_count)
             except Exception:
                 pass
@@ -7626,7 +7626,7 @@ async def zk_seal_names(
     ciphertext. Only converts a still-plaintext (unsealed) row to its encrypted form; an
     already-ZK-sealed row is left untouched (so this can't be used to overwrite a name).
     Requires WRITE on the vault; only valid for zero-knowledge vaults."""
-    from security import is_zk_sealed_name
+    from app.core.security import is_zk_sealed_name
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
@@ -7689,7 +7689,7 @@ async def get_dashboard_stats(
     """
     Get dashboard statistics (admin only).
     """
-    from models import Vault, File, ActiveSession
+    from app.core.models import Vault, File, ActiveSession
     from sqlalchemy import func
     
     total_users = db.query(func.count(User.id)).scalar()
@@ -7717,7 +7717,7 @@ async def logout(
     db: Session = Depends(get_db)
 ):
     """Logout user and invalidate session."""
-    from models import ActiveSession
+    from app.core.models import ActiveSession
     
     # Get JWT token from request
     token = request.headers.get('Authorization', '').replace('Bearer ', '')
@@ -7788,7 +7788,7 @@ async def get_monitoring_metrics(
     Performance: Supports ETag caching (polled every 10s as WebSocket backup).
     Returns 304 Not Modified when metrics unchanged, reducing polling overhead.
     """
-    from models import ActiveSession, TemporaryCredential, File, AuditLog
+    from app.core.models import ActiveSession, TemporaryCredential, File, AuditLog
     from sqlalchemy import func, distinct
     from datetime import datetime, timedelta
     
@@ -7930,7 +7930,7 @@ async def get_security_metrics(
     Requires admin privileges.
     """
     try:
-        from security_monitor import get_security_monitor
+        from app.services.security_monitor import get_security_monitor
         
         monitor = get_security_monitor(db)
         metrics = monitor.get_security_metrics(hours=hours)
@@ -7960,7 +7960,7 @@ async def get_security_alerts(
     Requires admin privileges.
     """
     try:
-        from security_monitor import get_security_monitor
+        from app.services.security_monitor import get_security_monitor
         
         monitor = get_security_monitor(db)
 
@@ -8019,7 +8019,7 @@ async def resolve_security_alert(
     Requires admin privileges.
     """
     try:
-        from security_monitor import get_security_monitor
+        from app.services.security_monitor import get_security_monitor
         
         monitor = get_security_monitor(db)
         # Convert current_user.username from Column to string using getattr
@@ -8063,7 +8063,7 @@ async def get_user_security_activity(
     except (ValueError, AttributeError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid user id")
     try:
-        from security_monitor import get_security_monitor
+        from app.services.security_monitor import get_security_monitor
 
         monitor = get_security_monitor(db)
         analysis = monitor.analyze_user_activity(user_id, hours=hours)
@@ -8134,7 +8134,7 @@ async def get_user_permissions(
     Users can access their own permissions, admins can access any user's permissions.
     For admin users, returns all permission groups as granted.
     """
-    from endpoint_permissions import get_user_permissions as get_perms
+    from app.core.endpoint_permissions import get_user_permissions as get_perms
     from app.core.api_catalog import API_CATALOG
     
     # Authorization: users see only their own permissions; a real (interactive) admin can see anyone's.
@@ -8186,7 +8186,7 @@ async def grant_user_permission(
     """
     Grant a functionality group to a user (admin only).
     """
-    from endpoint_permissions import grant_endpoint_permission
+    from app.core.endpoint_permissions import grant_endpoint_permission
     from app.core.api_catalog import API_CATALOG
     
     # Validate user exists
@@ -8252,7 +8252,7 @@ async def revoke_user_permission(
     """
     Revoke a functionality group from a user (admin only).
     """
-    from endpoint_permissions import revoke_endpoint_permission
+    from app.core.endpoint_permissions import revoke_endpoint_permission
     from app.core.api_catalog import API_CATALOG
     
     # Validate user exists
@@ -8317,8 +8317,8 @@ import asyncio
 
 async def cleanup_expired_sessions():
     """Background task to periodically clean up expired sessions."""
-    from models import ActiveSession, RateLimitRecord, User
-    from database import get_db_context
+    from app.core.models import ActiveSession, RateLimitRecord, User
+    from app.core.database import get_db_context
 
     while True:
         try:
@@ -8398,11 +8398,11 @@ def _seed_admin_user():
     no admin password is configured.
     """
     try:
-        from database import get_db_context
+        from app.core.database import get_db_context
         from auth_service import AuthService
-        from models import RoleEnum, User
+        from app.core.models import RoleEnum, User
 
-        # Match the config.py guard's emptiness definition: a whitespace-only value is "blank"
+        # Match the app/core/config.py guard's emptiness definition: a whitespace-only value is "blank"
         # (the post-bootstrap no-op state), not a credential to seed.
         if not (settings.admin_password or "").strip():
             return
@@ -8425,9 +8425,9 @@ def _backfill_default_permissions():
     (idempotent). Picks up newly-added defaults such as temp-credential
     self-service for the 'user' role without needing the user to be recreated."""
     try:
-        from database import get_db_context
-        from endpoint_permissions import grant_default_permissions_for_role
-        from models import RoleEnum, User
+        from app.core.database import get_db_context
+        from app.core.endpoint_permissions import grant_default_permissions_for_role
+        from app.core.models import RoleEnum, User
         with get_db_context() as db:
             users = db.query(User).filter(User.role != RoleEnum.ADMIN).all()
             for u in users:
@@ -8442,7 +8442,7 @@ def _run_lightweight_migrations():
     missing TABLES, not missing COLUMNS, so new columns on existing tables must be
     added here (Postgres ADD COLUMN IF NOT EXISTS makes this safe to re-run)."""
     try:
-        from database import get_db_context
+        from app.core.database import get_db_context
         from sqlalchemy import text
         statements = [
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS unlock_remember_minutes INTEGER",
@@ -8587,8 +8587,8 @@ def _backfill_encrypted_names():
     the clear). Rows already sealed (enc_name set), zero-knowledge vaults, and rows with
     no plaintext name are skipped — safe to re-run. Runs after the columns exist."""
     try:
-        from database import get_db_context
-        from models import File, Folder, Vault
+        from app.core.database import get_db_context
+        from app.core.models import File, Folder, Vault
         from vault_service import _seal_named_object
         BATCH = 500
         with get_db_context() as db:
@@ -8623,7 +8623,7 @@ def _backfill_encrypted_names():
 
 # The fixed sentinel a NULL folder_id / parent_folder_id is folded to inside the name
 # unique indexes, so two vault-ROOT items with the same name still collide (Postgres treats
-# NULLs as distinct otherwise). MUST match models.py File/Folder __table_args__ exactly.
+# NULLs as distinct otherwise). MUST match app/core/models.py File/Folder __table_args__ exactly.
 _NAME_UNIQ_NULL_FK = "'00000000-0000-0000-0000-000000000000'::uuid"
 
 
@@ -8644,9 +8644,9 @@ def _add_name_uniqueness():
     new create-time check until an operator resolves the duplicates."""
     try:
         from sqlalchemy import text
-        from database import get_db_context
-        from models import File, Vault
-        from authorization import PermissionService
+        from app.core.database import get_db_context
+        from app.core.models import File, Vault
+        from app.core.authorization import PermissionService
 
         # 1) Collapse pre-existing FILE duplicates (defensive; normally none exist). Isolated
         # so a de-dupe hiccup never prevents index creation below (if real dups remain, the

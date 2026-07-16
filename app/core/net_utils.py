@@ -23,7 +23,7 @@ import ipaddress
 from functools import lru_cache
 from typing import List, Optional
 
-from config import settings
+from app.core.config import settings
 
 
 @lru_cache(maxsize=1)

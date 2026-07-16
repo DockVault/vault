@@ -14,15 +14,15 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 
-from models import User, Vault, Folder, File, VaultPermissionEnum
-from security import (
+from app.core.models import User, Vault, Folder, File, VaultPermissionEnum
+from app.core.security import (
     encrypt_file_content, decrypt_file_content,
     calculate_file_checksum, verify_file_integrity,
     hash_password, verify_password, sanitize_filename
 )
-from authorization import PermissionService
-from config import settings
-from database import redis_client
+from app.core.authorization import PermissionService
+from app.core.config import settings
+from app.core.database import redis_client
 from app.services.encrypted_file_storage import EncryptedFileStorage
 
 
@@ -37,7 +37,7 @@ def _seal_named_object(vault, obj, is_file: bool) -> None:
     """
     if getattr(vault, 'type', 'standard') != 'standard':
         return
-    from security import encrypt_object_field, name_blind_index
+    from app.core.security import encrypt_object_field, name_blind_index
     if is_file:
         if obj.original_name is not None:
             obj.enc_name = encrypt_object_field(obj.vault_id, obj.id, obj.original_name, 'name')
@@ -62,7 +62,7 @@ def _name_match_filter(model, vault, name: str):
     Non-standard (ZK/legacy) vaults match on the plaintext column directly."""
     plain_col = model.original_name if model is File else model.name
     if getattr(vault, 'type', 'standard') == 'standard':
-        from security import name_blind_index
+        from app.core.security import name_blind_index
         return or_(model.name_bi == name_blind_index(vault.id, name), plain_col == name)
     return plain_col == name
 
@@ -201,8 +201,8 @@ class VaultService:
         Returns:
             Created Vault object
         """
-        from vault_key_utils import generate_vault_key, encrypt_vault_key
-        from config import settings
+        from app.core.vault_key_utils import generate_vault_key, encrypt_vault_key
+        from app.core.config import settings
         import json
         
         # Hash password if provided
@@ -285,7 +285,7 @@ class VaultService:
         # Least-privilege gate: a scoped temp credential may only reach vaults in
         # its scope. No-op for normal users / legacy creds. Covers web AND SFTP
         # because every per-vault operation funnels through get_vault().
-        from temp_scope import enforce_vault
+        from app.core.temp_scope import enforce_vault
         enforce_vault(user, vault_id)
 
         # Rate limiting for password-protected vaults
@@ -295,7 +295,7 @@ class VaultService:
             attempts = redis_client.get(rate_key)
             
             # Different limits based on role (admins get higher limit)
-            from models import RoleEnum
+            from app.core.models import RoleEnum
             limit = settings.rate_limit_vault_attempts_admin if user.role == RoleEnum.ADMIN else settings.rate_limit_vault_attempts
             
             if attempts and int(attempts) >= limit:
@@ -362,7 +362,7 @@ class VaultService:
         ).all()
 
         # Get vaults accessible via the user's group memberships
-        from models import vault_group_access, user_groups
+        from app.core.models import vault_group_access, user_groups
         from sqlalchemy import select
         group_ids = [
             r[0] for r in self.db.execute(
@@ -391,7 +391,7 @@ class VaultService:
 
         # Scoped temp credential in 'selected' mode: restrict to its granted set
         # (intersection enforces "restrict, never expand"). 'all' / legacy: no-op.
-        from temp_scope import is_scoped
+        from app.core.temp_scope import is_scoped
         if is_scoped(user) and getattr(user, '_temp_vault_mode', 'selected') == 'selected':
             allowed = set((getattr(user, '_temp_vault_caps', {}) or {}).keys())
             all_vaults = [v for v in all_vaults if str(v.id) in allowed]
@@ -428,7 +428,7 @@ class VaultService:
         
         # Only owner can update vault
         if vault.owner_id != user.id:
-            from authorization import PermissionDeniedError
+            from app.core.authorization import PermissionDeniedError
             raise PermissionDeniedError("Only vault owner can update vault")
         
         if name is not None:
@@ -439,8 +439,8 @@ class VaultService:
         
         # ✅ NEW: Handle password changes that require re-encrypting vault key
         if password is not None:
-            from vault_key_utils import decrypt_vault_key, encrypt_vault_key
-            from config import settings
+            from app.core.vault_key_utils import decrypt_vault_key, encrypt_vault_key
+            from app.core.config import settings
             import json
             
             master_key = settings.encryption_key.encode()
@@ -509,9 +509,9 @@ class VaultService:
         # the sole caller (the delete route) runs get_vault() first, which gates READ with no
         # admin special-case, so a non-member admin is already blocked upstream; this admin arm
         # covers an admin who is a member. Fails closed.
-        from models import RoleEnum
+        from app.core.models import RoleEnum
         if vault.owner_id != user.id and user.role != RoleEnum.ADMIN:
-            from authorization import PermissionDeniedError
+            from app.core.authorization import PermissionDeniedError
             raise PermissionDeniedError("Only the vault owner or an admin can delete this vault")
         
         vault_dir = self._get_vault_path(vault_id)
@@ -726,7 +726,7 @@ class VaultService:
             Tuple of (File object, StreamingUploadContext)
         """
         from app.services.streaming_upload import StreamingUploadContext
-        from security import GcmChunkStreamCodec, IdentityChunkCodec, calculate_file_checksum
+        from app.core.security import GcmChunkStreamCodec, IdentityChunkCodec, calculate_file_checksum
         
         # Verify vault access
         self.permission_service.require_vault_permission(
@@ -1020,7 +1020,7 @@ class VaultService:
         # NB: the old whole-file AES-GCM writer (upload_file + EncryptedFileStorage) is
         # never called, and its detector compared only header[:5] to a 9-byte magic so it
         # never matched — there are no such files to read.
-        from security import (
+        from app.core.security import (
             is_gcm_chunk_stream, decrypt_gcm_chunk_stream, decrypt_chunk_stream,
         )
 

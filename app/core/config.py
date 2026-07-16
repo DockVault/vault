@@ -22,7 +22,7 @@ else:
     pass
 
 # Import and unlock credentials
-from startup_security import credential_manager
+from app.core.startup_security import credential_manager
 
 # Only require master password if encrypted credentials are present
 has_encrypted_creds = os.getenv("ENCRYPTED_ENCRYPTION_KEY") and os.getenv("MASTER_PASSWORD_HASH")

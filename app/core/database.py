@@ -8,8 +8,8 @@ from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import NullPool
 import redis
 
-from config import settings
-from models import Base
+from app.core.config import settings
+from app.core.models import Base
 
 
 # PostgreSQL Engine

@@ -20,9 +20,9 @@ import json
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, desc
 
-from models import AuditLog, User, SecurityAlert
-from database import redis_client
-from config import settings
+from app.core.models import AuditLog, User, SecurityAlert
+from app.core.database import redis_client
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 

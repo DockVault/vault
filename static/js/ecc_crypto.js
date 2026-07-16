@@ -556,7 +556,7 @@ class ECCCryptoLibrary {
     // the server in a zero-knowledge vault. They are encrypted here IN THE BROWSER under
     // the same per-vault DEK as the content, and the server stores only the opaque blob
     // plus a blind index it cannot reverse. The server keeps these verbatim and decrypts
-    // nothing. Format/AAD/HKDF here MUST match security.py (ZK_NAME_PREFIX) and the test
+    // nothing. Format/AAD/HKDF here MUST match app/core/security.py (ZK_NAME_PREFIX) and the test
     // helpers — changing any of them silently breaks decryption of existing names.
 
     // Marker prefix on every ZK-sealed name blob so the SERVER can tell a browser-encrypted

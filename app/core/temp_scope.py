@@ -25,7 +25,7 @@ import uuid
 
 from fastapi import HTTPException, status
 
-from authorization import PermissionDeniedError
+from app.core.authorization import PermissionDeniedError
 
 # ---------------------------------------------------------------------------
 # Vocabulary
@@ -164,7 +164,7 @@ def attach_scope(db, user, temp_cred) -> None:
     caps_map: Dict[str, List[str]] = {}
     pw_fp_map: Dict[str, Optional[str]] = {}
     if temp_cred.scope is not None and user._temp_vault_mode == "selected":
-        from models import TempCredentialVaultAccess
+        from app.core.models import TempCredentialVaultAccess
         rows = db.query(TempCredentialVaultAccess).filter(
             TempCredentialVaultAccess.temp_credential_id == temp_cred.id
         ).all()

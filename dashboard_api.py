@@ -12,8 +12,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc, select
 
-from database import get_db
-from models import User, Vault, vault_members, TemporaryCredential, AuditLog, ActiveSession, RoleEnum
+from app.core.database import get_db
+from app.core.models import User, Vault, vault_members, TemporaryCredential, AuditLog, ActiveSession, RoleEnum
 from app.core.response_hash_utils import handle_conditional_response
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])

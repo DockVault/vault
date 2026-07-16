@@ -16,11 +16,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_
 from pydantic import BaseModel, EmailStr, Field
 
-from database import get_db
-from models import User, TemporaryCredential, RoleEnum, AuditLog, ActiveSession
+from app.core.database import get_db
+from app.core.models import User, TemporaryCredential, RoleEnum, AuditLog, ActiveSession
 from auth_service import AuthService
 from app.services.audit_logger import AuditLogger
-from endpoint_permissions import require_endpoint_permission
+from app.core.endpoint_permissions import require_endpoint_permission
 
 security_scheme = HTTPBearer()
 
@@ -439,7 +439,7 @@ def _blacklist_user_vault_keys(db: Session, user_id, revoked_by) -> int:
     key-holder — and for a sole-owner vault that is irreversible (no client left holds the DEK to
     re-wrap it), bricking the vault. A departing OWNER is an ownership-transfer problem, not a
     key-blacklist one, so their owned vaults are left intact. Returns the count blacklisted."""
-    from models import VaultMemberKey, Vault
+    from app.core.models import VaultMemberKey, Vault
     now = datetime.now(timezone.utc)
     owned_vault_ids = {vid for (vid,) in db.query(Vault.id).filter(Vault.owner_id == user_id).all()}
     rows = db.query(VaultMemberKey).filter(

@@ -18,7 +18,7 @@ from typing import Dict, Any
 
 from app.config.branding import branding
 from app.config.effective import get_effective_branding, branding_public_payload
-from database import get_db
+from app.core.database import get_db
 
 router = APIRouter(tags=["Information"])
 

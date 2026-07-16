@@ -13,17 +13,17 @@ from sqlalchemy import and_, or_, case
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from fastapi import HTTPException, status
-from models import (
+from app.core.models import (
     User, TemporaryCredential, ActiveSession, AuditLog,
     RateLimitRecord, RoleEnum, Vault
 )
-from security import (
+from app.core.security import (
     hash_password, verify_password, generate_temporary_credentials,
     verify_temporary_credential, generate_session_token, vault_password_fingerprint
 )
 from app.core.session_hash_utils import hash_session_token
-from database import redis_client, get_db_context
-from config import settings
+from app.core.database import redis_client, get_db_context
+from app.core.config import settings
 
 
 # Precomputed Argon2 hash used to equalize login timing: verifying the supplied password
@@ -354,7 +354,7 @@ class AuthService:
         # Tag the principal with this credential's least-privilege scope so both
         # the web (get_current_user re-attaches on JWT replay) and SFTP paths
         # enforce it. NULL scope = legacy = unrestricted.
-        from temp_scope import attach_scope
+        from app.core.temp_scope import attach_scope
         attach_scope(self.db, user, temp_cred)
 
         # Check if there's already an active session for this temp credential
@@ -450,7 +450,7 @@ class AuthService:
         # Resolve the least-privilege scope. None = legacy/unrestricted. When a
         # temp session delegates (parent_scope set), intersect so the child can
         # never exceed its parent.
-        from temp_scope import intersect_scope, VAULT_CAPS, expand_vault_caps
+        from app.core.temp_scope import intersect_scope, VAULT_CAPS, expand_vault_caps
         is_delegated = parent_scope is not None
         if scope is None and not is_delegated:
             effective_scope = None
@@ -544,7 +544,7 @@ class AuthService:
         # Persist per-vault access rows for 'selected' mode. For a delegated child,
         # constrain the selection + capabilities to what the parent itself held.
         if effective_scope is not None and mode == 'selected' and selected_vaults:
-            from models import TempCredentialVaultAccess
+            from app.core.models import TempCredentialVaultAccess
             parent_ids = set(str(v) for v in (parent_vault_ids or []))
             for sv in selected_vaults:
                 vid = sv.get('vault_id') if isinstance(sv, dict) else None
@@ -832,7 +832,7 @@ class AuthService:
         Raises RateLimitExceededError if the limit is exceeded; returns rate
         limit info (for response headers) otherwise.
         """
-        from rate_limiter import rate_limiter, RateLimiterUnavailable
+        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
 
         user_limit = settings.rate_limit_login_attempts
         ip_limit = settings.rate_limit_login_attempts * 2  # 2x threshold for IPs

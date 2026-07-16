@@ -302,7 +302,7 @@ class TemporaryCredential(Base):
     can_create_temp_credentials = Column(Boolean, default=False, nullable=False)
 
     # Least-privilege scope. NULL = legacy credential = unrestricted (inherits the
-    # creating user's full access). See temp_scope.py for the document shape.
+    # creating user's full access). See app/core/temp_scope.py for the document shape.
     scope = Column(JSON, nullable=True)
     # 'all' -> every vault the creator can reach; 'selected' -> only the vaults in
     # temp_credential_vault_access. Only consulted when scope is non-NULL.
@@ -333,7 +333,7 @@ class TempCredentialVaultAccess(Base):
         UUID(as_uuid=True), ForeignKey('temporary_credentials.id', ondelete='CASCADE'), nullable=False)
     vault_id = Column(UUID(as_uuid=True), ForeignKey('vaults.id', ondelete='CASCADE'), nullable=False)
     # Capability strings this credential holds on THIS vault (subset of the vocab
-    # in temp_scope.py, e.g. ["vault.see_files", "file.download"]).
+    # in app/core/temp_scope.py, e.g. ["vault.see_files", "file.download"]).
     vault_caps = Column(JSON, nullable=False, default=list)
     # Fingerprint of the vault's password hash captured when this grant was minted (only
     # for password-protected vaults; NULL otherwise). Re-checked on every SFTP access so a
@@ -649,7 +649,7 @@ def _decrypt_file_names(target, *_args):
     enc_mime = getattr(target, 'enc_mime', None)
     if not enc_name and not enc_mime:
         return
-    from security import decrypt_object_field, is_zk_sealed_name
+    from app.core.security import decrypt_object_field, is_zk_sealed_name
     # Zero-knowledge names are encrypted client-side under the vault DEK; the server has
     # no key and MUST leave them opaque (plaintext columns stay NULL — the browser
     # decrypts). Detect by the ZK marker so we never spam decrypt failures or, worse,
@@ -682,7 +682,7 @@ def _decrypt_folder_name(target, *_args):
     enc_name = getattr(target, 'enc_name', None)
     if not enc_name:
         return
-    from security import decrypt_object_field, is_zk_sealed_name
+    from app.core.security import decrypt_object_field, is_zk_sealed_name
     # Zero-knowledge folder names are browser-encrypted under the vault DEK — leave opaque.
     if is_zk_sealed_name(enc_name):
         return
