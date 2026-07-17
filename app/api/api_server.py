@@ -41,7 +41,7 @@ from app.services.vault_service import require_file_scope, require_folder_scope,
 from app.core.id_scope import id_in_scope
 from sqlalchemy.exc import IntegrityError
 from app.services.audit_logger import AuditLogger
-from app.services import log_pull  # RO2-3: pure helpers for the authenticated log-pull endpoint
+from app.services import log_pull  # pure helpers for the authenticated log-pull endpoint
 from app.core.security import create_access_token, verify_access_token
 from app.core.config import settings
 from app.core.endpoint_permissions import require_endpoint_permission
@@ -1296,7 +1296,7 @@ _SETTINGS_KEY = "global"
 _SETTINGS_SENSITIVE = {"smtp_password"}
 
 # ---------------------------------------------------------------------------
-# Brand fields (A3): the settings keys that ALSO drive the effective branding.
+# Brand fields: the settings keys that ALSO drive the effective branding.
 # When present in a /settings PUT they are validated here and mirrored into the
 # brand override row SystemSetting('brand') (see update_settings), so the admin
 # Settings page edits /branding + the rendered shell (title/header/theme colours)
@@ -1449,7 +1449,7 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     # Brand fields (app_name, tagline, company, support email, key URLs, the 8 theme
     # colours, copyright) are mirrored into the effective-branding override by
     # update_settings, so a bad value would rebrand the shell or inject into :root —
-    # validate them here (A3; A6 wired app_name).
+    # validate them here.
     _validate_brand_overrides(payload)
 
     _validate_group_id_list(payload, "sftp_require_temp_cred_groups", db)
@@ -1510,11 +1510,11 @@ async def update_settings(
     # SystemSetting('brand') (distinct from the 'global' settings row that
     # get_effective_branding merges over the env defaults) so the admin Settings
     # page drives /branding and the rendered shell <title>/header/theme colours live,
-    # no restart (A3; A6 wired app_name). Each field is validated above; an empty/
+    # no restart. Each field is validated above; an empty/
     # whitespace value drops that override -> back to the env default.
     brand_keys = _BRAND_FIELDS & set((payload or {}).keys())
     if brand_keys:
-        # shared writer (also used by A4 uploads + the A5 wizard): non-empty sets, empty
+        # shared writer (also used by the asset uploads + the setup wizard): non-empty sets, empty
         # clears -> env default. Values were validated by _validate_brand_overrides above.
         set_brand_overrides(db, updates={key: payload[key] for key in brand_keys})
     db.commit()
@@ -1641,7 +1641,7 @@ async def send_test_email(
 
 
 # ===========================================================================
-# RO2-3 — authenticated, disableable log-PULL endpoint (GET /logs) + admin token mgmt.
+# Authenticated, disableable log-PULL endpoint (GET /logs) + admin token mgmt.
 # Two-layer gate: the env CEILING (settings.plan_log_pull, HARD, default off) AND a
 # per-component DB flag in SystemSetting('logs'). A dedicated bearer dependency (NOT
 # require_endpoint_permission, whose catalog-miss fails OPEN) validates a LogPullToken by
@@ -1786,7 +1786,7 @@ async def pull_logs(
     token=Depends(require_log_pull_token),
     db: Session = Depends(get_db),
 ):
-    """Authenticated per-component log pull (RO2-3). Returns JSON {service, lines, truncated}.
+    """Authenticated per-component log pull. Returns JSON {service, lines, truncated}.
 
     `service` is optional in the signature (default None) so a missing value returns the same
     404 as an unknown one — no 422 that would reveal the endpoint exists when the ceiling is off.
@@ -1931,7 +1931,7 @@ async def disable_log_token(
 
 
 # ---------------------------------------------------------------------------
-# Brand asset uploads (A4): admin-uploaded logo / favicon. Stored in a writable
+# Brand asset uploads: admin-uploaded logo / favicon. Stored in a writable
 # volume (/app/brand), served from /brand-assets/, and pointed at by the effective
 # logo/favicon URLs via the 'brand' override row. Reset drops the override -> the
 # baked default returns. Env-level URLs (BRAND_LOGO_URL) still win as a deploy default.
@@ -1980,7 +1980,7 @@ def _is_safe_asset_name(name: str) -> bool:
 
 def _update_brand_row(db, set_map=None, remove_keys=None) -> None:
     """Thin wrapper over the shared brand-override writer (app.config.effective) so the
-    asset-upload path (A4) writes the same store as the Settings editor + wizard. Caller
+    asset-upload path writes the same store as the Settings editor + wizard. Caller
     commits. (set_map values here are server-generated /brand-assets URLs, never empty.)"""
     set_brand_overrides(db, updates=set_map, remove_keys=remove_keys)
 

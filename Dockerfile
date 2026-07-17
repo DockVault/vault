@@ -23,7 +23,7 @@ COPY . .
 
 # Runtime data directories (config.ensure_directories() and the SFTP server also
 # create these, but pre-making them keeps volume mounts clean). `brand` holds
-# admin-uploaded logo/favicon assets (A4) and is backed by a writable named volume
+# admin-uploaded logo/favicon assets and is backed by a writable named volume
 # so uploads survive a restart even under the read-only root fs; pre-making it here
 # (before the chown below) means a fresh volume mounted over it inherits appuser
 # ownership, so the non-root process can write uploads into it.

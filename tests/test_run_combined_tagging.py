@@ -97,7 +97,7 @@ def test_spawn_high_volume_child_drains_without_deadlock(tmp_path):
     assert any("err " in ln for ln in lines), "stderr was not merged into the tagged stream"
 
 
-# ---- RO2-3 Increment 1: the log sink (a rotating FILE the in-container API can tail, since it
+# ---- The log sink (a rotating FILE the in-container API can tail, since it
 #      is a SEPARATE process that cannot read this launcher's stdout). The sink write must never
 #      block a pump — it only put_nowait()s onto a bounded queue that a writer thread drains. ----
 

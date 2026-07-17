@@ -839,7 +839,7 @@ class UserPreference(Base):
 
 
 class LogPullToken(Base):
-    """RO2-3: a named bearer token that may PULL the container logs via GET /logs.
+    """A named bearer token that may PULL the container logs via GET /logs.
 
     Multiple tokens can coexist (zero-gap rotation = mint a new one, then disable the old).
     Only the peppered HMAC-SHA256 hash is stored — the plaintext is shown ONCE at mint time and

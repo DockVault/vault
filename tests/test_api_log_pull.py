@@ -1,4 +1,4 @@
-"""RO2-3 Phase 1 — the authenticated log-PULL endpoint + admin token management, over the
+"""The authenticated log-PULL endpoint + admin token management, over the
 live HTTP chain.
 
 The pure security logic (hashing, scope, filtering, redaction, the gate) is unit-tested in
@@ -23,7 +23,7 @@ def _require_endpoint(admin):
     """Skip cleanly if the running vault image predates the log-pull endpoint."""
     r = admin.get("/settings/logs")
     if r.status_code == 404:
-        pytest.skip("running vault image predates the RO2-3 log-pull endpoint (rebuild+redeploy)")
+        pytest.skip("running vault image predates the log-pull endpoint (rebuild+redeploy)")
 
 
 def _mint(admin, scope=("web",), name=None):

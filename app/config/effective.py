@@ -8,8 +8,8 @@ historically drifted apart:
   * JSON -> ``setup_state.json`` written by the setup wizard
 
 This module merges the DB brand overrides on top of the env :class:`BrandingConfig`
-so every reader — the ``/branding`` endpoint, the UI shell (A2), the setup wizard and
-email identity (A5) — sees the same *effective* values, editable at runtime with no
+so every reader — the ``/branding`` endpoint, the UI shell, the setup wizard and
+email identity — sees the same *effective* values, editable at runtime with no
 process restart.
 
 Readers MUST call :func:`get_effective_branding` (which re-reads the DB each call)
@@ -70,7 +70,7 @@ def set_brand_overrides(db, updates: Dict[str, Any] = None, remove_keys=None) ->
     A non-empty value in ``updates`` sets that key; an empty/whitespace/``None`` value
     (or a key in ``remove_keys``) drops it, reverting that field to the env default.
     The **single low-level writer** for every branding path — the admin Settings editor
-    (A3), logo/favicon uploads (A4) and the setup wizard (A5) — so all three feed the
+    , logo/favicon uploads and the setup wizard — so all three feed the
     same effective store. The caller commits (and is responsible for validating values;
     the read-time :func:`merge_branding` guard drops anything invalid as defence in depth).
     """
@@ -97,7 +97,7 @@ def merge_branding(base: BrandingConfig, overrides: Dict[str, Any]) -> BrandingC
     * Unknown keys are dropped (only declared :class:`BrandingConfig` fields apply).
     * A value the validators reject (bad hex colour, malformed email, …) is dropped and
       falls back to the env default — so a corrupt stored override can never break a
-      reader. Overrides are validated on write (A3); this read-time guard is defence in
+      reader. Overrides are validated on write; this read-time guard is defence in
       depth.
 
     No DB access — unit-testable in isolation.

@@ -45,7 +45,7 @@ async def get_branding_endpoint(db: Session = Depends(get_db)):
     Get the EFFECTIVE public branding.
 
     Env defaults with DB ``SystemSetting('brand')`` overrides layered on top. This is the
-    single source of truth the UI shell reads (A2) to render the app name, logo, favicon
+    single source of truth the UI shell reads to render the app name, logo, favicon
     and theme colours. Includes:
     - identity + company + support email + key URLs + copyright (``to_public_dict``)
     - ``colors``: the 8 theme colours as CSS custom properties (``:root`` ready)

@@ -1,4 +1,4 @@
-"""Brand asset upload tests (A4): an admin uploads a logo / favicon that is stored in a
+"""Brand asset upload tests: an admin uploads a logo / favicon that is stored in a
 writable volume, served from ``/brand-assets/`` with hardening headers, and pointed at by
 the effective ``logo_url`` / ``favicon_url`` (via the ``SystemSetting('brand')`` row) so
 ``/branding`` and the rendered shell use it. Type + size are validated; a reset reverts to

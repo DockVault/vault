@@ -33,7 +33,7 @@ from pydantic import Field, validator
 # module constant so the admin brand write path (api_server ``_validate_brand_overrides``,
 # A3) validates identically to the model validator below — a length-only check would
 # pass CSS metacharacters like ``#}body{`` that break out of a ``:root { … }`` rule once
-# the UI (A2) injects the value, enabling style-injection / ``url()`` exfil.
+# the UI injects the value, enabling style-injection / ``url()`` exfil.
 HEX_COLOR_RE = re.compile(r'^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$')
 
 
@@ -144,8 +144,8 @@ class BrandingConfig(BaseSettings):
     # ========================================
     
     # Defaults point at the real bundled DockVault assets (static/assets/*.png). The UI shell
-    # consumes these via /branding (A2), so a default MUST resolve to a file that exists
-    # — the old /static/logo.svg / /static/favicon.ico paths had no backing file. A4 adds
+    # consumes these via /branding, so a default MUST resolve to a file that exists
+    # — the old /static/logo.svg / /static/favicon.ico paths had no backing file. The
     # an admin upload path (POST /settings/brand/asset/{slot}) that overrides these at
     # runtime (served from /brand-assets/); these defaults are the DockVault logo/favicon.
     logo_url: str = Field(
@@ -382,7 +382,7 @@ class BrandingConfig(BaseSettings):
 
         Only ``#`` + 3 or 6 hex digits are allowed — no other characters. A length-only
         check (``len in (4, 7)``) would pass CSS metacharacters like ``#}body{`` which,
-        once injected into a ``:root { --primary-color: … }`` block by the UI (A2), break
+        once injected into a ``:root { --primary-color: … }`` block by the UI, break
         out of the rule and enable style-injection / ``url()`` exfil. The strict pattern
         closes that at the source and, being shared, hardens the A3 admin write path too.
         """

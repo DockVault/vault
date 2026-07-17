@@ -111,7 +111,7 @@ class Settings(BaseSettings):
     # behaves exactly as before. Unrecognised entries are ignored; an all-invalid value is
     # treated as empty (permissive) so a typo can never brick all vault creation.
     plan_allowed_vault_types: str = Field(default="")
-    # RO2-3: may this deployment expose the authenticated log-PULL endpoint (GET /logs)?
+    # May this deployment expose the authenticated log-PULL endpoint (GET /logs)?
     # DELIBERATELY default FALSE — unlike the other PLAN_* ceilings (which default permissive so
     # an un-gated vault behaves as before), exposing the log stream is the UNSAFE direction, and
     # "as before" here means "no log endpoint at all". So the endpoint 404s everywhere until the
@@ -131,7 +131,7 @@ class Settings(BaseSettings):
     jwt_algorithm: str = Field(default="HS256")
     jwt_access_token_expire_minutes: int = Field(default=30)
 
-    # RO2-3: dedicated HMAC pepper for hashing log-pull tokens at rest (NOT derived from
+    # Dedicated HMAC pepper for hashing log-pull tokens at rest (NOT derived from
     # ENCRYPTION_KEY/JWT_SECRET_KEY — a distinct secret so a leak of one does not compromise
     # stored token hashes). Plain env (not credential_manager) — it is only needed when the
     # log-pull ceiling is on, and its weakness is caught by a startup refusal below.
@@ -323,7 +323,7 @@ if _admin_pw:
 
 
 # --- Warn (do NOT brick) on a weak/empty LOG_TOKEN_PEPPER when the plan enables log-pull ---
-# The pepper hardens stored log-pull token hashes (RO2-3). It is only load-bearing when the
+# The pepper hardens stored log-pull token hashes. It is only load-bearing when the
 # endpoint can be reached. A DATA VAULT must never refuse to boot over a LOG-feature config
 # problem (that would deny the customer access to their FILES), and the control plane may set
 # PLAN_LOG_PULL a moment before the pepper reaches an existing/bundle container. So a

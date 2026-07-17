@@ -1,4 +1,4 @@
-"""RO2-3 Phase 1 — the admin 'Log access' Settings tab, end to end through the real UI.
+"""The admin 'Log access' Settings tab, end to end through the real UI.
 
 Logs in as admin, opens Settings -> Log access, toggles a component flag (persists via
 PUT /settings/logs), generates a token (the plaintext is revealed ONCE and the list shows
@@ -29,7 +29,7 @@ def _open_log_tab(page: Page):
 
 def test_log_access_tab_generate_and_disable(page: Page, admin_creds, admin):
     if not _endpoint_present(admin):
-        pytest.skip("running vault image predates the RO2-3 log-pull endpoint")
+        pytest.skip("running vault image predates the log-pull endpoint")
 
     _login(page, admin_creds["username"], admin_creds["password"])
     _open_log_tab(page)
@@ -75,7 +75,7 @@ def test_log_access_tab_generate_and_disable(page: Page, admin_creds, admin):
 
 def test_flag_toggle_persists(page: Page, admin_creds, admin):
     if not _endpoint_present(admin):
-        pytest.skip("running vault image predates the RO2-3 log-pull endpoint")
+        pytest.skip("running vault image predates the log-pull endpoint")
     import time
     before = admin.get("/settings/logs").json().get("flags", {})
     try:
@@ -102,7 +102,7 @@ def test_flag_toggle_persists(page: Page, admin_creds, admin):
 
 def test_stealth_toggle_persists(page: Page, admin_creds, admin):
     if not _endpoint_present(admin):
-        pytest.skip("running vault image predates the RO2-3 log-pull endpoint")
+        pytest.skip("running vault image predates the log-pull endpoint")
     import time
     before = bool(admin.get("/settings/logs").json().get("stealth_404", False))
     try:

@@ -123,7 +123,7 @@ services:
       - vault_storage:/app/storage
       - vault_logs:/app/logs
       - vault_keys:/app/keys
-      # Admin-uploaded logo/favicon assets (A4). A named volume (not tmpfs) so the
+      # Admin-uploaded logo/favicon assets. A named volume (not tmpfs) so the
       # brand survives a restart; the image pre-creates /app/brand as appuser so the
       # non-root process can write here under the read-only root fs.
       - vault_brand:/app/brand

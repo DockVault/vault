@@ -1,4 +1,4 @@
-"""RO2-3 Phase 1 — pure helpers behind GET /logs (app/services/log_pull.py). Security-critical: token
+"""Pure helpers behind GET /logs (app/services/log_pull.py). Security-critical: token
 hashing, scope validation, per-service filtering, the enable gate, and redaction. Pure stdlib,
 no app import, no running vault.
 """

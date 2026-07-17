@@ -1,4 +1,4 @@
-"""Branding / white-label end-to-end tests (A2).
+"""Branding / white-label end-to-end tests.
 
 Proves the app shell is data-driven from GET /branding via brand.js + data-brand-* hooks:
 with a DB SystemSetting('brand') override the served page's <title>, header name, logo alt
@@ -112,7 +112,7 @@ def test_shell_default_is_data_driven_from_branding(page: Page):
 
 
 def test_hostile_brand_values_are_neutralised(page: Page):
-    """Branding is admin-editable (A3) and could be hostile: the name must render as TEXT
+    """Branding is admin-editable and could be hostile: the name must render as TEXT
     (not HTML) and a javascript: logo URL must be rejected — no script executes."""
     with brand_override({"app_name": "<img src=x onerror=window.__xss=1>",
                          "logo_url": "javascript:window.__xss=1",

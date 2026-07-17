@@ -18,7 +18,7 @@
  *                            hidden only when powered_by.show is false (a deploy-level flag,
  *                            NOT the tenant editor, so a customizing tenant can't remove it)
  *
- * Security: branding values are admin-editable (A3) and could be hostile. Text is set
+ * Security: branding values are admin-editable and could be hostile. Text is set
  * via textContent only (never innerHTML — also hook-enforced). Asset URLs are
  * scheme-sanitised (only a same-origin path or an http(s) URL — javascript:/data: are
  * rejected). Theme colours are accepted only as strict hex.

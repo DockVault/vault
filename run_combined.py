@@ -38,8 +38,8 @@ _PROCS: list = []
 # on the shared parent stdout.
 _STDOUT_LOCK = threading.Lock()
 
-# --- RO2-3 log sink ---------------------------------------------------------------------
-# The API server that serves the RO2-3 pull endpoint runs as a SEPARATE child process; it
+# --- log sink ---------------------------------------------------------------------
+# The API server that serves the pull endpoint runs as a SEPARATE child process; it
 # cannot read this launcher's stdout (where the tagged lines go for `docker logs`) nor the
 # other child's stdout. So we ALSO append every tagged line to a bounded, rotating FILE that
 # the in-container API can tail. Writing to that file must NEVER block a `_pump` reader — a
@@ -199,7 +199,7 @@ def _on_signal(signum, _frame):
 def main() -> None:
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
-    # Set up the RO2-3 log sink (best-effort) and its writer thread BEFORE spawning children,
+    # Set up the log sink (best-effort) and its writer thread BEFORE spawning children,
     # so no tagged line is enqueued with no drainer running (the bounded queue would just fill
     # and drop — safe — but starting the writer first captures early startup lines too).
     _init_sink()

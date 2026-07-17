@@ -3580,15 +3580,15 @@ async function initSettings() {
     
     // Setup tab switching
     setupSettingsTabs();
-    setupLogAccess();  // RO2-3 log-access tab wiring
+    setupLogAccess();  // log-access tab wiring
 
-    // Wire the branding color pickers <-> text inputs (A3) + logo/favicon uploads (A4)
+    // Wire the branding color pickers <-> text inputs + logo/favicon uploads
     wireBrandColorInputs();
     wireBrandAssetUploads();
 
     // Load current settings
     await loadSettings();
-    loadLogSettings();  // RO2-3 (silent; no-op for non-admins)
+    loadLogSettings();  // silent; no-op for non-admins
     
     // Attach event listeners
     attachSettingsListeners();
@@ -3697,7 +3697,7 @@ async function applyBrandFields(settings) {
             if (hex) pick.value = hex;
         }
     }
-    // asset previews (A4) show the current effective logo / favicon
+    // asset previews show the current effective logo / favicon
     const assets = brand.assets || {};
     setBrandPreview('brand-logo-preview', assets.logo_small || assets.logo);
     setBrandPreview('brand-favicon-preview', assets.favicon);
@@ -3799,12 +3799,12 @@ function setupSettingsTabs() {
             if (content) {
                 content.classList.add('active');
             }
-            if (tabId === 'logs') { loadLogSettings(); }  // RO2-3: refresh on tab open
+            if (tabId === 'logs') { loadLogSettings(); }  // refresh on tab open
         });
     });
 }
 
-// ---- RO2-3 Log access (admin Settings tab) ---------------------------------------------
+// ---- Log access (admin Settings tab) ---------------------------------------------
 const LOG_COMPONENT_LABELS = {
     'web': 'Web / API', 'sftp': 'SFTP',
     'db-diag': 'DB diagnostics', 'redis-diag': 'Redis diagnostics',
@@ -4085,7 +4085,7 @@ async function loadSettings() {
         standardVaultAllowedGroups = (settings.standard_vault_allowed_groups || []).map(String);
         await loadSftpPolicyGroups();
 
-        // Branding (A3): stored overrides -> values, effective /branding -> placeholders
+        // Branding: stored overrides -> values, effective /branding -> placeholders
         await applyBrandFields(settings);
 
         console.log('✓ Settings loaded');
@@ -4137,7 +4137,7 @@ async function saveAllSettings() {
             directory_search_scope: (document.getElementById('setting-directory-search-scope') || {}).value || 'deployment'
         };
 
-        // Branding (A3): send the brand overrides. An empty value clears that
+        // Branding: send the brand overrides. An empty value clears that
         // override server-side (reverts to the env default). app_name/app_description
         // are already collected above from the General tab.
         for (const [elId, key] of Object.entries(BRAND_SETTING_FIELDS)) {
