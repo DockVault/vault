@@ -1495,6 +1495,35 @@ def _enforce_vault_size(db: Session, owner: User, requested_bytes: int, exclude_
         )
 
 
+def _upload_policy(db: Session):
+    """The current admin upload policy as (allowed_exts_set_or_None, effective_max_file_bytes) from
+    ONE settings read. allowed=None means no file-type restriction. The max is the env per-file cap,
+    lowered (never raised) by the admin 'max file size' setting."""
+    from app.core import upload_policy
+    from app.core.models import SystemSetting
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    blob = (row.value or {}) if (row and row.value) else {}
+    allowed = upload_policy.parse_allowed_exts(blob.get("allowed_file_types"))
+    env_bytes = settings.max_file_size_mb * 1024 * 1024
+    return allowed, upload_policy.effective_max_file_bytes(env_bytes, blob.get("max_file_size"))
+
+
+def _enforce_file_type(filename: str, allowed_exts) -> None:
+    """Reject (400) a filename whose extension isn't in the admin allowlist. No-op when allowed_exts
+    is None (no restriction). ZK vaults are exempt at the call site (their names are encrypted, so
+    the server can't see the extension). Takes a pre-read allowed set to avoid a per-file query."""
+    from app.core import upload_policy
+    if upload_policy.file_type_allowed(filename, allowed_exts):
+        return
+    ext = upload_policy.file_ext(filename)
+    permitted = f" Allowed: {', '.join('.' + e for e in sorted(allowed_exts))}." if allowed_exts else ""
+    raise HTTPException(
+        status_code=400,
+        detail=(f"File type '.{ext}' is not permitted here." if ext
+                else "Files without an extension are not permitted here.") + permitted,
+    )
+
+
 def _validate_settings_payload(payload: dict, db: Session) -> None:
     """Validate the few settings keys that drive real enforcement so the admin UI
     can't silently persist values that later fail open. The store is otherwise
@@ -1539,6 +1568,16 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             v = payload[gb_key]
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
                 raise HTTPException(status_code=400, detail=f"{gb_key} must be a non-negative number of GB")
+
+    # Upload policy: allowed_file_types (extension allowlist; empty = allow all) + max_file_size (MB).
+    if "allowed_file_types" in payload and payload["allowed_file_types"] is not None:
+        v = payload["allowed_file_types"]
+        if not isinstance(v, list) or not all(isinstance(e, str) for e in v):
+            raise HTTPException(status_code=400, detail="allowed_file_types must be a list of extension strings")
+    if "max_file_size" in payload and payload["max_file_size"] is not None:
+        v = payload["max_file_size"]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+            raise HTTPException(status_code=400, detail="max_file_size must be a non-negative number of MB")
 
 
 @app.get("/settings")
@@ -5855,11 +5894,13 @@ async def upload_file(
         # spreading data across many vaults.
         _enforce_deployment_storage_quota(db, estimated_upload_size)
 
-        # the per-file ceiling (max_file_size_mb) is enforced IN-STREAM inside the
-        # per-file loop below (see the bytes_uploaded check) — matching chunked-init — so an
-        # oversized single file is aborted before it is fully buffered to transient disk,
-        # WITHOUT wrongly rejecting a legitimate multi-file upload on its aggregate size.
-        _max_upload_bytes = settings.max_file_size_mb * 1024 * 1024
+        # the per-file ceiling is enforced IN-STREAM inside the per-file loop below (see the
+        # bytes_uploaded check) — matching chunked-init — so an oversized single file is aborted
+        # before it is fully buffered to transient disk, WITHOUT wrongly rejecting a legitimate
+        # multi-file upload on its aggregate size. Read the admin upload policy (allowed types +
+        # effective max) ONCE here; this multipart path is standard-only (ZK is rejected above), so
+        # the file-type allowlist always applies.
+        _allowed_exts, _max_upload_bytes = _upload_policy(db)
 
         # Parse folder_id if provided
         folder_uuid = uuid.UUID(folder_id) if folder_id else None
@@ -5966,7 +6007,10 @@ async def upload_file(
             # Validate filename
             if not upload_file.filename:
                 continue  # Skip files without names
-            
+
+            # Reject a disallowed file type up front (before any reservation/streaming work).
+            _enforce_file_type(upload_file.filename, _allowed_exts)
+
             # Create operation ID for tracking
             operation_id = f"upload_{uuid.uuid4()}"
             
@@ -6094,7 +6138,7 @@ async def upload_file(
                         if bytes_uploaded + len(chunk) > _max_upload_bytes:
                             raise HTTPException(
                                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                                detail=f"File '{upload_file.filename}' exceeds the maximum size of {settings.max_file_size_mb}MB",
+                                detail=f"File '{upload_file.filename}' exceeds the maximum size of {_max_upload_bytes // (1024 * 1024)}MB",
                             )
 
                         # Write and encrypt chunk immediately
@@ -6531,6 +6575,7 @@ async def init_chunked_upload(
     # index and MUST NOT carry a plaintext name/MIME (that would defeat zero-knowledge).
     # Standard uploads are the inverse: a plaintext name is required.
     is_zk = _is_zk_vault(vault)
+    _allowed_exts, _max_file_bytes = _upload_policy(db)
     if is_zk:
         if not body.enc_name or not body.name_bi:
             raise HTTPException(
@@ -6550,10 +6595,12 @@ async def init_chunked_upload(
         # sink is also defended, but keeping the at-rest name clean avoids log/listing
         # corruption from a crafted chunked-upload file_name (this path skips sanitize_filename).
         body.file_name = ''.join(c for c in body.file_name if ord(c) >= 32 and ord(c) != 127) or "download"
+        # Standard (non-ZK) uploads carry a plaintext name — enforce the admin file-type allowlist.
+        # ZK names are browser-encrypted (server-invisible), so ZK vaults are exempt.
+        _enforce_file_type(body.file_name, _allowed_exts)
 
-    max_size = settings.max_file_size_mb * 1024 * 1024
-    if body.total_size > max_size:
-        raise HTTPException(status_code=413, detail=f"File exceeds maximum size of {settings.max_file_size_mb}MB")
+    if body.total_size > _max_file_bytes:
+        raise HTTPException(status_code=413, detail=f"File exceeds maximum size of {_max_file_bytes // (1024 * 1024)}MB")
     if vault.size_limit and (vault.total_size_bytes or 0) + body.total_size > vault.size_limit:
         raise HTTPException(status_code=413, detail="File would exceed the vault size limit")
     _enforce_deployment_storage_quota(db, body.total_size)   # plan aggregate storage ceiling
@@ -7527,6 +7574,15 @@ async def rename_file(
             _cur = getattr(locked_vault, 'dek_version', 1) or 1
             if rename_data.name_key_version is not None and int(rename_data.name_key_version) > _cur:
                 raise HTTPException(status_code=400, detail="Folder name epoch is ahead of the vault's current key epoch.")
+
+        # Renaming a FILE is a write path too: enforce the admin file-type allowlist on the new
+        # name so a user can't upload an allowed type then rename it to a forbidden extension.
+        # Standard vaults only (ZK renames carry an encrypted, server-invisible name); folders have
+        # no file-type, so this only applies when the id resolves to a file.
+        if rename_data.new_name and not _is_zk_vault(vault):
+            _is_file = db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id).first() is not None
+            if _is_file:
+                _enforce_file_type(rename_data.new_name, _upload_policy(db)[0])
 
         # Rename the file/folder. Scoped to the path vault: rename_file rejects an id
         # that belongs to a DIFFERENT vault (cross-vault guard, files + folders), so the

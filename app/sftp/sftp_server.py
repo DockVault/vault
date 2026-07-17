@@ -767,6 +767,15 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 return paramiko.SFTP_NO_SUCH_FILE
             if not self._has_cap(user, vault.id, "file.upload"):
                 return paramiko.SFTP_PERMISSION_DENIED
+            # Admin file-type allowlist + effective max size. SFTP serves only standard vaults, so
+            # the plaintext extension is always visible and the allowlist always applies.
+            from app.core import upload_policy as _up
+            from app.core.models import SystemSetting as _SS
+            _srow = db.query(_SS).filter(_SS.key == "global").first()
+            _sblob = (_srow.value or {}) if (_srow and _srow.value) else {}
+            if not _up.file_type_allowed(filename, _up.parse_allowed_exts(_sblob.get("allowed_file_types"))):
+                return paramiko.SFTP_PERMISSION_DENIED
+            _eff_max = _up.effective_max_file_bytes((settings.max_file_size_mb or 0) * 1024 * 1024, _sblob.get("max_file_size"))
             try:
                 folder_id = self._resolve_folder(db, vault.id, segments[1:-1])
             except _PathNotFound:
@@ -814,7 +823,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         handle.writefile = wf
         # Bound the buffered plaintext in-stream at the configured per-file max, so the write
         # can't fill the shared .sftp_tmp volume before the close-time size check runs.
-        handle.max_bytes = (settings.max_file_size_mb or 0) * 1024 * 1024
+        handle.max_bytes = _eff_max
         handle.finalizer = self._make_upload_finalizer(
             vault_id, folder_id, filename, can_overwrite
         )
@@ -1021,6 +1030,16 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             # parent — so the item's own scope covers both source and destination); else non-existent.
             if not self._scope_ok_item(db, user, vault.id, target_id):
                 return paramiko.SFTP_NO_SUCH_FILE
+            # Renaming a FILE enforces the admin file-type allowlist on the new name (SFTP serves
+            # only standard vaults, so the extension is visible); folders have no file-type. Parity
+            # with the web rename + the upload sinks.
+            if f is not None:
+                from app.core import upload_policy as _up
+                from app.core.models import SystemSetting as _SS
+                _srow2 = db.query(_SS).filter(_SS.key == "global").first()
+                _sblob2 = (_srow2.value or {}) if (_srow2 and _srow2.value) else {}
+                if not _up.file_type_allowed(_strip_ctrl(new_seg[-1]), _up.parse_allowed_exts(_sblob2.get("allowed_file_types"))):
+                    return paramiko.SFTP_PERMISSION_DENIED
             try:
                 # vault_id pins the rename to the resolved vault (cross-vault guard).
                 # Strip control chars at the rename sink (parity with the upload sink) so a
