@@ -1524,6 +1524,18 @@ def _enforce_file_type(filename: str, allowed_exts) -> None:
     )
 
 
+def _setting_int(db: Session, key: str, default: int) -> int:
+    """A positive-integer override from SystemSetting('global'), or `default` when absent / ≤0 /
+    unparseable. Used to let the admin Settings UI tune the session-timeout without a redeploy."""
+    from app.core.models import SystemSetting
+    try:
+        row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+        n = int((row.value or {}).get(key)) if (row and row.value) else 0
+        return n if n > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _validate_password_policy(db: Session, password: str) -> None:
     """Enforce the admin account-password policy (min length + complexity) on a new account password.
     The API model already guarantees an 8-char floor; the stored policy can raise the minimum and add
@@ -1601,6 +1613,13 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     for bkey in ("require_uppercase", "require_lowercase", "require_numbers", "require_special"):
         if bkey in payload and not isinstance(payload[bkey], bool):
             raise HTTPException(status_code=400, detail=f"{bkey} must be true or false")
+
+    # Auth limits (0/absent = keep the deployment env default). Enforced at login / token mint.
+    for int_key in ("max_login_attempts", "lockout_duration", "session_timeout"):
+        if int_key in payload and payload[int_key] is not None:
+            v = payload[int_key]
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise HTTPException(status_code=400, detail=f"{int_key} must be a non-negative integer")
 
 
 @app.get("/settings")
@@ -2370,14 +2389,20 @@ async def login(
             )
             is_temporary = False
         
-        # Create JWT token (include session_token for session validation)
+        # Create JWT token (include session_token for session validation). A REGULAR session honours
+        # the admin 'Session Timeout' setting (falling back to the env default); a temp credential
+        # keeps the default token life — its own validity window is enforced separately.
+        _expires = None
+        if not is_temporary:
+            _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
         access_token = create_access_token(
             data={
-                "sub": str(user.id), 
+                "sub": str(user.id),
                 "username": user.username,
                 "session_token": session_token if session_token else None,
                 "is_temporary": is_temporary
-            }
+            },
+            expires_delta=_expires,
         )
         
         audit_logger.log_login_success(user, client_ip, is_temporary=is_temporary)

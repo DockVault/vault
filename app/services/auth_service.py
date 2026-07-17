@@ -838,6 +838,19 @@ class AuthService:
         for session in existing_sessions:
             self._terminate_session(session)
     
+    def _global_setting(self, key, default):
+        """A positive-integer override from the admin SystemSetting('global') blob, or `default`
+        (the env value) when absent / non-positive / unreadable. Lets the admin Settings UI tune the
+        login limits without a redeploy. FAILS SAFE to `default` so a settings-read hiccup (e.g. a
+        pre-migration DB) can never break login."""
+        from app.core.models import SystemSetting
+        try:
+            row = self.db.query(SystemSetting).filter(SystemSetting.key == "global").first()
+            n = int((row.value or {}).get(key)) if (row and row.value) else 0
+            return n if n > 0 else default
+        except Exception:  # noqa: BLE001 — fail safe to the env default; login must not break
+            return default
+
     def _check_rate_limit(self, identifier: str, ip_address: str):
         """
         Check the login rate limit (per-username AND per-IP).
@@ -855,8 +868,9 @@ class AuthService:
         """
         from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
 
-        user_limit = settings.rate_limit_login_attempts
-        ip_limit = settings.rate_limit_login_attempts * 2  # 2x threshold for IPs
+        # The admin 'Max Login Attempts' setting overrides the env default when configured.
+        user_limit = self._global_setting("max_login_attempts", settings.rate_limit_login_attempts)
+        ip_limit = user_limit * 2  # 2x threshold for IPs
         window = settings.rate_limit_login_window_seconds
 
         try:
@@ -1013,11 +1027,11 @@ class AuthService:
             # locked_until=NULL). Do NOT downgrade such a standing lock into an auto-expiring
             # one — only arm a fresh auto-lock when the account is not already permanently
             # locked (regression guard).
-            if user.failed_login_attempts >= settings.rate_limit_login_attempts and not (
-                user.is_locked and user.locked_until is None
-            ):
+            if user.failed_login_attempts >= self._global_setting(
+                "max_login_attempts", settings.rate_limit_login_attempts
+            ) and not (user.is_locked and user.locked_until is None):
                 user.is_locked = True
-                ttl = getattr(settings, 'account_lockout_minutes', 0) or 0
+                ttl = self._global_setting("lockout_duration", getattr(settings, 'account_lockout_minutes', 0) or 0)
                 user.locked_until = (
                     datetime.utcnow() + timedelta(minutes=ttl) if ttl > 0 else None
                 )
