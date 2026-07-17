@@ -215,6 +215,29 @@ function hideAdminNavForTempSession() {
         const el = document.querySelector(`.sidebar-item[data-section="${sec}"]`);
         if (el) el.style.display = 'none';
     });
+    reconcileNavGroupLabels();
+}
+
+// The v2 (Console) skin injects presentational rail group labels (Overview / Storage / Access /
+// System) unconditionally, assuming each group leads with an always-visible item. That holds for a
+// full admin, but a scoped temp credential (or a regular non-admin) hides whole groups of items,
+// leaving a label stranded over an empty run. Hide a label when every sidebar-item until the next
+// label is hidden. No-op on the v1 skin (no labels) and for an admin (every group keeps an item).
+function reconcileNavGroupLabels() {
+    const nav = document.querySelector('.sidebar-nav');
+    if (!nav) return;
+    nav.querySelectorAll('.nav-group-label').forEach(label => {
+        let visible = false;
+        let sib = label.nextElementSibling;
+        while (sib && !sib.classList.contains('nav-group-label')) {
+            if (sib.classList.contains('sidebar-item') && getComputedStyle(sib).display !== 'none') {
+                visible = true;
+                break;
+            }
+            sib = sib.nextElementSibling;
+        }
+        label.style.display = visible ? '' : 'none';
+    });
 }
 
 // Fetch which nav sections the CURRENT session may see. Only a SCOPED temporary
@@ -269,6 +292,7 @@ function applyScopedNavLock() {
     document.querySelectorAll('.sidebar-item[data-section]').forEach(item => {
         item.style.display = allowed.has(item.getAttribute('data-section')) ? 'flex' : 'none';
     });
+    reconcileNavGroupLabels();  // drop group headers left over an empty run of hidden items
     // If we're on a section the scope doesn't permit (default dashboard, or a
     // restored view), move to the first allowed one — or show nothing at all if
     // the scope grants no pages.
@@ -366,6 +390,7 @@ function updateNavigationPermissions() {
             rolesNav.style.display = 'none';
         }
     }
+    reconcileNavGroupLabels();  // hide any group header whose whole run of items is now hidden
 }
 
 // Update action button visibility/state based on permissions
@@ -840,6 +865,10 @@ function updateProfileUI(user) {
         if (usersTab) {
             usersTab.style.display = 'block';
         }
+        // Revealing the admin-only items may have re-populated a group that was empty when
+        // updateNavigationPermissions last reconciled, so reconcile again (a group whose whole run
+        // is admin-only would otherwise keep a wrongly-hidden header).
+        reconcileNavGroupLabels();
     }
 
     // If this is a scoped temp credential whose owner is an admin, the block above
