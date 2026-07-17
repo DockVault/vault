@@ -4177,7 +4177,7 @@ async function loadSettings() {
         document.getElementById('setting-allowed-types').value = (settings.allowed_file_types || []).join(', ');
         
         // Security
-        document.getElementById('setting-password-min-length').value = settings.password_min_length || 12;
+        document.getElementById('setting-password-min-length').value = settings.password_min_length || 8;  // 8 = the enforced floor
         document.getElementById('setting-require-uppercase').checked = settings.require_uppercase !== false;
         document.getElementById('setting-require-lowercase').checked = settings.require_lowercase !== false;
         document.getElementById('setting-require-numbers').checked = settings.require_numbers !== false;
@@ -4256,7 +4256,7 @@ async function saveAllSettings() {
                 .filter(t => t),
             
             // Security
-            password_min_length: parseInt(document.getElementById('setting-password-min-length').value) || 12,
+            password_min_length: parseInt(document.getElementById('setting-password-min-length').value) || 8,
             require_uppercase: document.getElementById('setting-require-uppercase').checked,
             require_lowercase: document.getElementById('setting-require-lowercase').checked,
             require_numbers: document.getElementById('setting-require-numbers').checked,

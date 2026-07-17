@@ -1524,6 +1524,19 @@ def _enforce_file_type(filename: str, allowed_exts) -> None:
     )
 
 
+def _validate_password_policy(db: Session, password: str) -> None:
+    """Enforce the admin account-password policy (min length + complexity) on a new account password.
+    The API model already guarantees an 8-char floor; the stored policy can raise the minimum and add
+    any complexity requirements the admin enabled. No-op when nothing beyond the floor is configured."""
+    from app.core import password_policy
+    from app.core.models import SystemSetting
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    cfg = (row.value or {}) if (row and row.value) else {}
+    errs = password_policy.password_policy_errors(password, cfg)
+    if errs:
+        raise HTTPException(status_code=400, detail="Password must " + "; ".join(errs) + ".")
+
+
 def _validate_settings_payload(payload: dict, db: Session) -> None:
     """Validate the few settings keys that drive real enforcement so the admin UI
     can't silently persist values that later fail open. The store is otherwise
@@ -1578,6 +1591,16 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
         v = payload["max_file_size"]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
             raise HTTPException(status_code=400, detail="max_file_size must be a non-negative number of MB")
+
+    # Account-password policy: minimum length + the four complexity toggles (enforced on user
+    # create/password-change; the model keeps an 8-char hard floor the stored minimum can only raise).
+    if "password_min_length" in payload and payload["password_min_length"] is not None:
+        v = payload["password_min_length"]
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise HTTPException(status_code=400, detail="password_min_length must be a non-negative integer")
+    for bkey in ("require_uppercase", "require_lowercase", "require_numbers", "require_special"):
+        if bkey in payload and not isinstance(payload[bkey], bool):
+            raise HTTPException(status_code=400, detail=f"{bkey} must be true or false")
 
 
 @app.get("/settings")
@@ -3273,6 +3296,9 @@ async def create_user(
     # Plan cap on the number of user accounts in this deployment.
     _enforce_user_cap(db)
 
+    # Admin password policy (min length + complexity) beyond the model's 8-char floor.
+    _validate_password_policy(db, user_create.password)
+
     try:
         new_user = auth_service.create_user(
             username=user_create.username,
@@ -3558,6 +3584,7 @@ async def update_user(
         user.email = user_update.email
     
     if user_update.password is not None:
+        _validate_password_policy(db, user_update.password)
         user.password_hash = hash_password(user_update.password)
         changes['password'] = 'changed'
 
