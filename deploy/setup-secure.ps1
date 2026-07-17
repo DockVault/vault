@@ -12,7 +12,12 @@
 #   ./deploy/setup-secure.ps1 -ServerName vault.example.com -CertMode byo `
 #                             -CertPath C:\certs\fullchain.pem -KeyPath C:\certs\privkey.pem
 #   ./deploy/setup-secure.ps1 -ServerName vault.example.com -EnableSftp     # also expose SFTP
+#   ./deploy/setup-secure.ps1 -ServerName vault.example.com -AdminPassword 'a-strong-12+char-pass'
 #   ./deploy/setup-secure.ps1 -ServerName vault.example.com -NoStart        # set up, do not start
+#
+# The first admin account is created at startup from ADMIN_USERNAME/ADMIN_PASSWORD (written to
+# .env). If you don't pass -AdminPassword it prompts, and a blank answer auto-generates a strong
+# password and prints it ONCE at the end. There is no separate web setup wizard.
 #
 # Idempotent: re-running reuses an existing ./.env (keeps your data + secrets) and only
 # (re)builds/starts. To start completely fresh, run
@@ -30,6 +35,9 @@ param(
     [string] $CertPath,
     [string] $KeyPath,
     [switch] $EnableSftp,
+    [string] $AdminUsername,
+    [string] $AdminEmail,
+    [string] $AdminPassword,
     [switch] $NoStart
 )
 
@@ -248,17 +256,55 @@ Set-CertReadable
 # --- .env (secrets) -------------------------------------------------------------------------
 # The compose file sets ENVIRONMENT=production, API_USE_HTTPS=true and the cert paths; .env
 # only carries the secrets + host name (+ optional SFTP profile). Reused as-is if present.
+#
+# The FIRST ADMIN account is created by the app at startup from ADMIN_USERNAME/ADMIN_PASSWORD in
+# .env (there is NO separate setup screen); it is a no-op once an admin exists. So .env MUST carry
+# an ADMIN_PASSWORD, or the login page has no account. These carry the seeded admin to the summary.
+$SeedAdminUser = $null   # username to show at the end
+$SeedAdminPw   = $null   # generated password to show ONCE (null when the operator supplied their own)
 if (Test-Path $EnvFile) {
     Say 'reusing existing ./.env (delete it to regenerate secrets)'
+    # A .env written before admin-seeding (e.g. by an older copy of this script) may have NO
+    # ADMIN_PASSWORD, in which case no admin is created and login has no valid account. Warn + guide.
+    $envText = Get-Content -Raw $EnvFile -ErrorAction SilentlyContinue
+    if ($envText -notmatch "(?m)^\s*ADMIN_PASSWORD\s*=\s*\S") {
+        Warn 'your existing ./.env has no ADMIN_PASSWORD, so NO admin account will be created (the login page will have no valid account).'
+        Write-Host "    Fix it: add these lines to ./.env, then re-run this script (or restart the stack):"
+        Write-Host "        ADMIN_USERNAME='admin'"
+        Write-Host "        ADMIN_PASSWORD='$(New-HexSecret 12)'   # example - a strong 12+ char value"
+        Write-Host "    Restart:  docker compose --env-file .env -f deploy/docker-compose.secure.yml up -d"
+    }
 } else {
     Say 'writing ./.env with freshly generated secrets'
+
+    # Resolve the first-admin credentials. ENVIRONMENT=production (set by the compose file) requires a
+    # STRONG password (>= 12 chars, not a known placeholder) or the container refuses to boot.
+    if (-not $AdminUsername) { $AdminUsername = 'admin' }
+    if (-not $AdminEmail)    { $AdminEmail    = 'admin@example.com' }
+    if (-not $AdminPassword -and -not $PSBoundParameters.ContainsKey('AdminPassword')) {
+        $AdminPassword = Read-Host 'Admin password (leave blank to auto-generate a strong one and show it once)'
+    }
+    if (-not $AdminPassword) {
+        $AdminPassword = New-HexSecret 12   # 24 hex chars: well over the 12-char floor, dotenv-safe
+        $SeedAdminPw   = $AdminPassword     # remember to print it once at the end
+    } else {
+        if ($AdminPassword.Length -lt 12) { Die 'ADMIN_PASSWORD must be at least 12 characters (production requirement).' }
+    }
+    if ($AdminPassword -match "'" -or $AdminUsername -match "'") {
+        Die 'ADMIN_USERNAME / ADMIN_PASSWORD must not contain a single quote (it breaks .env quoting).'
+    }
+    $SeedAdminUser = $AdminUsername
+
     $lines = @(
         "ENCRYPTION_KEY='$(New-FernetKey)'",
         "JWT_SECRET_KEY='$(New-HexSecret 32)'",
         "VAULT_DB_PASSWORD='$(New-HexSecret 16)'",
         "REDIS_PASSWORD='$(New-HexSecret 24)'",
         "ALLOWED_HOSTS='$ServerName'",
-        "SERVER_NAME='$ServerName'"
+        "SERVER_NAME='$ServerName'",
+        "ADMIN_USERNAME='$AdminUsername'",
+        "ADMIN_EMAIL='$AdminEmail'",
+        "ADMIN_PASSWORD='$AdminPassword'"
     )
     if ($EnableSftp) { $lines += 'COMPOSE_PROFILES=sftp' }
     # ASCII, no BOM: the app and docker compose read this as a plain env file.
@@ -290,4 +336,15 @@ $sftpState = 'disabled'
 if ($EnableSftp) { $sftpState = 'enabled (host port 2322 by default; set SFTP_HOST_PORT in .env to change)' }
 Write-Host "    SFTP  : $sftpState"
 Write-Host '    Back up ENCRYPTION_KEY from ./.env off-host: without it, stored files are unrecoverable.'
-Write-Host '    Open the URL and complete the first-run wizard to create your admin account.'
+if ($SeedAdminUser) {
+    Write-Host "    Admin : open the URL and log in as  $SeedAdminUser"
+    if ($SeedAdminPw) {
+        Write-Host '    Admin password (SHOWN ONCE - copy it now; it is also stored in ./.env):' -ForegroundColor Yellow
+        Write-Host "        $SeedAdminPw" -ForegroundColor Green
+        Write-Host '    Change it after your first login (Settings), then it is no longer needed in .env.'
+    } else {
+        Write-Host '            using the ADMIN_PASSWORD you set in ./.env.'
+    }
+} else {
+    Write-Host '    Admin : log in with the ADMIN_USERNAME / ADMIN_PASSWORD values from ./.env.'
+}

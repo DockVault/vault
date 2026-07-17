@@ -52,8 +52,10 @@ root, so `--env-file` finds the root `.env`) once `./.env` and `./certs/{cert.pe
 docker compose --env-file .env -f deploy/docker-compose.secure.yml up -d --build
 ```
 
-Then open `https://<your-domain>` and complete the first-run setup wizard to create your admin
-account. No license key, no activation.
+The setup script creates the first admin account from the `ADMIN_USERNAME` / `ADMIN_PASSWORD` it
+writes to `.env` (the Windows script prints a generated password once; the Linux script prompts you
+for one). Then open `https://<your-domain>` and log in with those credentials — change the password
+from Settings after the first login. No license key, no activation.
 
 > Re-running after changing `VAULT_DB_PASSWORD` (or starting fresh by removing `.env`) requires
 > resetting the database volume, or Postgres keeps the old password:
