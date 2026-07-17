@@ -1099,7 +1099,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand-secondar
 .files-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: var(--space-md); }
 .files-grid[hidden] { display: none; }
 .file-tile {
-    position: relative; display: flex; flex-direction: column; align-items: center; text-align: center; gap: .4rem;
+    position: relative; cursor: pointer; display: flex; flex-direction: column; align-items: center; text-align: center; gap: .4rem;
     padding: 1rem .75rem .6rem; border: 1px solid var(--line); border-radius: var(--radius-lg);
     background: var(--surface-0); box-shadow: none; transition: border-color var(--transition-fast);
 }
@@ -1114,10 +1114,17 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand-secondar
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .file-tile .tile-meta { font-size: var(--text-xs); color: var(--text-tertiary); font-family: var(--font-mono); }
-.file-tile .file-check { position: absolute; top: .5rem; left: .5rem; opacity: 0; transition: opacity var(--transition-fast); }
-.file-tile:hover .file-check, .file-tile.is-selected .file-check { opacity: 1; }
-.file-tile .file-actions { position: absolute; top: .35rem; right: .35rem; opacity: 0; transition: opacity var(--transition-fast); }
-.file-tile:hover .file-actions { opacity: 1; }
+/* Two positioned control clusters: checkbox + Download top-left (.tile-tl),
+   Edit + Delete top-right (.file-actions). Both reveal on hover; the left one
+   also stays visible while the tile is selected (it holds the checkbox). */
+/* Hidden clusters use pointer-events:none so a tap on an invisible control doesn't
+   swallow the whole-card open on touch (no :hover); they become clickable on reveal. */
+.file-tile .tile-tl { position: absolute; top: .35rem; left: .35rem; display: flex; align-items: center; gap: .25rem;
+    opacity: 0; pointer-events: none; transition: opacity var(--transition-fast); }
+.file-tile:hover .tile-tl, .file-tile.is-selected .tile-tl { opacity: 1; pointer-events: auto; }
+.file-tile .tile-tl .file-check { position: static; opacity: 1; }
+.file-tile .file-actions { position: absolute; top: .35rem; right: .35rem; opacity: 0; pointer-events: none; transition: opacity var(--transition-fast); }
+.file-tile:hover .file-actions { opacity: 1; pointer-events: auto; }
 
 /* Files empty state (rendered inside the grid/table) */
 .files-grid .empty-state-center { min-height: 30vh; }

@@ -850,7 +850,7 @@ button.chip:hover { filter: brightness(1.05); }
 /* Grid (gallery) view */
 .files-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: var(--space-md); }
 .files-grid[hidden] { display: none; }
-.file-tile { position: relative; display: flex; flex-direction: column; align-items: center; text-align: center; gap: .4rem;
+.file-tile { position: relative; cursor: pointer; display: flex; flex-direction: column; align-items: center; text-align: center; gap: .4rem;
     padding: 1rem .75rem .65rem; border: 1px solid var(--surface-3); border-radius: var(--radius-lg);
     background: var(--surface-0); box-shadow: var(--shadow-xs); transition: box-shadow .12s, border-color .12s; }
 .file-tile:hover { box-shadow: var(--shadow-md); border-color: var(--surface-4); }
@@ -862,10 +862,17 @@ button.chip:hover { filter: brightness(1.05); }
     display: block; text-align: center; /* override the flex base so the name centers + ellipsis works */
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-tile .tile-meta { font-size: var(--text-xs, .72rem); color: var(--text-tertiary); font-family: var(--font-mono); }
-.file-tile .file-check { position: absolute; top: .5rem; left: .5rem; opacity: 0; transition: opacity .12s; }
-.file-tile:hover .file-check, .file-tile.is-selected .file-check { opacity: 1; }
-.file-tile .file-actions { position: absolute; top: .35rem; right: .35rem; opacity: 0; transition: opacity .12s; }
-.file-tile:hover .file-actions { opacity: 1; }
+/* Two positioned control clusters: checkbox + Download top-left (.tile-tl),
+   Edit + Delete top-right (.file-actions). Both reveal on hover; the left one
+   also stays visible while the tile is selected (it holds the checkbox). */
+/* Hidden clusters use pointer-events:none so a tap on an invisible control doesn't
+   swallow the whole-card open on touch (no :hover); they become clickable on reveal. */
+.file-tile .tile-tl { position: absolute; top: .35rem; left: .35rem; display: flex; align-items: center; gap: .25rem;
+    opacity: 0; pointer-events: none; transition: opacity .12s; }
+.file-tile:hover .tile-tl, .file-tile.is-selected .tile-tl { opacity: 1; pointer-events: auto; }
+.file-tile .tile-tl .file-check { position: static; opacity: 1; }
+.file-tile .file-actions { position: absolute; top: .35rem; right: .35rem; opacity: 0; pointer-events: none; transition: opacity .12s; }
+.file-tile:hover .file-actions { opacity: 1; pointer-events: auto; }
 
 /* ============================================================================
    23. Vault cards — tighter cards, de-emphasized delete, grid/list switch

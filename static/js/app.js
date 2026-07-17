@@ -4872,27 +4872,41 @@ function filesEmptyStateHtml(grid) {
 
 // Build the inline action buttons for a file/folder row or tile. Keeps the
 // .action-btn + data-action hooks the e2e tests rely on; only the look changes.
+// opts.slot splits the grid tile's controls into two positioned clusters:
+//   'primary'   -> the left cluster (Download for files; nothing for folders),
+//   'secondary' -> the right cluster (Rename + Delete for both),
+// so a file gets an Edit affordance in grid too. Undefined slot (the table view)
+// returns every button in one cluster, as before.
 function fileActionButtons(item, canWrite, opts) {
     const isFolder = item.type === 'folder';
     const id = item.id;
     const nm = escapeHtml(item.name);
+    const slot = opts && opts.slot;
     const btn = (action, icon, label, danger) =>
         `<button class="action-btn${danger ? ' action-btn-danger' : ''}" data-action="${action}" data-id="${id}" data-name="${nm}" title="${label}" aria-label="${label}">${iconSvg(icon, 'icon-sm')}</button>`;
     // vaultCapAllowed() is a no-op (true) for non-scoped sessions; for a scoped temp
     // credential it gates each action by the cap its scope grants on this vault,
     // matching require_vault_cap server-side (rename=file.rename, delete=file.delete,
-    // folder delete=folder.delete, download=file.download).
+    // folder delete=folder.delete, download=file.download). The same gate applies in
+    // every slot, so splitting the cluster never grants an affordance the scope lacks.
     const out = [];
     if (isFolder) {
         const canRename = canWrite && vaultCapAllowed('file.rename');
         const canDelete = canWrite && vaultCapAllowed('folder.delete');
-        if (canRename) out.push(btn('rename-folder', 'edit', 'Rename'));
-        if (canDelete) out.push(btn('delete-folder', 'trash', 'Delete', true));
-        if (!canRename && !canDelete && (!opts || !opts.grid)) out.push('<span class="text-tertiary text-sm">—</span>');
+        if (slot !== 'primary') {  // folders have no download -> primary (left) is empty
+            if (canRename) out.push(btn('rename-folder', 'edit', 'Rename'));
+            if (canDelete) out.push(btn('delete-folder', 'trash', 'Delete', true));
+        }
+        if (!canRename && !canDelete && !slot && (!opts || !opts.grid)) out.push('<span class="text-tertiary text-sm">—</span>');
     } else {
-        if (vaultCapAllowed('file.download')) out.push(btn('download', 'download', 'Download'));
-        if (canWrite && vaultCapAllowed('file.rename') && (!opts || !opts.grid)) out.push(btn('rename-file', 'edit', 'Rename'));
-        if (canWrite && vaultCapAllowed('file.delete')) out.push(btn('delete-file', 'trash', 'Delete', true));
+        const canDownload = vaultCapAllowed('file.download');
+        const canRename = canWrite && vaultCapAllowed('file.rename');
+        const canDelete = canWrite && vaultCapAllowed('file.delete');
+        if (slot !== 'secondary' && canDownload) out.push(btn('download', 'download', 'Download'));
+        if (slot !== 'primary') {
+            if (canRename) out.push(btn('rename-file', 'edit', 'Rename'));
+            if (canDelete) out.push(btn('delete-file', 'trash', 'Delete', true));
+        }
     }
     return out.join('');
 }
@@ -4942,13 +4956,19 @@ function renderFilesGrid(items, canWrite, grid) {
             : `data-file-id="${item.id}" data-file-name="${escapeHtml(item.name)}" data-mime="${escapeHtml(item.mime_type || '')}" title="Click to preview"`;
         const check = (isFolder || !allowBulkSelect()) ? ''
             : `<input type="checkbox" class="files-check file-check" data-id="${item.id}" ${selected ? 'checked' : ''} aria-label="Select ${escapeHtml(item.name)}">`;
+        const primary = fileActionButtons(item, canWrite, { grid: true, slot: 'primary' });
+        const secondary = fileActionButtons(item, canWrite, { grid: true, slot: 'secondary' });
+        const openLabel = escapeHtml(isFolder ? `Open folder ${item.name}` : `Preview file ${item.name}`);
+        // The name (the primary open action) comes first in DOM so it is the first tab stop and
+        // the destructive Delete is last; the two control clusters are position:absolute, so their
+        // top-left / top-right placement is unchanged by trailing them in source order.
         return `
             <div class="file-tile ${isFolder ? 'is-folder' : ''} ${selected ? 'is-selected' : ''}">
-                ${check}
-                <div class="file-actions">${fileActionButtons(item, canWrite, { grid: true })}</div>
                 <div class="tile-icon">${icon}</div>
-                <div class="file-name tile-name" ${nameAttrs}>${escapeHtml(item.name)}${lockIcon}</div>
+                <div class="file-name tile-name" ${nameAttrs} role="button" tabindex="0" aria-label="${openLabel}">${escapeHtml(item.name)}${lockIcon}</div>
                 <div class="tile-meta">${meta}</div>
+                <div class="tile-tl">${check}${primary}</div>
+                <div class="tile-tr file-actions">${secondary}</div>
             </div>`;
     }).join('');
 }
@@ -4957,11 +4977,31 @@ function renderFilesGrid(items, canWrite, grid) {
 // (called fresh after each render of either view).
 function wireFileItemHandlers(container) {
     if (!container) return;
-    container.querySelectorAll('.file-name[data-folder-id]').forEach(elem => {
-        elem.addEventListener('click', () => openFolder(elem.getAttribute('data-folder-id'), elem.getAttribute('data-folder-name')));
+    // Open the file/folder a name element points at (folder -> navigate, file -> preview).
+    const openFromName = (elem) => {
+        if (elem.hasAttribute('data-folder-id')) openFolder(elem.getAttribute('data-folder-id'), elem.getAttribute('data-folder-name'));
+        else if (elem.hasAttribute('data-file-id')) openFilePreview(elem.getAttribute('data-file-id'), elem.getAttribute('data-file-name'), elem.getAttribute('data-mime'));
+    };
+    container.querySelectorAll('.file-name[data-folder-id], .file-name[data-file-id]').forEach(elem => {
+        elem.addEventListener('click', () => openFromName(elem));
+        // Keyboard: the grid tile name is role=button tabindex=0, so make Enter/Space
+        // activate it too (a plain div was mouse-only). preventDefault on Space stops
+        // the page from scrolling.
+        elem.addEventListener('keydown', (e) => {
+            if (e.repeat) return;  // holding the key must not re-open repeatedly
+            if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); openFromName(elem); }
+        });
     });
-    container.querySelectorAll('.file-name[data-file-id]').forEach(elem => {
-        elem.addEventListener('click', () => openFilePreview(elem.getAttribute('data-file-id'), elem.getAttribute('data-file-name'), elem.getAttribute('data-mime')));
+    // Whole-card click in grid view: clicking anywhere on a tile that is NOT an action
+    // control opens the item. .file-tile exists only in the grid render, so this is a
+    // no-op in the table view. The guard (incl. .file-name) keeps a name/button/checkbox
+    // click from firing this a second time.
+    container.querySelectorAll('.file-tile').forEach(tile => {
+        tile.addEventListener('click', (e) => {
+            if (e.target.closest('button, input, a, .file-actions, .tile-tl, .tile-tr, .file-check, .file-name')) return;
+            const nameEl = tile.querySelector('.file-name');
+            if (nameEl) openFromName(nameEl);
+        });
     });
     container.querySelectorAll('button[data-action]').forEach(btn => {
         btn.addEventListener('click', (e) => {
