@@ -4088,7 +4088,43 @@ function revealLogToken(res) {
         navigator.clipboard.writeText(res.token).then(() => showSuccess('Copied')).catch(() => {});
     });
     box.append(code, copy);
-    host.append(warn, box);
+
+    // Usage docs: a ready-to-copy curl per granted component, so the token is actually usable. The
+    // `service` query param is REQUIRED (a missing/unknown one 404s by design), the endpoint is on
+    // this same host, and it stays a header-only Bearer token (never a ?token= query param).
+    // Only the serveable components (web/sftp) return logs; others 404, so don't advertise a curl
+    // for them even if the token happens to carry one. Default to web when none are serveable.
+    const serveable = new Set((window._logSettings && window._logSettings.serveable) || ['web', 'sftp']);
+    const granted = (Array.isArray(res.scope) ? res.scope : []).filter(s => serveable.has(s));
+    const scopes = granted.length ? granted : ['web'];
+    const origin = window.location.origin;
+    const usage = document.createElement('div');
+    usage.className = 'mt-md';
+    const uhead = document.createElement('p');
+    uhead.className = 'text-secondary text-sm mb-sm';
+    uhead.textContent = 'Pull logs with it — the service query param is REQUIRED and must be one of the token’s components:';
+    usage.appendChild(uhead);
+    scopes.forEach(svc => {
+        const cmd = `curl -H "Authorization: Bearer ${res.token}" "${origin}/logs?service=${svc}"`;
+        const row = document.createElement('div');
+        row.className = 'flex items-center gap-sm mb-sm';
+        const c = document.createElement('code');
+        c.textContent = cmd;
+        c.style.wordBreak = 'break-all';
+        const b = document.createElement('button');
+        b.className = 'btn btn-outline btn-sm';
+        b.type = 'button';
+        b.textContent = 'Copy';
+        b.addEventListener('click', () => { navigator.clipboard.writeText(cmd).then(() => showSuccess('Copied')).catch(() => {}); });
+        row.append(c, b);
+        usage.appendChild(row);
+    });
+    const note = document.createElement('small');
+    note.className = 'form-help';
+    note.textContent = 'Same host/port as this page. Append &tail=N (max 5000) inside the quotes for more lines. A missing/unknown service, a component switched off above, or the log endpoint being disabled for this deployment all return 404.';
+    usage.appendChild(note);
+
+    host.append(warn, box, usage);
 }
 
 // Load settings from API
