@@ -1527,10 +1527,17 @@ function initTempScopeBuilder() {
     const enable = document.getElementById('tc-scope-enable');
     const builder = document.getElementById('tc-scope-builder');
     const legacy = document.getElementById('tc-legacy-cancreate-group');
+    const movedHint = document.getElementById('tc-cancreate-moved-hint');
     if (enable && builder) {
         enable.addEventListener('change', () => {
             builder.hidden = !enable.checked;
+            // The coarse "can create" checkbox only applies to an unscoped credential; under
+            // scoping it is replaced by the nested Temp-credentials "Create temp credentials"
+            // control, so hide it and point the user at where the ability moved.
             if (legacy) legacy.style.display = enable.checked ? 'none' : '';
+            // toggle via style.display, not the hidden attr: .form-help is display:block, which
+            // would override [hidden] and leave the hint always showing.
+            if (movedHint) movedHint.style.display = enable.checked ? '' : 'none';
         });
     }
     const tcPage = document.getElementById('tc-page-tempcreds');
@@ -1587,6 +1594,9 @@ function resetTempScopeBuilder() {
     if (enable) enable.checked = false;
     if (builder) builder.hidden = true;
     if (legacy) legacy.style.display = '';
+    const movedHint = document.getElementById('tc-cancreate-moved-hint');
+    if (movedHint) movedHint.style.display = 'none';
+    _tcHideError();
     document.querySelectorAll('.tc-page').forEach(c => { c.checked = (c.value === 'dashboard' || c.value === 'vaults'); });
     const tempPerms = document.getElementById('tc-temp-perms'); if (tempPerms) tempPerms.hidden = true;
     const delRow = document.getElementById('tc-temp-delegate-row'); if (delRow) delRow.hidden = true;
@@ -1620,7 +1630,7 @@ async function populateTempScopeVaults() {
                 <input type="checkbox" class="tc-vault-pick" value="${escapeHtml(v.id)}" data-haspw="${v.has_password ? '1' : '0'}">
                 <span class="member-pick-name">${escapeHtml(v.name || 'Untitled vault')}${v.has_password ? ' <span class="text-tertiary text-sm">· password-protected</span>' : ''}</span>
             </label>${v.has_password ? `
-            <input type="password" class="tc-vault-pw form-control" data-vault="${escapeHtml(v.id)}" placeholder="Vault password — required to grant SFTP access" autocomplete="new-password" style="margin:2px 0 10px 26px;max-width:340px;">` : ''}`).join('');
+            <input type="password" class="tc-vault-pw form-control" data-vault="${escapeHtml(v.id)}" placeholder="Vault password — required to grant access to this password-protected vault" autocomplete="new-password" style="margin:2px 0 10px 26px;max-width:340px;">` : ''}`).join('');
     } catch (_) {
         list.innerHTML = '<div class="text-tertiary text-sm p-sm">Could not load vaults.</div>';
     }
@@ -1810,7 +1820,35 @@ function collectTempScope() {
 // Generate Temporary Credentials
 // options.validity_minutes / options.total_lifetime_minutes override the
 // server-configured default lifetime when provided.
+// Surface a temp-credential error INSIDE the open generate modal (via textContent, so a
+// server-supplied vault name can't inject markup) instead of a transient toast, so a recoverable
+// failure — e.g. a missing/incorrect vault password — doesn't discard the operator's form state.
+// Falls back to a toast when the modal isn't the active surface (e.g. the markup-missing path).
+function _tcShowError(msg) {
+    const modal = document.getElementById('generate-temp-creds-modal');
+    const box = document.getElementById('temp-cred-error');
+    if (box && modal && modal.classList.contains('active')) {
+        box.textContent = msg;
+        box.style.display = '';  // .alert is display:flex; inline style toggles it (the [hidden] attr can't, .alert wins)
+        box.scrollIntoView({ block: 'nearest' });
+    } else {
+        showError(msg);
+    }
+}
+function _tcHideError() {
+    const box = document.getElementById('temp-cred-error');
+    if (box) { box.style.display = 'none'; box.textContent = ''; }
+}
+
+let _tcGenerating = false;
 async function generateTempCreds(options = {}) {
+    // Re-entrancy guard: the modal now stays open across the await (so a recoverable error can be
+    // shown inline), so nothing else stops a double-click from minting two credentials — block it
+    // and disable the submit button for the duration of the request.
+    if (_tcGenerating) return;
+    _tcGenerating = true;
+    const submitBtn = document.querySelector('#generate-temp-creds-form button[type="submit"]');
+    if (submitBtn) submitBtn.disabled = true;
     try {
         const body = {};
         if (options.validity_minutes != null) {
@@ -1832,15 +1870,19 @@ async function generateTempCreds(options = {}) {
             body: JSON.stringify(body)
         });
 
-        console.log('Temp credentials response:', creds); // Debug log
-
-        // Show credentials in modal
+        // Success only: close the generate modal now, then show the result modal. On failure the
+        // catch below keeps the generate modal open so the operator's entered scope/note/passwords
+        // survive a recoverable error.
+        closeModal();
         showTempCredsModal(creds);
 
         // Reload active credentials after a short delay
         setTimeout(() => loadTempCreds(), 1000);
     } catch (error) {
-        showError('Failed to generate credentials: ' + error.message);
+        _tcShowError('Failed to generate credentials: ' + error.message);
+    } finally {
+        _tcGenerating = false;
+        if (submitBtn) submitBtn.disabled = false;
     }
 }
 
@@ -8588,6 +8630,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (generateTempCredsForm) {
         generateTempCredsForm.addEventListener('submit', (e) => {
             e.preventDefault();
+            _tcHideError();  // clear any prior inline error at the start of each attempt
 
             const minutesInput = document.getElementById('temp-cred-validity-minutes');
             const endInput = document.getElementById('temp-cred-end-datetime');
@@ -8600,24 +8643,24 @@ document.addEventListener('DOMContentLoaded', () => {
                 // End date/time takes precedence — derive minutes from now.
                 const endTime = new Date(endValue).getTime();
                 if (isNaN(endTime)) {
-                    showError('Please enter a valid end date and time.');
+                    _tcShowError('Please enter a valid end date and time.');
                     return;
                 }
                 validityMinutes = Math.ceil((endTime - Date.now()) / 60000);
                 if (validityMinutes <= 0) {
-                    showError('End date/time must be in the future.');
+                    _tcShowError('End date/time must be in the future.');
                     return;
                 }
             } else if (minutesInput && minutesInput.value) {
                 validityMinutes = parseInt(minutesInput.value, 10);
                 if (isNaN(validityMinutes) || validityMinutes <= 0) {
-                    showError('Validity must be a positive number of minutes.');
+                    _tcShowError('Validity must be a positive number of minutes.');
                     return;
                 }
             }
 
             if (validityMinutes != null && validityMinutes > MAX_MINUTES) {
-                showError('Maximum validity is 30 days (43200 minutes).');
+                _tcShowError('Maximum validity is 30 days (43200 minutes).');
                 return;
             }
 
@@ -8630,10 +8673,11 @@ document.addEventListener('DOMContentLoaded', () => {
             if (scopeData && scopeData.vault_access_mode === 'selected'
                 && scopeData.selected_vaults.length === 0
                 && (scopeData.scope.pages || []).includes('vaults')) {
-                showError("Select at least one vault, or switch to 'All vaults' — a credential scoped to vaults with none selected can't access anything.");
+                _tcShowError("Select at least one vault, or switch to 'All vaults' — a credential scoped to vaults with none selected can't access anything.");
                 return;
             }
-            closeModal();
+            // Do NOT close here — generateTempCreds closes the modal only on success, and keeps it
+            // open (with an inline error) on a recoverable failure so entered state isn't lost.
             generateTempCreds({
                 validity_minutes: validityMinutes, note, can_create_temp_credentials: canCreate,
                 scope: scopeData ? scopeData.scope : null,

@@ -1479,7 +1479,7 @@
                         <form id="generate-temp-creds-form">
                             <div class="modal-body">
                                 <p class="text-secondary mb-md">
-                                    Issue one-time SFTP credentials. Choose how long they stay valid before they are deactivated.
+                                    Issue a temporary account credential — usable on the web, the API and SFTP. Choose how long it stays valid before it is deactivated.
                                 </p>
                                 <div class="form-group">
                                     <label for="temp-cred-validity-minutes">Valid for (minutes)</label>
@@ -1510,6 +1510,7 @@
                                         <span>Limit what this credential can access (least privilege)</span>
                                     </label>
                                     <small class="form-help">Off = full access of your account. On = choose exactly which pages, actions and vaults.</small>
+                                    <small class="form-help" id="tc-cancreate-moved-hint" style="display:none;">Want this credential to be able to create more credentials? Enable the <strong>Temp Credentials</strong> page below, then tick <strong>Create temp credentials</strong>.</small>
                                 </div>
 
                                 <div id="tc-scope-builder" hidden>
@@ -1579,6 +1580,7 @@
                                         <label class="checkbox-row"><input type="checkbox" class="tc-global-cap" value="vault.create"><span>Create new vaults</span></label>
                                     </div>
                                 </div>
+                                <div id="temp-cred-error" class="alert alert-error mt-md" role="alert" style="display:none;"></div>
                             </div>
                             <div class="modal-footer">
                                 <button type="button" class="close-modal-btn btn btn-secondary">Cancel</button>
