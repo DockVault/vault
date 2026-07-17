@@ -859,6 +859,7 @@ button.chip:hover { filter: brightness(1.05); }
 .file-tile .tile-icon .icon { width: 34px; height: 34px; }
 .file-tile.is-folder .tile-icon { color: var(--warning); }
 .file-tile .tile-name { font-size: var(--text-sm, .82rem); font-weight: 500; width: 100%; cursor: pointer;
+    display: block; text-align: center; /* override the flex base so the name centers + ellipsis works */
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-tile .tile-meta { font-size: var(--text-xs, .72rem); color: var(--text-tertiary); font-family: var(--font-mono); }
 .file-tile .file-check { position: absolute; top: .5rem; left: .5rem; opacity: 0; transition: opacity .12s; }
