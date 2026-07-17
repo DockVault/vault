@@ -485,6 +485,17 @@ class UserUpdate(BaseModel):
     sftp_password_auth: Optional[bool] = None
 
 
+class SelfUpdate(BaseModel):
+    """Self-service account update (PATCH /users/me). A credential-sensitive change (password or
+    email) also requires the current password. Role / active / lock are deliberately absent — a user
+    can never grant themselves privileges via this endpoint."""
+    current_password: Optional[str] = None
+    new_password: Optional[str] = Field(None, min_length=8)
+    email: Optional[EmailStr] = None
+    sftp_enabled: Optional[bool] = None
+    sftp_password_auth: Optional[bool] = None
+
+
 class GroupBrief(BaseModel):
     """Compact group reference embedded in user payloads."""
     id: uuid.UUID
@@ -3367,6 +3378,62 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
     Get current user information.
     """
     return UserResponse.model_validate(current_user)
+
+
+@app.patch("/users/me", response_model=UserResponse)
+async def update_own_account(
+    body: SelfUpdate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Self-service account update: change your OWN password, email, or SFTP toggles. Gated only by
+    a valid session (no USER_MANAGE), so a regular user can manage their own account — but a
+    TEMPORARY/external credential cannot touch the owning account, and a password/email change
+    requires re-proving the current password so a hijacked live session can't take the account over."""
+    from app.core.security import hash_password, verify_password
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot change account settings.")
+
+    user = db.query(User).filter(User.id == current_user.id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    audit_logger = AuditLogger(db)
+    changes = []
+    changing_email = body.email is not None and body.email != user.email
+    sensitive = body.new_password is not None or changing_email
+    if sensitive:
+        if not body.current_password or not user.password_hash or not verify_password(body.current_password, user.password_hash):
+            raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
+
+    if body.new_password is not None:
+        _validate_password_policy(db, body.new_password)
+        user.password_hash = hash_password(body.new_password)
+        changes.append("password")
+    if changing_email:
+        # email is unique — reject a clash with a clean 400 instead of a commit-time 500.
+        if db.query(User.id).filter(User.email == str(body.email), User.id != user.id).first():
+            raise HTTPException(status_code=400, detail="That email address is already in use.")
+        user.email = str(body.email)
+        changes.append("email")
+    if body.sftp_enabled is not None and body.sftp_enabled != user.sftp_enabled:
+        user.sftp_enabled = body.sftp_enabled
+        changes.append("sftp_enabled")
+    if body.sftp_password_auth is not None and body.sftp_password_auth != user.sftp_password_auth:
+        user.sftp_password_auth = body.sftp_password_auth
+        changes.append("sftp_password_auth")
+
+    if not changes:
+        raise HTTPException(status_code=400, detail="No changes were provided.")
+    db.commit()
+    db.refresh(user)
+    try:
+        audit_logger.log_action(action="self_account_update", status="success", user=user,
+                                ip_address=get_client_ip(request), details={"fields": changes})
+    except Exception:  # noqa: BLE001
+        pass
+    return UserResponse.model_validate(user)
 
 
 # -- Per-user UI preferences (theme / accent / background / skin) --------------
