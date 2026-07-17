@@ -3,6 +3,7 @@
 It must let a vault owner/manager (not just admins) find a recipient, while NOT being a
 directory-enumeration oracle for users who can't share anything.
 """
+import uuid
 
 
 def _logged_in(admin, role="user"):
@@ -64,3 +65,52 @@ def test_search_escapes_like_wildcards(admin):
     finally:
         admin.delete_vault(v["id"])
         admin.delete_user(u["id"])
+
+
+def test_directory_search_scope_validation(admin):
+    """The policy only accepts the two known values; anything else is rejected (fail-safe)."""
+    try:
+        assert admin.put("/settings", json={"directory_search_scope": "bogus"}).status_code == 400
+        assert admin.put("/settings", json={"directory_search_scope": "same_department"}).status_code == 200
+        assert admin.get("/settings").json()["directory_search_scope"] == "same_department"
+    finally:
+        admin.put("/settings", json={"directory_search_scope": "deployment"})
+
+
+def test_same_department_scope_filters_search(admin):
+    """With directory_search_scope=same_department, a sharer finds only accounts sharing a department
+    with them; group_id narrows to one of the caller's own departments (a foreign group id -> empty)."""
+    u, c, v = _sharer(admin)  # the caller — a manager, so allowed to search
+    G = admin.post("/groups", json={"name": "dss_" + uuid.uuid4().hex[:8]}).json()["id"]
+    H = admin.post("/groups", json={"name": "dss_" + uuid.uuid4().hex[:8]}).json()["id"]
+    pfx = "dss" + uuid.uuid4().hex[:6]
+    mate = admin.create_user(username=pfx + "-mate")    # same department as the caller
+    other = admin.create_user(username=pfx + "-other")  # a different department
+    try:
+        assert admin.post(f"/groups/{G}/members", json={"user_ids": [u["id"], mate["id"]]}).status_code == 200
+        assert admin.post(f"/groups/{H}/members", json={"user_ids": [other["id"]]}).status_code == 200
+
+        # deployment (default): both are findable
+        admin.put("/settings", json={"directory_search_scope": "deployment"})
+        names = {x["username"] for x in c.get(f"/users/search?q={pfx}").json()}
+        assert (pfx + "-mate") in names and (pfx + "-other") in names
+
+        # same_department: only the same-department account is findable
+        admin.put("/settings", json={"directory_search_scope": "same_department"})
+        names = {x["username"] for x in c.get(f"/users/search?q={pfx}").json()}
+        assert (pfx + "-mate") in names
+        assert (pfx + "-other") not in names
+
+        # group_id narrows to the caller's own department G; a foreign department H yields nothing
+        names = {x["username"] for x in c.get(f"/users/search?q={pfx}&group_id={G}").json()}
+        assert (pfx + "-mate") in names and (pfx + "-other") not in names
+        assert c.get(f"/users/search?q={pfx}&group_id={H}").json() == []  # caller not in H
+        assert c.get(f"/users/search?q={pfx}&group_id=not-a-uuid").json() == []  # unparseable -> empty
+    finally:
+        admin.put("/settings", json={"directory_search_scope": "deployment"})  # restore the shared policy
+        admin.delete_user(mate["id"])
+        admin.delete_user(other["id"])
+        admin.delete_vault(v["id"])
+        admin.delete_user(u["id"])
+        admin.delete(f"/groups/{G}")
+        admin.delete(f"/groups/{H}")

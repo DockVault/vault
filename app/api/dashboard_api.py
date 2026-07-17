@@ -81,9 +81,12 @@ async def get_dashboard_stats(
         total_storage = db.query(func.sum(Vault.total_size_bytes)).scalar() or 0
         stats["storage_mb"] = round(total_storage / (1024 * 1024), 2)
         
-    elif current_user.role in (RoleEnum.USER, RoleEnum.ADMIN):
-        # A non-interactive-admin principal (a regular USER, or an admin-minted temp credential whose
-        # principal is the owning admin) sees only their OWN statistics — never deployment-wide.
+    elif current_user.role in (RoleEnum.USER, RoleEnum.ADMIN) and not getattr(current_user, "_is_temp_session", False):
+        # A regular USER sees only their OWN statistics — never deployment-wide.
+        # A temporary credential is EXCLUDED here even though it carries the minting admin's ADMIN
+        # role + user_id: the owner-aggregate storage/file-count below is keyed on that shared
+        # user_id, so a scoped credential would learn the admin's whole-deployment file count and
+        # storage (an out-of-scope aggregate leak). It falls through to the minimal branch instead.
         # Vaults they own
         owned_vaults = db.query(Vault).filter(Vault.owner_id == current_user.id).count()
         
@@ -157,13 +160,20 @@ async def get_recent_events(
     # large result set (memory/CPU/response-size DoS), and a negative value errors. Mirror the
     # bounded audit-search sibling.
     limit = max(1, min(limit, 100))
+
+    # A temporary credential is a scoped share, not an operator, and it carries the minting admin's
+    # shared user_id — so "its own events" would resolve to the admin's deployment-wide audit trail
+    # (resource ids, actions, and — for renames — cleartext names, across every vault/folder). It
+    # must see no audit feed, consistent with the interactive-admin-only /audit/events sibling.
+    if getattr(current_user, "_is_temp_session", False):
+        return handle_conditional_response(request, [])
+
     query = db.query(AuditLog).order_by(desc(AuditLog.timestamp))
-    
+
     if not _is_interactive_admin(current_user):
-        # Non-admins — including admin-minted temp credentials — only see their own events, never the
-        # deployment-wide audit trail.
+        # Non-admin interactive users only see their own events, never the deployment-wide trail.
         query = query.filter(AuditLog.user_id == current_user.id)
-    
+
     events = query.limit(limit).all()
     
     events_data = [

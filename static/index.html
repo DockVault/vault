@@ -1191,6 +1191,21 @@
                                 </div>
                             </div>
                         </div>
+                        <div class="card mb-lg">
+                            <div class="card-header">
+                                <h3>User Directory</h3>
+                            </div>
+                            <div class="p-lg">
+                                <div class="form-group">
+                                    <label for="setting-directory-search-scope">Who a vault sharer can find in user search</label>
+                                    <p class="text-secondary text-sm mb-sm">Controls the recipient search in the “Grant access” picker. <strong>Whole deployment</strong> (default) lets a sharer find any active account by username or email. <strong>Same department only</strong> restricts the search to accounts that share a department with the searcher.</p>
+                                    <select id="setting-directory-search-scope" class="form-control" style="max-width:360px;">
+                                        <option value="deployment">Whole deployment (default)</option>
+                                        <option value="same_department">Same department only</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
                         <div class="card">
                             <div class="card-header">
                                 <h3>Zero-Knowledge Vaults</h3>
@@ -1530,7 +1545,7 @@
                                     <div class="scope-section" id="tc-vault-caps">
                                         <div class="scope-section-title">What can they do in those vaults?</div>
                                         <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.see_info" checked><span>See vault info</span></label>
-                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.see_files" checked><span>See files</span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.see_files" checked><span>See files <small>&mdash; browse/list the whole vault. Leave OFF for a "known files only" credential (it can still download/act on a file it's told about, but can't enumerate).</small></span></label>
                                         <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="file.download" checked><span>Download files</span></label>
                                         <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="file.upload"><span>Upload files</span></label>
                                         <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="folder.create"><span>Create folders</span></label>
@@ -1543,6 +1558,20 @@
                                         <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.change_password"><span>Change vault password</span></label>
                                         <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.change_expiry"><span>Change expiry / policies</span></label>
                                         <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.delete"><span>Delete vault</span></label>
+                                    </div>
+
+                                    <div class="scope-section" id="tc-restrict-section">
+                                        <div class="scope-section-title">Restrict to files/folders</div>
+                                        <label class="checkbox-row">
+                                            <input type="checkbox" id="tc-restrict-enable" disabled>
+                                            <span>Restrict to specific files/folders <small>&mdash; select exactly ONE vault above, then pick the files/folders this credential may use. It can act only on those (plus the folders needed to reach them) and can neither see nor touch anything else in the vault.</small></span>
+                                        </label>
+                                        <div id="tc-restrict-hint" class="text-tertiary text-sm" style="margin:.2rem 0 0 26px;">Select a single vault above to enable.</div>
+                                        <div id="tc-restrict-panel" hidden style="margin:.4rem 0 0 26px;">
+                                            <div id="tc-restrict-crumbs" class="tc-restrict-crumbs"></div>
+                                            <div id="tc-restrict-list" class="tc-restrict-list member-pick-list"></div>
+                                            <div id="tc-restrict-summary" class="text-tertiary text-sm mt-sm"></div>
+                                        </div>
                                     </div>
 
                                     <div class="scope-section">

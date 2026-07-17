@@ -4,10 +4,29 @@ Covers POST /auth/temp-credentials (self), the /temp-creds/* management
 routes, and the admin-creates-for-user route under /api/user-management.
 """
 from datetime import datetime, timezone
+import json
+import os
+import subprocess
 import uuid
 
 import pytest
 import requests
+
+_DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
+
+
+def _stored_scope(temp_username):
+    """Read the stored per-vault ID scope for a temp credential straight from the DB, so that
+    storage normalization and the delegation clamp are asserted at the source. Returns the
+    {"files","folders"} dict, or None for a whole-vault (NULL) grant."""
+    q = ("SELECT tcva.scope_ids FROM temp_credential_vault_access tcva "
+         "JOIN temporary_credentials tc ON tc.id = tcva.temp_credential_id "
+         f"WHERE tc.temp_username = '{temp_username}';")
+    out = subprocess.run(
+        ["docker", "exec", _DB_CONTAINER, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc", q],
+        capture_output=True, text=True, timeout=20)
+    val = (out.stdout or "").strip()
+    return json.loads(val) if val else None
 
 
 def _u(prefix: str) -> str:
@@ -236,19 +255,35 @@ def test_scoped_delete_cap_required(admin):
         admin.delete_vault(va["id"])
 
 
-def test_download_cap_implies_see_info_and_see_files(admin):
-    """Granting only file.download must auto-include the prerequisites (vault.see_info,
-    vault.see_files) so the credential can actually open the vault + list + download."""
+def test_download_cap_implies_see_info_not_see_files(admin):
+    """Granting file.download implies vault.see_info (open the vault) but NOT vault.see_files
+    (listing/enumeration): a 'download this known file' credential can fetch a file by id, but
+    cannot enumerate the vault. Listing is granted separately, so download does not leak the whole
+    file list as a side effect (least privilege)."""
     va = admin.create_vault(name=_u("dlonly"))
     try:
         admin.post(f"/vaults/{va['id']}/files", files=[("files", ("f.txt", b"hi", "text/plain"))])
         fid = admin.get(f"/vaults/{va['id']}/files").json()["items"][0]["id"]
-        caps = ["file.download"]  # ONLY download — the prerequisites must be implied
+        caps = ["file.download"]  # ONLY download — see_info is implied; see_files is NOT
         scope = {"v": 1, "pages": ["vaults"], "caps": [], "vault_caps_default": caps, "temp": {}}
         c, _ = _scoped_client(admin, scope, "selected", [{"vault_id": va["id"], "caps": caps}])
-        assert c.get(f"/vaults/{va['id']}").status_code == 200            # see_info implied
-        assert c.get(f"/vaults/{va['id']}/files").status_code == 200      # see_files implied
-        assert c.get(f"/vaults/{va['id']}/files/{fid}/download").status_code == 200
+        assert c.get(f"/vaults/{va['id']}").status_code == 200            # see_info implied (open the vault)
+        assert c.get(f"/vaults/{va['id']}/files/{fid}/download").status_code == 200  # fetch a KNOWN file by id
+        assert c.get(f"/vaults/{va['id']}/files").status_code == 403      # see_files NOT implied -> no enumeration
+    finally:
+        admin.delete_vault(va["id"])
+
+
+def test_see_files_still_grants_listing_when_asked(admin):
+    """Granting vault.see_files explicitly still allows listing (the browse case is unchanged) —
+    the decouple only stops download from IMPLYING it, it doesn't remove the capability."""
+    va = admin.create_vault(name=_u("browse"))
+    try:
+        admin.post(f"/vaults/{va['id']}/files", files=[("files", ("f.txt", b"hi", "text/plain"))])
+        caps = ["vault.see_files", "file.download"]  # listing explicitly granted
+        scope = {"v": 1, "pages": ["vaults"], "caps": [], "vault_caps_default": caps, "temp": {}}
+        c, _ = _scoped_client(admin, scope, "selected", [{"vault_id": va["id"], "caps": caps}])
+        assert c.get(f"/vaults/{va['id']}/files").status_code == 200      # explicit see_files -> can list
     finally:
         admin.delete_vault(va["id"])
 
@@ -403,3 +438,56 @@ def test_scoped_session_reports_mode_all_and_global_caps(admin):
     assert s["vault_access_mode"] == "all"
     assert "vault.create" in s["caps"]
     assert set(s["vault_caps_default"]) == {"vault.see_info", "file.upload"}
+
+
+def test_id_scope_stored_and_delegation_clamps(admin):
+    """A per-vault ID scope ({files,folders}) is stored NORMALIZED, and a delegated child is clamped
+    to the parent's file/folder scope by real folder ancestry (a child can never widen past its
+    parent). Covers storage normalization and the delegation clamp at mint time."""
+    v = admin.create_vault(name=_u("idscope"))
+    try:
+        vid = v["id"]
+        caps = ["vault.see_files", "file.download"]
+        deleg = {"view": True, "create": True, "invalidate": True, "clear": True, "delegate": True}
+        # 'temp_creds' page is required for the parent to reach the mint endpoint when it delegates.
+        scope = {"v": 1, "pages": ["vaults", "temp_creds"], "caps": [], "vault_caps_default": caps, "temp": deleg}
+        # Real ancestry: folder D (root) with a child folder SUB; OUTSIDE is an id not under D.
+        D = admin.post(f"/vaults/{vid}/folders", json={"name": _u("D")}).json()["folder"]["id"]
+        SUB = admin.post(f"/vaults/{vid}/folders",
+                         json={"name": _u("SUB"), "parent_folder_id": D}).json()["folder"]["id"]
+        OUTSIDE = str(uuid.uuid4())
+
+        # 1) STORAGE (admin mint): the id scope is normalized (dedup + drop non-uuid).
+        _, body = _scoped_client(admin, scope, "selected",
+                                 [{"vault_id": vid, "caps": caps,
+                                   "scope_ids": {"folders": [D, D, "bad"], "files": []}}])
+        assert _stored_scope(body["temp_username"]) == {"files": [], "folders": [D]}
+
+        # a credential that omits scope_ids stays whole-vault (NULL)
+        _, body2 = _scoped_client(admin, scope, "selected", [{"vault_id": vid, "caps": caps}])
+        assert _stored_scope(body2["temp_username"]) is None
+
+        # 2) DELEGATION: a parent limited to folder D that can delegate...
+        parent, _ = _scoped_client(admin, scope, "selected",
+                                   [{"vault_id": vid, "caps": caps, "scope_ids": {"folders": [D], "files": []}}])
+        child_scope = {"v": 1, "pages": ["vaults"], "caps": [], "vault_caps_default": caps,
+                       "temp": {"view": False, "create": False, "invalidate": False,
+                                "clear": False, "delegate": False}}
+        # ...mints a child asking for SUB (a subfolder of D -> kept via ancestry) + an OUTSIDE id
+        # (dropped): clamped to the parent.
+        r = parent.post("/auth/temp-credentials", json={
+            "validity_minutes": 30, "scope": child_scope, "vault_access_mode": "selected",
+            "selected_vaults": [{"vault_id": vid, "caps": caps,
+                                 "scope_ids": {"folders": [SUB], "files": [OUTSIDE]}}]})
+        assert r.status_code == 200, r.text
+        assert _stored_scope(r.json()["temp_username"]) == {"files": [], "folders": [SUB]}
+
+        # a delegated child that OMITS scope_ids INHERITS the parent's (must NOT default to
+        # whole-vault / NULL) -- the highest-risk delegation case, through the real mint endpoint.
+        r2 = parent.post("/auth/temp-credentials", json={
+            "validity_minutes": 30, "scope": child_scope, "vault_access_mode": "selected",
+            "selected_vaults": [{"vault_id": vid, "caps": caps}]})
+        assert r2.status_code == 200, r2.text
+        assert _stored_scope(r2.json()["temp_username"]) == {"files": [], "folders": [D]}
+    finally:
+        admin.delete_vault(vid)

@@ -1388,6 +1388,19 @@ button.chip:hover { filter: brightness(1.06); }
 #tc-vault-list .member-pick-item:hover { background: var(--hover-overlay); }
 #tc-vault-list .member-pick-item input { accent-color: var(--brand-secondary); }
 
+/* Temp-cred file/folder restriction picker */
+.tc-restrict-crumbs { display: flex; flex-wrap: wrap; gap: .25rem; align-items: center; font-size: var(--text-sm); margin-bottom: .35rem; }
+.tc-restrict-crumbs a { cursor: pointer; color: var(--brand-secondary); }
+.tc-restrict-crumbs a:hover { text-decoration: underline; }
+.tc-restrict-crumbs .sep { color: var(--text-tertiary); }
+.tc-restrict-list { max-height: 220px; }
+.tc-restrict-row { display: flex; align-items: center; gap: .5rem; padding: .25rem .35rem; border-radius: var(--radius-sm); font-size: var(--text-sm); }
+.tc-restrict-row:hover { background: var(--hover-overlay); }
+.tc-restrict-row .name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tc-restrict-row input[type="checkbox"] { accent-color: var(--brand-secondary); flex: 0 0 auto; }
+.tc-restrict-row .open { cursor: pointer; color: var(--brand-secondary); background: none; border: none; padding: 0 .25rem; font-size: var(--text-sm); flex: 0 0 auto; }
+.tc-restrict-row .open:hover { text-decoration: underline; }
+
 /* Searchable member picker (Add members / Grant access modals). */
 .grant-toolbar { display: flex; flex-wrap: wrap; gap: var(--space-sm); margin-bottom: var(--space-md); }
 .grant-toolbar .toolbar-search { flex: 1 1 180px; }

@@ -58,11 +58,16 @@ from app.services.vault_service import (
     FolderNotFoundError,
     PasswordRequiredError,
     InvalidPasswordError,
+    require_file_scope,
+    require_folder_scope,
+    require_item_scope,
+    filter_listing_for_scope,
+    folder_is_navigable,
 )
 from app.services.vault_service import FileNotFoundError as VaultFileNotFoundError
 from app.services.audit_logger import AuditLogger
 from app.core.config import settings
-from app.core.temp_scope import is_scoped, effective_vault_caps
+from app.core.temp_scope import is_scoped, effective_vault_caps, scope_ids
 from app.core.security import name_blind_index
 from sqlalchemy import or_
 
@@ -227,6 +232,10 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         "_is_temp_session", "_temp_cred_id", "_temp_scope",
         "_temp_vault_mode", "_temp_can_create", "_temp_vault_caps",
         "_temp_vault_pw_fp",
+        # Per-vault ID-based file/folder restriction ({files, folders} | None). Without re-applying
+        # this to the freshly-loaded principal, scope_ids() reads None (whole vault) and every SFTP
+        # per-file/folder scope check silently degrades to no-op.
+        "_temp_vault_scope",
     )
 
     def _load_principal(self, db) -> Optional[User]:
@@ -275,6 +284,34 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         scope = getattr(user, "_temp_scope", None) or {}
         allowed = set(effective_vault_caps(user, vault_id)) | set(scope.get("caps", []))
         return cap in allowed
+
+    # -- per-file/folder scope (non-raising; a scoped credential sees a virtual filesystem
+    #    containing ONLY its in-scope subtree, so anything outside it reads as "not found") ------
+    def _scope_ok_file(self, db, user, vault_id, file_id) -> bool:
+        """True if the credential may act on this FILE (in scope). No-op True for non-scoped."""
+        try:
+            require_file_scope(db, user, vault_id, file_id)
+            return True
+        except PermissionDeniedError:
+            return False
+
+    def _scope_ok_folder(self, db, user, vault_id, folder_id) -> bool:
+        """True if the credential may write INTO / delete this FOLDER (strictly in scope). Root
+        (None) is denied for a scoped credential. No-op True for non-scoped."""
+        try:
+            require_folder_scope(db, user, vault_id, folder_id)
+            return True
+        except PermissionDeniedError:
+            return False
+
+    def _scope_ok_item(self, db, user, vault_id, item_id) -> bool:
+        """True if the credential may act on this FILE-or-FOLDER (in-place rename). No-op True for
+        non-scoped."""
+        try:
+            require_item_scope(db, user, vault_id, item_id)
+            return True
+        except PermissionDeniedError:
+            return False
 
     def _check_session_valid(self) -> bool:
         """Check the connection's session is still active (immediate revocation)."""
@@ -525,10 +562,17 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                     # A scoped temp credential only sees a vault it may "see_info".
                     if not self._has_cap(user, vault.id, "vault.see_info"):
                         continue
+                    # A per-file/folder-scoped credential must not learn the whole-vault size OR
+                    # mtime from the vault directory entry: the size covers files outside its scope,
+                    # and vault.updated_at is bumped by any file activity anywhere in the vault, so it
+                    # would be a coarse "something changed" oracle over out-of-scope files. Report 0/0.
+                    _scoped_here = scope_ids(user, vault.id) is not None
+                    _sz = 0 if _scoped_here else (vault.total_size_bytes or 0)
+                    _mt = 0 if _scoped_here else self._ts(vault.updated_at)
                     result.append(self._dir_attr(
                         self._vault_display_name(vault),
-                        mtime=self._ts(vault.updated_at),
-                        size=vault.total_size_bytes or 0,
+                        mtime=_mt,
+                        size=_sz,
                     ))
                 return result
 
@@ -546,18 +590,26 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             except _PathNotFound:
                 return paramiko.SFTP_NO_SUCH_FILE
 
-            result = []
+            # A scoped credential can only list a folder it may navigate (in scope, or an ancestor
+            # of its scope). A folder outside its scope reads as non-existent — never an empty dir,
+            # which would confirm the folder exists.
+            if not folder_is_navigable(db, user, vault.id, folder_id):
+                return paramiko.SFTP_NO_SUCH_FILE
+
             folders = db.query(Folder).filter(
                 Folder.vault_id == vault.id,
                 Folder.parent_folder_id == folder_id,
             ).all()
-            for folder in folders:
-                result.append(self._dir_attr(folder.name, mtime=self._ts(folder.updated_at)))
-
             files = db.query(File).filter(
                 File.vault_id == vault.id,
                 File.folder_id == folder_id,
             ).all()
+            # Filter to in-scope children + the ancestor folders needed to reach the scope.
+            folders, files = filter_listing_for_scope(db, user, vault.id, folder_id, folders, files)
+
+            result = []
+            for folder in folders:
+                result.append(self._dir_attr(folder.name, mtime=self._ts(folder.updated_at)))
             for f in files:
                 result.append(self._file_attr(
                     f.original_name or f.name,
@@ -597,19 +649,31 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 if not (self._has_cap(user, vault.id, "vault.see_info")
                         or self._has_cap(user, vault.id, "vault.see_files")):
                     return paramiko.SFTP_NO_SUCH_FILE
-                return self._dir_attr(self._vault_display_name(vault),
-                                      mtime=self._ts(vault.updated_at))
+                # Suppress the vault mtime for a scoped credential (see the root listing) — it is a
+                # whole-vault activity oracle otherwise.
+                _mt = 0 if scope_ids(user, vault.id) is not None else self._ts(vault.updated_at)
+                return self._dir_attr(self._vault_display_name(vault), mtime=_mt)
 
-            # Metadata for anything INSIDE the vault requires see_files — same
-            # gate as list_folder and the web list path. Return NO_SUCH_FILE (not
-            # PERMISSION_DENIED) so a see_info-only credential can't confirm a
-            # file/folder's existence, size, or mtime via stat/lstat.
-            if not self._has_cap(user, vault.id, "vault.see_files"):
+            # Metadata for a KNOWN path inside the vault. Directory ENUMERATION stays gated on
+            # vault.see_files (see list_folder / the web list path), but confirming ONE
+            # already-known path reveals no more than the per-file capability already does — a
+            # download/rename/delete credential can already open/act on that exact path, so
+            # stat/lstat of it is not extra disclosure. Any of those caps (or see_files) therefore
+            # satisfies stat: this lets `sftp get <known-file>` work for a download-only credential
+            # (paramiko stats a file before opening it) without letting a credential holding NONE of
+            # these confirm a file/folder's existence, size or mtime. Return NO_SUCH_FILE (not
+            # PERMISSION_DENIED) so such a credential can't use stat as an existence oracle.
+            if not any(self._has_cap(user, vault.id, c) for c in (
+                    "vault.see_files", "file.download", "file.rename", "file.delete", "folder.delete")):
                 return paramiko.SFTP_NO_SUCH_FILE
 
             # Try the full path as a folder first.
             try:
                 folder_id = self._resolve_folder(db, vault.id, segments[1:])
+                # A scoped credential may stat a folder it can navigate to (in scope or an ancestor
+                # of its scope); anything else reads as non-existent (no existence oracle).
+                if not folder_is_navigable(db, user, vault.id, folder_id):
+                    return paramiko.SFTP_NO_SUCH_FILE
                 folder = db.query(Folder).filter(Folder.id == folder_id).first()
                 return self._dir_attr(segments[-1], mtime=self._ts(folder.updated_at) if folder else 0)
             except _PathNotFound:
@@ -622,6 +686,9 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 return paramiko.SFTP_NO_SUCH_FILE
             f = self._resolve_file(db, vault.id, folder_id, segments[-1])
             if f is None:
+                return paramiko.SFTP_NO_SUCH_FILE
+            # A scoped credential may stat only an in-scope file; else it reads as non-existent.
+            if not self._scope_ok_file(db, user, vault.id, f.id):
                 return paramiko.SFTP_NO_SUCH_FILE
             return self._file_attr(f.original_name or f.name,
                                    size=f.size_bytes or 0, mtime=self._ts(f.created_at))
@@ -664,6 +731,9 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             f = self._resolve_file(db, vault.id, folder_id, filename)
             if f is None:
                 return paramiko.SFTP_NO_SUCH_FILE
+            # A scoped credential may download only an in-scope file; else it reads as non-existent.
+            if not self._scope_ok_file(db, user, vault.id, f.id):
+                return paramiko.SFTP_NO_SUCH_FILE
             try:
                 # download_file re-resolves the file's REAL vault and re-checks
                 # READ permission + any per-file password — same as the web path.
@@ -700,6 +770,10 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             try:
                 folder_id = self._resolve_folder(db, vault.id, segments[1:-1])
             except _PathNotFound:
+                return paramiko.SFTP_NO_SUCH_FILE
+            # A scoped credential may upload only INTO an in-scope folder (the vault root is denied);
+            # an out-of-scope destination reads as non-existent.
+            if not self._scope_ok_folder(db, user, vault.id, folder_id):
                 return paramiko.SFTP_NO_SUCH_FILE
             vault_id = vault.id
             # Replacing an existing file deletes it, so overwrite requires real DELETE
@@ -780,6 +854,12 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 # Re-authorize at persist time (fresh session): membership +
                 # temp-cred vault scope. upload re-checks the real vault.
                 vault = vault_service.get_vault(vault_id, user, require_password=False)
+                # Re-check the destination folder's ID-scope too (parity with the session/password/
+                # quota re-checks): a scoped credential whose scope was narrowed between open() and
+                # close() must not land a write into a now-out-of-scope folder.
+                if not interface._scope_ok_folder(db, user, vault_id, folder_id):
+                    print("⚠️ SFTP upload aborted: destination folder no longer in scope")
+                    return
                 # Re-gate the per-vault password proof too: a password ADDED or rotated
                 # between open() and close() must not let an in-flight write land without
                 # current proof (TOCTOU) — same gate _resolve_vault applies at open().
@@ -875,6 +955,9 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             f = self._resolve_file(db, vault.id, folder_id, segments[-1])
             if f is None:
                 return paramiko.SFTP_NO_SUCH_FILE
+            # A scoped credential may delete only an in-scope file; else it reads as non-existent.
+            if not self._scope_ok_file(db, user, vault.id, f.id):
+                return paramiko.SFTP_NO_SUCH_FILE
             fid = f.id
             try:
                 vault_service.delete_file(fid, user)
@@ -934,6 +1017,10 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 if folder is None:
                     return paramiko.SFTP_NO_SUCH_FILE
                 target_id = folder.id
+            # A scoped credential may rename only an in-scope file/folder (rename is in-place — same
+            # parent — so the item's own scope covers both source and destination); else non-existent.
+            if not self._scope_ok_item(db, user, vault.id, target_id):
+                return paramiko.SFTP_NO_SUCH_FILE
             try:
                 # vault_id pins the rename to the resolved vault (cross-vault guard).
                 # Strip control chars at the rename sink (parity with the upload sink) so a
@@ -972,6 +1059,10 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             try:
                 parent_id = self._resolve_folder(db, vault.id, segments[1:-1])
             except _PathNotFound:
+                return paramiko.SFTP_NO_SUCH_FILE
+            # A scoped credential may create a folder only INSIDE an in-scope folder (not at the
+            # vault root); an out-of-scope parent reads as non-existent.
+            if not self._scope_ok_folder(db, user, vault.id, parent_id):
                 return paramiko.SFTP_NO_SUCH_FILE
             try:
                 new_folder = vault_service.create_folder(
@@ -1024,6 +1115,10 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 return paramiko.SFTP_NO_SUCH_FILE
             if folder_id is None:
                 return paramiko.SFTP_PERMISSION_DENIED
+            # A scoped credential may remove only an in-scope folder (its own subtree); an
+            # out-of-scope folder reads as non-existent.
+            if not self._scope_ok_folder(db, user, vault.id, folder_id):
+                return paramiko.SFTP_NO_SUCH_FILE
 
             # Recursively wipe contained files (storage + rows + stats), then
             # sub-folders, then the folder — mirrors the web delete_folder handler.

@@ -26,6 +26,7 @@ import uuid
 from fastapi import HTTPException, status
 
 from app.core.authorization import PermissionDeniedError
+from app.core.id_scope import id_in_scope  # pure ID-based per-file/folder matching
 
 # ---------------------------------------------------------------------------
 # Vocabulary
@@ -43,19 +44,22 @@ VAULT_CAPS = {
     "vault.change_info", "vault.change_password", "vault.change_expiry", "vault.rotate_key",
     "vault.delete",
 }
-# Implied prerequisite capabilities. Enforcement checks these lower caps first — opening a vault
-# needs vault.see_info, then vault.see_files, before any per-file op is reachable — so a credential
-# that holds only a higher cap (e.g. file.download) without them is unusable ("scope does not
-# permit"). expand_vault_caps() adds the prerequisites so any granted combination actually works.
+# Implied prerequisite capabilities. Enforcement checks the lower caps first — a per-file op is only
+# reachable once the vault is opened (vault.see_info) — so a credential holding only a higher cap
+# without vault.see_info is unusable ("scope does not permit"). expand_vault_caps() adds the
+# prerequisites so any granted combination actually works.
+#
+# A per-file op needs to OPEN the vault (see_info) but NOT to LIST it (see_files): the single-file
+# endpoints (REST + SFTP) address a known file by id/path and never require listing. Listing is
+# enumeration, granted SEPARATELY via vault.see_files, so a "download/act on this known file"
+# credential does not hand out the ability to enumerate everything in the vault (least privilege).
 CAP_IMPLIES = {
     "vault.see_files":          {"vault.see_info"},
-    # Ops that act on a LISTED item need to open the vault (see_info) AND see its listing
-    # (see_files) to reach the target.
-    "file.download":            {"vault.see_files", "vault.see_info"},
-    "file.rename":              {"vault.see_files", "vault.see_info"},
-    "file.delete":              {"vault.see_files", "vault.see_info"},
-    "folder.delete":            {"vault.see_files", "vault.see_info"},
-    # Creating/uploading doesn't require the listing — just the ability to open the vault.
+    "file.download":            {"vault.see_info"},
+    "file.rename":              {"vault.see_info"},
+    "file.delete":              {"vault.see_info"},
+    "folder.delete":            {"vault.see_info"},
+    # Creating/uploading doesn't require the listing either — just the ability to open the vault.
     "file.upload":              {"vault.see_info"},
     "folder.create":            {"vault.see_info"},
     # Vault-level ops only need to open the vault.
@@ -71,8 +75,9 @@ CAP_IMPLIES = {
 
 def expand_vault_caps(caps) -> List[str]:
     """Add the implied prerequisite caps (CAP_IMPLIES) so a granted combination is actually
-    usable — e.g. file.download pulls in vault.see_files + vault.see_info. Idempotent; bounded to
-    the VAULT_CAPS vocabulary."""
+    usable — e.g. file.download pulls in vault.see_info (opening the vault), but NOT
+    vault.see_files (listing stays a separate grant). Idempotent; bounded to the VAULT_CAPS
+    vocabulary."""
     out = {c for c in (caps or []) if c in VAULT_CAPS}
     changed = True
     while changed:
@@ -163,6 +168,7 @@ def attach_scope(db, user, temp_cred) -> None:
     user._temp_can_create = bool(getattr(temp_cred, "can_create_temp_credentials", False))
     caps_map: Dict[str, List[str]] = {}
     pw_fp_map: Dict[str, Optional[str]] = {}
+    scope_ids_map: Dict[str, Optional[dict]] = {}
     if temp_cred.scope is not None and user._temp_vault_mode == "selected":
         from app.core.models import TempCredentialVaultAccess
         rows = db.query(TempCredentialVaultAccess).filter(
@@ -171,10 +177,15 @@ def attach_scope(db, user, temp_cred) -> None:
         for r in rows:
             caps_map[str(r.vault_id)] = list(r.vault_caps or [])
             pw_fp_map[str(r.vault_id)] = getattr(r, "vault_password_fingerprint", None)
+            # None (or missing column) = the whole vault; a {"files","folders"} dict = an ID-based
+            # per-file/folder restriction.
+            scope_ids_map[str(r.vault_id)] = getattr(r, "scope_ids", None)
     user._temp_vault_caps = caps_map
     # Per-vault fingerprint of the password proven at mint; the SFTP layer compares it to
     # the vault's live password hash so a rotation voids the standing proof.
     user._temp_vault_pw_fp = pw_fp_map
+    # Per-vault ID-based file/folder restriction (None = whole vault); enforced by require_scope().
+    user._temp_vault_scope = scope_ids_map
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +253,35 @@ def require_cap(user, vault_id, cap: str) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Temporary credential scope does not permit this action",
         )
+
+
+def scope_ids(user, vault_id):
+    """The ID-based per-file/folder restriction this scoped credential holds on `vault_id`: a
+    {"files": [...], "folders": [...]} dict, or None = the WHOLE vault (the default). Returns None
+    for a non-scoped principal and for mode 'all' (which is inherently whole-vault). Used to RESTRICT
+    a scoped session only — never to grant more than it has."""
+    if not is_scoped(user):
+        return None
+    if getattr(user, "_temp_vault_mode", "selected") == "all":
+        return None
+    return (getattr(user, "_temp_vault_scope", {}) or {}).get(str(vault_id))
+
+
+def require_scope(user, vault_id, target_id, ancestor_folder_ids, kind: str = "read") -> None:
+    """Fine per-file/folder gate for an ID-restricted scoped temp session. No-op for a non-scoped
+    principal or a whole-vault (unrestricted) grant. Raises PermissionDeniedError (handlers map it to
+    403; the SFTP layer catches it) when the credential acts on a file/folder outside its scope.
+    `target_id` is the file/folder being acted on; `ancestor_folder_ids` is its containing-folder
+    chain toward the vault root (from app/services/vault_service.folder_ancestry). `kind`
+    ('read'/'write') is informational — both use the same membership check. Fails CLOSED: an
+    unresolved target (empty ancestry that matches nothing) is denied."""
+    if not is_scoped(user):
+        return
+    scope = scope_ids(user, vault_id)
+    if scope is None:
+        return  # whole-vault grant (default) — no per-file limit
+    if not id_in_scope(scope, target_id, ancestor_folder_ids):
+        raise PermissionDeniedError("Temporary credential scope does not permit this file or folder")
 
 
 def require_create_vault_type(user, vault_type: str) -> None:
@@ -312,7 +352,8 @@ def normalize_scope(raw: Optional[dict]) -> Optional[dict]:
         "pages": sorted(p for p in _as_list(raw.get("pages")) if p in PAGES),
         "caps": sorted(c for c in _as_list(raw.get("caps")) if c in GLOBAL_CAPS),
         # Add implied prerequisite caps so e.g. file.download is actually usable (pulls in
-        # vault.see_files + vault.see_info) rather than silently unusable.
+        # vault.see_info to open the vault; NOT vault.see_files — listing is a separate grant)
+        # rather than being silently unusable.
         "vault_caps_default": expand_vault_caps(_as_list(raw.get("vault_caps_default"))),
         "temp": {k: bool(temp_in.get(k, False)) for k in TEMP_PERMS},
     }

@@ -705,3 +705,31 @@ def test_sftp_rejects_weak_3des_cbc_cipher():
         t.close()
         with contextlib.suppress(Exception):
             sock.close()
+
+
+def test_download_only_cred_gets_known_file_but_cannot_enumerate(admin):
+    """A temp credential scoped to file.download (which now implies vault.see_info but NOT
+    vault.see_files) can DOWNLOAD a known file over SFTP through the high-level get()/getfo()
+    path -- paramiko stat()s a file before opening it -- yet CANNOT enumerate the vault
+    (listdir inside the vault requires see_files). This is the 'download this known file,
+    no enumeration' credential working over SFTP, not just REST."""
+    pw = "DlOnlySftp!123long"
+    v = admin.create_vault(name=unique("dlsftp"), password=pw)
+    try:
+        vid, vname = v["id"], v["name"]
+        content = b"download-only sftp get\n" * 40
+        fname = unique("known") + ".bin"
+        _web_upload(admin, vid, fname, content, password=pw)
+        body = _mint_vault_cred(admin, vid, ["file.download"], password=pw)  # download-only, proven
+        assert body.status_code in (200, 201), body.text
+        tuser, tcred = body.json()["temp_username"], body.json()["credential"]
+        with sftp_session(tuser, tcred) as sftp:
+            # enumeration of the vault's contents is blocked (no see_files)
+            with pytest.raises((IOError, OSError)):
+                sftp.listdir(f"/{vname}")
+            # ...but get()/getfo() of the KNOWN file works (it stat()s, then open()s)
+            buf = io.BytesIO()
+            sftp.getfo(f"/{vname}/{fname}", buf)
+            assert buf.getvalue() == content
+    finally:
+        admin.delete_vault(vid)

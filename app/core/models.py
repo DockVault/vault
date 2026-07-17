@@ -335,6 +335,14 @@ class TempCredentialVaultAccess(Base):
     # Capability strings this credential holds on THIS vault (subset of the vocab
     # in app/core/temp_scope.py, e.g. ["vault.see_files", "file.download"]).
     vault_caps = Column(JSON, nullable=False, default=list)
+    # Optional per-file/folder restriction WITHIN this vault (ID-based). NULL/absent = the WHOLE
+    # vault (default, backward compatible). A dict {"files": [file_id, ...], "folders": [folder_id,
+    # ...]}: a folders entry means that folder AND its whole subtree, a files entry means exactly
+    # that one file. A PROVIDED dict with both lists empty means "no files" (fail closed). IDs are
+    # used (not names/paths) so this enforces even for zero-knowledge vaults whose names the server
+    # never holds. Matching/normalization live in app/core/id_scope.py; folder ancestry via
+    # app/services/vault_service.folder_ancestry.
+    scope_ids = Column(JSON, nullable=True)
     # Fingerprint of the vault's password hash captured when this grant was minted (only
     # for password-protected vaults; NULL otherwise). Re-checked on every SFTP access so a
     # later password add/change/rotation voids this credential's standing SFTP proof —

@@ -1546,7 +1546,25 @@ function initTempScopeBuilder() {
         const sel = document.getElementById('tc-vault-select');
         const isSel = document.querySelector('input[name="tc-vault-mode"]:checked')?.value === 'selected';
         if (sel) sel.style.display = isSel ? '' : 'none';
+        _tcRestrictSyncAvailability();
     }));
+    // File/folder restriction: reveal the picker when enabled; keep availability in sync as the
+    // vault selection changes (the list is re-rendered on open, so delegate the pick listener).
+    const restrictEnable = document.getElementById('tc-restrict-enable');
+    if (restrictEnable) restrictEnable.addEventListener('change', () => {
+        const panel = document.getElementById('tc-restrict-panel');
+        if (restrictEnable.checked) {
+            _tcRestrict.crumbs = [{ id: null, name: 'Root' }];  // re-anchor so the trail matches the root load
+            _tcRestrictLoad(null);
+        } else if (panel) { panel.hidden = true; }
+        _tcRestrictRenderSummary();
+    });
+    const vlist = document.getElementById('tc-vault-list');
+    if (vlist) vlist.addEventListener('change', (e) => {
+        if (e.target && e.target.classList && e.target.classList.contains('tc-vault-pick')) {
+            _tcRestrictSyncAvailability();
+        }
+    });
     const search = document.getElementById('tc-vault-search');
     if (search) search.addEventListener('input', () => {
         const q = search.value.toLowerCase();
@@ -1579,6 +1597,7 @@ function resetTempScopeBuilder() {
     document.querySelectorAll('.tc-cap').forEach(c => { c.checked = baseline.has(c.value); });
     document.querySelectorAll('.tc-global-cap').forEach(c => { c.checked = false; });
     const search = document.getElementById('tc-vault-search'); if (search) search.value = '';
+    _tcRestrictReset();
 }
 
 async function populateTempScopeVaults() {
@@ -1587,6 +1606,8 @@ async function populateTempScopeVaults() {
     list.innerHTML = '<div class="text-tertiary text-sm p-sm">Loading vaults…</div>';
     try {
         const vaults = await apiRequest('/vaults', { silent: true });
+        _tcVaultObjs = {};
+        if (Array.isArray(vaults)) vaults.forEach(v => { _tcVaultObjs[v.id] = v; });
         if (!Array.isArray(vaults) || !vaults.length) {
             list.innerHTML = '<div class="text-tertiary text-sm p-sm">No vaults available to grant.</div>';
             return;
@@ -1602,6 +1623,147 @@ async function populateTempScopeVaults() {
             <input type="password" class="tc-vault-pw form-control" data-vault="${escapeHtml(v.id)}" placeholder="Vault password — required to grant SFTP access" autocomplete="new-password" style="margin:2px 0 10px 26px;max-width:340px;">` : ''}`).join('');
     } catch (_) {
         list.innerHTML = '<div class="text-tertiary text-sm p-sm">Could not load vaults.</div>';
+    }
+}
+
+// --- File/folder restriction picker (produces selected_vaults[].scope_ids) ------------------
+// A restriction targets exactly ONE selected vault (file/folder sharing is inherently single-vault);
+// with 0 or 2+ vaults selected, or "all my vaults", it is disabled and the credential is whole-vault.
+const _tcRestrict = { vaultId: null, files: new Set(), folders: new Set(), crumbs: [{ id: null, name: 'Root' }] };
+let _tcVaultObjs = {};  // id -> vault object (from the picker fetch), so the picker can decrypt ZK names
+let _tcRestrictSeq = 0; // monotonic load token: only the latest _tcRestrictLoad may paint (last-click-wins)
+
+function _tcRestrictReset() {
+    _tcRestrict.vaultId = null;
+    _tcRestrict.files.clear();
+    _tcRestrict.folders.clear();
+    _tcRestrict.crumbs = [{ id: null, name: 'Root' }];
+    const en = document.getElementById('tc-restrict-enable');
+    if (en) { en.checked = false; en.disabled = true; }
+    const panel = document.getElementById('tc-restrict-panel'); if (panel) panel.hidden = true;
+    const hint = document.getElementById('tc-restrict-hint'); if (hint) hint.style.display = '';
+    _tcRestrictRenderSummary();
+}
+
+function _tcRestrictSyncAvailability() {
+    const en = document.getElementById('tc-restrict-enable');
+    const hint = document.getElementById('tc-restrict-hint');
+    if (!en) return;
+    const picks = Array.from(document.querySelectorAll('.tc-vault-pick:checked'));
+    const isSelected = document.querySelector('input[name="tc-vault-mode"]:checked')?.value === 'selected';
+    if (isSelected && picks.length === 1) {
+        en.disabled = false;
+        if (hint) hint.style.display = 'none';
+        const vid = picks[0].value;
+        if (_tcRestrict.vaultId !== vid) {
+            // The single selected vault changed — drop any prior selection (ids are per-vault).
+            _tcRestrict.vaultId = vid;
+            _tcRestrict.files.clear();
+            _tcRestrict.folders.clear();
+            _tcRestrict.crumbs = [{ id: null, name: 'Root' }];
+            if (en.checked) _tcRestrictLoad(null);
+        }
+    } else {
+        en.disabled = true;
+        en.checked = false;
+        _tcRestrict.vaultId = null;
+        _tcRestrict.files.clear();
+        _tcRestrict.folders.clear();
+        const panel = document.getElementById('tc-restrict-panel'); if (panel) panel.hidden = true;
+        if (hint) hint.style.display = '';
+    }
+    _tcRestrictRenderSummary();
+}
+
+async function _tcRestrictLoad(folderId) {
+    const panel = document.getElementById('tc-restrict-panel');
+    const list = document.getElementById('tc-restrict-list');
+    if (!panel || !list || !_tcRestrict.vaultId) return;
+    // Last-click-wins: a slower earlier load (esp. behind a ZK unlock prompt) must not paint over a
+    // newer navigation, which would show one folder's contents under another's breadcrumb.
+    const seq = ++_tcRestrictSeq;
+    panel.hidden = false;
+    list.innerHTML = '<div class="text-tertiary text-sm p-sm">Loading…</div>';
+    let items = [];
+    try {
+        const q = folderId ? `?folder_id=${encodeURIComponent(folderId)}` : '';
+        const res = await apiRequest(`/vaults/${encodeURIComponent(_tcRestrict.vaultId)}/files${q}`, { silent: true });
+        items = (res && res.items) || [];
+    } catch (_) {
+        if (seq === _tcRestrictSeq) list.innerHTML = '<div class="text-tertiary text-sm p-sm">Could not load files.</div>';
+        return;
+    }
+    if (seq !== _tcRestrictSeq) return;  // superseded by a newer navigation
+    // Zero-knowledge vaults return encrypted names; decrypt them client-side (same flow as the
+    // main file view) so the picker shows real names. IDs are always cleartext, so selection works
+    // either way — a cancelled unlock just leaves "🔒 Encrypted name" labels.
+    const vobj = _tcVaultObjs[_tcRestrict.vaultId];
+    if (vobj && vobj.type === 'zero_knowledge') {
+        try { await zkDecryptListingNames(items, vobj); } catch (_) { /* names stay encrypted; ids still work */ }
+        if (seq !== _tcRestrictSeq) return;  // the unlock prompt is async — re-check after it
+    }
+    _tcRestrictRenderCrumbs();
+    const rows = [];
+    for (const f of items.filter(i => i.type === 'folder')) {
+        const on = _tcRestrict.folders.has(f.id) ? 'checked' : '';
+        rows.push(`<div class="tc-restrict-row">
+            <input type="checkbox" class="tc-restrict-include" data-id="${escapeHtml(f.id)}" data-kind="folder" ${on}>
+            <span class="name" title="${escapeHtml(f.name || '')}">\u{1F4C1} ${escapeHtml(f.name || 'Folder')}</span>
+            <button type="button" class="open" data-open="${escapeHtml(f.id)}" data-name="${escapeHtml(f.name || 'Folder')}">open →</button>
+        </div>`);
+    }
+    for (const f of items.filter(i => i.type === 'file')) {
+        const on = _tcRestrict.files.has(f.id) ? 'checked' : '';
+        rows.push(`<div class="tc-restrict-row">
+            <input type="checkbox" class="tc-restrict-include" data-id="${escapeHtml(f.id)}" data-kind="file" ${on}>
+            <span class="name" title="${escapeHtml(f.name || '')}">\u{1F4C4} ${escapeHtml(f.name || 'File')}</span>
+        </div>`);
+    }
+    list.innerHTML = rows.length ? rows.join('') : '<div class="text-tertiary text-sm p-sm">This folder is empty.</div>';
+    list.querySelectorAll('.tc-restrict-include').forEach(cb => {
+        cb.addEventListener('change', () => {
+            const set = cb.dataset.kind === 'folder' ? _tcRestrict.folders : _tcRestrict.files;
+            if (cb.checked) set.add(cb.dataset.id); else set.delete(cb.dataset.id);
+            _tcRestrictRenderSummary();
+        });
+    });
+    list.querySelectorAll('button[data-open]').forEach(b => {
+        b.addEventListener('click', () => {
+            _tcRestrict.crumbs.push({ id: b.dataset.open, name: b.dataset.name });
+            _tcRestrictLoad(b.dataset.open);
+        });
+    });
+    _tcRestrictRenderSummary();
+}
+
+function _tcRestrictRenderCrumbs() {
+    const el = document.getElementById('tc-restrict-crumbs');
+    if (!el) return;
+    el.innerHTML = _tcRestrict.crumbs.map((c, i) => {
+        const last = i === _tcRestrict.crumbs.length - 1;
+        const label = escapeHtml(c.name);
+        return last ? `<span>${label}</span>` : `<a data-crumb="${i}">${label}</a><span class="sep">/</span>`;
+    }).join('');
+    el.querySelectorAll('a[data-crumb]').forEach(a => {
+        a.addEventListener('click', () => {
+            const idx = parseInt(a.dataset.crumb, 10);
+            _tcRestrict.crumbs = _tcRestrict.crumbs.slice(0, idx + 1);
+            _tcRestrictLoad(_tcRestrict.crumbs[idx].id);
+        });
+    });
+}
+
+function _tcRestrictRenderSummary() {
+    const el = document.getElementById('tc-restrict-summary');
+    if (!el) return;
+    const en = document.getElementById('tc-restrict-enable');
+    if (!en || !en.checked) { el.textContent = ''; return; }
+    const nf = _tcRestrict.files.size, nd = _tcRestrict.folders.size;
+    if (nf + nd === 0) {
+        el.innerHTML = '<span style="color:var(--danger,#b91c1c)">Select at least one file or folder — with nothing selected the credential is granted the WHOLE vault.</span>';
+    } else {
+        el.textContent = `Restricted to ${nf} file${nf === 1 ? '' : 's'} + ${nd} folder${nd === 1 ? '' : 's'} `
+            + `(plus the folders needed to reach them).`;
     }
 }
 
@@ -1629,6 +1791,18 @@ function collectTempScope() {
                 }
                 return item;
             });
+        // A single-vault file/folder restriction attaches scope_ids to that vault's entry. Only when
+        // at least one file/folder is chosen — an empty {files:[],folders:[]} means deny-all on the
+        // server, so "restrict enabled but nothing picked" is treated as whole-vault (scope omitted).
+        const restrictEnable = document.getElementById('tc-restrict-enable');
+        if (restrictEnable && restrictEnable.checked && _tcRestrict.vaultId
+            && (_tcRestrict.files.size + _tcRestrict.folders.size) > 0) {
+            const entry = selected_vaults.find(sv => sv.vault_id === _tcRestrict.vaultId);
+            if (entry) entry.scope_ids = {
+                files: Array.from(_tcRestrict.files),
+                folders: Array.from(_tcRestrict.folders),
+            };
+        }
     }
     return { scope: { v: 1, pages, caps, vault_caps_default: vaultCaps, temp }, vault_access_mode: mode, selected_vaults };
 }
@@ -3887,6 +4061,8 @@ async function loadSettings() {
         if (zkEl) zkEl.checked = settings.zero_knowledge_enabled === true;
         const fzkEl = document.getElementById('setting-force-zero-knowledge');
         if (fzkEl) fzkEl.checked = settings.force_zero_knowledge === true;
+        const dssEl = document.getElementById('setting-directory-search-scope');
+        if (dssEl) dssEl.value = (settings.directory_search_scope === 'same_department') ? 'same_department' : 'deployment';
         // When the PLAN mandates zero-knowledge (Enterprise tier), the local toggles can't
         // lower that floor — show ZK as allowed + required, checked and LOCKED, with an
         // explanatory note, so an unchecked-but-forced box isn't contradictory. Best-effort:
@@ -3957,7 +4133,8 @@ async function saveAllSettings() {
 
             // SFTP & Encryption
             zero_knowledge_enabled: document.getElementById('setting-zero-knowledge-enabled').checked,
-            force_zero_knowledge: document.getElementById('setting-force-zero-knowledge').checked
+            force_zero_knowledge: document.getElementById('setting-force-zero-knowledge').checked,
+            directory_search_scope: (document.getElementById('setting-directory-search-scope') || {}).value || 'deployment'
         };
 
         // Branding (A3): send the brand overrides. An empty value clears that
@@ -7433,7 +7610,13 @@ async function runVaultGrantSearch() {
         return;
     }
     try {
-        const users = await apiRequest(`/users/search?q=${encodeURIComponent(q)}`, { silent: true });
+        // Optional department narrow: the picker's dept <select> passes a group the caller belongs
+        // to; the server ignores a foreign group id. Under the same_department org policy the server
+        // already limits results to the caller's departments regardless.
+        const gsel = document.getElementById('vault-grant-group-filter');
+        const gid = gsel && gsel.value && gsel.value !== 'all' ? gsel.value : '';
+        const url = `/users/search?q=${encodeURIComponent(q)}${gid ? `&group_id=${encodeURIComponent(gid)}` : ''}`;
+        const users = await apiRequest(url, { silent: true });
         if (seq !== vaultGrantSearchSeq) return;  // a newer search (or modal reopen) superseded this one
         vaultGrantState.results = (Array.isArray(users) ? users : []).filter(u => !vaultGrantState.excluded.has(u.id));
         renderVaultGrantList();
@@ -7472,21 +7655,30 @@ async function openVaultGrantModal() {
         const headers = {};
         if (state.currentVault.has_password && state.vaultPassword) headers['X-Vault-Password'] = state.vaultPassword;
         // Non-admins can't read the admin-only /users list; the recipient picker searches the
-        // scoped /users/search endpoint on input instead of preloading the whole directory.
-        const [groups, perms] = await Promise.all([
-            apiRequest('/groups', { silent: true }).catch(() => []),
+        // scoped /users/search endpoint on input instead of preloading the whole directory. The
+        // department filter is populated from the CALLER's own groups (the /groups list is
+        // admin-only, and the server only honors a group id the caller belongs to anyway).
+        const [me, perms] = await Promise.all([
+            (Array.isArray(currentUser && currentUser.groups) && currentUser.groups.length)
+                ? Promise.resolve({ groups: currentUser.groups })
+                : apiRequest('/users/me', { silent: true }).catch(() => ({ groups: [] })),
             apiRequest(`/vaults/${state.currentVault.id}/permissions`, { headers, silent: true }).catch(() => [])
         ]);
         vaultGrantState.excluded = new Set((Array.isArray(perms) ? perms : []).map(p => p.user_id));
         if (state.currentVault.owner_id) vaultGrantState.excluded.add(state.currentVault.owner_id);
         vaultGrantState.results = [];
-        vaultGrantState.groups = Array.isArray(groups) ? groups : [];
+        vaultGrantState.groups = Array.isArray(me && me.groups) ? me.groups : [];
         const groupSel = document.getElementById('vault-grant-group-filter');
-        groupSel.innerHTML = `<option value="all">All departments</option>` +
-            vaultGrantState.groups.slice().sort((a, b) => a.name.localeCompare(b.name))
-                .map(g => `<option value="${g.id}">${escapeHtml(g.name)}</option>`).join('');
-        // Group filtering doesn't apply to the server-side search results — hide the control.
-        if (groupSel) groupSel.style.display = 'none';
+        if (groupSel) {
+            groupSel.innerHTML = `<option value="all">All my departments</option>` +
+                vaultGrantState.groups.slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+                    .map(g => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.name || 'Department')}</option>`).join('');
+            // Show the filter only when the caller actually belongs to a department; otherwise there is
+            // nothing to narrow by. Selecting one re-runs the (server-side, scoped) search.
+            groupSel.style.display = vaultGrantState.groups.length ? '' : 'none';
+            groupSel.value = 'all';
+            groupSel.onchange = () => runVaultGrantSearch();
+        }
         setTimeout(() => document.getElementById('vault-grant-search').focus(), 60);
     } catch (e) {
         document.getElementById('vault-grant-list').innerHTML = `<div class="alert alert-error">Failed to load users: ${escapeHtml(e.message)}</div>`;

@@ -94,6 +94,82 @@ def test_temp_credential_end_datetime_overrides_minutes(logged_in: Page):
     page.click("#close-temp-creds-modal")
 
 
+def test_directory_search_scope_setting_persists_via_ui(logged_in: Page, admin):
+    """The admin 'User Directory' policy select saves through the Settings UI to the backend."""
+    import time as _t
+    page = logged_in
+    admin.put("/settings", json={"directory_search_scope": "deployment"})  # deterministic start
+    try:
+        page.click('.sidebar-item[data-section="settings"]')
+        page.click('.tab-btn[data-tab="sftp"]')
+        # Wait until loadSettings has populated the control (else its async fetch would reset our
+        # selection after select_option and the save would send the stale value).
+        expect(page.locator("#setting-directory-search-scope")).to_have_value("deployment")
+        page.select_option("#setting-directory-search-scope", "same_department")
+        page.click("#save-all-settings-btn")
+        ok = False
+        for _ in range(24):
+            if admin.get("/settings").json().get("directory_search_scope") == "same_department":
+                ok = True
+                break
+            _t.sleep(0.25)
+        assert ok, "directory_search_scope did not persist via the settings UI"
+        # And the value round-trips back into the control on reload.
+        page.reload()
+        page.click('.sidebar-item[data-section="settings"]')
+        page.click('.tab-btn[data-tab="sftp"]')
+        expect(page.locator("#setting-directory-search-scope")).to_have_value("same_department")
+    finally:
+        admin.put("/settings", json={"directory_search_scope": "deployment"})
+
+
+def _api_mkfolder(admin, vid, name, parent=None):
+    body = {"name": name}
+    if parent:
+        body["parent_folder_id"] = parent
+    return admin.post(f"/vaults/{vid}/folders", json=body).json()["folder"]
+
+
+def _api_upload(admin, vid, name, folder_id=None):
+    params = {"folder_id": folder_id} if folder_id else {}
+    admin.post(f"/vaults/{vid}/files", files=[("files", (name, b"data", "text/plain"))], params=params)
+
+
+def test_temp_cred_file_folder_restriction_picker(logged_in: Page, admin):
+    """The mint modal's 'Restrict to specific files/folders' picker attaches selected_vaults[].scope_ids."""
+    page = logged_in
+    v = admin.create_vault(name=_u("uiscope"))
+    vid = v["id"]
+    try:
+        D = _api_mkfolder(admin, vid, _u("D"))
+        _api_upload(admin, vid, "x.txt", folder_id=D["id"])
+        _api_upload(admin, vid, "r.txt")  # a root file — must stay hidden from a D-scoped credential
+
+        page.click('.sidebar-item[data-section="temp-creds"]')
+        page.click("#generate-temp-creds-btn")
+        expect(page.locator("#generate-temp-creds-modal")).to_be_visible()
+        page.check("#tc-scope-enable")
+        # Restriction is unavailable until exactly one vault is selected.
+        expect(page.locator("#tc-restrict-enable")).to_be_disabled()
+        page.check(f'.tc-vault-pick[value="{vid}"]')
+        expect(page.locator("#tc-restrict-enable")).to_be_enabled()
+        page.check("#tc-restrict-enable")
+        # The picker loads the vault root; include folder D (its whole subtree).
+        page.check(f'.tc-restrict-include[data-id="{D["id"]}"][data-kind="folder"]')
+        expect(page.locator("#tc-restrict-summary")).to_contain_text("1 folder")
+
+        # The mint request must carry scope_ids on our vault's entry (files empty, folders=[D]).
+        with page.expect_request("**/auth/temp-credentials") as ri:
+            page.click("#generate-temp-creds-form button[type=submit]")
+        body = ri.value.post_data_json
+        sv = [s for s in body["selected_vaults"] if s["vault_id"] == vid]
+        assert sv, f"our vault missing from selected_vaults: {body}"
+        assert sv[0].get("scope_ids") == {"files": [], "folders": [D["id"]]}, body
+        expect(page.locator("#temp-creds-modal")).to_be_visible(timeout=10000)
+    finally:
+        admin.delete_vault(vid)
+
+
 def test_create_vault_via_ui(logged_in: Page, admin):
     page = logged_in
     name = _u("uivault")

@@ -20,7 +20,7 @@ from app.core.security import (
     calculate_file_checksum, verify_file_integrity,
     hash_password, verify_password, sanitize_filename
 )
-from app.core.authorization import PermissionService
+from app.core.authorization import PermissionService, PermissionDeniedError
 from app.core.config import settings
 from app.core.database import redis_client
 from app.services.encrypted_file_storage import EncryptedFileStorage
@@ -165,6 +165,160 @@ def calculate_file_expiration(vault) -> Optional[datetime]:
         return now + timedelta(hours=value)
     else:  # 'days' or any other value defaults to days
         return now + timedelta(days=value)
+
+
+def folder_ancestry(db: Session, vault_id, folder_id) -> List[str]:
+    """Folder-id chain from `folder_id` up to the vault root, INCLUSIVE:
+    ``[str(folder_id), str(parent), ..., str(root)]``; ``[]`` when folder_id is None (vault root).
+    Every hop is filtered by `vault_id` (a cross-vault folder stops the walk), and a visited-set
+    guards against a cycle. Feeds the ID-based scope check (app/core/id_scope) and the delegation
+    clamp; because it uses IDs, not names, it works for zero-knowledge vaults too."""
+    chain: List[str] = []
+    seen = set()
+    cur = folder_id
+    while cur is not None:
+        cur_s = str(cur)
+        if cur_s in seen:
+            break  # cycle guard (defensive; the tree should never contain one)
+        seen.add(cur_s)
+        row = db.query(Folder.id, Folder.parent_folder_id).filter(
+            Folder.id == cur, Folder.vault_id == vault_id).first()
+        if row is None:
+            break  # unknown / cross-vault folder -> stop (the caller fails closed)
+        chain.append(str(row[0]))
+        cur = row[1]
+    return chain
+
+
+def id_ancestry(db: Session, vault_id, obj_id) -> List[str]:
+    """``[str(obj_id)] + containing-folder chain`` for a FILE or FOLDER id in `vault_id` -- what the
+    delegation clamp (id_scope.intersect_id_scope) needs to test whether a child id falls within a
+    parent folder. An unknown/cross-vault id resolves to just ``[str(obj_id)]`` (so it can only match
+    a parent that granted exactly that id, never a broader parent folder -- fail closed)."""
+    oid = str(obj_id)
+    f = db.query(File.folder_id).filter(File.id == obj_id, File.vault_id == vault_id).first()
+    if f is not None:
+        return [oid] + folder_ancestry(db, vault_id, f[0])
+    d = db.query(Folder.parent_folder_id).filter(Folder.id == obj_id, Folder.vault_id == vault_id).first()
+    if d is not None:
+        return [oid] + folder_ancestry(db, vault_id, d[0])
+    return [oid]
+
+
+# --- Per-file/folder scope enforcement wrappers ------------------------------------------------
+# These are the ONLY way REST/SFTP surfaces should check a per-file/folder ID scope: they resolve
+# the target within the vault and compute its folder ancestry INTERNALLY, so no call site ever
+# hand-rolls (and risks mis-computing) the ancestry. All no-op for a non-scoped principal or a
+# whole-vault (unrestricted) grant, and raise PermissionDeniedError (handlers map it to 403; the
+# SFTP layer catches it) for anything outside the scope -- failing CLOSED on an unresolved target.
+
+def require_file_scope(db, user, vault_id, file_id) -> None:
+    """A scoped temp credential may act on file `file_id` only if it (or a containing folder) is in
+    its ID scope. Fails closed if the file doesn't exist in this vault."""
+    from app.core.temp_scope import is_scoped, scope_ids, require_scope
+    if not is_scoped(user) or scope_ids(user, vault_id) is None:
+        return
+    f = db.query(File.id, File.folder_id).filter(
+        File.id == file_id, File.vault_id == vault_id).first()
+    if f is None:
+        raise PermissionDeniedError("Temporary credential scope does not permit this file")
+    require_scope(user, vault_id, f[0], folder_ancestry(db, vault_id, f[1]))
+
+
+def require_folder_scope(db, user, vault_id, folder_id) -> None:
+    """A scoped temp credential may act ON, or write INTO, folder `folder_id` only if it (or an
+    ancestor) is in its ID scope. `folder_id` None = the vault ROOT, which no file/folder id-scope
+    covers, so it is denied for a scoped credential. Fails closed on an unknown/cross-vault folder."""
+    from app.core.temp_scope import is_scoped, scope_ids, require_scope
+    if not is_scoped(user) or scope_ids(user, vault_id) is None:
+        return
+    if folder_id is None or str(folder_id) == "":
+        raise PermissionDeniedError("Temporary credential scope does not permit the vault root")
+    try:
+        folder_id = uuid.UUID(str(folder_id))  # callers may pass a str (upload/create) or a UUID
+    except (ValueError, AttributeError, TypeError):
+        raise PermissionDeniedError("Temporary credential scope does not permit this folder")
+    d = db.query(Folder.id, Folder.parent_folder_id).filter(
+        Folder.id == folder_id, Folder.vault_id == vault_id).first()
+    if d is None:
+        raise PermissionDeniedError("Temporary credential scope does not permit this folder")
+    require_scope(user, vault_id, d[0], folder_ancestry(db, vault_id, d[1]))
+
+
+def require_item_scope(db, user, vault_id, item_id) -> None:
+    """`item_id` may identify a FILE or a FOLDER (e.g. the rename endpoint is id-polymorphic --
+    it renames whichever the id resolves to). Enforce the scope on whichever it is; fail closed if
+    it is neither. No-op for a non-scoped principal or a whole-vault grant."""
+    from app.core.temp_scope import is_scoped, scope_ids, require_scope
+    if not is_scoped(user) or scope_ids(user, vault_id) is None:
+        return
+    f = db.query(File.id, File.folder_id).filter(
+        File.id == item_id, File.vault_id == vault_id).first()
+    if f is not None:
+        require_scope(user, vault_id, f[0], folder_ancestry(db, vault_id, f[1]))
+        return
+    d = db.query(Folder.id, Folder.parent_folder_id).filter(
+        Folder.id == item_id, Folder.vault_id == vault_id).first()
+    if d is not None:
+        require_scope(user, vault_id, d[0], folder_ancestry(db, vault_id, d[1]))
+        return
+    raise PermissionDeniedError("Temporary credential scope does not permit this item")
+
+
+def _scope_nav_folder_ids(db, vault_id, scope) -> set:
+    """The set of folder ids on the PATH to any scoped item (each scope folder's ancestry + each
+    scope file's containing-folder ancestry). These are shown as bare navigable nodes so the holder
+    can descend to its subtree, but they are NOT themselves in scope (no read/write on them)."""
+    nav = set()
+    for fid in (scope.get('folders') or []):
+        nav.update(folder_ancestry(db, vault_id, fid))
+    for xid in (scope.get('files') or []):
+        xf = db.query(File.folder_id).filter(File.id == xid, File.vault_id == vault_id).first()
+        if xf is not None:
+            nav.update(folder_ancestry(db, vault_id, xf[0]))
+    return nav
+
+
+def folder_is_navigable(db, user, vault_id, folder_id) -> bool:
+    """Whether a scoped credential may SEE/traverse `folder_id` as a container (for stat/list/`cd`):
+    it is IN scope (itself or an ancestor is a scope folder), OR it is an ANCESTOR of an in-scope
+    item (on the path down to the scope). True (no restriction) for a non-scoped principal, a
+    whole-vault grant, or the vault ROOT (folder_id None). This is WEAKER than require_folder_scope
+    (which gates writes/deletes ON/INTO a folder) — it must NOT be used to authorize mutation."""
+    from app.core.temp_scope import is_scoped, scope_ids
+    from app.core.id_scope import id_in_scope
+    if not is_scoped(user):
+        return True
+    scope = scope_ids(user, vault_id)
+    if scope is None or folder_id is None:
+        return True
+    fid = str(folder_id)
+    if id_in_scope(scope, fid, folder_ancestry(db, vault_id, folder_id)):
+        return True
+    return fid in _scope_nav_folder_ids(db, vault_id, scope)
+
+
+def filter_listing_for_scope(db, user, vault_id, folder_id, folders, files):
+    """Filter a folder listing to what a path-scoped temp credential may SEE: files/folders in its
+    scope, PLUS the ancestor folders needed to NAVIGATE down toward a scoped item. Returns
+    (folders, files) unchanged for a non-scoped principal or a whole-vault grant. This is the
+    anti-enumeration defense -- out-of-scope names/sizes/counts are never emitted. `folders`
+    and `files` are the child rows of `folder_id` (None = vault root); each child's containing
+    folder is `folder_id`, so they share its ancestry."""
+    from app.core.temp_scope import is_scoped, scope_ids
+    from app.core.id_scope import id_in_scope
+    if not is_scoped(user):
+        return folders, files
+    scope = scope_ids(user, vault_id)
+    if scope is None:
+        return folders, files
+    base_anc = folder_ancestry(db, vault_id, folder_id)  # ancestry of the folder being listed
+    # Every folder on the path to any scoped item is navigable (shown so the user can descend).
+    nav = _scope_nav_folder_ids(db, vault_id, scope)
+    vis_folders = [f for f in folders
+                   if id_in_scope(scope, str(f.id), base_anc) or str(f.id) in nav]
+    vis_files = [x for x in files if id_in_scope(scope, str(x.id), base_anc)]
+    return vis_folders, vis_files
 
 
 class VaultService:

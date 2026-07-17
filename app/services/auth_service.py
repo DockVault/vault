@@ -396,6 +396,7 @@ class AuthService:
         parent_vault_mode: Optional[str] = None,
         parent_vault_ids: Optional[list] = None,
         parent_vault_caps: Optional[dict] = None,
+        parent_vault_scope: Optional[dict] = None,
         created_by_temp_credential_id: Optional[uuid.UUID] = None,
         created_by_user_id: Optional[uuid.UUID] = None,
     ) -> dict:
@@ -451,6 +452,8 @@ class AuthService:
         # temp session delegates (parent_scope set), intersect so the child can
         # never exceed its parent.
         from app.core.temp_scope import intersect_scope, VAULT_CAPS, expand_vault_caps
+        from app.core.id_scope import normalize_id_scope, intersect_id_scope
+        from app.services.vault_service import id_ancestry
         is_delegated = parent_scope is not None
         if scope is None and not is_delegated:
             effective_scope = None
@@ -506,6 +509,10 @@ class AuthService:
                 if not vid:
                     continue
                 try:
+                    vid = str(uuid.UUID(str(vid)))  # canonicalize so pw_fingerprints keys match the persist loop
+                except (ValueError, AttributeError, TypeError):
+                    continue
+                try:
                     vault = self.db.query(Vault).filter(Vault.id == uuid.UUID(str(vid))).first()
                 except (ValueError, AttributeError):
                     continue
@@ -550,22 +557,36 @@ class AuthService:
                 vid = sv.get('vault_id') if isinstance(sv, dict) else None
                 if not vid:
                     continue
+                try:
+                    vid = str(uuid.UUID(str(vid)))  # canonicalize so the parent-key lookups below are case-insensitive
+                except (ValueError, AttributeError, TypeError):
+                    continue
                 if is_delegated and parent_vault_mode == 'selected' and str(vid) not in parent_ids:
                     continue  # child cannot reach a vault the parent could not
                 # Add implied prerequisite caps so the granted combination is usable, then (for a
                 # delegated child) clamp to what the parent held so expansion can't broaden scope.
                 caps = expand_vault_caps(sv.get('caps') or [])
+                # Optional ID-based per-file/folder restriction (None = whole vault). For a delegated
+                # child, clamp it to the parent's own so a child can never widen past it.
+                scope_ids = normalize_id_scope(sv.get('scope_ids') if isinstance(sv, dict) else None)
                 if is_delegated:
                     if parent_vault_mode == 'all':
                         parent_caps = set((parent_scope or {}).get('vault_caps_default', []))
+                        parent_scope_ids = None  # a whole-vault parent imposes no file/folder limit
                     else:
                         parent_caps = set((parent_vault_caps or {}).get(str(vid), []))
+                        parent_scope_ids = (parent_vault_scope or {}).get(str(vid))
                     caps = [c for c in caps if c in parent_caps]
+                    _vid = uuid.UUID(str(vid))
+                    scope_ids = intersect_id_scope(
+                        parent_scope_ids, scope_ids,
+                        lambda cid: id_ancestry(self.db, _vid, cid))
                 try:
                     self.db.add(TempCredentialVaultAccess(
                         temp_credential_id=temp_cred.id,
                         vault_id=uuid.UUID(str(vid)),
                         vault_caps=caps,
+                        scope_ids=scope_ids,
                         # Binds the SFTP proof to the password proven above (NULL for
                         # non-password vaults); re-checked against the live hash on access.
                         vault_password_fingerprint=pw_fingerprints.get(str(vid)),

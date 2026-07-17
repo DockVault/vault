@@ -130,18 +130,49 @@ function Copy-ByoCert {
     Say "installed bring-your-own certificate for $ServerName"
 }
 
+function Test-CertPair {
+    (Test-Path (Join-Path $CertDir 'cert.pem')) -and (Test-Path (Join-Path $CertDir 'key.pem'))
+}
+
 function New-SelfSignedCert {
     # Self-signed, RSA 4096, 825 days, with the server name as CN + SAN.
     $san = "DNS:$ServerName"
     if ($ServerName -match '^\d{1,3}(\.\d{1,3}){3}$') { $san = "IP:$ServerName" }
     Say "generating a self-signed certificate for $ServerName (RSA 4096, 825 days)"
-    Invoke-OpenSSL @(
+    $osslArgs = @(
         'req', '-x509', '-newkey', 'rsa:4096', '-sha256', '-days', '825', '-nodes',
         '-keyout', 'key.pem', '-out', 'cert.pem', '-subj', "/CN=$ServerName",
         '-addext', "subjectAltName=$san"
-    ) | Out-Null
-    if (-not (Test-Path (Join-Path $CertDir 'cert.pem')) -or -not (Test-Path (Join-Path $CertDir 'key.pem'))) {
-        Die 'certificate generation failed (no cert.pem/key.pem produced). Install OpenSSL or check Docker.'
+    )
+    $diag = ''
+
+    # 1) Prefer a host OpenSSL if present (fast, no image pull). Capture its output (2>&1) so a
+    #    failure is DIAGNOSABLE instead of being silently swallowed.
+    $openssl = Get-Command openssl -ErrorAction SilentlyContinue
+    if ($openssl) {
+        Push-Location $CertDir
+        try { $out = & $openssl.Source @osslArgs 2>&1 } finally { Pop-Location }
+        if ($LASTEXITCODE -ne 0 -or -not (Test-CertPair)) {
+            $diag = "host OpenSSL (exit $LASTEXITCODE): " + (($out | Out-String).Trim())
+            Warn 'host OpenSSL did not produce a certificate; falling back to a throwaway Docker container.'
+        }
+    }
+
+    # 2) Fall back to a throwaway alpine/openssl container (needs only Docker, already required
+    #    above) when the host tool is missing OR failed. The Linux openssl also sidesteps Windows
+    #    -subj path mangling by an MSYS/Git-based openssl.
+    if (-not (Test-CertPair)) {
+        $out = docker run --rm -v "${CertDir}:/certs" -w /certs alpine/openssl @osslArgs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            if ($diag) { $diag += "`n" }
+            $diag += "docker openssl (exit $LASTEXITCODE): " + (($out | Out-String).Trim())
+        }
+    }
+
+    if (-not (Test-CertPair)) {
+        Die ("certificate generation failed (no cert.pem/key.pem produced).`n$diag`n" +
+             'Ensure Docker Desktop is running (the script can generate the cert via a throwaway ' +
+             'alpine/openssl container), or install a working OpenSSL.')
     }
 }
 

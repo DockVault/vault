@@ -37,6 +37,8 @@ from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum,
 from app.services.auth_service import AuthService, InvalidCredentialsError, AccountLockedError, RateLimitExceededError as AuthRateLimitExceededError
 from app.core.authorization import PermissionService, PermissionDeniedError, ResourceNotFoundError, AuthorizationError
 from app.services.vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, _name_match_filter
+from app.services.vault_service import require_file_scope, require_folder_scope, require_item_scope, folder_ancestry, filter_listing_for_scope
+from app.core.id_scope import id_in_scope
 from sqlalchemy.exc import IntegrityError
 from app.services.audit_logger import AuditLogger
 from app.services import log_pull  # RO2-3: pure helpers for the authenticated log-pull endpoint
@@ -710,8 +712,11 @@ class VaultResponse(BaseModel):
     expire_files_unit: Optional[str]
     unlock_remember_minutes: Optional[int] = None
     size_limit: Optional[int]
-    total_size_bytes: int
-    file_count: int
+    # Whole-vault aggregates. Null when the caller is a per-file/folder-scoped credential: the
+    # denormalized counters cover the ENTIRE vault, so returning them would reveal the count/size
+    # of files outside the credential's scope (an anti-enumeration leak).
+    total_size_bytes: Optional[int]
+    file_count: Optional[int]
     created_at: datetime
     updated_at: datetime
     last_accessed: Optional[datetime]
@@ -1407,6 +1412,19 @@ def _validate_group_id_list(payload: dict, key: str, db: Session) -> None:
             )
 
 
+_DIRECTORY_SEARCH_SCOPES = ("deployment", "same_department")
+
+
+def _directory_search_scope(db: Session) -> str:
+    """Org policy governing GET /users/search breadth: 'deployment' (default — any active,
+    non-EXTERNAL account is findable by a vault sharer) or 'same_department' (only accounts sharing
+    at least one group/department with the caller). Unset/invalid -> 'deployment' (today's behavior)."""
+    from app.core.models import SystemSetting
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    val = (row.value or {}).get("directory_search_scope") if (row and row.value) else None
+    return val if val in _DIRECTORY_SEARCH_SCOPES else "deployment"
+
+
 def _validate_settings_payload(payload: dict, db: Session) -> None:
     """Validate the few settings keys that drive real enforcement so the admin UI
     can't silently persist values that later fail open. The store is otherwise
@@ -1437,6 +1455,12 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     _validate_group_id_list(payload, "sftp_require_temp_cred_groups", db)
     _validate_group_id_list(payload, "standard_vault_allowed_groups", db)
 
+    if "directory_search_scope" in payload and payload["directory_search_scope"] not in _DIRECTORY_SEARCH_SCOPES:
+        raise HTTPException(
+            status_code=400,
+            detail="directory_search_scope must be 'deployment' or 'same_department'",
+        )
+
 
 @app.get("/settings")
 async def get_settings(
@@ -1454,6 +1478,9 @@ async def get_settings(
     # whole object) would persist the unchecked default and silently disable the auto-enabled
     # feature. An explicit admin off is preserved (_zk_enabled returns it verbatim).
     data["zero_knowledge_enabled"] = _zk_enabled(db)
+    # Always report the EFFECTIVE directory-search policy so the admin toggle reflects the default
+    # ('deployment') even when never explicitly saved.
+    data["directory_search_scope"] = _directory_search_scope(db)
     return data
 
 
@@ -2424,7 +2451,7 @@ async def create_temp_credentials(
     req_scope = payload.scope if payload else None
     req_mode = (payload.vault_access_mode if (payload and payload.vault_access_mode) else 'selected')
     req_vaults = payload.selected_vaults if payload else None
-    parent_scope = parent_mode = parent_vault_ids = parent_vault_caps = None
+    parent_scope = parent_mode = parent_vault_ids = parent_vault_caps = parent_vault_scope = None
     # Stamp the creating temp session on every child (scoped OR legacy NULL-scope) so the child
     # lands in the creator's confinement subtree and stays visible/manageable by it. Without this a
     # legacy temp session would mint children with a NULL creator that its own confined list/guard
@@ -2450,6 +2477,7 @@ async def create_temp_credentials(
         parent_mode = getattr(current_user, '_temp_vault_mode', 'selected')
         parent_vault_caps = getattr(current_user, '_temp_vault_caps', {}) or {}
         parent_vault_ids = list(parent_vault_caps.keys())
+        parent_vault_scope = getattr(current_user, '_temp_vault_scope', {}) or {}
 
     temp_creds = auth_service.create_temporary_credential(
         current_user.id,
@@ -2464,6 +2492,7 @@ async def create_temp_credentials(
         parent_vault_mode=parent_mode,
         parent_vault_ids=parent_vault_ids,
         parent_vault_caps=parent_vault_caps,
+        parent_vault_scope=parent_vault_scope,
         created_by_temp_credential_id=created_by_temp_id,
         created_by_user_id=current_user.id,
     )
@@ -3255,6 +3284,7 @@ async def update_my_preferences(
 @app.get("/users/search")
 async def search_users(
     q: str = "",
+    group_id: str = "",
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3300,11 +3330,40 @@ async def search_users(
     # Prefix match; escape the LIKE wildcards so a query like "%" can't sweep the directory.
     esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     like = esc + "%"
-    rows = db.query(User.id, User.username).filter(
+    query = db.query(User.id, User.username).filter(
         User.is_active == True,  # noqa: E712
         User.role != RoleEnum.EXTERNAL,
         or_(User.username.ilike(like, escape="\\"), User.email.ilike(like, escape="\\")),
-    ).order_by(User.username).limit(10).all()
+    )
+
+    # Org policy: 'same_department' limits discovery to accounts that share at least one group with
+    # the caller (a caller in no groups therefore finds no one); 'deployment' (default) keeps the
+    # whole-directory behavior. Applied uniformly — an interactive admin still has the /users list.
+    # The optional group_id narrows to ONE department the caller belongs to (a foreign group id
+    # yields no results — the join to the caller's memberships makes it fail closed either way).
+    from app.core.models import user_groups
+    from sqlalchemy import select as _select
+    scope = _directory_search_scope(db)
+    gid = None
+    if group_id:
+        try:
+            gid = uuid.UUID(str(group_id))
+        except (ValueError, TypeError):
+            return []  # an unparseable group filter matches nothing rather than sweeping the directory
+    if scope == "same_department" or gid is not None:
+        caller_group_ids = _select(user_groups.c.group_id).where(user_groups.c.user_id == current_user.id)
+        query = query.join(user_groups, User.id == user_groups.c.user_id)
+        if scope == "same_department":
+            query = query.filter(user_groups.c.group_id.in_(caller_group_ids))
+        if gid is not None:
+            # A specific-department filter is only honored for a group the caller belongs to, so it
+            # can't be used to enumerate a department the caller isn't in.
+            query = query.filter(
+                user_groups.c.group_id == gid,
+                user_groups.c.group_id.in_(caller_group_ids),
+            )
+        query = query.distinct()
+    rows = query.order_by(User.username).limit(10).all()
     return [{"id": str(uid), "username": uname} for uid, uname in rows]
 
 
@@ -4283,9 +4342,13 @@ async def list_vaults(
         ).fetchall()
     }
 
+    from app.core.temp_scope import scope_ids as _scope_ids
     result = []
     for vault in vaults:
         perms = permission_service.get_vault_permissions(current_user, vault.id)
+        # Suppress the whole-vault aggregates for a per-file/folder-scoped credential on this vault
+        # (see get_vault) so it can't count/measure files outside its scope.
+        _id_scoped = _scope_ids(current_user, vault.id) is not None
         vault_dict = {
             'id': vault.id,
             'name': vault.name,
@@ -4296,8 +4359,8 @@ async def list_vaults(
             'expire_files_unit': vault.expire_files_unit or 'days',
             'unlock_remember_minutes': vault.unlock_remember_minutes,
             'size_limit': vault.size_limit,
-            'total_size_bytes': vault.total_size_bytes,
-            'file_count': vault.file_count,
+            'total_size_bytes': None if _id_scoped else vault.total_size_bytes,
+            'file_count': None if _id_scoped else vault.file_count,
             'created_at': vault.created_at,
             'updated_at': vault.updated_at,
             'last_accessed': vault.last_accessed,
@@ -4331,11 +4394,16 @@ async def get_vault(
     try:
         # require_password=False means we're just viewing metadata
         vault = vault_service.get_vault(vault_id, current_user, vault_password, require_password=False)
-        
+
         # Get owner username
         owner = db.query(User).filter(User.id == vault.owner_id).first()
         owner_username = owner.username if owner else None
-        
+
+        # A per-file/folder-scoped credential must not learn the whole-vault file count / size (it
+        # would reveal how many files exist outside its scope). Suppress the denormalized aggregates.
+        from app.core.temp_scope import scope_ids as _scope_ids
+        _id_scoped = _scope_ids(current_user, vault_id) is not None
+
         # Build response dict with has_password and owner_username
         vault_dict = {
             'id': vault.id,
@@ -4348,8 +4416,8 @@ async def get_vault(
             'expire_files_unit': vault.expire_files_unit or 'days',
             'unlock_remember_minutes': vault.unlock_remember_minutes,
             'size_limit': vault.size_limit,
-            'total_size_bytes': vault.total_size_bytes,
-            'file_count': vault.file_count,
+            'total_size_bytes': None if _id_scoped else vault.total_size_bytes,
+            'file_count': None if _id_scoped else vault.file_count,
             'created_at': vault.created_at,
             'updated_at': vault.updated_at,
             'last_accessed': vault.last_accessed,
@@ -5431,6 +5499,11 @@ async def list_vault_files(
         
         files = file_query.all()
 
+        # A path-scoped temp credential sees only its in-scope files/folders (+ the ancestor folders
+        # needed to navigate to them). This is the anti-enumeration gate (out-of-scope names/sizes
+        # are never emitted); the @require_vault_cap("vault.see_files") above still gates listing at all.
+        folders, files = filter_listing_for_scope(db, current_user, vault_id, folder_uuid, folders, files)
+
         # Build response
         items = []
         # Zero-knowledge vaults: names/MIME are encrypted client-side under the vault DEK,
@@ -5628,6 +5701,9 @@ async def upload_file(
     try:
         # Verify vault access and password (from header for security)
         vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+        # A path-scoped temp credential may only upload INTO a folder within its scope
+        # (uploading to the vault root, folder_id None, is denied for a scoped credential).
+        require_folder_scope(db, current_user, vault_id, folder_id)
 
         # Zero-knowledge vaults cannot use this multipart path: the bytes (and the
         # multipart filename) arrive in the CLEAR, so the server would store plaintext
@@ -6366,6 +6442,9 @@ async def init_chunked_upload(
         if not folder:
             raise HTTPException(status_code=404, detail="Folder not found in vault")
 
+    # A scoped credential may only start an upload into an in-scope folder (root => denied).
+    require_folder_scope(db, current_user, vault_id, body.folder_id)
+
     now = datetime.utcnow()
     # Resume: reuse an active session for the same file if present. Standard vaults match
     # by plaintext name + size; ZK vaults match by the client blind index + size (the
@@ -6379,6 +6458,14 @@ async def init_chunked_upload(
         ChunkedUploadSession.status == 'active',
         ChunkedUploadSession.expires_at > now,
     )
+    # Match the requested destination too. user_id is shared between the minting admin and every
+    # temp credential they mint, so without this a re-init would resume a session opened into a
+    # DIFFERENT folder — reusing its stored target and ignoring body.folder_id (a correctness bug
+    # for everyone, and it would let a scope-checked destination silently become another folder).
+    if folder_uuid is None:
+        resume_q = resume_q.filter(ChunkedUploadSession.folder_id.is_(None))
+    else:
+        resume_q = resume_q.filter(ChunkedUploadSession.folder_id == folder_uuid)
     if is_zk:
         resume_q = resume_q.filter(ChunkedUploadSession.name_bi == body.name_bi)
     else:
@@ -6466,6 +6553,9 @@ async def upload_chunk(
     ).first()
     if session is None:
         raise HTTPException(status_code=404, detail="Upload session not found")
+    # A scoped credential may only write to a session whose target folder is in scope
+    # (the session was created by the same shared user id, so re-check per surface).
+    require_folder_scope(db, current_user, vault_id, session.folder_id)
     if session.status != 'active':
         raise HTTPException(status_code=409, detail=f"Upload session is {session.status}")
     if session.expires_at and session.expires_at <= datetime.utcnow():
@@ -6583,6 +6673,8 @@ async def complete_chunked_upload(
     ).first()
     if session is None:
         raise HTTPException(status_code=404, detail="Upload session not found")
+    # A scoped credential may only finalize a session whose target folder is in scope.
+    require_folder_scope(db, current_user, vault_id, session.folder_id)
     if session.status == 'completed' and session.file_id:
         return {'id': str(session.file_id), 'name': session.filename, 'already_completed': True}
     if session.status != 'active':
@@ -6838,8 +6930,15 @@ async def list_resumable_uploads(
         ChunkedUploadSession.expires_at > now,
     ).order_by(ChunkedUploadSession.created_at.desc()).all()
 
+    # A scoped credential enumerates only its in-scope upload sessions: require_folder_scope
+    # is a no-op for a whole-vault credential and raises for one whose scope excludes the
+    # session's target folder (so out-of-scope filenames/folders are never listed).
     out = []
     for s in sessions:
+        try:
+            require_folder_scope(db, current_user, vault_id, s.folder_id)
+        except PermissionDeniedError:
+            continue
         received = len(_received_chunk_indices(_upload_session_dir(vault_service, str(s.id))))
         out.append(_session_payload(s, received))
     return out
@@ -6868,6 +6967,9 @@ async def get_upload_session(
     ).first()
     if session is None:
         raise HTTPException(status_code=404, detail="Upload session not found")
+    # A scoped credential may only inspect a session whose target folder is in scope
+    # (the payload carries the filename + folder id — do not reveal it out of scope).
+    require_folder_scope(db, current_user, vault_id, session.folder_id)
 
     received = sorted(_received_chunk_indices(_upload_session_dir(vault_service, str(session.id))))
     payload = _session_payload(session, len(received))
@@ -6899,6 +7001,8 @@ async def cancel_chunked_upload(
     ).first()
     if session is None:
         raise HTTPException(status_code=404, detail="Upload session not found")
+    # A scoped credential may only cancel a session whose target folder is in scope.
+    require_folder_scope(db, current_user, vault_id, session.folder_id)
 
     shutil.rmtree(_upload_session_dir(vault_service, str(session.id)), ignore_errors=True)
     if session.status == 'active':
@@ -7024,7 +7128,9 @@ async def download_file(
     try:
         # Verify vault access and password
         vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
-        
+        # A path-scoped temp credential may only download a file within its file/folder scope.
+        require_file_scope(db, current_user, vault_id, file_id)
+
         # Create operation ID for tracking downloads
         operation_id = f"download_{uuid.uuid4()}"
         start_operation(operation_id)
@@ -7186,7 +7292,9 @@ async def delete_file(
     try:
         # Verify vault access and password
         vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
-        
+        # A path-scoped temp credential may only delete a file within its file/folder scope.
+        require_file_scope(db, current_user, vault_id, file_id)
+
         # Get file info before deletion. The file MUST belong to the vault it's
         # deleted through, so the password/access gate above covers it (cross-vault
         # guard — otherwise B's file could be deleted by routing through vault A).
@@ -7268,6 +7376,10 @@ async def rename_file(
     try:
         # Verify vault access and password
         vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+        # A path-scoped temp credential may only rename a file/folder within its scope (this endpoint
+        # is id-polymorphic — the id may be a file or a folder; rename keeps it in the same folder,
+        # so the source check covers it).
+        require_item_scope(db, current_user, vault_id, file_id)
 
         # Zero-knowledge: the new name must arrive ENCRYPTED (enc_name + name_bi) and never as
         # plaintext — mirror the upload/folder-create contract so all three write paths agree.
@@ -7388,6 +7500,9 @@ async def create_folder(
         # Extract folder data
         folder_name = folder_data.get('name')
         parent_folder_id = folder_data.get('parent_folder_id')
+        # A path-scoped temp credential may only create a folder INSIDE a folder within its scope
+        # (creating at the vault root, parent None, is denied for a scoped credential).
+        require_folder_scope(db, current_user, vault_id, parent_folder_id)
 
         # Zero-knowledge folders carry a browser-encrypted name + blind index (no plaintext);
         # Standard folders carry a plaintext name. Enforce the right shape per vault type.
@@ -7521,6 +7636,8 @@ async def delete_folder(
     audit_logger = AuditLogger(db)
     try:
         vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+        # A path-scoped temp credential may only delete a folder (subtree) within its scope.
+        require_folder_scope(db, current_user, vault_id, folder_id)
         # folder deletion recursively wipes every file in the subtree — require DELETE
         # permission, not the mere READ that get_vault checks. Without this a read-only member
         # could destroy a whole folder tree (the per-file delete_file errors below were
@@ -7645,6 +7762,12 @@ async def zk_seal_names(
 
     sealed = 0
     for it in body.items:
+        # A scoped credential may only seal names of in-scope objects (skip the rest, as with
+        # any other non-applicable item). require_item_scope is a no-op for a whole-vault cred.
+        try:
+            require_item_scope(db, current_user, vault_id, it.id)
+        except PermissionDeniedError:
+            continue
         if not it.enc_name or not it.name_bi:
             continue
         # The blob must be a real sealed 'zk1:' ciphertext (server-enforced marker), and a
@@ -8458,6 +8581,8 @@ def _run_lightweight_migrations():
             # Least-privilege scope for temp credentials (the temp_credential_vault_access
             # TABLE itself is created by create_all; only new COLUMNS need an ALTER).
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS scope JSONB",
+            # Optional per-file/folder ID scope on a selected-mode vault grant (NULL = whole vault).
+            "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS scope_ids JSONB",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS vault_access_mode VARCHAR(10) DEFAULT 'selected'",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS created_by_temp_credential_id UUID",
             # Per-vault SFTP password proof: fingerprint of the vault password hash proven
