@@ -1104,12 +1104,14 @@
                             </div>
                             <div class="p-lg">
                                 <div class="form-group">
-                                    <label for="setting-default-quota">Default User Storage Quota (GB)</label>
-                                    <input type="number" id="setting-default-quota" class="form-control" placeholder="10" min="1">
+                                    <label for="setting-default-quota">Per-account storage quota (GB)</label>
+                                    <input type="number" id="setting-default-quota" class="form-control" placeholder="Unlimited" min="0" step="1">
+                                    <small class="text-secondary">The total a single account's vaults may reserve (the sum of their declared sizes). <strong>Blank = unlimited.</strong> Admins are exempt.</small>
                                 </div>
                                 <div class="form-group">
-                                    <label for="setting-max-vault-size">Max Vault Size (GB)</label>
-                                    <input type="number" id="setting-max-vault-size" class="form-control" placeholder="100" min="1">
+                                    <label for="setting-max-vault-size">Maximum size per vault (GB)</label>
+                                    <input type="number" id="setting-max-vault-size" class="form-control" placeholder="Unlimited" min="0" step="1">
+                                    <small class="text-secondary">The largest any single vault may be set to. <strong>Blank = unlimited.</strong></small>
                                 </div>
                                 <div class="form-group">
                                     <label for="setting-storage-path">Storage Path (Read-Only)</label>
@@ -1390,6 +1392,11 @@
                                 <div class="form-group">
                                     <label for="vault-desc">Description</label>
                                     <textarea id="vault-desc" class="form-control" rows="3"></textarea>
+                                </div>
+                                <div class="form-group">
+                                    <label for="vault-size-gb">Maximum size (GB)</label>
+                                    <input type="number" id="vault-size-gb" class="form-control" min="0.1" step="0.1" value="1">
+                                    <small class="form-help" id="vault-size-avail">The most this vault may hold. Default 1 GB; you can change it later in the vault's policies.</small>
                                 </div>
                                 <!-- The top-level vault password is a web access gate for STANDARD
                                      vaults only; zero-knowledge vaults are unlocked by the browser-side
@@ -1784,6 +1791,11 @@
                                 <label for="unlock-remember-minutes">Remember unlock for (minutes)</label>
                                 <input type="number" id="unlock-remember-minutes" class="form-control" min="0" max="1440" step="1" placeholder="15 (default)">
                                 <small class="text-secondary">How long this device keeps the vault unlocked before asking for the password again. <strong>0 = always ask</strong> (best for sensitive vaults). Leave blank for the 15-minute default.</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="vault-size-limit-gb">Maximum size (GB)</label>
+                                <input type="number" id="vault-size-limit-gb" class="form-control" min="0.1" step="0.1">
+                                <small class="text-secondary" id="vault-size-limit-avail">The most this vault may hold. Can't be set below what's already stored.</small>
                             </div>
                             <div class="modal-footer">
                                 <button type="button" class="btn btn-secondary close-modal-btn" data-modal="set-expiry-modal">Cancel</button>

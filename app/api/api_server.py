@@ -4257,6 +4257,28 @@ def _resolve_vault_type_for_create(current_user: User, requested: Optional[str],
     return "standard"
 
 
+@app.get("/account/storage")
+async def account_storage(
+    exclude_vault_id: Optional[uuid.UUID] = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The current account's storage picture, so the UI can show how much a new/edited vault may
+    declare. Bytes; a null bound means UNLIMITED on that axis. reserved = the SUM of the owner's
+    declared vault size_limits; available = the largest size a vault may declare right now (pass
+    exclude_vault_id when editing a vault, so its OWN current reservation doesn't count against it)."""
+    budget = _quota_setting_bytes(db, "default_user_quota")
+    ceiling = _quota_setting_bytes(db, "max_vault_size")
+    is_full_admin = current_user.role == RoleEnum.ADMIN and not getattr(current_user, "_is_temp_session", False)
+    return {
+        "reserved_bytes": _account_reserved_bytes(db, current_user.id),
+        "account_quota_bytes": (budget or None) if not is_full_admin else None,
+        "per_vault_max_bytes": ceiling or None,
+        "available_bytes": _max_allowed_vault_size_bytes(db, current_user, exclude_vault_id),
+        "budget_exempt": is_full_admin,
+    }
+
+
 @app.post("/vaults", response_model=VaultResponse)
 @require_endpoint_permission("VAULT_CREATE")
 async def create_vault(

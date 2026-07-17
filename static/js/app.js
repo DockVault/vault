@@ -1377,6 +1377,32 @@ function syncCreateVaultForm() {
 }
 
 // Create Vault Modal
+async function fetchAccountStorage(excludeVaultId) {
+    const qs = excludeVaultId ? `?exclude_vault_id=${encodeURIComponent(excludeVaultId)}` : '';
+    try { return await apiRequest('/account/storage' + qs, { silent: true }); }
+    catch (_) { return null; }
+}
+function _bytesToGb(bytes) { return bytes / (1024 ** 3); }
+// Fill a "how much you can allocate" note + set the size input's soft max from /account/storage.
+// Pass the vault id being edited (else null) so its own reservation is excluded from the headroom.
+async function renderVaultSizeAvailability(noteId, inputEl, excludeVaultId, baseText) {
+    const note = document.getElementById(noteId);
+    if (!note) return;
+    const base = baseText || 'The most this vault may hold.';
+    const s = await fetchAccountStorage(excludeVaultId);
+    if (!s) return;
+    if (s.available_bytes == null) {  // unlimited on both axes (or budget-exempt admin)
+        note.textContent = s.budget_exempt ? base + ' No account storage limit.' : base;
+        if (inputEl) inputEl.removeAttribute('max');
+        return;
+    }
+    const fmt = g => g.toFixed(g < 10 ? 2 : 0);
+    const availGb = _bytesToGb(s.available_bytes);
+    const usedGb = _bytesToGb(s.reserved_bytes || 0);
+    note.textContent = `${base} You can allocate up to ${fmt(availGb)} GB (${fmt(usedGb)} GB reserved on your account).`;
+    if (inputEl) inputEl.max = String(Math.max(0.1, availGb));
+}
+
 async function showCreateVault() {
     // The zero-knowledge option is only offered when the deployment enables it.
     const grp = document.getElementById('vault-type-group');
@@ -1435,6 +1461,12 @@ async function showCreateVault() {
         }
     }
 
+    // Reset the size to the 1 GB default + surface how much the account can still allocate.
+    const sizeInput = document.getElementById('vault-size-gb');
+    if (sizeInput) sizeInput.value = '1';
+    renderVaultSizeAvailability('vault-size-avail', sizeInput, null,
+        'The most this vault may hold. Default 1 GB; changeable later in policies.');
+
     // Reflect the resolved type into password + team-mode visibility, then show.
     syncCreateVaultForm();
     document.getElementById('create-vault-modal').classList.add('active');
@@ -1447,6 +1479,7 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
     const description = document.getElementById('vault-desc').value.trim();
     const password = document.getElementById('vault-password').value;
     const vaultType = effectiveVaultType();
+    const sizeGb = parseFloat(document.getElementById('vault-size-gb').value);
 
     try {
         const payload = {
@@ -1455,7 +1488,10 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
             // The top-level password only applies to standard vaults; never send a
             // stale value for a zero-knowledge vault (its field is hidden).
             password: (vaultType === 'standard' ? (password || null) : null),
-            expire_files_after_days: null
+            expire_files_after_days: null,
+            // Per-vault maximum size; default 1 GB. The server bounds it by the account budget
+            // and the per-vault ceiling and 400s if over.
+            size_limit_gb: (sizeGb && sizeGb > 0) ? sizeGb : 1
         };
 
         // Zero-knowledge: generate the vault DEK IN THE BROWSER and wrap it to our
@@ -4151,8 +4187,10 @@ async function loadSettings() {
         document.getElementById('setting-lockout-duration').value = settings.lockout_duration || 30;
         
         // Storage
-        document.getElementById('setting-default-quota').value = settings.default_user_quota || 10;
-        document.getElementById('setting-max-vault-size').value = settings.max_vault_size || 100;
+        // Show the actual stored quota, or BLANK when unset/0 (which the backend treats as
+        // unlimited) — don't render 10/100 as if a limit were enforced.
+        document.getElementById('setting-default-quota').value = (settings.default_user_quota > 0) ? settings.default_user_quota : '';
+        document.getElementById('setting-max-vault-size').value = (settings.max_vault_size > 0) ? settings.max_vault_size : '';
         document.getElementById('setting-storage-path').value = settings.storage_path || '';
         
         // Email
@@ -4228,8 +4266,9 @@ async function saveAllSettings() {
             lockout_duration: parseInt(document.getElementById('setting-lockout-duration').value) || 30,
             
             // Storage
-            default_user_quota: parseInt(document.getElementById('setting-default-quota').value) || 10,
-            max_vault_size: parseInt(document.getElementById('setting-max-vault-size').value) || 100,
+            // Blank -> 0 (unlimited); the backend enforces a positive value and ignores 0.
+            default_user_quota: parseInt(document.getElementById('setting-default-quota').value) || 0,
+            max_vault_size: parseInt(document.getElementById('setting-max-vault-size').value) || 0,
             
             // Email
             smtp_server: document.getElementById('setting-smtp-server').value,
@@ -8008,6 +8047,11 @@ function setupVaultSettingsButtons() {
                 document.getElementById('expire-files-unit').value = currentUnit;
                 const urmEl = document.getElementById('unlock-remember-minutes');
                 if (urmEl) urmEl.value = (state.currentVault.unlock_remember_minutes ?? '');
+                // Current max size (bytes -> GB) + remaining account headroom (excluding this vault).
+                const sizeEl = document.getElementById('vault-size-limit-gb');
+                if (sizeEl) sizeEl.value = state.currentVault.size_limit ? _bytesToGb(state.currentVault.size_limit) : '';
+                renderVaultSizeAvailability('vault-size-limit-avail', sizeEl, state.currentVault.id,
+                    "The most this vault may hold. Can't go below what's already stored.");
                 openModal('set-expiry-modal');
             };
         }
@@ -8179,21 +8223,37 @@ async function handleSetExpiry(e) {
     const expireUnit = document.getElementById('expire-files-unit').value;
     const urmRaw = document.getElementById('unlock-remember-minutes');
     const urm = (urmRaw && urmRaw.value !== '') ? Math.max(0, parseInt(urmRaw.value) || 0) : null;
+    const sizeEl = document.getElementById('vault-size-limit-gb');
+    const sizeGb = (sizeEl && sizeEl.value !== '') ? parseFloat(sizeEl.value) : null;
 
     try {
+        const body = {
+            expire_files_after_days: expireValue > 0 ? expireValue : null,
+            expire_files_unit: expireValue > 0 ? expireUnit : 'days',
+            unlock_remember_minutes: urm
+        };
+        // Only send size_limit when a positive value is entered AND it actually changed. Sent in
+        // BYTES. Skipping an unchanged value means editing OTHER policies never re-validates the
+        // size — so a vault grandfathered above a since-lowered ceiling can still have its expiry
+        // edited (the server rejects a null/0; the field isn't clearable to unlimited).
+        let newSizeBytes = null;
+        if (sizeGb != null && sizeGb > 0) {
+            const candidate = Math.round(sizeGb * (1024 ** 3));
+            if (candidate !== (state.currentVault.size_limit || 0)) {
+                newSizeBytes = candidate;
+                body.size_limit = newSizeBytes;
+            }
+        }
         await apiRequest(`/vaults/${state.currentVault.id}/settings`, {
             method: 'PATCH',
-            body: JSON.stringify({
-                expire_files_after_days: expireValue > 0 ? expireValue : null,
-                expire_files_unit: expireValue > 0 ? expireUnit : 'days',
-                unlock_remember_minutes: urm
-            })
+            body: JSON.stringify(body)
         });
 
         // Update local state + drop any remembered password so the new window applies.
         state.currentVault.expire_files_after_days = expireValue > 0 ? expireValue : null;
         state.currentVault.expire_files_unit = expireValue > 0 ? expireUnit : 'days';
         state.currentVault.unlock_remember_minutes = urm;
+        if (newSizeBytes != null) state.currentVault.size_limit = newSizeBytes;
         // Re-base the remember window on the new policy (applies to the next
         // re-entry; the currently-open vault stays open either way).
         state.forgetVaultPassword(state.currentVault.id);

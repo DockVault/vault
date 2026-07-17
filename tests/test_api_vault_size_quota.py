@@ -115,6 +115,23 @@ def test_admin_exempt_from_account_budget(admin):
         _reset_quotas(admin)
 
 
+def test_account_storage_endpoint(admin):
+    r = admin.get("/account/storage")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    for k in ("reserved_bytes", "available_bytes", "per_vault_max_bytes", "account_quota_bytes", "budget_exempt"):
+        assert k in body, body
+    assert body["budget_exempt"] is True  # the admin is exempt from the account budget
+    _set_quotas(admin, 1000, 5)  # 5 GB per-vault ceiling
+    try:
+        got = admin.get("/account/storage").json()
+        assert got["per_vault_max_bytes"] == 5 * GIB
+        assert got["available_bytes"] == 5 * GIB  # admin: only the ceiling binds
+        assert got["account_quota_bytes"] is None  # admin is budget-exempt
+    finally:
+        _reset_quotas(admin)
+
+
 def test_account_budget_enforced_for_non_admin(admin):
     _set_quotas(admin, 2, 1000)  # 2 GB per-account budget
     u = admin.create_user(role="user")
