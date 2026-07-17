@@ -340,7 +340,8 @@ class VaultService:
         description: Optional[str] = None,
         password: Optional[str] = None,
         expire_files_after_days: Optional[int] = None,
-        vault_type: str = 'standard'
+        vault_type: str = 'standard',
+        size_limit: Optional[int] = None
     ) -> Vault:
         """
         Create a new vault.
@@ -389,7 +390,10 @@ class VaultService:
                 'iterations': encrypted_key_data['iterations']
             })
         )
-        
+        # Per-vault size cap. When unset, the model column default (1 GB) applies.
+        if size_limit is not None:
+            vault.size_limit = size_limit
+
         self.db.add(vault)
         self.db.commit()
         self.db.refresh(vault)

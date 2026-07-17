@@ -643,6 +643,10 @@ class VaultCreate(BaseModel):
     description: Optional[str] = None
     password: Optional[str] = None
     expire_files_after_days: Optional[int] = Field(None, gt=0)
+    # Per-vault maximum size in GB (absent => 1 GB, the model column default). Bounded at create
+    # time by the admin per-vault ceiling and the owner's remaining account budget (see
+    # _enforce_vault_size); a scoped temp cred / non-admin can never exceed its account quota.
+    size_limit_gb: Optional[float] = Field(None, gt=0)
     # Confidentiality tier; the creation-policy hook resolves/validates it.
     # Defaults to 'standard' (today's only functional tier).
     type: Optional[str] = None
@@ -1425,6 +1429,72 @@ def _directory_search_scope(db: Session) -> str:
     return val if val in _DIRECTORY_SEARCH_SCOPES else "deployment"
 
 
+_GIB = 1024 ** 3
+_INT64_MAX = 2 ** 63 - 1  # the size_limit column is BigInteger; a larger value overflows it
+
+
+def _quota_setting_bytes(db: Session, key: str) -> int:
+    """A GB quota from the global settings blob -> bytes. Missing / non-positive / unparseable => 0,
+    which means UNLIMITED on that axis (not enforced). So a fresh deployment that never set the value
+    is unbounded, and an admin opts in by saving a positive number of GB."""
+    from app.core.models import SystemSetting
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    val = (row.value or {}).get(key) if (row and row.value) else None
+    try:
+        gb = float(val)
+    except (TypeError, ValueError):
+        return 0
+    return int(gb * _GIB) if gb > 0 else 0
+
+
+def _account_reserved_bytes(db: Session, owner_id, exclude_vault_id=None) -> int:
+    """Sum of the declared per-vault size_limit across an owner's ACTIVE vaults — a RESERVATION
+    (declared, not used), so a user can't oversubscribe their account budget by declaring large
+    limits they may never fill. Optionally excludes one vault (when re-sizing it)."""
+    from sqlalchemy import func as _f
+    q = db.query(_f.coalesce(_f.sum(Vault.size_limit), 0)).filter(
+        Vault.owner_id == owner_id, Vault.is_active == True)  # noqa: E712
+    if exclude_vault_id is not None:
+        q = q.filter(Vault.id != exclude_vault_id)
+    return int(q.scalar() or 0)
+
+
+def _max_allowed_vault_size_bytes(db: Session, owner: User, exclude_vault_id=None):
+    """The largest size_limit (bytes) this owner may declare for ONE vault, bounded by the admin
+    'Max Vault Size' per-vault ceiling AND — for non-admins — the remaining per-account budget
+    ('Default User Storage Quota' minus what the owner's OTHER active vaults already reserve). Admins
+    are still bounded by the per-vault ceiling but exempt from the account budget. Returns None when
+    both axes are unlimited (nothing to enforce)."""
+    caps = []
+    ceiling = _quota_setting_bytes(db, "max_vault_size")
+    if ceiling > 0:
+        caps.append(ceiling)
+    # "Full admin" = an interactive admin, NOT an admin-minted temp credential (which the codebase
+    # deliberately does not treat as a full admin — mirrors the require_interactive_admin gate), so a
+    # delegated credential can't over-consume the owner's account budget.
+    is_full_admin = owner.role == RoleEnum.ADMIN and not getattr(owner, "_is_temp_session", False)
+    if not is_full_admin:
+        budget = _quota_setting_bytes(db, "default_user_quota")
+        if budget > 0:
+            caps.append(max(0, budget - _account_reserved_bytes(db, owner.id, exclude_vault_id)))
+    return min(caps) if caps else None
+
+
+def _enforce_vault_size(db: Session, owner: User, requested_bytes: int, exclude_vault_id=None) -> None:
+    """Reject a requested per-vault size_limit that exceeds the owner's available headroom (the
+    per-vault ceiling and/or the per-account budget). No-op when both are unlimited. The account
+    budget is a best-effort reservation (a SELECT-then-write, not a lock), like the deployment-wide
+    storage cap: two concurrent creates can overshoot by at most one vault's declared size — the
+    per-upload guard remains the atomic backstop on ACTUAL bytes."""
+    cap = _max_allowed_vault_size_bytes(db, owner, exclude_vault_id)
+    if cap is not None and requested_bytes > cap:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Requested vault size ({requested_bytes / _GIB:.2f} GB) exceeds the maximum size "
+                    f"available to your account for this vault ({max(0, cap) / _GIB:.2f} GB)."),
+        )
+
+
 def _validate_settings_payload(payload: dict, db: Session) -> None:
     """Validate the few settings keys that drive real enforcement so the admin UI
     can't silently persist values that later fail open. The store is otherwise
@@ -1460,6 +1530,15 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             status_code=400,
             detail="directory_search_scope must be 'deployment' or 'same_department'",
         )
+
+    # Storage quotas (GB). default_user_quota = per-account budget (sum of an owner's vault size
+    # reservations); max_vault_size = the per-vault ceiling. Both are enforced at vault create/resize
+    # (see _enforce_vault_size); 0 / absent means unlimited on that axis.
+    for gb_key in ("default_user_quota", "max_vault_size"):
+        if gb_key in payload and payload[gb_key] is not None:
+            v = payload[gb_key]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+                raise HTTPException(status_code=400, detail=f"{gb_key} must be a non-negative number of GB")
 
 
 @app.get("/settings")
@@ -4203,6 +4282,15 @@ async def create_vault(
     from app.core.temp_scope import require_create_vault_type
     require_create_vault_type(current_user, vault_type)
 
+    # Per-vault size: default 1 GB. Reject a size that is out of range (a sub-nanogigabyte value
+    # truncates to 0, which every upload guard reads as UNLIMITED; a huge value overflows the
+    # BigInteger column and 500s) BEFORE the quota check, then enforce the ceiling / account budget.
+    requested_size = int(vault_create.size_limit_gb * _GIB) if vault_create.size_limit_gb else _GIB
+    if requested_size <= 0 or requested_size > _INT64_MAX:
+        raise HTTPException(status_code=400,
+                            detail=f"Vault size must be between 1 byte and {_INT64_MAX / _GIB:.0f} GB")
+    _enforce_vault_size(db, current_user, requested_size)
+
     vault = vault_service.create_vault(
         name=vault_create.name,
         owner=current_user,
@@ -4210,6 +4298,7 @@ async def create_vault(
         password=vault_create.password,
         expire_files_after_days=vault_create.expire_files_after_days,
         vault_type=vault_type,
+        size_limit=requested_size,
     )
 
     # Zero-knowledge vaults: the DEK is generated AND wrapped IN THE BROWSER to the
@@ -4787,14 +4876,29 @@ async def update_vault_settings(
         
         if 'size_limit' in settings_update:
             size_limit = settings_update['size_limit']
-            if size_limit is not None:
-                # Validate size limit is not less than current usage
-                current_size = vault.total_size_bytes or 0
-                if size_limit < current_size:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Size limit ({size_limit} bytes) cannot be less than current usage ({current_size} bytes)"
-                    )
+            # A null would clear the cap to "unlimited", bypassing the per-vault ceiling AND the
+            # account budget — reject it (the field is a bounded quota now, not a clearable option).
+            if size_limit is None:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail="size_limit is required (a positive number of bytes)")
+            try:
+                size_limit = int(size_limit)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail="size_limit must be a number of bytes")
+            if size_limit <= 0 or size_limit > _INT64_MAX:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail=f"size_limit must be between 1 byte and {_INT64_MAX / _GIB:.0f} GB")
+            # Floor: can't shrink below what's already stored.
+            current_size = vault.total_size_bytes or 0
+            if size_limit < current_size:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Size limit ({size_limit} bytes) cannot be less than current usage ({current_size} bytes)"
+                )
+            # Ceiling: can't exceed the per-vault ceiling or the owner's remaining account budget
+            # (excluding THIS vault's own current reservation). The owner is enforced above.
+            _enforce_vault_size(db, current_user, size_limit, exclude_vault_id=vault_id)
             vault.size_limit = size_limit
             updated_fields.append('size_limit')
         
@@ -8636,6 +8740,10 @@ def _run_lightweight_migrations():
             # client-declared epoch through to finalize for the upload-vs-rekey race check.
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS dek_version INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS zk_key_version INTEGER",
+            # Backfill any legacy NULL/0 per-vault size_limit to the 1 GB default: such a vault
+            # reserves nothing in the account budget SUM yet is treated as UNLIMITED at every upload
+            # guard (`if vault.size_limit`), so the reservation model would under-count it. Idempotent.
+            "UPDATE vaults SET size_limit = 1073741824 WHERE size_limit IS NULL OR size_limit <= 0",
             # Hierarchical ZK key wrapping (VaultTeamKey). team_public_key = the per-vault team
             # public key; team_key_version = the team-KEYPAIR epoch, SEPARATE from dek_version
             # (bumps only on a team-keypair rotation, not a routine DEK rotation). team_key (the
