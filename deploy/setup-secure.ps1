@@ -75,6 +75,28 @@ if ($ServerName -notmatch '^[A-Za-z0-9.-]+$') {
     Die "invalid server name '$ServerName' (use letters, digits, dots and hyphens only)."
 }
 
+# --- prompt for any CORE option not given on the command line -------------------------------
+# These choices are security-relevant, so we don't silently assume a default: if a flag wasn't
+# passed, ask. A fully-scripted caller that passes every core flag (-CertMode, -EnableSftp, and
+# -CertPath/-KeyPath for byo) is never prompted; a partial invocation is completed interactively.
+if (-not $PSBoundParameters.ContainsKey('CertMode')) {
+    Write-Host ''
+    Write-Host 'TLS certificate for the HTTPS listener:'
+    Write-Host '  [1] self-signed      - quick; browsers show a warning (testing / private LAN use)'
+    Write-Host '  [2] bring-your-own   - a real certificate you already have (public / trusted use)'
+    $choice = Read-Host 'Choose 1 or 2 [1]'
+    $CertMode = if ($choice -eq '2') { 'byo' } else { 'selfsigned' }
+}
+if ($CertMode -eq 'byo') {
+    if (-not $CertPath) { $CertPath = Read-Host 'Path to the certificate file (e.g. fullchain.pem)' }
+    if (-not $KeyPath)  { $KeyPath  = Read-Host 'Path to the private key file (e.g. privkey.pem)' }
+}
+if (-not $PSBoundParameters.ContainsKey('EnableSftp')) {
+    $ans = Read-Host 'Expose SFTP file access (SSH-based, host port 2322)? [y/N]'
+    $EnableSftp = ($ans -match '^(y|yes)$')
+}
+Say ("configuration: cert=$CertMode, SFTP=" + ($(if ($EnableSftp) { 'enabled' } else { 'disabled' })) + ", server=$ServerName")
+
 New-Item -ItemType Directory -Force -Path $CertDir -ErrorAction Stop | Out-Null
 
 # --- secret generation (pure .NET; no OpenSSL needed) ---------------------------------------
@@ -91,8 +113,10 @@ function New-FernetKey {
 }
 
 # --- certificates ---------------------------------------------------------------------------
-# On Docker Desktop a bind-mounted ./certs is readable by the in-container app user, so no
-# ownership fix-up is needed (unlike the Linux userns-remap case deploy/setup-secure.sh handles).
+# The cert + key are bind-mounted read-only into the container and read by uvicorn as the non-root
+# app user (uid 10001). OpenSSL writes the key mode 0600 owned by root, so that user cannot read it
+# (uvicorn then dies with a TLS-key PermissionError). Set-CertReadable (below) fixes the mode after
+# generation; the Linux deploy/setup-secure.sh does the equivalent via a numeric chown.
 
 # Run OpenSSL from the host if present, otherwise via a throwaway container so the host needs
 # nothing but Docker. Args run with the certs dir as the working directory.
@@ -147,21 +171,32 @@ function New-SelfSignedCert {
     $diag = ''
 
     # 1) Prefer a host OpenSSL if present (fast, no image pull). Capture its output (2>&1) so a
-    #    failure is DIAGNOSABLE instead of being silently swallowed.
+    #    failure is DIAGNOSABLE instead of being silently swallowed. A Git-for-Windows / MSYS
+    #    OpenSSL rewrites a leading-slash argument like -subj "/CN=host" into a Windows path
+    #    ("C:/Program Files/Git/CN=host"), which corrupts the subject and fails the command;
+    #    MSYS_NO_PATHCONV / MSYS2_ARG_CONV_EXCL disable that translation for this call.
     $openssl = Get-Command openssl -ErrorAction SilentlyContinue
     if ($openssl) {
+        $savedPC = $env:MSYS_NO_PATHCONV; $savedCE = $env:MSYS2_ARG_CONV_EXCL
+        $env:MSYS_NO_PATHCONV = '1'; $env:MSYS2_ARG_CONV_EXCL = '*'
         Push-Location $CertDir
-        try { $out = & $openssl.Source @osslArgs 2>&1 } finally { Pop-Location }
+        try { $out = & $openssl.Source @osslArgs 2>&1 }
+        finally {
+            Pop-Location
+            $env:MSYS_NO_PATHCONV = $savedPC; $env:MSYS2_ARG_CONV_EXCL = $savedCE
+        }
         if ($LASTEXITCODE -ne 0 -or -not (Test-CertPair)) {
             $diag = "host OpenSSL (exit $LASTEXITCODE): " + (($out | Out-String).Trim())
-            Warn 'host OpenSSL did not produce a certificate; falling back to a throwaway Docker container.'
+            Warn 'host OpenSSL could not generate the certificate; using Docker to generate it instead (this is fine).'
         }
     }
 
-    # 2) Fall back to a throwaway alpine/openssl container (needs only Docker, already required
-    #    above) when the host tool is missing OR failed. The Linux openssl also sidesteps Windows
-    #    -subj path mangling by an MSYS/Git-based openssl.
+    # 2) Generate via a throwaway (--rm) alpine/openssl container: a one-shot container that runs
+    #    OpenSSL against the mounted ./certs and is then deleted, so the host needs nothing but the
+    #    already-required Docker. Used when there is no host OpenSSL, or the host one failed. The
+    #    Linux OpenSSL here also sidesteps the Windows -subj path mangling entirely.
     if (-not (Test-CertPair)) {
+        if (-not $openssl) { Say 'generating the certificate via a throwaway Docker container (no host OpenSSL needed)' }
         $out = docker run --rm -v "${CertDir}:/certs" -w /certs alpine/openssl @osslArgs 2>&1
         if ($LASTEXITCODE -ne 0) {
             if ($diag) { $diag += "`n" }
@@ -176,6 +211,28 @@ function New-SelfSignedCert {
     }
 }
 
+function Set-CertReadable {
+    # The web/API container runs uvicorn as the NON-ROOT app user (uid 10001  -  see the Dockerfile).
+    # OpenSSL writes key.pem mode 0600 owned by root, so that user cannot read it and uvicorn aborts
+    # at startup with "PermissionError: [Errno 13] Permission denied" loading the TLS key.
+    #
+    # The Linux setup-secure.sh makes the app user OWN the key (numeric chown to uid 10001, keeping
+    # mode 0600). On Docker Desktop, though, a container-side chown to a Windows bind mount does NOT
+    # reliably stick, so we cannot depend on ownership  -  but chmod IS honoured (that mode 0600 is
+    # exactly what blocks the app user). So make the files world-READABLE within ./certs: the cert is
+    # public anyway, and for the key this matches the Linux script's own fallback for when a numeric
+    # chown is refused. This is safe for the self-hosted single-tenant model: ./certs is on the
+    # operator's host, the key is bind-mounted READ-ONLY into the one app container, and the real
+    # application secrets live in the separately ACL-locked ./.env. (A BYO cert on a shared host can
+    # be tightened afterwards once the right container gid is known.) Run from a throwaway root
+    # container so it works regardless of the host OS. Idempotent  -  safe to run every time.
+    if (-not (Test-CertPair)) { return }
+    docker run --rm -v "${CertDir}:/certs" alpine sh -c 'chmod 0644 /certs/cert.pem /certs/key.pem' *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Warn 'could not adjust ./certs permissions; if the API logs a TLS-key PermissionError, chmod the key so uid 10001 can read it.'
+    }
+}
+
 $certExists = (Test-Path (Join-Path $CertDir 'cert.pem')) -and (Test-Path (Join-Path $CertDir 'key.pem'))
 if ($CertMode -eq 'byo') {
     Copy-ByoCert
@@ -184,6 +241,9 @@ if ($CertMode -eq 'byo') {
 } else {
     Say 'reusing existing ./certs (pass -CertMode byo or delete ./certs to replace)'
 }
+# Ensure the non-root container user can read the cert+key (covers self-signed, BYO, AND a re-run
+# over pre-existing root-owned certs that would otherwise still fail).
+Set-CertReadable
 
 # --- .env (secrets) -------------------------------------------------------------------------
 # The compose file sets ENVIRONMENT=production, API_USE_HTTPS=true and the cert paths; .env
