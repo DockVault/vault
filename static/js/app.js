@@ -624,6 +624,14 @@ function showPrompt(message, title = 'Enter value', options = {}) {
         messageEl.textContent = message;
         inputEl.style.display = 'block';
         inputEl.type = password ? 'password' : 'text';
+        // This one <input> is reused for every prompt, including the ZK master passphrase. Mark a
+        // password prompt as a one-time code so password managers don't offer to SAVE/autofill the
+        // master passphrase; reset for a plain text prompt. Set every attribute per-use (symmetric,
+        // both branches) so nothing leaks from a prior prompt.
+        inputEl.setAttribute('autocomplete', password ? 'one-time-code' : 'off');
+        inputEl.setAttribute('autocapitalize', 'off');
+        inputEl.setAttribute('autocorrect', 'off');
+        inputEl.setAttribute('spellcheck', password ? 'false' : 'true');
         inputEl.placeholder = placeholder || '';
         inputEl.value = defaultValue || '';
         confirmBtn.disabled = false;
@@ -1430,6 +1438,7 @@ async function showCreateVault() {
     if (grp) {
         try {
             const f = await apiRequest('/zk-enabled', { silent: true });
+            setZkIdleLockMinutes(f && f.zk_idle_lock_minutes);  // keep the idle-lock policy fresh
             const on = !!(f && f.zero_knowledge_enabled);
             const must = !!(f && f.must_use_zk);
             const planHasZk = !!(f && f.plan_zero_knowledge);
@@ -4545,6 +4554,8 @@ async function loadSettings() {
         if (dssEl) dssEl.value = (settings.directory_search_scope === 'same_department') ? 'same_department' : 'deployment';
         const fnrEl = document.getElementById('setting-force-no-remember-vault-password');
         if (fnrEl) fnrEl.checked = settings.force_no_remember_vault_password === true;
+        const zilEl = document.getElementById('setting-zk-idle-lock-minutes');
+        if (zilEl) zilEl.value = Number(settings.zk_idle_lock_minutes) || 0;
 
         // Temporary Vault Passcodes. GET /settings overlays the EFFECTIVE policy, so these keys
         // are always present (feature default off; allow-ZK default on).
@@ -4638,6 +4649,7 @@ async function saveAllSettings() {
             force_zero_knowledge: document.getElementById('setting-force-zero-knowledge').checked,
             directory_search_scope: (document.getElementById('setting-directory-search-scope') || {}).value || 'deployment',
             force_no_remember_vault_password: document.getElementById('setting-force-no-remember-vault-password').checked,
+            zk_idle_lock_minutes: parseInt(document.getElementById('setting-zk-idle-lock-minutes').value) || 0,
 
             // Temporary Vault Passcodes
             temp_passcodes_enabled: document.getElementById('setting-temp-passcodes-enabled').checked,
@@ -5736,6 +5748,42 @@ function eccLib() {
 const zkState = { privateKey: null, vaultDeks: {}, teamKeys: {}, pinnedHier: {} };
 function zkResetKeys() { zkState.privateKey = null; zkState.vaultDeks = {}; zkState.teamKeys = {}; zkState.pinnedHier = {}; }
 
+// --- ZK idle auto-lock -------------------------------------------------------------------------
+// Optional org policy (zk_idle_lock_minutes, from /zk-enabled): drop the in-memory ZK key after N
+// minutes of inactivity so the user must re-enter their passphrase. 0 = disabled. Enforced here
+// because the key never leaves the browser; the server only supplies the threshold.
+let _zkIdleLockMinutes = 0;
+let _zkIdleTimer = null;
+let _zkActivityWired = false;
+
+function zkIdleLock() {
+    if (_zkIdleTimer) { clearTimeout(_zkIdleTimer); _zkIdleTimer = null; }
+    if (!zkState.privateKey) return;          // already locked
+    zkResetKeys();                            // drop the ECC key + per-vault DEKs; next op re-prompts
+    try { showInfo('Encryption locked after inactivity — you\'ll be asked for your passphrase again.'); } catch (_) {}
+}
+
+// (Re)arm the idle timer. No-op unless the policy is on AND a key is currently unlocked.
+function zkArmIdleLock() {
+    if (_zkIdleTimer) { clearTimeout(_zkIdleTimer); _zkIdleTimer = null; }
+    if (_zkIdleLockMinutes > 0 && zkState.privateKey) {
+        _zkIdleTimer = setTimeout(zkIdleLock, _zkIdleLockMinutes * 60 * 1000);
+        if (!_zkActivityWired) {
+            _zkActivityWired = true;
+            // Reset the countdown on real user activity while a key is unlocked (passive listeners).
+            ['mousedown', 'keydown', 'scroll', 'touchstart'].forEach(ev =>
+                document.addEventListener(ev, () => { if (zkState.privateKey && _zkIdleLockMinutes > 0) zkArmIdleLock(); },
+                    { passive: true }));
+        }
+    }
+}
+
+// Apply a policy value from /zk-enabled and (re)arm.
+function setZkIdleLockMinutes(n) {
+    _zkIdleLockMinutes = (typeof n === 'number' && isFinite(n) && n > 0) ? Math.min(Math.floor(n), 1440) : 0;
+    zkArmIdleLock();
+}
+
 function isZkVault(v) { return !!v && v.type === 'zero_knowledge'; }
 
 // Unlock the user's ECC private key into memory (prompts for the passphrase once
@@ -5767,6 +5815,7 @@ async function zkEnsureUnlocked() {
         throw new Error('Incorrect passphrase (or the stored key is corrupt).');
     }
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);  // non-extractable runtime key
+    zkArmIdleLock();  // start the inactivity auto-lock countdown now a key is in memory
     return zkState.privateKey;
 }
 
@@ -5824,6 +5873,7 @@ async function zkRegisterNewKeypair() {
     // Hold a NON-extractable runtime copy (the generated key was extractable only
     // so we could export + password-encrypt it above).
     zkState.privateKey = await lib.importPrivateKeyPEM(privatePem, false);
+    zkArmIdleLock();
 }
 
 // Change the encryption passphrase: unlock the private key with the CURRENT passphrase,
@@ -5865,6 +5915,7 @@ async function zkChangePassphrase() {
     });
     // Keep a NON-extractable runtime copy so the session stays unlocked with the same key.
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
+    zkArmIdleLock();
 }
 
 // Export a recovery kit: re-wrap the private key under a SEPARATE recovery passphrase and download
@@ -5955,6 +6006,7 @@ async function zkRestoreFromRecoveryKey(kitText) {
     const enc = await eccLib().encryptPrivateKey(pem, next);
     await apiRequest('/ecc/keys/private', { method: 'PUT', body: JSON.stringify({ encrypted_private_key: JSON.stringify(enc) }) });
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
+    zkArmIdleLock();
 }
 
 // Ensure the user has an ECC keypair: create + register one (first time) or just
@@ -8869,6 +8921,11 @@ async function applyServerPreferences() {
         state.forceNoRememberVaultPassword = !!(pol && pol.force_no_remember_vault_password === true);
         if (state.forceNoRememberVaultPassword) { state.rememberedVaults = {}; state._persistRemembered(); }
     } catch (_) { /* best-effort; the server clamp is the authoritative enforcement */ }
+    // Load the ZK-key idle auto-lock policy at boot so any later unlock arms the countdown.
+    try {
+        const zk = await apiRequest('/zk-enabled', { silent: true });
+        setZkIdleLockMinutes(zk && zk.zk_idle_lock_minutes);
+    } catch (_) { /* best-effort; default = no idle lock */ }
 
     const tm = window.themeManager;
     if (!tm) return false;

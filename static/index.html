@@ -1237,6 +1237,11 @@
                                     <label>Departments exempt from the requirement</label>
                                     <div id="standard-vault-allowed-group-picker"></div>
                                 </div>
+                                <div class="form-group mt-md">
+                                    <label for="setting-zk-idle-lock-minutes">Auto-lock encryption key after inactivity (minutes, 0 = never)</label>
+                                    <input type="number" id="setting-zk-idle-lock-minutes" class="form-control" min="0" max="1440" style="max-width:200px;">
+                                    <p class="text-secondary text-sm mt-sm">When set, the in-browser zero-knowledge key is dropped from memory after this many minutes of inactivity, so the user must re-enter their encryption passphrase to open a zero-knowledge vault again. Independent of the login session timeout.</p>
+                                </div>
                             </div>
                         </div>
                         <div class="card mt-lg">

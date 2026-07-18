@@ -1646,6 +1646,15 @@ def _force_no_remember_vault_password(db: Session) -> bool:
     return bool(_global_settings_blob(db).get("force_no_remember_vault_password", False))
 
 
+def _zk_idle_lock_minutes(db: Session) -> int:
+    """Org policy: auto-lock the in-memory zero-knowledge key (re-prompt for the passphrase) after N
+    minutes of inactivity. 0 (default) = disabled. Enforced client-side; clamped to [0, 1440]."""
+    v = _global_settings_blob(db).get("zk_idle_lock_minutes", 0)
+    if isinstance(v, bool) or not isinstance(v, int):
+        return 0
+    return max(0, min(v, 1440))
+
+
 def _validate_settings_payload(payload: dict, db: Session) -> None:
     """Validate the few settings keys that drive real enforcement so the admin UI
     can't silently persist values that later fail open. The store is otherwise
@@ -1712,7 +1721,8 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             raise HTTPException(status_code=400, detail=f"{bkey} must be true or false")
 
     # Auth limits (0/absent = keep the deployment env default). Enforced at login / token mint.
-    for int_key in ("max_login_attempts", "lockout_duration", "session_timeout"):
+    # zk_idle_lock_minutes (0 = disabled) is a client-enforced ZK-key idle auto-lock.
+    for int_key in ("max_login_attempts", "lockout_duration", "session_timeout", "zk_idle_lock_minutes"):
         if int_key in payload and payload[int_key] is not None:
             v = payload[int_key]
             if isinstance(v, bool) or not isinstance(v, int) or v < 0:
@@ -1762,6 +1772,8 @@ async def get_settings(
     data.update(_temp_passcode_policy(db))
     # Effective org floor for browser-remembering a vault password (default OFF).
     data["force_no_remember_vault_password"] = _force_no_remember_vault_password(db)
+    # Effective ZK-key idle auto-lock (minutes; 0 = disabled).
+    data["zk_idle_lock_minutes"] = _zk_idle_lock_minutes(db)
     return data
 
 
@@ -2417,6 +2429,8 @@ async def get_zk_enabled(
         "max_zk_vaults": settings.plan_max_zk_vaults,
         "zk_vault_count": _zk_vault_count(db),
         "allowed_vault_types": sorted(allowed),
+        # Idle auto-lock for the in-memory ZK key (minutes; 0 = disabled). Enforced client-side.
+        "zk_idle_lock_minutes": _zk_idle_lock_minutes(db),
     }
 
 
