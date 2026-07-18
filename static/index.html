@@ -1649,6 +1649,22 @@
                                         </div>
                                     </div>
 
+                                    <div class="scope-section" id="tc-passcode-section" hidden>
+                                        <div class="scope-section-title">Temporary passcode</div>
+                                        <label class="checkbox-row">
+                                            <input type="checkbox" id="tc-passcode-enable">
+                                            <span>Issue a temporary vault passcode <small>&mdash; the holder opens the vault with a short-lived passcode instead of the real vault password. Offered for password-protected <strong>standard</strong> vaults only (zero-knowledge vaults can't have one).</small></span>
+                                        </label>
+                                        <div id="tc-passcode-opts" hidden style="margin:.3rem 0 0 26px;">
+                                            <label class="checkbox-row"><input type="checkbox" id="tc-passcode-same" checked><span>Use the same passcode for all selected vaults</span></label>
+                                            <div id="tc-passcode-shared-row" hidden style="margin:.2rem 0 0 26px;">
+                                                <input type="text" id="tc-passcode-shared-value" class="form-control" placeholder="Custom passcode (leave blank to auto-generate a strong one)" autocomplete="off" style="max-width:340px;">
+                                                <div id="tc-passcode-shared-help" class="text-tertiary text-sm mt-sm"></div>
+                                            </div>
+                                            <div id="tc-passcode-note" class="text-tertiary text-sm mt-sm"></div>
+                                        </div>
+                                    </div>
+
                                     <div class="scope-section">
                                         <div class="scope-section-title">Other</div>
                                         <label class="checkbox-row"><input type="checkbox" class="tc-global-cap" value="vault.create"><span>Create new vaults</span></label>

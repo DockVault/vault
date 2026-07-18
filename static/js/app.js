@@ -1580,9 +1580,24 @@ function showGenerateTempCreds() {
 
     initTempScopeBuilder();      // wire the scope-builder controls once
     resetTempScopeBuilder();     // reset to defaults
+    _tcLoadPasscodePolicy();     // fetch the effective temp-passcode policy (shapes the controls)
     populateTempScopeVaults();   // fill the selectable vault list
 
     modal.classList.add('active');
+}
+
+// Effective temp-passcode policy (from GET /temp-passcode-policy) — shapes the mint controls:
+// whether the feature is offered at all, whether custom passcodes are allowed, etc. Null until loaded.
+let _tcPasscodePolicy = null;
+async function _tcLoadPasscodePolicy() {
+    _tcPasscodePolicy = null;  // clear the prior session's policy so the section stays hidden until the fresh fetch lands
+    _tcSyncPasscodeUI();
+    try {
+        _tcPasscodePolicy = await apiRequest('/temp-passcode-policy', { silent: true });
+    } catch (_) {
+        _tcPasscodePolicy = null;  // fail closed: no policy => passcode controls stay hidden
+    }
+    _tcSyncPasscodeUI();
 }
 
 let _tempScopeWired = false;
@@ -1619,7 +1634,13 @@ function initTempScopeBuilder() {
         const isSel = document.querySelector('input[name="tc-vault-mode"]:checked')?.value === 'selected';
         if (sel) sel.style.display = isSel ? '' : 'none';
         _tcRestrictSyncAvailability();
+        _tcSyncPasscodeUI();  // passcodes attach to per-vault grants -> only in selected mode
     }));
+    // Temporary-passcode controls: reflect the toggle + same-for-all state onto the rows.
+    const pcEnable = document.getElementById('tc-passcode-enable');
+    if (pcEnable) pcEnable.addEventListener('change', _tcSyncPasscodeUI);
+    const pcSame = document.getElementById('tc-passcode-same');
+    if (pcSame) pcSame.addEventListener('change', _tcSyncPasscodeUI);
     // File/folder restriction: reveal the picker when enabled; keep availability in sync as the
     // vault selection changes (the list is re-rendered on open, so delegate the pick listener).
     const restrictEnable = document.getElementById('tc-restrict-enable');
@@ -1649,6 +1670,7 @@ function initTempScopeBuilder() {
             const pw = cb && document.querySelector(`.tc-vault-pw[data-vault="${cb.value}"]`);
             if (pw) pw.style.display = show ? '' : 'none';
         });
+        _tcSyncPasscodeUI();  // the per-vault passcode input + ZK note follow the toggle AND the filter
     });
 }
 
@@ -1672,6 +1694,11 @@ function resetTempScopeBuilder() {
     document.querySelectorAll('.tc-cap').forEach(c => { c.checked = baseline.has(c.value); });
     document.querySelectorAll('.tc-global-cap').forEach(c => { c.checked = false; });
     const search = document.getElementById('tc-vault-search'); if (search) search.value = '';
+    // Reset the temporary-passcode controls (off; same-for-all on; shared custom cleared).
+    const pcEnable = document.getElementById('tc-passcode-enable'); if (pcEnable) pcEnable.checked = false;
+    const pcSame = document.getElementById('tc-passcode-same'); if (pcSame) pcSame.checked = true;
+    const pcShared = document.getElementById('tc-passcode-shared-value'); if (pcShared) pcShared.value = '';
+    _tcSyncPasscodeUI();
     _tcRestrictReset();
 }
 
@@ -1696,9 +1723,89 @@ async function populateTempScopeVaults() {
                 <span class="member-pick-name">${escapeHtml(v.name || 'Untitled vault')}${v.has_password ? ' <span class="text-tertiary text-sm">· password-protected</span>' : ''}</span>
             </label>${v.has_password ? `
             <input type="password" class="tc-vault-pw form-control" data-vault="${escapeHtml(v.id)}" placeholder="Vault password — required to grant access to this password-protected vault" autocomplete="new-password" style="margin:2px 0 10px 26px;max-width:340px;">` : ''}`).join('');
+        _tcDecoratePasscodeRows(vaults);   // append per-vault passcode controls via DOM (no innerHTML)
+        _tcSyncPasscodeUI();               // reflect the current passcode-toggle state onto the rows
     } catch (_) {
         list.innerHTML = '<div class="text-tertiary text-sm p-sm">Could not load vaults.</div>';
     }
+}
+
+// After the vault list renders, append the per-vault passcode controls via DOM (createElement, no
+// innerHTML): a custom-passcode input for each eligible (standard + password-protected) vault, and a
+// "not available" note for each zero-knowledge vault. Hidden until the passcode toggle is on.
+function _tcDecoratePasscodeRows(vaults) {
+    const list = document.getElementById('tc-vault-list');
+    if (!list || !Array.isArray(vaults)) return;
+    vaults.forEach(v => {
+        const cb = list.querySelector(`.tc-vault-pick[value="${v.id}"]`);  // v.id is a UUID (selector-safe)
+        if (!cb) return;
+        const row = cb.closest('.member-pick-item');
+        if (!row) return;
+        const isZk = v.type === 'zero_knowledge';
+        const eligible = !isZk && !!v.has_password;  // a passcode is a second gate on a password-protected standard vault
+        cb.dataset.eligible = eligible ? '1' : '0';
+        // Insert after the row's password input if present, else after the row itself.
+        const anchor = list.querySelector(`.tc-vault-pw[data-vault="${v.id}"]`) || row;
+        if (eligible) {
+            const inp = document.createElement('input');
+            inp.type = 'text';
+            inp.className = 'tc-vault-passcode form-control';
+            inp.dataset.vault = v.id;
+            inp.placeholder = 'Custom passcode for this vault (blank = auto-generate)';
+            inp.autocomplete = 'off';
+            inp.style.cssText = 'display:none;margin:0 0 10px 26px;max-width:340px;';
+            anchor.insertAdjacentElement('afterend', inp);
+        } else if (isZk) {
+            const note = document.createElement('div');
+            note.className = 'tc-passcode-zk-note text-tertiary text-sm';
+            note.dataset.vault = v.id;  // so the search filter can hide it with its row
+            note.style.cssText = 'display:none;margin:0 0 10px 26px;';
+            note.textContent = "Passcodes aren't available for zero-knowledge vaults — add a member or use a disposable standard vault.";
+            anchor.insertAdjacentElement('afterend', note);
+        }
+    });
+}
+
+// True when a vault's picker row is currently filtered out (hidden) by the search box, so its
+// passcode input / ZK note should stay hidden regardless of the passcode-toggle state.
+function _tcRowHidden(vid) {
+    const cb = document.querySelector(`.tc-vault-pick[value="${vid}"]`);
+    const row = cb && cb.closest('.member-pick-item');
+    return !!(row && row.style.display === 'none');
+}
+
+// Show/hide the passcode controls per the effective policy + toggles + vault mode.
+function _tcSyncPasscodeUI() {
+    const section = document.getElementById('tc-passcode-section');
+    if (!section) return;
+    const policyOn = !!(_tcPasscodePolicy && _tcPasscodePolicy.temp_passcodes_enabled);
+    const modeSelected = document.querySelector('input[name="tc-vault-mode"]:checked')?.value !== 'all';
+    // The section rides the scope-builder (shown only when scoping is on); offer it only when the
+    // feature is enabled AND we're in selected-vault mode (passcodes attach to per-vault grants).
+    section.hidden = !(policyOn && modeSelected);
+    const enable = document.getElementById('tc-passcode-enable');
+    const on = !!(enable && enable.checked) && policyOn && modeSelected;
+    const opts = document.getElementById('tc-passcode-opts');
+    if (opts) opts.hidden = !on;
+    const allowCustom = !!(_tcPasscodePolicy && _tcPasscodePolicy.temp_passcode_allow_custom);
+    const same = document.getElementById('tc-passcode-same');
+    const sameOn = !!(same && same.checked);
+    const sharedRow = document.getElementById('tc-passcode-shared-row');
+    if (sharedRow) sharedRow.hidden = !(on && allowCustom && sameOn);   // one shared custom input
+    document.querySelectorAll('.tc-vault-passcode').forEach(el => {      // per-vault custom inputs
+        el.style.display = (on && allowCustom && !sameOn && !_tcRowHidden(el.dataset.vault)) ? '' : 'none';
+    });
+    document.querySelectorAll('.tc-passcode-zk-note').forEach(el => {    // ZK not-available note
+        el.style.display = (on && !_tcRowHidden(el.dataset.vault)) ? '' : 'none';
+    });
+    const minLen = (_tcPasscodePolicy && _tcPasscodePolicy.temp_passcode_min_length) || 16;
+    const oneTime = !(_tcPasscodePolicy && _tcPasscodePolicy.temp_passcode_one_time_default === false);
+    const note = document.getElementById('tc-passcode-note');
+    if (note) note.textContent = on
+        ? `Shown once on create. ${allowCustom ? 'Custom passcodes must be' : 'Generated passcodes are'} at least ${minLen} characters; ${oneTime ? 'one-time use by default' : 'multi-use by default'}. Only password-protected standard vaults get one.`
+        : '';
+    const help = document.getElementById('tc-passcode-shared-help');
+    if (help) help.textContent = `At least ${minLen} characters (blank to auto-generate).`;
 }
 
 // --- File/folder restriction picker (produces selected_vaults[].scope_ids) ------------------
@@ -1879,7 +1986,33 @@ function collectTempScope() {
             };
         }
     }
-    return { scope: { v: 1, pages, caps, vault_caps_default: vaultCaps, temp }, vault_access_mode: mode, selected_vaults };
+    // Temporary passcodes: attach issue_passcode (+ an optional custom value) to each ELIGIBLE
+    // (standard, password-protected) selected vault. ZK / no-password vaults never get one.
+    let passcode_same_for_all = false;
+    const pcEnable = document.getElementById('tc-passcode-enable');
+    if (mode === 'selected' && pcEnable && pcEnable.checked
+        && _tcPasscodePolicy && _tcPasscodePolicy.temp_passcodes_enabled) {
+        const same = document.getElementById('tc-passcode-same');
+        passcode_same_for_all = !!(same && same.checked);
+        const allowCustom = !!_tcPasscodePolicy.temp_passcode_allow_custom;
+        const sharedVal = (allowCustom && passcode_same_for_all)
+            ? ((document.getElementById('tc-passcode-shared-value') || {}).value || '').trim() : '';
+        selected_vaults.forEach(sv => {
+            const vobj = _tcVaultObjs[sv.vault_id] || {};
+            if (vobj.type === 'zero_knowledge' || !vobj.has_password) return;  // ineligible
+            sv.issue_passcode = true;
+            if (allowCustom) {
+                if (passcode_same_for_all) {
+                    if (sharedVal) sv.passcode = sharedVal;
+                } else {
+                    const el = document.querySelector(`.tc-vault-passcode[data-vault="${sv.vault_id}"]`);
+                    const val = ((el && el.value) || '').trim();
+                    if (val) sv.passcode = val;
+                }
+            }
+        });
+    }
+    return { scope: { v: 1, pages, caps, vault_caps_default: vaultCaps, temp }, vault_access_mode: mode, selected_vaults, passcode_same_for_all };
 }
 
 // Generate Temporary Credentials
@@ -1928,6 +2061,7 @@ async function generateTempCreds(options = {}) {
             body.scope = options.scope;
             body.vault_access_mode = options.vault_access_mode || 'selected';
             body.selected_vaults = options.selected_vaults || [];
+            if (options.passcode_same_for_all) body.passcode_same_for_all = true;
         }
 
         const creds = await apiRequest('/auth/temp-credentials', {
@@ -1976,6 +2110,17 @@ function showTempCredsModal(creds) {
         ? `<div class="alert alert-warning" style="font-size:.85rem;">${iconSvg('alert-triangle', 'icon-sm')} This credential can itself create more temporary credentials.</div>`
         : '';
 
+    // Temporary vault passcodes minted with this credential — shown ONCE (like the password). The
+    // vault NAME goes in the field LABEL which field() does NOT escape, so escapeHtml it here; the
+    // passcode itself is the value, which field() escapes.
+    const hasPasscodes = Array.isArray(creds.passcodes) && creds.passcodes.length > 0;
+    const passcodesHtml = hasPasscodes
+        ? creds.passcodes.map(p => {
+            const nm = (_tcVaultObjs[p.vault_id] || {}).name || p.vault_id || 'vault';
+            return field(`Vault passcode — ${escapeHtml(nm)}`, p.passcode || '');
+          }).join('')
+        : '';
+
     const modalHTML = `
         <div id="temp-creds-modal" class="modal active">
             <div class="modal-content" style="max-width: 560px;">
@@ -1985,10 +2130,11 @@ function showTempCredsModal(creds) {
                 </div>
                 <div class="modal-body">
                     <div class="alert alert-warning mb-md">
-                        ${iconSvg('alert-triangle', 'icon-sm')} <strong>Copy these now.</strong> The password is shown once and can't be retrieved later.
+                        ${iconSvg('alert-triangle', 'icon-sm')} <strong>Copy these now.</strong> The password${hasPasscodes ? ' and vault passcode(s)' : ''} ${hasPasscodes ? 'are' : 'is'} shown once and can't be retrieved later.
                     </div>
                     ${field('Username', creds.temp_username || 'N/A')}
                     ${field('Password', creds.credential || 'N/A')}
+                    ${passcodesHtml}
                     <div class="cred-field">
                         <span class="cred-field-label">SFTP command</span>
                         <div class="cred-field-row">
@@ -8942,6 +9088,23 @@ document.addEventListener('DOMContentLoaded', () => {
                 _tcShowError("Select at least one vault, or switch to 'All vaults' — a credential scoped to vaults with none selected can't access anything.");
                 return;
             }
+            // Passcode fail-closed: a passcode rides the vault-password proof, so an eligible vault
+            // must be selected AND its password entered before we mint (the server also enforces this).
+            const pcEnable = document.getElementById('tc-passcode-enable');
+            const pcSection = document.getElementById('tc-passcode-section');
+            if (scopeData && pcEnable && pcEnable.checked && pcSection && !pcSection.hidden) {
+                const withPc = (scopeData.selected_vaults || []).filter(sv => sv.issue_passcode);
+                if (!withPc.length) {
+                    _tcShowError('To issue a temporary passcode, select at least one password-protected standard vault.');
+                    return;
+                }
+                const unproven = withPc.find(sv => !sv.password);
+                if (unproven) {
+                    const nm = (_tcVaultObjs[unproven.vault_id] || {}).name || 'the selected vault';
+                    _tcShowError(`Enter the vault password for “${nm}” to issue its passcode.`);
+                    return;
+                }
+            }
             // Do NOT close here — generateTempCreds closes the modal only on success, and keeps it
             // open (with an inline error) on a recoverable failure so entered state isn't lost.
             generateTempCreds({
@@ -8949,6 +9112,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 scope: scopeData ? scopeData.scope : null,
                 vault_access_mode: scopeData ? scopeData.vault_access_mode : null,
                 selected_vaults: scopeData ? scopeData.selected_vaults : null,
+                passcode_same_for_all: scopeData ? scopeData.passcode_same_for_all : false,
             });
         });
     }
