@@ -88,7 +88,16 @@ const state = {
     // when the tab closes) and only for the unlock window, so a refresh keeps you
     // in the vault. The password never leaves the browser / never hits the server.
     rememberedVaults: {},
+    // Per-user preference: when on, the browser never remembers a vault password (always re-ask),
+    // regardless of the vault's unlock window. Loaded from server preferences on boot.
+    neverRememberVaultPassword: false,
+    // Deployment-wide org floor (admin-set): when on, remembering is forbidden for everyone and the
+    // per-user toggle is shown forced-on. Mirrors the server-side unlock_remember_minutes clamp.
+    forceNoRememberVaultPassword: false,
     rememberVaultPassword(vaultId, password, minutes) {
+        // The deployment-wide org floor and the per-user opt-out both forbid remembering — a
+        // stale/local unlock window from any call site can't override either.
+        if (this.forceNoRememberVaultPassword || this.neverRememberVaultPassword) { delete this.rememberedVaults[vaultId]; this._persistRemembered(); return; }
         const mins = (typeof minutes === 'number' && minutes >= 0) ? minutes : 15;
         if (mins === 0) { delete this.rememberedVaults[vaultId]; this._persistRemembered(); return; } // 0 = always ask
         this.rememberedVaults[vaultId] = { password, expiresAt: Date.now() + mins * 60 * 1000 };
@@ -615,6 +624,14 @@ function showPrompt(message, title = 'Enter value', options = {}) {
         messageEl.textContent = message;
         inputEl.style.display = 'block';
         inputEl.type = password ? 'password' : 'text';
+        // This one <input> is reused for every prompt, including the ZK master passphrase. Mark a
+        // password prompt as a one-time code so password managers don't offer to SAVE/autofill the
+        // master passphrase; reset for a plain text prompt. Set every attribute per-use (symmetric,
+        // both branches) so nothing leaks from a prior prompt.
+        inputEl.setAttribute('autocomplete', password ? 'one-time-code' : 'off');
+        inputEl.setAttribute('autocapitalize', 'off');
+        inputEl.setAttribute('autocorrect', 'off');
+        inputEl.setAttribute('spellcheck', password ? 'false' : 'true');
         inputEl.placeholder = placeholder || '';
         inputEl.value = defaultValue || '';
         confirmBtn.disabled = false;
@@ -1421,6 +1438,7 @@ async function showCreateVault() {
     if (grp) {
         try {
             const f = await apiRequest('/zk-enabled', { silent: true });
+            setZkIdleLockMinutes(f && f.zk_idle_lock_minutes);  // keep the idle-lock policy fresh
             const on = !!(f && f.zero_knowledge_enabled);
             const must = !!(f && f.must_use_zk);
             const planHasZk = !!(f && f.plan_zero_knowledge);
@@ -1580,9 +1598,24 @@ function showGenerateTempCreds() {
 
     initTempScopeBuilder();      // wire the scope-builder controls once
     resetTempScopeBuilder();     // reset to defaults
+    _tcLoadPasscodePolicy();     // fetch the effective temp-passcode policy (shapes the controls)
     populateTempScopeVaults();   // fill the selectable vault list
 
     modal.classList.add('active');
+}
+
+// Effective temp-passcode policy (from GET /temp-passcode-policy) — shapes the mint controls:
+// whether the feature is offered at all, whether custom passcodes are allowed, etc. Null until loaded.
+let _tcPasscodePolicy = null;
+async function _tcLoadPasscodePolicy() {
+    _tcPasscodePolicy = null;  // clear the prior session's policy so the section stays hidden until the fresh fetch lands
+    _tcSyncPasscodeUI();
+    try {
+        _tcPasscodePolicy = await apiRequest('/temp-passcode-policy', { silent: true });
+    } catch (_) {
+        _tcPasscodePolicy = null;  // fail closed: no policy => passcode controls stay hidden
+    }
+    _tcSyncPasscodeUI();
 }
 
 let _tempScopeWired = false;
@@ -1619,7 +1652,13 @@ function initTempScopeBuilder() {
         const isSel = document.querySelector('input[name="tc-vault-mode"]:checked')?.value === 'selected';
         if (sel) sel.style.display = isSel ? '' : 'none';
         _tcRestrictSyncAvailability();
+        _tcSyncPasscodeUI();  // passcodes attach to per-vault grants -> only in selected mode
     }));
+    // Temporary-passcode controls: reflect the toggle + same-for-all state onto the rows.
+    const pcEnable = document.getElementById('tc-passcode-enable');
+    if (pcEnable) pcEnable.addEventListener('change', _tcSyncPasscodeUI);
+    const pcSame = document.getElementById('tc-passcode-same');
+    if (pcSame) pcSame.addEventListener('change', _tcSyncPasscodeUI);
     // File/folder restriction: reveal the picker when enabled; keep availability in sync as the
     // vault selection changes (the list is re-rendered on open, so delegate the pick listener).
     const restrictEnable = document.getElementById('tc-restrict-enable');
@@ -1649,6 +1688,7 @@ function initTempScopeBuilder() {
             const pw = cb && document.querySelector(`.tc-vault-pw[data-vault="${cb.value}"]`);
             if (pw) pw.style.display = show ? '' : 'none';
         });
+        _tcSyncPasscodeUI();  // the per-vault passcode input + ZK note follow the toggle AND the filter
     });
 }
 
@@ -1672,6 +1712,11 @@ function resetTempScopeBuilder() {
     document.querySelectorAll('.tc-cap').forEach(c => { c.checked = baseline.has(c.value); });
     document.querySelectorAll('.tc-global-cap').forEach(c => { c.checked = false; });
     const search = document.getElementById('tc-vault-search'); if (search) search.value = '';
+    // Reset the temporary-passcode controls (off; same-for-all on; shared custom cleared).
+    const pcEnable = document.getElementById('tc-passcode-enable'); if (pcEnable) pcEnable.checked = false;
+    const pcSame = document.getElementById('tc-passcode-same'); if (pcSame) pcSame.checked = true;
+    const pcShared = document.getElementById('tc-passcode-shared-value'); if (pcShared) pcShared.value = '';
+    _tcSyncPasscodeUI();
     _tcRestrictReset();
 }
 
@@ -1696,9 +1741,137 @@ async function populateTempScopeVaults() {
                 <span class="member-pick-name">${escapeHtml(v.name || 'Untitled vault')}${v.has_password ? ' <span class="text-tertiary text-sm">· password-protected</span>' : ''}</span>
             </label>${v.has_password ? `
             <input type="password" class="tc-vault-pw form-control" data-vault="${escapeHtml(v.id)}" placeholder="Vault password — required to grant access to this password-protected vault" autocomplete="new-password" style="margin:2px 0 10px 26px;max-width:340px;">` : ''}`).join('');
+        _tcDecoratePasscodeRows(vaults);   // append per-vault passcode controls via DOM (no innerHTML)
+        _tcSyncPasscodeUI();               // reflect the current passcode-toggle state onto the rows
     } catch (_) {
         list.innerHTML = '<div class="text-tertiary text-sm p-sm">Could not load vaults.</div>';
     }
+}
+
+// After the vault list renders, append the per-vault passcode controls via DOM (createElement, no
+// innerHTML): a custom-passcode input for each eligible (standard + password-protected) vault, and a
+// "not available" note for each zero-knowledge vault. Hidden until the passcode toggle is on.
+function _tcDecoratePasscodeRows(vaults) {
+    const list = document.getElementById('tc-vault-list');
+    if (!list || !Array.isArray(vaults)) return;
+    vaults.forEach(v => {
+        const cb = list.querySelector(`.tc-vault-pick[value="${v.id}"]`);  // v.id is a UUID (selector-safe)
+        if (!cb) return;
+        const row = cb.closest('.member-pick-item');
+        if (!row) return;
+        const isZk = v.type === 'zero_knowledge';
+        const eligible = !isZk && !!v.has_password;  // a passcode is a second gate on a password-protected standard vault
+        cb.dataset.eligible = eligible ? '1' : '0';
+        // Insert after the row's password input if present, else after the row itself.
+        const anchor = list.querySelector(`.tc-vault-pw[data-vault="${v.id}"]`) || row;
+        if (eligible) {
+            const inp = document.createElement('input');
+            inp.type = 'text';
+            inp.className = 'tc-vault-passcode form-control';
+            inp.dataset.vault = v.id;
+            inp.placeholder = 'Custom passcode for this vault (blank = auto-generate)';
+            inp.autocomplete = 'off';
+            inp.style.cssText = 'display:none;margin:0 0 10px 26px;max-width:340px;';
+            anchor.insertAdjacentElement('afterend', inp);
+        } else if (isZk) {
+            // Two hidden notes; _tcSyncPasscodeUI shows whichever applies per the current policy: the
+            // passcode "not available" note (when ZK is allowed in a temp-cred scope) OR the org-policy
+            // "not allowed" note (when ZK is denied, alongside disabling the row's checkbox).
+            const pNote = document.createElement('div');
+            pNote.className = 'tc-passcode-zk-note text-tertiary text-sm';
+            pNote.dataset.vault = v.id;  // so the search filter can hide it with its row
+            pNote.style.cssText = 'display:none;margin:0 0 10px 26px;';
+            pNote.textContent = "Passcodes aren't available for zero-knowledge vaults — add a member or use a disposable standard vault.";
+            anchor.insertAdjacentElement('afterend', pNote);
+            const dNote = document.createElement('div');
+            dNote.className = 'tc-zk-deny-note text-tertiary text-sm';
+            dNote.dataset.vault = v.id;
+            dNote.style.cssText = 'display:none;margin:0 0 10px 26px;';
+            dNote.textContent = 'Not allowed in temporary credentials by organization policy.';
+            anchor.insertAdjacentElement('afterend', dNote);
+        }
+    });
+}
+
+// True when a vault's picker row is currently filtered out (hidden) by the search box, so its
+// passcode input / ZK note should stay hidden regardless of the passcode-toggle state.
+function _tcRowHidden(vid) {
+    const cb = document.querySelector(`.tc-vault-pick[value="${vid}"]`);
+    const row = cb && cb.closest('.member-pick-item');
+    return !!(row && row.style.display === 'none');
+}
+
+// Show/hide the passcode controls per the effective policy + toggles + vault mode.
+function _tcSyncPasscodeUI() {
+    const section = document.getElementById('tc-passcode-section');
+    if (!section) return;
+    const policyOn = !!(_tcPasscodePolicy && _tcPasscodePolicy.temp_passcodes_enabled);
+    const modeSelected = document.querySelector('input[name="tc-vault-mode"]:checked')?.value !== 'all';
+    // The section rides the scope-builder (shown only when scoping is on); offer it only when the
+    // feature is enabled AND we're in selected-vault mode (passcodes attach to per-vault grants).
+    section.hidden = !(policyOn && modeSelected);
+    const enable = document.getElementById('tc-passcode-enable');
+    const on = !!(enable && enable.checked) && policyOn && modeSelected;
+    const opts = document.getElementById('tc-passcode-opts');
+    if (opts) opts.hidden = !on;
+    const allowCustom = !!(_tcPasscodePolicy && _tcPasscodePolicy.temp_passcode_allow_custom);
+    const same = document.getElementById('tc-passcode-same');
+    const sameOn = !!(same && same.checked);
+    const sharedRow = document.getElementById('tc-passcode-shared-row');
+    if (sharedRow) sharedRow.hidden = !(on && allowCustom && sameOn);   // one shared custom input
+    document.querySelectorAll('.tc-vault-passcode').forEach(el => {      // per-vault custom inputs
+        el.style.display = (on && allowCustom && !sameOn && !_tcRowHidden(el.dataset.vault)) ? '' : 'none';
+    });
+    // Zero-knowledge vault handling per the org policy. DENY: disable + grey the ZK row and show the
+    // "not allowed" note. ALLOW: keep it selectable; the passcode "not available" note shows when the
+    // passcode toggle is on. (The server independently enforces the deny at the mint chokepoint.)
+    // Fail closed: a null policy (pre-load / fetch failure) is treated as DENY, matching the
+    // passcode section's fail-closed posture — the server is the authority either way.
+    const denyZk = !(_tcPasscodePolicy && _tcPasscodePolicy.temp_cred_allow_zk_vaults !== false);
+    document.querySelectorAll('.tc-zk-deny-note').forEach(dn => {
+        const vid = dn.dataset.vault;
+        const cb = document.querySelector(`.tc-vault-pick[value="${vid}"]`);
+        const row = cb && cb.closest('.member-pick-item');
+        if (cb) { cb.disabled = denyZk; if (denyZk) cb.checked = false; }
+        if (row) row.style.opacity = denyZk ? '0.55' : '';
+        dn.style.display = (denyZk && !_tcRowHidden(vid)) ? '' : 'none';
+    });
+    document.querySelectorAll('.tc-passcode-zk-note').forEach(el => {    // passcode not-available note (ALLOW only)
+        el.style.display = (on && !denyZk && !_tcRowHidden(el.dataset.vault)) ? '' : 'none';
+    });
+    const minLen = (_tcPasscodePolicy && _tcPasscodePolicy.temp_passcode_min_length) || 16;
+    const oneTime = !(_tcPasscodePolicy && _tcPasscodePolicy.temp_passcode_one_time_default === false);
+    const note = document.getElementById('tc-passcode-note');
+    if (note) note.textContent = on
+        ? `Shown once on create. ${allowCustom ? 'Custom passcodes must be' : 'Generated passcodes are'} at least ${minLen} characters; ${oneTime ? 'one-time use by default' : 'multi-use by default'}. Only password-protected standard vaults get one.`
+        : '';
+    const help = document.getElementById('tc-passcode-shared-help');
+    if (help) help.textContent = `At least ${minLen} characters (blank to auto-generate).`;
+}
+
+// Acknowledge-to-proceed modal shown when the scope includes a zero-knowledge vault (allow policy):
+// a passcode isn't available for it, so the holder must enter the real account passphrase (master
+// key). The mint proceeds only on explicit acknowledgment. Static content -> XSS-safe.
+function _tcConfirmZkAck(onProceed) {
+    const existing = document.getElementById('tc-zk-ack-modal');
+    if (existing) existing.remove();
+    const html = `
+        <div id="tc-zk-ack-modal" class="modal active">
+            <div class="modal-content" style="max-width:520px;">
+                <div class="modal-header"><h3>Zero-knowledge vault in scope</h3></div>
+                <div class="modal-body">
+                    <div class="alert alert-warning">This credential's scope includes a zero-knowledge vault. Temporary passcodes aren't available for them — the holder must enter the real account passphrase (your master key) to decrypt their contents. Only issue this where you trust the device the passphrase will be typed on.</div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" id="tc-zk-ack-cancel">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="tc-zk-ack-proceed">I understand — continue</button>
+                </div>
+            </div>
+        </div>`;
+    document.body.insertAdjacentHTML('beforeend', html);
+    const modal = document.getElementById('tc-zk-ack-modal');
+    modal.querySelector('#tc-zk-ack-cancel').addEventListener('click', () => modal.remove());
+    modal.querySelector('#tc-zk-ack-proceed').addEventListener('click', () => { modal.remove(); onProceed(); });
 }
 
 // --- File/folder restriction picker (produces selected_vaults[].scope_ids) ------------------
@@ -1879,7 +2052,33 @@ function collectTempScope() {
             };
         }
     }
-    return { scope: { v: 1, pages, caps, vault_caps_default: vaultCaps, temp }, vault_access_mode: mode, selected_vaults };
+    // Temporary passcodes: attach issue_passcode (+ an optional custom value) to each ELIGIBLE
+    // (standard, password-protected) selected vault. ZK / no-password vaults never get one.
+    let passcode_same_for_all = false;
+    const pcEnable = document.getElementById('tc-passcode-enable');
+    if (mode === 'selected' && pcEnable && pcEnable.checked
+        && _tcPasscodePolicy && _tcPasscodePolicy.temp_passcodes_enabled) {
+        const same = document.getElementById('tc-passcode-same');
+        passcode_same_for_all = !!(same && same.checked);
+        const allowCustom = !!_tcPasscodePolicy.temp_passcode_allow_custom;
+        const sharedVal = (allowCustom && passcode_same_for_all)
+            ? ((document.getElementById('tc-passcode-shared-value') || {}).value || '').trim() : '';
+        selected_vaults.forEach(sv => {
+            const vobj = _tcVaultObjs[sv.vault_id] || {};
+            if (vobj.type === 'zero_knowledge' || !vobj.has_password) return;  // ineligible
+            sv.issue_passcode = true;
+            if (allowCustom) {
+                if (passcode_same_for_all) {
+                    if (sharedVal) sv.passcode = sharedVal;
+                } else {
+                    const el = document.querySelector(`.tc-vault-passcode[data-vault="${sv.vault_id}"]`);
+                    const val = ((el && el.value) || '').trim();
+                    if (val) sv.passcode = val;
+                }
+            }
+        });
+    }
+    return { scope: { v: 1, pages, caps, vault_caps_default: vaultCaps, temp }, vault_access_mode: mode, selected_vaults, passcode_same_for_all };
 }
 
 // Generate Temporary Credentials
@@ -1928,6 +2127,7 @@ async function generateTempCreds(options = {}) {
             body.scope = options.scope;
             body.vault_access_mode = options.vault_access_mode || 'selected';
             body.selected_vaults = options.selected_vaults || [];
+            if (options.passcode_same_for_all) body.passcode_same_for_all = true;
         }
 
         const creds = await apiRequest('/auth/temp-credentials', {
@@ -1976,6 +2176,17 @@ function showTempCredsModal(creds) {
         ? `<div class="alert alert-warning" style="font-size:.85rem;">${iconSvg('alert-triangle', 'icon-sm')} This credential can itself create more temporary credentials.</div>`
         : '';
 
+    // Temporary vault passcodes minted with this credential — shown ONCE (like the password). The
+    // vault NAME goes in the field LABEL which field() does NOT escape, so escapeHtml it here; the
+    // passcode itself is the value, which field() escapes.
+    const hasPasscodes = Array.isArray(creds.passcodes) && creds.passcodes.length > 0;
+    const passcodesHtml = hasPasscodes
+        ? creds.passcodes.map(p => {
+            const nm = (_tcVaultObjs[p.vault_id] || {}).name || p.vault_id || 'vault';
+            return field(`Vault passcode — ${escapeHtml(nm)}`, p.passcode || '');
+          }).join('')
+        : '';
+
     const modalHTML = `
         <div id="temp-creds-modal" class="modal active">
             <div class="modal-content" style="max-width: 560px;">
@@ -1985,10 +2196,11 @@ function showTempCredsModal(creds) {
                 </div>
                 <div class="modal-body">
                     <div class="alert alert-warning mb-md">
-                        ${iconSvg('alert-triangle', 'icon-sm')} <strong>Copy these now.</strong> The password is shown once and can't be retrieved later.
+                        ${iconSvg('alert-triangle', 'icon-sm')} <strong>Copy these now.</strong> The password${hasPasscodes ? ' and vault passcode(s)' : ''} ${hasPasscodes ? 'are' : 'is'} shown once and can't be retrieved later.
                     </div>
                     ${field('Username', creds.temp_username || 'N/A')}
                     ${field('Password', creds.credential || 'N/A')}
+                    ${passcodesHtml}
                     <div class="cred-field">
                         <span class="cred-field-label">SFTP command</span>
                         <div class="cred-field-row">
@@ -2769,6 +2981,21 @@ function openUserSettingsModal() {
     const themeSel = document.getElementById('us-theme'); if (themeSel && tm) themeSel.value = (tm.currentTheme === 'dark') ? 'dark' : 'light';
     const skinSel = document.getElementById('us-skin'); if (skinSel && tm) skinSel.value = (tm.currentUi === 'v1') ? 'v1' : 'v2';
 
+    // Privacy: "never remember vault password". Reflect the user's own preference immediately,
+    // then fetch the deployment-wide org floor and, if set, force the toggle on + disabled.
+    const nrEl = document.getElementById('us-never-remember-pw');
+    const nrForced = document.getElementById('us-never-remember-forced');
+    if (nrEl) {
+        nrEl.checked = !!state.neverRememberVaultPassword;
+        nrEl.disabled = false;
+        if (nrForced) nrForced.style.display = 'none';
+        apiRequest('/temp-passcode-policy', { silent: true }).then(p => {
+            const forced = !!(p && p.force_no_remember_vault_password === true);
+            state.forceNoRememberVaultPassword = forced;
+            if (forced) { nrEl.checked = true; nrEl.disabled = true; if (nrForced) nrForced.style.display = ''; }
+        }).catch(() => {});
+    }
+
     document.querySelector('.profile-menu')?.classList.remove('active');  // close the dropdown
     openModal('user-settings-modal');
 }
@@ -2831,6 +3058,13 @@ function wireUserSettingsModal() {
         // re-applies the skin pre-paint), handling the save/reload race for us.
         const v = e.target.value === 'v1' ? 'v1' : 'v2';
         if (window.themeManager && typeof window.themeManager.setUi === 'function') window.themeManager.setUi(v);
+    });
+    document.getElementById('us-never-remember-pw')?.addEventListener('change', (e) => {
+        if (state.forceNoRememberVaultPassword) { e.target.checked = true; return; }  // org floor: not user-changeable
+        const on = !!e.target.checked;
+        state.neverRememberVaultPassword = on;
+        if (on) { state.rememberedVaults = {}; state._persistRemembered(); }  // drop anything already held
+        if (window.saveUserPreference) window.saveUserPreference({ never_remember_vault_password: on ? 'on' : 'off' });
     });
 }
 
@@ -4318,6 +4552,29 @@ async function loadSettings() {
         if (fzkEl) fzkEl.checked = settings.force_zero_knowledge === true;
         const dssEl = document.getElementById('setting-directory-search-scope');
         if (dssEl) dssEl.value = (settings.directory_search_scope === 'same_department') ? 'same_department' : 'deployment';
+        const fnrEl = document.getElementById('setting-force-no-remember-vault-password');
+        if (fnrEl) fnrEl.checked = settings.force_no_remember_vault_password === true;
+        const zilEl = document.getElementById('setting-zk-idle-lock-minutes');
+        if (zilEl) zilEl.value = Number(settings.zk_idle_lock_minutes) || 0;
+
+        // Temporary Vault Passcodes. GET /settings overlays the EFFECTIVE policy, so these keys
+        // are always present (feature default off; allow-ZK default on).
+        const setPasscodeChk = (id, val) => { const el = document.getElementById(id); if (el) el.checked = val === true; };
+        setPasscodeChk('setting-temp-passcodes-enabled', settings.temp_passcodes_enabled);
+        setPasscodeChk('setting-temp-passcode-one-time-default', settings.temp_passcode_one_time_default);
+        setPasscodeChk('setting-temp-passcode-single-vault-only', settings.temp_passcode_single_vault_only);
+        setPasscodeChk('setting-temp-passcode-allow-custom', settings.temp_passcode_allow_custom);
+        setPasscodeChk('setting-temp-passcode-require-uppercase', settings.temp_passcode_require_uppercase);
+        setPasscodeChk('setting-temp-passcode-require-lowercase', settings.temp_passcode_require_lowercase);
+        setPasscodeChk('setting-temp-passcode-require-numbers', settings.temp_passcode_require_numbers);
+        setPasscodeChk('setting-temp-passcode-require-special', settings.temp_passcode_require_special);
+        // allow-ZK-in-scope defaults to ON (today's behavior) when the key is absent.
+        const tczkEl = document.getElementById('setting-temp-cred-allow-zk-vaults');
+        if (tczkEl) tczkEl.checked = settings.temp_cred_allow_zk_vaults !== false;
+        const tpMinEl = document.getElementById('setting-temp-passcode-min-length');
+        if (tpMinEl) tpMinEl.value = settings.temp_passcode_min_length || 16;
+        const tpMaxEl = document.getElementById('setting-temp-passcode-max-lifetime');
+        if (tpMaxEl) tpMaxEl.value = (settings.temp_passcode_max_lifetime_minutes > 0) ? settings.temp_passcode_max_lifetime_minutes : '';
         // When the PLAN mandates zero-knowledge (Enterprise tier), the local toggles can't
         // lower that floor — show ZK as allowed + required, checked and LOCKED, with an
         // explanatory note, so an unchecked-but-forced box isn't contradictory. Best-effort:
@@ -4390,7 +4647,22 @@ async function saveAllSettings() {
             // SFTP & Encryption
             zero_knowledge_enabled: document.getElementById('setting-zero-knowledge-enabled').checked,
             force_zero_knowledge: document.getElementById('setting-force-zero-knowledge').checked,
-            directory_search_scope: (document.getElementById('setting-directory-search-scope') || {}).value || 'deployment'
+            directory_search_scope: (document.getElementById('setting-directory-search-scope') || {}).value || 'deployment',
+            force_no_remember_vault_password: document.getElementById('setting-force-no-remember-vault-password').checked,
+            zk_idle_lock_minutes: parseInt(document.getElementById('setting-zk-idle-lock-minutes').value) || 0,
+
+            // Temporary Vault Passcodes
+            temp_passcodes_enabled: document.getElementById('setting-temp-passcodes-enabled').checked,
+            temp_passcode_allow_custom: document.getElementById('setting-temp-passcode-allow-custom').checked,
+            temp_passcode_one_time_default: document.getElementById('setting-temp-passcode-one-time-default').checked,
+            temp_passcode_single_vault_only: document.getElementById('setting-temp-passcode-single-vault-only').checked,
+            temp_passcode_require_uppercase: document.getElementById('setting-temp-passcode-require-uppercase').checked,
+            temp_passcode_require_lowercase: document.getElementById('setting-temp-passcode-require-lowercase').checked,
+            temp_passcode_require_numbers: document.getElementById('setting-temp-passcode-require-numbers').checked,
+            temp_passcode_require_special: document.getElementById('setting-temp-passcode-require-special').checked,
+            temp_passcode_min_length: parseInt(document.getElementById('setting-temp-passcode-min-length').value) || 16,
+            temp_passcode_max_lifetime_minutes: parseInt(document.getElementById('setting-temp-passcode-max-lifetime').value) || 0,
+            temp_cred_allow_zk_vaults: document.getElementById('setting-temp-cred-allow-zk-vaults').checked
         };
 
         // Branding: send the brand overrides. An empty value clears that
@@ -5476,6 +5748,42 @@ function eccLib() {
 const zkState = { privateKey: null, vaultDeks: {}, teamKeys: {}, pinnedHier: {} };
 function zkResetKeys() { zkState.privateKey = null; zkState.vaultDeks = {}; zkState.teamKeys = {}; zkState.pinnedHier = {}; }
 
+// --- ZK idle auto-lock -------------------------------------------------------------------------
+// Optional org policy (zk_idle_lock_minutes, from /zk-enabled): drop the in-memory ZK key after N
+// minutes of inactivity so the user must re-enter their passphrase. 0 = disabled. Enforced here
+// because the key never leaves the browser; the server only supplies the threshold.
+let _zkIdleLockMinutes = 0;
+let _zkIdleTimer = null;
+let _zkActivityWired = false;
+
+function zkIdleLock() {
+    if (_zkIdleTimer) { clearTimeout(_zkIdleTimer); _zkIdleTimer = null; }
+    if (!zkState.privateKey) return;          // already locked
+    zkResetKeys();                            // drop the ECC key + per-vault DEKs; next op re-prompts
+    try { showInfo('Encryption locked after inactivity — you\'ll be asked for your passphrase again.'); } catch (_) {}
+}
+
+// (Re)arm the idle timer. No-op unless the policy is on AND a key is currently unlocked.
+function zkArmIdleLock() {
+    if (_zkIdleTimer) { clearTimeout(_zkIdleTimer); _zkIdleTimer = null; }
+    if (_zkIdleLockMinutes > 0 && zkState.privateKey) {
+        _zkIdleTimer = setTimeout(zkIdleLock, _zkIdleLockMinutes * 60 * 1000);
+        if (!_zkActivityWired) {
+            _zkActivityWired = true;
+            // Reset the countdown on real user activity while a key is unlocked (passive listeners).
+            ['mousedown', 'keydown', 'scroll', 'touchstart'].forEach(ev =>
+                document.addEventListener(ev, () => { if (zkState.privateKey && _zkIdleLockMinutes > 0) zkArmIdleLock(); },
+                    { passive: true }));
+        }
+    }
+}
+
+// Apply a policy value from /zk-enabled and (re)arm.
+function setZkIdleLockMinutes(n) {
+    _zkIdleLockMinutes = (typeof n === 'number' && isFinite(n) && n > 0) ? Math.min(Math.floor(n), 1440) : 0;
+    zkArmIdleLock();
+}
+
 function isZkVault(v) { return !!v && v.type === 'zero_knowledge'; }
 
 // Unlock the user's ECC private key into memory (prompts for the passphrase once
@@ -5507,6 +5815,7 @@ async function zkEnsureUnlocked() {
         throw new Error('Incorrect passphrase (or the stored key is corrupt).');
     }
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);  // non-extractable runtime key
+    zkArmIdleLock();  // start the inactivity auto-lock countdown now a key is in memory
     return zkState.privateKey;
 }
 
@@ -5564,6 +5873,7 @@ async function zkRegisterNewKeypair() {
     // Hold a NON-extractable runtime copy (the generated key was extractable only
     // so we could export + password-encrypt it above).
     zkState.privateKey = await lib.importPrivateKeyPEM(privatePem, false);
+    zkArmIdleLock();
 }
 
 // Change the encryption passphrase: unlock the private key with the CURRENT passphrase,
@@ -5605,6 +5915,7 @@ async function zkChangePassphrase() {
     });
     // Keep a NON-extractable runtime copy so the session stays unlocked with the same key.
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
+    zkArmIdleLock();
 }
 
 // Export a recovery kit: re-wrap the private key under a SEPARATE recovery passphrase and download
@@ -5695,6 +6006,7 @@ async function zkRestoreFromRecoveryKey(kitText) {
     const enc = await eccLib().encryptPrivateKey(pem, next);
     await apiRequest('/ecc/keys/private', { method: 'PUT', body: JSON.stringify({ encrypted_private_key: JSON.stringify(enc) }) });
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
+    zkArmIdleLock();
 }
 
 // Ensure the user has an ECC keypair: create + register one (first time) or just
@@ -8354,21 +8666,23 @@ async function handleSetExpiry(e) {
                 body.size_limit = newSizeBytes;
             }
         }
-        await apiRequest(`/vaults/${state.currentVault.id}/settings`, {
+        const saved = await apiRequest(`/vaults/${state.currentVault.id}/settings`, {
             method: 'PATCH',
             body: JSON.stringify(body)
         });
+        // Trust the server's stored window (clamped to 0 when the org floor is set), not the submitted one.
+        const effectiveUrm = (saved && typeof saved.unlock_remember_minutes === 'number') ? saved.unlock_remember_minutes : urm;
 
         // Update local state + drop any remembered password so the new window applies.
         state.currentVault.expire_files_after_days = expireValue > 0 ? expireValue : null;
         state.currentVault.expire_files_unit = expireValue > 0 ? expireUnit : 'days';
-        state.currentVault.unlock_remember_minutes = urm;
+        state.currentVault.unlock_remember_minutes = effectiveUrm;
         if (newSizeBytes != null) state.currentVault.size_limit = newSizeBytes;
         // Re-base the remember window on the new policy (applies to the next
         // re-entry; the currently-open vault stays open either way).
         state.forgetVaultPassword(state.currentVault.id);
         if (state.currentVault.has_password) {
-            state.rememberVaultPassword(state.currentVault.id, state.vaultPassword, urm);
+            state.rememberVaultPassword(state.currentVault.id, state.vaultPassword, effectiveUrm);
         }
 
         showSuccess('Vault policies saved');
@@ -8592,6 +8906,26 @@ async function applyServerPreferences() {
         prefs = await resp.json();
     } catch (_) { return false; }
     if (!prefs || typeof prefs !== 'object') return false;
+
+    // Per-user "never remember my vault password" preference (stored as 'on'/'off'). Apply it
+    // before any early-return below so the opt-out always takes effect.
+    if (typeof prefs.never_remember_vault_password === 'string') {
+        state.neverRememberVaultPassword = (prefs.never_remember_vault_password === 'on');
+        if (state.neverRememberVaultPassword) { state.rememberedVaults = {}; state._persistRemembered(); }
+    }
+    // Load the deployment-wide org floor at boot (not just when the account modal opens) so the
+    // client remember-guard is reliably armed before any vault is opened. Server-side the floor
+    // already clamps every vault's unlock window to 0; this closes the client cache path too.
+    try {
+        const pol = await apiRequest('/temp-passcode-policy', { silent: true });
+        state.forceNoRememberVaultPassword = !!(pol && pol.force_no_remember_vault_password === true);
+        if (state.forceNoRememberVaultPassword) { state.rememberedVaults = {}; state._persistRemembered(); }
+    } catch (_) { /* best-effort; the server clamp is the authoritative enforcement */ }
+    // Load the ZK-key idle auto-lock policy at boot so any later unlock arms the countdown.
+    try {
+        const zk = await apiRequest('/zk-enabled', { silent: true });
+        setZkIdleLockMinutes(zk && zk.zk_idle_lock_minutes);
+    } catch (_) { /* best-effort; default = no idle lock */ }
 
     const tm = window.themeManager;
     if (!tm) return false;
@@ -8910,14 +9244,45 @@ document.addEventListener('DOMContentLoaded', () => {
                 _tcShowError("Select at least one vault, or switch to 'All vaults' — a credential scoped to vaults with none selected can't access anything.");
                 return;
             }
+            // Passcode fail-closed: a passcode rides the vault-password proof, so an eligible vault
+            // must be selected AND its password entered before we mint (the server also enforces this).
+            const pcEnable = document.getElementById('tc-passcode-enable');
+            const pcSection = document.getElementById('tc-passcode-section');
+            if (scopeData && pcEnable && pcEnable.checked && pcSection && !pcSection.hidden) {
+                const withPc = (scopeData.selected_vaults || []).filter(sv => sv.issue_passcode);
+                if (!withPc.length) {
+                    _tcShowError('To issue a temporary passcode, select at least one password-protected standard vault.');
+                    return;
+                }
+                const unproven = withPc.find(sv => !sv.password);
+                if (unproven) {
+                    const nm = (_tcVaultObjs[unproven.vault_id] || {}).name || 'the selected vault';
+                    _tcShowError(`Enter the vault password for “${nm}” to issue its passcode.`);
+                    return;
+                }
+            }
             // Do NOT close here — generateTempCreds closes the modal only on success, and keeps it
             // open (with an inline error) on a recoverable failure so entered state isn't lost.
-            generateTempCreds({
+            const doMint = () => generateTempCreds({
                 validity_minutes: validityMinutes, note, can_create_temp_credentials: canCreate,
                 scope: scopeData ? scopeData.scope : null,
                 vault_access_mode: scopeData ? scopeData.vault_access_mode : null,
                 selected_vaults: scopeData ? scopeData.selected_vaults : null,
+                passcode_same_for_all: scopeData ? scopeData.passcode_same_for_all : false,
             });
+            // ZK-in-scope (allow policy): if the scope includes a zero-knowledge vault, a passcode
+            // isn't available for it — require an explicit acknowledgment that the holder must type the
+            // master passphrase before we mint. (Deny policy disables ZK rows / rejects server-side.)
+            // An unrestricted (no scope) or all-vaults mint reaches EVERY vault, so it counts as
+            // "ZK in scope" when the account owns/holds any zero-knowledge vault.
+            const allowZk = !(_tcPasscodePolicy && _tcPasscodePolicy.temp_cred_allow_zk_vaults === false);
+            const _mode = scopeData ? scopeData.vault_access_mode : null;
+            const _unrestrictedOrAll = !scopeData || _mode === 'all';
+            const zkSelected = _unrestrictedOrAll
+                ? Object.keys(_tcVaultObjs).some(id => (_tcVaultObjs[id] || {}).type === 'zero_knowledge')
+                : (scopeData.selected_vaults || []).some(sv => (_tcVaultObjs[sv.vault_id] || {}).type === 'zero_knowledge');
+            if (allowZk && zkSelected) { _tcConfirmZkAck(doMint); return; }
+            doMint();
         });
     }
     

@@ -337,6 +337,39 @@ if getattr(settings, 'rate_limit_api_enabled', True):
 
 app.add_middleware(SecurityHeadersMiddleware)
 
+
+class VaultPasscodeMiddleware:
+    """Pure-ASGI middleware that captures the X-Vault-Passcode header into a request-scoped contextvar
+    so VaultService.get_vault can redeem a temp-credential passcode at the single chokepoint without
+    threading the header through every file endpoint (the vault password is threaded explicitly; the
+    passcode rides the contextvar instead). Pure ASGI — NOT BaseHTTPMiddleware — so the contextvar
+    reliably propagates into the sync route handler's threadpool call."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        from app.services.vault_service import set_current_vault_passcode, reset_current_vault_passcode
+        value = None
+        for k, v in (scope.get("headers") or []):
+            if k == b"x-vault-passcode":
+                try:
+                    value = v.decode("latin-1")
+                except Exception:
+                    value = None
+                break
+        token = set_current_vault_passcode(value)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            reset_current_vault_passcode(token)
+
+
+app.add_middleware(VaultPasscodeMiddleware)
+
 # Host-header allowlist (opt-in). Empty ALLOWED_HOSTS => permissive ['*'] (a self-hosted vault's
 # served hostname is deployment-specific and unknown at build time), so this is inert unless the
 # operator declares the served name(s) — then a forged Host / X-Forwarded-Host is rejected (a
@@ -632,7 +665,12 @@ class TempCredentialCreate(BaseModel):
     # Least-privilege scope (None = legacy/unrestricted). See app/core/temp_scope.py.
     scope: Optional[dict] = None
     vault_access_mode: Optional[str] = None          # 'all' | 'selected'
-    selected_vaults: Optional[list] = None           # [{"vault_id":..., "caps":[...]}]
+    # [{"vault_id":..., "caps":[...], "scope_ids":..., "password":..., "issue_passcode":bool,
+    #   "passcode":"custom-or-omitted", "one_time":bool?}] — passcode fields are optional per vault.
+    selected_vaults: Optional[list] = None
+    # Issue ONE shared temporary passcode across all passcode-enabled selected vaults (a supplied
+    # custom value if any, else a single generated one), stored as N verifiers.
+    passcode_same_for_all: Optional[bool] = None
 
 
 class TempCredentialResponse(BaseModel):
@@ -647,6 +685,8 @@ class TempCredentialResponse(BaseModel):
     can_create_temp_credentials: bool = False
     scope: Optional[dict] = None
     vault_access_mode: Optional[str] = None
+    # Temporary vault passcodes minted with this credential, shown ONCE. [{vault_id, passcode, kind}].
+    passcodes: list = []
 
 
 class VaultCreate(BaseModel):
@@ -1560,6 +1600,61 @@ def _validate_password_policy(db: Session, password: str) -> None:
         raise HTTPException(status_code=400, detail="Password must " + "; ".join(errs) + ".")
 
 
+# ---------------------------------------------------------------------------
+# Temporary Vault Passcode policy. The effective values are resolved by the pure,
+# unit-tested app/core/temp_passcode_policy module (mirrors password_policy.py);
+# these thin wrappers just read the SystemSetting('global') blob and delegate. No
+# PLAN_* env ceiling on this feature; no enforcement here (redemption
+# reads them). Kept beside _zk_enabled/_directory_search_scope, NOT in
+# app/config/effective.py (that resolver is branding-only).
+# ---------------------------------------------------------------------------
+def _global_settings_blob(db: Session) -> dict:
+    """The raw SystemSetting('global') value dict, or {} on absence/error (so the passcode resolvers
+    fail closed)."""
+    from app.core.models import SystemSetting
+    try:
+        row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+        return (row.value or {}) if (row and row.value) else {}
+    except Exception:
+        return {}
+
+
+def _temp_passcodes_enabled(db: Session) -> bool:
+    """Master switch (FAIL-CLOSED: default False, and False for any non-bool stored value)."""
+    from app.core import temp_passcode_policy
+    return temp_passcode_policy.passcodes_enabled(_global_settings_blob(db))
+
+
+def _temp_cred_allow_zk_vaults(db: Session) -> bool:
+    """May a zero-knowledge vault be included in a temporary credential's scope at all. Default True =
+    today's behavior; only an explicit stored False denies (enforced fail-closed at the mint chokepoint)."""
+    from app.core import temp_passcode_policy
+    return temp_passcode_policy.allow_zk_vaults(_global_settings_blob(db))
+
+
+def _temp_passcode_policy(db: Session) -> dict:
+    """The effective Temporary Vault Passcode policy (INCLUDING temp_cred_allow_zk_vaults), keyed by the
+    exact setting names so ONE call drives both the mint UI (GET /temp-passcode-policy) and the
+    GET /settings overlay. No enforcement here — redemption reads this."""
+    from app.core import temp_passcode_policy
+    return temp_passcode_policy.effective_policy(_global_settings_blob(db))
+
+
+def _force_no_remember_vault_password(db: Session) -> bool:
+    """Org policy: when True, browser-remembering a vault password is forbidden deployment-wide, so
+    every vault's EFFECTIVE unlock_remember_minutes is clamped to 0 (always re-ask). Default False."""
+    return bool(_global_settings_blob(db).get("force_no_remember_vault_password", False))
+
+
+def _zk_idle_lock_minutes(db: Session) -> int:
+    """Org policy: auto-lock the in-memory zero-knowledge key (re-prompt for the passphrase) after N
+    minutes of inactivity. 0 (default) = disabled. Enforced client-side; clamped to [0, 1440]."""
+    v = _global_settings_blob(db).get("zk_idle_lock_minutes", 0)
+    if isinstance(v, bool) or not isinstance(v, int):
+        return 0
+    return max(0, min(v, 1440))
+
+
 def _validate_settings_payload(payload: dict, db: Session) -> None:
     """Validate the few settings keys that drive real enforcement so the admin UI
     can't silently persist values that later fail open. The store is otherwise
@@ -1577,7 +1672,7 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Settings payload must be an object")
 
-    for bool_key in ("zero_knowledge_enabled", "force_zero_knowledge"):
+    for bool_key in ("zero_knowledge_enabled", "force_zero_knowledge", "force_no_remember_vault_password"):
         if bool_key in payload and not isinstance(payload[bool_key], bool):
             raise HTTPException(status_code=400, detail=f"{bool_key} must be true or false")
 
@@ -1626,7 +1721,27 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             raise HTTPException(status_code=400, detail=f"{bkey} must be true or false")
 
     # Auth limits (0/absent = keep the deployment env default). Enforced at login / token mint.
-    for int_key in ("max_login_attempts", "lockout_duration", "session_timeout"):
+    # zk_idle_lock_minutes (0 = disabled) is a client-enforced ZK-key idle auto-lock.
+    for int_key in ("max_login_attempts", "lockout_duration", "session_timeout", "zk_idle_lock_minutes"):
+        if int_key in payload and payload[int_key] is not None:
+            v = payload[int_key]
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise HTTPException(status_code=400, detail=f"{int_key} must be a non-negative integer")
+
+    # Temporary Vault Passcode policy. The master switch, the custom-passcode toggle + its complexity
+    # toggles, the one-time/single-vault defaults, and whether ZK vaults may sit in a temp credential's
+    # scope are all booleans; the length + max-lifetime are non-negative ints. No enforcement here —
+    # redemption reads the effective policy via the helpers above.
+    _TEMP_PASSCODE_BOOL_KEYS = (
+        "temp_passcodes_enabled", "temp_cred_allow_zk_vaults", "temp_passcode_allow_custom",
+        "temp_passcode_require_uppercase", "temp_passcode_require_lowercase",
+        "temp_passcode_require_numbers", "temp_passcode_require_special",
+        "temp_passcode_one_time_default", "temp_passcode_single_vault_only",
+    )
+    for bkey in _TEMP_PASSCODE_BOOL_KEYS:
+        if bkey in payload and not isinstance(payload[bkey], bool):
+            raise HTTPException(status_code=400, detail=f"{bkey} must be true or false")
+    for int_key in ("temp_passcode_min_length", "temp_passcode_max_lifetime_minutes"):
         if int_key in payload and payload[int_key] is not None:
             v = payload[int_key]
             if isinstance(v, bool) or not isinstance(v, int) or v < 0:
@@ -1652,6 +1767,13 @@ async def get_settings(
     # Always report the EFFECTIVE directory-search policy so the admin toggle reflects the default
     # ('deployment') even when never explicitly saved.
     data["directory_search_scope"] = _directory_search_scope(db)
+    # Overlay the EFFECTIVE Temporary Vault Passcode policy (incl. the ZK-in-scope toggle) so the
+    # Settings card renders correct defaults even when never saved (feature default OFF, allow-ZK ON).
+    data.update(_temp_passcode_policy(db))
+    # Effective org floor for browser-remembering a vault password (default OFF).
+    data["force_no_remember_vault_password"] = _force_no_remember_vault_password(db)
+    # Effective ZK-key idle auto-lock (minutes; 0 = disabled).
+    data["zk_idle_lock_minutes"] = _zk_idle_lock_minutes(db)
     return data
 
 
@@ -2307,7 +2429,31 @@ async def get_zk_enabled(
         "max_zk_vaults": settings.plan_max_zk_vaults,
         "zk_vault_count": _zk_vault_count(db),
         "allowed_vault_types": sorted(allowed),
+        # Idle auto-lock for the in-memory ZK key (minutes; 0 = disabled). Enforced client-side.
+        "zk_idle_lock_minutes": _zk_idle_lock_minutes(db),
     }
+
+
+@app.get("/temp-passcode-policy")
+async def get_temp_passcode_policy(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Effective Temporary Vault Passcode policy for the CURRENT user. Non-sensitive flags any
+    authenticated user (including a temp session) may read — like /zk-enabled — so the temp-credential
+    mint UI can shape the passcode controls without exposing the admin-only /settings store:
+      - temp_passcodes_enabled: is the feature turned on (default off / fail-closed)
+      - temp_passcode_allow_custom + the four temp_passcode_require_* toggles + temp_passcode_min_length:
+          the custom-passcode complexity policy (generated passcodes are always high-entropy)
+      - temp_passcode_one_time_default / temp_passcode_single_vault_only / temp_passcode_max_lifetime_minutes:
+          mint defaults / ceilings
+      - temp_cred_allow_zk_vaults: whether a zero-knowledge vault may be included in scope at all
+      - force_no_remember_vault_password: deployment-wide floor forbidding the browser from
+          remembering a vault password (lets the account UI show the per-user toggle as forced)
+    No enforcement here — redemption reads the policy."""
+    policy = dict(_temp_passcode_policy(db))
+    policy["force_no_remember_vault_password"] = _force_no_remember_vault_password(db)
+    return policy
 
 
 @app.get("/zk/unsealed")
@@ -2672,14 +2818,22 @@ async def create_temp_credentials(
         parent_vault_scope=parent_vault_scope,
         created_by_temp_credential_id=created_by_temp_id,
         created_by_user_id=current_user.id,
+        passcode_same_for_all=bool(payload.passcode_same_for_all) if payload else False,
     )
-    
+
     audit_logger.log_temp_credential_created(
         current_user,
         temp_creds['temp_username'],
         client_ip
     )
-    
+    # A minted passcode is a second access door to a vault — record it (vault ids + kinds + count,
+    # never the passcode plaintext) so a mint is auditable alongside its redemptions.
+    if temp_creds.get('passcodes'):
+        audit_logger.log_temp_passcode_minted(
+            current_user, client_ip, temp_creds['passcodes'],
+            same_for_all=bool(payload.passcode_same_for_all) if payload else False,
+        )
+
     return TempCredentialResponse(**temp_creds)
 
 
@@ -3446,6 +3600,9 @@ _PREF_ALLOWED = {
     "accent": {"teal", "indigo", "violet", "rose", "orange", "sky"},
     "background": {"slate", "graphite", "navy", "warm", "forest", "plum"},
     "ui": {"v1", "v2"},
+    # Per-user opt-out of browser-remembering a vault password. Stored as a string enum ('on'/'off')
+    # because _sanitize_preferences keeps only string values in the whitelist (a bare bool is dropped).
+    "never_remember_vault_password": {"on", "off"},
 }
 
 
@@ -3467,6 +3624,7 @@ class PreferencesUpdate(BaseModel):
     accent: Optional[str] = None
     background: Optional[str] = None
     ui: Optional[str] = None
+    never_remember_vault_password: Optional[str] = None
 
 
 @app.get("/users/me/preferences")
@@ -4569,6 +4727,7 @@ async def create_vault(
     )
     
     # Build response dict with has_password
+    _fnr = _force_no_remember_vault_password(db)
     vault_dict = {
         'id': vault.id,
         'name': vault.name,
@@ -4577,7 +4736,7 @@ async def create_vault(
         'has_password': vault.password_hash is not None,
         'expire_files_after_days': vault.expire_files_after_days,
         'expire_files_unit': vault.expire_files_unit or 'days',
-        'unlock_remember_minutes': vault.unlock_remember_minutes,
+        'unlock_remember_minutes': (0 if _fnr else vault.unlock_remember_minutes),
         'size_limit': vault.size_limit,
         'total_size_bytes': vault.total_size_bytes,
         'file_count': vault.file_count,
@@ -4620,6 +4779,7 @@ async def list_vaults(
     }
 
     from app.core.temp_scope import scope_ids as _scope_ids
+    _fnr = _force_no_remember_vault_password(db)
     result = []
     for vault in vaults:
         perms = permission_service.get_vault_permissions(current_user, vault.id)
@@ -4634,7 +4794,7 @@ async def list_vaults(
             'has_password': vault.password_hash is not None,
             'expire_files_after_days': vault.expire_files_after_days,
             'expire_files_unit': vault.expire_files_unit or 'days',
-            'unlock_remember_minutes': vault.unlock_remember_minutes,
+            'unlock_remember_minutes': (0 if _fnr else vault.unlock_remember_minutes),
             'size_limit': vault.size_limit,
             'total_size_bytes': None if _id_scoped else vault.total_size_bytes,
             'file_count': None if _id_scoped else vault.file_count,
@@ -4657,20 +4817,22 @@ async def list_vaults(
 @require_vault_cap("vault.see_info")
 async def get_vault(
     vault_id: uuid.UUID,
-    vault_password: Optional[str] = None,
+    x_vault_password: Optional[str] = Header(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
     Get vault details (metadata only - no password required).
-    Password is only required when accessing files.
+    An optional X-Vault-Password HEADER soft-verifies the vault password (rate-limited). The password
+    is taken from the header, never a URL query string (which would leak into access logs).
     """
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
-    
+
     try:
-        # require_password=False means we're just viewing metadata
-        vault = vault_service.get_vault(vault_id, current_user, vault_password, require_password=False)
+        # require_password=False means we're just viewing metadata; a supplied X-Vault-Password is
+        # soft-verified (and rate-limited) inside get_vault.
+        vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=False)
 
         # Get owner username
         owner = db.query(User).filter(User.id == vault.owner_id).first()
@@ -4680,6 +4842,7 @@ async def get_vault(
         # would reveal how many files exist outside its scope). Suppress the denormalized aggregates.
         from app.core.temp_scope import scope_ids as _scope_ids
         _id_scoped = _scope_ids(current_user, vault_id) is not None
+        _fnr = _force_no_remember_vault_password(db)
 
         # Build response dict with has_password and owner_username
         vault_dict = {
@@ -4691,7 +4854,7 @@ async def get_vault(
             'has_password': vault.password_hash is not None,
             'expire_files_after_days': vault.expire_files_after_days,
             'expire_files_unit': vault.expire_files_unit or 'days',
-            'unlock_remember_minutes': vault.unlock_remember_minutes,
+            'unlock_remember_minutes': (0 if _fnr else vault.unlock_remember_minutes),
             'size_limit': vault.size_limit,
             'total_size_bytes': None if _id_scoped else vault.total_size_bytes,
             'file_count': None if _id_scoped else vault.file_count,
@@ -5112,13 +5275,18 @@ async def update_vault_settings(
                 except (TypeError, ValueError):
                     raise HTTPException(status_code=400, detail="unlock_remember_minutes must be a number")
                 urm = max(0, min(urm, 1440))  # 0 = always ask, cap at 24h
+                if urm and _force_no_remember_vault_password(db):
+                    urm = 0  # org policy forbids browser-remembering the vault password
             vault.unlock_remember_minutes = urm
             updated_fields.append('unlock_remember_minutes')
 
         vault.updated_at = datetime.now(timezone.utc)
         db.commit()
-        
-        return {"message": "Vault settings updated successfully"}
+
+        # Echo the stored unlock window (already clamped to 0 when the org floor is set) so the
+        # client bases its remember cache on the authoritative value, not the submitted one.
+        return {"message": "Vault settings updated successfully",
+                "unlock_remember_minutes": vault.unlock_remember_minutes}
         
     except ResourceNotFoundError as e:
         raise HTTPException(
@@ -8897,6 +9065,13 @@ def _run_lightweight_migrations():
             # Per-vault SFTP password proof: fingerprint of the vault password hash proven
             # when this grant was minted (re-checked on SFTP access; voided by a rotation).
             "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS vault_password_fingerprint VARCHAR(64)",
+            # Temporary passcode verifier on a selected-mode standard-vault grant (a second access
+            # gate; NULL = no passcode). Content is not re-encrypted — this is authorization only.
+            "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS passcode_hash VARCHAR(255)",
+            "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS passcode_kind VARCHAR(16)",
+            "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS passcode_max_uses INTEGER",
+            "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS passcode_use_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS passcode_expires_at TIMESTAMP",
             # Per-account SFTP controls (the user_ssh_keys TABLE is created by create_all).
             # Auth/session hardening: time-boxed account auto-unlock + durable session
             # revocation (web logout/lock survives a Redis outage). Both additive + idempotent.

@@ -32,6 +32,22 @@ from app.core.config import settings
 _DUMMY_PASSWORD_HASH = hash_password("dummy-account-do-not-use-x9Q2")
 
 
+def user_reaches_active_zk_vault(db, user_id) -> bool:
+    """True when a user OWNS or is a keyed MEMBER of any active zero-knowledge vault — i.e. an
+    unrestricted / all-vaults temporary credential for them would put zero-knowledge content in
+    scope. Used to enforce the ZK-in-scope deny policy on the mint paths that don't resolve to a
+    per-vault selected list (unrestricted + all-vaults + the admin-for-user unrestricted mint)."""
+    from app.core.models import Vault, VaultMemberKey
+    if db.query(Vault.id).filter(
+            Vault.owner_id == user_id, Vault.type == "zero_knowledge", Vault.is_active == True).first():  # noqa: E712
+        return True
+    member = (db.query(VaultMemberKey.id)
+              .join(Vault, Vault.id == VaultMemberKey.vault_id)
+              .filter(VaultMemberKey.user_id == user_id, Vault.type == "zero_knowledge",
+                      Vault.is_active == True).first())  # noqa: E712
+    return member is not None
+
+
 # --- Token revocation denylist ---------------------------------------------
 # On logout we blacklist the session token in Redis until it would expire anyway, so the
 # JWT stops working IMMEDIATELY without having to validate session existence on every
@@ -399,6 +415,7 @@ class AuthService:
         parent_vault_scope: Optional[dict] = None,
         created_by_temp_credential_id: Optional[uuid.UUID] = None,
         created_by_user_id: Optional[uuid.UUID] = None,
+        passcode_same_for_all: bool = False,
     ) -> dict:
         """
         Create temporary one-time credentials for a user.
@@ -465,6 +482,25 @@ class AuthService:
             if is_delegated and parent_vault_mode == 'selected':
                 mode = 'selected'  # a child cannot broaden vault access to 'all'
 
+        # Org policy: may a zero-knowledge vault be in a temp credential's scope at all? Read once here
+        # and reused below (the selected-mode per-vault loop + the passcode block).
+        from app.core import temp_passcode_policy as _tpp
+        from app.core.models import SystemSetting as _PolSS
+        _pol_row = self.db.query(_PolSS).filter(_PolSS.key == 'global').first()
+        _tp_policy = _tpp.effective_policy((_pol_row.value or {}) if (_pol_row and _pol_row.value) else {})
+        # An UNRESTRICTED (effective_scope is None) or ALL-vaults credential does NOT pass through the
+        # per-vault selected loop below, yet it reaches every vault the account can access — including
+        # zero-knowledge. Enforce the deny here too, fail-closed, before anything is persisted, when the
+        # minting account owns or is a keyed member of any active ZK vault. (Selected-mode ZK entries
+        # are rejected per-vault in the proof loop; the admin-for-user unrestricted mint is guarded at
+        # its own endpoint.)
+        if (effective_scope is None or mode == 'all') and not _tp_policy['temp_cred_allow_zk_vaults'] \
+                and user_reaches_active_zk_vault(self.db, user_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=("Zero-knowledge vaults can't be included in a temporary credential by "
+                        "organization policy. Mint a credential scoped to specific standard vaults instead."))
+
         # A 'selected'-mode credential scoped to the vaults page but with no vaults that will
         # actually resolve to an access grant can reach nothing — reject rather than silently mint
         # a dead credential. Keyed on the 'vaults' page (the only signal that governs selected-mode
@@ -516,7 +552,18 @@ class AuthService:
                     vault = self.db.query(Vault).filter(Vault.id == uuid.UUID(str(vid))).first()
                 except (ValueError, AttributeError):
                     continue
-                if vault is None or not vault.password_hash:
+                if vault is None:
+                    continue
+                # Org policy may forbid a zero-knowledge vault in a temp credential's scope entirely (a
+                # scoped ZK cred still forces the holder to enter the account master passphrase). Fail
+                # closed HERE so self-service AND delegated-child mints both honor it, before anything is
+                # persisted. The admin-for-user path (no scope) is guarded separately at its endpoint.
+                if not _tp_policy['temp_cred_allow_zk_vaults'] and getattr(vault, 'type', 'standard') == 'zero_knowledge':
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=(f"Zero-knowledge vaults can't be included in a temporary credential by "
+                                f"organization policy (vault '{vault.name}')."))
+                if not vault.password_hash:
                     continue  # not password-protected — nothing to prove
                 supplied = sv.get('password') if isinstance(sv, dict) else None
                 if not supplied or not verify_password(supplied, vault.password_hash):
@@ -526,6 +573,110 @@ class AuthService:
                                 "password is required to grant access via a temporary credential."),
                     )
                 pw_fingerprints[str(vid)] = vault_password_fingerprint(vault.password_hash)
+
+        # --- Temporary passcodes (standard, password-protected vaults only) -----------------------
+        # A passcode is a SECOND server-side access gate that opens a vault in place of its real
+        # password for the holder of this credential — it does NOT re-encrypt content. Policy-gated
+        # and fail-closed: computed BEFORE anything is persisted, so a policy violation mints nothing.
+        # The plaintext is returned ONCE (like the credential password) and never stored.
+        passcode_plans = {}   # str(vault_id) -> {hash, kind, max_uses, expires_at}
+        passcode_reveal = []  # [{vault_id, passcode, kind}] returned once to the minter
+        # Gate on the SAME condition as the persist loop below (effective_scope is not None) so a
+        # passcode is only computed/revealed when a grant row will actually be written to carry its
+        # verifier — never reveal a passcode that isn't persisted.
+        if effective_scope is not None and mode == 'selected' and selected_vaults:
+            requested = [sv for sv in selected_vaults
+                         if isinstance(sv, dict) and sv.get('issue_passcode')]
+            if requested:
+                from app.core.password_policy import password_policy_errors
+                from app.core.security import generate_passcode
+                policy = _tp_policy  # resolved unconditionally above
+                if not policy['temp_passcodes_enabled']:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Temporary vault passcodes are disabled by the administrator.")
+                if policy['temp_passcode_single_vault_only'] and len(requested) > 1:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="A temporary passcode may only cover a single vault (organization policy).")
+                # Complexity config for CUSTOM passcodes (generated ones are always high-entropy),
+                # mapped onto the account password_policy validator so both share one implementation.
+                complexity_cfg = {
+                    "password_min_length": policy['temp_passcode_min_length'],
+                    "require_uppercase": policy['temp_passcode_require_uppercase'],
+                    "require_lowercase": policy['temp_passcode_require_lowercase'],
+                    "require_numbers": policy['temp_passcode_require_numbers'],
+                    "require_special": policy['temp_passcode_require_special'],
+                }
+                # "Same passcode for all": one secret (a supplied custom value, else generated),
+                # stored as N independent verifiers.
+                shared_plain = shared_kind = None
+                if passcode_same_for_all:
+                    _custom = next((sv.get('passcode') for sv in requested if sv.get('passcode')), None)
+                    if _custom:
+                        shared_plain, shared_kind = _custom, 'custom'
+                    else:
+                        shared_plain, shared_kind = generate_passcode(policy['temp_passcode_min_length']), 'generated'
+                parent_ids_pc = set(str(v) for v in (parent_vault_ids or []))
+                for sv in requested:
+                    try:
+                        vid = str(uuid.UUID(str(sv.get('vault_id'))))
+                    except (ValueError, AttributeError, TypeError):
+                        continue
+                    if vid in passcode_plans:
+                        continue  # already issued a passcode for this vault (dedup a repeated id)
+                    if is_delegated and parent_vault_mode == 'selected' and vid not in parent_ids_pc:
+                        continue  # a child cannot passcode a vault it cannot reach
+                    vault = self.db.query(Vault).filter(Vault.id == uuid.UUID(vid)).first()
+                    if vault is None:
+                        continue
+                    if getattr(vault, 'type', 'standard') == 'zero_knowledge':
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=(f"Vault '{vault.name}' is zero-knowledge — temporary passcodes "
+                                    "aren't available for it. Add a member or use a disposable "
+                                    "standard vault."))
+                    if not vault.password_hash:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=(f"Vault '{vault.name}' has no password, so a passcode gate does "
+                                    "not apply."))
+                    # Resolve the plaintext + kind for THIS vault.
+                    if passcode_same_for_all:
+                        plain, kind = shared_plain, shared_kind
+                    elif sv.get('passcode'):
+                        plain, kind = sv.get('passcode'), 'custom'
+                    else:
+                        plain, kind = generate_passcode(policy['temp_passcode_min_length']), 'generated'
+                    if kind == 'custom':
+                        if not policy['temp_passcode_allow_custom']:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Custom temporary passcodes are not allowed; use a generated one.")
+                        if not isinstance(plain, str):
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="A custom passcode must be a string.")
+                        errs = password_policy_errors(plain, complexity_cfg)
+                        if errs:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Passcode must " + "; ".join(errs) + ".")
+                    # One-time vs multi-use: per-vault override, else the org default.
+                    one_time = sv.get('one_time')
+                    if one_time is None:
+                        one_time = policy['temp_passcode_one_time_default']
+                    max_uses = 1 if one_time else None
+                    # Expiry = the credential's validity end, capped by the org max-lifetime if set.
+                    p_expires = deactivate_at
+                    _max_life = policy['temp_passcode_max_lifetime_minutes']
+                    if _max_life and _max_life > 0:
+                        p_expires = min(p_expires, now + timedelta(minutes=_max_life))
+                    passcode_plans[vid] = {
+                        "hash": hash_password(plain), "kind": kind,
+                        "max_uses": max_uses, "expires_at": p_expires,
+                    }
+                    passcode_reveal.append({"vault_id": vid, "passcode": plain, "kind": kind})
 
         # Create temporary credential record
         # Note: encrypted_password is NULL (security enhancement - one-way hashing only)
@@ -581,6 +732,7 @@ class AuthService:
                     scope_ids = intersect_id_scope(
                         parent_scope_ids, scope_ids,
                         lambda cid: id_ancestry(self.db, _vid, cid))
+                _pp = passcode_plans.get(str(vid)) or {}
                 try:
                     self.db.add(TempCredentialVaultAccess(
                         temp_credential_id=temp_cred.id,
@@ -590,6 +742,11 @@ class AuthService:
                         # Binds the SFTP proof to the password proven above (NULL for
                         # non-password vaults); re-checked against the live hash on access.
                         vault_password_fingerprint=pw_fingerprints.get(str(vid)),
+                        # Optional passcode verifier (NULL = no passcode). Computed + policy-checked above.
+                        passcode_hash=_pp.get('hash'),
+                        passcode_kind=_pp.get('kind'),
+                        passcode_max_uses=_pp.get('max_uses'),
+                        passcode_expires_at=_pp.get('expires_at'),
                         created_by=created_by_user_id,
                     ))
                 except (ValueError, AttributeError):
@@ -627,6 +784,9 @@ class AuthService:
             'can_create_temp_credentials': bool(can_create_temp_credentials),
             'scope': effective_scope,
             'vault_access_mode': mode,
+            # Any temporary vault passcodes minted with this credential — shown ONCE (like the
+            # credential password). Empty when no passcode was requested. [{vault_id, passcode, kind}].
+            'passcodes': passcode_reveal,
             'warning': '⚠️ COPY THIS PASSWORD NOW - It cannot be retrieved later!',
             'password_length': len(credential_string),
             'password_policy': 'One-time viewing only. Password is hashed and cannot be retrieved after creation.'

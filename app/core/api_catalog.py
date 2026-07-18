@@ -147,7 +147,7 @@ API_CATALOG = {
             APIEndpoint(
                 method="POST",
                 path="/auth/temp-credentials",
-                function_name="generate_temp_credential",
+                function_name="create_temp_credentials",
                 description="Generate new temporary credential",
                 role_requirement=RoleRequirement.USER,
                 ui_widgets=["generate-temp-creds-btn", "temp-creds-modal"]
