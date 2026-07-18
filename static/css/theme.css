@@ -178,6 +178,15 @@ p {
     max-width: 70ch; /* Optimal reading width */
 }
 
+/* The 70ch reading-width cap above leaves a paragraph as a narrow, left-anchored
+   block; inside a centered placeholder (empty state / no-preview) that reads as
+   left-aligned under the centered heading. Auto side margins re-center the block
+   while keeping the readable line length. */
+.empty-state p,
+.preview-none p {
+    margin-inline: auto;
+}
+
 a {
     color: var(--brand-secondary);
     text-decoration: none;

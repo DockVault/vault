@@ -215,6 +215,29 @@ function hideAdminNavForTempSession() {
         const el = document.querySelector(`.sidebar-item[data-section="${sec}"]`);
         if (el) el.style.display = 'none';
     });
+    reconcileNavGroupLabels();
+}
+
+// The v2 (Console) skin injects presentational rail group labels (Overview / Storage / Access /
+// System) unconditionally, assuming each group leads with an always-visible item. That holds for a
+// full admin, but a scoped temp credential (or a regular non-admin) hides whole groups of items,
+// leaving a label stranded over an empty run. Hide a label when every sidebar-item until the next
+// label is hidden. No-op on the v1 skin (no labels) and for an admin (every group keeps an item).
+function reconcileNavGroupLabels() {
+    const nav = document.querySelector('.sidebar-nav');
+    if (!nav) return;
+    nav.querySelectorAll('.nav-group-label').forEach(label => {
+        let visible = false;
+        let sib = label.nextElementSibling;
+        while (sib && !sib.classList.contains('nav-group-label')) {
+            if (sib.classList.contains('sidebar-item') && getComputedStyle(sib).display !== 'none') {
+                visible = true;
+                break;
+            }
+            sib = sib.nextElementSibling;
+        }
+        label.style.display = visible ? '' : 'none';
+    });
 }
 
 // Fetch which nav sections the CURRENT session may see. Only a SCOPED temporary
@@ -269,6 +292,7 @@ function applyScopedNavLock() {
     document.querySelectorAll('.sidebar-item[data-section]').forEach(item => {
         item.style.display = allowed.has(item.getAttribute('data-section')) ? 'flex' : 'none';
     });
+    reconcileNavGroupLabels();  // drop group headers left over an empty run of hidden items
     // If we're on a section the scope doesn't permit (default dashboard, or a
     // restored view), move to the first allowed one — or show nothing at all if
     // the scope grants no pages.
@@ -366,6 +390,7 @@ function updateNavigationPermissions() {
             rolesNav.style.display = 'none';
         }
     }
+    reconcileNavGroupLabels();  // hide any group header whose whole run of items is now hidden
 }
 
 // Update action button visibility/state based on permissions
@@ -840,6 +865,10 @@ function updateProfileUI(user) {
         if (usersTab) {
             usersTab.style.display = 'block';
         }
+        // Revealing the admin-only items may have re-populated a group that was empty when
+        // updateNavigationPermissions last reconciled, so reconcile again (a group whose whole run
+        // is admin-only would otherwise keep a wrongly-hidden header).
+        reconcileNavGroupLabels();
     }
 
     // If this is a scoped temp credential whose owner is an admin, the block above
@@ -1348,6 +1377,32 @@ function syncCreateVaultForm() {
 }
 
 // Create Vault Modal
+async function fetchAccountStorage(excludeVaultId) {
+    const qs = excludeVaultId ? `?exclude_vault_id=${encodeURIComponent(excludeVaultId)}` : '';
+    try { return await apiRequest('/account/storage' + qs, { silent: true }); }
+    catch (_) { return null; }
+}
+function _bytesToGb(bytes) { return bytes / (1024 ** 3); }
+// Fill a "how much you can allocate" note + set the size input's soft max from /account/storage.
+// Pass the vault id being edited (else null) so its own reservation is excluded from the headroom.
+async function renderVaultSizeAvailability(noteId, inputEl, excludeVaultId, baseText) {
+    const note = document.getElementById(noteId);
+    if (!note) return;
+    const base = baseText || 'The most this vault may hold.';
+    const s = await fetchAccountStorage(excludeVaultId);
+    if (!s) return;
+    if (s.available_bytes == null) {  // unlimited on both axes (or budget-exempt admin)
+        note.textContent = s.budget_exempt ? base + ' No account storage limit.' : base;
+        if (inputEl) inputEl.removeAttribute('max');
+        return;
+    }
+    const fmt = g => g.toFixed(g < 10 ? 2 : 0);
+    const availGb = _bytesToGb(s.available_bytes);
+    const usedGb = _bytesToGb(s.reserved_bytes || 0);
+    note.textContent = `${base} You can allocate up to ${fmt(availGb)} GB (${fmt(usedGb)} GB reserved on your account).`;
+    if (inputEl) inputEl.max = String(Math.max(0.1, availGb));
+}
+
 async function showCreateVault() {
     // The zero-knowledge option is only offered when the deployment enables it.
     const grp = document.getElementById('vault-type-group');
@@ -1406,6 +1461,12 @@ async function showCreateVault() {
         }
     }
 
+    // Reset the size to the 1 GB default + surface how much the account can still allocate.
+    const sizeInput = document.getElementById('vault-size-gb');
+    if (sizeInput) sizeInput.value = '1';
+    renderVaultSizeAvailability('vault-size-avail', sizeInput, null,
+        'The most this vault may hold. Default 1 GB; changeable later in policies.');
+
     // Reflect the resolved type into password + team-mode visibility, then show.
     syncCreateVaultForm();
     document.getElementById('create-vault-modal').classList.add('active');
@@ -1418,6 +1479,7 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
     const description = document.getElementById('vault-desc').value.trim();
     const password = document.getElementById('vault-password').value;
     const vaultType = effectiveVaultType();
+    const sizeGb = parseFloat(document.getElementById('vault-size-gb').value);
 
     try {
         const payload = {
@@ -1426,7 +1488,10 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
             // The top-level password only applies to standard vaults; never send a
             // stale value for a zero-knowledge vault (its field is hidden).
             password: (vaultType === 'standard' ? (password || null) : null),
-            expire_files_after_days: null
+            expire_files_after_days: null,
+            // Per-vault maximum size; default 1 GB. The server bounds it by the account budget
+            // and the per-vault ceiling and 400s if over.
+            size_limit_gb: (sizeGb && sizeGb > 0) ? sizeGb : 1
         };
 
         // Zero-knowledge: generate the vault DEK IN THE BROWSER and wrap it to our
@@ -1527,10 +1592,17 @@ function initTempScopeBuilder() {
     const enable = document.getElementById('tc-scope-enable');
     const builder = document.getElementById('tc-scope-builder');
     const legacy = document.getElementById('tc-legacy-cancreate-group');
+    const movedHint = document.getElementById('tc-cancreate-moved-hint');
     if (enable && builder) {
         enable.addEventListener('change', () => {
             builder.hidden = !enable.checked;
+            // The coarse "can create" checkbox only applies to an unscoped credential; under
+            // scoping it is replaced by the nested Temp-credentials "Create temp credentials"
+            // control, so hide it and point the user at where the ability moved.
             if (legacy) legacy.style.display = enable.checked ? 'none' : '';
+            // toggle via style.display, not the hidden attr: .form-help is display:block, which
+            // would override [hidden] and leave the hint always showing.
+            if (movedHint) movedHint.style.display = enable.checked ? '' : 'none';
         });
     }
     const tcPage = document.getElementById('tc-page-tempcreds');
@@ -1587,6 +1659,9 @@ function resetTempScopeBuilder() {
     if (enable) enable.checked = false;
     if (builder) builder.hidden = true;
     if (legacy) legacy.style.display = '';
+    const movedHint = document.getElementById('tc-cancreate-moved-hint');
+    if (movedHint) movedHint.style.display = 'none';
+    _tcHideError();
     document.querySelectorAll('.tc-page').forEach(c => { c.checked = (c.value === 'dashboard' || c.value === 'vaults'); });
     const tempPerms = document.getElementById('tc-temp-perms'); if (tempPerms) tempPerms.hidden = true;
     const delRow = document.getElementById('tc-temp-delegate-row'); if (delRow) delRow.hidden = true;
@@ -1620,7 +1695,7 @@ async function populateTempScopeVaults() {
                 <input type="checkbox" class="tc-vault-pick" value="${escapeHtml(v.id)}" data-haspw="${v.has_password ? '1' : '0'}">
                 <span class="member-pick-name">${escapeHtml(v.name || 'Untitled vault')}${v.has_password ? ' <span class="text-tertiary text-sm">· password-protected</span>' : ''}</span>
             </label>${v.has_password ? `
-            <input type="password" class="tc-vault-pw form-control" data-vault="${escapeHtml(v.id)}" placeholder="Vault password — required to grant SFTP access" autocomplete="new-password" style="margin:2px 0 10px 26px;max-width:340px;">` : ''}`).join('');
+            <input type="password" class="tc-vault-pw form-control" data-vault="${escapeHtml(v.id)}" placeholder="Vault password — required to grant access to this password-protected vault" autocomplete="new-password" style="margin:2px 0 10px 26px;max-width:340px;">` : ''}`).join('');
     } catch (_) {
         list.innerHTML = '<div class="text-tertiary text-sm p-sm">Could not load vaults.</div>';
     }
@@ -1810,7 +1885,35 @@ function collectTempScope() {
 // Generate Temporary Credentials
 // options.validity_minutes / options.total_lifetime_minutes override the
 // server-configured default lifetime when provided.
+// Surface a temp-credential error INSIDE the open generate modal (via textContent, so a
+// server-supplied vault name can't inject markup) instead of a transient toast, so a recoverable
+// failure — e.g. a missing/incorrect vault password — doesn't discard the operator's form state.
+// Falls back to a toast when the modal isn't the active surface (e.g. the markup-missing path).
+function _tcShowError(msg) {
+    const modal = document.getElementById('generate-temp-creds-modal');
+    const box = document.getElementById('temp-cred-error');
+    if (box && modal && modal.classList.contains('active')) {
+        box.textContent = msg;
+        box.style.display = '';  // .alert is display:flex; inline style toggles it (the [hidden] attr can't, .alert wins)
+        box.scrollIntoView({ block: 'nearest' });
+    } else {
+        showError(msg);
+    }
+}
+function _tcHideError() {
+    const box = document.getElementById('temp-cred-error');
+    if (box) { box.style.display = 'none'; box.textContent = ''; }
+}
+
+let _tcGenerating = false;
 async function generateTempCreds(options = {}) {
+    // Re-entrancy guard: the modal now stays open across the await (so a recoverable error can be
+    // shown inline), so nothing else stops a double-click from minting two credentials — block it
+    // and disable the submit button for the duration of the request.
+    if (_tcGenerating) return;
+    _tcGenerating = true;
+    const submitBtn = document.querySelector('#generate-temp-creds-form button[type="submit"]');
+    if (submitBtn) submitBtn.disabled = true;
     try {
         const body = {};
         if (options.validity_minutes != null) {
@@ -1832,15 +1935,19 @@ async function generateTempCreds(options = {}) {
             body: JSON.stringify(body)
         });
 
-        console.log('Temp credentials response:', creds); // Debug log
-
-        // Show credentials in modal
+        // Success only: close the generate modal now, then show the result modal. On failure the
+        // catch below keeps the generate modal open so the operator's entered scope/note/passwords
+        // survive a recoverable error.
+        closeModal();
         showTempCredsModal(creds);
 
         // Reload active credentials after a short delay
         setTimeout(() => loadTempCreds(), 1000);
     } catch (error) {
-        showError('Failed to generate credentials: ' + error.message);
+        _tcShowError('Failed to generate credentials: ' + error.message);
+    } finally {
+        _tcGenerating = false;
+        if (submitBtn) submitBtn.disabled = false;
     }
 }
 
@@ -2528,12 +2635,15 @@ async function updateUserSftp(userId, field, value, cb) {
 }
 
 // Lazily fetch + render a user's SSH keys when their row is expanded.
-async function loadUserSshKeys(userId) {
-    const host = document.querySelector(`.ssh-keys-list[data-user-id="${userId}"]`);
+// `root` scopes the DOM lookups so the same widget can appear in more than one place
+// (the admin Users panel AND the self-service account modal) without colliding on
+// `[data-user-id]` — the modal passes its own element so it never grabs the panel's inputs.
+async function loadUserSshKeys(userId, root = document) {
+    const host = root.querySelector(`.ssh-keys-list[data-user-id="${userId}"]`);
     if (!host) return;
     try {
         const keys = await apiRequest(`/users/${userId}/ssh-keys`, { silent: true });
-        renderUserSshKeys(userId, Array.isArray(keys) ? keys : []);
+        renderUserSshKeys(userId, Array.isArray(keys) ? keys : [], root);
     } catch (e) {
         host.replaceChildren();
         const msg = document.createElement('span');
@@ -2543,8 +2653,8 @@ async function loadUserSshKeys(userId) {
     }
 }
 
-function renderUserSshKeys(userId, keys) {
-    const host = document.querySelector(`.ssh-keys-list[data-user-id="${userId}"]`);
+function renderUserSshKeys(userId, keys, root = document) {
+    const host = root.querySelector(`.ssh-keys-list[data-user-id="${userId}"]`);
     if (!host) return;
     host.replaceChildren();
     if (!keys.length) {
@@ -2576,15 +2686,15 @@ function renderUserSshKeys(userId, keys) {
         del.dataset.keyId = String(k.id);
         del.setAttribute('aria-label', `Remove SSH key ${k.name}`);
         del.appendChild(svgUseIcon('trash', 'icon-sm'));
-        del.addEventListener('click', () => deleteSshKey(userId, k.id, k.name));
+        del.addEventListener('click', () => deleteSshKey(userId, k.id, k.name, root));
         item.appendChild(del);
         host.appendChild(item);
     });
 }
 
-async function addSshKey(userId) {
-    const nameEl = document.querySelector(`.ssh-key-name[data-user-id="${userId}"]`);
-    const pubEl = document.querySelector(`.ssh-key-public[data-user-id="${userId}"]`);
+async function addSshKey(userId, root = document) {
+    const nameEl = root.querySelector(`.ssh-key-name[data-user-id="${userId}"]`);
+    const pubEl = root.querySelector(`.ssh-key-public[data-user-id="${userId}"]`);
     const name = (nameEl?.value || '').trim();
     const publicKey = (pubEl?.value || '').trim();
     if (!name || !publicKey) {
@@ -2596,13 +2706,13 @@ async function addSshKey(userId) {
         if (nameEl) nameEl.value = '';
         if (pubEl) pubEl.value = '';
         showSuccess('SSH key added');
-        await loadUserSshKeys(userId);
+        await loadUserSshKeys(userId, root);
     } catch (e) {
         showError('Failed to add SSH key: ' + e.message);
     }
 }
 
-async function deleteSshKey(userId, keyId, keyName) {
+async function deleteSshKey(userId, keyId, keyName, root = document) {
     const confirmed = await showConfirm(
         `Remove SSH key “${keyName}”? Any SFTP session using it will lose access.`,
         'Remove SSH key?'
@@ -2611,10 +2721,117 @@ async function deleteSshKey(userId, keyId, keyName) {
     try {
         await apiRequest(`/users/${userId}/ssh-keys/${keyId}`, { method: 'DELETE' });
         showSuccess('SSH key removed');
-        await loadUserSshKeys(userId);
+        await loadUserSshKeys(userId, root);
     } catch (e) {
         showError('Failed to remove SSH key: ' + e.message);
     }
+}
+
+// ---- Self-service "Your account" modal --------------------------------------------------------
+function _usShowError(msg) {
+    const box = document.getElementById('us-error');
+    if (box) { box.textContent = msg; box.style.display = ''; box.scrollIntoView({ block: 'nearest' }); }
+}
+function _usHideError() {
+    const box = document.getElementById('us-error');
+    if (box) { box.style.display = 'none'; box.textContent = ''; }
+}
+
+// Open the account modal for the CURRENT user. Credential-write sections are hidden for a temporary
+// credential (the server rejects those writes too — this is UX, not the security boundary).
+function openUserSettingsModal() {
+    const modal = document.getElementById('user-settings-modal');
+    if (!modal || !currentUser) return;
+    _usHideError();
+    const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+    set('us-username', currentUser.username || '');
+    set('us-email-display', currentUser.email || '');
+    set('us-role', currentUser.role === 'admin' ? 'Administrator' : (currentUser.role || 'User'));
+    set('us-last-login', currentUser.last_login ? new Date(currentUser.last_login).toLocaleString() : '—');
+
+    const isTemp = isScopedTemp || !!(sessionAccess && sessionAccess.is_scoped_temp);
+    document.querySelectorAll('#user-settings-modal .us-credential').forEach(s => { s.style.display = isTemp ? 'none' : ''; });
+    const note = document.getElementById('us-temp-note'); if (note) note.style.display = isTemp ? '' : 'none';
+
+    if (!isTemp) {
+        ['us-cur-pw', 'us-new-pw', 'us-new-pw2', 'us-new-email', 'us-email-cur-pw'].forEach(id => {
+            const e = document.getElementById(id); if (e) e.value = '';
+        });
+        const se = document.getElementById('us-sftp-enabled'); if (se) se.checked = currentUser.sftp_enabled !== false;
+        const sp = document.getElementById('us-sftp-pw-auth'); if (sp) sp.checked = currentUser.sftp_password_auth !== false;
+        // Point the reusable SSH-key list/inputs at the current user, then load their keys —
+        // scoped to the modal so they never collide with the admin Users panel's rows.
+        modal.querySelectorAll('.ssh-keys-list, .ssh-key-name, .ssh-key-public')
+            .forEach(el => el.setAttribute('data-user-id', String(currentUser.id)));
+        loadUserSshKeys(currentUser.id, modal);
+    }
+    const tm = window.themeManager;
+    const themeSel = document.getElementById('us-theme'); if (themeSel && tm) themeSel.value = (tm.currentTheme === 'dark') ? 'dark' : 'light';
+    const skinSel = document.getElementById('us-skin'); if (skinSel && tm) skinSel.value = (tm.currentUi === 'v1') ? 'v1' : 'v2';
+
+    document.querySelector('.profile-menu')?.classList.remove('active');  // close the dropdown
+    openModal('user-settings-modal');
+}
+
+// Wire the account-modal form handlers once (idempotent via a flag).
+let _usWired = false;
+function wireUserSettingsModal() {
+    if (_usWired) return;
+    _usWired = true;
+    document.getElementById('us-password-form')?.addEventListener('submit', async (e) => {
+        e.preventDefault(); _usHideError();
+        const cur = document.getElementById('us-cur-pw').value;
+        const np = document.getElementById('us-new-pw').value;
+        const np2 = document.getElementById('us-new-pw2').value;
+        if (!cur) { _usShowError('Enter your current password.'); return; }
+        if (!np) { _usShowError('Enter a new password.'); return; }
+        if (np !== np2) { _usShowError('The new passwords do not match.'); return; }
+        try {
+            await apiRequest('/users/me', { method: 'PATCH', body: JSON.stringify({ current_password: cur, new_password: np }) });
+            showSuccess('Password updated');
+            ['us-cur-pw', 'us-new-pw', 'us-new-pw2'].forEach(id => { document.getElementById(id).value = ''; });
+        } catch (err) { _usShowError(err.message || 'Could not update password.'); }
+    });
+    document.getElementById('us-email-form')?.addEventListener('submit', async (e) => {
+        e.preventDefault(); _usHideError();
+        const email = document.getElementById('us-new-email').value.trim();
+        const cur = document.getElementById('us-email-cur-pw').value;
+        if (!email) { _usShowError('Enter a new email address.'); return; }
+        if (!cur) { _usShowError('Enter your current password.'); return; }
+        try {
+            const updated = await apiRequest('/users/me', { method: 'PATCH', body: JSON.stringify({ current_password: cur, email }) });
+            if (updated && updated.email) { currentUser.email = updated.email; document.getElementById('us-email-display').textContent = updated.email; }
+            showSuccess('Email updated');
+            document.getElementById('us-email-cur-pw').value = '';
+        } catch (err) { _usShowError(err.message || 'Could not update email.'); }
+    });
+    document.getElementById('us-sftp-save')?.addEventListener('click', async () => {
+        _usHideError();
+        const en = document.getElementById('us-sftp-enabled').checked;
+        const pa = document.getElementById('us-sftp-pw-auth').checked;
+        if (en === (currentUser.sftp_enabled !== false) && pa === (currentUser.sftp_password_auth !== false)) {
+            showSuccess('No changes'); return;  // the endpoint 400s on a no-op change
+        }
+        try {
+            const updated = await apiRequest('/users/me', { method: 'PATCH', body: JSON.stringify({ sftp_enabled: en, sftp_password_auth: pa }) });
+            if (updated) { currentUser.sftp_enabled = updated.sftp_enabled; currentUser.sftp_password_auth = updated.sftp_password_auth; }
+            showSuccess('SFTP options saved');
+        } catch (err) { _usShowError(err.message || 'Could not save SFTP options.'); }
+    });
+    document.getElementById('us-ssh-add')?.addEventListener('click', () => {
+        const modal = document.getElementById('user-settings-modal');
+        if (currentUser && modal) addSshKey(currentUser.id, modal);
+    });
+    document.getElementById('us-theme')?.addEventListener('change', (e) => {
+        if (window.themeManager) window.themeManager.applyTheme(e.target.value);
+        if (window.saveUserPreference) window.saveUserPreference({ theme: e.target.value });
+    });
+    document.getElementById('us-skin')?.addEventListener('change', (e) => {
+        // Delegate to themeManager.setUi — it persists to the server, then reloads (ui-boot.js
+        // re-applies the skin pre-paint), handling the save/reload race for us.
+        const v = e.target.value === 'v1' ? 'v1' : 'v2';
+        if (window.themeManager && typeof window.themeManager.setUi === 'function') window.themeManager.setUi(v);
+    });
 }
 
 // Attach event listeners for user actions
@@ -4017,7 +4234,43 @@ function revealLogToken(res) {
         navigator.clipboard.writeText(res.token).then(() => showSuccess('Copied')).catch(() => {});
     });
     box.append(code, copy);
-    host.append(warn, box);
+
+    // Usage docs: a ready-to-copy curl per granted component, so the token is actually usable. The
+    // `service` query param is REQUIRED (a missing/unknown one 404s by design), the endpoint is on
+    // this same host, and it stays a header-only Bearer token (never a ?token= query param).
+    // Only the serveable components (web/sftp) return logs; others 404, so don't advertise a curl
+    // for them even if the token happens to carry one. Default to web when none are serveable.
+    const serveable = new Set((window._logSettings && window._logSettings.serveable) || ['web', 'sftp']);
+    const granted = (Array.isArray(res.scope) ? res.scope : []).filter(s => serveable.has(s));
+    const scopes = granted.length ? granted : ['web'];
+    const origin = window.location.origin;
+    const usage = document.createElement('div');
+    usage.className = 'mt-md';
+    const uhead = document.createElement('p');
+    uhead.className = 'text-secondary text-sm mb-sm';
+    uhead.textContent = 'Pull logs with it — the service query param is REQUIRED and must be one of the token’s components:';
+    usage.appendChild(uhead);
+    scopes.forEach(svc => {
+        const cmd = `curl -H "Authorization: Bearer ${res.token}" "${origin}/logs?service=${svc}"`;
+        const row = document.createElement('div');
+        row.className = 'flex items-center gap-sm mb-sm';
+        const c = document.createElement('code');
+        c.textContent = cmd;
+        c.style.wordBreak = 'break-all';
+        const b = document.createElement('button');
+        b.className = 'btn btn-outline btn-sm';
+        b.type = 'button';
+        b.textContent = 'Copy';
+        b.addEventListener('click', () => { navigator.clipboard.writeText(cmd).then(() => showSuccess('Copied')).catch(() => {}); });
+        row.append(c, b);
+        usage.appendChild(row);
+    });
+    const note = document.createElement('small');
+    note.className = 'form-help';
+    note.textContent = 'Same host/port as this page. Append &tail=N (max 5000) inside the quotes for more lines. A missing/unknown service, a component switched off above, or the log endpoint being disabled for this deployment all return 404.';
+    usage.appendChild(note);
+
+    host.append(warn, box, usage);
 }
 
 // Load settings from API
@@ -4034,7 +4287,7 @@ async function loadSettings() {
         document.getElementById('setting-allowed-types').value = (settings.allowed_file_types || []).join(', ');
         
         // Security
-        document.getElementById('setting-password-min-length').value = settings.password_min_length || 12;
+        document.getElementById('setting-password-min-length').value = settings.password_min_length || 8;  // 8 = the enforced floor
         document.getElementById('setting-require-uppercase').checked = settings.require_uppercase !== false;
         document.getElementById('setting-require-lowercase').checked = settings.require_lowercase !== false;
         document.getElementById('setting-require-numbers').checked = settings.require_numbers !== false;
@@ -4044,8 +4297,10 @@ async function loadSettings() {
         document.getElementById('setting-lockout-duration').value = settings.lockout_duration || 30;
         
         // Storage
-        document.getElementById('setting-default-quota').value = settings.default_user_quota || 10;
-        document.getElementById('setting-max-vault-size').value = settings.max_vault_size || 100;
+        // Show the actual stored quota, or BLANK when unset/0 (which the backend treats as
+        // unlimited) — don't render 10/100 as if a limit were enforced.
+        document.getElementById('setting-default-quota').value = (settings.default_user_quota > 0) ? settings.default_user_quota : '';
+        document.getElementById('setting-max-vault-size').value = (settings.max_vault_size > 0) ? settings.max_vault_size : '';
         document.getElementById('setting-storage-path').value = settings.storage_path || '';
         
         // Email
@@ -4111,7 +4366,7 @@ async function saveAllSettings() {
                 .filter(t => t),
             
             // Security
-            password_min_length: parseInt(document.getElementById('setting-password-min-length').value) || 12,
+            password_min_length: parseInt(document.getElementById('setting-password-min-length').value) || 8,
             require_uppercase: document.getElementById('setting-require-uppercase').checked,
             require_lowercase: document.getElementById('setting-require-lowercase').checked,
             require_numbers: document.getElementById('setting-require-numbers').checked,
@@ -4121,8 +4376,9 @@ async function saveAllSettings() {
             lockout_duration: parseInt(document.getElementById('setting-lockout-duration').value) || 30,
             
             // Storage
-            default_user_quota: parseInt(document.getElementById('setting-default-quota').value) || 10,
-            max_vault_size: parseInt(document.getElementById('setting-max-vault-size').value) || 100,
+            // Blank -> 0 (unlimited); the backend enforces a positive value and ignores 0.
+            default_user_quota: parseInt(document.getElementById('setting-default-quota').value) || 0,
+            max_vault_size: parseInt(document.getElementById('setting-max-vault-size').value) || 0,
             
             // Email
             smtp_server: document.getElementById('setting-smtp-server').value,
@@ -4872,27 +5128,41 @@ function filesEmptyStateHtml(grid) {
 
 // Build the inline action buttons for a file/folder row or tile. Keeps the
 // .action-btn + data-action hooks the e2e tests rely on; only the look changes.
+// opts.slot splits the grid tile's controls into two positioned clusters:
+//   'primary'   -> the left cluster (Download for files; nothing for folders),
+//   'secondary' -> the right cluster (Rename + Delete for both),
+// so a file gets an Edit affordance in grid too. Undefined slot (the table view)
+// returns every button in one cluster, as before.
 function fileActionButtons(item, canWrite, opts) {
     const isFolder = item.type === 'folder';
     const id = item.id;
     const nm = escapeHtml(item.name);
+    const slot = opts && opts.slot;
     const btn = (action, icon, label, danger) =>
         `<button class="action-btn${danger ? ' action-btn-danger' : ''}" data-action="${action}" data-id="${id}" data-name="${nm}" title="${label}" aria-label="${label}">${iconSvg(icon, 'icon-sm')}</button>`;
     // vaultCapAllowed() is a no-op (true) for non-scoped sessions; for a scoped temp
     // credential it gates each action by the cap its scope grants on this vault,
     // matching require_vault_cap server-side (rename=file.rename, delete=file.delete,
-    // folder delete=folder.delete, download=file.download).
+    // folder delete=folder.delete, download=file.download). The same gate applies in
+    // every slot, so splitting the cluster never grants an affordance the scope lacks.
     const out = [];
     if (isFolder) {
         const canRename = canWrite && vaultCapAllowed('file.rename');
         const canDelete = canWrite && vaultCapAllowed('folder.delete');
-        if (canRename) out.push(btn('rename-folder', 'edit', 'Rename'));
-        if (canDelete) out.push(btn('delete-folder', 'trash', 'Delete', true));
-        if (!canRename && !canDelete && (!opts || !opts.grid)) out.push('<span class="text-tertiary text-sm">—</span>');
+        if (slot !== 'primary') {  // folders have no download -> primary (left) is empty
+            if (canRename) out.push(btn('rename-folder', 'edit', 'Rename'));
+            if (canDelete) out.push(btn('delete-folder', 'trash', 'Delete', true));
+        }
+        if (!canRename && !canDelete && !slot && (!opts || !opts.grid)) out.push('<span class="text-tertiary text-sm">—</span>');
     } else {
-        if (vaultCapAllowed('file.download')) out.push(btn('download', 'download', 'Download'));
-        if (canWrite && vaultCapAllowed('file.rename') && (!opts || !opts.grid)) out.push(btn('rename-file', 'edit', 'Rename'));
-        if (canWrite && vaultCapAllowed('file.delete')) out.push(btn('delete-file', 'trash', 'Delete', true));
+        const canDownload = vaultCapAllowed('file.download');
+        const canRename = canWrite && vaultCapAllowed('file.rename');
+        const canDelete = canWrite && vaultCapAllowed('file.delete');
+        if (slot !== 'secondary' && canDownload) out.push(btn('download', 'download', 'Download'));
+        if (slot !== 'primary') {
+            if (canRename) out.push(btn('rename-file', 'edit', 'Rename'));
+            if (canDelete) out.push(btn('delete-file', 'trash', 'Delete', true));
+        }
     }
     return out.join('');
 }
@@ -4942,13 +5212,19 @@ function renderFilesGrid(items, canWrite, grid) {
             : `data-file-id="${item.id}" data-file-name="${escapeHtml(item.name)}" data-mime="${escapeHtml(item.mime_type || '')}" title="Click to preview"`;
         const check = (isFolder || !allowBulkSelect()) ? ''
             : `<input type="checkbox" class="files-check file-check" data-id="${item.id}" ${selected ? 'checked' : ''} aria-label="Select ${escapeHtml(item.name)}">`;
+        const primary = fileActionButtons(item, canWrite, { grid: true, slot: 'primary' });
+        const secondary = fileActionButtons(item, canWrite, { grid: true, slot: 'secondary' });
+        const openLabel = escapeHtml(isFolder ? `Open folder ${item.name}` : `Preview file ${item.name}`);
+        // The name (the primary open action) comes first in DOM so it is the first tab stop and
+        // the destructive Delete is last; the two control clusters are position:absolute, so their
+        // top-left / top-right placement is unchanged by trailing them in source order.
         return `
             <div class="file-tile ${isFolder ? 'is-folder' : ''} ${selected ? 'is-selected' : ''}">
-                ${check}
-                <div class="file-actions">${fileActionButtons(item, canWrite, { grid: true })}</div>
                 <div class="tile-icon">${icon}</div>
-                <div class="file-name tile-name" ${nameAttrs}>${escapeHtml(item.name)}${lockIcon}</div>
+                <div class="file-name tile-name" ${nameAttrs} role="button" tabindex="0" aria-label="${openLabel}">${escapeHtml(item.name)}${lockIcon}</div>
                 <div class="tile-meta">${meta}</div>
+                <div class="tile-tl">${check}${primary}</div>
+                <div class="tile-tr file-actions">${secondary}</div>
             </div>`;
     }).join('');
 }
@@ -4957,11 +5233,31 @@ function renderFilesGrid(items, canWrite, grid) {
 // (called fresh after each render of either view).
 function wireFileItemHandlers(container) {
     if (!container) return;
-    container.querySelectorAll('.file-name[data-folder-id]').forEach(elem => {
-        elem.addEventListener('click', () => openFolder(elem.getAttribute('data-folder-id'), elem.getAttribute('data-folder-name')));
+    // Open the file/folder a name element points at (folder -> navigate, file -> preview).
+    const openFromName = (elem) => {
+        if (elem.hasAttribute('data-folder-id')) openFolder(elem.getAttribute('data-folder-id'), elem.getAttribute('data-folder-name'));
+        else if (elem.hasAttribute('data-file-id')) openFilePreview(elem.getAttribute('data-file-id'), elem.getAttribute('data-file-name'), elem.getAttribute('data-mime'));
+    };
+    container.querySelectorAll('.file-name[data-folder-id], .file-name[data-file-id]').forEach(elem => {
+        elem.addEventListener('click', () => openFromName(elem));
+        // Keyboard: the grid tile name is role=button tabindex=0, so make Enter/Space
+        // activate it too (a plain div was mouse-only). preventDefault on Space stops
+        // the page from scrolling.
+        elem.addEventListener('keydown', (e) => {
+            if (e.repeat) return;  // holding the key must not re-open repeatedly
+            if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); openFromName(elem); }
+        });
     });
-    container.querySelectorAll('.file-name[data-file-id]').forEach(elem => {
-        elem.addEventListener('click', () => openFilePreview(elem.getAttribute('data-file-id'), elem.getAttribute('data-file-name'), elem.getAttribute('data-mime')));
+    // Whole-card click in grid view: clicking anywhere on a tile that is NOT an action
+    // control opens the item. .file-tile exists only in the grid render, so this is a
+    // no-op in the table view. The guard (incl. .file-name) keeps a name/button/checkbox
+    // click from firing this a second time.
+    container.querySelectorAll('.file-tile').forEach(tile => {
+        tile.addEventListener('click', (e) => {
+            if (e.target.closest('button, input, a, .file-actions, .tile-tl, .tile-tr, .file-check, .file-name')) return;
+            const nameEl = tile.querySelector('.file-name');
+            if (nameEl) openFromName(nameEl);
+        });
     });
     container.querySelectorAll('button[data-action]').forEach(btn => {
         btn.addEventListener('click', (e) => {
@@ -7861,6 +8157,11 @@ function setupVaultSettingsButtons() {
                 document.getElementById('expire-files-unit').value = currentUnit;
                 const urmEl = document.getElementById('unlock-remember-minutes');
                 if (urmEl) urmEl.value = (state.currentVault.unlock_remember_minutes ?? '');
+                // Current max size (bytes -> GB) + remaining account headroom (excluding this vault).
+                const sizeEl = document.getElementById('vault-size-limit-gb');
+                if (sizeEl) sizeEl.value = state.currentVault.size_limit ? _bytesToGb(state.currentVault.size_limit) : '';
+                renderVaultSizeAvailability('vault-size-limit-avail', sizeEl, state.currentVault.id,
+                    "The most this vault may hold. Can't go below what's already stored.");
                 openModal('set-expiry-modal');
             };
         }
@@ -8032,21 +8333,37 @@ async function handleSetExpiry(e) {
     const expireUnit = document.getElementById('expire-files-unit').value;
     const urmRaw = document.getElementById('unlock-remember-minutes');
     const urm = (urmRaw && urmRaw.value !== '') ? Math.max(0, parseInt(urmRaw.value) || 0) : null;
+    const sizeEl = document.getElementById('vault-size-limit-gb');
+    const sizeGb = (sizeEl && sizeEl.value !== '') ? parseFloat(sizeEl.value) : null;
 
     try {
+        const body = {
+            expire_files_after_days: expireValue > 0 ? expireValue : null,
+            expire_files_unit: expireValue > 0 ? expireUnit : 'days',
+            unlock_remember_minutes: urm
+        };
+        // Only send size_limit when a positive value is entered AND it actually changed. Sent in
+        // BYTES. Skipping an unchanged value means editing OTHER policies never re-validates the
+        // size — so a vault grandfathered above a since-lowered ceiling can still have its expiry
+        // edited (the server rejects a null/0; the field isn't clearable to unlimited).
+        let newSizeBytes = null;
+        if (sizeGb != null && sizeGb > 0) {
+            const candidate = Math.round(sizeGb * (1024 ** 3));
+            if (candidate !== (state.currentVault.size_limit || 0)) {
+                newSizeBytes = candidate;
+                body.size_limit = newSizeBytes;
+            }
+        }
         await apiRequest(`/vaults/${state.currentVault.id}/settings`, {
             method: 'PATCH',
-            body: JSON.stringify({
-                expire_files_after_days: expireValue > 0 ? expireValue : null,
-                expire_files_unit: expireValue > 0 ? expireUnit : 'days',
-                unlock_remember_minutes: urm
-            })
+            body: JSON.stringify(body)
         });
 
         // Update local state + drop any remembered password so the new window applies.
         state.currentVault.expire_files_after_days = expireValue > 0 ? expireValue : null;
         state.currentVault.expire_files_unit = expireValue > 0 ? expireUnit : 'days';
         state.currentVault.unlock_remember_minutes = urm;
+        if (newSizeBytes != null) state.currentVault.size_limit = newSizeBytes;
         // Re-base the remember window on the new policy (applies to the next
         // re-entry; the currently-open vault stays open either way).
         state.forgetVaultPassword(state.currentVault.id);
@@ -8394,12 +8711,11 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Settings button
+    // Settings button — open the self-service "Your account" modal.
     const settingsBtn = document.getElementById('settings-btn');
     if (settingsBtn) {
-        settingsBtn.addEventListener('click', () => {
-            alert('Settings feature coming soon!');
-        });
+        wireUserSettingsModal();
+        settingsBtn.addEventListener('click', openUserSettingsModal);
     }
     
     // Sidebar navigation
@@ -8548,6 +8864,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (generateTempCredsForm) {
         generateTempCredsForm.addEventListener('submit', (e) => {
             e.preventDefault();
+            _tcHideError();  // clear any prior inline error at the start of each attempt
 
             const minutesInput = document.getElementById('temp-cred-validity-minutes');
             const endInput = document.getElementById('temp-cred-end-datetime');
@@ -8560,24 +8877,24 @@ document.addEventListener('DOMContentLoaded', () => {
                 // End date/time takes precedence — derive minutes from now.
                 const endTime = new Date(endValue).getTime();
                 if (isNaN(endTime)) {
-                    showError('Please enter a valid end date and time.');
+                    _tcShowError('Please enter a valid end date and time.');
                     return;
                 }
                 validityMinutes = Math.ceil((endTime - Date.now()) / 60000);
                 if (validityMinutes <= 0) {
-                    showError('End date/time must be in the future.');
+                    _tcShowError('End date/time must be in the future.');
                     return;
                 }
             } else if (minutesInput && minutesInput.value) {
                 validityMinutes = parseInt(minutesInput.value, 10);
                 if (isNaN(validityMinutes) || validityMinutes <= 0) {
-                    showError('Validity must be a positive number of minutes.');
+                    _tcShowError('Validity must be a positive number of minutes.');
                     return;
                 }
             }
 
             if (validityMinutes != null && validityMinutes > MAX_MINUTES) {
-                showError('Maximum validity is 30 days (43200 minutes).');
+                _tcShowError('Maximum validity is 30 days (43200 minutes).');
                 return;
             }
 
@@ -8590,10 +8907,11 @@ document.addEventListener('DOMContentLoaded', () => {
             if (scopeData && scopeData.vault_access_mode === 'selected'
                 && scopeData.selected_vaults.length === 0
                 && (scopeData.scope.pages || []).includes('vaults')) {
-                showError("Select at least one vault, or switch to 'All vaults' — a credential scoped to vaults with none selected can't access anything.");
+                _tcShowError("Select at least one vault, or switch to 'All vaults' — a credential scoped to vaults with none selected can't access anything.");
                 return;
             }
-            closeModal();
+            // Do NOT close here — generateTempCreds closes the modal only on success, and keeps it
+            // open (with an inline error) on a recoverable failure so entered state isn't lost.
             generateTempCreds({
                 validity_minutes: validityMinutes, note, can_create_temp_credentials: canCreate,
                 scope: scopeData ? scopeData.scope : null,

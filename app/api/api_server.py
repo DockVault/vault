@@ -485,6 +485,17 @@ class UserUpdate(BaseModel):
     sftp_password_auth: Optional[bool] = None
 
 
+class SelfUpdate(BaseModel):
+    """Self-service account update (PATCH /users/me). A credential-sensitive change (password or
+    email) also requires the current password. Role / active / lock are deliberately absent — a user
+    can never grant themselves privileges via this endpoint."""
+    current_password: Optional[str] = None
+    new_password: Optional[str] = Field(None, min_length=8)
+    email: Optional[EmailStr] = None
+    sftp_enabled: Optional[bool] = None
+    sftp_password_auth: Optional[bool] = None
+
+
 class GroupBrief(BaseModel):
     """Compact group reference embedded in user payloads."""
     id: uuid.UUID
@@ -643,6 +654,10 @@ class VaultCreate(BaseModel):
     description: Optional[str] = None
     password: Optional[str] = None
     expire_files_after_days: Optional[int] = Field(None, gt=0)
+    # Per-vault maximum size in GB (absent => 1 GB, the model column default). Bounded at create
+    # time by the admin per-vault ceiling and the owner's remaining account budget (see
+    # _enforce_vault_size); a scoped temp cred / non-admin can never exceed its account quota.
+    size_limit_gb: Optional[float] = Field(None, gt=0)
     # Confidentiality tier; the creation-policy hook resolves/validates it.
     # Defaults to 'standard' (today's only functional tier).
     type: Optional[str] = None
@@ -1425,6 +1440,126 @@ def _directory_search_scope(db: Session) -> str:
     return val if val in _DIRECTORY_SEARCH_SCOPES else "deployment"
 
 
+_GIB = 1024 ** 3
+_INT64_MAX = 2 ** 63 - 1  # the size_limit column is BigInteger; a larger value overflows it
+
+
+def _quota_setting_bytes(db: Session, key: str) -> int:
+    """A GB quota from the global settings blob -> bytes. Missing / non-positive / unparseable => 0,
+    which means UNLIMITED on that axis (not enforced). So a fresh deployment that never set the value
+    is unbounded, and an admin opts in by saving a positive number of GB."""
+    from app.core.models import SystemSetting
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    val = (row.value or {}).get(key) if (row and row.value) else None
+    try:
+        gb = float(val)
+    except (TypeError, ValueError):
+        return 0
+    return int(gb * _GIB) if gb > 0 else 0
+
+
+def _account_reserved_bytes(db: Session, owner_id, exclude_vault_id=None) -> int:
+    """Sum of the declared per-vault size_limit across an owner's ACTIVE vaults — a RESERVATION
+    (declared, not used), so a user can't oversubscribe their account budget by declaring large
+    limits they may never fill. Optionally excludes one vault (when re-sizing it)."""
+    from sqlalchemy import func as _f
+    q = db.query(_f.coalesce(_f.sum(Vault.size_limit), 0)).filter(
+        Vault.owner_id == owner_id, Vault.is_active == True)  # noqa: E712
+    if exclude_vault_id is not None:
+        q = q.filter(Vault.id != exclude_vault_id)
+    return int(q.scalar() or 0)
+
+
+def _max_allowed_vault_size_bytes(db: Session, owner: User, exclude_vault_id=None):
+    """The largest size_limit (bytes) this owner may declare for ONE vault, bounded by the admin
+    'Max Vault Size' per-vault ceiling AND — for non-admins — the remaining per-account budget
+    ('Default User Storage Quota' minus what the owner's OTHER active vaults already reserve). Admins
+    are still bounded by the per-vault ceiling but exempt from the account budget. Returns None when
+    both axes are unlimited (nothing to enforce)."""
+    caps = []
+    ceiling = _quota_setting_bytes(db, "max_vault_size")
+    if ceiling > 0:
+        caps.append(ceiling)
+    # "Full admin" = an interactive admin, NOT an admin-minted temp credential (which the codebase
+    # deliberately does not treat as a full admin — mirrors the require_interactive_admin gate), so a
+    # delegated credential can't over-consume the owner's account budget.
+    is_full_admin = owner.role == RoleEnum.ADMIN and not getattr(owner, "_is_temp_session", False)
+    if not is_full_admin:
+        budget = _quota_setting_bytes(db, "default_user_quota")
+        if budget > 0:
+            caps.append(max(0, budget - _account_reserved_bytes(db, owner.id, exclude_vault_id)))
+    return min(caps) if caps else None
+
+
+def _enforce_vault_size(db: Session, owner: User, requested_bytes: int, exclude_vault_id=None) -> None:
+    """Reject a requested per-vault size_limit that exceeds the owner's available headroom (the
+    per-vault ceiling and/or the per-account budget). No-op when both are unlimited. The account
+    budget is a best-effort reservation (a SELECT-then-write, not a lock), like the deployment-wide
+    storage cap: two concurrent creates can overshoot by at most one vault's declared size — the
+    per-upload guard remains the atomic backstop on ACTUAL bytes."""
+    cap = _max_allowed_vault_size_bytes(db, owner, exclude_vault_id)
+    if cap is not None and requested_bytes > cap:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Requested vault size ({requested_bytes / _GIB:.2f} GB) exceeds the maximum size "
+                    f"available to your account for this vault ({max(0, cap) / _GIB:.2f} GB)."),
+        )
+
+
+def _upload_policy(db: Session):
+    """The current admin upload policy as (allowed_exts_set_or_None, effective_max_file_bytes) from
+    ONE settings read. allowed=None means no file-type restriction. The max is the env per-file cap,
+    lowered (never raised) by the admin 'max file size' setting."""
+    from app.core import upload_policy
+    from app.core.models import SystemSetting
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    blob = (row.value or {}) if (row and row.value) else {}
+    allowed = upload_policy.parse_allowed_exts(blob.get("allowed_file_types"))
+    env_bytes = settings.max_file_size_mb * 1024 * 1024
+    return allowed, upload_policy.effective_max_file_bytes(env_bytes, blob.get("max_file_size"))
+
+
+def _enforce_file_type(filename: str, allowed_exts) -> None:
+    """Reject (400) a filename whose extension isn't in the admin allowlist. No-op when allowed_exts
+    is None (no restriction). ZK vaults are exempt at the call site (their names are encrypted, so
+    the server can't see the extension). Takes a pre-read allowed set to avoid a per-file query."""
+    from app.core import upload_policy
+    if upload_policy.file_type_allowed(filename, allowed_exts):
+        return
+    ext = upload_policy.file_ext(filename)
+    permitted = f" Allowed: {', '.join('.' + e for e in sorted(allowed_exts))}." if allowed_exts else ""
+    raise HTTPException(
+        status_code=400,
+        detail=(f"File type '.{ext}' is not permitted here." if ext
+                else "Files without an extension are not permitted here.") + permitted,
+    )
+
+
+def _setting_int(db: Session, key: str, default: int) -> int:
+    """A positive-integer override from SystemSetting('global'), or `default` when absent / ≤0 /
+    unparseable. Used to let the admin Settings UI tune the session-timeout without a redeploy."""
+    from app.core.models import SystemSetting
+    try:
+        row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+        n = int((row.value or {}).get(key)) if (row and row.value) else 0
+        return n if n > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _validate_password_policy(db: Session, password: str) -> None:
+    """Enforce the admin account-password policy (min length + complexity) on a new account password.
+    The API model already guarantees an 8-char floor; the stored policy can raise the minimum and add
+    any complexity requirements the admin enabled. No-op when nothing beyond the floor is configured."""
+    from app.core import password_policy
+    from app.core.models import SystemSetting
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    cfg = (row.value or {}) if (row and row.value) else {}
+    errs = password_policy.password_policy_errors(password, cfg)
+    if errs:
+        raise HTTPException(status_code=400, detail="Password must " + "; ".join(errs) + ".")
+
+
 def _validate_settings_payload(payload: dict, db: Session) -> None:
     """Validate the few settings keys that drive real enforcement so the admin UI
     can't silently persist values that later fail open. The store is otherwise
@@ -1460,6 +1595,42 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             status_code=400,
             detail="directory_search_scope must be 'deployment' or 'same_department'",
         )
+
+    # Storage quotas (GB). default_user_quota = per-account budget (sum of an owner's vault size
+    # reservations); max_vault_size = the per-vault ceiling. Both are enforced at vault create/resize
+    # (see _enforce_vault_size); 0 / absent means unlimited on that axis.
+    for gb_key in ("default_user_quota", "max_vault_size"):
+        if gb_key in payload and payload[gb_key] is not None:
+            v = payload[gb_key]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+                raise HTTPException(status_code=400, detail=f"{gb_key} must be a non-negative number of GB")
+
+    # Upload policy: allowed_file_types (extension allowlist; empty = allow all) + max_file_size (MB).
+    if "allowed_file_types" in payload and payload["allowed_file_types"] is not None:
+        v = payload["allowed_file_types"]
+        if not isinstance(v, list) or not all(isinstance(e, str) for e in v):
+            raise HTTPException(status_code=400, detail="allowed_file_types must be a list of extension strings")
+    if "max_file_size" in payload and payload["max_file_size"] is not None:
+        v = payload["max_file_size"]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+            raise HTTPException(status_code=400, detail="max_file_size must be a non-negative number of MB")
+
+    # Account-password policy: minimum length + the four complexity toggles (enforced on user
+    # create/password-change; the model keeps an 8-char hard floor the stored minimum can only raise).
+    if "password_min_length" in payload and payload["password_min_length"] is not None:
+        v = payload["password_min_length"]
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise HTTPException(status_code=400, detail="password_min_length must be a non-negative integer")
+    for bkey in ("require_uppercase", "require_lowercase", "require_numbers", "require_special"):
+        if bkey in payload and not isinstance(payload[bkey], bool):
+            raise HTTPException(status_code=400, detail=f"{bkey} must be true or false")
+
+    # Auth limits (0/absent = keep the deployment env default). Enforced at login / token mint.
+    for int_key in ("max_login_attempts", "lockout_duration", "session_timeout"):
+        if int_key in payload and payload[int_key] is not None:
+            v = payload[int_key]
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise HTTPException(status_code=400, detail=f"{int_key} must be a non-negative integer")
 
 
 @app.get("/settings")
@@ -2229,14 +2400,20 @@ async def login(
             )
             is_temporary = False
         
-        # Create JWT token (include session_token for session validation)
+        # Create JWT token (include session_token for session validation). A REGULAR session honours
+        # the admin 'Session Timeout' setting (falling back to the env default); a temp credential
+        # keeps the default token life — its own validity window is enforced separately.
+        _expires = None
+        if not is_temporary:
+            _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
         access_token = create_access_token(
             data={
-                "sub": str(user.id), 
+                "sub": str(user.id),
                 "username": user.username,
                 "session_token": session_token if session_token else None,
                 "is_temporary": is_temporary
-            }
+            },
+            expires_delta=_expires,
         )
         
         audit_logger.log_login_success(user, client_ip, is_temporary=is_temporary)
@@ -3155,6 +3332,9 @@ async def create_user(
     # Plan cap on the number of user accounts in this deployment.
     _enforce_user_cap(db)
 
+    # Admin password policy (min length + complexity) beyond the model's 8-char floor.
+    _validate_password_policy(db, user_create.password)
+
     try:
         new_user = auth_service.create_user(
             username=user_create.username,
@@ -3198,6 +3378,62 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
     Get current user information.
     """
     return UserResponse.model_validate(current_user)
+
+
+@app.patch("/users/me", response_model=UserResponse)
+async def update_own_account(
+    body: SelfUpdate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Self-service account update: change your OWN password, email, or SFTP toggles. Gated only by
+    a valid session (no USER_MANAGE), so a regular user can manage their own account — but a
+    TEMPORARY/external credential cannot touch the owning account, and a password/email change
+    requires re-proving the current password so a hijacked live session can't take the account over."""
+    from app.core.security import hash_password, verify_password
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot change account settings.")
+
+    user = db.query(User).filter(User.id == current_user.id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    audit_logger = AuditLogger(db)
+    changes = []
+    changing_email = body.email is not None and body.email != user.email
+    sensitive = body.new_password is not None or changing_email
+    if sensitive:
+        if not body.current_password or not user.password_hash or not verify_password(body.current_password, user.password_hash):
+            raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
+
+    if body.new_password is not None:
+        _validate_password_policy(db, body.new_password)
+        user.password_hash = hash_password(body.new_password)
+        changes.append("password")
+    if changing_email:
+        # email is unique — reject a clash with a clean 400 instead of a commit-time 500.
+        if db.query(User.id).filter(User.email == str(body.email), User.id != user.id).first():
+            raise HTTPException(status_code=400, detail="That email address is already in use.")
+        user.email = str(body.email)
+        changes.append("email")
+    if body.sftp_enabled is not None and body.sftp_enabled != user.sftp_enabled:
+        user.sftp_enabled = body.sftp_enabled
+        changes.append("sftp_enabled")
+    if body.sftp_password_auth is not None and body.sftp_password_auth != user.sftp_password_auth:
+        user.sftp_password_auth = body.sftp_password_auth
+        changes.append("sftp_password_auth")
+
+    if not changes:
+        raise HTTPException(status_code=400, detail="No changes were provided.")
+    db.commit()
+    db.refresh(user)
+    try:
+        audit_logger.log_action(action="self_account_update", status="success", user=user,
+                                ip_address=get_client_ip(request), details={"fields": changes})
+    except Exception:  # noqa: BLE001
+        pass
+    return UserResponse.model_validate(user)
 
 
 # -- Per-user UI preferences (theme / accent / background / skin) --------------
@@ -3440,6 +3676,7 @@ async def update_user(
         user.email = user_update.email
     
     if user_update.password is not None:
+        _validate_password_policy(db, user_update.password)
         user.password_hash = hash_password(user_update.password)
         changes['password'] = 'changed'
 
@@ -3538,21 +3775,29 @@ def _parse_ssh_public_key(line: str):
     return key_type, f"{key_type} {blob_b64}", fingerprint
 
 
-def _ssh_key_target_user(user_id, current_user, db):
+def _ssh_key_target_user(user_id, current_user, db, *, write=False):
     """Admin-or-self gate for SSH-key management; returns the target user.
 
-    A temp credential must not add/remove an SSH key on ANOTHER account — a stored key is a
-    persistent SFTP auth factor that outlives the credential's time-box. Self
-    management stays allowed; an admin acting on another user must be an INTERACTIVE admin."""
+    A stored SSH key is a persistent SFTP auth factor that outlives a temporary credential's
+    time-box, so a temp session must not CREATE or REMOVE one — not on another account and not
+    even on its own owning account (which would let the credential holder keep SFTP access after
+    the credential expires). Reads (listing keys) stay allowed for self. An admin acting on
+    another user must be an INTERACTIVE admin."""
     is_self = current_user.id == user_id
+    is_temp = getattr(current_user, "_is_temp_session", False)
     if not is_self:
         if current_user.role != RoleEnum.ADMIN:
             raise HTTPException(status_code=403, detail="Access denied")
-        if getattr(current_user, "_is_temp_session", False):
+        if is_temp:
             raise HTTPException(
                 status_code=403,
                 detail="This action requires an interactive admin session, not a temporary credential.",
             )
+    elif write and is_temp:
+        raise HTTPException(
+            status_code=403,
+            detail="A temporary credential cannot manage SSH keys; use an interactive session.",
+        )
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -3582,7 +3827,7 @@ async def add_ssh_key(
 ):
     """Add an SSH public key authorizing this user's SFTP access (admin or self)."""
     from app.core.models import UserSSHKey
-    _ssh_key_target_user(user_id, current_user, db)
+    _ssh_key_target_user(user_id, current_user, db, write=True)
     key_type, normalized, fingerprint = _parse_ssh_public_key(body.public_key)
     if db.query(UserSSHKey).filter(
         UserSSHKey.user_id == user_id, UserSSHKey.fingerprint == fingerprint
@@ -3617,7 +3862,7 @@ async def delete_ssh_key(
 ):
     """Remove an authorized SSH key (admin or self)."""
     from app.core.models import UserSSHKey
-    _ssh_key_target_user(user_id, current_user, db)
+    _ssh_key_target_user(user_id, current_user, db, write=True)
     key = db.query(UserSSHKey).filter(
         UserSSHKey.id == key_id, UserSSHKey.user_id == user_id
     ).first()
@@ -4178,6 +4423,28 @@ def _resolve_vault_type_for_create(current_user: User, requested: Optional[str],
     return "standard"
 
 
+@app.get("/account/storage")
+async def account_storage(
+    exclude_vault_id: Optional[uuid.UUID] = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The current account's storage picture, so the UI can show how much a new/edited vault may
+    declare. Bytes; a null bound means UNLIMITED on that axis. reserved = the SUM of the owner's
+    declared vault size_limits; available = the largest size a vault may declare right now (pass
+    exclude_vault_id when editing a vault, so its OWN current reservation doesn't count against it)."""
+    budget = _quota_setting_bytes(db, "default_user_quota")
+    ceiling = _quota_setting_bytes(db, "max_vault_size")
+    is_full_admin = current_user.role == RoleEnum.ADMIN and not getattr(current_user, "_is_temp_session", False)
+    return {
+        "reserved_bytes": _account_reserved_bytes(db, current_user.id),
+        "account_quota_bytes": (budget or None) if not is_full_admin else None,
+        "per_vault_max_bytes": ceiling or None,
+        "available_bytes": _max_allowed_vault_size_bytes(db, current_user, exclude_vault_id),
+        "budget_exempt": is_full_admin,
+    }
+
+
 @app.post("/vaults", response_model=VaultResponse)
 @require_endpoint_permission("VAULT_CREATE")
 async def create_vault(
@@ -4203,6 +4470,15 @@ async def create_vault(
     from app.core.temp_scope import require_create_vault_type
     require_create_vault_type(current_user, vault_type)
 
+    # Per-vault size: default 1 GB. Reject a size that is out of range (a sub-nanogigabyte value
+    # truncates to 0, which every upload guard reads as UNLIMITED; a huge value overflows the
+    # BigInteger column and 500s) BEFORE the quota check, then enforce the ceiling / account budget.
+    requested_size = int(vault_create.size_limit_gb * _GIB) if vault_create.size_limit_gb else _GIB
+    if requested_size <= 0 or requested_size > _INT64_MAX:
+        raise HTTPException(status_code=400,
+                            detail=f"Vault size must be between 1 byte and {_INT64_MAX / _GIB:.0f} GB")
+    _enforce_vault_size(db, current_user, requested_size)
+
     vault = vault_service.create_vault(
         name=vault_create.name,
         owner=current_user,
@@ -4210,6 +4486,7 @@ async def create_vault(
         password=vault_create.password,
         expire_files_after_days=vault_create.expire_files_after_days,
         vault_type=vault_type,
+        size_limit=requested_size,
     )
 
     # Zero-knowledge vaults: the DEK is generated AND wrapped IN THE BROWSER to the
@@ -4787,14 +5064,29 @@ async def update_vault_settings(
         
         if 'size_limit' in settings_update:
             size_limit = settings_update['size_limit']
-            if size_limit is not None:
-                # Validate size limit is not less than current usage
-                current_size = vault.total_size_bytes or 0
-                if size_limit < current_size:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Size limit ({size_limit} bytes) cannot be less than current usage ({current_size} bytes)"
-                    )
+            # A null would clear the cap to "unlimited", bypassing the per-vault ceiling AND the
+            # account budget — reject it (the field is a bounded quota now, not a clearable option).
+            if size_limit is None:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail="size_limit is required (a positive number of bytes)")
+            try:
+                size_limit = int(size_limit)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail="size_limit must be a number of bytes")
+            if size_limit <= 0 or size_limit > _INT64_MAX:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail=f"size_limit must be between 1 byte and {_INT64_MAX / _GIB:.0f} GB")
+            # Floor: can't shrink below what's already stored.
+            current_size = vault.total_size_bytes or 0
+            if size_limit < current_size:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Size limit ({size_limit} bytes) cannot be less than current usage ({current_size} bytes)"
+                )
+            # Ceiling: can't exceed the per-vault ceiling or the owner's remaining account budget
+            # (excluding THIS vault's own current reservation). The owner is enforced above.
+            _enforce_vault_size(db, current_user, size_limit, exclude_vault_id=vault_id)
             vault.size_limit = size_limit
             updated_fields.append('size_limit')
         
@@ -5729,11 +6021,13 @@ async def upload_file(
         # spreading data across many vaults.
         _enforce_deployment_storage_quota(db, estimated_upload_size)
 
-        # the per-file ceiling (max_file_size_mb) is enforced IN-STREAM inside the
-        # per-file loop below (see the bytes_uploaded check) — matching chunked-init — so an
-        # oversized single file is aborted before it is fully buffered to transient disk,
-        # WITHOUT wrongly rejecting a legitimate multi-file upload on its aggregate size.
-        _max_upload_bytes = settings.max_file_size_mb * 1024 * 1024
+        # the per-file ceiling is enforced IN-STREAM inside the per-file loop below (see the
+        # bytes_uploaded check) — matching chunked-init — so an oversized single file is aborted
+        # before it is fully buffered to transient disk, WITHOUT wrongly rejecting a legitimate
+        # multi-file upload on its aggregate size. Read the admin upload policy (allowed types +
+        # effective max) ONCE here; this multipart path is standard-only (ZK is rejected above), so
+        # the file-type allowlist always applies.
+        _allowed_exts, _max_upload_bytes = _upload_policy(db)
 
         # Parse folder_id if provided
         folder_uuid = uuid.UUID(folder_id) if folder_id else None
@@ -5840,7 +6134,10 @@ async def upload_file(
             # Validate filename
             if not upload_file.filename:
                 continue  # Skip files without names
-            
+
+            # Reject a disallowed file type up front (before any reservation/streaming work).
+            _enforce_file_type(upload_file.filename, _allowed_exts)
+
             # Create operation ID for tracking
             operation_id = f"upload_{uuid.uuid4()}"
             
@@ -5968,7 +6265,7 @@ async def upload_file(
                         if bytes_uploaded + len(chunk) > _max_upload_bytes:
                             raise HTTPException(
                                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                                detail=f"File '{upload_file.filename}' exceeds the maximum size of {settings.max_file_size_mb}MB",
+                                detail=f"File '{upload_file.filename}' exceeds the maximum size of {_max_upload_bytes // (1024 * 1024)}MB",
                             )
 
                         # Write and encrypt chunk immediately
@@ -6405,6 +6702,7 @@ async def init_chunked_upload(
     # index and MUST NOT carry a plaintext name/MIME (that would defeat zero-knowledge).
     # Standard uploads are the inverse: a plaintext name is required.
     is_zk = _is_zk_vault(vault)
+    _allowed_exts, _max_file_bytes = _upload_policy(db)
     if is_zk:
         if not body.enc_name or not body.name_bi:
             raise HTTPException(
@@ -6424,10 +6722,12 @@ async def init_chunked_upload(
         # sink is also defended, but keeping the at-rest name clean avoids log/listing
         # corruption from a crafted chunked-upload file_name (this path skips sanitize_filename).
         body.file_name = ''.join(c for c in body.file_name if ord(c) >= 32 and ord(c) != 127) or "download"
+        # Standard (non-ZK) uploads carry a plaintext name — enforce the admin file-type allowlist.
+        # ZK names are browser-encrypted (server-invisible), so ZK vaults are exempt.
+        _enforce_file_type(body.file_name, _allowed_exts)
 
-    max_size = settings.max_file_size_mb * 1024 * 1024
-    if body.total_size > max_size:
-        raise HTTPException(status_code=413, detail=f"File exceeds maximum size of {settings.max_file_size_mb}MB")
+    if body.total_size > _max_file_bytes:
+        raise HTTPException(status_code=413, detail=f"File exceeds maximum size of {_max_file_bytes // (1024 * 1024)}MB")
     if vault.size_limit and (vault.total_size_bytes or 0) + body.total_size > vault.size_limit:
         raise HTTPException(status_code=413, detail="File would exceed the vault size limit")
     _enforce_deployment_storage_quota(db, body.total_size)   # plan aggregate storage ceiling
@@ -7401,6 +7701,15 @@ async def rename_file(
             _cur = getattr(locked_vault, 'dek_version', 1) or 1
             if rename_data.name_key_version is not None and int(rename_data.name_key_version) > _cur:
                 raise HTTPException(status_code=400, detail="Folder name epoch is ahead of the vault's current key epoch.")
+
+        # Renaming a FILE is a write path too: enforce the admin file-type allowlist on the new
+        # name so a user can't upload an allowed type then rename it to a forbidden extension.
+        # Standard vaults only (ZK renames carry an encrypted, server-invisible name); folders have
+        # no file-type, so this only applies when the id resolves to a file.
+        if rename_data.new_name and not _is_zk_vault(vault):
+            _is_file = db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id).first() is not None
+            if _is_file:
+                _enforce_file_type(rename_data.new_name, _upload_policy(db)[0])
 
         # Rename the file/folder. Scoped to the path vault: rename_file rejects an id
         # that belongs to a DIFFERENT vault (cross-vault guard, files + folders), so the
@@ -8636,6 +8945,10 @@ def _run_lightweight_migrations():
             # client-declared epoch through to finalize for the upload-vs-rekey race check.
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS dek_version INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS zk_key_version INTEGER",
+            # Backfill any legacy NULL/0 per-vault size_limit to the 1 GB default: such a vault
+            # reserves nothing in the account budget SUM yet is treated as UNLIMITED at every upload
+            # guard (`if vault.size_limit`), so the reservation model would under-count it. Idempotent.
+            "UPDATE vaults SET size_limit = 1073741824 WHERE size_limit IS NULL OR size_limit <= 0",
             # Hierarchical ZK key wrapping (VaultTeamKey). team_public_key = the per-vault team
             # public key; team_key_version = the team-KEYPAIR epoch, SEPARATE from dek_version
             # (bumps only on a team-keypair rotation, not a routine DEK rotation). team_key (the
