@@ -348,6 +348,17 @@ class TempCredentialVaultAccess(Base):
     # later password add/change/rotation voids this credential's standing SFTP proof —
     # keeping SFTP at the web's live two-factor bar rather than a proof frozen at mint.
     vault_password_fingerprint = Column(String(64), nullable=True)
+    # --- Temporary passcode: a second server-side access gate on a password-protected STANDARD vault
+    # (never on a zero-knowledge vault). An Argon2 verifier that opens the vault in place of the real
+    # password for the holder of this credential — scoped, expiring, revocable, rate-limited. NULL =
+    # no passcode (today's behavior: the holder must know the real password). Content is NOT
+    # re-encrypted (it is keyed off the deployment secret, not the password); this is authorization
+    # only. Redemption (a later phase) enforces expiry + max_uses and rate-limits like the password.
+    passcode_hash = Column(String(255), nullable=True)
+    passcode_kind = Column(String(16), nullable=True)              # 'generated' | 'custom'
+    passcode_max_uses = Column(Integer, nullable=True)            # NULL = multi-use within TTL; 1 = one-time
+    passcode_use_count = Column(Integer, nullable=False, default=0)
+    passcode_expires_at = Column(DateTime, nullable=True)         # <= the credential's deactivate_at
     created_at = Column(DateTime, default=datetime.utcnow)
     created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
 

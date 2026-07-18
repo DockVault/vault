@@ -632,7 +632,12 @@ class TempCredentialCreate(BaseModel):
     # Least-privilege scope (None = legacy/unrestricted). See app/core/temp_scope.py.
     scope: Optional[dict] = None
     vault_access_mode: Optional[str] = None          # 'all' | 'selected'
-    selected_vaults: Optional[list] = None           # [{"vault_id":..., "caps":[...]}]
+    # [{"vault_id":..., "caps":[...], "scope_ids":..., "password":..., "issue_passcode":bool,
+    #   "passcode":"custom-or-omitted", "one_time":bool?}] — passcode fields are optional per vault.
+    selected_vaults: Optional[list] = None
+    # Issue ONE shared temporary passcode across all passcode-enabled selected vaults (a supplied
+    # custom value if any, else a single generated one), stored as N verifiers.
+    passcode_same_for_all: Optional[bool] = None
 
 
 class TempCredentialResponse(BaseModel):
@@ -647,6 +652,8 @@ class TempCredentialResponse(BaseModel):
     can_create_temp_credentials: bool = False
     scope: Optional[dict] = None
     vault_access_mode: Optional[str] = None
+    # Temporary vault passcodes minted with this credential, shown ONCE. [{vault_id, passcode, kind}].
+    passcodes: list = []
 
 
 class VaultCreate(BaseModel):
@@ -2752,8 +2759,9 @@ async def create_temp_credentials(
         parent_vault_scope=parent_vault_scope,
         created_by_temp_credential_id=created_by_temp_id,
         created_by_user_id=current_user.id,
+        passcode_same_for_all=bool(payload.passcode_same_for_all) if payload else False,
     )
-    
+
     audit_logger.log_temp_credential_created(
         current_user,
         temp_creds['temp_username'],
@@ -8977,6 +8985,13 @@ def _run_lightweight_migrations():
             # Per-vault SFTP password proof: fingerprint of the vault password hash proven
             # when this grant was minted (re-checked on SFTP access; voided by a rotation).
             "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS vault_password_fingerprint VARCHAR(64)",
+            # Temporary passcode verifier on a selected-mode standard-vault grant (a second access
+            # gate; NULL = no passcode). Content is not re-encrypted — this is authorization only.
+            "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS passcode_hash VARCHAR(255)",
+            "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS passcode_kind VARCHAR(16)",
+            "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS passcode_max_uses INTEGER",
+            "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS passcode_use_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS passcode_expires_at TIMESTAMP",
             # Per-account SFTP controls (the user_ssh_keys TABLE is created by create_all).
             # Auth/session hardening: time-boxed account auto-unlock + durable session
             # revocation (web logout/lock survives a Redis outage). Both additive + idempotent.

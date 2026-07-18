@@ -360,8 +360,26 @@ def generate_temporary_credentials() -> Tuple[str, str, str]:
     
     # Hash the credential for storage (bcrypt - one-way hashing)
     credential_hash = hash_password(credential_string)
-    
+
     return temp_username, credential_string, credential_hash
+
+
+def generate_passcode(length: int = 16) -> str:
+    """Generate a high-entropy alphanumeric temporary vault passcode.
+
+    The passcode is a second access gate on a password-protected standard vault. Uses the same
+    62-char alphabet + secrets.choice as the credential password; the length comes from the admin
+    policy (floored at 8, defaulting to 16). A 16-char alphanumeric passcode has ~95 bits of entropy,
+    so a generated passcode is strong regardless of the (custom-only) complexity toggles.
+    """
+    import string
+    try:
+        n = int(length)
+    except (TypeError, ValueError):
+        n = 16
+    n = max(8, n)
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(n))
 
 
 def verify_temporary_credential(credential: str, credential_hash: str) -> bool:
