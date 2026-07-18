@@ -1560,6 +1560,46 @@ def _validate_password_policy(db: Session, password: str) -> None:
         raise HTTPException(status_code=400, detail="Password must " + "; ".join(errs) + ".")
 
 
+# ---------------------------------------------------------------------------
+# Temporary Vault Passcode policy. The effective values are resolved by the pure,
+# unit-tested app/core/temp_passcode_policy module (mirrors password_policy.py);
+# these thin wrappers just read the SystemSetting('global') blob and delegate. No
+# PLAN_* env ceiling (available on all tiers); no enforcement here (redemption
+# reads them). Kept beside _zk_enabled/_directory_search_scope, NOT in
+# app/config/effective.py (that resolver is branding-only).
+# ---------------------------------------------------------------------------
+def _global_settings_blob(db: Session) -> dict:
+    """The raw SystemSetting('global') value dict, or {} on absence/error (so the passcode resolvers
+    fail closed)."""
+    from app.core.models import SystemSetting
+    try:
+        row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+        return (row.value or {}) if (row and row.value) else {}
+    except Exception:
+        return {}
+
+
+def _temp_passcodes_enabled(db: Session) -> bool:
+    """Master switch (FAIL-CLOSED: default False, and False for any non-bool stored value)."""
+    from app.core import temp_passcode_policy
+    return temp_passcode_policy.passcodes_enabled(_global_settings_blob(db))
+
+
+def _temp_cred_allow_zk_vaults(db: Session) -> bool:
+    """May a zero-knowledge vault be included in a temporary credential's scope at all. Default True =
+    today's behavior; only an explicit stored False denies (enforced fail-closed at the mint chokepoint)."""
+    from app.core import temp_passcode_policy
+    return temp_passcode_policy.allow_zk_vaults(_global_settings_blob(db))
+
+
+def _temp_passcode_policy(db: Session) -> dict:
+    """The effective Temporary Vault Passcode policy (INCLUDING temp_cred_allow_zk_vaults), keyed by the
+    exact setting names so ONE call drives both the mint UI (GET /temp-passcode-policy) and the
+    GET /settings overlay. No enforcement here — redemption reads this."""
+    from app.core import temp_passcode_policy
+    return temp_passcode_policy.effective_policy(_global_settings_blob(db))
+
+
 def _validate_settings_payload(payload: dict, db: Session) -> None:
     """Validate the few settings keys that drive real enforcement so the admin UI
     can't silently persist values that later fail open. The store is otherwise
@@ -1632,6 +1672,25 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             if isinstance(v, bool) or not isinstance(v, int) or v < 0:
                 raise HTTPException(status_code=400, detail=f"{int_key} must be a non-negative integer")
 
+    # Temporary Vault Passcode policy. The master switch, the custom-passcode toggle + its complexity
+    # toggles, the one-time/single-vault defaults, and whether ZK vaults may sit in a temp credential's
+    # scope are all booleans; the length + max-lifetime are non-negative ints. No enforcement here —
+    # redemption reads the effective policy via the helpers above.
+    _TEMP_PASSCODE_BOOL_KEYS = (
+        "temp_passcodes_enabled", "temp_cred_allow_zk_vaults", "temp_passcode_allow_custom",
+        "temp_passcode_require_uppercase", "temp_passcode_require_lowercase",
+        "temp_passcode_require_numbers", "temp_passcode_require_special",
+        "temp_passcode_one_time_default", "temp_passcode_single_vault_only",
+    )
+    for bkey in _TEMP_PASSCODE_BOOL_KEYS:
+        if bkey in payload and not isinstance(payload[bkey], bool):
+            raise HTTPException(status_code=400, detail=f"{bkey} must be true or false")
+    for int_key in ("temp_passcode_min_length", "temp_passcode_max_lifetime_minutes"):
+        if int_key in payload and payload[int_key] is not None:
+            v = payload[int_key]
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise HTTPException(status_code=400, detail=f"{int_key} must be a non-negative integer")
+
 
 @app.get("/settings")
 async def get_settings(
@@ -1652,6 +1711,9 @@ async def get_settings(
     # Always report the EFFECTIVE directory-search policy so the admin toggle reflects the default
     # ('deployment') even when never explicitly saved.
     data["directory_search_scope"] = _directory_search_scope(db)
+    # Overlay the EFFECTIVE Temporary Vault Passcode policy (incl. the ZK-in-scope toggle) so the
+    # Settings card renders correct defaults even when never saved (feature default OFF, allow-ZK ON).
+    data.update(_temp_passcode_policy(db))
     return data
 
 
@@ -2308,6 +2370,24 @@ async def get_zk_enabled(
         "zk_vault_count": _zk_vault_count(db),
         "allowed_vault_types": sorted(allowed),
     }
+
+
+@app.get("/temp-passcode-policy")
+async def get_temp_passcode_policy(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Effective Temporary Vault Passcode policy for the CURRENT user. Non-sensitive flags any
+    authenticated user (including a temp session) may read — like /zk-enabled — so the temp-credential
+    mint UI can shape the passcode controls without exposing the admin-only /settings store:
+      - temp_passcodes_enabled: is the feature turned on (default off / fail-closed)
+      - temp_passcode_allow_custom + the four temp_passcode_require_* toggles + temp_passcode_min_length:
+          the custom-passcode complexity policy (generated passcodes are always high-entropy)
+      - temp_passcode_one_time_default / temp_passcode_single_vault_only / temp_passcode_max_lifetime_minutes:
+          mint defaults / ceilings
+      - temp_cred_allow_zk_vaults: whether a zero-knowledge vault may be included in scope at all
+    No enforcement here — redemption reads the policy."""
+    return _temp_passcode_policy(db)
 
 
 @app.get("/zk/unsealed")

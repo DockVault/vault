@@ -1239,6 +1239,71 @@
                                 </div>
                             </div>
                         </div>
+                        <div class="card mt-lg">
+                            <div class="card-header">
+                                <h3>Temporary Vault Passcodes</h3>
+                            </div>
+                            <div class="p-lg">
+                                <label class="flex items-center gap-sm">
+                                    <input type="checkbox" id="setting-temp-passcodes-enabled">
+                                    <span>Allow issuing temporary vault passcodes</span>
+                                </label>
+                                <p class="text-secondary text-sm mt-sm">When enabled, a temporary credential can carry a short-lived <strong>passcode</strong> that opens a standard vault in place of its real password — scoped, expiring, revocable, and rate-limited. Passcodes are a standard-vault feature only; zero-knowledge vaults never get a passcode (their contents are decryptable only with the account passphrase). Leave off to keep today’s behavior (a holder must know the real vault password).</p>
+
+                                <div class="mt-lg">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="setting-temp-passcode-one-time-default">
+                                        <span>Default new passcodes to one-time use</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">A one-time passcode is burned after a single redemption (safest for untrusted devices / break-glass). Multi-use can still be chosen per passcode at mint time.</p>
+                                </div>
+
+                                <div class="mt-lg">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="setting-temp-passcode-single-vault-only">
+                                        <span>Restrict a passcode to a single vault</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">Forbid one passcode from spanning multiple vaults in a batch mint.</p>
+                                </div>
+
+                                <div class="mt-lg">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="setting-temp-passcode-allow-custom">
+                                        <span>Allow minter-chosen (custom) passcodes</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">When off, passcodes are always system-generated at high entropy (strongest against offline cracking). When on, a minter may type a custom passcode that must satisfy the complexity policy below.</p>
+                                </div>
+
+                                <div class="form-group mt-md">
+                                    <label for="setting-temp-passcode-min-length">Minimum passcode length (also the generated length)</label>
+                                    <input type="number" id="setting-temp-passcode-min-length" class="form-control" min="8" max="128" style="max-width:200px;">
+                                    <p class="text-secondary text-sm mt-sm">At least 8. Applies to custom passcodes and sets the length of generated ones.</p>
+                                </div>
+
+                                <div class="form-group mt-md">
+                                    <label>Custom-passcode complexity</label>
+                                    <p class="text-secondary text-sm mb-sm">Requirements a <em>custom</em> passcode must meet (generated passcodes are always high-entropy). Tuned separately from the account-password policy.</p>
+                                    <label class="flex items-center gap-sm"><input type="checkbox" id="setting-temp-passcode-require-uppercase"><span>Require an uppercase letter</span></label>
+                                    <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="setting-temp-passcode-require-lowercase"><span>Require a lowercase letter</span></label>
+                                    <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="setting-temp-passcode-require-numbers"><span>Require a number</span></label>
+                                    <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="setting-temp-passcode-require-special"><span>Require a special character</span></label>
+                                </div>
+
+                                <div class="form-group mt-md">
+                                    <label for="setting-temp-passcode-max-lifetime">Maximum passcode lifetime (minutes, 0 = no extra cap)</label>
+                                    <input type="number" id="setting-temp-passcode-max-lifetime" class="form-control" min="0" style="max-width:200px;">
+                                    <p class="text-secondary text-sm mt-sm">Optional ceiling on how long a passcode stays valid; it never exceeds the temporary credential’s own lifetime.</p>
+                                </div>
+
+                                <div class="mt-lg">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="setting-temp-cred-allow-zk-vaults">
+                                        <span>Allow zero-knowledge vaults in a temporary credential’s scope</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">On by default. A temporary credential may include a zero-knowledge vault, but the holder must still enter the real account passphrase to decrypt it (no passcode is available for ZK vaults). Turn this off to forbid ZK vaults in temporary credentials entirely.</p>
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Audit Log Tab -->

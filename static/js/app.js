@@ -4318,6 +4318,25 @@ async function loadSettings() {
         if (fzkEl) fzkEl.checked = settings.force_zero_knowledge === true;
         const dssEl = document.getElementById('setting-directory-search-scope');
         if (dssEl) dssEl.value = (settings.directory_search_scope === 'same_department') ? 'same_department' : 'deployment';
+
+        // Temporary Vault Passcodes. GET /settings overlays the EFFECTIVE policy, so these keys
+        // are always present (feature default off; allow-ZK default on).
+        const setPasscodeChk = (id, val) => { const el = document.getElementById(id); if (el) el.checked = val === true; };
+        setPasscodeChk('setting-temp-passcodes-enabled', settings.temp_passcodes_enabled);
+        setPasscodeChk('setting-temp-passcode-one-time-default', settings.temp_passcode_one_time_default);
+        setPasscodeChk('setting-temp-passcode-single-vault-only', settings.temp_passcode_single_vault_only);
+        setPasscodeChk('setting-temp-passcode-allow-custom', settings.temp_passcode_allow_custom);
+        setPasscodeChk('setting-temp-passcode-require-uppercase', settings.temp_passcode_require_uppercase);
+        setPasscodeChk('setting-temp-passcode-require-lowercase', settings.temp_passcode_require_lowercase);
+        setPasscodeChk('setting-temp-passcode-require-numbers', settings.temp_passcode_require_numbers);
+        setPasscodeChk('setting-temp-passcode-require-special', settings.temp_passcode_require_special);
+        // allow-ZK-in-scope defaults to ON (today's behavior) when the key is absent.
+        const tczkEl = document.getElementById('setting-temp-cred-allow-zk-vaults');
+        if (tczkEl) tczkEl.checked = settings.temp_cred_allow_zk_vaults !== false;
+        const tpMinEl = document.getElementById('setting-temp-passcode-min-length');
+        if (tpMinEl) tpMinEl.value = settings.temp_passcode_min_length || 16;
+        const tpMaxEl = document.getElementById('setting-temp-passcode-max-lifetime');
+        if (tpMaxEl) tpMaxEl.value = (settings.temp_passcode_max_lifetime_minutes > 0) ? settings.temp_passcode_max_lifetime_minutes : '';
         // When the PLAN mandates zero-knowledge (Enterprise tier), the local toggles can't
         // lower that floor — show ZK as allowed + required, checked and LOCKED, with an
         // explanatory note, so an unchecked-but-forced box isn't contradictory. Best-effort:
@@ -4390,7 +4409,20 @@ async function saveAllSettings() {
             // SFTP & Encryption
             zero_knowledge_enabled: document.getElementById('setting-zero-knowledge-enabled').checked,
             force_zero_knowledge: document.getElementById('setting-force-zero-knowledge').checked,
-            directory_search_scope: (document.getElementById('setting-directory-search-scope') || {}).value || 'deployment'
+            directory_search_scope: (document.getElementById('setting-directory-search-scope') || {}).value || 'deployment',
+
+            // Temporary Vault Passcodes
+            temp_passcodes_enabled: document.getElementById('setting-temp-passcodes-enabled').checked,
+            temp_passcode_allow_custom: document.getElementById('setting-temp-passcode-allow-custom').checked,
+            temp_passcode_one_time_default: document.getElementById('setting-temp-passcode-one-time-default').checked,
+            temp_passcode_single_vault_only: document.getElementById('setting-temp-passcode-single-vault-only').checked,
+            temp_passcode_require_uppercase: document.getElementById('setting-temp-passcode-require-uppercase').checked,
+            temp_passcode_require_lowercase: document.getElementById('setting-temp-passcode-require-lowercase').checked,
+            temp_passcode_require_numbers: document.getElementById('setting-temp-passcode-require-numbers').checked,
+            temp_passcode_require_special: document.getElementById('setting-temp-passcode-require-special').checked,
+            temp_passcode_min_length: parseInt(document.getElementById('setting-temp-passcode-min-length').value) || 16,
+            temp_passcode_max_lifetime_minutes: parseInt(document.getElementById('setting-temp-passcode-max-lifetime').value) || 0,
+            temp_cred_allow_zk_vaults: document.getElementById('setting-temp-cred-allow-zk-vaults').checked
         };
 
         // Branding: send the brand overrides. An empty value clears that
