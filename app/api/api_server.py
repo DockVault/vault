@@ -2826,7 +2826,14 @@ async def create_temp_credentials(
         temp_creds['temp_username'],
         client_ip
     )
-    
+    # A minted passcode is a second access door to a vault — record it (vault ids + kinds + count,
+    # never the passcode plaintext) so a mint is auditable alongside its redemptions.
+    if temp_creds.get('passcodes'):
+        audit_logger.log_temp_passcode_minted(
+            current_user, client_ip, temp_creds['passcodes'],
+            same_for_all=bool(payload.passcode_same_for_all) if payload else False,
+        )
+
     return TempCredentialResponse(**temp_creds)
 
 

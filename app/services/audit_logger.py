@@ -236,7 +236,66 @@ class AuditLogger:
             ip_address=ip_address,
             details={'temp_username': temp_username}
         )
-    
+
+    def log_temp_passcode_minted(
+        self,
+        user: User,
+        ip_address: Optional[str],
+        passcodes,
+        same_for_all: bool = False,
+    ):
+        """A temp credential was minted carrying one or more vault passcodes. Records the vault ids,
+        passcode kinds, and count — NEVER the passcode plaintext."""
+        vaults = [{'vault_id': p.get('vault_id'), 'kind': p.get('kind')} for p in (passcodes or [])]
+        self.log_action(
+            action="temp_passcode_minted",
+            status="success",
+            user=user,
+            resource_type="temporary_credential",
+            ip_address=ip_address,
+            details={'count': len(vaults), 'vaults': vaults, 'same_for_all': bool(same_for_all)},
+        )
+
+    def log_temp_passcode_used(
+        self,
+        user: Optional[User],
+        vault_id,
+        temp_credential_id,
+        ip_address: Optional[str] = None,
+    ):
+        """A temp-credential passcode successfully opened a password-protected vault (redemption)."""
+        self.log_action(
+            action="temp_passcode_used",
+            status="success",
+            user=user,
+            resource_type="vault",
+            resource_id=str(vault_id) if vault_id else None,
+            ip_address=ip_address,
+            details={'temp_credential_id': str(temp_credential_id) if temp_credential_id else None},
+        )
+
+    def log_temp_passcode_failed(
+        self,
+        user: Optional[User],
+        vault_id,
+        temp_credential_id,
+        reason: str,
+        ip_address: Optional[str] = None,
+    ):
+        """A temp-credential passcode redemption failed (wrong / expired / used up / disabled). The
+        ``reason`` is a short code — NEVER the attempted passcode."""
+        self.log_action(
+            action="temp_passcode_failed",
+            status="failure",
+            user=user,
+            resource_type="vault",
+            resource_id=str(vault_id) if vault_id else None,
+            ip_address=ip_address,
+            details={'reason': reason,
+                     'temp_credential_id': str(temp_credential_id) if temp_credential_id else None},
+            error_message=reason,
+        )
+
     def log_vault_created(
         self,
         vault_id: uuid.UUID,

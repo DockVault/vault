@@ -438,33 +438,46 @@ class VaultService:
             return False
         if not getattr(user, "_is_temp_session", False) or not getattr(user, "_temp_cred_id", None):
             return False  # only a temp session redeems a passcode; others use the real password
+
+        _cred_id = getattr(user, "_temp_cred_id", None)
+
+        def _fail(reason, message):
+            # Record the failed redemption (short reason code, NEVER the attempted passcode) and raise.
+            # Auditing must never itself break redemption, so it is best-effort.
+            try:
+                from app.services.audit_logger import AuditLogger
+                AuditLogger(self.db).log_temp_passcode_failed(user, vault.id, _cred_id, reason)
+            except Exception:
+                pass
+            raise InvalidPasswordError(message)
+
         # Master kill-switch: if the feature is turned OFF, outstanding passcodes stop working (defense
         # in depth — an admin can disable redemption org-wide, e.g. on a suspected passcode leak).
         from app.core import temp_passcode_policy
         from app.core.models import SystemSetting, TempCredentialVaultAccess
         _pol = self.db.query(SystemSetting).filter(SystemSetting.key == "global").first()
         if not temp_passcode_policy.passcodes_enabled((_pol.value or {}) if (_pol and _pol.value) else {}):
-            raise InvalidPasswordError("Temporary vault passcodes are disabled")
+            _fail("disabled", "Temporary vault passcodes are disabled")
         grant = self.db.query(TempCredentialVaultAccess).filter(
             TempCredentialVaultAccess.temp_credential_id == user._temp_cred_id,
             TempCredentialVaultAccess.vault_id == vault.id,
         ).first()
         if grant is None or not grant.passcode_hash:
             burn()
-            raise InvalidPasswordError("Invalid vault passcode")
+            _fail("no_passcode", "Invalid vault passcode")
         # Expiry (stored naive-UTC or tz-aware).
         exp = grant.passcode_expires_at
         if exp is not None:
             if exp.tzinfo is None:
                 exp = exp.replace(tzinfo=timezone.utc)
             if datetime.now(timezone.utc) >= exp:
-                raise InvalidPasswordError("This vault passcode has expired")
+                _fail("expired", "This vault passcode has expired")
         # Use cap (one-time = max_uses 1; NULL = multi-use).
         if grant.passcode_max_uses is not None and (grant.passcode_use_count or 0) >= grant.passcode_max_uses:
-            raise InvalidPasswordError("This vault passcode has already been used")
+            _fail("used_up", "This vault passcode has already been used")
         if not verify_password(passcode, grant.passcode_hash):
             burn()
-            raise InvalidPasswordError("Invalid vault passcode")
+            _fail("wrong", "Invalid vault passcode")
         # Success: count the use. For a capped passcode do an ATOMIC conditional increment so two
         # concurrent redemptions can't both burn a one-time passcode (row-count guards the race).
         if grant.passcode_max_uses is not None:
@@ -476,7 +489,7 @@ class VaultService:
                 synchronize_session=False)
             self.db.commit()
             if not updated:
-                raise InvalidPasswordError("This vault passcode has already been used")
+                _fail("used_up", "This vault passcode has already been used")
         else:
             # Multi-use (no cap): still count uses for audit, atomically so a concurrent redemption
             # can't lose a count.
@@ -485,6 +498,12 @@ class VaultService:
                 {TempCredentialVaultAccess.passcode_use_count: TempCredentialVaultAccess.passcode_use_count + 1},
                 synchronize_session=False)
             self.db.commit()
+        # Success: record the redemption (best-effort — never let auditing break a valid redemption).
+        try:
+            from app.services.audit_logger import AuditLogger
+            AuditLogger(self.db).log_temp_passcode_used(user, vault.id, _cred_id)
+        except Exception:
+            pass
         return True
 
     def get_vault(
