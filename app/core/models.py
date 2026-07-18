@@ -353,7 +353,7 @@ class TempCredentialVaultAccess(Base):
     # password for the holder of this credential — scoped, expiring, revocable, rate-limited. NULL =
     # no passcode (today's behavior: the holder must know the real password). Content is NOT
     # re-encrypted (it is keyed off the deployment secret, not the password); this is authorization
-    # only. Redemption (a later phase) enforces expiry + max_uses and rate-limits like the password.
+    # only. Redemption (at the vault-access chokepoint) enforces expiry + max_uses and rate-limits like the password.
     passcode_hash = Column(String(255), nullable=True)
     passcode_kind = Column(String(16), nullable=True)              # 'generated' | 'custom'
     passcode_max_uses = Column(Integer, nullable=True)            # NULL = multi-use within TTL; 1 = one-time

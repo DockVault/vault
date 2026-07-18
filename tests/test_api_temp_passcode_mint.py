@@ -3,8 +3,8 @@
 A passcode is a SECOND server-side access gate on a password-protected standard vault: the minter
 proves the real vault password, then a passcode verifier is stored on the per-vault grant. These
 tests pin generation, custom-with-policy, the fail-closed policy checks, the zero-knowledge
-exclusion, and the one-time/same-for-all behavior. REDEMPTION is a later phase — here we only assert
-the stored grant + the once-shown plaintext. Exercised by a normal admin account AND a
+exclusion, and the one-time/same-for-all behavior. Redemption is covered separately — here we only
+assert the stored grant + the once-shown plaintext. Exercised by a normal admin account AND a
 temp-credential (delegated) session.
 """
 import json
@@ -356,7 +356,7 @@ def test_rejected_passcode_persists_nothing(admin, restore_policy):
 
 def test_max_lifetime_caps_passcode_expiry(admin, restore_policy):
     """An org max-lifetime shorter than the credential validity caps passcode_expires_at below the
-    credential's deactivate_at (expiry storage is in scope this phase; enforcement is later)."""
+    credential's deactivate_at (this asserts the stored expiry; the redemption check enforces it)."""
     _set_policy(admin, temp_passcodes_enabled=True, temp_passcode_max_lifetime_minutes=5)
     vid, pw = _pw_vault(admin)
     try:

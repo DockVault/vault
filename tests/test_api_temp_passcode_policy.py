@@ -13,7 +13,7 @@ import uuid
 import pytest
 
 
-# the 9 boolean policy keys + the 2 integer keys this phase introduces (all overlaid onto GET /settings)
+# the 9 boolean policy keys + the 2 integer keys the passcode policy adds (all overlaid onto GET /settings)
 _BOOL_KEYS = [
     "temp_passcodes_enabled", "temp_cred_allow_zk_vaults", "temp_passcode_allow_custom",
     "temp_passcode_require_uppercase", "temp_passcode_require_lowercase",
@@ -135,7 +135,7 @@ def test_policy_endpoint_normal_account(admin):
 
 
 def test_policy_endpoint_temp_session(admin):
-    """Owner requirement: every new endpoint is exercised by a temp-credential session too."""
+    """The policy endpoint is also reachable from a temporary-credential session (not just a full account)."""
     tclient = _temp_session(admin)
     r = tclient.get("/temp-passcode-policy")
     assert r.status_code == 200, r.text

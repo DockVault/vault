@@ -204,7 +204,7 @@ def test_wrong_passcode_increments_rate_counter(admin, restore_policy):
 
 
 def test_passcode_denied_after_credential_revoked(admin, restore_policy):
-    """T-A5 (revoke half): deleting the temp credential stops its passcode from working."""
+    """Revoke: deleting the temp credential stops its passcode from working."""
     admin.put("/settings", json={"temp_passcodes_enabled": True, "temp_passcode_one_time_default": False})
     vid, fid, _ = _pw_vault_with_file(admin)
     try:
@@ -217,7 +217,7 @@ def test_passcode_denied_after_credential_revoked(admin, restore_policy):
 
 
 def test_one_time_passcode_concurrent_single_success(admin, restore_policy):
-    """T-A4 (race): two concurrent redemptions of a one-time passcode yield EXACTLY one success
+    """Race: two concurrent redemptions of a one-time passcode yield EXACTLY one success
     (the atomic conditional-UPDATE burn), not a double-spend."""
     import concurrent.futures
     admin.put("/settings", json={"temp_passcodes_enabled": True, "temp_passcode_one_time_default": True})

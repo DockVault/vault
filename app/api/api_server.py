@@ -1604,7 +1604,7 @@ def _validate_password_policy(db: Session, password: str) -> None:
 # Temporary Vault Passcode policy. The effective values are resolved by the pure,
 # unit-tested app/core/temp_passcode_policy module (mirrors password_policy.py);
 # these thin wrappers just read the SystemSetting('global') blob and delegate. No
-# PLAN_* env ceiling (available on all tiers); no enforcement here (redemption
+# PLAN_* env ceiling on this feature; no enforcement here (redemption
 # reads them). Kept beside _zk_enabled/_directory_search_scope, NOT in
 # app/config/effective.py (that resolver is branding-only).
 # ---------------------------------------------------------------------------
