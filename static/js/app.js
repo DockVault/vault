@@ -2635,12 +2635,15 @@ async function updateUserSftp(userId, field, value, cb) {
 }
 
 // Lazily fetch + render a user's SSH keys when their row is expanded.
-async function loadUserSshKeys(userId) {
-    const host = document.querySelector(`.ssh-keys-list[data-user-id="${userId}"]`);
+// `root` scopes the DOM lookups so the same widget can appear in more than one place
+// (the admin Users panel AND the self-service account modal) without colliding on
+// `[data-user-id]` — the modal passes its own element so it never grabs the panel's inputs.
+async function loadUserSshKeys(userId, root = document) {
+    const host = root.querySelector(`.ssh-keys-list[data-user-id="${userId}"]`);
     if (!host) return;
     try {
         const keys = await apiRequest(`/users/${userId}/ssh-keys`, { silent: true });
-        renderUserSshKeys(userId, Array.isArray(keys) ? keys : []);
+        renderUserSshKeys(userId, Array.isArray(keys) ? keys : [], root);
     } catch (e) {
         host.replaceChildren();
         const msg = document.createElement('span');
@@ -2650,8 +2653,8 @@ async function loadUserSshKeys(userId) {
     }
 }
 
-function renderUserSshKeys(userId, keys) {
-    const host = document.querySelector(`.ssh-keys-list[data-user-id="${userId}"]`);
+function renderUserSshKeys(userId, keys, root = document) {
+    const host = root.querySelector(`.ssh-keys-list[data-user-id="${userId}"]`);
     if (!host) return;
     host.replaceChildren();
     if (!keys.length) {
@@ -2683,15 +2686,15 @@ function renderUserSshKeys(userId, keys) {
         del.dataset.keyId = String(k.id);
         del.setAttribute('aria-label', `Remove SSH key ${k.name}`);
         del.appendChild(svgUseIcon('trash', 'icon-sm'));
-        del.addEventListener('click', () => deleteSshKey(userId, k.id, k.name));
+        del.addEventListener('click', () => deleteSshKey(userId, k.id, k.name, root));
         item.appendChild(del);
         host.appendChild(item);
     });
 }
 
-async function addSshKey(userId) {
-    const nameEl = document.querySelector(`.ssh-key-name[data-user-id="${userId}"]`);
-    const pubEl = document.querySelector(`.ssh-key-public[data-user-id="${userId}"]`);
+async function addSshKey(userId, root = document) {
+    const nameEl = root.querySelector(`.ssh-key-name[data-user-id="${userId}"]`);
+    const pubEl = root.querySelector(`.ssh-key-public[data-user-id="${userId}"]`);
     const name = (nameEl?.value || '').trim();
     const publicKey = (pubEl?.value || '').trim();
     if (!name || !publicKey) {
@@ -2703,13 +2706,13 @@ async function addSshKey(userId) {
         if (nameEl) nameEl.value = '';
         if (pubEl) pubEl.value = '';
         showSuccess('SSH key added');
-        await loadUserSshKeys(userId);
+        await loadUserSshKeys(userId, root);
     } catch (e) {
         showError('Failed to add SSH key: ' + e.message);
     }
 }
 
-async function deleteSshKey(userId, keyId, keyName) {
+async function deleteSshKey(userId, keyId, keyName, root = document) {
     const confirmed = await showConfirm(
         `Remove SSH key “${keyName}”? Any SFTP session using it will lose access.`,
         'Remove SSH key?'
@@ -2718,10 +2721,117 @@ async function deleteSshKey(userId, keyId, keyName) {
     try {
         await apiRequest(`/users/${userId}/ssh-keys/${keyId}`, { method: 'DELETE' });
         showSuccess('SSH key removed');
-        await loadUserSshKeys(userId);
+        await loadUserSshKeys(userId, root);
     } catch (e) {
         showError('Failed to remove SSH key: ' + e.message);
     }
+}
+
+// ---- Self-service "Your account" modal --------------------------------------------------------
+function _usShowError(msg) {
+    const box = document.getElementById('us-error');
+    if (box) { box.textContent = msg; box.style.display = ''; box.scrollIntoView({ block: 'nearest' }); }
+}
+function _usHideError() {
+    const box = document.getElementById('us-error');
+    if (box) { box.style.display = 'none'; box.textContent = ''; }
+}
+
+// Open the account modal for the CURRENT user. Credential-write sections are hidden for a temporary
+// credential (the server rejects those writes too — this is UX, not the security boundary).
+function openUserSettingsModal() {
+    const modal = document.getElementById('user-settings-modal');
+    if (!modal || !currentUser) return;
+    _usHideError();
+    const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+    set('us-username', currentUser.username || '');
+    set('us-email-display', currentUser.email || '');
+    set('us-role', currentUser.role === 'admin' ? 'Administrator' : (currentUser.role || 'User'));
+    set('us-last-login', currentUser.last_login ? new Date(currentUser.last_login).toLocaleString() : '—');
+
+    const isTemp = isScopedTemp || !!(sessionAccess && sessionAccess.is_scoped_temp);
+    document.querySelectorAll('#user-settings-modal .us-credential').forEach(s => { s.style.display = isTemp ? 'none' : ''; });
+    const note = document.getElementById('us-temp-note'); if (note) note.style.display = isTemp ? '' : 'none';
+
+    if (!isTemp) {
+        ['us-cur-pw', 'us-new-pw', 'us-new-pw2', 'us-new-email', 'us-email-cur-pw'].forEach(id => {
+            const e = document.getElementById(id); if (e) e.value = '';
+        });
+        const se = document.getElementById('us-sftp-enabled'); if (se) se.checked = currentUser.sftp_enabled !== false;
+        const sp = document.getElementById('us-sftp-pw-auth'); if (sp) sp.checked = currentUser.sftp_password_auth !== false;
+        // Point the reusable SSH-key list/inputs at the current user, then load their keys —
+        // scoped to the modal so they never collide with the admin Users panel's rows.
+        modal.querySelectorAll('.ssh-keys-list, .ssh-key-name, .ssh-key-public')
+            .forEach(el => el.setAttribute('data-user-id', String(currentUser.id)));
+        loadUserSshKeys(currentUser.id, modal);
+    }
+    const tm = window.themeManager;
+    const themeSel = document.getElementById('us-theme'); if (themeSel && tm) themeSel.value = (tm.currentTheme === 'dark') ? 'dark' : 'light';
+    const skinSel = document.getElementById('us-skin'); if (skinSel && tm) skinSel.value = (tm.currentUi === 'v1') ? 'v1' : 'v2';
+
+    document.querySelector('.profile-menu')?.classList.remove('active');  // close the dropdown
+    openModal('user-settings-modal');
+}
+
+// Wire the account-modal form handlers once (idempotent via a flag).
+let _usWired = false;
+function wireUserSettingsModal() {
+    if (_usWired) return;
+    _usWired = true;
+    document.getElementById('us-password-form')?.addEventListener('submit', async (e) => {
+        e.preventDefault(); _usHideError();
+        const cur = document.getElementById('us-cur-pw').value;
+        const np = document.getElementById('us-new-pw').value;
+        const np2 = document.getElementById('us-new-pw2').value;
+        if (!cur) { _usShowError('Enter your current password.'); return; }
+        if (!np) { _usShowError('Enter a new password.'); return; }
+        if (np !== np2) { _usShowError('The new passwords do not match.'); return; }
+        try {
+            await apiRequest('/users/me', { method: 'PATCH', body: JSON.stringify({ current_password: cur, new_password: np }) });
+            showSuccess('Password updated');
+            ['us-cur-pw', 'us-new-pw', 'us-new-pw2'].forEach(id => { document.getElementById(id).value = ''; });
+        } catch (err) { _usShowError(err.message || 'Could not update password.'); }
+    });
+    document.getElementById('us-email-form')?.addEventListener('submit', async (e) => {
+        e.preventDefault(); _usHideError();
+        const email = document.getElementById('us-new-email').value.trim();
+        const cur = document.getElementById('us-email-cur-pw').value;
+        if (!email) { _usShowError('Enter a new email address.'); return; }
+        if (!cur) { _usShowError('Enter your current password.'); return; }
+        try {
+            const updated = await apiRequest('/users/me', { method: 'PATCH', body: JSON.stringify({ current_password: cur, email }) });
+            if (updated && updated.email) { currentUser.email = updated.email; document.getElementById('us-email-display').textContent = updated.email; }
+            showSuccess('Email updated');
+            document.getElementById('us-email-cur-pw').value = '';
+        } catch (err) { _usShowError(err.message || 'Could not update email.'); }
+    });
+    document.getElementById('us-sftp-save')?.addEventListener('click', async () => {
+        _usHideError();
+        const en = document.getElementById('us-sftp-enabled').checked;
+        const pa = document.getElementById('us-sftp-pw-auth').checked;
+        if (en === (currentUser.sftp_enabled !== false) && pa === (currentUser.sftp_password_auth !== false)) {
+            showSuccess('No changes'); return;  // the endpoint 400s on a no-op change
+        }
+        try {
+            const updated = await apiRequest('/users/me', { method: 'PATCH', body: JSON.stringify({ sftp_enabled: en, sftp_password_auth: pa }) });
+            if (updated) { currentUser.sftp_enabled = updated.sftp_enabled; currentUser.sftp_password_auth = updated.sftp_password_auth; }
+            showSuccess('SFTP options saved');
+        } catch (err) { _usShowError(err.message || 'Could not save SFTP options.'); }
+    });
+    document.getElementById('us-ssh-add')?.addEventListener('click', () => {
+        const modal = document.getElementById('user-settings-modal');
+        if (currentUser && modal) addSshKey(currentUser.id, modal);
+    });
+    document.getElementById('us-theme')?.addEventListener('change', (e) => {
+        if (window.themeManager) window.themeManager.applyTheme(e.target.value);
+        if (window.saveUserPreference) window.saveUserPreference({ theme: e.target.value });
+    });
+    document.getElementById('us-skin')?.addEventListener('change', (e) => {
+        // Delegate to themeManager.setUi — it persists to the server, then reloads (ui-boot.js
+        // re-applies the skin pre-paint), handling the save/reload race for us.
+        const v = e.target.value === 'v1' ? 'v1' : 'v2';
+        if (window.themeManager && typeof window.themeManager.setUi === 'function') window.themeManager.setUi(v);
+    });
 }
 
 // Attach event listeners for user actions
@@ -8601,12 +8711,11 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Settings button
+    // Settings button — open the self-service "Your account" modal.
     const settingsBtn = document.getElementById('settings-btn');
     if (settingsBtn) {
-        settingsBtn.addEventListener('click', () => {
-            alert('Settings feature coming soon!');
-        });
+        wireUserSettingsModal();
+        settingsBtn.addEventListener('click', openUserSettingsModal);
     }
     
     // Sidebar navigation

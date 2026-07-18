@@ -1706,6 +1706,90 @@
                         </form>
                     </div>
                 </div>
+
+                <!-- Your Account (self-service) Modal -->
+                <div id="user-settings-modal" class="modal">
+                    <div class="modal-content modal-lg">
+                        <div class="modal-header">
+                            <h3><svg class="icon"><use href="#i-settings"/></svg> Your account</h3>
+                            <button class="close-modal-btn modal-close" aria-label="Close">×</button>
+                        </div>
+                        <div class="modal-body">
+                            <div id="us-error" class="alert alert-error mb-md" role="alert" style="display:none;"></div>
+                            <div id="us-temp-note" class="alert alert-info mb-md" style="display:none;">You are signed in with a temporary credential — account settings can't be changed here.</div>
+
+                            <div class="us-section">
+                                <h4 class="us-section-title">Profile</h4>
+                                <div class="us-profile-grid">
+                                    <div><span class="text-tertiary text-sm">Username</span><div id="us-username" class="mono"></div></div>
+                                    <div><span class="text-tertiary text-sm">Email</span><div id="us-email-display" class="mono"></div></div>
+                                    <div><span class="text-tertiary text-sm">Role</span><div id="us-role"></div></div>
+                                    <div><span class="text-tertiary text-sm">Last login</span><div id="us-last-login"></div></div>
+                                </div>
+                            </div>
+
+                            <form id="us-password-form" class="us-section us-credential">
+                                <h4 class="us-section-title">Change password</h4>
+                                <div class="form-group">
+                                    <label for="us-cur-pw">Current password</label>
+                                    <input type="password" id="us-cur-pw" class="form-control" autocomplete="current-password">
+                                </div>
+                                <div class="form-group">
+                                    <label for="us-new-pw">New password</label>
+                                    <input type="password" id="us-new-pw" class="form-control" minlength="8" autocomplete="new-password">
+                                </div>
+                                <div class="form-group">
+                                    <label for="us-new-pw2">Confirm new password</label>
+                                    <input type="password" id="us-new-pw2" class="form-control" minlength="8" autocomplete="new-password">
+                                </div>
+                                <button type="submit" class="btn btn-primary">Update password</button>
+                            </form>
+
+                            <form id="us-email-form" class="us-section us-credential">
+                                <h4 class="us-section-title">Change email</h4>
+                                <div class="form-group">
+                                    <label for="us-new-email">New email</label>
+                                    <input type="email" id="us-new-email" class="form-control">
+                                </div>
+                                <div class="form-group">
+                                    <label for="us-email-cur-pw">Current password</label>
+                                    <input type="password" id="us-email-cur-pw" class="form-control" autocomplete="current-password">
+                                </div>
+                                <button type="submit" class="btn btn-primary">Update email</button>
+                            </form>
+
+                            <div class="us-section us-credential">
+                                <h4 class="us-section-title">SFTP</h4>
+                                <label class="checkbox-row"><input type="checkbox" id="us-sftp-enabled"><span>SFTP access enabled</span></label>
+                                <label class="checkbox-row"><input type="checkbox" id="us-sftp-pw-auth"><span>Allow SFTP password authentication</span></label>
+                                <button type="button" id="us-sftp-save" class="btn btn-secondary btn-sm mt-sm">Save SFTP options</button>
+                                <div class="mt-md">
+                                    <label>SSH keys</label>
+                                    <div class="ssh-keys-list" data-user-id=""></div>
+                                    <input type="text" class="ssh-key-name form-control mt-sm" data-user-id="" placeholder="Key label (e.g. laptop)" maxlength="100">
+                                    <textarea class="ssh-key-public form-control mt-sm" data-user-id="" rows="2" placeholder="ssh-ed25519 AAAA… or ssh-rsa AAAA…"></textarea>
+                                    <button type="button" id="us-ssh-add" class="btn btn-secondary btn-sm mt-sm">Add SSH key</button>
+                                </div>
+                            </div>
+
+                            <div class="us-section">
+                                <h4 class="us-section-title">Appearance</h4>
+                                <div class="form-group">
+                                    <label for="us-theme">Theme</label>
+                                    <select id="us-theme" class="form-control"><option value="light">Light</option><option value="dark">Dark</option></select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="us-skin">Interface</label>
+                                    <select id="us-skin" class="form-control"><option value="v2">Console</option><option value="v1">Classic</option></select>
+                                    <small class="form-help">Accent &amp; background colours are in the profile menu.</small>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="close-modal-btn btn btn-secondary">Close</button>
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <!-- Edit Vault Info Modal -->
