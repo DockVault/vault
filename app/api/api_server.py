@@ -1640,6 +1640,12 @@ def _temp_passcode_policy(db: Session) -> dict:
     return temp_passcode_policy.effective_policy(_global_settings_blob(db))
 
 
+def _force_no_remember_vault_password(db: Session) -> bool:
+    """Org policy: when True, browser-remembering a vault password is forbidden deployment-wide, so
+    every vault's EFFECTIVE unlock_remember_minutes is clamped to 0 (always re-ask). Default False."""
+    return bool(_global_settings_blob(db).get("force_no_remember_vault_password", False))
+
+
 def _validate_settings_payload(payload: dict, db: Session) -> None:
     """Validate the few settings keys that drive real enforcement so the admin UI
     can't silently persist values that later fail open. The store is otherwise
@@ -1657,7 +1663,7 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Settings payload must be an object")
 
-    for bool_key in ("zero_knowledge_enabled", "force_zero_knowledge"):
+    for bool_key in ("zero_knowledge_enabled", "force_zero_knowledge", "force_no_remember_vault_password"):
         if bool_key in payload and not isinstance(payload[bool_key], bool):
             raise HTTPException(status_code=400, detail=f"{bool_key} must be true or false")
 
@@ -1754,6 +1760,8 @@ async def get_settings(
     # Overlay the EFFECTIVE Temporary Vault Passcode policy (incl. the ZK-in-scope toggle) so the
     # Settings card renders correct defaults even when never saved (feature default OFF, allow-ZK ON).
     data.update(_temp_passcode_policy(db))
+    # Effective org floor for browser-remembering a vault password (default OFF).
+    data["force_no_remember_vault_password"] = _force_no_remember_vault_password(db)
     return data
 
 
@@ -2426,8 +2434,12 @@ async def get_temp_passcode_policy(
       - temp_passcode_one_time_default / temp_passcode_single_vault_only / temp_passcode_max_lifetime_minutes:
           mint defaults / ceilings
       - temp_cred_allow_zk_vaults: whether a zero-knowledge vault may be included in scope at all
+      - force_no_remember_vault_password: deployment-wide floor forbidding the browser from
+          remembering a vault password (lets the account UI show the per-user toggle as forced)
     No enforcement here — redemption reads the policy."""
-    return _temp_passcode_policy(db)
+    policy = dict(_temp_passcode_policy(db))
+    policy["force_no_remember_vault_password"] = _force_no_remember_vault_password(db)
+    return policy
 
 
 @app.get("/zk/unsealed")
@@ -3567,6 +3579,9 @@ _PREF_ALLOWED = {
     "accent": {"teal", "indigo", "violet", "rose", "orange", "sky"},
     "background": {"slate", "graphite", "navy", "warm", "forest", "plum"},
     "ui": {"v1", "v2"},
+    # Per-user opt-out of browser-remembering a vault password. Stored as a string enum ('on'/'off')
+    # because _sanitize_preferences keeps only string values in the whitelist (a bare bool is dropped).
+    "never_remember_vault_password": {"on", "off"},
 }
 
 
@@ -3588,6 +3603,7 @@ class PreferencesUpdate(BaseModel):
     accent: Optional[str] = None
     background: Optional[str] = None
     ui: Optional[str] = None
+    never_remember_vault_password: Optional[str] = None
 
 
 @app.get("/users/me/preferences")
@@ -4690,6 +4706,7 @@ async def create_vault(
     )
     
     # Build response dict with has_password
+    _fnr = _force_no_remember_vault_password(db)
     vault_dict = {
         'id': vault.id,
         'name': vault.name,
@@ -4698,7 +4715,7 @@ async def create_vault(
         'has_password': vault.password_hash is not None,
         'expire_files_after_days': vault.expire_files_after_days,
         'expire_files_unit': vault.expire_files_unit or 'days',
-        'unlock_remember_minutes': vault.unlock_remember_minutes,
+        'unlock_remember_minutes': (0 if _fnr else vault.unlock_remember_minutes),
         'size_limit': vault.size_limit,
         'total_size_bytes': vault.total_size_bytes,
         'file_count': vault.file_count,
@@ -4741,6 +4758,7 @@ async def list_vaults(
     }
 
     from app.core.temp_scope import scope_ids as _scope_ids
+    _fnr = _force_no_remember_vault_password(db)
     result = []
     for vault in vaults:
         perms = permission_service.get_vault_permissions(current_user, vault.id)
@@ -4755,7 +4773,7 @@ async def list_vaults(
             'has_password': vault.password_hash is not None,
             'expire_files_after_days': vault.expire_files_after_days,
             'expire_files_unit': vault.expire_files_unit or 'days',
-            'unlock_remember_minutes': vault.unlock_remember_minutes,
+            'unlock_remember_minutes': (0 if _fnr else vault.unlock_remember_minutes),
             'size_limit': vault.size_limit,
             'total_size_bytes': None if _id_scoped else vault.total_size_bytes,
             'file_count': None if _id_scoped else vault.file_count,
@@ -4803,6 +4821,7 @@ async def get_vault(
         # would reveal how many files exist outside its scope). Suppress the denormalized aggregates.
         from app.core.temp_scope import scope_ids as _scope_ids
         _id_scoped = _scope_ids(current_user, vault_id) is not None
+        _fnr = _force_no_remember_vault_password(db)
 
         # Build response dict with has_password and owner_username
         vault_dict = {
@@ -4814,7 +4833,7 @@ async def get_vault(
             'has_password': vault.password_hash is not None,
             'expire_files_after_days': vault.expire_files_after_days,
             'expire_files_unit': vault.expire_files_unit or 'days',
-            'unlock_remember_minutes': vault.unlock_remember_minutes,
+            'unlock_remember_minutes': (0 if _fnr else vault.unlock_remember_minutes),
             'size_limit': vault.size_limit,
             'total_size_bytes': None if _id_scoped else vault.total_size_bytes,
             'file_count': None if _id_scoped else vault.file_count,
@@ -5235,13 +5254,18 @@ async def update_vault_settings(
                 except (TypeError, ValueError):
                     raise HTTPException(status_code=400, detail="unlock_remember_minutes must be a number")
                 urm = max(0, min(urm, 1440))  # 0 = always ask, cap at 24h
+                if urm and _force_no_remember_vault_password(db):
+                    urm = 0  # org policy forbids browser-remembering the vault password
             vault.unlock_remember_minutes = urm
             updated_fields.append('unlock_remember_minutes')
 
         vault.updated_at = datetime.now(timezone.utc)
         db.commit()
-        
-        return {"message": "Vault settings updated successfully"}
+
+        # Echo the stored unlock window (already clamped to 0 when the org floor is set) so the
+        # client bases its remember cache on the authoritative value, not the submitted one.
+        return {"message": "Vault settings updated successfully",
+                "unlock_remember_minutes": vault.unlock_remember_minutes}
         
     except ResourceNotFoundError as e:
         raise HTTPException(

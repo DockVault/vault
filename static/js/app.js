@@ -88,7 +88,16 @@ const state = {
     // when the tab closes) and only for the unlock window, so a refresh keeps you
     // in the vault. The password never leaves the browser / never hits the server.
     rememberedVaults: {},
+    // Per-user preference: when on, the browser never remembers a vault password (always re-ask),
+    // regardless of the vault's unlock window. Loaded from server preferences on boot.
+    neverRememberVaultPassword: false,
+    // Deployment-wide org floor (admin-set): when on, remembering is forbidden for everyone and the
+    // per-user toggle is shown forced-on. Mirrors the server-side unlock_remember_minutes clamp.
+    forceNoRememberVaultPassword: false,
     rememberVaultPassword(vaultId, password, minutes) {
+        // The deployment-wide org floor and the per-user opt-out both forbid remembering — a
+        // stale/local unlock window from any call site can't override either.
+        if (this.forceNoRememberVaultPassword || this.neverRememberVaultPassword) { delete this.rememberedVaults[vaultId]; this._persistRemembered(); return; }
         const mins = (typeof minutes === 'number' && minutes >= 0) ? minutes : 15;
         if (mins === 0) { delete this.rememberedVaults[vaultId]; this._persistRemembered(); return; } // 0 = always ask
         this.rememberedVaults[vaultId] = { password, expiresAt: Date.now() + mins * 60 * 1000 };
@@ -2963,6 +2972,21 @@ function openUserSettingsModal() {
     const themeSel = document.getElementById('us-theme'); if (themeSel && tm) themeSel.value = (tm.currentTheme === 'dark') ? 'dark' : 'light';
     const skinSel = document.getElementById('us-skin'); if (skinSel && tm) skinSel.value = (tm.currentUi === 'v1') ? 'v1' : 'v2';
 
+    // Privacy: "never remember vault password". Reflect the user's own preference immediately,
+    // then fetch the deployment-wide org floor and, if set, force the toggle on + disabled.
+    const nrEl = document.getElementById('us-never-remember-pw');
+    const nrForced = document.getElementById('us-never-remember-forced');
+    if (nrEl) {
+        nrEl.checked = !!state.neverRememberVaultPassword;
+        nrEl.disabled = false;
+        if (nrForced) nrForced.style.display = 'none';
+        apiRequest('/temp-passcode-policy', { silent: true }).then(p => {
+            const forced = !!(p && p.force_no_remember_vault_password === true);
+            state.forceNoRememberVaultPassword = forced;
+            if (forced) { nrEl.checked = true; nrEl.disabled = true; if (nrForced) nrForced.style.display = ''; }
+        }).catch(() => {});
+    }
+
     document.querySelector('.profile-menu')?.classList.remove('active');  // close the dropdown
     openModal('user-settings-modal');
 }
@@ -3025,6 +3049,13 @@ function wireUserSettingsModal() {
         // re-applies the skin pre-paint), handling the save/reload race for us.
         const v = e.target.value === 'v1' ? 'v1' : 'v2';
         if (window.themeManager && typeof window.themeManager.setUi === 'function') window.themeManager.setUi(v);
+    });
+    document.getElementById('us-never-remember-pw')?.addEventListener('change', (e) => {
+        if (state.forceNoRememberVaultPassword) { e.target.checked = true; return; }  // org floor: not user-changeable
+        const on = !!e.target.checked;
+        state.neverRememberVaultPassword = on;
+        if (on) { state.rememberedVaults = {}; state._persistRemembered(); }  // drop anything already held
+        if (window.saveUserPreference) window.saveUserPreference({ never_remember_vault_password: on ? 'on' : 'off' });
     });
 }
 
@@ -4512,6 +4543,8 @@ async function loadSettings() {
         if (fzkEl) fzkEl.checked = settings.force_zero_knowledge === true;
         const dssEl = document.getElementById('setting-directory-search-scope');
         if (dssEl) dssEl.value = (settings.directory_search_scope === 'same_department') ? 'same_department' : 'deployment';
+        const fnrEl = document.getElementById('setting-force-no-remember-vault-password');
+        if (fnrEl) fnrEl.checked = settings.force_no_remember_vault_password === true;
 
         // Temporary Vault Passcodes. GET /settings overlays the EFFECTIVE policy, so these keys
         // are always present (feature default off; allow-ZK default on).
@@ -4604,6 +4637,7 @@ async function saveAllSettings() {
             zero_knowledge_enabled: document.getElementById('setting-zero-knowledge-enabled').checked,
             force_zero_knowledge: document.getElementById('setting-force-zero-knowledge').checked,
             directory_search_scope: (document.getElementById('setting-directory-search-scope') || {}).value || 'deployment',
+            force_no_remember_vault_password: document.getElementById('setting-force-no-remember-vault-password').checked,
 
             // Temporary Vault Passcodes
             temp_passcodes_enabled: document.getElementById('setting-temp-passcodes-enabled').checked,
@@ -8580,21 +8614,23 @@ async function handleSetExpiry(e) {
                 body.size_limit = newSizeBytes;
             }
         }
-        await apiRequest(`/vaults/${state.currentVault.id}/settings`, {
+        const saved = await apiRequest(`/vaults/${state.currentVault.id}/settings`, {
             method: 'PATCH',
             body: JSON.stringify(body)
         });
+        // Trust the server's stored window (clamped to 0 when the org floor is set), not the submitted one.
+        const effectiveUrm = (saved && typeof saved.unlock_remember_minutes === 'number') ? saved.unlock_remember_minutes : urm;
 
         // Update local state + drop any remembered password so the new window applies.
         state.currentVault.expire_files_after_days = expireValue > 0 ? expireValue : null;
         state.currentVault.expire_files_unit = expireValue > 0 ? expireUnit : 'days';
-        state.currentVault.unlock_remember_minutes = urm;
+        state.currentVault.unlock_remember_minutes = effectiveUrm;
         if (newSizeBytes != null) state.currentVault.size_limit = newSizeBytes;
         // Re-base the remember window on the new policy (applies to the next
         // re-entry; the currently-open vault stays open either way).
         state.forgetVaultPassword(state.currentVault.id);
         if (state.currentVault.has_password) {
-            state.rememberVaultPassword(state.currentVault.id, state.vaultPassword, urm);
+            state.rememberVaultPassword(state.currentVault.id, state.vaultPassword, effectiveUrm);
         }
 
         showSuccess('Vault policies saved');
@@ -8818,6 +8854,21 @@ async function applyServerPreferences() {
         prefs = await resp.json();
     } catch (_) { return false; }
     if (!prefs || typeof prefs !== 'object') return false;
+
+    // Per-user "never remember my vault password" preference (stored as 'on'/'off'). Apply it
+    // before any early-return below so the opt-out always takes effect.
+    if (typeof prefs.never_remember_vault_password === 'string') {
+        state.neverRememberVaultPassword = (prefs.never_remember_vault_password === 'on');
+        if (state.neverRememberVaultPassword) { state.rememberedVaults = {}; state._persistRemembered(); }
+    }
+    // Load the deployment-wide org floor at boot (not just when the account modal opens) so the
+    // client remember-guard is reliably armed before any vault is opened. Server-side the floor
+    // already clamps every vault's unlock window to 0; this closes the client cache path too.
+    try {
+        const pol = await apiRequest('/temp-passcode-policy', { silent: true });
+        state.forceNoRememberVaultPassword = !!(pol && pol.force_no_remember_vault_password === true);
+        if (state.forceNoRememberVaultPassword) { state.rememberedVaults = {}; state._persistRemembered(); }
+    } catch (_) { /* best-effort; the server clamp is the authoritative enforcement */ }
 
     const tm = window.themeManager;
     if (!tm) return false;

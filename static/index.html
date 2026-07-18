@@ -1304,6 +1304,18 @@
                                 </div>
                             </div>
                         </div>
+                        <div class="card mt-lg">
+                            <div class="card-header">
+                                <h3>Vault Password Handling</h3>
+                            </div>
+                            <div class="p-lg">
+                                <label class="flex items-center gap-sm">
+                                    <input type="checkbox" id="setting-force-no-remember-vault-password">
+                                    <span>Never remember vault passwords in the browser</span>
+                                </label>
+                                <p class="text-secondary text-sm mt-sm">When enabled, every vault’s unlock window is forced to 0 deployment-wide — a user must re-enter a vault’s password each time it is opened, and the per-user “remember” preference is locked on. Use for shared or untrusted devices. Leave off to let each vault keep its own unlock window.</p>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Audit Log Tab -->
@@ -1864,6 +1876,12 @@
                                     <select id="us-skin" class="form-control"><option value="v2">Console</option><option value="v1">Classic</option></select>
                                     <small class="form-help">Accent &amp; background colours are in the profile menu.</small>
                                 </div>
+                            </div>
+
+                            <div class="us-section">
+                                <h4 class="us-section-title">Privacy</h4>
+                                <label class="checkbox-row"><input type="checkbox" id="us-never-remember-pw"><span>Never remember vault passwords in this browser</span></label>
+                                <small class="form-help" id="us-never-remember-forced" style="display:none;">Required by your administrator — vault passwords are never remembered on this deployment.</small>
                             </div>
                         </div>
                         <div class="modal-footer">
