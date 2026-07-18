@@ -1756,12 +1756,21 @@ function _tcDecoratePasscodeRows(vaults) {
             inp.style.cssText = 'display:none;margin:0 0 10px 26px;max-width:340px;';
             anchor.insertAdjacentElement('afterend', inp);
         } else if (isZk) {
-            const note = document.createElement('div');
-            note.className = 'tc-passcode-zk-note text-tertiary text-sm';
-            note.dataset.vault = v.id;  // so the search filter can hide it with its row
-            note.style.cssText = 'display:none;margin:0 0 10px 26px;';
-            note.textContent = "Passcodes aren't available for zero-knowledge vaults — add a member or use a disposable standard vault.";
-            anchor.insertAdjacentElement('afterend', note);
+            // Two hidden notes; _tcSyncPasscodeUI shows whichever applies per the current policy: the
+            // passcode "not available" note (when ZK is allowed in a temp-cred scope) OR the org-policy
+            // "not allowed" note (when ZK is denied, alongside disabling the row's checkbox).
+            const pNote = document.createElement('div');
+            pNote.className = 'tc-passcode-zk-note text-tertiary text-sm';
+            pNote.dataset.vault = v.id;  // so the search filter can hide it with its row
+            pNote.style.cssText = 'display:none;margin:0 0 10px 26px;';
+            pNote.textContent = "Passcodes aren't available for zero-knowledge vaults — add a member or use a disposable standard vault.";
+            anchor.insertAdjacentElement('afterend', pNote);
+            const dNote = document.createElement('div');
+            dNote.className = 'tc-zk-deny-note text-tertiary text-sm';
+            dNote.dataset.vault = v.id;
+            dNote.style.cssText = 'display:none;margin:0 0 10px 26px;';
+            dNote.textContent = 'Not allowed in temporary credentials by organization policy.';
+            anchor.insertAdjacentElement('afterend', dNote);
         }
     });
 }
@@ -1795,8 +1804,22 @@ function _tcSyncPasscodeUI() {
     document.querySelectorAll('.tc-vault-passcode').forEach(el => {      // per-vault custom inputs
         el.style.display = (on && allowCustom && !sameOn && !_tcRowHidden(el.dataset.vault)) ? '' : 'none';
     });
-    document.querySelectorAll('.tc-passcode-zk-note').forEach(el => {    // ZK not-available note
-        el.style.display = (on && !_tcRowHidden(el.dataset.vault)) ? '' : 'none';
+    // Zero-knowledge vault handling per the org policy. DENY: disable + grey the ZK row and show the
+    // "not allowed" note. ALLOW: keep it selectable; the passcode "not available" note shows when the
+    // passcode toggle is on. (The server independently enforces the deny at the mint chokepoint.)
+    // Fail closed: a null policy (pre-load / fetch failure) is treated as DENY, matching the
+    // passcode section's fail-closed posture — the server is the authority either way.
+    const denyZk = !(_tcPasscodePolicy && _tcPasscodePolicy.temp_cred_allow_zk_vaults !== false);
+    document.querySelectorAll('.tc-zk-deny-note').forEach(dn => {
+        const vid = dn.dataset.vault;
+        const cb = document.querySelector(`.tc-vault-pick[value="${vid}"]`);
+        const row = cb && cb.closest('.member-pick-item');
+        if (cb) { cb.disabled = denyZk; if (denyZk) cb.checked = false; }
+        if (row) row.style.opacity = denyZk ? '0.55' : '';
+        dn.style.display = (denyZk && !_tcRowHidden(vid)) ? '' : 'none';
+    });
+    document.querySelectorAll('.tc-passcode-zk-note').forEach(el => {    // passcode not-available note (ALLOW only)
+        el.style.display = (on && !denyZk && !_tcRowHidden(el.dataset.vault)) ? '' : 'none';
     });
     const minLen = (_tcPasscodePolicy && _tcPasscodePolicy.temp_passcode_min_length) || 16;
     const oneTime = !(_tcPasscodePolicy && _tcPasscodePolicy.temp_passcode_one_time_default === false);
@@ -1806,6 +1829,31 @@ function _tcSyncPasscodeUI() {
         : '';
     const help = document.getElementById('tc-passcode-shared-help');
     if (help) help.textContent = `At least ${minLen} characters (blank to auto-generate).`;
+}
+
+// Acknowledge-to-proceed modal shown when the scope includes a zero-knowledge vault (allow policy):
+// a passcode isn't available for it, so the holder must enter the real account passphrase (master
+// key). The mint proceeds only on explicit acknowledgment. Static content -> XSS-safe.
+function _tcConfirmZkAck(onProceed) {
+    const existing = document.getElementById('tc-zk-ack-modal');
+    if (existing) existing.remove();
+    const html = `
+        <div id="tc-zk-ack-modal" class="modal active">
+            <div class="modal-content" style="max-width:520px;">
+                <div class="modal-header"><h3>Zero-knowledge vault in scope</h3></div>
+                <div class="modal-body">
+                    <div class="alert alert-warning">This credential's scope includes a zero-knowledge vault. Temporary passcodes aren't available for them — the holder must enter the real account passphrase (your master key) to decrypt their contents. Only issue this where you trust the device the passphrase will be typed on.</div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" id="tc-zk-ack-cancel">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="tc-zk-ack-proceed">I understand — continue</button>
+                </div>
+            </div>
+        </div>`;
+    document.body.insertAdjacentHTML('beforeend', html);
+    const modal = document.getElementById('tc-zk-ack-modal');
+    modal.querySelector('#tc-zk-ack-cancel').addEventListener('click', () => modal.remove());
+    modal.querySelector('#tc-zk-ack-proceed').addEventListener('click', () => { modal.remove(); onProceed(); });
 }
 
 // --- File/folder restriction picker (produces selected_vaults[].scope_ids) ------------------
@@ -9107,13 +9155,26 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             // Do NOT close here — generateTempCreds closes the modal only on success, and keeps it
             // open (with an inline error) on a recoverable failure so entered state isn't lost.
-            generateTempCreds({
+            const doMint = () => generateTempCreds({
                 validity_minutes: validityMinutes, note, can_create_temp_credentials: canCreate,
                 scope: scopeData ? scopeData.scope : null,
                 vault_access_mode: scopeData ? scopeData.vault_access_mode : null,
                 selected_vaults: scopeData ? scopeData.selected_vaults : null,
                 passcode_same_for_all: scopeData ? scopeData.passcode_same_for_all : false,
             });
+            // ZK-in-scope (allow policy): if the scope includes a zero-knowledge vault, a passcode
+            // isn't available for it — require an explicit acknowledgment that the holder must type the
+            // master passphrase before we mint. (Deny policy disables ZK rows / rejects server-side.)
+            // An unrestricted (no scope) or all-vaults mint reaches EVERY vault, so it counts as
+            // "ZK in scope" when the account owns/holds any zero-knowledge vault.
+            const allowZk = !(_tcPasscodePolicy && _tcPasscodePolicy.temp_cred_allow_zk_vaults === false);
+            const _mode = scopeData ? scopeData.vault_access_mode : null;
+            const _unrestrictedOrAll = !scopeData || _mode === 'all';
+            const zkSelected = _unrestrictedOrAll
+                ? Object.keys(_tcVaultObjs).some(id => (_tcVaultObjs[id] || {}).type === 'zero_knowledge')
+                : (scopeData.selected_vaults || []).some(sv => (_tcVaultObjs[sv.vault_id] || {}).type === 'zero_knowledge');
+            if (allowZk && zkSelected) { _tcConfirmZkAck(doMint); return; }
+            doMint();
         });
     }
     

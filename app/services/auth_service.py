@@ -32,6 +32,22 @@ from app.core.config import settings
 _DUMMY_PASSWORD_HASH = hash_password("dummy-account-do-not-use-x9Q2")
 
 
+def user_reaches_active_zk_vault(db, user_id) -> bool:
+    """True when a user OWNS or is a keyed MEMBER of any active zero-knowledge vault — i.e. an
+    unrestricted / all-vaults temporary credential for them would put zero-knowledge content in
+    scope. Used to enforce the ZK-in-scope deny policy on the mint paths that don't resolve to a
+    per-vault selected list (unrestricted + all-vaults + the admin-for-user unrestricted mint)."""
+    from app.core.models import Vault, VaultMemberKey
+    if db.query(Vault.id).filter(
+            Vault.owner_id == user_id, Vault.type == "zero_knowledge", Vault.is_active == True).first():  # noqa: E712
+        return True
+    member = (db.query(VaultMemberKey.id)
+              .join(Vault, Vault.id == VaultMemberKey.vault_id)
+              .filter(VaultMemberKey.user_id == user_id, Vault.type == "zero_knowledge",
+                      Vault.is_active == True).first())  # noqa: E712
+    return member is not None
+
+
 # --- Token revocation denylist ---------------------------------------------
 # On logout we blacklist the session token in Redis until it would expire anyway, so the
 # JWT stops working IMMEDIATELY without having to validate session existence on every
@@ -466,6 +482,25 @@ class AuthService:
             if is_delegated and parent_vault_mode == 'selected':
                 mode = 'selected'  # a child cannot broaden vault access to 'all'
 
+        # Org policy: may a zero-knowledge vault be in a temp credential's scope at all? Read once here
+        # and reused below (the selected-mode per-vault loop + the passcode block).
+        from app.core import temp_passcode_policy as _tpp
+        from app.core.models import SystemSetting as _PolSS
+        _pol_row = self.db.query(_PolSS).filter(_PolSS.key == 'global').first()
+        _tp_policy = _tpp.effective_policy((_pol_row.value or {}) if (_pol_row and _pol_row.value) else {})
+        # An UNRESTRICTED (effective_scope is None) or ALL-vaults credential does NOT pass through the
+        # per-vault selected loop below, yet it reaches every vault the account can access — including
+        # zero-knowledge. Enforce the deny here too, fail-closed, before anything is persisted, when the
+        # minting account owns or is a keyed member of any active ZK vault. (Selected-mode ZK entries
+        # are rejected per-vault in the proof loop; the admin-for-user unrestricted mint is guarded at
+        # its own endpoint.)
+        if (effective_scope is None or mode == 'all') and not _tp_policy['temp_cred_allow_zk_vaults'] \
+                and user_reaches_active_zk_vault(self.db, user_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=("Zero-knowledge vaults can't be included in a temporary credential by "
+                        "organization policy. Mint a credential scoped to specific standard vaults instead."))
+
         # A 'selected'-mode credential scoped to the vaults page but with no vaults that will
         # actually resolve to an access grant can reach nothing — reject rather than silently mint
         # a dead credential. Keyed on the 'vaults' page (the only signal that governs selected-mode
@@ -517,7 +552,18 @@ class AuthService:
                     vault = self.db.query(Vault).filter(Vault.id == uuid.UUID(str(vid))).first()
                 except (ValueError, AttributeError):
                     continue
-                if vault is None or not vault.password_hash:
+                if vault is None:
+                    continue
+                # Org policy may forbid a zero-knowledge vault in a temp credential's scope entirely (a
+                # scoped ZK cred still forces the holder to enter the account master passphrase). Fail
+                # closed HERE so self-service AND delegated-child mints both honor it, before anything is
+                # persisted. The admin-for-user path (no scope) is guarded separately at its endpoint.
+                if not _tp_policy['temp_cred_allow_zk_vaults'] and getattr(vault, 'type', 'standard') == 'zero_knowledge':
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=(f"Zero-knowledge vaults can't be included in a temporary credential by "
+                                f"organization policy (vault '{vault.name}')."))
+                if not vault.password_hash:
                     continue  # not password-protected — nothing to prove
                 supplied = sv.get('password') if isinstance(sv, dict) else None
                 if not supplied or not verify_password(supplied, vault.password_hash):
@@ -542,12 +588,9 @@ class AuthService:
             requested = [sv for sv in selected_vaults
                          if isinstance(sv, dict) and sv.get('issue_passcode')]
             if requested:
-                from app.core import temp_passcode_policy as tpp
                 from app.core.password_policy import password_policy_errors
                 from app.core.security import generate_passcode
-                from app.core.models import SystemSetting
-                _row = self.db.query(SystemSetting).filter(SystemSetting.key == 'global').first()
-                policy = tpp.effective_policy((_row.value or {}) if (_row and _row.value) else {})
+                policy = _tp_policy  # resolved unconditionally above
                 if not policy['temp_passcodes_enabled']:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,

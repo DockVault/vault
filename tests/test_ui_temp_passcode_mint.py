@@ -198,8 +198,11 @@ def test_mixed_selection_omits_zk_from_passcode_payload(page: Page, admin, admin
         page.fill(f'.tc-vault-pw[data-vault="{std["id"]}"]', _PW)
         page.locator(f'.tc-vault-pick[value="{zk["id"]}"]').check()
         page.check("#tc-passcode-enable")
+        page.click("#generate-temp-creds-form button[type=submit]")
+        # a selected ZK vault triggers the acknowledge-to-proceed modal (allow policy) — proceed
+        expect(page.locator("#tc-zk-ack-modal")).to_be_visible(timeout=8000)
         with page.expect_request("**/auth/temp-credentials") as ri:
-            page.click("#generate-temp-creds-form button[type=submit]")
+            page.click("#tc-zk-ack-proceed")
         body = ri.value.post_data_json
         by_id = {x["vault_id"]: x for x in body["selected_vaults"]}
         assert by_id[std["id"]].get("issue_passcode") is True

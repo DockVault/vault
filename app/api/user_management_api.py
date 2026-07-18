@@ -700,7 +700,24 @@ async def create_temp_credential_for_user(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
+    # ZK-in-scope policy: this endpoint mints an UNRESTRICTED (whole-account) credential, which would
+    # reach the target's zero-knowledge vaults. Under a deny policy that bypasses the ZK-in-scope
+    # restriction, so refuse (fail-closed) when the target owns OR is a keyed member of any active ZK
+    # vault — the target can mint a scoped credential for themselves instead. (Scoped/self-service +
+    # delegated + all-vaults/unrestricted mints enforce this inside create_temporary_credential, using
+    # the same user_reaches_active_zk_vault check.)
+    from app.core import temp_passcode_policy
+    from app.core.models import SystemSetting
+    from app.services.auth_service import user_reaches_active_zk_vault
+    _pol_row = db.query(SystemSetting).filter(SystemSetting.key == "global").first()
+    if (not temp_passcode_policy.allow_zk_vaults((_pol_row.value or {}) if (_pol_row and _pol_row.value) else {})
+            and user_reaches_active_zk_vault(db, user_id)):
+        raise HTTPException(
+            status_code=400,
+            detail=("This user owns or is a member of zero-knowledge vaults, which organization policy "
+                    "forbids in a temporary credential. Ask them to mint a scoped credential for themselves."))
+
     # Create the temp credential
     auth_service = AuthService(db)
     result = auth_service.create_temporary_credential(user_id)
