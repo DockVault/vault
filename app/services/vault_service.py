@@ -25,6 +25,29 @@ from app.core.config import settings
 from app.core.database import redis_client
 from app.services.encrypted_file_storage import EncryptedFileStorage
 
+import contextvars
+
+# The X-Vault-Passcode header value for the CURRENT HTTP request, captured by a pure-ASGI middleware
+# (see api_server.VaultPasscodeMiddleware) and read by get_vault. A contextvar so a temp-credential
+# passcode can be redeemed at the single get_vault chokepoint WITHOUT threading a second header through
+# every file endpoint (the vault password is threaded explicitly; the passcode rides this instead).
+# None for SFTP / requests without the header.
+_vault_passcode_ctx = contextvars.ContextVar("vault_passcode", default=None)
+
+
+def current_vault_passcode():
+    """The X-Vault-Passcode for the current request, or None."""
+    return _vault_passcode_ctx.get()
+
+
+def set_current_vault_passcode(value):
+    """Set the request's X-Vault-Passcode (middleware only); returns a token to reset with."""
+    return _vault_passcode_ctx.set(value)
+
+
+def reset_current_vault_passcode(token):
+    _vault_passcode_ctx.reset(token)
+
 
 def _seal_named_object(vault, obj, is_file: bool) -> None:
     """Encrypt a File/Folder name (and a File's MIME) at rest for STANDARD vaults and set
@@ -404,6 +427,66 @@ class VaultService:
         
         return vault
     
+    def _redeem_temp_passcode(self, user, vault, passcode, burn) -> bool:
+        """Redeem a temp-credential passcode as an alternative to the real vault password on a
+        password-protected STANDARD vault. Returns True when a valid passcode was redeemed; False when
+        no passcode applies (caller falls through to the real-password path). Raises InvalidPasswordError
+        (recording a rate-limit failure via ``burn`` on a wrong/absent-verifier passcode) when a passcode
+        was supplied but is wrong, expired, or used up. The passcode is a second server-side access
+        gate — it does NOT re-encrypt content; caps/scope are still enforced independently."""
+        if not passcode:
+            return False
+        if not getattr(user, "_is_temp_session", False) or not getattr(user, "_temp_cred_id", None):
+            return False  # only a temp session redeems a passcode; others use the real password
+        # Master kill-switch: if the feature is turned OFF, outstanding passcodes stop working (defense
+        # in depth — an admin can disable redemption org-wide, e.g. on a suspected passcode leak).
+        from app.core import temp_passcode_policy
+        from app.core.models import SystemSetting, TempCredentialVaultAccess
+        _pol = self.db.query(SystemSetting).filter(SystemSetting.key == "global").first()
+        if not temp_passcode_policy.passcodes_enabled((_pol.value or {}) if (_pol and _pol.value) else {}):
+            raise InvalidPasswordError("Temporary vault passcodes are disabled")
+        grant = self.db.query(TempCredentialVaultAccess).filter(
+            TempCredentialVaultAccess.temp_credential_id == user._temp_cred_id,
+            TempCredentialVaultAccess.vault_id == vault.id,
+        ).first()
+        if grant is None or not grant.passcode_hash:
+            burn()
+            raise InvalidPasswordError("Invalid vault passcode")
+        # Expiry (stored naive-UTC or tz-aware).
+        exp = grant.passcode_expires_at
+        if exp is not None:
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) >= exp:
+                raise InvalidPasswordError("This vault passcode has expired")
+        # Use cap (one-time = max_uses 1; NULL = multi-use).
+        if grant.passcode_max_uses is not None and (grant.passcode_use_count or 0) >= grant.passcode_max_uses:
+            raise InvalidPasswordError("This vault passcode has already been used")
+        if not verify_password(passcode, grant.passcode_hash):
+            burn()
+            raise InvalidPasswordError("Invalid vault passcode")
+        # Success: count the use. For a capped passcode do an ATOMIC conditional increment so two
+        # concurrent redemptions can't both burn a one-time passcode (row-count guards the race).
+        if grant.passcode_max_uses is not None:
+            updated = self.db.query(TempCredentialVaultAccess).filter(
+                TempCredentialVaultAccess.id == grant.id,
+                TempCredentialVaultAccess.passcode_use_count < grant.passcode_max_uses,
+            ).update(
+                {TempCredentialVaultAccess.passcode_use_count: TempCredentialVaultAccess.passcode_use_count + 1},
+                synchronize_session=False)
+            self.db.commit()
+            if not updated:
+                raise InvalidPasswordError("This vault passcode has already been used")
+        else:
+            # Multi-use (no cap): still count uses for audit, atomically so a concurrent redemption
+            # can't lose a count.
+            self.db.query(TempCredentialVaultAccess).filter(
+                TempCredentialVaultAccess.id == grant.id).update(
+                {TempCredentialVaultAccess.passcode_use_count: TempCredentialVaultAccess.passcode_use_count + 1},
+                synchronize_session=False)
+            self.db.commit()
+        return True
+
     def get_vault(
         self,
         vault_id: uuid.UUID,
@@ -446,40 +529,37 @@ class VaultService:
         from app.core.temp_scope import enforce_vault
         enforce_vault(user, vault_id)
 
-        # Rate limiting for password-protected vaults
+        # Password / passcode gate for password-protected vaults (file access). Metadata-only access
+        # (require_password=False) skips this.
         if vault.password_hash and require_password:
-            # Check rate limit before attempting password verification
             rate_key = f"rate_limit:vault:{vault_id}:{user.id}"
-            attempts = redis_client.get(rate_key)
-            
-            # Different limits based on role (admins get higher limit)
             from app.core.models import RoleEnum
+            # Different limits based on role (admins get higher limit)
             limit = settings.rate_limit_vault_attempts_admin if user.role == RoleEnum.ADMIN else settings.rate_limit_vault_attempts
-            
+            attempts = redis_client.get(rate_key)
             if attempts and int(attempts) >= limit:
-                raise RateLimitExceededError(
-                    f"Too many vault access attempts. Please try again later."
-                )
-        
-        # Check vault password if set AND if we require password validation
-        # For metadata-only access (like opening vault view), we don't require password
-        # For file access, we do require password
-        if vault.password_hash and require_password:
-            if not vault_password:
-                raise PasswordRequiredError("Vault password is required")
-            
-            # Verify password
-            password_valid = verify_password(vault_password, vault.password_hash)
-            
-            # Record failed attempt for rate limiting
-            if not password_valid:
-                rate_key = f"rate_limit:vault:{vault_id}:{user.id}"
+                raise RateLimitExceededError("Too many vault access attempts. Please try again later.")
+
+            def _burn():
+                # One failed attempt on the inline, failure-only, fixed-window counter (shared by the
+                # real-password and passcode checks so neither is an unthrottled bypass of the other).
+                # The bucket is keyed by (vault, account); a temp session runs AS the owning account, so
+                # a temp holder's wrong-passcode guesses share the owner's bucket — an intentional
+                # trade-off (a separate bucket would grant an attacker 2x total guesses).
                 pipe = redis_client.pipeline()
                 pipe.incr(rate_key)
                 pipe.expire(rate_key, settings.rate_limit_vault_window_seconds)
                 pipe.execute()
-                
-                raise InvalidPasswordError("Invalid vault password")
+
+            # A temp-credential passcode opens the vault in place of the real vault password. When a
+            # passcode is supplied (X-Vault-Passcode, via the request contextvar) it must be valid;
+            # otherwise fall through to the real-password check.
+            if not self._redeem_temp_passcode(user, vault, current_vault_passcode(), _burn):
+                if not vault_password:
+                    raise PasswordRequiredError("Vault password is required")
+                if not verify_password(vault_password, vault.password_hash):
+                    _burn()
+                    raise InvalidPasswordError("Invalid vault password")
         
         # If password was provided, validate it (even if not required)
         if vault.password_hash and vault_password and not require_password:

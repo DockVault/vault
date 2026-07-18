@@ -337,6 +337,39 @@ if getattr(settings, 'rate_limit_api_enabled', True):
 
 app.add_middleware(SecurityHeadersMiddleware)
 
+
+class VaultPasscodeMiddleware:
+    """Pure-ASGI middleware that captures the X-Vault-Passcode header into a request-scoped contextvar
+    so VaultService.get_vault can redeem a temp-credential passcode at the single chokepoint without
+    threading the header through every file endpoint (the vault password is threaded explicitly; the
+    passcode rides the contextvar instead). Pure ASGI — NOT BaseHTTPMiddleware — so the contextvar
+    reliably propagates into the sync route handler's threadpool call."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        from app.services.vault_service import set_current_vault_passcode, reset_current_vault_passcode
+        value = None
+        for k, v in (scope.get("headers") or []):
+            if k == b"x-vault-passcode":
+                try:
+                    value = v.decode("latin-1")
+                except Exception:
+                    value = None
+                break
+        token = set_current_vault_passcode(value)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            reset_current_vault_passcode(token)
+
+
+app.add_middleware(VaultPasscodeMiddleware)
+
 # Host-header allowlist (opt-in). Empty ALLOWED_HOSTS => permissive ['*'] (a self-hosted vault's
 # served hostname is deployment-specific and unknown at build time), so this is inert unless the
 # operator declares the served name(s) — then a forged Host / X-Forwarded-Host is rejected (a
