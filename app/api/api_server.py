@@ -4778,20 +4778,22 @@ async def list_vaults(
 @require_vault_cap("vault.see_info")
 async def get_vault(
     vault_id: uuid.UUID,
-    vault_password: Optional[str] = None,
+    x_vault_password: Optional[str] = Header(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
     Get vault details (metadata only - no password required).
-    Password is only required when accessing files.
+    An optional X-Vault-Password HEADER soft-verifies the vault password (rate-limited). The password
+    is taken from the header, never a URL query string (which would leak into access logs).
     """
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
-    
+
     try:
-        # require_password=False means we're just viewing metadata
-        vault = vault_service.get_vault(vault_id, current_user, vault_password, require_password=False)
+        # require_password=False means we're just viewing metadata; a supplied X-Vault-Password is
+        # soft-verified (and rate-limited) inside get_vault.
+        vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=False)
 
         # Get owner username
         owner = db.query(User).filter(User.id == vault.owner_id).first()

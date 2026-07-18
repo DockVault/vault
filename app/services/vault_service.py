@@ -529,9 +529,12 @@ class VaultService:
         from app.core.temp_scope import enforce_vault
         enforce_vault(user, vault_id)
 
-        # Password / passcode gate for password-protected vaults (file access). Metadata-only access
-        # (require_password=False) skips this.
-        if vault.password_hash and require_password:
+        # Password / passcode gate for a password-protected vault. On file access (require_password) a
+        # real password OR a temp-credential passcode is required; on a metadata read a supplied
+        # password is soft-verified. BOTH checks share the same inline, failure-only, fixed-window rate
+        # counter so neither is an unthrottled brute-force surface (the soft-verify path used to be
+        # un-throttled). Skipped entirely for a metadata read with no password supplied.
+        if vault.password_hash and (require_password or vault_password):
             rate_key = f"rate_limit:vault:{vault_id}:{user.id}"
             from app.core.models import RoleEnum
             # Different limits based on role (admins get higher limit)
@@ -551,21 +554,23 @@ class VaultService:
                 pipe.expire(rate_key, settings.rate_limit_vault_window_seconds)
                 pipe.execute()
 
-            # A temp-credential passcode opens the vault in place of the real vault password. When a
-            # passcode is supplied (X-Vault-Passcode, via the request contextvar) it must be valid;
-            # otherwise fall through to the real-password check.
-            if not self._redeem_temp_passcode(user, vault, current_vault_passcode(), _burn):
-                if not vault_password:
-                    raise PasswordRequiredError("Vault password is required")
+            if require_password:
+                # A temp-credential passcode opens the vault in place of the real vault password. When a
+                # passcode is supplied (X-Vault-Passcode, via the request contextvar) it must be valid;
+                # otherwise fall through to the real-password check.
+                if not self._redeem_temp_passcode(user, vault, current_vault_passcode(), _burn):
+                    if not vault_password:
+                        raise PasswordRequiredError("Vault password is required")
+                    if not verify_password(vault_password, vault.password_hash):
+                        _burn()
+                        raise InvalidPasswordError("Invalid vault password")
+            elif vault_password:
+                # Soft-verify: a password supplied on a metadata read — verify it and rate-limit
+                # failures (no passcode path here; the passcode is a file-access gate).
                 if not verify_password(vault_password, vault.password_hash):
                     _burn()
                     raise InvalidPasswordError("Invalid vault password")
-        
-        # If password was provided, validate it (even if not required)
-        if vault.password_hash and vault_password and not require_password:
-            if not verify_password(vault_password, vault.password_hash):
-                raise InvalidPasswordError("Invalid vault password")
-        
+
         # Update last accessed time
         vault.last_accessed = datetime.now(timezone.utc)
         self.db.commit()
