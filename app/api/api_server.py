@@ -3775,21 +3775,29 @@ def _parse_ssh_public_key(line: str):
     return key_type, f"{key_type} {blob_b64}", fingerprint
 
 
-def _ssh_key_target_user(user_id, current_user, db):
+def _ssh_key_target_user(user_id, current_user, db, *, write=False):
     """Admin-or-self gate for SSH-key management; returns the target user.
 
-    A temp credential must not add/remove an SSH key on ANOTHER account — a stored key is a
-    persistent SFTP auth factor that outlives the credential's time-box. Self
-    management stays allowed; an admin acting on another user must be an INTERACTIVE admin."""
+    A stored SSH key is a persistent SFTP auth factor that outlives a temporary credential's
+    time-box, so a temp session must not CREATE or REMOVE one — not on another account and not
+    even on its own owning account (which would let the credential holder keep SFTP access after
+    the credential expires). Reads (listing keys) stay allowed for self. An admin acting on
+    another user must be an INTERACTIVE admin."""
     is_self = current_user.id == user_id
+    is_temp = getattr(current_user, "_is_temp_session", False)
     if not is_self:
         if current_user.role != RoleEnum.ADMIN:
             raise HTTPException(status_code=403, detail="Access denied")
-        if getattr(current_user, "_is_temp_session", False):
+        if is_temp:
             raise HTTPException(
                 status_code=403,
                 detail="This action requires an interactive admin session, not a temporary credential.",
             )
+    elif write and is_temp:
+        raise HTTPException(
+            status_code=403,
+            detail="A temporary credential cannot manage SSH keys; use an interactive session.",
+        )
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -3819,7 +3827,7 @@ async def add_ssh_key(
 ):
     """Add an SSH public key authorizing this user's SFTP access (admin or self)."""
     from app.core.models import UserSSHKey
-    _ssh_key_target_user(user_id, current_user, db)
+    _ssh_key_target_user(user_id, current_user, db, write=True)
     key_type, normalized, fingerprint = _parse_ssh_public_key(body.public_key)
     if db.query(UserSSHKey).filter(
         UserSSHKey.user_id == user_id, UserSSHKey.fingerprint == fingerprint
@@ -3854,7 +3862,7 @@ async def delete_ssh_key(
 ):
     """Remove an authorized SSH key (admin or self)."""
     from app.core.models import UserSSHKey
-    _ssh_key_target_user(user_id, current_user, db)
+    _ssh_key_target_user(user_id, current_user, db, write=True)
     key = db.query(UserSSHKey).filter(
         UserSSHKey.id == key_id, UserSSHKey.user_id == user_id
     ).first()

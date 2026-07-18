@@ -86,6 +86,31 @@ def test_temp_admin_cannot_plant_ssh_key_on_another_user(temp_admin_client, temp
     assert r.status_code == 403
 
 
+def test_temp_admin_cannot_plant_ssh_key_on_own_account(temp_admin_client):
+    # A temp credential must not add/remove an SSH key even on its OWN owning account: a stored key
+    # is a persistent SFTP auth factor that would outlive the credential's time-box, letting the
+    # holder keep SFTP access after it expires. The self-branch previously had no temp guard.
+    own_id = temp_admin_client.get("/users/me").json()["id"]
+    key = {
+        "name": "persist",
+        "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForTestingOnly00000000000000000 x",
+    }
+    assert temp_admin_client.post(f"/users/{own_id}/ssh-keys", json=key).status_code == 403
+    assert temp_admin_client.delete(
+        f"/users/{own_id}/ssh-keys/00000000-0000-0000-0000-000000000000"
+    ).status_code == 403
+    # reading its own keys stays allowed (a read is no escalation) — must not 403
+    assert temp_admin_client.get(f"/users/{own_id}/ssh-keys").status_code in (200, 304)
+
+
+def test_interactive_admin_not_blocked_by_ssh_temp_gate(admin):
+    # Guard: the temp write-gate must NOT block an interactive admin. A malformed key then fails
+    # validation (400/422) — proving the request passed the gate rather than being 403'd by it.
+    own_id = admin.get("/users/me").json()["id"]
+    r = admin.post(f"/users/{own_id}/ssh-keys", json={"name": "x", "public_key": "ssh-ed25519 not-a-real-key x"})
+    assert r.status_code != 403, r.text
+
+
 def test_temp_admin_cannot_mint_credentials_for_user(temp_admin_client, temp_user):
     r = temp_admin_client.post(
         f"/api/user-management/users/{temp_user['id']}/temp-credentials", json={}
