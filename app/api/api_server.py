@@ -4453,11 +4453,18 @@ def _validate_ids_exist(db: Session, model, ids, field: str) -> None:
         raise HTTPException(status_code=400, detail=f"{field} contains unknown id(s): {missing}")
 
 
-def _validate_share_tag_fields(eff: dict, changed_keys: set, db: Session) -> None:
+def _validate_share_tag_fields(eff: dict, changed_keys: set, db: Session, existing: dict = None) -> None:
     """Cross-field + existence validation for a share tag. `eff` is the EFFECTIVE (post-merge) view so
-    a PATCH that touches only one side of a pair is checked against the stored other side; existence is
-    only re-checked for id lists actually CHANGED (so a stale id in an untouched list can't block an
-    unrelated edit)."""
+    a PATCH that touches only one side of a pair is checked against the stored other side. Existence is
+    only re-checked for id lists actually CHANGED, and (on PATCH) only for the NEWLY-ADDED ids vs
+    `existing` — so an id that was valid when saved but whose user/group is later deleted can't block an
+    unrelated edit, while a fresh typo still fails loud."""
+    existing = existing or {}
+
+    def _new_ids(key):
+        prior = set(existing.get(key) or [])
+        return [i for i in (eff.get(key) or []) if i not in prior]
+
     ml, dl = eff.get("max_lifetime_minutes"), eff.get("default_lifetime_minutes")
     if ml is not None and dl is not None and dl > ml:
         raise HTTPException(status_code=400, detail="default_lifetime_minutes cannot exceed max_lifetime_minutes")
@@ -4478,10 +4485,10 @@ def _validate_share_tag_fields(eff: dict, changed_keys: set, db: Session) -> Non
         if not sharing_policy.normalize_audiences(aud):
             raise HTTPException(status_code=400, detail="allowed_audiences must include at least one audience")
     if "allowed_department_ids" in changed_keys:
-        _validate_ids_exist(db, Group, eff.get("allowed_department_ids"), "allowed_department_ids")
+        _validate_ids_exist(db, Group, _new_ids("allowed_department_ids"), "allowed_department_ids")
     for uk in ("allowed_user_ids", "blocked_user_ids"):
         if uk in changed_keys:
-            _validate_ids_exist(db, User, eff.get(uk), uk)
+            _validate_ids_exist(db, User, _new_ids(uk), uk)
 
 
 def _audit_share_tag(db: Session, request: Request, user: User, action: str, tag: ShareTag) -> None:
@@ -4570,8 +4577,9 @@ async def update_share_tag(
         if k in data:
             data[k] = [str(x) for x in (data[k] or [])]
     eff = _share_tag_dict(tag)
+    stored = dict(eff)  # snapshot BEFORE the patch, so only newly-added ids are existence-checked
     eff.update(data)
-    _validate_share_tag_fields(eff, set(data.keys()), db)
+    _validate_share_tag_fields(eff, set(data.keys()), db, existing=stored)
     if "allowed_audiences" in data:
         data["allowed_audiences"] = sharing_policy.normalize_audiences(data["allowed_audiences"])
     for k, v in data.items():

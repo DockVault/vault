@@ -4720,7 +4720,12 @@ async function saveAllSettings() {
 // the per-user allow/block lists are managed separately. All controls build via DOM (no innerHTML).
 let shareTagsCache = [];
 let shareTagEditorDeptIds = [];
+let shareTagEditorAllowUserIds = [];
+let shareTagEditorBlockUserIds = [];
+let shareTagUsersById = {};          // id -> username, for rendering the user chips
 let shareTagsUIWired = false;
+const _tagUserSearchTimer = { allow: null, block: null };
+const _tagUserSearchSeq = { allow: 0, block: 0 };
 
 function _stEl(id) { return document.getElementById(id); }
 function _stChecked(id) { const e = _stEl(id); return !!(e && e.checked); }
@@ -4752,6 +4757,16 @@ function setupShareTagsUI() {
     cancel.addEventListener('click', closeShareTagEditor);
     const allowVO = _stEl('share-tag-allow-view-only');
     if (allowVO) allowVO.addEventListener('change', _stSyncViewOnly);
+    const allowSearch = _stEl('share-tag-allow-user-search');
+    if (allowSearch) allowSearch.addEventListener('input', () => {
+        clearTimeout(_tagUserSearchTimer.allow);
+        _tagUserSearchTimer.allow = setTimeout(() => _tagUserSearch('allow'), 250);
+    });
+    const blockSearch = _stEl('share-tag-block-user-search');
+    if (blockSearch) blockSearch.addEventListener('input', () => {
+        clearTimeout(_tagUserSearchTimer.block);
+        _tagUserSearchTimer.block = setTimeout(() => _tagUserSearch('block'), 250);
+    });
     shareTagsUIWired = true;
 }
 
@@ -4839,6 +4854,122 @@ function renderShareTagDeptPicker() {
     );
 }
 
+// Per-user create-allowlist pickers (allowed_user_ids / blocked_user_ids). Search is server-side
+// (/users/search, scoped + rate-limited); the admin /users list is fetched once only to resolve the
+// stored ids of an existing tag into usernames for the chips. All rendering is textContent/DOM.
+async function loadShareTagUsers() {
+    try {
+        const users = await apiRequest('/users', { silent: true });
+        (Array.isArray(users) ? users : []).forEach(u => {
+            shareTagUsersById[u.id] = u.username || u.email || String(u.id).slice(0, 8);
+        });
+    } catch (_) { /* names fall back to the id */ }
+}
+
+function _tagUserName(id) { return shareTagUsersById[id] || String(id).slice(0, 8); }
+
+function _renderTagUserChips(chipsId, ids, onRemove) {
+    const host = _stEl(chipsId);
+    if (!host) return;
+    host.replaceChildren();
+    if (!ids.length) {
+        const none = document.createElement('span');
+        none.className = 'text-tertiary text-sm';
+        none.textContent = 'None';
+        host.appendChild(none);
+        return;
+    }
+    ids.forEach(id => {
+        const chip = document.createElement('span');
+        chip.className = 'chip';
+        chip.append(_tagUserName(id));
+        const rm = document.createElement('button');
+        rm.type = 'button';
+        rm.className = 'chip-remove';
+        rm.setAttribute('aria-label', `Remove ${_tagUserName(id)}`);
+        rm.appendChild(svgUseIcon('x', 'icon-sm'));
+        rm.addEventListener('click', () => onRemove(id));
+        chip.appendChild(rm);
+        host.appendChild(chip);
+    });
+}
+
+function _renderTagAllowChips() {
+    _renderTagUserChips('share-tag-allow-user-chips', shareTagEditorAllowUserIds, id => {
+        shareTagEditorAllowUserIds = shareTagEditorAllowUserIds.filter(x => x !== id);
+        _renderTagAllowChips();
+    });
+}
+function _renderTagBlockChips() {
+    _renderTagUserChips('share-tag-block-user-chips', shareTagEditorBlockUserIds, id => {
+        shareTagEditorBlockUserIds = shareTagEditorBlockUserIds.filter(x => x !== id);
+        _renderTagBlockChips();
+    });
+}
+
+function _tagUserPickerIds(kind) {
+    return {
+        search: kind === 'allow' ? 'share-tag-allow-user-search' : 'share-tag-block-user-search',
+        results: kind === 'allow' ? 'share-tag-allow-user-results' : 'share-tag-block-user-results',
+    };
+}
+
+function _tagUserSearch(kind) {
+    const { search, results } = _tagUserPickerIds(kind);
+    const seq = ++_tagUserSearchSeq[kind];
+    const host = _stEl(results);
+    if (!host) return;
+    const q = (_stEl(search)?.value || '').trim();
+    if (q.length < 2) { host.replaceChildren(); return; }
+    apiRequest(`/users/search?q=${encodeURIComponent(q)}`, { silent: true }).then(users => {
+        if (seq !== _tagUserSearchSeq[kind]) return;  // a newer keystroke superseded this one
+        _renderTagUserResults(kind, Array.isArray(users) ? users : []);
+    }).catch(() => {
+        if (seq !== _tagUserSearchSeq[kind]) return;
+        host.replaceChildren();
+    });
+}
+
+function _renderTagUserResults(kind, users) {
+    const { results } = _tagUserPickerIds(kind);
+    const host = _stEl(results);
+    if (!host) return;
+    host.replaceChildren();
+    const already = kind === 'allow' ? shareTagEditorAllowUserIds : shareTagEditorBlockUserIds;
+    const fresh = users.filter(u => !already.includes(u.id));
+    if (!fresh.length) {
+        const none = document.createElement('div');
+        none.className = 'text-tertiary text-sm';
+        none.textContent = 'No matching users.';
+        host.appendChild(none);
+        return;
+    }
+    fresh.forEach(u => {
+        shareTagUsersById[u.id] = u.username || u.email || String(u.id).slice(0, 8);
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'pick-row';
+        row.style.width = '100%';
+        row.style.textAlign = 'left';
+        row.textContent = u.username || u.email || u.id;
+        row.addEventListener('click', () => _addTagUser(kind, u.id));
+        host.appendChild(row);
+    });
+}
+
+function _addTagUser(kind, id) {
+    // allowed and blocked are mutually exclusive in the editor (the backend blocklist wins regardless).
+    shareTagEditorAllowUserIds = shareTagEditorAllowUserIds.filter(x => x !== id);
+    shareTagEditorBlockUserIds = shareTagEditorBlockUserIds.filter(x => x !== id);
+    if (kind === 'allow') shareTagEditorAllowUserIds.push(id);
+    else shareTagEditorBlockUserIds.push(id);
+    _renderTagAllowChips();
+    _renderTagBlockChips();
+    const { search, results } = _tagUserPickerIds(kind);
+    if (_stEl(search)) _stEl(search).value = '';
+    if (_stEl(results)) _stEl(results).replaceChildren();
+}
+
 function openShareTagEditor(tag) {
     const editor = _stEl('share-tag-editor');
     if (!editor) return;
@@ -4865,6 +4996,16 @@ function openShareTagEditor(tag) {
     _stEl('share-tag-auto-enroll').checked = !!t.auto_enroll_new_users;
     shareTagEditorDeptIds = (t.allowed_department_ids || []).map(String);
     renderShareTagDeptPicker();
+    shareTagEditorAllowUserIds = (t.allowed_user_ids || []).map(String);
+    shareTagEditorBlockUserIds = (t.blocked_user_ids || []).map(String);
+    ['share-tag-allow-user-search', 'share-tag-block-user-search'].forEach(id => { if (_stEl(id)) _stEl(id).value = ''; });
+    ['share-tag-allow-user-results', 'share-tag-block-user-results'].forEach(id => { if (_stEl(id)) _stEl(id).replaceChildren(); });
+    _renderTagAllowChips();
+    _renderTagBlockChips();
+    // resolve the stored ids of an existing tag into usernames (fetch the admin user list once)
+    if (shareTagEditorAllowUserIds.length || shareTagEditorBlockUserIds.length) {
+        loadShareTagUsers().then(() => { _renderTagAllowChips(); _renderTagBlockChips(); });
+    }
     _stSyncViewOnly();
     editor.style.display = '';
     editor.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -4897,9 +5038,9 @@ async function saveShareTag() {
         allow_custom: _stChecked('share-tag-allow-custom'),
         auto_enroll_new_users: _stChecked('share-tag-auto-enroll'),
         allowed_department_ids: shareTagEditorDeptIds.slice(),
+        allowed_user_ids: shareTagEditorAllowUserIds.slice(),
+        blocked_user_ids: shareTagEditorBlockUserIds.slice(),
     };
-    // On EDIT we intentionally omit allowed_user_ids/blocked_user_ids so PATCH preserves them (the
-    // per-user lists are managed separately); on CREATE they default to empty server-side.
     try {
         if (id) {
             await apiRequest(`/share-tags/${id}`, { method: 'PATCH', body: JSON.stringify(body) });

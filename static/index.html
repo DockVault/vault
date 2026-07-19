@@ -1419,7 +1419,19 @@
                                                 <label class="text-sm text-secondary">Allowed departments</label>
                                                 <div id="share-tag-dept-picker"></div>
                                             </div>
-                                            <p class="text-secondary text-sm mt-sm">If auto-enroll is off and no departments are selected, no one can create shares with this tag until you grant access. (Per-user allow/block lists are managed separately.)</p>
+                                            <div class="mt-sm">
+                                                <label class="text-sm text-secondary" for="share-tag-allow-user-search">Allowed users</label>
+                                                <input type="text" id="share-tag-allow-user-search" class="form-control" placeholder="Search by username (type at least 2 characters)" autocomplete="off">
+                                                <div id="share-tag-allow-user-results" class="share-tag-user-results" style="max-height:180px; overflow:auto;"></div>
+                                                <div id="share-tag-allow-user-chips" class="chip-row mt-sm"></div>
+                                            </div>
+                                            <div class="mt-sm">
+                                                <label class="text-sm text-secondary" for="share-tag-block-user-search">Blocked users</label>
+                                                <input type="text" id="share-tag-block-user-search" class="form-control" placeholder="Search by username (type at least 2 characters)" autocomplete="off">
+                                                <div id="share-tag-block-user-results" class="share-tag-user-results" style="max-height:180px; overflow:auto;"></div>
+                                                <div id="share-tag-block-user-chips" class="chip-row mt-sm"></div>
+                                            </div>
+                                            <p class="text-secondary text-sm mt-sm">If auto-enroll is off and no departments or users are allowed, no one can create shares with this tag until you grant access. A blocked user can never create with this tag, even via a department or auto-enroll.</p>
                                         </div>
 
                                         <div class="flex gap-sm mt-lg">

@@ -152,3 +152,69 @@ def test_tag_validation_error_surfaced_in_ui(page: Page, admin, fresh_admin):
     expect(page.locator("#share-tag-editor")).to_be_visible()
     # and no tag with that name was created
     assert not any(t["name"] == name for t in admin.get("/share-tags").json())
+
+
+def test_user_allowlist_and_blocklist_pickers(page: Page, admin, fresh_admin):
+    # two users to find through the /users/search-backed pickers
+    u_allow = admin.create_user(role="user")
+    u_block = admin.create_user(role="user")
+    name = unique("uiUsers")
+    try:
+        _login(page, fresh_admin["_username"], fresh_admin["_password"])
+        _open_sharing_settings(page)
+        page.click("#share-tag-add-btn")
+        expect(page.locator("#share-tag-editor")).to_be_visible()
+        page.fill("#share-tag-name", name)
+
+        # allowed users: search by username -> click the result -> a chip appears
+        page.fill("#share-tag-allow-user-search", u_allow["_username"])
+        allow_row = page.locator("#share-tag-allow-user-results").get_by_role("button", name=u_allow["_username"])
+        expect(allow_row).to_be_visible(timeout=8000)
+        allow_row.click()
+        expect(page.locator("#share-tag-allow-user-chips .chip")).to_have_count(1)
+
+        # blocked users: same flow, independent picker
+        page.fill("#share-tag-block-user-search", u_block["_username"])
+        block_row = page.locator("#share-tag-block-user-results").get_by_role("button", name=u_block["_username"])
+        expect(block_row).to_be_visible(timeout=8000)
+        block_row.click()
+        expect(page.locator("#share-tag-block-user-chips .chip")).to_have_count(1)
+
+        # mutual exclusion: adding the blocked user to the ALLOW picker MOVES it (removed from block)
+        page.fill("#share-tag-allow-user-search", u_block["_username"])
+        page.locator("#share-tag-allow-user-results").get_by_role("button", name=u_block["_username"]).click()
+        expect(page.locator("#share-tag-block-user-chips .chip")).to_have_count(0)
+        expect(page.locator("#share-tag-allow-user-chips .chip")).to_have_count(2)
+        # move it back to blocked for the persistence assertions below
+        page.fill("#share-tag-block-user-search", u_block["_username"])
+        page.locator("#share-tag-block-user-results").get_by_role("button", name=u_block["_username"]).click()
+        expect(page.locator("#share-tag-block-user-chips .chip")).to_have_count(1)
+        expect(page.locator("#share-tag-allow-user-chips .chip")).to_have_count(1)
+
+        with page.expect_response(
+            lambda r: r.url.rstrip("/").endswith("/share-tags") and r.request.method == "POST"
+        ) as resp:
+            page.click("#share-tag-save-btn")
+        assert resp.value.ok, f"POST failed: {resp.value.status}"
+
+        tag = next((t for t in admin.get("/share-tags").json() if t["name"] == name), None)
+        assert tag is not None
+        tid = tag["id"]
+        assert u_allow["id"] in tag["allowed_user_ids"], "allowed user not persisted"
+        assert u_block["id"] in tag["blocked_user_ids"], "blocked user not persisted"
+
+        # reopen (edit): the stored ids resolve to usernames in the chips, and PATCH preserves them
+        page.locator(f'.share-tag-row[data-tag-id="{tid}"]').get_by_role("button", name="Edit").click()
+        expect(page.locator("#share-tag-editor")).to_be_visible()
+        expect(page.locator("#share-tag-allow-user-chips")).to_contain_text(u_allow["_username"])
+        expect(page.locator("#share-tag-block-user-chips")).to_contain_text(u_block["_username"])
+        with page.expect_response(
+            lambda r: f"/share-tags/{tid}" in r.url and r.request.method == "PATCH"
+        ) as resp:
+            page.click("#share-tag-save-btn")
+        assert resp.value.ok
+        after = next(t for t in admin.get("/share-tags").json() if t["id"] == tid)
+        assert u_allow["id"] in after["allowed_user_ids"] and u_block["id"] in after["blocked_user_ids"]
+    finally:
+        admin.delete_user(u_allow["id"])
+        admin.delete_user(u_block["id"])

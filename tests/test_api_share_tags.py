@@ -125,6 +125,20 @@ def test_patch_explicit_null_on_required_field_rejected_not_500(admin):
     assert admin.patch(f"/share-tags/{tid}", json={"max_recipients_cap": None}).status_code == 200
 
 
+def test_patch_tolerates_stale_user_id_but_rejects_new_bogus_id(admin):
+    # a tag whose allowlist references a real user
+    u = admin.create_user(role="user")
+    tid = admin.post("/share-tags", json={"name": unique("stale"), "allowed_user_ids": [u["id"]]}).json()["id"]
+    # deleting the user does NOT scrub its id from the tag; an unrelated edit must still succeed (not 400)
+    admin.delete_user(u["id"])
+    assert admin.patch(f"/share-tags/{tid}", json={"description": "unrelated edit"}).status_code == 200
+    # but adding a genuinely-unknown id still fails loud (only newly-added ids are existence-checked)
+    r = admin.patch(f"/share-tags/{tid}", json={
+        "allowed_user_ids": [u["id"], "00000000-0000-0000-0000-000000000000"],
+    })
+    assert r.status_code == 400
+
+
 def test_description_rejects_markup_on_create_and_patch(admin):
     # create with markup in description -> 400 (input-boundary hygiene, like every sibling free-text field)
     assert admin.post("/share-tags", json={
