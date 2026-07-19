@@ -1349,6 +1349,152 @@ function renderVaults() {
     });
 }
 
+// ---- Shared with me (recipient tab) ----
+// Built with DOM APIs (no innerHTML) so all recipient/creator-controlled strings go through
+// textContent and can never inject markup.
+const _SVGNS = 'http://www.w3.org/2000/svg';
+function _svgIcon(name, cls) {
+    const svg = document.createElementNS(_SVGNS, 'svg');
+    svg.setAttribute('class', 'icon' + (cls ? ' ' + cls : ''));
+    const use = document.createElementNS(_SVGNS, 'use');
+    use.setAttribute('href', '#i-' + name);
+    svg.appendChild(use);
+    return svg;
+}
+function _el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+}
+
+async function loadShared() {
+    const container = document.getElementById('shared-list');
+    if (container) container.replaceChildren(_el('div', 'spinner'));
+    wireClaimLinkBox();
+    try {
+        state.sharedWithMe = await apiRequest('/shares/shared-with-me');
+        renderShared();
+    } catch (error) {
+        if (container) container.replaceChildren(_el('div', 'alert alert-error', 'Failed to load shared items: ' + (error.message || '')));
+    }
+}
+
+// Wire the claim-a-link box once (the section markup is static, so guard against re-binding).
+function wireClaimLinkBox() {
+    const btn = document.getElementById('claim-link-btn');
+    const input = document.getElementById('claim-link-input');
+    if (!btn || !input || btn.dataset.wired) return;
+    btn.dataset.wired = '1';
+    const submit = () => claimShareLink(input.value);
+    btn.addEventListener('click', submit);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+}
+
+// A share link may be a full URL (…?token=XYZ or …/something/XYZ) or a bare token; pull out the token.
+function extractShareToken(raw) {
+    const v = (raw || '').trim();
+    if (!v) return '';
+    const m = v.match(/[?&]token=([^&\s]+)/);
+    // decodeURIComponent throws URIError on a malformed percent sequence (e.g. "%zz"); fall back to
+    // the raw match so a mangled paste still produces a token attempt (that then fails cleanly).
+    if (m) { try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; } }
+    if (v.includes('/')) { const parts = v.split(/[/?#]/).filter(Boolean); return parts[parts.length - 1] || v; }
+    return v;
+}
+
+async function claimShareLink(raw) {
+    const btn = document.getElementById('claim-link-btn');
+    if (btn && btn.disabled) return;  // a claim is already in flight (guards the Enter-key path too)
+    const token = extractShareToken(raw);
+    if (!token) { showToast('Paste a share link or token first', 'error'); return; }
+    if (btn) btn.disabled = true;
+    try {
+        await apiRequest('/shares/claim', { method: 'POST', body: JSON.stringify({ token }) });
+        showToast('Share claimed', 'success');
+        const input = document.getElementById('claim-link-input');
+        if (input) input.value = '';
+        await loadShared();
+    } catch (error) {
+        showToast(error.message || 'Could not claim that link', 'error');
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+function _sharedKindLabel(t) { return t === 'vault' ? 'Vault' : (t === 'folder' ? 'Folder' : 'File'); }
+
+function _sharedCard(it) {
+    const active = it.status === 'active';
+    const title = it.target_type === 'vault' ? (it.vault_name || 'Shared vault') : (it.target_name || _sharedKindLabel(it.target_type));
+    const tileIcon = it.target_type === 'file' ? 'file' : (it.target_type === 'folder' ? 'folder' : 'vault');
+
+    const card = _el('div', 'card card-interactive vault-card');
+    card.setAttribute('data-share-id', it.share_id);
+    const body = _el('div', 'vault-card-body');
+
+    const tile = _el('div', 'vault-tile');
+    tile.appendChild(_svgIcon(tileIcon));
+    body.appendChild(tile);
+
+    const main = _el('div', 'vault-card-main');
+    const h = _el('h3', 'vault-name', title);
+    if (it.status === 'expired' || it.status === 'revoked') {
+        h.appendChild(document.createTextNode(' '));
+        h.appendChild(_el('span', it.status === 'expired' ? 'badge badge-warning' : 'badge badge-error',
+                          it.status === 'expired' ? 'Expired' : 'Revoked'));
+    }
+    main.appendChild(h);
+    main.appendChild(_el('p', 'vault-desc', it.target_type === 'vault'
+        ? 'Whole vault' : (_sharedKindLabel(it.target_type) + ' in ' + (it.vault_name || 'a vault'))));
+
+    const meta = _el('div', 'vault-meta');
+    if (it.view_only) {
+        const s = _el('span'); s.appendChild(_svgIcon('eye', 'icon-sm')); s.appendChild(document.createTextNode(' View only'));
+        meta.appendChild(s);
+    }
+    if (it.max_downloads != null) {
+        const s = _el('span'); s.appendChild(_svgIcon('download', 'icon-sm'));
+        s.appendChild(document.createTextNode(' ' + it.download_count + '/' + it.max_downloads + ' downloads'));
+        meta.appendChild(s);
+    }
+    if (!active) meta.appendChild(_el('span', 'text-secondary', 'Access ' + it.status));
+    main.appendChild(meta);
+    body.appendChild(main);
+
+    if (active) {
+        const openBtn = _el('button', 'open-shared-btn btn btn-primary btn-sm', 'Open');
+        openBtn.addEventListener('click', (e) => { e.stopPropagation(); openSharedItem(it.vault_id, it.target_folder_id || ''); });
+        body.appendChild(openBtn);
+    }
+    card.appendChild(body);
+    return card;
+}
+
+function renderShared() {
+    const container = document.getElementById('shared-list');
+    if (!container) return;
+    const items = state.sharedWithMe || [];
+    if (items.length === 0) {
+        const wrap = _el('div', 'empty-state-center p-xl');
+        const icon = _el('div'); icon.style.fontSize = '3rem'; icon.style.marginBottom = 'var(--space-md)';
+        icon.appendChild(_svgIcon('link', 'icon-lg'));
+        wrap.appendChild(icon);
+        wrap.appendChild(_el('h3', 'text-xl font-bold mb-xs', 'Nothing shared with you yet'));
+        wrap.appendChild(_el('p', 'text-secondary', 'Paste a share link above to claim access to a shared file, folder, or vault.'));
+        container.replaceChildren(wrap);
+        return;
+    }
+    container.replaceChildren(...items.map(_sharedCard));
+}
+
+// Open a shared item: reuse the standard vault browser (the backend scopes the listing to the shared
+// subtree), then drop into the shared folder when the share targets one.
+async function openSharedItem(vaultId, folderId) {
+    await openVault(vaultId);
+    if (folderId) { try { await navigateToFolder(folderId); } catch (e) { /* root listing still shows the path down */ } }
+}
+
 // Star / un-star a vault (optimistic; reverts on failure).
 async function toggleVaultFavorite(vaultId) {
     const v = (state.allVaults || []).find(x => x.id === vaultId);
@@ -9468,6 +9614,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 // Load data for specific sections
                 if (section === 'vaults') {
                     loadVaults().catch(err => console.error('Failed to load vaults:', err));
+                } else if (section === 'shared') {
+                    loadShared().catch(err => console.error('Failed to load shared items:', err));
                 } else if (section === 'temp-creds') {
                     loadTempCreds().catch(err => console.error('Failed to load temp creds:', err));
                 } else if (section === 'users') {

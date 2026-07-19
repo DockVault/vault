@@ -5072,6 +5072,68 @@ async def claim_share(
     return _share_claim_dict(claim, share)
 
 
+def _shared_with_me_dict(db: Session, claim: ShareClaim, share: Share) -> dict:
+    """Recipient-facing card for the 'Shared with me' tab. Describes the shared item (vault name +
+    target kind/name) + the effective status so an expired/revoked card can show its reason, and the
+    recipient's own download usage. NEVER includes the link token or any creator/allowlist internals.
+    Standard vaults only, so the target name is server-visible plaintext the recipient may already
+    list."""
+    if claim.revoked or share.status == "revoked":
+        st = "revoked"
+    elif _share_effective_status(share) == "expired":
+        st = "expired"
+    else:
+        st = "active"
+    # A recipient who has LOST access (revoked/expired) must not learn the item's CURRENT name — that
+    # would be a live, post-access rename oracle. Resolve names ONLY for an active claim; an inactive
+    # card shows just the kind + the reason.
+    vault_name = target_name = None
+    if st == "active":
+        vault = db.query(Vault).filter(Vault.id == share.vault_id).first()
+        vault_name = vault.name if vault else None
+        if share.target_type == "folder" and share.target_folder_id:
+            f = db.query(Folder).filter(Folder.id == share.target_folder_id).first()
+            target_name = f.name if f else None
+        elif share.target_type == "file" and share.target_file_id:
+            x = db.query(File).filter(File.id == share.target_file_id).first()
+            target_name = x.original_name if x else None
+    return {
+        "claim_id": str(claim.id),
+        "share_id": str(share.id),
+        "vault_id": str(share.vault_id),
+        "vault_name": vault_name,
+        "target_type": share.target_type,
+        "target_folder_id": str(share.target_folder_id) if share.target_folder_id else None,
+        "target_file_id": str(share.target_file_id) if share.target_file_id else None,
+        "target_name": target_name,
+        "view_only": share.view_only,
+        "status": st,
+        "expires_at": share.expires_at.isoformat() if share.expires_at else None,
+        "max_downloads": share.max_downloads,
+        "download_count": claim.download_count,
+        "claimed_at": claim.claimed_at.isoformat() if claim.claimed_at else None,
+    }
+
+
+@app.get("/shares/shared-with-me")
+async def list_shared_with_me(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The current user's claimed shares ('Shared with me' recipient tab). Returns active + expired +
+    revoked claims (so the UI can show a reason) but NEVER a token. A temp session owns no claims."""
+    if getattr(current_user, "_is_temp_session", False):
+        return []
+    rows = (
+        db.query(ShareClaim, Share)
+        .join(Share, Share.id == ShareClaim.share_id)
+        .filter(ShareClaim.user_id == current_user.id)
+        .order_by(ShareClaim.claimed_at.desc())
+        .all()
+    )
+    return [_shared_with_me_dict(db, claim, share) for claim, share in rows]
+
+
 @app.post("/groups/{group_id}/members")
 async def add_group_members(
     group_id: uuid.UUID,
