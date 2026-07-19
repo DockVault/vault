@@ -325,7 +325,9 @@ class PermissionService:
         Fail-closed and intentionally NARROW: grants only for
           * a Standard, non-password vault (zero-knowledge + password-protected are
             refused; the vault could have gained a password after the claim);
-          * a non-view-only share that is 'active' and not past expiry;
+          * an 'active', not-past-expiry share (INCLUDING view-only — a view-only share
+            grants read so the recipient can open/list/preview; the download path denies
+            file.download separately via the downloadable scope);
           * a caller holding a non-revoked ShareClaim on that share.
         Grants read (the download path re-checks READ) but never write/delete/manage. For a
         FILE/FOLDER-target share this read is SUBTREE-RESTRICTED by the id-scope wrappers once
@@ -350,7 +352,6 @@ class PermissionService:
                 ShareClaim.user_id == user.id,
                 ShareClaim.revoked.is_(False),
                 Share.vault_id == vault.id,
-                Share.view_only.is_(False),
                 Share.status == 'active',
                 Share.expires_at > now,
             )
@@ -373,61 +374,77 @@ class PermissionService:
         return sharing_policy.sharing_enabled(cfg)
 
     def stamp_share_scope(self, user: User, vault: Vault) -> None:
-        """Stamp ``user._share_vault_scope[vault_id]`` with the id-subtree a share recipient may
-        reach, so the generalized id-scope wrappers (temp_scope.scope_ids + vault_service's listing
-        filter / per-file gate) confine a file/folder share to its subtree. share-ONLY: an owner /
-        member / group-member who ALSO holds a claim keeps full (unscoped) access — never downgraded.
+        """Stamp a share recipient's per-vault id-subtrees so the generalized id-scope wrappers
+        (temp_scope.scope_ids + vault_service's listing filter / per-file gate) confine a file/folder
+        share to its subtree. share-ONLY: an owner / member / group-member who ALSO holds a claim keeps
+        full (unscoped) access — never downgraded.
 
-        The stamp is the UNION of the recipient's active, non-revoked, non-view-only claims on this
-        vault (the SAME claim set _share_vault_permission grants read for): any whole-vault claim ⇒
-        None (no id restriction); otherwise ``{"files": [...], "folders": [...]}``. A recipient whose
-        only claims resolve to empty targets gets a deny-all scope (fail-closed). No-op for a
-        non-recipient (leaves _share_vault_scope untouched). Called from get_vault with the sharing
-        master switch already checked; still fail-closed if sharing is off."""
+        Stamps TWO scopes, each the UNION of the caller's active, non-revoked claims on this vault:
+          * ``_share_vault_scope[vault_id]``  — the VISIBLE scope (ALL claims, incl. view-only): what
+            the recipient may open/list. This is the SAME claim set _share_vault_permission grants
+            read for.
+          * ``_share_download_scope[vault_id]`` — the DOWNLOADABLE scope (NON-view-only claims only):
+            what the recipient may download. A view-only share contributes to the visible scope but
+            NOT the downloadable one, so it is see-but-not-download.
+        For each scope: any qualifying whole-vault claim ⇒ None (no id restriction); otherwise
+        ``{"files": [...], "folders": [...]}`` (empty ⇒ deny-all, fail-closed). If the claim set is
+        unresolvable NOW — sharing just disabled, or the claim revoked/expired between the read-grant
+        query and this one (a read-committed race) — BOTH scopes fail closed to deny-all rather than
+        leaving the caller unstamped, which scope_ids would read as whole-vault (fail-open). No-op for
+        a non-recipient (leaves the stamps untouched)."""
         if vault.owner_id == user.id:
             return
         # A member/group principal is NOT scope-restricted by a share; only a share-only caller is.
         if self.get_vault_permissions(user, vault.id) is not None:
             return
-        # From here the caller is share-ONLY: reaching get_vault means their READ grant came from a
-        # ShareClaim (require_vault_permission passed first). Resolve the subtree and ALWAYS stamp. If
-        # it is unresolvable NOW — sharing just disabled, or the claim was revoked/expired between the
-        # grant query and this one (a read-committed race) — FAIL CLOSED with a deny-all scope rather
-        # than leaving the caller unstamped, which scope_ids would read as whole-vault (fail-open).
-        scope = {"files": [], "folders": []}
+        visible = {"files": [], "folders": []}
+        downloadable = {"files": [], "folders": []}
         if self._sharing_enabled():
             now = datetime.utcnow()
             rows = (
-                self.db.query(Share.target_type, Share.target_folder_id, Share.target_file_id)
+                self.db.query(Share.target_type, Share.target_folder_id,
+                              Share.target_file_id, Share.view_only)
                 .join(ShareClaim, ShareClaim.share_id == Share.id)
                 .filter(
                     ShareClaim.user_id == user.id,
                     ShareClaim.revoked.is_(False),
                     Share.vault_id == vault.id,
-                    Share.view_only.is_(False),
                     Share.status == 'active',
                     Share.expires_at > now,
                 )
                 .all()
             )
             if rows:
-                whole = False
-                files, folders = set(), set()
-                for target_type, folder_id, file_id in rows:
+                v_whole = d_whole = False
+                v_files, v_folders = set(), set()
+                d_files, d_folders = set(), set()
+                for target_type, folder_id, file_id, view_only in rows:
+                    # Every active claim contributes to the VISIBLE scope; only a non-view-only claim
+                    # also contributes to the DOWNLOADABLE scope.
                     if target_type == 'vault':
-                        whole = True
+                        v_whole = True
+                        if not view_only:
+                            d_whole = True
                     elif target_type == 'folder' and folder_id is not None:
-                        folders.add(str(folder_id))
+                        v_folders.add(str(folder_id))
+                        if not view_only:
+                            d_folders.add(str(folder_id))
                     elif target_type == 'file' and file_id is not None:
-                        files.add(str(file_id))
-                # A whole-vault claim removes the id restriction; otherwise confine to the union
-                # subtree (empty ⇒ the deny-all default above, fail-closed, per id_scope semantics).
-                scope = None if whole else {"files": sorted(files), "folders": sorted(folders)}
-        smap = getattr(user, "_share_vault_scope", None)
+                        v_files.add(str(file_id))
+                        if not view_only:
+                            d_files.add(str(file_id))
+                visible = None if v_whole else {"files": sorted(v_files), "folders": sorted(v_folders)}
+                downloadable = None if d_whole else {"files": sorted(d_files), "folders": sorted(d_folders)}
+        self._stamp_scope(user, "_share_vault_scope", vault.id, visible)
+        self._stamp_scope(user, "_share_download_scope", vault.id, downloadable)
+
+    @staticmethod
+    def _stamp_scope(user: User, attr: str, vault_id, scope) -> None:
+        smap = getattr(user, attr, None)
         if smap is None:
             smap = {}
-            user._share_vault_scope = smap
-        smap[str(vault.id)] = scope
+            setattr(user, attr, smap)
+        smap[str(vault_id)] = scope
 
     def _group_vault_permission(self, user: User, vault_id: uuid.UUID) -> Optional[dict]:
         """Highest vault permission the user gets via any group that has been

@@ -38,7 +38,7 @@ from app.core import sharing_policy
 from app.services.auth_service import AuthService, InvalidCredentialsError, AccountLockedError, RateLimitExceededError as AuthRateLimitExceededError
 from app.core.authorization import PermissionService, PermissionDeniedError, ResourceNotFoundError, AuthorizationError
 from app.services.vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, _name_match_filter
-from app.services.vault_service import require_file_scope, require_folder_scope, require_item_scope, folder_ancestry, filter_listing_for_scope
+from app.services.vault_service import require_file_scope, require_folder_scope, require_item_scope, require_download_scope, folder_ancestry, filter_listing_for_scope
 from app.core.id_scope import id_in_scope
 from sqlalchemy.exc import IntegrityError
 from app.services.audit_logger import AuditLogger
@@ -8392,6 +8392,8 @@ async def download_file(
                                         require_password=True, allow_share=True)
         # A path-scoped temp credential may only download a file within its file/folder scope.
         require_file_scope(db, current_user, vault_id, file_id)
+        # A view-only share recipient may see the file but not download it (denied here).
+        require_download_scope(db, current_user, vault_id, file_id)
 
         # Create operation ID for tracking downloads
         operation_id = f"download_{uuid.uuid4()}"
@@ -8440,6 +8442,17 @@ async def download_file(
                 details={'vault_id': str(vault_id), 'file_name': audit_name},
                 ip_address=get_client_ip(request)
             )
+
+            # If this download came via a share claim (the recipient was stamped a share scope on this
+            # vault by get_vault; owners/members are not), record a distinct share_downloaded event.
+            if str(vault_id) in (getattr(current_user, '_share_vault_scope', None) or {}):
+                try:
+                    audit_logger.log_action(
+                        action='share_downloaded', status='success', user=current_user,
+                        resource_type='file', resource_id=str(file_id),
+                        details={'vault_id': str(vault_id)}, ip_address=get_client_ip(request))
+                except Exception:
+                    db.rollback()
 
             # Broadcast event to monitoring WebSocket clients
             broadcast_event({

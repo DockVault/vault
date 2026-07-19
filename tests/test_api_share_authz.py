@@ -3,9 +3,9 @@
 A recipient who holds an active claim on a whole-vault share may OPEN the vault, LIST its
 contents, and DOWNLOAD its files — read-only — over the web endpoints. Everything else is
 fail-closed: no claim, a revoked claim, a revoked/expired share, a vault that gained a
-password or became zero-knowledge, a view-only share (not granted in this slice), and any
-write/delete op are all denied. The SFTP fail-closed guarantee is proven in
-test_sftp_share_denied.py.
+password or became zero-knowledge, and any write/delete op are all denied. A view-only share
+grants open/list but denies download (see test_api_share_viewonly.py). The SFTP fail-closed
+guarantee is proven in test_sftp_share_denied.py.
 """
 import os
 import subprocess
@@ -175,15 +175,17 @@ def test_zk_vault_denies_share_access(admin, temp_user_client):
         admin.delete_vault(v["id"])
 
 
-def test_view_only_share_grants_no_access_in_this_slice(admin, temp_user_client):
-    """A view-only whole-vault share is claimable, but the whole-vault read+download slice grants
-    NOTHING for it (fail-closed; see-but-not-download is a later phase)."""
+def test_view_only_share_allows_open_but_not_download(admin, temp_user_client):
+    """A view-only whole-vault share lets the recipient OPEN the vault (see-only); download is
+    denied on the download path (thorough view-only coverage is in test_api_share_viewonly.py)."""
     _enable_sharing(admin, True)
     v = admin.create_vault(name=unique("azvo"))
     try:
+        fid = _upload(admin, v["id"], "vo.txt", b"view-only-bytes")
         share = _make_share(admin, v, _tag(admin), view_only=True)
-        _claim(temp_user_client, share)  # claim still succeeds
-        assert temp_user_client.get(f"/vaults/{v['id']}").status_code == 403
+        _claim(temp_user_client, share)
+        assert temp_user_client.get(f"/vaults/{v['id']}").status_code == 200          # can open
+        assert temp_user_client.get(f"/vaults/{v['id']}/files/{fid}/download").status_code == 403  # no download
     finally:
         admin.delete_vault(v["id"])
 

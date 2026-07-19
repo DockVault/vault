@@ -250,6 +250,24 @@ def require_file_scope(db, user, vault_id, file_id) -> None:
     require_scope(user, vault_id, f[0], folder_ancestry(db, vault_id, f[1]))
 
 
+def require_download_scope(db, user, vault_id, file_id) -> None:
+    """A SHARE recipient may DOWNLOAD file `file_id` only if it (or a containing folder) is in their
+    DOWNLOADABLE scope. A view-only share grants VISIBILITY (require_file_scope passes) but NOT
+    download — such a file lists fine yet is denied here. No-op for a non-share principal or a
+    downloadable whole-vault share (download_scope_ids is None). Fails closed on an unknown file."""
+    from app.core.temp_scope import download_scope_ids
+    from app.core.id_scope import id_in_scope
+    scope = download_scope_ids(user, vault_id)
+    if scope is None:
+        return
+    f = db.query(File.id, File.folder_id).filter(
+        File.id == file_id, File.vault_id == vault_id).first()
+    if f is None:
+        raise PermissionDeniedError("Scope does not permit downloading this file")
+    if not id_in_scope(scope, str(f[0]), folder_ancestry(db, vault_id, f[1])):
+        raise PermissionDeniedError("This share is view-only; downloading is not permitted.")
+
+
 def require_folder_scope(db, user, vault_id, folder_id) -> None:
     """A scoped principal (temp credential OR share recipient) may act ON, or write INTO, folder
     `folder_id` only if it (or an ancestor) is in its ID scope. `folder_id` None = the vault ROOT,
@@ -1273,6 +1291,9 @@ class VaultService:
             if share_vault is not None:
                 self.permission_service.stamp_share_scope(user, share_vault)
             require_file_scope(self.db, user, file.vault_id, file_id)
+            # View-only shares grant visibility but not download: the file may be in the visible scope
+            # yet outside the downloadable scope.
+            require_download_scope(self.db, user, file.vault_id, file_id)
 
         # Check file password if set
         if file.password_hash:

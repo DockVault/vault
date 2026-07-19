@@ -275,6 +275,19 @@ def scope_ids(user, vault_id):
     return None
 
 
+def download_scope_ids(user, vault_id):
+    """The DOWNLOADABLE-file id-scope for a SHARE recipient on `vault_id`: the subtree they may
+    DOWNLOAD from (view-only claims contribute to the VISIBLE scope_ids but NOT here). A
+    {"files","folders"} dict restricts; None = no sharing download restriction (a non-share
+    principal, or a recipient holding a downloadable whole-vault share). Distinct from scope_ids so a
+    view-only recipient can see/list (scope_ids) yet be denied download (this). Stamped by
+    PermissionService.stamp_share_scope; used ONLY to RESTRICT, never to grant."""
+    smap = getattr(user, "_share_download_scope", None)
+    if smap is not None:
+        return smap.get(str(vault_id))
+    return None
+
+
 def require_scope(user, vault_id, target_id, ancestor_folder_ids, kind: str = "read") -> None:
     """Fine per-file/folder gate for an ID-restricted scoped temp session. No-op for a non-scoped
     principal or a whole-vault (unrestricted) grant. Raises PermissionDeniedError (handlers map it to
