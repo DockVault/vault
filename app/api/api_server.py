@@ -5057,6 +5057,14 @@ async def claim_share(
     share = db.query(Share).filter(Share.link_token_hash == token_hash).first()
     if not share:
         raise HTTPException(status_code=404, detail="That share link is not valid.")
+    return _claim_resolved_share(db, share, current_user, request)
+
+
+def _claim_resolved_share(db: Session, share: Share, current_user: User, request: Request) -> dict:
+    """Shared claim logic once the share is resolved (by token OR by id): status/expiry, defense-in-depth
+    ZK/password refusal, the claim-audience check, idempotent re-open (revoked denied), the row-locked
+    max_recipients guard, create the ShareClaim, audit. The caller has already checked the temp-session
+    and sharing-enabled gates. Returns the recipient claim dict."""
     if share.status == "revoked":
         raise HTTPException(status_code=410, detail="That share has been revoked.")
     if _share_effective_status(share) == "expired":
@@ -5115,6 +5123,29 @@ async def claim_share(
     return _share_claim_dict(claim, share)
 
 
+@app.post("/shares/{share_id}/claim")
+async def claim_pushed_share(
+    share_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Claim a share you were DIRECTLY pushed to (a named users/departments audience) BY ID, without the
+    link token — the audience check is the gate. anyone_internal shares are link-only (they carry no
+    named recipients), so they must be claimed via POST /shares/claim with the token. Fail-closed: temp
+    session denied; sharing must be on; the audience membership is verified in _claim_resolved_share."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="A temporary session cannot claim shares.")
+    if not _sharing_enabled(db):
+        raise HTTPException(status_code=403, detail="Sharing is disabled on this deployment.")
+    share = db.query(Share).filter(Share.id == share_id).first()
+    if not share:
+        raise HTTPException(status_code=404, detail="Share not found.")
+    if share.claim_audience not in ("users", "departments"):
+        raise HTTPException(status_code=403, detail="This share can only be claimed through its link.")
+    return _claim_resolved_share(db, share, current_user, request)
+
+
 def _shared_with_me_dict(db: Session, claim: ShareClaim, share: Share) -> dict:
     """Recipient-facing card for the 'Shared with me' tab. Describes the shared item (vault name +
     target kind/name) + the effective status so an expired/revoked card can show its reason, and the
@@ -5158,13 +5189,53 @@ def _shared_with_me_dict(db: Session, claim: ShareClaim, share: Share) -> dict:
     }
 
 
+def _shared_available_dict(db: Session, share: Share) -> Optional[dict]:
+    """A DIRECT-PUSH share addressed to the current user (named users/departments audience) that they
+    have NOT claimed yet — an 'available' card they can claim in one click. Returns None if the vault is
+    no longer shareable (deleted / zero-knowledge / password-protected), so a stale push isn't offered."""
+    vault = db.query(Vault).filter(Vault.id == share.vault_id, Vault.is_active.is_(True)).first()
+    if not vault or getattr(vault, "type", "standard") == "zero_knowledge" or vault.password_hash:
+        return None
+    # A share whose recipient cap is already full can never be claimed by a new recipient — don't offer
+    # a dead-end 'Claim' card (the claim would just 409). First-come-first-served among the pushed set.
+    if share.max_recipients is not None:
+        active = db.query(ShareClaim).filter(
+            ShareClaim.share_id == share.id, ShareClaim.revoked.is_(False)).count()
+        if active >= share.max_recipients:
+            return None
+    target_name = None
+    if share.target_type == "folder" and share.target_folder_id:
+        f = db.query(Folder).filter(Folder.id == share.target_folder_id).first()
+        target_name = f.name if f else None
+    elif share.target_type == "file" and share.target_file_id:
+        x = db.query(File).filter(File.id == share.target_file_id).first()
+        target_name = x.original_name if x else None
+    return {
+        "claim_id": None,
+        "share_id": str(share.id),
+        "vault_id": str(share.vault_id),
+        "vault_name": vault.name,
+        "target_type": share.target_type,
+        "target_folder_id": str(share.target_folder_id) if share.target_folder_id else None,
+        "target_file_id": str(share.target_file_id) if share.target_file_id else None,
+        "target_name": target_name,
+        "view_only": share.view_only,
+        "status": "available",   # pushed to you; claim to access
+        "expires_at": share.expires_at.isoformat() if share.expires_at else None,
+        "max_downloads": share.max_downloads,
+        "download_count": 0,
+        "claimed_at": None,
+    }
+
+
 @app.get("/shares/shared-with-me")
 async def list_shared_with_me(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """The current user's claimed shares ('Shared with me' recipient tab). Returns active + expired +
-    revoked claims (so the UI can show a reason) but NEVER a token. A temp session owns no claims."""
+    """The current user's 'Shared with me' tab: shares they have CLAIMED (active/expired/revoked, so the
+    UI can show a reason) PLUS shares they were directly pushed (named users/departments audience) but
+    have not claimed yet ('available'). NEVER a token. A temp session owns nothing."""
     if getattr(current_user, "_is_temp_session", False):
         return []
     rows = (
@@ -5174,7 +5245,31 @@ async def list_shared_with_me(
         .order_by(ShareClaim.claimed_at.desc())
         .all()
     )
-    return [_shared_with_me_dict(db, claim, share) for claim, share in rows]
+    out = [_shared_with_me_dict(db, claim, share) for claim, share in rows]
+
+    # Direct push: active named-audience shares addressed to this user that they haven't claimed appear
+    # as 'available' cards. (Filtered in Python against the audience helper — the audience lists are
+    # small; the recipient tab is not a hot poll.)
+    claimed_ids = {r[1].id for r in rows}
+    now = datetime.utcnow()
+    gids = _user_group_ids(db, current_user.id)
+    pushed = (
+        db.query(Share)
+        .filter(Share.status == "active", Share.expires_at > now,
+                Share.claim_audience.in_(("users", "departments")))
+        .order_by(Share.created_at.desc())
+        .all()
+    )
+    for share in pushed:
+        if share.id in claimed_ids:
+            continue
+        if sharing_policy.user_matches_claim_audience(
+                share.claim_audience, share.audience_user_ids, share.audience_department_ids,
+                current_user.id, gids):
+            d = _shared_available_dict(db, share)
+            if d is not None:
+                out.append(d)
+    return out
 
 
 @app.post("/groups/{group_id}/members")

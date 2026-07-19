@@ -1441,7 +1441,10 @@ function _sharedCard(it) {
 
     const main = _el('div', 'vault-card-main');
     const h = _el('h3', 'vault-name', title);
-    if (it.status === 'expired' || it.status === 'revoked') {
+    if (it.status === 'available') {
+        h.appendChild(document.createTextNode(' '));
+        h.appendChild(_el('span', 'badge badge-info', 'Available'));
+    } else if (it.status === 'expired' || it.status === 'revoked') {
         h.appendChild(document.createTextNode(' '));
         h.appendChild(_el('span', it.status === 'expired' ? 'badge badge-warning' : 'badge badge-error',
                           it.status === 'expired' ? 'Expired' : 'Revoked'));
@@ -1460,7 +1463,8 @@ function _sharedCard(it) {
         s.appendChild(document.createTextNode(' ' + it.download_count + '/' + it.max_downloads + ' downloads'));
         meta.appendChild(s);
     }
-    if (!active) meta.appendChild(_el('span', 'text-secondary', 'Access ' + it.status));
+    if (it.status === 'available') meta.appendChild(_el('span', 'text-secondary', 'Shared with you — claim to open'));
+    else if (!active) meta.appendChild(_el('span', 'text-secondary', 'Access ' + it.status));
     main.appendChild(meta);
     body.appendChild(main);
 
@@ -1468,9 +1472,22 @@ function _sharedCard(it) {
         const openBtn = _el('button', 'open-shared-btn btn btn-primary btn-sm', 'Open');
         openBtn.addEventListener('click', (e) => { e.stopPropagation(); openSharedItem(it.vault_id, it.target_folder_id || ''); });
         body.appendChild(openBtn);
+    } else if (it.status === 'available') {
+        const claimBtn = _el('button', 'btn btn-primary btn-sm', 'Claim');
+        claimBtn.addEventListener('click', (e) => { e.stopPropagation(); claimPushedShare(it.share_id); });
+        body.appendChild(claimBtn);
     }
     card.appendChild(body);
     return card;
+}
+
+// Claim a share you were directly pushed (a named users/departments audience) — by id, no link needed.
+async function claimPushedShare(shareId) {
+    try {
+        await apiRequest('/shares/' + shareId + '/claim', { method: 'POST' });
+        showToast('Share claimed', 'success');
+        await loadShared();
+    } catch (e) { showToast(e.message || 'Could not claim this share', 'error'); }
 }
 
 function renderShared() {
