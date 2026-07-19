@@ -28,7 +28,8 @@ import traceback
 from pathlib import Path
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
-from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference
+from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag
+from app.core import sharing_policy
 # NOTE: auth_service and vault_service BOTH define a class named RateLimitExceededError
 # (unrelated: one subclasses AuthenticationError, the other FileServiceError). Import the
 # auth one under an alias so the later vault import below can't shadow it — otherwise the
@@ -652,6 +653,86 @@ class GroupMembersAdd(BaseModel):
 class VaultGroupAccessAdd(BaseModel):
     group_id: uuid.UUID
     permission: str = 'read'  # 'read' | 'write'
+
+
+class ShareTagCreate(BaseModel):
+    """Create a share tag (interactive-admin). Policy + create-allowlist. Ints are >= 1; a NULL cap or
+    default means unlimited on that axis. Cross-field checks (default <= cap, default_lifetime <=
+    ceiling, audiences subset, allowlist ids exist) run in the endpoint via _validate_share_tag_fields.
+    The create-allowlist DEFAULTS FAIL-CLOSED (auto_enroll off + empty lists): a fresh tag grants no one
+    until the admin allow-lists users/departments or enables auto-enroll."""
+    name: str = Field(..., min_length=1, max_length=120)
+    description: Optional[str] = None
+    color: Optional[str] = Field(None, max_length=20)
+    max_lifetime_minutes: int = Field(10080, ge=1)     # ceiling (7 days)
+    default_lifetime_minutes: int = Field(1440, ge=1)  # default (1 day)
+    max_recipients_cap: Optional[int] = Field(None, ge=1)
+    max_recipients_default: Optional[int] = Field(None, ge=1)
+    max_downloads_cap: Optional[int] = Field(None, ge=1)
+    max_downloads_default: Optional[int] = Field(None, ge=1)
+    allow_view_only: bool = True
+    default_view_only: bool = False
+    allow_custom: bool = True
+    allowed_audiences: List[str] = Field(default_factory=lambda: list(sharing_policy.AUDIENCES))
+    allowed_department_ids: List[uuid.UUID] = Field(default_factory=list)
+    allowed_user_ids: List[uuid.UUID] = Field(default_factory=list)
+    blocked_user_ids: List[uuid.UUID] = Field(default_factory=list)
+    auto_enroll_new_users: bool = False
+
+    @field_validator('name')
+    @classmethod
+    def _clean_name(cls, v):
+        return _reject_markup_chars(v, 'name')
+
+    @field_validator('color')
+    @classmethod
+    def _clean_color(cls, v):
+        return _validate_chip_color(v)
+
+    @field_validator('description')
+    @classmethod
+    def _clean_description(cls, v):
+        # Strip HTML markup at the input boundary like every sibling free-text field (name/username/…),
+        # so a later Tags-manager UI can never render a stored-XSS payload from a tag description.
+        return _reject_markup_chars(v, 'description') if v is not None else v
+
+
+class ShareTagUpdate(BaseModel):
+    """Patch a share tag (interactive-admin). All fields optional; only PROVIDED keys change (an
+    explicit null on a cap/default clears it -> unlimited). is_active toggles soft-deactivate/reactivate."""
+    name: Optional[str] = Field(None, min_length=1, max_length=120)
+    description: Optional[str] = None
+    color: Optional[str] = Field(None, max_length=20)
+    is_active: Optional[bool] = None
+    max_lifetime_minutes: Optional[int] = Field(None, ge=1)
+    default_lifetime_minutes: Optional[int] = Field(None, ge=1)
+    max_recipients_cap: Optional[int] = Field(None, ge=1)
+    max_recipients_default: Optional[int] = Field(None, ge=1)
+    max_downloads_cap: Optional[int] = Field(None, ge=1)
+    max_downloads_default: Optional[int] = Field(None, ge=1)
+    allow_view_only: Optional[bool] = None
+    default_view_only: Optional[bool] = None
+    allow_custom: Optional[bool] = None
+    allowed_audiences: Optional[List[str]] = None
+    allowed_department_ids: Optional[List[uuid.UUID]] = None
+    allowed_user_ids: Optional[List[uuid.UUID]] = None
+    blocked_user_ids: Optional[List[uuid.UUID]] = None
+    auto_enroll_new_users: Optional[bool] = None
+
+    @field_validator('name')
+    @classmethod
+    def _clean_name(cls, v):
+        return _reject_markup_chars(v, 'name') if v is not None else v
+
+    @field_validator('color')
+    @classmethod
+    def _clean_color(cls, v):
+        return _validate_chip_color(v)
+
+    @field_validator('description')
+    @classmethod
+    def _clean_description(cls, v):
+        return _reject_markup_chars(v, 'description') if v is not None else v
 
 
 class TempCredentialCreate(BaseModel):
@@ -1625,6 +1706,13 @@ def _temp_passcodes_enabled(db: Session) -> bool:
     return temp_passcode_policy.passcodes_enabled(_global_settings_blob(db))
 
 
+def _sharing_enabled(db: Session) -> bool:
+    """Sharing feature master switch (FAIL-CLOSED: default False, and False for any non-bool stored
+    value). Mirrors _temp_passcodes_enabled / _zk_enabled; the per-tag policy lives in the share_tags
+    table, this is only the deployment-wide on/off."""
+    return sharing_policy.sharing_enabled(_global_settings_blob(db))
+
+
 def _temp_cred_allow_zk_vaults(db: Session) -> bool:
     """May a zero-knowledge vault be included in a temporary credential's scope at all. Default True =
     today's behavior; only an explicit stored False denies (enforced fail-closed at the mint chokepoint)."""
@@ -1672,7 +1760,8 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Settings payload must be an object")
 
-    for bool_key in ("zero_knowledge_enabled", "force_zero_knowledge", "force_no_remember_vault_password"):
+    for bool_key in ("zero_knowledge_enabled", "force_zero_knowledge", "force_no_remember_vault_password",
+                     "sharing_enabled"):
         if bool_key in payload and not isinstance(payload[bool_key], bool):
             raise HTTPException(status_code=400, detail=f"{bool_key} must be true or false")
 
@@ -1774,6 +1863,8 @@ async def get_settings(
     data["force_no_remember_vault_password"] = _force_no_remember_vault_password(db)
     # Effective ZK-key idle auto-lock (minutes; 0 = disabled).
     data["zk_idle_lock_minutes"] = _zk_idle_lock_minutes(db)
+    # Effective Sharing master switch (default OFF) so the Settings -> Sharing toggle reflects reality.
+    data["sharing_enabled"] = _sharing_enabled(db)
     return data
 
 
@@ -4303,6 +4394,267 @@ async def delete_group(
     db.delete(group)
     db.commit()
     return {"message": f"Group '{name}' deleted"}
+
+
+# ---------------------------------------------------------------------------
+# Sharing policy & tags. The Sharing feature's admin policy surface. The master
+# switch lives in the SystemSetting('global') blob (validated in
+# _validate_settings_payload, overlaid in get_settings, resolved by _sharing_enabled);
+# the per-tag policy + create-allowlist live in the share_tags table (CRUD below,
+# interactive-admin). GET /share-policy is the non-admin effective reader (like
+# /zk-enabled) that shapes the share modal. No share creation or enforcement here.
+# ---------------------------------------------------------------------------
+# Tag fields whose columns are NOT NULL. A PATCH may OMIT them, but an explicit JSON null is rejected:
+# ShareTagUpdate types everything Optional, so model_dump(exclude_unset=True) keeps an explicit null,
+# which would otherwise violate the NOT-NULL column (500) or, for allowed_audiences, store an unusable
+# empty-audiences tag. The caps (max_recipients_cap/max_downloads_cap) are nullable -> null clears them.
+_SHARE_TAG_NOT_NULLABLE = frozenset({
+    "name", "is_active", "max_lifetime_minutes", "default_lifetime_minutes",
+    "allow_view_only", "default_view_only", "allow_custom", "auto_enroll_new_users", "allowed_audiences",
+})
+
+
+def _share_tag_dict(t: ShareTag) -> dict:
+    """Full admin view of a share tag (includes the create-allowlist so the Tags manager can edit it).
+    Id lists are stringified; this is the admin-only shape (GET /share-policy exposes far less)."""
+    return {
+        "id": str(t.id),
+        "name": t.name,
+        "description": t.description,
+        "color": t.color,
+        "is_active": t.is_active,
+        "max_lifetime_minutes": t.max_lifetime_minutes,
+        "default_lifetime_minutes": t.default_lifetime_minutes,
+        "max_recipients_cap": t.max_recipients_cap,
+        "max_recipients_default": t.max_recipients_default,
+        "max_downloads_cap": t.max_downloads_cap,
+        "max_downloads_default": t.max_downloads_default,
+        "allow_view_only": t.allow_view_only,
+        "default_view_only": t.default_view_only,
+        "allow_custom": t.allow_custom,
+        "allowed_audiences": list(t.allowed_audiences or []),
+        "allowed_department_ids": [str(x) for x in (t.allowed_department_ids or [])],
+        "allowed_user_ids": [str(x) for x in (t.allowed_user_ids or [])],
+        "blocked_user_ids": [str(x) for x in (t.blocked_user_ids or [])],
+        "auto_enroll_new_users": t.auto_enroll_new_users,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+    }
+
+
+def _validate_ids_exist(db: Session, model, ids, field: str) -> None:
+    """Reject a tag allowlist that references a user/group id that doesn't exist, so a typo can't
+    silently do nothing (mirrors _validate_group_id_list's fail-loud philosophy)."""
+    if not ids:
+        return
+    ids = [str(x) for x in ids]
+    found = {str(r[0]) for r in db.query(model.id).filter(model.id.in_(ids)).all()}
+    missing = [i for i in ids if i not in found]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"{field} contains unknown id(s): {missing}")
+
+
+def _validate_share_tag_fields(eff: dict, changed_keys: set, db: Session) -> None:
+    """Cross-field + existence validation for a share tag. `eff` is the EFFECTIVE (post-merge) view so
+    a PATCH that touches only one side of a pair is checked against the stored other side; existence is
+    only re-checked for id lists actually CHANGED (so a stale id in an untouched list can't block an
+    unrelated edit)."""
+    ml, dl = eff.get("max_lifetime_minutes"), eff.get("default_lifetime_minutes")
+    if ml is not None and dl is not None and dl > ml:
+        raise HTTPException(status_code=400, detail="default_lifetime_minutes cannot exceed max_lifetime_minutes")
+    for cap_k, def_k in (("max_recipients_cap", "max_recipients_default"),
+                         ("max_downloads_cap", "max_downloads_default")):
+        cap, dv = eff.get(cap_k), eff.get(def_k)
+        if cap is not None and dv is not None and dv > cap:
+            raise HTTPException(status_code=400, detail=f"{def_k} cannot exceed {cap_k}")
+    # A view-only DEFAULT is meaningless if view-only isn't even ALLOWED for the tag.
+    if eff.get("default_view_only") and eff.get("allow_view_only") is False:
+        raise HTTPException(status_code=400, detail="default_view_only requires allow_view_only")
+    aud = eff.get("allowed_audiences")
+    if aud is not None:
+        bad = [a for a in aud if a not in sharing_policy.AUDIENCES]
+        if bad:
+            raise HTTPException(status_code=400,
+                                detail=f"unknown audience(s) {bad}; allowed: {list(sharing_policy.AUDIENCES)}")
+        if not sharing_policy.normalize_audiences(aud):
+            raise HTTPException(status_code=400, detail="allowed_audiences must include at least one audience")
+    if "allowed_department_ids" in changed_keys:
+        _validate_ids_exist(db, Group, eff.get("allowed_department_ids"), "allowed_department_ids")
+    for uk in ("allowed_user_ids", "blocked_user_ids"):
+        if uk in changed_keys:
+            _validate_ids_exist(db, User, eff.get(uk), uk)
+
+
+def _audit_share_tag(db: Session, request: Request, user: User, action: str, tag: ShareTag) -> None:
+    """Best-effort admin-config audit for a tag mutation (never fails the mutation). A tag NAME is an
+    admin-authored classification label, not a file/folder name, so logging it is safe (cf. vault_name)."""
+    try:
+        AuditLogger(db).log_action(action=action, status="success", user=user,
+                                   ip_address=get_client_ip(request),
+                                   details={"tag_id": str(tag.id), "name": tag.name})
+    except Exception:
+        pass
+
+
+@app.get("/share-tags")
+async def list_share_tags(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """List all share tags (active AND inactive) for the admin Tags manager."""
+    tags = db.query(ShareTag).order_by(ShareTag.name).all()
+    return [_share_tag_dict(t) for t in tags]
+
+
+@app.post("/share-tags")
+async def create_share_tag(
+    payload: ShareTagCreate,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Create a share tag (interactive-admin). Name is unique; policy + create-allowlist validated."""
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Tag name is required")
+    existing = db.query(ShareTag).filter(ShareTag.name == name).first()
+    if existing:
+        if not existing.is_active:
+            raise HTTPException(status_code=400,
+                                detail="A deactivated tag already uses this name — reactivate it or choose another")
+        raise HTTPException(status_code=400, detail="A tag with that name already exists")
+    data = payload.model_dump()
+    data["name"] = name
+    for k in ("allowed_department_ids", "allowed_user_ids", "blocked_user_ids"):
+        data[k] = [str(x) for x in (data.get(k) or [])]
+    _validate_share_tag_fields(data, set(data.keys()), db)
+    data["allowed_audiences"] = sharing_policy.normalize_audiences(data.get("allowed_audiences"))
+    tag = ShareTag(created_by=current_user.id, **data)
+    db.add(tag)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()  # a concurrent create raced the same unique name -> clean 400, not a 500
+        raise HTTPException(status_code=400, detail="A tag with that name already exists")
+    db.refresh(tag)
+    _audit_share_tag(db, request, current_user, "share_tag_created", tag)
+    return _share_tag_dict(tag)
+
+
+@app.patch("/share-tags/{tag_id}")
+async def update_share_tag(
+    tag_id: uuid.UUID,
+    payload: ShareTagUpdate,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Update a share tag's policy / create-allowlist / active state (interactive-admin). Only PROVIDED
+    keys change; editing does NOT retroactively alter existing shares (they snapshot the tag at create)."""
+    tag = db.query(ShareTag).filter(ShareTag.id == tag_id).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Tag not found")
+    data = payload.model_dump(exclude_unset=True)
+    # An explicit JSON null on a NOT-NULL field is rejected here (a PATCH may omit it, but must not blank
+    # it): otherwise it would violate the column (500) or, for allowed_audiences, store an unusable tag.
+    for k in _SHARE_TAG_NOT_NULLABLE:
+        if k in data and data[k] is None:
+            raise HTTPException(status_code=400, detail=f"{k} cannot be null")
+    if "name" in data:
+        nm = (data["name"] or "").strip()
+        if not nm:
+            raise HTTPException(status_code=400, detail="Tag name cannot be empty")
+        if db.query(ShareTag).filter(ShareTag.name == nm, ShareTag.id != tag_id).first():
+            raise HTTPException(status_code=400, detail="A tag with that name already exists")
+        data["name"] = nm
+    for k in ("allowed_department_ids", "allowed_user_ids", "blocked_user_ids"):
+        if k in data:
+            data[k] = [str(x) for x in (data[k] or [])]
+    eff = _share_tag_dict(tag)
+    eff.update(data)
+    _validate_share_tag_fields(eff, set(data.keys()), db)
+    if "allowed_audiences" in data:
+        data["allowed_audiences"] = sharing_policy.normalize_audiences(data["allowed_audiences"])
+    for k, v in data.items():
+        setattr(tag, k, v)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()  # a concurrent rename raced the same unique name -> clean 400, not a 500
+        raise HTTPException(status_code=400, detail="A tag with that name already exists")
+    db.refresh(tag)
+    _audit_share_tag(db, request, current_user, "share_tag_updated", tag)
+    return _share_tag_dict(tag)
+
+
+@app.delete("/share-tags/{tag_id}")
+async def deactivate_share_tag(
+    tag_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Soft-deactivate a share tag (interactive-admin) — NEVER a hard delete, so any shares that
+    reference it keep their snapshot. Deactivating stops NEW creates with the tag; reactivate via PATCH
+    is_active=true."""
+    tag = db.query(ShareTag).filter(ShareTag.id == tag_id).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Tag not found")
+    tag.is_active = False
+    db.commit()
+    _audit_share_tag(db, request, current_user, "share_tag_deactivated", tag)
+    return {"message": f"Tag '{tag.name}' deactivated", "id": str(tag.id), "is_active": False}
+
+
+@app.get("/share-policy")
+async def get_share_policy(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Effective sharing policy for the CURRENT user — non-admin readable (like /zk-enabled), so the
+    (future) share modal can shape controls without exposing the admin-only /settings or /share-tags.
+    Returns whether sharing is on + ONLY the tags this user may CREATE shares with, each carrying its
+    effective limit envelope + allowed audiences.
+
+    FAIL-CLOSED: sharing off -> no tags; a temp-credential session can never create a share -> no tags;
+    a user not permitted by a tag's create-allowlist never sees that tag. The create-allowlist internals
+    (who is allowed/blocked) are NEVER exposed here."""
+    enabled = _sharing_enabled(db)
+    if not enabled or getattr(current_user, "_is_temp_session", False):
+        return {"sharing_enabled": enabled, "tags": []}
+    user_gids = [
+        str(r[0]) for r in db.query(user_groups.c.group_id)
+        .filter(user_groups.c.user_id == current_user.id).all()
+    ]
+    creatable = []
+    for t in db.query(ShareTag).filter(ShareTag.is_active.is_(True)).order_by(ShareTag.name).all():
+        allowlist = {
+            "is_active": t.is_active,
+            "blocked_user_ids": t.blocked_user_ids,
+            "allowed_user_ids": t.allowed_user_ids,
+            "allowed_department_ids": t.allowed_department_ids,
+            "auto_enroll_new_users": t.auto_enroll_new_users,
+        }
+        if not sharing_policy.user_can_create_with_tag(allowlist, current_user.id, user_gids):
+            continue
+        eff = sharing_policy.tag_effective_limits({
+            "max_lifetime_minutes": t.max_lifetime_minutes,
+            "default_lifetime_minutes": t.default_lifetime_minutes,
+            "max_recipients_cap": t.max_recipients_cap,
+            "max_recipients_default": t.max_recipients_default,
+            "max_downloads_cap": t.max_downloads_cap,
+            "max_downloads_default": t.max_downloads_default,
+        })
+        creatable.append({
+            "id": str(t.id),
+            "name": t.name,
+            "color": t.color,
+            "allowed_audiences": sharing_policy.normalize_audiences(t.allowed_audiences),
+            "allow_view_only": t.allow_view_only,
+            "default_view_only": t.default_view_only,
+            "allow_custom": t.allow_custom,
+            **eff,
+        })
+    return {"sharing_enabled": True, "tags": creatable}
 
 
 @app.post("/groups/{group_id}/members")

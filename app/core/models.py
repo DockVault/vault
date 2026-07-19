@@ -369,6 +369,56 @@ class TempCredentialVaultAccess(Base):
     )
 
 
+class ShareTag(Base):
+    """Admin-owned share classification + policy — the spine of the Sharing feature.
+
+    One row per tag (e.g. Confidential / Internal / Temporary). Carries the POLICY a share minted under
+    it inherits (lifetime ceiling/default, recipient/download caps + defaults, allowed audiences,
+    view-only, whether a creator may customize within caps) AND a CREATE-ALLOWLIST governing who may
+    create shares with it. Soft-deactivated (is_active=False), never hard-deleted while shares reference
+    it — deactivating stops NEW creates; existing shares run out their snapshot. A WHOLE NEW TABLE (not
+    columns on an existing one) so init_db()'s create_all() migrates it cleanly onto already-deployed
+    vaults (create_all never ALTERs). The create-allowlist is evaluated LIVE (never snapshotted); the
+    limit/policy fields are snapshotted onto each Share at creation (see app/core/sharing_policy.py).
+    """
+    __tablename__ = 'share_tags'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(120), nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    color = Column(String(20), nullable=True)  # optional accent tag, e.g. 'indigo'
+    is_active = Column(Boolean, nullable=False, default=True)
+
+    # --- Policy (snapshotted onto a Share at creation; editing a tag does NOT change existing shares) ---
+    # Lifetime is admin-bounded with NO app cap (may be years); hard floor 1 minute (sharing_policy.MIN_LIFETIME_MINUTES).
+    max_lifetime_minutes = Column(Integer, nullable=False, default=10080)     # ceiling (default 7 days)
+    default_lifetime_minutes = Column(Integer, nullable=False, default=1440)  # default (1 day)
+    # NULL cap / NULL default = unlimited on that axis (within the tag). A default may not exceed its cap.
+    max_recipients_cap = Column(Integer, nullable=True)
+    max_recipients_default = Column(Integer, nullable=True)
+    max_downloads_cap = Column(Integer, nullable=True)
+    max_downloads_default = Column(Integer, nullable=True)
+    allow_view_only = Column(Boolean, nullable=False, default=True)
+    default_view_only = Column(Boolean, nullable=False, default=False)
+    allow_custom = Column(Boolean, nullable=False, default=True)  # may a creator override defaults within caps?
+    # Subset of sharing_policy.AUDIENCES the creator may pick for a share's claim-audience.
+    allowed_audiences = Column(JSON, nullable=False, default=list)
+
+    # --- Create-allowlist (evaluated LIVE, never snapshotted): who may create a share with this tag ---
+    allowed_department_ids = Column(JSON, nullable=False, default=list)  # group ids (str)
+    allowed_user_ids = Column(JSON, nullable=False, default=list)        # user ids (str)
+    blocked_user_ids = Column(JSON, nullable=False, default=list)        # user ids (str) — the blocklist wins
+    auto_enroll_new_users = Column(Boolean, nullable=False, default=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+
+    __table_args__ = (
+        Index('idx_share_tag_active', 'is_active'),
+    )
+
+
 class ActiveSession(Base):
     """Track active SFTP sessions."""
     __tablename__ = 'active_sessions'
