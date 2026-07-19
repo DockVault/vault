@@ -4904,6 +4904,74 @@ async def list_my_shares(
     return [_share_dict(db, s, claim_counts=counts) for s in shares]
 
 
+def _load_manageable_share(db: Session, share_id, current_user: User) -> Share:
+    """Fetch a share the caller may MANAGE (revoke / kick): the creator or a global admin. A temp
+    session can never manage a share. Raises the mapped HTTPException on any failure (fail-closed)."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="A temporary session cannot manage shares.")
+    share = db.query(Share).filter(Share.id == share_id).first()
+    if not share:
+        raise HTTPException(status_code=404, detail="Share not found.")
+    if share.creator_id != current_user.id and current_user.role != RoleEnum.ADMIN:
+        raise HTTPException(status_code=403, detail="Only the share's creator or an admin can manage it.")
+    return share
+
+
+@app.post("/shares/{share_id}/revoke")
+async def revoke_share(
+    share_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Revoke a whole share (creator or admin). Sets status='revoked'; every claimant loses access at
+    the vault chokepoint on their next request (evaluated LIVE — there is no session to expire).
+    Idempotent: revoking an already-revoked share is a no-op success."""
+    share = _load_manageable_share(db, share_id, current_user)
+    if share.status != "revoked":
+        share.status = "revoked"
+        share.revoked_at = datetime.utcnow()
+        share.revoked_by = current_user.id
+        db.commit()
+        try:
+            AuditLogger(db).log_action(
+                action="share_revoked", status="success", user=current_user,
+                ip_address=get_client_ip(request),
+                details={"share_id": str(share.id), "vault_id": str(share.vault_id)})
+        except Exception:
+            db.rollback()
+    return _share_dict(db, share)
+
+
+@app.post("/shares/{share_id}/claims/{user_id}/revoke")
+async def revoke_share_claim(
+    share_id: uuid.UUID,
+    user_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Kick a single recipient from a share (creator or admin) without revoking it for everyone. Sets
+    that recipient's ShareClaim.revoked=True; they lose access LIVE at the chokepoint, other claimants
+    keep theirs. Idempotent for an already-kicked recipient; 404 if that user never claimed."""
+    share = _load_manageable_share(db, share_id, current_user)
+    claim = db.query(ShareClaim).filter(
+        ShareClaim.share_id == share.id, ShareClaim.user_id == user_id).first()
+    if not claim:
+        raise HTTPException(status_code=404, detail="That recipient has not claimed this share.")
+    if not claim.revoked:
+        claim.revoked = True
+        db.commit()
+        try:
+            target = db.query(User).filter(User.id == user_id).first()
+            AuditLogger(db).log_permission_revoked(
+                target_user_id=user_id, target_username=(target.username if target else "?"),
+                permission=f"share:{share.id}", revoked_by=current_user, ip_address=get_client_ip(request))
+        except Exception:
+            db.rollback()
+    return {"share_id": str(share.id), "user_id": str(user_id), "revoked": True}
+
+
 def _share_claim_dict(claim: ShareClaim, share: Share) -> dict:
     """Recipient-facing view returned to a claimant. Describes WHAT was claimed (so the Shared tab can
     render a card); it does NOT itself grant access — a later phase authorizes the claim at the vault
