@@ -1495,6 +1495,220 @@ async function openSharedItem(vaultId, folderId) {
     if (folderId) { try { await navigateToFolder(folderId); } catch (e) { /* root listing still shows the path down */ } }
 }
 
+// ---- Create-share modal (creator) ----
+// DOM-built (no innerHTML). Reuses the existing openModal/closeModal, copyToClipboard, and the
+// department chip picker (_renderGroupPickerInto); the user picker is a small /users/search wrapper.
+const _shareCreate = { targetType: null, targetId: null, vaultId: null, targetName: null,
+                       policy: null, userIds: [], usersById: {}, deptIds: [], lastLink: '' };
+
+// A share requires a Standard, non-password vault (the backend refuses zero-knowledge + password-
+// protected). Hide the Share affordances for those so they aren't a dead-end.
+function vaultShareable() {
+    const v = state.currentVault;
+    return !!(v && (v.type || 'standard') !== 'zero_knowledge' && !v.has_password);
+}
+
+async function openCreateShareModal(targetType, targetId, targetName) {
+    const vaultId = state.currentVault && state.currentVault.id;
+    if (!vaultId) { showToast('Open a vault first', 'error'); return; }
+    _shareCreate.targetType = targetType;
+    _shareCreate.targetId = (targetType === 'vault') ? null : targetId;
+    _shareCreate.vaultId = vaultId;
+    _shareCreate.userIds = []; _shareCreate.deptIds = []; _shareCreate.usersById = {};
+
+    const label = document.getElementById('share-target-label');
+    if (label) label.textContent = targetType === 'vault' ? (state.currentVault.name || 'this vault') : (targetName || targetType);
+    document.getElementById('share-create-fields').style.display = '';
+    document.getElementById('share-create-result').style.display = 'none';
+    const submitBtn = document.getElementById('share-create-submit');
+    if (submitBtn) { submitBtn.style.display = ''; submitBtn.disabled = true; }
+    // Reset the reused singleton's inputs so a prior share's values don't leak into this one.
+    _shareCreate.lastLink = '';
+    ['share-lifetime-days', 'share-max-recipients', 'share-max-downloads', 'share-user-search'].forEach(id => {
+        const el = document.getElementById(id); if (el) el.value = '';
+    });
+    const results = document.getElementById('share-user-results'); if (results) results.replaceChildren();
+    _shareSetError('');
+    openModal('create-share-modal');
+    setupShareCreateModalOnce();
+
+    const tagSel = document.getElementById('share-tag-select');
+    tagSel.replaceChildren(_el('option', null, 'Loading…'));
+    tagSel.disabled = true;
+    try { _shareCreate.policy = await apiRequest('/share-policy', { silent: true }); }
+    catch (e) { _shareCreate.policy = { sharing_enabled: false, tags: [] }; }
+    await loadSftpPolicyGroups().catch(() => {});  // for the department picker (idempotent)
+    populateShareTags();
+}
+
+function populateShareTags() {
+    const tagSel = document.getElementById('share-tag-select');
+    const submitBtn = document.getElementById('share-create-submit');
+    const tags = (_shareCreate.policy && _shareCreate.policy.tags) || [];
+    tagSel.disabled = false;
+    if (!_shareCreate.policy || !_shareCreate.policy.sharing_enabled || tags.length === 0) {
+        tagSel.replaceChildren(_el('option', null, 'No tags available'));
+        _shareSetError((!_shareCreate.policy || !_shareCreate.policy.sharing_enabled)
+            ? 'Sharing is not enabled on this deployment.'
+            : 'You do not have permission to create shares here.');
+        if (submitBtn) submitBtn.disabled = true;
+        _shareToggleRecipientGroups(null);
+        return;
+    }
+    tagSel.replaceChildren(...tags.map(t => { const o = _el('option', null, t.name); o.value = t.id; return o; }));
+    if (submitBtn) submitBtn.disabled = false;
+    onShareTagChange();
+}
+
+function currentShareTag() {
+    const id = document.getElementById('share-tag-select').value;
+    return ((_shareCreate.policy && _shareCreate.policy.tags) || []).find(t => t.id === id) || null;
+}
+
+const _SHARE_AUD_LABEL = { anyone_internal: 'Anyone with the link', users: 'Specific users', departments: 'Departments' };
+
+function onShareTagChange() {
+    const t = currentShareTag();
+    const audSel = document.getElementById('share-audience-select');
+    if (!t) { audSel.replaceChildren(); _shareToggleRecipientGroups(null); return; }
+    const auds = t.allowed_audiences || [];
+    audSel.replaceChildren(...auds.map(a => { const o = _el('option', null, _SHARE_AUD_LABEL[a] || a); o.value = a; return o; }));
+    const voGroup = document.getElementById('share-viewonly-group');
+    const voInput = document.getElementById('share-view-only');
+    voGroup.style.display = t.allow_view_only ? '' : 'none';
+    voInput.checked = !!(t.allow_view_only && t.default_view_only);
+    // The backend only honors a custom view_only when the tag allows customization; otherwise it
+    // forces default_view_only. Reflect that: editable only when allow_custom, else read-only.
+    voInput.disabled = !t.allow_custom;
+    document.getElementById('share-limits-group').style.display = t.allow_custom ? '' : 'none';
+    _shareCreate.userIds = []; _shareCreate.deptIds = [];
+    onShareAudienceChange();
+}
+
+function onShareAudienceChange() {
+    _shareToggleRecipientGroups(document.getElementById('share-audience-select').value);
+}
+
+function _shareToggleRecipientGroups(aud) {
+    document.getElementById('share-users-group').style.display = aud === 'users' ? '' : 'none';
+    document.getElementById('share-depts-group').style.display = aud === 'departments' ? '' : 'none';
+    if (aud === 'users') renderShareUserChips();
+    if (aud === 'departments') renderShareDeptPicker();
+}
+
+function renderShareUserChips() {
+    const host = document.getElementById('share-user-chips');
+    host.replaceChildren(..._shareCreate.userIds.map(id => {
+        const chip = _el('span', 'chip', _shareCreate.usersById[id] || id);
+        const x = _el('button', 'chip-remove'); x.type = 'button'; x.setAttribute('aria-label', 'Remove');
+        x.appendChild(_svgIcon('x', 'icon-sm'));
+        x.addEventListener('click', () => { _shareCreate.userIds = _shareCreate.userIds.filter(i => i !== id); renderShareUserChips(); });
+        chip.appendChild(x);
+        return chip;
+    }));
+}
+
+let _shareUserSearchTimer = null, _shareUserSearchSeq = 0;
+async function shareUserSearch(q) {
+    q = (q || '').trim();
+    const results = document.getElementById('share-user-results');
+    if (!q) { results.replaceChildren(); return; }
+    const seq = ++_shareUserSearchSeq;
+    try {
+        const users = await apiRequest('/users/search?q=' + encodeURIComponent(q), { silent: true });
+        if (seq !== _shareUserSearchSeq) return;  // a newer keystroke superseded this result
+        results.replaceChildren(...(users || []).slice(0, 8).map(u => {
+            const row = _el('button', 'pick-row', u.username); row.type = 'button';
+            row.addEventListener('click', () => {
+                if (!_shareCreate.userIds.includes(u.id)) { _shareCreate.userIds.push(u.id); _shareCreate.usersById[u.id] = u.username; }
+                document.getElementById('share-user-search').value = '';
+                results.replaceChildren();
+                renderShareUserChips();
+            });
+            return row;
+        }));
+    } catch (e) { /* transient search error — ignore */ }
+}
+
+function renderShareDeptPicker() {
+    _renderGroupPickerInto('share-dept-picker',
+        () => _shareCreate.deptIds, v => { _shareCreate.deptIds = v; },
+        'No departments selected', renderShareDeptPicker, 'share-dept-add', 'share-dept-remove');
+}
+
+function _shareSetError(msg) {
+    const e = document.getElementById('share-create-error');
+    if (!e) return;
+    if (msg) { e.textContent = msg; e.style.display = ''; } else { e.textContent = ''; e.style.display = 'none'; }
+}
+
+let _shareCreateWired = false;
+function setupShareCreateModalOnce() {
+    if (_shareCreateWired) return;
+    _shareCreateWired = true;
+    document.getElementById('share-tag-select').addEventListener('change', onShareTagChange);
+    document.getElementById('share-audience-select').addEventListener('change', onShareAudienceChange);
+    const search = document.getElementById('share-user-search');
+    search.addEventListener('input', () => {
+        clearTimeout(_shareUserSearchTimer);
+        _shareUserSearchTimer = setTimeout(() => shareUserSearch(search.value), 250);
+    });
+    document.getElementById('share-create-submit').addEventListener('click', submitCreateShare);
+    // Copy from the STORED token, not the element text (copyToClipboard swaps the element to a
+    // "Copied!" label for 2s; on a show-once link a re-read would copy that label and lose the token).
+    document.getElementById('share-link-copy').addEventListener('click', () => {
+        const tok = _shareCreate.lastLink || '';
+        if (!tok) return;
+        navigator.clipboard.writeText(tok).then(() => showToast('Link copied', 'success')).catch(() => {});
+    });
+}
+
+async function submitCreateShare() {
+    const t = currentShareTag();
+    if (!t) { _shareSetError('Pick a classification tag.'); return; }
+    const aud = document.getElementById('share-audience-select').value;
+    const payload = {
+        vault_id: _shareCreate.vaultId, tag_id: t.id, target_type: _shareCreate.targetType,
+        claim_audience: aud, with_link: true,
+    };
+    if (_shareCreate.targetType === 'folder') payload.target_folder_id = _shareCreate.targetId;
+    if (_shareCreate.targetType === 'file') payload.target_file_id = _shareCreate.targetId;
+    if (aud === 'users') {
+        if (!_shareCreate.userIds.length) { _shareSetError('Pick at least one recipient.'); return; }
+        payload.audience_user_ids = _shareCreate.userIds;
+    }
+    if (aud === 'departments') {
+        if (!_shareCreate.deptIds.length) { _shareSetError('Pick at least one department.'); return; }
+        payload.audience_department_ids = _shareCreate.deptIds;
+    }
+    // view_only is only honored server-side when the tag allows customization (else the tag default
+    // is forced); only send it then, matching the UI's read-only state for non-custom tags.
+    if (t.allow_view_only && t.allow_custom) payload.view_only = document.getElementById('share-view-only').checked;
+    if (t.allow_custom) {
+        const days = parseInt(document.getElementById('share-lifetime-days').value, 10);
+        const mr = parseInt(document.getElementById('share-max-recipients').value, 10);
+        const md = parseInt(document.getElementById('share-max-downloads').value, 10);
+        if (days > 0) payload.lifetime_minutes = days * 1440;
+        if (mr > 0) payload.max_recipients = mr;
+        if (md > 0) payload.max_downloads = md;
+    }
+    const submitBtn = document.getElementById('share-create-submit');
+    submitBtn.disabled = true;
+    _shareSetError('');
+    try {
+        const res = await apiRequest('/shares', { method: 'POST', body: JSON.stringify(payload) });
+        _shareCreate.lastLink = res.link_token || '';
+        document.getElementById('share-link-value').textContent = res.link_token || '';
+        document.getElementById('share-create-fields').style.display = 'none';
+        document.getElementById('share-create-result').style.display = '';
+        submitBtn.style.display = 'none';
+        showToast('Share created', 'success');
+    } catch (e) {
+        _shareSetError(e.message || 'Could not create the share.');
+        submitBtn.disabled = false;
+    }
+}
+
 // Star / un-star a vault (optimistic; reverts on failure).
 async function toggleVaultFavorite(vaultId) {
     const v = (state.allVaults || []).find(x => x.id === vaultId);
@@ -5944,8 +6158,9 @@ function fileActionButtons(item, canWrite, opts) {
         if (slot !== 'primary') {  // folders have no download -> primary (left) is empty
             if (canRename) out.push(btn('rename-folder', 'edit', 'Rename'));
             if (canDelete) out.push(btn('delete-folder', 'trash', 'Delete', true));
+            if (vaultShareable()) out.push(btn('share-folder', 'link', 'Share'));
         }
-        if (!canRename && !canDelete && !slot && (!opts || !opts.grid)) out.push('<span class="text-tertiary text-sm">—</span>');
+        if (out.length === 0 && !slot && (!opts || !opts.grid)) out.push('<span class="text-tertiary text-sm">—</span>');
     } else {
         const canDownload = vaultCapAllowed('file.download');
         const canRename = canWrite && vaultCapAllowed('file.rename');
@@ -5954,6 +6169,7 @@ function fileActionButtons(item, canWrite, opts) {
         if (slot !== 'primary') {
             if (canRename) out.push(btn('rename-file', 'edit', 'Rename'));
             if (canDelete) out.push(btn('delete-file', 'trash', 'Delete', true));
+            if (vaultShareable()) out.push(btn('share-file', 'link', 'Share'));
         }
     }
     return out.join('');
@@ -6060,6 +6276,7 @@ function wireFileItemHandlers(container) {
             if (action === 'download') downloadFile(id, name);
             else if (action === 'rename-file' || action === 'rename-folder') renameVaultItem(id, name, action === 'rename-folder' ? 'folder' : 'file');
             else if (action === 'delete-file' || action === 'delete-folder') deleteVaultItem(id, name, action === 'delete-folder' ? 'folder' : 'file');
+            else if (action === 'share-file' || action === 'share-folder') openCreateShareModal(action === 'share-folder' ? 'folder' : 'file', id, name);
         });
     });
     container.querySelectorAll('.file-check').forEach(cb => {
@@ -7261,6 +7478,9 @@ function applyVaultViewPermissions(isOwner, canWrite, canManage) {
     // its scope grants on this vault (matching require_vault_cap server-side).
     show(document.getElementById('upload-file-btn'), canWrite && vaultCapAllowed('file.upload'));
     show(document.getElementById('create-folder-btn'), canWrite && vaultCapAllowed('folder.create'));
+    // Share is only for Standard, non-password vaults (the backend refuses zero-knowledge + password-
+    // protected); hide the affordance otherwise so it isn't a dead-end.
+    show(document.getElementById('share-vault-btn'), vaultShareable());
     // Permissions is open to the owner AND managers (delegated administration);
     // Settings stays owner-only (rename/password/rotate/delete). Don't show dead tabs.
     // Gate on see_permissions specifically — the tab's initial GET /permissions is
@@ -9702,7 +9922,16 @@ document.addEventListener('DOMContentLoaded', () => {
     if (createFolderBtn) {
         createFolderBtn.addEventListener('click', createFolder);
     }
-    
+
+    // Share the whole vault
+    const shareVaultBtn = document.getElementById('share-vault-btn');
+    if (shareVaultBtn) {
+        shareVaultBtn.addEventListener('click', () => {
+            const v = state.currentVault;
+            if (v) openCreateShareModal('vault', v.id, v.name);
+        });
+    }
+
     // Create vault button
     const createVaultBtn = document.getElementById('create-vault-btn');
     if (createVaultBtn) {

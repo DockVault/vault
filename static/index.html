@@ -422,6 +422,7 @@
                                 <input type="file" id="file-upload-input" multiple style="display: none;">
                                 <button id="upload-file-btn" class="btn btn-primary btn-sm"><svg class="icon icon-sm"><use href="#i-upload"/></svg> Upload File</button>
                                 <button id="create-folder-btn" class="btn btn-secondary btn-sm"><svg class="icon icon-sm"><use href="#i-folder"/></svg> New Folder</button>
+                                <button id="share-vault-btn" class="btn btn-secondary btn-sm"><svg class="icon icon-sm"><use href="#i-link"/></svg> Share</button>
                             </div>
                         </div>
 
@@ -1603,6 +1604,57 @@
             <!-- Active modals: create vault, create user, edit user, change user password.
                  NOTE: do NOT wrap these in display:none — each .modal is hidden by default
                  and shown via the .active class; a hidden ancestor would make them unreachable. -->
+                <div id="create-share-modal" class="modal">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3>Share</h3>
+                            <button class="close-modal-btn modal-close" aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <p class="text-secondary text-sm mb-sm">Sharing: <span id="share-target-label" class="font-bold"></span></p>
+                            <div id="share-create-fields">
+                                <div class="form-group">
+                                    <label for="share-tag-select">Classification tag</label>
+                                    <select id="share-tag-select" class="input"></select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="share-audience-select">Who can claim this</label>
+                                    <select id="share-audience-select" class="input"></select>
+                                </div>
+                                <div class="form-group" id="share-users-group" style="display:none;">
+                                    <label for="share-user-search">Recipients</label>
+                                    <input id="share-user-search" type="text" class="input" placeholder="Search users…" autocomplete="off" />
+                                    <div id="share-user-results" class="pick-results"></div>
+                                    <div id="share-user-chips" class="chip-row"></div>
+                                </div>
+                                <div class="form-group" id="share-depts-group" style="display:none;">
+                                    <label>Recipient departments</label>
+                                    <div id="share-dept-picker"></div>
+                                </div>
+                                <div class="form-group" id="share-viewonly-group" style="display:none;">
+                                    <label class="checkbox-label"><input type="checkbox" id="share-view-only" /> View only (recipients can preview but not download)</label>
+                                </div>
+                                <div id="share-limits-group" style="display:none;">
+                                    <div class="form-group"><label for="share-lifetime-days">Expires after (days, optional)</label><input id="share-lifetime-days" type="number" min="1" step="1" class="input" /></div>
+                                    <div class="form-group"><label for="share-max-recipients">Max recipients (optional)</label><input id="share-max-recipients" type="number" min="1" step="1" class="input" /></div>
+                                    <div class="form-group"><label for="share-max-downloads">Max downloads per recipient (optional)</label><input id="share-max-downloads" type="number" min="1" step="1" class="input" /></div>
+                                </div>
+                                <div id="share-create-error" class="alert alert-error" style="display:none;"></div>
+                            </div>
+                            <div id="share-create-result" style="display:none;">
+                                <p class="text-secondary text-sm">Share created. Copy the link now — it will not be shown again.</p>
+                                <div class="flex items-center gap-sm">
+                                    <code id="share-link-value" class="input" style="flex:1; overflow:auto; white-space:nowrap;"></code>
+                                    <button id="share-link-copy" class="btn btn-secondary" type="button">Copy</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="close-modal-btn btn btn-secondary" id="share-modal-close">Close</button>
+                            <button id="share-create-submit" class="btn btn-primary" type="button">Create share</button>
+                        </div>
+                    </div>
+                </div>
                 <div id="create-vault-modal" class="modal">
                     <div class="modal-content">
                         <div class="modal-header">
