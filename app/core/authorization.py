@@ -3,6 +3,7 @@ Authorization and permission management system.
 Implements Role-Based Access Control (RBAC) with fine-grained permissions.
 """
 from typing import List, Optional, Set
+from datetime import datetime
 import uuid
 
 from sqlalchemy.orm import Session
@@ -10,7 +11,8 @@ from sqlalchemy import and_, select
 
 from app.core.models import (
     User, RoleEnum, PermissionEnum, user_permissions,
-    Vault, vault_members, VaultPermissionEnum, vault_group_access, user_groups
+    Vault, vault_members, VaultPermissionEnum, vault_group_access, user_groups,
+    Share, ShareClaim,
 )
 
 
@@ -242,24 +244,30 @@ class PermissionService:
     def get_vault_permissions(
         self,
         user: User,
-        vault_id: uuid.UUID
+        vault_id: uuid.UUID,
+        allow_share: bool = False,
     ) -> Optional[dict]:
         """
         Get user's permissions for a specific vault.
-        
+
         Args:
             user: User object
             vault_id: Vault UUID
-            
+            allow_share: When True (opt-in at the recipient READ endpoints ONLY),
+                a caller with no owner/member/group access may still be granted
+                READ-ONLY access by an active whole-vault share claim. Defaults to
+                False, so every other caller — every write/delete path and ALL SFTP
+                call sites — never sees a share grant (SFTP fail-closed).
+
         Returns:
             Dictionary with read, write, delete permissions or None if no access
         """
         # Check if user owns the vault
         vault = self.db.query(Vault).filter(Vault.id == vault_id).first()
-        
+
         if not vault:
             return None
-        
+
         if vault.owner_id == user.id:
             # Owner has all permissions, including management.
             return {
@@ -268,7 +276,7 @@ class PermissionService:
                 'delete': True,
                 'manage': True
             }
-        
+
         # Check if user is a member
         membership = self.db.execute(
             vault_members.select().where(
@@ -278,25 +286,84 @@ class PermissionService:
                 )
             )
         ).fetchone()
-        
-        if not membership:
+
+        if membership:
+            return {
+                'read': membership.read_permission,
+                'write': membership.write_permission,
+                'delete': membership.delete_permission,
+                # A member granted manage_permission is a vault "Manager".
+                'manage': bool(getattr(membership, 'manage_permission', False)),
+            }
+
+        # No direct membership.
+        if getattr(vault, 'type', 'standard') == 'zero_knowledge':
             # Zero-knowledge vaults are never shared via groups: a group has no
             # key, so a group member holds no wrapped DEK and "access" would only
             # leak metadata. The grant endpoint blocks creating such rows; this is
             # defense-in-depth for any row that predates that block. ZK sharing is
-            # explicit per-user only (owner + direct members).
-            if getattr(vault, 'type', 'standard') == 'zero_knowledge':
-                return None
-            # No direct membership — fall back to group-based access.
-            return self._group_vault_permission(user, vault_id)
+            # explicit per-user only (owner + direct members) — and a share claim
+            # never opens a ZK vault either.
+            return None
 
-        return {
-            'read': membership.read_permission,
-            'write': membership.write_permission,
-            'delete': membership.delete_permission,
-            # A member granted manage_permission is a vault "Manager".
-            'manage': bool(getattr(membership, 'manage_permission', False)),
-        }
+        # Fall back to group-based access.
+        group_perms = self._group_vault_permission(user, vault_id)
+        if group_perms is not None:
+            return group_perms
+
+        # No owner/member/group access. Only when the caller explicitly opted in
+        # (a recipient READ endpoint), an active whole-vault share claim may grant
+        # read-only access. Fail-closed everywhere else.
+        if allow_share:
+            return self._share_vault_permission(user, vault)
+        return None
+
+    def _share_vault_permission(self, user: User, vault: Vault) -> Optional[dict]:
+        """READ-ONLY access granted by an active WHOLE-VAULT share claim, or None.
+
+        Fail-closed and intentionally NARROW (the whole-vault slice): grants only for
+          * a Standard, non-password vault (zero-knowledge + password-protected are
+            refused; the vault could have gained a password after the claim);
+          * a 'vault'-target, non-view-only share that is 'active' and not past expiry;
+          * a caller holding a non-revoked ShareClaim on that share.
+        Grants read (the download path re-checks READ) but never write/delete/manage.
+        Only reached with allow_share=True, so a share claim confers nothing over SFTP.
+        File/folder-target shares and view-only are handled in later phases."""
+        # The deployment-wide sharing master switch is a LIVE kill-switch: disabling sharing
+        # org-wide (e.g. on a suspected leak) stops existing claims from granting access at once,
+        # mirroring how the temp-passcode master switch gates redemption at the vault chokepoint.
+        # Fail-closed: an absent/unreadable setting or any error denies the share grant.
+        from app.core import sharing_policy
+        from app.core.models import SystemSetting
+        try:
+            row = self.db.query(SystemSetting).filter(SystemSetting.key == 'global').first()
+            cfg = (row.value or {}) if (row and row.value) else {}
+        except Exception:
+            cfg = {}
+        if not sharing_policy.sharing_enabled(cfg):
+            return None
+        if getattr(vault, 'type', 'standard') == 'zero_knowledge':
+            return None
+        if vault.password_hash:
+            return None
+        now = datetime.utcnow()
+        claim = (
+            self.db.query(ShareClaim)
+            .join(Share, Share.id == ShareClaim.share_id)
+            .filter(
+                ShareClaim.user_id == user.id,
+                ShareClaim.revoked.is_(False),
+                Share.vault_id == vault.id,
+                Share.target_type == 'vault',
+                Share.view_only.is_(False),
+                Share.status == 'active',
+                Share.expires_at > now,
+            )
+            .first()
+        )
+        if claim is None:
+            return None
+        return {'read': True, 'write': False, 'delete': False, 'manage': False}
 
     def _group_vault_permission(self, user: User, vault_id: uuid.UUID) -> Optional[dict]:
         """Highest vault permission the user gets via any group that has been
@@ -336,21 +403,24 @@ class PermissionService:
         self,
         user: User,
         vault_id: uuid.UUID,
-        required_permission: VaultPermissionEnum = VaultPermissionEnum.READ
+        required_permission: VaultPermissionEnum = VaultPermissionEnum.READ,
+        allow_share: bool = False,
     ) -> bool:
         """
         Check if user can access a vault with specified permission.
-        
+
         Args:
             user: User object
             vault_id: Vault UUID
             required_permission: Required vault permission
-            
+            allow_share: opt-in to an active whole-vault share claim (see
+                get_vault_permissions). Defaults False → SFTP/write paths fail-closed.
+
         Returns:
             True if user has access, False otherwise
         """
-        perms = self.get_vault_permissions(user, vault_id)
-        
+        perms = self.get_vault_permissions(user, vault_id, allow_share=allow_share)
+
         if not perms:
             return False
         
@@ -366,16 +436,19 @@ class PermissionService:
         self,
         user: User,
         vault_id: uuid.UUID,
-        required_permission: VaultPermissionEnum = VaultPermissionEnum.READ
+        required_permission: VaultPermissionEnum = VaultPermissionEnum.READ,
+        allow_share: bool = False,
     ):
         """
         Require user to have vault access permission.
-        
+
         Args:
             user: User object
             vault_id: Vault UUID
             required_permission: Required vault permission
-            
+            allow_share: opt-in to an active whole-vault share claim (see
+                get_vault_permissions). Defaults False → SFTP/write paths fail-closed.
+
         Raises:
             ResourceNotFoundError: If vault not found
             PermissionDeniedError: If user lacks permission
@@ -383,8 +456,8 @@ class PermissionService:
         vault = self.db.query(Vault).filter(Vault.id == vault_id).first()
         if not vault:
             raise ResourceNotFoundError(f"Vault not found: {vault_id}")
-        
-        if not self.can_access_vault(user, vault_id, required_permission):
+
+        if not self.can_access_vault(user, vault_id, required_permission, allow_share=allow_share):
             raise PermissionDeniedError(
                 f"User lacks {required_permission.value} permission for vault {vault_id}"
             )

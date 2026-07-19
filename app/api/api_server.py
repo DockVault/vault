@@ -5516,6 +5516,7 @@ async def list_vaults(
 @require_vault_cap("vault.see_info")
 async def get_vault(
     vault_id: uuid.UUID,
+    request: Request,
     x_vault_password: Optional[str] = Header(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -5530,8 +5531,10 @@ async def get_vault(
 
     try:
         # require_password=False means we're just viewing metadata; a supplied X-Vault-Password is
-        # soft-verified (and rate-limited) inside get_vault.
-        vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=False)
+        # soft-verified (and rate-limited) inside get_vault. allow_share=True: a recipient with an
+        # active whole-vault share claim may open the vault (read-only). SFTP never passes this.
+        vault = vault_service.get_vault(vault_id, current_user, x_vault_password,
+                                        require_password=False, allow_share=True)
 
         # Get owner username
         owner = db.query(User).filter(User.id == vault.owner_id).first()
@@ -5542,6 +5545,25 @@ async def get_vault(
         from app.core.temp_scope import scope_ids as _scope_ids
         _id_scoped = _scope_ids(current_user, vault_id) is not None
         _fnr = _force_no_remember_vault_password(db)
+
+        # Effective permission for this caller. If they have no owner/member/group access but DID open
+        # the vault, it was via an active share claim: reflect read-only in my_permission and audit the
+        # open ONCE here (not on the polled file-list). base_perms is None only for a share-only caller.
+        base_perms = permission_service.get_vault_permissions(current_user, vault.id)
+        if base_perms is None:
+            share_perms = permission_service.get_vault_permissions(current_user, vault.id, allow_share=True)
+            if share_perms is not None:
+                base_perms = share_perms
+                try:
+                    AuditLogger(db).log_action(
+                        action="share_opened", status="success", user=current_user,
+                        ip_address=get_client_ip(request), details={"vault_id": str(vault.id)})
+                except Exception:
+                    # A failed audit commit leaves the session in a pending-rollback state; roll it
+                    # back so the same-request reads below (e.g. _is_vault_favorite) don't raise
+                    # PendingRollbackError and turn an authorized open into a 500. Losing the audit
+                    # row is acceptable; failing the open is not.
+                    db.rollback()
 
         # Build response dict with has_password and owner_username
         vault_dict = {
@@ -5562,8 +5584,7 @@ async def get_vault(
             'last_accessed': vault.last_accessed,
             'is_active': vault.is_active,
             'type': vault.type,
-            'my_permission': _effective_vault_permission(
-                vault, permission_service.get_vault_permissions(current_user, vault.id), current_user),
+            'my_permission': _effective_vault_permission(vault, base_perms, current_user),
             'is_favorite': _is_vault_favorite(db, current_user.id, vault.id)
         }
         return VaultResponse(**vault_dict)
@@ -6634,9 +6655,12 @@ async def list_vault_files(
     vault_service = VaultService(db, permission_service)
     
     try:
-        # Verify vault access and password (require_password=True for file access)
-        vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
-        
+        # Verify vault access and password (require_password=True for file access).
+        # allow_share=True: a recipient with an active whole-vault share claim may list
+        # the vault's contents (read-only). SFTP listing never passes this flag.
+        vault = vault_service.get_vault(vault_id, current_user, x_vault_password,
+                                        require_password=True, allow_share=True)
+
         # Parse folder_id if provided
         folder_uuid = uuid.UUID(folder_id) if folder_id else None
         
@@ -8293,8 +8317,11 @@ async def download_file(
     audit_logger = AuditLogger(db)
     
     try:
-        # Verify vault access and password
-        vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+        # Verify vault access and password. allow_share=True: a recipient with an active
+        # whole-vault share claim may open + download from the vault (read-only). SFTP
+        # downloads never pass this flag.
+        vault = vault_service.get_vault(vault_id, current_user, x_vault_password,
+                                        require_password=True, allow_share=True)
         # A path-scoped temp credential may only download a file within its file/folder scope.
         require_file_scope(db, current_user, vault_id, file_id)
 
@@ -8317,11 +8344,13 @@ async def download_file(
                     detail="File not found"
                 )
             
-            # Download file
+            # Download file. allow_share=True so a whole-vault share claimant (read-only)
+            # can download; SFTP downloads keep the default (False).
             file_content, file_name, mime_type = vault_service.download_file(
                 file_id=file_id,
                 user=current_user,
-                file_password=file_password
+                file_password=file_password,
+                allow_share=True,
             )
 
             # Zero-knowledge: the name is the client's secret. For a SEALED ZK file it's already

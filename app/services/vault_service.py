@@ -511,21 +511,29 @@ class VaultService:
         vault_id: uuid.UUID,
         user: User,
         vault_password: Optional[str] = None,
-        require_password: bool = False
+        require_password: bool = False,
+        allow_share: bool = False,
     ) -> Vault:
         """
         Get a vault with access verification.
-        
+
         Args:
             vault_id: Vault UUID
             user: User requesting access
             vault_password: Optional vault password
             require_password: If True, validates password even for metadata access.
                             If False, password only validated when provided.
-            
+            allow_share: When True (opt-in ONLY at the recipient READ endpoints), a
+                caller with no owner/member/group access may be granted read-only
+                access by an active whole-vault share claim. Defaults False, so SFTP
+                and every write/delete caller never opens a vault via a share claim.
+                A password-protected vault is still refused for a share grant (the
+                permission layer declines it, and the password gate below blocks file
+                access without the real password / a temp passcode).
+
         Returns:
             Vault object
-            
+
         Raises:
             VaultNotFoundError: If vault not found
             PermissionDeniedError: If user lacks access
@@ -533,13 +541,13 @@ class VaultService:
             InvalidPasswordError: If provided password is invalid
         """
         vault = self.db.query(Vault).filter(Vault.id == vault_id).first()
-        
+
         if not vault:
             raise VaultNotFoundError(f"Vault not found: {vault_id}")
-        
+
         # Check permissions
         self.permission_service.require_vault_permission(
-            user, vault_id, VaultPermissionEnum.READ
+            user, vault_id, VaultPermissionEnum.READ, allow_share=allow_share
         )
 
         # Least-privilege gate: a scoped temp credential may only reach vaults in
@@ -1219,27 +1227,32 @@ class VaultService:
         self,
         file_id: uuid.UUID,
         user: User,
-        file_password: Optional[str] = None
+        file_password: Optional[str] = None,
+        allow_share: bool = False,
     ) -> Tuple[bytes, str, str]:
         """
         Download and decrypt a file.
-        
+
         Args:
             file_id: File UUID
             user: User downloading file
             file_password: Optional file password
-            
+            allow_share: opt-in to an active whole-vault share claim on this file's
+                vault (see PermissionService.get_vault_permissions). Set True ONLY by
+                the web download endpoint; SFTP downloads keep the default (False) so
+                a share claim grants nothing over SFTP.
+
         Returns:
             Tuple of (file_content, file_name, mime_type)
         """
         file = self.db.query(File).filter(File.id == file_id).first()
-        
+
         if not file:
             raise FileNotFoundError(f"File not found: {file_id}")
-        
+
         # Check vault access
         self.permission_service.require_vault_permission(
-            user, file.vault_id, VaultPermissionEnum.READ
+            user, file.vault_id, VaultPermissionEnum.READ, allow_share=allow_share
         )
         
         # Check file password if set
