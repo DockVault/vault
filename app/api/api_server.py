@@ -754,6 +754,11 @@ class ShareCreate(BaseModel):
     with_link: bool = True
 
 
+class ShareClaimRequest(BaseModel):
+    """Claim a share by its link token."""
+    token: str = Field(..., min_length=1, max_length=512)
+
+
 class TempCredentialCreate(BaseModel):
     # Optional overrides for the credential lifetime. When omitted, the server
     # falls back to the configured defaults (temp_cred_validity_minutes /
@@ -4897,6 +4902,106 @@ async def list_my_shares(
             ShareClaim.share_id.in_(ids), ShareClaim.revoked.is_(False)).group_by(ShareClaim.share_id).all()
         counts = {str(sid): c for sid, c in rows}
     return [_share_dict(db, s, claim_counts=counts) for s in shares]
+
+
+def _share_claim_dict(claim: ShareClaim, share: Share) -> dict:
+    """Recipient-facing view returned to a claimant. Describes WHAT was claimed (so the Shared tab can
+    render a card); it does NOT itself grant access — a later phase authorizes the claim at the vault
+    chokepoint. No token, no creator/allowlist internals."""
+    return {
+        "claim_id": str(claim.id),
+        "share_id": str(share.id),
+        "vault_id": str(share.vault_id),
+        "target_type": share.target_type,
+        "target_folder_id": str(share.target_folder_id) if share.target_folder_id else None,
+        "target_file_id": str(share.target_file_id) if share.target_file_id else None,
+        "view_only": share.view_only,
+        "expires_at": share.expires_at.isoformat() if share.expires_at else None,
+        "claimed_at": claim.claimed_at.isoformat() if claim.claimed_at else None,
+    }
+
+
+@app.post("/shares/claim")
+async def claim_share(
+    payload: ShareClaimRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Claim a share by its link token. Fail-closed: a temporary session cannot claim; sharing must be
+    on; the token must resolve to an ACTIVE, non-expired, non-revoked share; the claimant must satisfy
+    the share's claim-audience; and the recipient limit must not be exceeded (an existing non-revoked
+    claim is returned idempotently, a revoked one is denied). Creates a ShareClaim — this does NOT itself
+    grant access to the shared item; a later phase authorizes the claim at the vault chokepoint."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="A temporary session cannot claim shares.")
+    if not _sharing_enabled(db):
+        raise HTTPException(status_code=403, detail="Sharing is disabled on this deployment.")
+
+    import hashlib as _hashlib
+    token = (payload.token or "").strip()
+    # 'surrogatepass' so an adversarial lone-surrogate token can't crash encode() (500); the resulting
+    # hash matches no stored token and the request falls through to the clean 404 below.
+    token_hash = _hashlib.sha256(token.encode("utf-8", "surrogatepass")).hexdigest()
+    share = db.query(Share).filter(Share.link_token_hash == token_hash).first()
+    if not share:
+        raise HTTPException(status_code=404, detail="That share link is not valid.")
+    if share.status == "revoked":
+        raise HTTPException(status_code=410, detail="That share has been revoked.")
+    if _share_effective_status(share) == "expired":
+        if share.status == "active":
+            share.status = "expired"  # lazy expiry: flip the stored status for the UI
+            db.commit()
+        raise HTTPException(status_code=410, detail="That share has expired.")
+
+    # Defense-in-depth: the vault must still be a shareable Standard, non-password vault (these are refused
+    # at CREATE, but a vault password could be added afterwards — a claim must not open that gate).
+    vault = db.query(Vault).filter(Vault.id == share.vault_id, Vault.is_active.is_(True)).first()
+    if not vault or getattr(vault, "type", "standard") == "zero_knowledge" or vault.password_hash:
+        raise HTTPException(status_code=403, detail="That share is no longer available.")
+
+    if not sharing_policy.user_matches_claim_audience(
+            share.claim_audience, share.audience_user_ids, share.audience_department_ids,
+            current_user.id, _user_group_ids(db, current_user.id)):
+        raise HTTPException(status_code=403, detail="You are not in the audience for this share.")
+
+    existing = db.query(ShareClaim).filter(
+        ShareClaim.share_id == share.id, ShareClaim.user_id == current_user.id).first()
+    if existing:
+        if existing.revoked:
+            raise HTTPException(status_code=403, detail="Your access to this share was revoked.")
+        return _share_claim_dict(existing, share)  # idempotent re-open
+
+    # Serialize the recipient-limit check + insert against the share row, so concurrent claims by
+    # DIFFERENT users cannot over-admit past max_recipients (a plain count-then-insert would race; the
+    # unique (share,user) constraint only guards the same-user race). The lock releases on commit.
+    locked = db.query(Share).filter(Share.id == share.id).with_for_update().first()
+    if locked is not None and locked.max_recipients is not None:
+        active = db.query(ShareClaim).filter(
+            ShareClaim.share_id == share.id, ShareClaim.revoked.is_(False)).count()
+        if active >= locked.max_recipients:
+            db.rollback()  # release the FOR UPDATE lock
+            raise HTTPException(status_code=409, detail="This share has reached its recipient limit.")
+
+    claim = ShareClaim(share_id=share.id, user_id=current_user.id)
+    db.add(claim)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()  # a concurrent claim by the same user raced the unique (share,user) -> idempotent
+        existing = db.query(ShareClaim).filter(
+            ShareClaim.share_id == share.id, ShareClaim.user_id == current_user.id).first()
+        if existing and not existing.revoked:
+            return _share_claim_dict(existing, share)
+        raise HTTPException(status_code=409, detail="Could not claim this share.")
+    db.refresh(claim)
+    try:
+        AuditLogger(db).log_action(
+            action="share_claimed", status="success", user=current_user, ip_address=get_client_ip(request),
+            details={"share_id": str(share.id), "vault_id": str(share.vault_id)})
+    except Exception:
+        pass
+    return _share_claim_dict(claim, share)
 
 
 @app.post("/groups/{group_id}/members")

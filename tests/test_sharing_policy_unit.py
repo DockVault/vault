@@ -123,3 +123,20 @@ def test_resolve_share_limits_defaults_overrides_caps_and_lock():
     assert err is None and lim["max_recipients"] == 2 and lim["view_only"] is False
     # view-only requested but the tag forbids it
     assert sp.resolve_share_limits({**tag, "allow_view_only": False}, {"view_only": True})[1] is not None
+
+
+def test_user_matches_claim_audience_fail_closed():
+    import uuid
+    u = str(uuid.uuid4())
+    # anyone_internal: any authenticated user (who holds the link)
+    assert sp.user_matches_claim_audience("anyone_internal", [], [], u, []) is True
+    # users: id must be listed
+    assert sp.user_matches_claim_audience("users", [u], [], u, []) is True
+    assert sp.user_matches_claim_audience("users", ["other"], [], u, []) is False
+    assert sp.user_matches_claim_audience("users", [uuid.UUID(u)], [], u, []) is True  # UUID vs str tolerant
+    # departments: user must be in one of them
+    assert sp.user_matches_claim_audience("departments", [], ["g1"], u, ["g1", "g2"]) is True
+    assert sp.user_matches_claim_audience("departments", [], ["g1"], u, ["g9"]) is False
+    # unknown audience / malformed field -> fail closed
+    assert sp.user_matches_claim_audience("bogus", [u], ["g1"], u, ["g1"]) is False
+    assert sp.user_matches_claim_audience("users", "not-a-list", [], u, []) is False

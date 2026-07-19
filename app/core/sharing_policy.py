@@ -77,6 +77,25 @@ def user_can_create_with_tag(tag, user_id, user_group_ids) -> bool:
     return bool(tag.get("auto_enroll_new_users", False))
 
 
+def user_matches_claim_audience(claim_audience, audience_user_ids, audience_department_ids,
+                                user_id, user_group_ids) -> bool:
+    """Whether a user may CLAIM a share, given its claim-audience. Governs REDEMPTION (distinct from the
+    tag's create-allowlist, which governs who may CREATE). FAIL-CLOSED: an unknown audience returns False.
+      - 'anyone_internal' -> any authenticated internal user (who holds the link)
+      - 'users'           -> the user id must be in audience_user_ids
+      - 'departments'     -> the user must belong to one of audience_department_ids
+    Ids compare as strings; a malformed (non-list) audience field matches nothing."""
+    if claim_audience == "anyone_internal":
+        return True
+    uid = str(user_id)
+    if claim_audience == "users":
+        return uid in _as_id_set(audience_user_ids)
+    if claim_audience == "departments":
+        user_gids = {str(g) for g in (user_group_ids or [])}
+        return bool(user_gids & _as_id_set(audience_department_ids))
+    return False
+
+
 def _clamp_default(default, cap):
     """A default must never exceed its cap. cap None = unlimited (the default stands as given). If a
     cap exists, an unlimited default (None) or one above the cap is clamped down to the cap."""
