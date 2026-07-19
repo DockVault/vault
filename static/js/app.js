@@ -4251,6 +4251,7 @@ function setupSettingsTabs() {
                 content.classList.add('active');
             }
             if (tabId === 'logs') { loadLogSettings(); }  // refresh on tab open
+            if (tabId === 'sharing') { setupShareTagsUI(); loadShareTags(); }  // wire (idempotent) + refresh
         });
     });
 }
@@ -4600,6 +4601,12 @@ async function loadSettings() {
         // Branding: stored overrides -> values, effective /branding -> placeholders
         await applyBrandFields(settings);
 
+        // Sharing: master switch + the Share Tags manager
+        const shEl = document.getElementById('setting-sharing-enabled');
+        if (shEl) shEl.checked = settings.sharing_enabled === true;
+        setupShareTagsUI();
+        loadShareTags();
+
         console.log('✓ Settings loaded');
     } catch (error) {
         console.log('Settings endpoint not available');
@@ -4682,6 +4689,10 @@ async function saveAllSettings() {
             settings.standard_vault_allowed_groups = standardVaultAllowedGroups.slice();
         }
 
+        // Sharing master switch (the per-tag policy lives in the Share Tags manager, not here)
+        const shEnEl = document.getElementById('setting-sharing-enabled');
+        if (shEnEl) settings.sharing_enabled = shEnEl.checked;
+
         // Only include password if provided
         const smtpPassword = document.getElementById('setting-smtp-password').value;
         if (smtpPassword) {
@@ -4699,6 +4710,228 @@ async function saveAllSettings() {
     } catch (error) {
         console.error('Failed to save settings:', error);
         showError('Failed to save settings: ' + error.message);
+    }
+}
+
+// ---- Share Tags manager (admin Settings -> Sharing) ------------------------
+// The per-tag policy + create-allowlist backing the Sharing feature. The list is rendered
+// from GET /share-tags; add/edit/deactivate go through the interactive-admin /share-tags CRUD.
+// This editor covers the policy, the audiences, and the DEPARTMENT allowlist + auto-enroll;
+// the per-user allow/block lists are managed separately. All controls build via DOM (no innerHTML).
+let shareTagsCache = [];
+let shareTagEditorDeptIds = [];
+let shareTagsUIWired = false;
+
+function _stEl(id) { return document.getElementById(id); }
+function _stChecked(id) { const e = _stEl(id); return !!(e && e.checked); }
+function _stNumOrNull(id) {
+    const e = _stEl(id);
+    if (!e || e.value === '' || e.value == null) return null;
+    const n = parseInt(e.value, 10);
+    return Number.isFinite(n) ? n : null;
+}
+
+// Keep the view-only DEFAULT consistent with whether view-only is ALLOWED (mirrors the backend
+// invariant default_view_only requires allow_view_only) so the admin can't submit the invalid pair.
+function _stSyncViewOnly() {
+    const allow = _stEl('share-tag-allow-view-only');
+    const def = _stEl('share-tag-default-view-only');
+    if (!allow || !def) return;
+    if (!allow.checked) def.checked = false;
+    def.disabled = !allow.checked;
+}
+
+function setupShareTagsUI() {
+    if (shareTagsUIWired) return;
+    const add = _stEl('share-tag-add-btn');
+    const save = _stEl('share-tag-save-btn');
+    const cancel = _stEl('share-tag-cancel-btn');
+    if (!add || !save || !cancel) return;  // sharing tab markup not present
+    add.addEventListener('click', () => openShareTagEditor(null));
+    save.addEventListener('click', saveShareTag);
+    cancel.addEventListener('click', closeShareTagEditor);
+    const allowVO = _stEl('share-tag-allow-view-only');
+    if (allowVO) allowVO.addEventListener('change', _stSyncViewOnly);
+    shareTagsUIWired = true;
+}
+
+async function loadShareTags() {
+    const host = _stEl('share-tags-list');
+    if (!host) return;
+    try {
+        const tags = await apiRequest('/share-tags', { silent: true });
+        shareTagsCache = Array.isArray(tags) ? tags : [];
+    } catch (_) {
+        shareTagsCache = [];
+    }
+    renderShareTagsList();
+}
+
+function renderShareTagsList() {
+    const host = _stEl('share-tags-list');
+    if (!host) return;
+    host.replaceChildren();
+    if (!shareTagsCache.length) {
+        const empty = document.createElement('p');
+        empty.className = 'text-tertiary text-sm';
+        empty.textContent = 'No share tags yet. Add one to let users create shares.';
+        host.appendChild(empty);
+        return;
+    }
+    shareTagsCache.slice().sort((a, b) => a.name.localeCompare(b.name)).forEach(tag => {
+        const row = document.createElement('div');
+        row.className = 'share-tag-row flex justify-between items-center mb-sm';
+        row.setAttribute('data-tag-id', tag.id);
+
+        const left = document.createElement('div');
+        const title = document.createElement('span');
+        title.className = 'font-medium';
+        title.textContent = tag.name;
+        left.appendChild(title);
+        const badge = document.createElement('span');
+        badge.className = 'chip ml-sm';
+        badge.textContent = tag.is_active ? 'active' : 'inactive';
+        left.appendChild(badge);
+        const summary = document.createElement('div');
+        summary.className = 'text-tertiary text-sm';
+        const parts = [
+            `lifetime ≤ ${tag.max_lifetime_minutes}m (default ${tag.default_lifetime_minutes}m)`,
+            `recipients ${tag.max_recipients_cap == null ? '∞' : tag.max_recipients_cap}`,
+            `downloads ${tag.max_downloads_cap == null ? '∞' : tag.max_downloads_cap}`,
+        ];
+        if (Array.isArray(tag.allowed_audiences) && tag.allowed_audiences.length) {
+            parts.push(`audiences: ${tag.allowed_audiences.join(', ')}`);
+        }
+        if (tag.auto_enroll_new_users) parts.push('auto-enroll');
+        summary.textContent = parts.join(' · ');
+        left.appendChild(summary);
+        row.appendChild(left);
+
+        const actions = document.createElement('div');
+        actions.className = 'flex gap-sm';
+        const edit = document.createElement('button');
+        edit.type = 'button';
+        edit.className = 'btn btn-secondary';
+        edit.textContent = 'Edit';
+        edit.addEventListener('click', () => openShareTagEditor(tag));
+        actions.appendChild(edit);
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'btn btn-secondary';
+        toggle.textContent = tag.is_active ? 'Deactivate' : 'Reactivate';
+        toggle.addEventListener('click', () => (tag.is_active ? deactivateShareTag(tag.id) : reactivateShareTag(tag.id)));
+        actions.appendChild(toggle);
+        row.appendChild(actions);
+
+        host.appendChild(row);
+    });
+}
+
+function renderShareTagDeptPicker() {
+    _renderGroupPickerInto(
+        'share-tag-dept-picker',
+        () => shareTagEditorDeptIds,
+        v => { shareTagEditorDeptIds = v; },
+        'No departments selected',
+        renderShareTagDeptPicker,
+        'share-tag-dept-add',
+        'share-tag-dept-remove'
+    );
+}
+
+function openShareTagEditor(tag) {
+    const editor = _stEl('share-tag-editor');
+    if (!editor) return;
+    const t = tag || {};
+    _stEl('share-tag-editor-title').textContent = tag ? 'Edit tag' : 'Add tag';
+    _stEl('share-tag-editor-id').value = tag ? t.id : '';
+    _stEl('share-tag-name').value = t.name || '';
+    _stEl('share-tag-description').value = t.description || '';
+    _stEl('share-tag-color').value = t.color || '';
+    _stEl('share-tag-max-lifetime').value = t.max_lifetime_minutes != null ? t.max_lifetime_minutes : 10080;
+    _stEl('share-tag-default-lifetime').value = t.default_lifetime_minutes != null ? t.default_lifetime_minutes : 1440;
+    _stEl('share-tag-max-recipients-cap').value = t.max_recipients_cap != null ? t.max_recipients_cap : '';
+    _stEl('share-tag-max-recipients-default').value = t.max_recipients_default != null ? t.max_recipients_default : '';
+    _stEl('share-tag-max-downloads-cap').value = t.max_downloads_cap != null ? t.max_downloads_cap : '';
+    _stEl('share-tag-max-downloads-default').value = t.max_downloads_default != null ? t.max_downloads_default : '';
+    const aud = Array.isArray(t.allowed_audiences) ? t.allowed_audiences
+        : (tag ? [] : ['users', 'departments', 'anyone_internal']);
+    _stEl('share-tag-aud-users').checked = aud.includes('users');
+    _stEl('share-tag-aud-departments').checked = aud.includes('departments');
+    _stEl('share-tag-aud-anyone').checked = aud.includes('anyone_internal');
+    _stEl('share-tag-allow-view-only').checked = tag ? !!t.allow_view_only : true;
+    _stEl('share-tag-default-view-only').checked = !!t.default_view_only;
+    _stEl('share-tag-allow-custom').checked = tag ? !!t.allow_custom : true;
+    _stEl('share-tag-auto-enroll').checked = !!t.auto_enroll_new_users;
+    shareTagEditorDeptIds = (t.allowed_department_ids || []).map(String);
+    renderShareTagDeptPicker();
+    _stSyncViewOnly();
+    editor.style.display = '';
+    editor.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function closeShareTagEditor() {
+    const editor = _stEl('share-tag-editor');
+    if (editor) editor.style.display = 'none';
+}
+
+async function saveShareTag() {
+    const id = _stEl('share-tag-editor-id').value;
+    const aud = [];
+    if (_stChecked('share-tag-aud-users')) aud.push('users');
+    if (_stChecked('share-tag-aud-departments')) aud.push('departments');
+    if (_stChecked('share-tag-aud-anyone')) aud.push('anyone_internal');
+    const body = {
+        name: _stEl('share-tag-name').value.trim(),
+        description: _stEl('share-tag-description').value.trim() || null,
+        color: _stEl('share-tag-color').value.trim() || null,
+        max_lifetime_minutes: _stNumOrNull('share-tag-max-lifetime') || 1,
+        default_lifetime_minutes: _stNumOrNull('share-tag-default-lifetime') || 1,
+        max_recipients_cap: _stNumOrNull('share-tag-max-recipients-cap'),
+        max_recipients_default: _stNumOrNull('share-tag-max-recipients-default'),
+        max_downloads_cap: _stNumOrNull('share-tag-max-downloads-cap'),
+        max_downloads_default: _stNumOrNull('share-tag-max-downloads-default'),
+        allowed_audiences: aud,
+        allow_view_only: _stChecked('share-tag-allow-view-only'),
+        default_view_only: _stChecked('share-tag-default-view-only'),
+        allow_custom: _stChecked('share-tag-allow-custom'),
+        auto_enroll_new_users: _stChecked('share-tag-auto-enroll'),
+        allowed_department_ids: shareTagEditorDeptIds.slice(),
+    };
+    // On EDIT we intentionally omit allowed_user_ids/blocked_user_ids so PATCH preserves them (the
+    // per-user lists are managed separately); on CREATE they default to empty server-side.
+    try {
+        if (id) {
+            await apiRequest(`/share-tags/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
+            showSuccess('Tag updated');
+        } else {
+            await apiRequest('/share-tags', { method: 'POST', body: JSON.stringify(body) });
+            showSuccess('Tag created');
+        }
+        closeShareTagEditor();
+        await loadShareTags();
+    } catch (error) {
+        showError('Could not save tag: ' + (error && error.message ? error.message : 'unknown error'));
+    }
+}
+
+async function deactivateShareTag(id) {
+    try {
+        await apiRequest(`/share-tags/${id}`, { method: 'DELETE' });
+        showSuccess('Tag deactivated');
+        await loadShareTags();
+    } catch (error) {
+        showError('Could not deactivate tag: ' + (error && error.message ? error.message : 'unknown error'));
+    }
+}
+
+async function reactivateShareTag(id) {
+    try {
+        await apiRequest(`/share-tags/${id}`, { method: 'PATCH', body: JSON.stringify({ is_active: true }) });
+        showSuccess('Tag reactivated');
+        await loadShareTags();
+    } catch (error) {
+        showError('Could not reactivate tag: ' + (error && error.message ? error.message : 'unknown error'));
     }
 }
 

@@ -867,6 +867,7 @@
                         <button class="tab-btn" data-tab="storage">Storage</button>
                         <button class="tab-btn" data-tab="email">Email</button>
                         <button class="tab-btn" data-tab="sftp">SFTP &amp; Encryption</button>
+                        <button class="tab-btn" data-tab="sharing">Sharing</button>
                         <button class="tab-btn" data-tab="logs">Log access</button>
                         <button class="tab-btn" data-tab="audit">Audit Log</button>
                     </div>
@@ -1319,6 +1320,114 @@
                                     <span>Never remember vault passwords in the browser</span>
                                 </label>
                                 <p class="text-secondary text-sm mt-sm">When enabled, every vault’s unlock window is forced to 0 deployment-wide — a user must re-enter a vault’s password each time it is opened, and the per-user “remember” preference is locked on. Use for shared or untrusted devices. Leave off to let each vault keep its own unlock window.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Sharing Tab -->
+                    <div id="settings-tab-sharing" class="settings-tab-content">
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>Sharing</h3>
+                            </div>
+                            <div class="p-lg">
+                                <label class="flex items-center gap-sm">
+                                    <input type="checkbox" id="setting-sharing-enabled">
+                                    <span>Enable sharing</span>
+                                </label>
+                                <p class="text-secondary text-sm mt-sm">When enabled, users may share a file, folder, or whole standard vault with other authenticated members of this deployment, governed by the tags below. Sharing is never anonymous — every recipient must sign in. Leave off to disable sharing entirely.</p>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header flex justify-between items-center">
+                                <h3>Share Tags</h3>
+                                <button type="button" id="share-tag-add-btn" class="btn btn-secondary">Add tag</button>
+                            </div>
+                            <div class="p-lg">
+                                <p class="text-secondary text-sm mb-md">A tag classifies a share and carries its policy (how long it lasts, how many recipients/downloads, which audiences, whether view-only) plus a create-allowlist controlling who may create shares with it. Deactivating a tag stops new shares under it; existing shares keep the limits they were created with.</p>
+                                <div id="share-tags-list"></div>
+
+                                <!-- Add / edit editor (hidden until Add / Edit) -->
+                                <div id="share-tag-editor" class="card mt-lg" style="display:none;">
+                                    <div class="card-header"><h4 id="share-tag-editor-title">Add tag</h4></div>
+                                    <div class="p-lg">
+                                        <input type="hidden" id="share-tag-editor-id">
+                                        <div class="form-group">
+                                            <label for="share-tag-name">Name</label>
+                                            <input type="text" id="share-tag-name" class="form-control" maxlength="120" placeholder="e.g. Confidential">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="share-tag-description">Description</label>
+                                            <input type="text" id="share-tag-description" class="form-control" placeholder="Optional">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="share-tag-color">Colour</label>
+                                            <input type="text" id="share-tag-color" class="form-control" maxlength="20" placeholder="e.g. indigo" style="max-width:200px;">
+                                        </div>
+
+                                        <div class="form-group mt-md">
+                                            <label>Lifetime (minutes)</label>
+                                            <div class="flex gap-sm">
+                                                <div>
+                                                    <label class="text-sm text-secondary" for="share-tag-max-lifetime">Ceiling</label>
+                                                    <input type="number" id="share-tag-max-lifetime" class="form-control" min="1" style="max-width:160px;">
+                                                </div>
+                                                <div>
+                                                    <label class="text-sm text-secondary" for="share-tag-default-lifetime">Default</label>
+                                                    <input type="number" id="share-tag-default-lifetime" class="form-control" min="1" style="max-width:160px;">
+                                                </div>
+                                            </div>
+                                            <p class="text-secondary text-sm mt-sm">The default must not exceed the ceiling. There is no fixed maximum — a ceiling may be as long as you like.</p>
+                                        </div>
+
+                                        <div class="form-group mt-md">
+                                            <label>Recipients</label>
+                                            <div class="flex gap-sm">
+                                                <div><label class="text-sm text-secondary" for="share-tag-max-recipients-cap">Cap (blank = unlimited)</label><input type="number" id="share-tag-max-recipients-cap" class="form-control" min="1" style="max-width:180px;"></div>
+                                                <div><label class="text-sm text-secondary" for="share-tag-max-recipients-default">Default</label><input type="number" id="share-tag-max-recipients-default" class="form-control" min="1" style="max-width:160px;"></div>
+                                            </div>
+                                        </div>
+
+                                        <div class="form-group mt-md">
+                                            <label>Downloads</label>
+                                            <div class="flex gap-sm">
+                                                <div><label class="text-sm text-secondary" for="share-tag-max-downloads-cap">Cap (blank = unlimited)</label><input type="number" id="share-tag-max-downloads-cap" class="form-control" min="1" style="max-width:180px;"></div>
+                                                <div><label class="text-sm text-secondary" for="share-tag-max-downloads-default">Default</label><input type="number" id="share-tag-max-downloads-default" class="form-control" min="1" style="max-width:160px;"></div>
+                                            </div>
+                                        </div>
+
+                                        <div class="form-group mt-md">
+                                            <label>Allowed audiences</label>
+                                            <p class="text-secondary text-sm mb-sm">Which recipient audiences a creator may choose for a share with this tag.</p>
+                                            <label class="flex items-center gap-sm"><input type="checkbox" id="share-tag-aud-users"><span>Specific users</span></label>
+                                            <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="share-tag-aud-departments"><span>Departments</span></label>
+                                            <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="share-tag-aud-anyone"><span>Anyone internal with the link</span></label>
+                                        </div>
+
+                                        <div class="form-group mt-md">
+                                            <label>Capabilities</label>
+                                            <label class="flex items-center gap-sm"><input type="checkbox" id="share-tag-allow-view-only"><span>Allow view-only shares (no download)</span></label>
+                                            <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="share-tag-default-view-only"><span>Default new shares to view-only</span></label>
+                                            <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="share-tag-allow-custom"><span>Let creators customise limits within the caps</span></label>
+                                        </div>
+
+                                        <div class="form-group mt-md">
+                                            <label>Who may create shares with this tag</label>
+                                            <label class="flex items-center gap-sm"><input type="checkbox" id="share-tag-auto-enroll"><span>Everyone (auto-enroll all users, except any blocked)</span></label>
+                                            <div class="mt-sm">
+                                                <label class="text-sm text-secondary">Allowed departments</label>
+                                                <div id="share-tag-dept-picker"></div>
+                                            </div>
+                                            <p class="text-secondary text-sm mt-sm">If auto-enroll is off and no departments are selected, no one can create shares with this tag until you grant access. (Per-user allow/block lists are managed separately.)</p>
+                                        </div>
+
+                                        <div class="flex gap-sm mt-lg">
+                                            <button type="button" id="share-tag-save-btn" class="btn btn-primary">Save tag</button>
+                                            <button type="button" id="share-tag-cancel-btn" class="btn btn-secondary">Cancel</button>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>
