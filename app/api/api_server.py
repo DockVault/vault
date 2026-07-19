@@ -8413,7 +8413,19 @@ async def download_file(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="File not found"
                 )
-            
+
+            # Per-recipient max_downloads: consume one download against the covering share claim(s)
+            # BEFORE serving the bytes (an atomic conditional burn, so concurrent GETs can't exceed
+            # the cap). Only for a share recipient (stamped a share scope on this vault by get_vault);
+            # a no-op for owners/members/temp creds and for unlimited shares.
+            if str(vault_id) in (getattr(current_user, '_share_vault_scope', None) or {}):
+                if not permission_service.burn_share_download(
+                        current_user, vault, file_record,
+                        folder_ancestry(db, vault_id, file_record.folder_id)):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="This share has reached its download limit.")
+
             # Download file. allow_share=True so a whole-vault share claimant (read-only)
             # can download; SFTP downloads keep the default (False).
             file_content, file_name, mime_type = vault_service.download_file(

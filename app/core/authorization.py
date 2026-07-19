@@ -7,7 +7,7 @@ from datetime import datetime
 import uuid
 
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, select
+from sqlalchemy import and_, select, update
 
 from app.core.models import (
     User, RoleEnum, PermissionEnum, user_permissions,
@@ -445,6 +445,73 @@ class PermissionService:
             smap = {}
             setattr(user, attr, smap)
         smap[str(vault_id)] = scope
+
+    def burn_share_download(self, user: User, vault: Vault, file, ancestor_folder_ids) -> bool:
+        """Consume ONE download against the per-recipient ``max_downloads`` of the SHARE claims that
+        cover this file (O1: each recipient gets N per share). Returns True to allow, False to deny
+        (a covering LIMITED claim is exhausted). MUST be called only for a share recipient (the caller
+        gates on the share-scope stamp); it independently re-resolves the covering claims.
+
+        Coverage: a claim covers `file` if it is a whole-vault share, a folder share whose target
+        folder is `file`'s own folder or an ancestor, or a file share of exactly this file. Only
+        active, non-revoked, non-view-only claims count (a view-only claim can't download, so it can't
+        consume a download). If ANY covering claim is UNLIMITED (max_downloads NULL) the download is
+        unlimited and burns nothing. Otherwise EACH covering LIMITED claim is consumed via an ATOMIC
+        conditional increment (``download_count < max_downloads`` in the WHERE — so concurrent GETs by
+        the same recipient can never exceed the cap); if any is already at its cap the whole burn is
+        rolled back and the download denied. No covering claim => allow (this gate enforces ONLY
+        max_downloads; revoke/expiry is enforced at get_vault at request start, so a claim that
+        vanished mid-request is a get_vault concern, not a limit to burn). The web download endpoint
+        serves the full object (no Range/partial responses), so every successful GET counts once.
+
+        TRANSACTION OWNERSHIP: this commits (on allow) or rolls back (on deny) the request session, so
+        it must be called with NO unrelated pending writes — at the current call site (the download
+        endpoint, after get_vault has committed and only reads follow) that holds."""
+        now = datetime.utcnow()
+        anc = {str(a) for a in (ancestor_folder_ids or [])}
+        fid = str(file.id)
+        rows = (
+            self.db.query(ShareClaim.id, Share.max_downloads, Share.target_type,
+                          Share.target_folder_id, Share.target_file_id)
+            .join(Share, Share.id == ShareClaim.share_id)
+            .filter(
+                ShareClaim.user_id == user.id,
+                ShareClaim.revoked.is_(False),
+                Share.vault_id == vault.id,
+                Share.view_only.is_(False),
+                Share.status == 'active',
+                Share.expires_at > now,
+            )
+            .all()
+        )
+        covering = []
+        for claim_id, max_dl, ttype, tfolder, tfile in rows:
+            covers = (
+                ttype == 'vault'
+                or (ttype == 'folder' and tfolder is not None and str(tfolder) in anc)
+                or (ttype == 'file' and tfile is not None and str(tfile) == fid)
+            )
+            if covers:
+                covering.append((claim_id, max_dl))
+        if not covering:
+            return True  # require_download_scope already gated visibility/download; defensive
+        # An unlimited covering claim ⇒ unlimited downloads for this file (burn nothing).
+        if any(max_dl is None for _, max_dl in covering):
+            return True
+        # All covering claims are limited: atomically consume one from EACH; deny (and roll back the
+        # whole burn) if any is already at its cap. Consuming every covering limited claim keeps each
+        # share's max_downloads a hard ceiling (INV) — the multi-claim keying is intentionally strict.
+        for claim_id, max_dl in covering:
+            res = self.db.execute(
+                update(ShareClaim)
+                .where(ShareClaim.id == claim_id, ShareClaim.download_count < max_dl)
+                .values(download_count=ShareClaim.download_count + 1)
+            )
+            if res.rowcount == 0:
+                self.db.rollback()
+                return False
+        self.db.commit()
+        return True
 
     def _group_vault_permission(self, user: User, vault_id: uuid.UUID) -> Optional[dict]:
         """Highest vault permission the user gets via any group that has been
