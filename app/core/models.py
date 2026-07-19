@@ -419,6 +419,71 @@ class ShareTag(Base):
     )
 
 
+class Share(Base):
+    """One shared item — a file, a folder (recursively), or a whole Standard vault — granted to
+    authorized, logged-in internal users and classified by a ShareTag. The tag's LIMIT policy is
+    SNAPSHOTTED here at creation (editing the tag later never changes an existing share); the tag's
+    create-allowlist and any revoke stay LIVE. New table (created by create_all). Standard vaults only
+    (never zero-knowledge); a password-protected vault is refused at create. NO claim/enforcement lives
+    here yet — the link token is stored HASHED (a bearer secret) and the plaintext is shown once."""
+    __tablename__ = 'shares'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    creator_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    vault_id = Column(UUID(as_uuid=True), ForeignKey('vaults.id', ondelete='CASCADE'), nullable=False)
+    # RESTRICT: a tag can't be hard-deleted while shares reference it (tags soft-deactivate instead).
+    tag_id = Column(UUID(as_uuid=True), ForeignKey('share_tags.id', ondelete='RESTRICT'), nullable=False)
+
+    target_type = Column(String(10), nullable=False)  # 'vault' | 'folder' | 'file'
+    target_folder_id = Column(UUID(as_uuid=True), ForeignKey('folders.id', ondelete='CASCADE'), nullable=True)
+    target_file_id = Column(UUID(as_uuid=True), ForeignKey('files.id', ondelete='CASCADE'), nullable=True)
+
+    # --- Distribution ---
+    link_token_hash = Column(String(64), nullable=True)  # sha256 hex of the bearer link token; NULL = direct-only
+    claim_audience = Column(String(20), nullable=False)  # 'users' | 'departments' | 'anyone_internal'
+    audience_user_ids = Column(JSON, nullable=False, default=list)       # only for claim_audience 'users'
+    audience_department_ids = Column(JSON, nullable=False, default=list)  # only for claim_audience 'departments'
+
+    # --- Limits (SNAPSHOT at creation) ---
+    expires_at = Column(DateTime, nullable=False)
+    max_recipients = Column(Integer, nullable=True)  # NULL = unlimited (within the tag cap at create)
+    max_downloads = Column(Integer, nullable=True)   # NULL = unlimited (within the tag cap at create)
+    view_only = Column(Boolean, nullable=False, default=False)  # capability: view-only vs read+download
+    tag_policy_snapshot = Column(JSON, nullable=True)  # the tag's limit fields at creation (provenance)
+
+    # --- State ---
+    status = Column(String(10), nullable=False, default='active')  # 'active' | 'revoked' | 'expired'
+    revoked_at = Column(DateTime, nullable=True)
+    revoked_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_share_creator', 'creator_id'),
+        Index('idx_share_vault', 'vault_id'),
+        Index('idx_share_token', 'link_token_hash'),
+    )
+
+
+class ShareClaim(Base):
+    """One claimant of a Share (one row per distinct claiming user; populated at claim time in a later
+    phase). Enforces max_recipients (# active rows) and carries the per-recipient download counter +
+    the single-recipient kick. Unique per (share, user)."""
+    __tablename__ = 'share_claims'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    share_id = Column(UUID(as_uuid=True), ForeignKey('shares.id', ondelete='CASCADE'), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    claimed_at = Column(DateTime, default=datetime.utcnow)
+    last_access_at = Column(DateTime, nullable=True)
+    download_count = Column(Integer, nullable=False, default=0)
+    revoked = Column(Boolean, nullable=False, default=False)  # single-recipient kick
+
+    __table_args__ = (
+        UniqueConstraint('share_id', 'user_id', name='uq_share_claim_user'),
+        Index('idx_share_claim_share', 'share_id'),
+    )
+
+
 class ActiveSession(Base):
     """Track active SFTP sessions."""
     __tablename__ = 'active_sessions'

@@ -97,3 +97,29 @@ def test_effective_limits_clamp_defaults_within_caps_and_lifetime():
     eff3 = sp.tag_effective_limits({"max_lifetime_minutes": 0, "default_lifetime_minutes": 0})
     assert eff3["max_lifetime_minutes"] >= sp.MIN_LIFETIME_MINUTES
     assert eff3["default_lifetime_minutes"] >= 1
+
+
+def test_resolve_share_limits_defaults_overrides_caps_and_lock():
+    tag = {"max_lifetime_minutes": 10000, "default_lifetime_minutes": 1440,
+           "max_recipients_cap": 5, "max_recipients_default": 2,
+           "max_downloads_cap": None, "max_downloads_default": 3,
+           "allow_view_only": True, "default_view_only": False, "allow_custom": True}
+    # no overrides -> tag defaults
+    lim, err = sp.resolve_share_limits(tag, {})
+    assert err is None
+    assert lim == {"lifetime_minutes": 1440, "max_recipients": 2, "max_downloads": 3, "view_only": False}
+    # override WITHIN the caps is honored
+    lim, err = sp.resolve_share_limits(tag, {"max_recipients": 4, "view_only": True})
+    assert err is None and lim["max_recipients"] == 4 and lim["view_only"] is True
+    # a request ABOVE a cap is an ERROR (never a silent clamp)
+    assert sp.resolve_share_limits(tag, {"max_recipients": 9})[1] is not None
+    assert sp.resolve_share_limits(tag, {"lifetime_minutes": 99999})[1] is not None
+    assert sp.resolve_share_limits(tag, {"max_recipients": 0})[1] is not None
+    # a null cap (unlimited) honors any positive value
+    lim, err = sp.resolve_share_limits(tag, {"max_downloads": 999})
+    assert err is None and lim["max_downloads"] == 999
+    # allow_custom False -> requested values IGNORED, tag defaults used (a locked tag can't be widened)
+    lim, err = sp.resolve_share_limits({**tag, "allow_custom": False}, {"max_recipients": 4, "view_only": True})
+    assert err is None and lim["max_recipients"] == 2 and lim["view_only"] is False
+    # view-only requested but the tag forbids it
+    assert sp.resolve_share_limits({**tag, "allow_view_only": False}, {"view_only": True})[1] is not None

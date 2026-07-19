@@ -103,3 +103,56 @@ def tag_effective_limits(tag) -> dict:
         "max_downloads_cap": tag.get("max_downloads_cap"),
         "max_downloads_default": _clamp_default(tag.get("max_downloads_default"), tag.get("max_downloads_cap")),
     }
+
+
+def resolve_share_limits(tag, requested):
+    """Resolve a share's effective limits from the tag policy + the creator's requested overrides.
+
+    Returns (limits, error): `limits` is {lifetime_minutes, max_recipients, max_downloads, view_only}
+    and `error` is None, OR (None, message) — the caller maps a message to a 400. Rules:
+      - If the tag forbids customization (`allow_custom` False), the requested values are IGNORED and
+        the tag defaults are used (a caller cannot widen a locked tag).
+      - Otherwise each requested value is honored only WITHIN the tag's cap: a request ABOVE a cap is an
+        ERROR (not a silent clamp), so the creator learns the share wasn't what they asked for. A
+        requested view-only is honored only if the tag allows view-only. `None`/absent falls to the
+        tag default. `max_recipients`/`max_downloads` caps of None mean unlimited (any positive value).
+    Caps/defaults are read via tag_effective_limits (defaults already clamped to their caps)."""
+    eff = tag_effective_limits(tag)
+    allow_custom = bool(tag.get("allow_custom", True))
+    req = requested or {}
+
+    def _bounded(default, cap, req_val, name):
+        if not allow_custom or req_val is None:
+            return default, None
+        try:
+            v = int(req_val)
+        except (TypeError, ValueError):
+            return None, f"{name} must be an integer"
+        if v < 1:
+            return None, f"{name} must be at least 1"
+        if cap is not None and v > cap:
+            return None, f"{name} exceeds the tag cap ({cap})"
+        return v, None
+
+    life, err = _bounded(eff["default_lifetime_minutes"], eff["max_lifetime_minutes"],
+                         req.get("lifetime_minutes"), "lifetime_minutes")
+    if err:
+        return None, err
+    max_recip, err = _bounded(eff["max_recipients_default"], eff["max_recipients_cap"],
+                              req.get("max_recipients"), "max_recipients")
+    if err:
+        return None, err
+    max_dl, err = _bounded(eff["max_downloads_default"], eff["max_downloads_cap"],
+                           req.get("max_downloads"), "max_downloads")
+    if err:
+        return None, err
+
+    view_only = bool(tag.get("default_view_only", False))
+    if allow_custom and req.get("view_only") is not None:
+        vo = bool(req["view_only"])
+        if vo and not bool(tag.get("allow_view_only", True)):
+            return None, "this tag does not allow view-only shares"
+        view_only = vo
+
+    return {"lifetime_minutes": life, "max_recipients": max_recip,
+            "max_downloads": max_dl, "view_only": view_only}, None
