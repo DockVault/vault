@@ -1369,6 +1369,8 @@ function _el(tag, cls, text) {
 }
 
 async function loadShared() {
+    setupSharedTabsOnce();
+    switchSharedTab('with-me');  // entering the section always lands on "Shared with me"
     const container = document.getElementById('shared-list');
     if (container) container.replaceChildren(_el('div', 'spinner'));
     wireClaimLinkBox();
@@ -1493,6 +1495,147 @@ function renderShared() {
 async function openSharedItem(vaultId, folderId) {
     await openVault(vaultId);
     if (folderId) { try { await navigateToFolder(folderId); } catch (e) { /* root listing still shows the path down */ } }
+}
+
+// ---- Shared sub-tabs + "Shared by me" management (creator) ----
+function setupSharedTabsOnce() {
+    const bar = document.querySelector('#shared-section .tabs');
+    if (!bar || bar.dataset.wired) return;
+    bar.dataset.wired = '1';
+    bar.querySelectorAll('.tab-btn[data-shared-tab]').forEach(btn => {
+        btn.addEventListener('click', () => switchSharedTab(btn.getAttribute('data-shared-tab')));
+    });
+}
+
+function switchSharedTab(which) {
+    document.querySelectorAll('#shared-section .tab-btn[data-shared-tab]').forEach(
+        b => b.classList.toggle('active', b.getAttribute('data-shared-tab') === which));
+    const withMe = document.getElementById('shared-tab-with-me');
+    const byMe = document.getElementById('shared-tab-by-me');
+    if (withMe) withMe.style.display = which === 'with-me' ? '' : 'none';
+    if (byMe) byMe.style.display = which === 'by-me' ? '' : 'none';
+    if (which === 'by-me') loadSharedByMe().catch(err => console.error('Failed to load shared-by-me:', err));
+}
+
+async function loadSharedByMe() {
+    const container = document.getElementById('shared-by-me-list');
+    if (container) container.replaceChildren(_el('div', 'spinner'));
+    try {
+        state.sharedByMe = await apiRequest('/shares');
+        renderSharedByMe();
+    } catch (error) {
+        if (container) container.replaceChildren(_el('div', 'alert alert-error', 'Failed to load your shares: ' + (error.message || '')));
+    }
+}
+
+function _byMeStatusBadge(st) {
+    if (st === 'expired') return _el('span', 'badge badge-warning', 'Expired');
+    if (st === 'revoked') return _el('span', 'badge badge-error', 'Revoked');
+    return _el('span', 'badge badge-success', 'Active');
+}
+
+function _sharedByMeCard(sh) {
+    const active = sh.status === 'active';
+    const kind = sh.target_type === 'vault' ? 'Vault' : (sh.target_type === 'folder' ? 'Folder' : 'File');
+    const title = sh.target_type === 'vault' ? (sh.vault_name || 'Vault') : (sh.target_name || kind);
+    const tileIcon = sh.target_type === 'file' ? 'file' : (sh.target_type === 'folder' ? 'folder' : 'vault');
+
+    const card = _el('div', 'card vault-card');
+    card.setAttribute('data-share-id', sh.id);
+    const body = _el('div', 'vault-card-body');
+    const tile = _el('div', 'vault-tile'); tile.appendChild(_svgIcon(tileIcon)); body.appendChild(tile);
+    const main = _el('div', 'vault-card-main');
+    const h = _el('h3', 'vault-name', title);
+    h.appendChild(document.createTextNode(' ')); h.appendChild(_byMeStatusBadge(sh.status));
+    main.appendChild(h);
+    main.appendChild(_el('p', 'vault-desc', (sh.tag_name ? sh.tag_name + ' · ' : '') +
+        (sh.target_type === 'vault' ? 'Whole vault' : (kind + ' in ' + (sh.vault_name || 'a vault')))));
+    const meta = _el('div', 'vault-meta');
+    meta.appendChild(_el('span', null, (sh.claim_count || 0) + (sh.max_recipients != null ? '/' + sh.max_recipients : '') + ' recipients'));
+    if (sh.view_only) meta.appendChild(_el('span', null, 'View only'));
+    if (sh.max_downloads != null) meta.appendChild(_el('span', null, sh.max_downloads + ' downloads/recipient'));
+    main.appendChild(meta);
+    body.appendChild(main);
+    card.appendChild(body);
+
+    const actions = _el('div', 'flex items-center gap-sm'); actions.style.marginTop = 'var(--space-sm)';
+    if (active) {
+        const revokeBtn = _el('button', 'btn btn-sm', 'Revoke'); revokeBtn.type = 'button'; revokeBtn.style.color = '#dc2626';
+        revokeBtn.addEventListener('click', () => revokeShare(sh.id, title));
+        actions.appendChild(revokeBtn);
+    }
+    card.appendChild(actions);
+
+    if ((sh.claim_count || 0) > 0) {
+        const recipWrap = _el('div'); recipWrap.style.display = 'none'; recipWrap.style.marginTop = 'var(--space-sm)';
+        const recipBtn = _el('button', 'btn btn-secondary btn-sm', 'Recipients (' + sh.claim_count + ')'); recipBtn.type = 'button';
+        recipBtn.addEventListener('click', () => {
+            if (recipWrap.style.display === 'none') { recipWrap.style.display = ''; loadShareClaims(sh.id, recipWrap); }
+            else recipWrap.style.display = 'none';
+        });
+        actions.appendChild(recipBtn);
+        card.appendChild(recipWrap);
+    }
+    return card;
+}
+
+function renderSharedByMe() {
+    const container = document.getElementById('shared-by-me-list');
+    if (!container) return;
+    const items = state.sharedByMe || [];
+    if (items.length === 0) {
+        const wrap = _el('div', 'empty-state-center p-xl');
+        wrap.appendChild(_el('h3', 'text-xl font-bold mb-xs', 'You have not shared anything yet'));
+        wrap.appendChild(_el('p', 'text-secondary', 'Open a vault, file, or folder and use Share to create a share.'));
+        container.replaceChildren(wrap);
+        return;
+    }
+    container.replaceChildren(...items.map(_sharedByMeCard));
+}
+
+async function revokeShare(shareId, title) {
+    const ok = await showConfirm('Revoke the share of "' + title + '"? Everyone will lose access.', 'Revoke share');
+    if (!ok) return;
+    try {
+        await apiRequest('/shares/' + shareId + '/revoke', { method: 'POST' });
+        showToast('Share revoked', 'success');
+        await loadSharedByMe();
+    } catch (e) { showToast(e.message || 'Could not revoke the share', 'error'); }
+}
+
+async function loadShareClaims(shareId, wrap) {
+    wrap.replaceChildren(_el('div', 'spinner'));
+    try {
+        const claims = await apiRequest('/shares/' + shareId + '/claims', { silent: true });
+        renderShareClaims(shareId, claims, wrap);
+    } catch (e) {
+        wrap.replaceChildren(_el('div', 'alert alert-error', 'Failed to load recipients: ' + (e.message || '')));
+    }
+}
+
+function renderShareClaims(shareId, claims, wrap) {
+    if (!claims || claims.length === 0) { wrap.replaceChildren(_el('p', 'text-secondary text-sm', 'No recipients yet.')); return; }
+    wrap.replaceChildren(...claims.map(c => {
+        const row = _el('div', 'flex items-center justify-between'); row.style.padding = '2px 0';
+        row.appendChild(_el('span', 'text-sm',
+            c.username + (c.revoked ? ' (removed)' : '') + ' · ' + (c.download_count || 0) + ' downloads'));
+        if (!c.revoked) {
+            const kick = _el('button', 'btn btn-sm', 'Remove'); kick.type = 'button'; kick.style.color = '#dc2626';
+            kick.addEventListener('click', () => kickShareRecipient(shareId, c.user_id, c.username, wrap));
+            row.appendChild(kick);
+        }
+        return row;
+    }));
+}
+
+async function kickShareRecipient(shareId, userId, username, wrap) {
+    const ok = await showConfirm('Remove ' + username + ' from this share? They lose access immediately.', 'Remove recipient');
+    if (!ok) return;
+    try {
+        await apiRequest('/shares/' + shareId + '/claims/' + userId + '/revoke', { method: 'POST' });
+        showToast('Recipient removed', 'success');
+        await loadShareClaims(shareId, wrap);  // refresh the expanded recipient list in place
+    } catch (e) { showToast(e.message || 'Could not remove the recipient', 'error'); }
 }
 
 // ---- Create-share modal (creator) ----

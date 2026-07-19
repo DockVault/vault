@@ -4715,10 +4715,25 @@ def _share_dict(db: Session, share: Share, claim_counts: dict = None) -> dict:
     else:
         claim_count = db.query(ShareClaim).filter(
             ShareClaim.share_id == share.id, ShareClaim.revoked.is_(False)).count()
+    # Display names for the management cards. tag_name comes from the creation snapshot (survives a
+    # later tag rename/deactivation); target_name is the folder/file name (Standard-vault plaintext
+    # the creator authored). vault_name for the item label.
+    tag_name = (share.tag_policy_snapshot or {}).get("tag_name") if isinstance(share.tag_policy_snapshot, dict) else None
+    vault = db.query(Vault).filter(Vault.id == share.vault_id).first()
+    target_name = None
+    if share.target_type == "folder" and share.target_folder_id:
+        f = db.query(Folder).filter(Folder.id == share.target_folder_id).first()
+        target_name = f.name if f else None
+    elif share.target_type == "file" and share.target_file_id:
+        x = db.query(File).filter(File.id == share.target_file_id).first()
+        target_name = x.original_name if x else None
     return {
         "id": str(share.id),
         "vault_id": str(share.vault_id),
+        "vault_name": vault.name if vault else None,
         "tag_id": str(share.tag_id),
+        "tag_name": tag_name,
+        "target_name": target_name,
         "target_type": share.target_type,
         "target_folder_id": str(share.target_folder_id) if share.target_folder_id else None,
         "target_file_id": str(share.target_file_id) if share.target_file_id else None,
@@ -4970,6 +4985,34 @@ async def revoke_share_claim(
         except Exception:
             db.rollback()
     return {"share_id": str(share.id), "user_id": str(user_id), "revoked": True}
+
+
+@app.get("/shares/{share_id}/claims")
+async def list_share_claims(
+    share_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The recipients who have claimed a share, for the creator's (or an admin's) management view —
+    so they can see usage and kick a specific recipient. Creator/admin only (via _load_manageable_share,
+    which also blocks temp sessions). Returns per-recipient id/username + download usage + revoked flag;
+    no tokens."""
+    share = _load_manageable_share(db, share_id, current_user)
+    rows = (
+        db.query(ShareClaim, User.username)
+        .join(User, User.id == ShareClaim.user_id)
+        .filter(ShareClaim.share_id == share.id)
+        .order_by(ShareClaim.claimed_at.asc())
+        .all()
+    )
+    return [{
+        "user_id": str(c.user_id),
+        "username": username,
+        "download_count": c.download_count,
+        "revoked": bool(c.revoked),
+        "claimed_at": c.claimed_at.isoformat() if c.claimed_at else None,
+        "last_access_at": c.last_access_at.isoformat() if c.last_access_at else None,
+    } for c, username in rows]
 
 
 def _share_claim_dict(claim: ShareClaim, share: Share) -> dict:

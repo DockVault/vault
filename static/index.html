@@ -375,18 +375,27 @@
                 <!-- Shared with me (recipient tab) -->
                 <div id="shared-section" class="content-section">
                     <div class="flex justify-between items-center mb-lg">
-                        <h2 class="text-2xl font-bold">Shared with me</h2>
+                        <h2 class="text-2xl font-bold">Shared</h2>
                     </div>
-                    <div class="card mb-lg" style="padding: var(--space-md);">
-                        <label for="claim-link-input" class="text-sm font-bold">Claim a share link</label>
-                        <p class="text-secondary text-sm mb-sm">Paste a share link or token to add it to your shared items.</p>
-                        <div class="flex items-center gap-sm">
-                            <input id="claim-link-input" type="text" class="input" style="flex:1;"
-                                   placeholder="Paste a share link or token" autocomplete="off" />
-                            <button id="claim-link-btn" class="btn btn-primary" type="button">Claim</button>
+                    <div class="tabs mb-lg" role="tablist">
+                        <button class="tab-btn active" type="button" data-shared-tab="with-me">Shared with me</button>
+                        <button class="tab-btn" type="button" data-shared-tab="by-me">Shared by me</button>
+                    </div>
+                    <div id="shared-tab-with-me" class="shared-tab-content">
+                        <div class="card mb-lg" style="padding: var(--space-md);">
+                            <label for="claim-link-input" class="text-sm font-bold">Claim a share link</label>
+                            <p class="text-secondary text-sm mb-sm">Paste a share link or token to add it to your shared items.</p>
+                            <div class="flex items-center gap-sm">
+                                <input id="claim-link-input" type="text" class="input" style="flex:1;"
+                                       placeholder="Paste a share link or token" autocomplete="off" />
+                                <button id="claim-link-btn" class="btn btn-primary" type="button">Claim</button>
+                            </div>
                         </div>
+                        <div id="shared-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: var(--space-md);"></div>
                     </div>
-                    <div id="shared-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: var(--space-md);"></div>
+                    <div id="shared-tab-by-me" class="shared-tab-content" style="display:none;">
+                        <div id="shared-by-me-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: var(--space-md);"></div>
+                    </div>
                 </div>
 
                 <!-- Individual Vault View (Hidden by default) -->
