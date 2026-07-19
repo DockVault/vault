@@ -89,3 +89,33 @@ def test_whole_vault_share_claim_grants_nothing_over_sftp(admin, temp_user, temp
                 s.listdir(f"/{vname}")  # opening the shared vault by path is denied
     finally:
         admin.delete_vault(v["id"])
+
+
+def test_folder_share_claim_grants_nothing_over_sftp(admin, temp_user, temp_user_client):
+    """Subtree-share SFTP denial: a folder-share recipient with a LIVE web claim still gets nothing
+    over SFTP — the vault is neither enumerated nor navigable, and neither is the shared folder."""
+    _enable_sharing(admin, True)
+    v = admin.create_vault(name=unique("sftpfld"))
+    vname = v["name"]
+    try:
+        fld = admin.post(f"/vaults/{v['id']}/folders", json={"name": "shared-dir"}).json()["folder"]["id"]
+        admin.post(f"/vaults/{v['id']}/files", params={"folder_id": fld},
+                   files=[("files", ("in.txt", b"secret", "application/octet-stream"))])
+        r = admin.post("/shares", json={"vault_id": v["id"], "tag_id": _tag(admin)["id"],
+                                        "target_type": "folder", "target_folder_id": fld,
+                                        "claim_audience": "anyone_internal"})
+        assert r.status_code == 200, r.text
+        share = r.json()
+
+        assert temp_user_client.post("/shares/claim", json={"token": share["link_token"]}).status_code == 200
+        # the recipient can list the shared folder over the WEB (positive control)
+        assert temp_user_client.get(f"/vaults/{v['id']}/files", params={"folder_id": fld}).status_code == 200
+
+        with _sftp(temp_user["_username"], temp_user["_password"]) as s:
+            assert vname not in set(s.listdir("/")), "shared folder's vault must not be enumerated over SFTP"
+            with pytest.raises((IOError, OSError)):
+                s.listdir(f"/{vname}")            # the vault is not navigable
+            with pytest.raises((IOError, OSError)):
+                s.listdir(f"/{vname}/shared-dir")  # nor the shared folder
+    finally:
+        admin.delete_vault(v["id"])
