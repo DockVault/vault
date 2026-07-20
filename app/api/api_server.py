@@ -28,7 +28,8 @@ import traceback
 from pathlib import Path
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
-from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference
+from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim
+from app.core import sharing_policy
 # NOTE: auth_service and vault_service BOTH define a class named RateLimitExceededError
 # (unrelated: one subclasses AuthenticationError, the other FileServiceError). Import the
 # auth one under an alias so the later vault import below can't shadow it — otherwise the
@@ -37,7 +38,7 @@ from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum,
 from app.services.auth_service import AuthService, InvalidCredentialsError, AccountLockedError, RateLimitExceededError as AuthRateLimitExceededError
 from app.core.authorization import PermissionService, PermissionDeniedError, ResourceNotFoundError, AuthorizationError
 from app.services.vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, _name_match_filter
-from app.services.vault_service import require_file_scope, require_folder_scope, require_item_scope, folder_ancestry, filter_listing_for_scope
+from app.services.vault_service import require_file_scope, require_folder_scope, require_item_scope, require_download_scope, folder_ancestry, filter_listing_for_scope
 from app.core.id_scope import id_in_scope
 from sqlalchemy.exc import IntegrityError
 from app.services.audit_logger import AuditLogger
@@ -652,6 +653,118 @@ class GroupMembersAdd(BaseModel):
 class VaultGroupAccessAdd(BaseModel):
     group_id: uuid.UUID
     permission: str = 'read'  # 'read' | 'write'
+
+
+# Postgres INTEGER (int4) ceiling. The share limit/lifetime fields map to int4 columns, so bound the
+# Pydantic validators here: a larger value would pass validation and then raise an uncaught DataError
+# (HTTP 500 — only IntegrityError is caught) on INSERT/UPDATE. le= turns it into a clean 422 at the edge.
+_INT4_MAX = 2147483647
+
+
+class ShareTagCreate(BaseModel):
+    """Create a share tag (interactive-admin). Policy + create-allowlist. Ints are >= 1; a NULL cap or
+    default means unlimited on that axis. Cross-field checks (default <= cap, default_lifetime <=
+    ceiling, audiences subset, allowlist ids exist) run in the endpoint via _validate_share_tag_fields.
+    The create-allowlist DEFAULTS FAIL-CLOSED (auto_enroll off + empty lists): a fresh tag grants no one
+    until the admin allow-lists users/departments or enables auto-enroll."""
+    name: str = Field(..., min_length=1, max_length=120)
+    description: Optional[str] = None
+    color: Optional[str] = Field(None, max_length=20)
+    max_lifetime_minutes: int = Field(10080, ge=1, le=_INT4_MAX)     # ceiling (7 days)
+    default_lifetime_minutes: int = Field(1440, ge=1, le=_INT4_MAX)  # default (1 day)
+    max_recipients_cap: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_recipients_default: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_downloads_cap: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_downloads_default: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    allow_view_only: bool = True
+    default_view_only: bool = False
+    force_view_only: bool = False
+    allow_custom: bool = True
+    allowed_audiences: List[str] = Field(default_factory=lambda: list(sharing_policy.AUDIENCES))
+    allowed_department_ids: List[uuid.UUID] = Field(default_factory=list)
+    allowed_user_ids: List[uuid.UUID] = Field(default_factory=list)
+    blocked_user_ids: List[uuid.UUID] = Field(default_factory=list)
+    auto_enroll_new_users: bool = False
+
+    @field_validator('name')
+    @classmethod
+    def _clean_name(cls, v):
+        return _reject_markup_chars(v, 'name')
+
+    @field_validator('color')
+    @classmethod
+    def _clean_color(cls, v):
+        return _validate_chip_color(v)
+
+    @field_validator('description')
+    @classmethod
+    def _clean_description(cls, v):
+        # Strip HTML markup at the input boundary like every sibling free-text field (name/username/…),
+        # so the Tags-manager UI can never render a stored-XSS payload from a tag description.
+        return _reject_markup_chars(v, 'description') if v is not None else v
+
+
+class ShareTagUpdate(BaseModel):
+    """Patch a share tag (interactive-admin). All fields optional; only PROVIDED keys change (an
+    explicit null on a cap/default clears it -> unlimited). is_active toggles soft-deactivate/reactivate."""
+    name: Optional[str] = Field(None, min_length=1, max_length=120)
+    description: Optional[str] = None
+    color: Optional[str] = Field(None, max_length=20)
+    is_active: Optional[bool] = None
+    max_lifetime_minutes: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    default_lifetime_minutes: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_recipients_cap: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_recipients_default: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_downloads_cap: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_downloads_default: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    allow_view_only: Optional[bool] = None
+    default_view_only: Optional[bool] = None
+    force_view_only: Optional[bool] = None
+    allow_custom: Optional[bool] = None
+    allowed_audiences: Optional[List[str]] = None
+    allowed_department_ids: Optional[List[uuid.UUID]] = None
+    allowed_user_ids: Optional[List[uuid.UUID]] = None
+    blocked_user_ids: Optional[List[uuid.UUID]] = None
+    auto_enroll_new_users: Optional[bool] = None
+
+    @field_validator('name')
+    @classmethod
+    def _clean_name(cls, v):
+        return _reject_markup_chars(v, 'name') if v is not None else v
+
+    @field_validator('color')
+    @classmethod
+    def _clean_color(cls, v):
+        return _validate_chip_color(v)
+
+    @field_validator('description')
+    @classmethod
+    def _clean_description(cls, v):
+        return _reject_markup_chars(v, 'description') if v is not None else v
+
+
+class ShareCreate(BaseModel):
+    """Create a share of a file / folder / whole Standard vault. Standard-only; the chosen tag governs
+    the limits + who may create. Limit overrides are honored only within the tag caps (and only if the
+    tag permits customization). `with_link` mints the show-once claimable link token."""
+    vault_id: uuid.UUID
+    tag_id: uuid.UUID
+    target_type: str = Field(..., pattern='^(vault|folder|file)$')
+    target_folder_id: Optional[uuid.UUID] = None
+    target_file_id: Optional[uuid.UUID] = None
+    claim_audience: str = Field(..., pattern='^(users|departments|anyone_internal)$')
+    audience_user_ids: List[uuid.UUID] = Field(default_factory=list)
+    audience_department_ids: List[uuid.UUID] = Field(default_factory=list)
+    lifetime_minutes: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_recipients: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_downloads: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    view_only: Optional[bool] = None
+    with_link: bool = True
+
+
+class ShareClaimRequest(BaseModel):
+    """Claim a share by its link token."""
+    token: str = Field(..., min_length=1, max_length=512)
 
 
 class TempCredentialCreate(BaseModel):
@@ -1625,6 +1738,13 @@ def _temp_passcodes_enabled(db: Session) -> bool:
     return temp_passcode_policy.passcodes_enabled(_global_settings_blob(db))
 
 
+def _sharing_enabled(db: Session) -> bool:
+    """Sharing feature master switch (FAIL-CLOSED: default False, and False for any non-bool stored
+    value). Mirrors _temp_passcodes_enabled / _zk_enabled; the per-tag policy lives in the share_tags
+    table, this is only the deployment-wide on/off."""
+    return sharing_policy.sharing_enabled(_global_settings_blob(db))
+
+
 def _temp_cred_allow_zk_vaults(db: Session) -> bool:
     """May a zero-knowledge vault be included in a temporary credential's scope at all. Default True =
     today's behavior; only an explicit stored False denies (enforced fail-closed at the mint chokepoint)."""
@@ -1672,7 +1792,8 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Settings payload must be an object")
 
-    for bool_key in ("zero_knowledge_enabled", "force_zero_knowledge", "force_no_remember_vault_password"):
+    for bool_key in ("zero_knowledge_enabled", "force_zero_knowledge", "force_no_remember_vault_password",
+                     "sharing_enabled"):
         if bool_key in payload and not isinstance(payload[bool_key], bool):
             raise HTTPException(status_code=400, detail=f"{bool_key} must be true or false")
 
@@ -1774,6 +1895,8 @@ async def get_settings(
     data["force_no_remember_vault_password"] = _force_no_remember_vault_password(db)
     # Effective ZK-key idle auto-lock (minutes; 0 = disabled).
     data["zk_idle_lock_minutes"] = _zk_idle_lock_minutes(db)
+    # Effective Sharing master switch (default OFF) so the Settings -> Sharing toggle reflects reality.
+    data["sharing_enabled"] = _sharing_enabled(db)
     return data
 
 
@@ -4305,6 +4428,918 @@ async def delete_group(
     return {"message": f"Group '{name}' deleted"}
 
 
+# ---------------------------------------------------------------------------
+# Sharing policy & tags. The Sharing feature's admin policy surface. The master
+# switch lives in the SystemSetting('global') blob (validated in
+# _validate_settings_payload, overlaid in get_settings, resolved by _sharing_enabled);
+# the per-tag policy + create-allowlist live in the share_tags table (CRUD below,
+# interactive-admin). GET /share-policy is the non-admin effective reader (like
+# /zk-enabled) that shapes the share modal. No share creation or enforcement here.
+# ---------------------------------------------------------------------------
+# Tag fields whose columns are NOT NULL. A PATCH may OMIT them, but an explicit JSON null is rejected:
+# ShareTagUpdate types everything Optional, so model_dump(exclude_unset=True) keeps an explicit null,
+# which would otherwise violate the NOT-NULL column (500) or, for allowed_audiences, store an unusable
+# empty-audiences tag. The caps (max_recipients_cap/max_downloads_cap) are nullable -> null clears them.
+_SHARE_TAG_NOT_NULLABLE = frozenset({
+    "name", "is_active", "max_lifetime_minutes", "default_lifetime_minutes",
+    "allow_view_only", "default_view_only", "force_view_only", "allow_custom", "auto_enroll_new_users",
+    "allowed_audiences",
+})
+
+
+def _share_tag_dict(t: ShareTag) -> dict:
+    """Full admin view of a share tag (includes the create-allowlist so the Tags manager can edit it).
+    Id lists are stringified; this is the admin-only shape (GET /share-policy exposes far less)."""
+    return {
+        "id": str(t.id),
+        "name": t.name,
+        "description": t.description,
+        "color": t.color,
+        "is_active": t.is_active,
+        "max_lifetime_minutes": t.max_lifetime_minutes,
+        "default_lifetime_minutes": t.default_lifetime_minutes,
+        "max_recipients_cap": t.max_recipients_cap,
+        "max_recipients_default": t.max_recipients_default,
+        "max_downloads_cap": t.max_downloads_cap,
+        "max_downloads_default": t.max_downloads_default,
+        "allow_view_only": t.allow_view_only,
+        "default_view_only": t.default_view_only,
+        "force_view_only": t.force_view_only,
+        "allow_custom": t.allow_custom,
+        "allowed_audiences": list(t.allowed_audiences or []),
+        "allowed_department_ids": [str(x) for x in (t.allowed_department_ids or [])],
+        "allowed_user_ids": [str(x) for x in (t.allowed_user_ids or [])],
+        "blocked_user_ids": [str(x) for x in (t.blocked_user_ids or [])],
+        "auto_enroll_new_users": t.auto_enroll_new_users,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+    }
+
+
+def _validate_ids_exist(db: Session, model, ids, field: str) -> None:
+    """Reject a tag allowlist that references a user/group id that doesn't exist, so a typo can't
+    silently do nothing (mirrors _validate_group_id_list's fail-loud philosophy)."""
+    if not ids:
+        return
+    ids = [str(x) for x in ids]
+    found = {str(r[0]) for r in db.query(model.id).filter(model.id.in_(ids)).all()}
+    missing = [i for i in ids if i not in found]
+    if missing:
+        # Report only a COUNT, never the ids themselves: echoing the submitted-but-unknown ids back
+        # would turn this into an existence oracle for arbitrary user/group ids.
+        raise HTTPException(status_code=400, detail=f"{field} contains {len(missing)} unknown id(s).")
+
+
+def _validate_share_tag_fields(eff: dict, changed_keys: set, db: Session, existing: dict = None) -> None:
+    """Cross-field + existence validation for a share tag. `eff` is the EFFECTIVE (post-merge) view so
+    a PATCH that touches only one side of a pair is checked against the stored other side. Existence is
+    only re-checked for id lists actually CHANGED, and (on PATCH) only for the NEWLY-ADDED ids vs
+    `existing` — so an id that was valid when saved but whose user/group is later deleted can't block an
+    unrelated edit, while a fresh typo still fails loud."""
+    existing = existing or {}
+
+    def _new_ids(key):
+        prior = set(existing.get(key) or [])
+        return [i for i in (eff.get(key) or []) if i not in prior]
+
+    ml, dl = eff.get("max_lifetime_minutes"), eff.get("default_lifetime_minutes")
+    if ml is not None and dl is not None and dl > ml:
+        raise HTTPException(status_code=400, detail="default_lifetime_minutes cannot exceed max_lifetime_minutes")
+    for cap_k, def_k in (("max_recipients_cap", "max_recipients_default"),
+                         ("max_downloads_cap", "max_downloads_default")):
+        cap, dv = eff.get(cap_k), eff.get(def_k)
+        if cap is not None and dv is not None and dv > cap:
+            raise HTTPException(status_code=400, detail=f"{def_k} cannot exceed {cap_k}")
+    # A view-only DEFAULT is meaningless if view-only isn't even ALLOWED for the tag.
+    if eff.get("default_view_only") and eff.get("allow_view_only") is False:
+        raise HTTPException(status_code=400, detail="default_view_only requires allow_view_only")
+    # Forcing view-only implies view-only is permitted; the contradictory combo is rejected.
+    if eff.get("force_view_only") and eff.get("allow_view_only") is False:
+        raise HTTPException(status_code=400, detail="force_view_only requires allow_view_only")
+    aud = eff.get("allowed_audiences")
+    if aud is not None:
+        bad = [a for a in aud if a not in sharing_policy.AUDIENCES]
+        if bad:
+            raise HTTPException(status_code=400,
+                                detail=f"unknown audience(s) {bad}; allowed: {list(sharing_policy.AUDIENCES)}")
+        if not sharing_policy.normalize_audiences(aud):
+            raise HTTPException(status_code=400, detail="allowed_audiences must include at least one audience")
+    if "allowed_department_ids" in changed_keys:
+        _validate_ids_exist(db, Group, _new_ids("allowed_department_ids"), "allowed_department_ids")
+    for uk in ("allowed_user_ids", "blocked_user_ids"):
+        if uk in changed_keys:
+            _validate_ids_exist(db, User, _new_ids(uk), uk)
+
+
+def _audit_share_tag(db: Session, request: Request, user: User, action: str, tag: ShareTag) -> None:
+    """Best-effort admin-config audit for a tag mutation (never fails the mutation). A tag NAME is an
+    admin-authored classification label, not a file/folder name, so logging it is safe (cf. vault_name)."""
+    try:
+        AuditLogger(db).log_action(action=action, status="success", user=user,
+                                   ip_address=get_client_ip(request),
+                                   details={"tag_id": str(tag.id), "name": tag.name})
+    except Exception:
+        pass
+
+
+@app.get("/share-tags")
+async def list_share_tags(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """List all share tags (active AND inactive) for the admin Tags manager."""
+    tags = db.query(ShareTag).order_by(ShareTag.name).all()
+    return [_share_tag_dict(t) for t in tags]
+
+
+@app.post("/share-tags")
+async def create_share_tag(
+    payload: ShareTagCreate,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Create a share tag (interactive-admin). Name is unique; policy + create-allowlist validated."""
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Tag name is required")
+    existing = db.query(ShareTag).filter(ShareTag.name == name).first()
+    if existing:
+        if not existing.is_active:
+            raise HTTPException(status_code=400,
+                                detail="A deactivated tag already uses this name — reactivate it or choose another")
+        raise HTTPException(status_code=400, detail="A tag with that name already exists")
+    data = payload.model_dump()
+    data["name"] = name
+    for k in ("allowed_department_ids", "allowed_user_ids", "blocked_user_ids"):
+        data[k] = [str(x) for x in (data.get(k) or [])]
+    _validate_share_tag_fields(data, set(data.keys()), db)
+    data["allowed_audiences"] = sharing_policy.normalize_audiences(data.get("allowed_audiences"))
+    tag = ShareTag(created_by=current_user.id, **data)
+    db.add(tag)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()  # a concurrent create raced the same unique name -> clean 400, not a 500
+        raise HTTPException(status_code=400, detail="A tag with that name already exists")
+    db.refresh(tag)
+    _audit_share_tag(db, request, current_user, "share_tag_created", tag)
+    return _share_tag_dict(tag)
+
+
+@app.patch("/share-tags/{tag_id}")
+async def update_share_tag(
+    tag_id: uuid.UUID,
+    payload: ShareTagUpdate,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Update a share tag's policy / create-allowlist / active state (interactive-admin). Only PROVIDED
+    keys change; editing does NOT retroactively alter existing shares (they snapshot the tag at create)."""
+    tag = db.query(ShareTag).filter(ShareTag.id == tag_id).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Tag not found")
+    data = payload.model_dump(exclude_unset=True)
+    # An explicit JSON null on a NOT-NULL field is rejected here (a PATCH may omit it, but must not blank
+    # it): otherwise it would violate the column (500) or, for allowed_audiences, store an unusable tag.
+    for k in _SHARE_TAG_NOT_NULLABLE:
+        if k in data and data[k] is None:
+            raise HTTPException(status_code=400, detail=f"{k} cannot be null")
+    if "name" in data:
+        nm = (data["name"] or "").strip()
+        if not nm:
+            raise HTTPException(status_code=400, detail="Tag name cannot be empty")
+        if db.query(ShareTag).filter(ShareTag.name == nm, ShareTag.id != tag_id).first():
+            raise HTTPException(status_code=400, detail="A tag with that name already exists")
+        data["name"] = nm
+    for k in ("allowed_department_ids", "allowed_user_ids", "blocked_user_ids"):
+        if k in data:
+            data[k] = [str(x) for x in (data[k] or [])]
+    eff = _share_tag_dict(tag)
+    stored = dict(eff)  # snapshot BEFORE the patch, so only newly-added ids are existence-checked
+    eff.update(data)
+    _validate_share_tag_fields(eff, set(data.keys()), db, existing=stored)
+    if "allowed_audiences" in data:
+        data["allowed_audiences"] = sharing_policy.normalize_audiences(data["allowed_audiences"])
+    for k, v in data.items():
+        setattr(tag, k, v)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()  # a concurrent rename raced the same unique name -> clean 400, not a 500
+        raise HTTPException(status_code=400, detail="A tag with that name already exists")
+    db.refresh(tag)
+    _audit_share_tag(db, request, current_user, "share_tag_updated", tag)
+    return _share_tag_dict(tag)
+
+
+@app.delete("/share-tags/{tag_id}")
+async def deactivate_share_tag(
+    tag_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Soft-deactivate a share tag (interactive-admin) — NEVER a hard delete, so any shares that
+    reference it keep their snapshot. Deactivating stops NEW creates with the tag; reactivate via PATCH
+    is_active=true."""
+    tag = db.query(ShareTag).filter(ShareTag.id == tag_id).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Tag not found")
+    tag.is_active = False
+    db.commit()
+    _audit_share_tag(db, request, current_user, "share_tag_deactivated", tag)
+    return {"message": f"Tag '{tag.name}' deactivated", "id": str(tag.id), "is_active": False}
+
+
+@app.get("/share-policy")
+async def get_share_policy(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Effective sharing policy for the CURRENT user — non-admin readable (like /zk-enabled), so the
+    share modal can shape controls without exposing the admin-only /settings or /share-tags.
+    Returns whether sharing is on + ONLY the tags this user may CREATE shares with, each carrying its
+    effective limit envelope + allowed audiences.
+
+    FAIL-CLOSED: sharing off -> no tags; a temp-credential session can never create a share -> no tags;
+    a user not permitted by a tag's create-allowlist never sees that tag. The create-allowlist internals
+    (who is allowed/blocked) are NEVER exposed here."""
+    enabled = _sharing_enabled(db)
+    if not enabled or getattr(current_user, "_is_temp_session", False):
+        return {"sharing_enabled": enabled, "tags": []}
+    user_gids = [
+        str(r[0]) for r in db.query(user_groups.c.group_id)
+        .filter(user_groups.c.user_id == current_user.id).all()
+    ]
+    creatable = []
+    for t in db.query(ShareTag).filter(ShareTag.is_active.is_(True)).order_by(ShareTag.name).all():
+        allowlist = {
+            "is_active": t.is_active,
+            "blocked_user_ids": t.blocked_user_ids,
+            "allowed_user_ids": t.allowed_user_ids,
+            "allowed_department_ids": t.allowed_department_ids,
+            "auto_enroll_new_users": t.auto_enroll_new_users,
+        }
+        if not sharing_policy.user_can_create_with_tag(allowlist, current_user.id, user_gids):
+            continue
+        eff = sharing_policy.tag_effective_limits({
+            "max_lifetime_minutes": t.max_lifetime_minutes,
+            "default_lifetime_minutes": t.default_lifetime_minutes,
+            "max_recipients_cap": t.max_recipients_cap,
+            "max_recipients_default": t.max_recipients_default,
+            "max_downloads_cap": t.max_downloads_cap,
+            "max_downloads_default": t.max_downloads_default,
+        })
+        creatable.append({
+            "id": str(t.id),
+            "name": t.name,
+            "color": t.color,
+            "allowed_audiences": sharing_policy.normalize_audiences(t.allowed_audiences),
+            "allow_view_only": t.allow_view_only,
+            "default_view_only": t.default_view_only,
+            "force_view_only": t.force_view_only,
+            "allow_custom": t.allow_custom,
+            **eff,
+        })
+    return {"sharing_enabled": True, "tags": creatable}
+
+
+# ---------------------------------------------------------------------------
+# Shares (create + list-mine). A Share grants ONE item (file / folder / whole Standard vault) to
+# authorized internal users, classified by a ShareTag whose limit policy is SNAPSHOTTED at creation.
+# The link token is a bearer secret: stored HASHED and shown once at create.
+# ---------------------------------------------------------------------------
+def _user_group_ids(db: Session, user_id) -> list:
+    return [str(r[0]) for r in db.query(user_groups.c.group_id).filter(user_groups.c.user_id == user_id).all()]
+
+
+def _validate_share_audience_users(db: Session, current_user: User, aud_users: list) -> None:
+    """A direct-push 'users' audience must be limited to recipients the creator could actually reach
+    through the recipient picker (GET /users/search): active, non-EXTERNAL accounts, and — when the org
+    sets directory_search_scope='same_department' — accounts sharing a department with the creator.
+    Existence is already checked by _validate_ids_exist; this applies the SAME eligibility filter the
+    picker applies, so a crafted POST /shares can't push a share to a user the picker would never
+    surface (an out-of-scope, EXTERNAL, or inactive account). An interactive admin is NOT
+    department-scoped — they have the unrestricted /users directory — mirroring /users/search. Fail-
+    closed: any ineligible id is rejected with a non-enumerating 400 (the specific ids are not echoed)."""
+    if not aud_users:
+        return
+    from sqlalchemy import select as _select
+    q = db.query(User.id).filter(
+        User.id.in_(aud_users),
+        User.is_active == True,  # noqa: E712
+        User.role != RoleEnum.EXTERNAL,
+    )
+    if getattr(current_user, "role", None) != RoleEnum.ADMIN and _directory_search_scope(db) == "same_department":
+        caller_gids = _select(user_groups.c.group_id).where(user_groups.c.user_id == current_user.id)
+        q = q.join(user_groups, User.id == user_groups.c.user_id).filter(
+            user_groups.c.group_id.in_(caller_gids)).distinct()
+    eligible = {str(r[0]) for r in q.all()}
+    if any(str(u) not in eligible for u in aud_users):
+        raise HTTPException(
+            status_code=400,
+            detail="One or more selected recipients aren't eligible to receive this share.")
+
+
+def _share_effective_status(share: Share) -> str:
+    """Lazy expiry: an active share past its expiry reads as 'expired' (a periodic sweep can flip the
+    stored status later; correctness never depends on it)."""
+    if share.status == "active" and share.expires_at and share.expires_at <= datetime.utcnow():
+        return "expired"
+    return share.status
+
+
+def _share_dict(db: Session, share: Share, claim_counts: dict = None) -> dict:
+    """Creator-facing view of a share ('Shared by me'). NEVER includes the link token (shown once at
+    create); only whether a link exists. `claim_counts` is an optional precomputed {share_id: count} map
+    so a list view avoids an N+1 COUNT per share."""
+    if claim_counts is not None:
+        claim_count = claim_counts.get(str(share.id), 0)
+    else:
+        claim_count = db.query(ShareClaim).filter(
+            ShareClaim.share_id == share.id, ShareClaim.revoked.is_(False)).count()
+    # Display names for the management cards. tag_name comes from the creation snapshot (survives a
+    # later tag rename/deactivation); target_name is the folder/file name (Standard-vault plaintext
+    # the creator authored). vault_name for the item label.
+    tag_name = (share.tag_policy_snapshot or {}).get("tag_name") if isinstance(share.tag_policy_snapshot, dict) else None
+    vault = db.query(Vault).filter(Vault.id == share.vault_id).first()
+    target_name = None
+    if share.target_type == "folder" and share.target_folder_id:
+        f = db.query(Folder).filter(Folder.id == share.target_folder_id).first()
+        target_name = f.name if f else None
+    elif share.target_type == "file" and share.target_file_id:
+        x = db.query(File).filter(File.id == share.target_file_id).first()
+        target_name = x.original_name if x else None
+    return {
+        "id": str(share.id),
+        "vault_id": str(share.vault_id),
+        "vault_name": vault.name if vault else None,
+        "tag_id": str(share.tag_id),
+        "tag_name": tag_name,
+        "target_name": target_name,
+        "target_type": share.target_type,
+        "target_folder_id": str(share.target_folder_id) if share.target_folder_id else None,
+        "target_file_id": str(share.target_file_id) if share.target_file_id else None,
+        "claim_audience": share.claim_audience,
+        "audience_user_ids": [str(x) for x in (share.audience_user_ids or [])],
+        "audience_department_ids": [str(x) for x in (share.audience_department_ids or [])],
+        "has_link": bool(share.link_token_hash),
+        "expires_at": share.expires_at.isoformat() if share.expires_at else None,
+        "max_recipients": share.max_recipients,
+        "max_downloads": share.max_downloads,
+        "view_only": share.view_only,
+        "status": _share_effective_status(share),
+        "claim_count": claim_count,
+        "created_at": share.created_at.isoformat() if share.created_at else None,
+    }
+
+
+@app.post("/shares")
+async def create_share(
+    payload: ShareCreate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a share of a file / folder / whole Standard vault. Fail-closed:
+    a temporary session cannot create; sharing must be on; the creator must be able to READ the item;
+    zero-knowledge and password-protected vaults are refused; the tag must be active and permit the
+    creator (its create-allowlist); the audience must be one the tag allows; limit overrides are honored
+    only within the tag caps. The tag's limits are snapshotted; a bearer link token is minted, stored
+    HASHED, and returned ONCE."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="A temporary session cannot create shares.")
+    if not _sharing_enabled(db):
+        raise HTTPException(status_code=403, detail="Sharing is disabled on this deployment.")
+
+    vault = db.query(Vault).filter(Vault.id == payload.vault_id, Vault.is_active.is_(True)).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="Vault not found.")
+    if not PermissionService(db).can_access_vault(current_user, vault.id, VaultPermissionEnum.READ):
+        raise HTTPException(status_code=403, detail="You do not have access to this vault.")
+    if getattr(vault, "type", "standard") == "zero_knowledge":
+        raise HTTPException(status_code=400,
+                            detail="Zero-knowledge vaults can't be shared — add the person as a member instead.")
+    if vault.password_hash:
+        raise HTTPException(status_code=400,
+                            detail="Password-protected vaults can't be shared yet — remove the vault password or add the person as a member.")
+
+    tag = db.query(ShareTag).filter(ShareTag.id == payload.tag_id).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Share tag not found.")
+    if not tag.is_active:
+        raise HTTPException(status_code=400, detail="That share tag is inactive.")
+    allowlist = {
+        "is_active": tag.is_active, "blocked_user_ids": tag.blocked_user_ids,
+        "allowed_user_ids": tag.allowed_user_ids, "allowed_department_ids": tag.allowed_department_ids,
+        "auto_enroll_new_users": tag.auto_enroll_new_users,
+    }
+    if not sharing_policy.user_can_create_with_tag(allowlist, current_user.id, _user_group_ids(db, current_user.id)):
+        raise HTTPException(status_code=403, detail="You are not allowed to create shares with this tag.")
+
+    # --- Target must be a real item in THIS vault ---
+    tt = payload.target_type
+    tf_folder = tf_file = None
+    if tt == "vault":
+        if payload.target_folder_id or payload.target_file_id:
+            raise HTTPException(status_code=400, detail="A whole-vault share takes no folder/file target.")
+    elif tt == "folder":
+        if not payload.target_folder_id:
+            raise HTTPException(status_code=400, detail="A folder share requires target_folder_id.")
+        if payload.target_file_id:
+            raise HTTPException(status_code=400, detail="A folder share takes no file target.")
+        folder = db.query(Folder).filter(Folder.id == payload.target_folder_id, Folder.vault_id == vault.id).first()
+        if not folder:
+            raise HTTPException(status_code=404, detail="Folder not found in this vault.")
+        # A folder may carry its own password_hash; refuse to share such a folder (defense-in-depth, for
+        # the same reason a password-protected vault is refused).
+        if folder.password_hash:
+            raise HTTPException(status_code=400,
+                                detail="Password-protected folders can't be shared — remove the folder password or add the person as a member.")
+        tf_folder = folder.id
+    else:  # file
+        if not payload.target_file_id:
+            raise HTTPException(status_code=400, detail="A file share requires target_file_id.")
+        if payload.target_folder_id:
+            raise HTTPException(status_code=400, detail="A file share takes no folder target.")
+        f = db.query(File).filter(File.id == payload.target_file_id, File.vault_id == vault.id).first()
+        if not f:
+            raise HTTPException(status_code=404, detail="File not found in this vault.")
+        if f.password_hash:
+            raise HTTPException(status_code=400,
+                                detail="Password-protected files can't be shared — remove the file password or add the person as a member.")
+        tf_file = f.id
+
+    # --- Audience within the tag's allowed audiences ---
+    if payload.claim_audience not in sharing_policy.normalize_audiences(tag.allowed_audiences):
+        raise HTTPException(status_code=400, detail=f"This tag does not allow the '{payload.claim_audience}' audience.")
+    aud_users = [str(x) for x in (payload.audience_user_ids or [])]
+    aud_depts = [str(x) for x in (payload.audience_department_ids or [])]
+    if payload.claim_audience == "users":
+        if not aud_users:
+            raise HTTPException(status_code=400, detail="Select at least one user for a user-audience share.")
+        _validate_ids_exist(db, User, aud_users, "audience_user_ids")
+        _validate_share_audience_users(db, current_user, aud_users)
+        aud_depts = []
+    elif payload.claim_audience == "departments":
+        if not aud_depts:
+            raise HTTPException(status_code=400, detail="Select at least one department for a department-audience share.")
+        _validate_ids_exist(db, Group, aud_depts, "audience_department_ids")
+        aud_users = []
+    else:  # anyone_internal — bounded by the link token + limits, never anonymous
+        aud_users = aud_depts = []
+
+    # --- Limits within the tag caps (honoring allow_custom), then snapshot ---
+    tag_limits = {
+        "max_lifetime_minutes": tag.max_lifetime_minutes, "default_lifetime_minutes": tag.default_lifetime_minutes,
+        "max_recipients_cap": tag.max_recipients_cap, "max_recipients_default": tag.max_recipients_default,
+        "max_downloads_cap": tag.max_downloads_cap, "max_downloads_default": tag.max_downloads_default,
+        "allow_view_only": tag.allow_view_only, "default_view_only": tag.default_view_only,
+        "force_view_only": tag.force_view_only, "allow_custom": tag.allow_custom,
+    }
+    limits, err = sharing_policy.resolve_share_limits(tag_limits, {
+        "lifetime_minutes": payload.lifetime_minutes, "max_recipients": payload.max_recipients,
+        "max_downloads": payload.max_downloads, "view_only": payload.view_only,
+    })
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    try:
+        expires_at = datetime.utcnow() + timedelta(minutes=limits["lifetime_minutes"])
+    except OverflowError:  # an absurd admin-set tag ceiling; the creator can't reach this
+        raise HTTPException(status_code=400, detail="The share lifetime is too large.")
+
+    # --- Bearer link token: minted, stored HASHED, returned once ---
+    link_token = link_token_hash = None
+    if payload.with_link:
+        import secrets as _secrets
+        import hashlib as _hashlib
+        link_token = _secrets.token_urlsafe(32)   # high-entropy bearer secret
+        link_token_hash = _hashlib.sha256(link_token.encode()).hexdigest()  # only the hash is stored
+
+    snapshot = dict(sharing_policy.tag_effective_limits(tag_limits))
+    snapshot.update({"allow_view_only": tag.allow_view_only, "default_view_only": tag.default_view_only,
+                     "force_view_only": tag.force_view_only, "allow_custom": tag.allow_custom,
+                     "tag_name": tag.name})
+    share = Share(
+        creator_id=current_user.id, vault_id=vault.id, tag_id=tag.id,
+        target_type=tt, target_folder_id=tf_folder, target_file_id=tf_file,
+        link_token_hash=link_token_hash, claim_audience=payload.claim_audience,
+        audience_user_ids=aud_users, audience_department_ids=aud_depts,
+        expires_at=expires_at, max_recipients=limits["max_recipients"], max_downloads=limits["max_downloads"],
+        view_only=limits["view_only"], tag_policy_snapshot=snapshot, status="active",
+    )
+    db.add(share)
+    db.commit()
+    db.refresh(share)
+    try:
+        AuditLogger(db).log_action(
+            action="share_created", status="success", user=current_user, ip_address=get_client_ip(request),
+            details={"share_id": str(share.id), "vault_id": str(vault.id), "target_type": tt,
+                     "tag_id": str(tag.id), "claim_audience": payload.claim_audience, "view_only": limits["view_only"]})
+    except Exception:
+        pass  # never fail the create on an audit-write error
+    out = _share_dict(db, share)
+    out["link_token"] = link_token  # SHOW ONCE — only the hash is stored; this is never returned again
+    return out
+
+
+@app.get("/shares")
+async def list_my_shares(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The current user's own shares ('Shared by me'). Never returns the link token (shown once at
+    create). A temp session owns no shares."""
+    if getattr(current_user, "_is_temp_session", False):
+        return []
+    shares = db.query(Share).filter(Share.creator_id == current_user.id).order_by(Share.created_at.desc()).all()
+    # One GROUP BY for all the creator's shares instead of a COUNT per row.
+    from sqlalchemy import func as _func
+    ids = [s.id for s in shares]
+    counts = {}
+    if ids:
+        rows = db.query(ShareClaim.share_id, _func.count(ShareClaim.id)).filter(
+            ShareClaim.share_id.in_(ids), ShareClaim.revoked.is_(False)).group_by(ShareClaim.share_id).all()
+        counts = {str(sid): c for sid, c in rows}
+    return [_share_dict(db, s, claim_counts=counts) for s in shares]
+
+
+def _load_manageable_share(db: Session, share_id, current_user: User) -> Share:
+    """Fetch a share the caller may MANAGE (revoke / kick): the creator or a global admin. A temp
+    session can never manage a share. Raises the mapped HTTPException on any failure (fail-closed)."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="A temporary session cannot manage shares.")
+    share = db.query(Share).filter(Share.id == share_id).first()
+    if not share:
+        raise HTTPException(status_code=404, detail="Share not found.")
+    if share.creator_id != current_user.id and current_user.role != RoleEnum.ADMIN:
+        raise HTTPException(status_code=403, detail="Only the share's creator or an admin can manage it.")
+    return share
+
+
+@app.post("/shares/{share_id}/revoke")
+async def revoke_share(
+    share_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Revoke a whole share (creator or admin). Sets status='revoked'; every claimant loses access at
+    the vault chokepoint on their next request (evaluated LIVE — there is no session to expire).
+    Idempotent: revoking an already-revoked share is a no-op success."""
+    share = _load_manageable_share(db, share_id, current_user)
+    if share.status != "revoked":
+        share.status = "revoked"
+        share.revoked_at = datetime.utcnow()
+        share.revoked_by = current_user.id
+        db.commit()
+        try:
+            AuditLogger(db).log_action(
+                action="share_revoked", status="success", user=current_user,
+                ip_address=get_client_ip(request),
+                details={"share_id": str(share.id), "vault_id": str(share.vault_id)})
+        except Exception:
+            db.rollback()
+    return _share_dict(db, share)
+
+
+@app.post("/shares/{share_id}/claims/{user_id}/revoke")
+async def revoke_share_claim(
+    share_id: uuid.UUID,
+    user_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Kick a single recipient from a share (creator or admin) without revoking it for everyone. Sets
+    that recipient's ShareClaim.revoked=True; they lose access LIVE at the chokepoint, other claimants
+    keep theirs. Idempotent for an already-kicked recipient; 404 if that user never claimed."""
+    share = _load_manageable_share(db, share_id, current_user)
+    claim = db.query(ShareClaim).filter(
+        ShareClaim.share_id == share.id, ShareClaim.user_id == user_id).first()
+    if not claim:
+        raise HTTPException(status_code=404, detail="That recipient has not claimed this share.")
+    if not claim.revoked:
+        claim.revoked = True
+        db.commit()
+        try:
+            target = db.query(User).filter(User.id == user_id).first()
+            AuditLogger(db).log_permission_revoked(
+                target_user_id=user_id, target_username=(target.username if target else "?"),
+                permission=f"share:{share.id}", revoked_by=current_user, ip_address=get_client_ip(request))
+        except Exception:
+            db.rollback()
+    return {"share_id": str(share.id), "user_id": str(user_id), "revoked": True}
+
+
+@app.get("/shares/{share_id}/claims")
+async def list_share_claims(
+    share_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The recipients who have claimed a share, for the creator's (or an admin's) management view —
+    so they can see usage and kick a specific recipient. Creator/admin only (via _load_manageable_share,
+    which also blocks temp sessions). Returns per-recipient id/username + download usage + revoked flag;
+    no tokens."""
+    share = _load_manageable_share(db, share_id, current_user)
+    rows = (
+        db.query(ShareClaim, User.username)
+        .join(User, User.id == ShareClaim.user_id)
+        .filter(ShareClaim.share_id == share.id)
+        .order_by(ShareClaim.claimed_at.asc())
+        .all()
+    )
+    return [{
+        "user_id": str(c.user_id),
+        "username": username,
+        "download_count": c.download_count,
+        "revoked": bool(c.revoked),
+        "claimed_at": c.claimed_at.isoformat() if c.claimed_at else None,
+        "last_access_at": c.last_access_at.isoformat() if c.last_access_at else None,
+    } for c, username in rows]
+
+
+def _share_claim_dict(claim: ShareClaim, share: Share) -> dict:
+    """Recipient-facing view returned to a claimant. Describes WHAT was claimed (so the Shared tab can
+    render a card); it does NOT itself grant access — the claim is authorized at the vault chokepoint on
+    each access. No token, no creator/allowlist internals."""
+    return {
+        "claim_id": str(claim.id),
+        "share_id": str(share.id),
+        "vault_id": str(share.vault_id),
+        "target_type": share.target_type,
+        "target_folder_id": str(share.target_folder_id) if share.target_folder_id else None,
+        "target_file_id": str(share.target_file_id) if share.target_file_id else None,
+        "view_only": share.view_only,
+        "expires_at": share.expires_at.isoformat() if share.expires_at else None,
+        "claimed_at": claim.claimed_at.isoformat() if claim.claimed_at else None,
+    }
+
+
+@app.post("/shares/claim")
+async def claim_share(
+    payload: ShareClaimRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Claim a share by its link token. Fail-closed: a temporary session cannot claim; sharing must be
+    on; the token must resolve to an ACTIVE, non-expired, non-revoked share; the claimant must satisfy
+    the share's claim-audience; and the recipient limit must not be exceeded (an existing non-revoked
+    claim is returned idempotently, a revoked one is denied). Creates a ShareClaim — this does NOT itself
+    grant access to the shared item; the claim is authorized at the vault chokepoint on each access."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="A temporary session cannot claim shares.")
+    if not _sharing_enabled(db):
+        raise HTTPException(status_code=403, detail="Sharing is disabled on this deployment.")
+
+    import hashlib as _hashlib
+    token = (payload.token or "").strip()
+    # 'surrogatepass' so an adversarial lone-surrogate token can't crash encode() (500); the resulting
+    # hash matches no stored token and the request falls through to the clean 404 below.
+    token_hash = _hashlib.sha256(token.encode("utf-8", "surrogatepass")).hexdigest()
+    share = db.query(Share).filter(Share.link_token_hash == token_hash).first()
+    if not share:
+        raise HTTPException(status_code=404, detail="That share link is not valid.")
+    return _claim_resolved_share(db, share, current_user, request)
+
+
+def _claim_resolved_share(db: Session, share: Share, current_user: User, request: Request) -> dict:
+    """Shared claim logic once the share is resolved (by token OR by id): status/expiry, defense-in-depth
+    ZK/password refusal, the claim-audience check, idempotent re-open (revoked denied), the row-locked
+    max_recipients guard, create the ShareClaim, audit. The caller has already checked the temp-session
+    and sharing-enabled gates. Returns the recipient claim dict."""
+    # Audience FIRST — before any status/expiry/vault check — so a caller who holds a share id/token but
+    # is NOT in the audience is denied uniformly and cannot fingerprint the share's lifecycle state
+    # (active vs revoked vs expired vs vault-gone) from the distinct error codes below.
+    if not sharing_policy.user_matches_claim_audience(
+            share.claim_audience, share.audience_user_ids, share.audience_department_ids,
+            current_user.id, _user_group_ids(db, current_user.id)):
+        raise HTTPException(status_code=403, detail="You are not in the audience for this share.")
+    if share.status == "revoked":
+        raise HTTPException(status_code=410, detail="That share has been revoked.")
+    if _share_effective_status(share) == "expired":
+        if share.status == "active":
+            share.status = "expired"  # lazy expiry: flip the stored status for the UI
+            db.commit()
+            # Audit the active->expired transition (ids only, name-redacted). The status=='active' guard
+            # above suppresses re-emit on any later claim of the already-flipped share, so sequential
+            # claims emit once; a rare concurrent claim race could still write a duplicate benign audit
+            # row (the flip is idempotent, so no data impact). Expiry is otherwise lazy (no periodic
+            # sweep), so this claim-time flip is the transition event.
+            try:
+                AuditLogger(db).log_action(
+                    action="share_expired", status="success", user=current_user,
+                    ip_address=get_client_ip(request),
+                    details={"share_id": str(share.id), "vault_id": str(share.vault_id)})
+            except Exception:
+                db.rollback()
+        raise HTTPException(status_code=410, detail="That share has expired.")
+
+    # Defense-in-depth: the vault must still be a shareable Standard, non-password vault (these are refused
+    # at CREATE, but a vault password could be added afterwards — a claim must not open that gate).
+    vault = db.query(Vault).filter(Vault.id == share.vault_id, Vault.is_active.is_(True)).first()
+    if not vault or getattr(vault, "type", "standard") == "zero_knowledge" or vault.password_hash:
+        raise HTTPException(status_code=403, detail="That share is no longer available.")
+
+    existing = db.query(ShareClaim).filter(
+        ShareClaim.share_id == share.id, ShareClaim.user_id == current_user.id).first()
+    if existing:
+        if existing.revoked:
+            raise HTTPException(status_code=403, detail="Your access to this share was revoked.")
+        return _share_claim_dict(existing, share)  # idempotent re-open
+
+    # Serialize the recipient-limit check + insert against the share row, so concurrent claims by
+    # DIFFERENT users cannot over-admit past max_recipients (a plain count-then-insert would race; the
+    # unique (share,user) constraint only guards the same-user race). The lock releases on commit.
+    # Relies on READ COMMITTED (the engine default) so the post-lock count re-reads the committed
+    # winner; REPEATABLE READ would use a stale snapshot and could reintroduce over-admit.
+    locked = db.query(Share).filter(Share.id == share.id).with_for_update().first()
+    if locked is not None and locked.max_recipients is not None:
+        active = db.query(ShareClaim).filter(
+            ShareClaim.share_id == share.id, ShareClaim.revoked.is_(False)).count()
+        if active >= locked.max_recipients:
+            db.rollback()  # release the FOR UPDATE lock
+            raise HTTPException(status_code=409, detail="This share has reached its recipient limit.")
+
+    claim = ShareClaim(share_id=share.id, user_id=current_user.id)
+    db.add(claim)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()  # a concurrent claim by the same user raced the unique (share,user) -> idempotent
+        existing = db.query(ShareClaim).filter(
+            ShareClaim.share_id == share.id, ShareClaim.user_id == current_user.id).first()
+        if existing and not existing.revoked:
+            return _share_claim_dict(existing, share)
+        raise HTTPException(status_code=409, detail="Could not claim this share.")
+    db.refresh(claim)
+    try:
+        AuditLogger(db).log_action(
+            action="share_claimed", status="success", user=current_user, ip_address=get_client_ip(request),
+            details={"share_id": str(share.id), "vault_id": str(share.vault_id)})
+    except Exception:
+        pass
+    return _share_claim_dict(claim, share)
+
+
+@app.post("/shares/{share_id}/claim")
+async def claim_pushed_share(
+    share_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Claim a share you were DIRECTLY pushed to (a named users/departments audience) BY ID, without the
+    link token — the audience check is the gate. anyone_internal shares are link-only (they carry no
+    named recipients), so they must be claimed via POST /shares/claim with the token. Fail-closed: temp
+    session denied; sharing must be on; the audience membership is verified in _claim_resolved_share."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="A temporary session cannot claim shares.")
+    if not _sharing_enabled(db):
+        raise HTTPException(status_code=403, detail="Sharing is disabled on this deployment.")
+    share = db.query(Share).filter(Share.id == share_id).first()
+    if not share:
+        raise HTTPException(status_code=404, detail="Share not found.")
+    if share.claim_audience not in ("users", "departments"):
+        raise HTTPException(status_code=403, detail="This share can only be claimed through its link.")
+    return _claim_resolved_share(db, share, current_user, request)
+
+
+def _shared_with_me_dict(db: Session, claim: ShareClaim, share: Share) -> dict:
+    """Recipient-facing card for the 'Shared with me' tab. Describes the shared item (vault name +
+    target kind/name) + the effective status so an expired/revoked card can show its reason, and the
+    recipient's own download usage. NEVER includes the link token or any creator/allowlist internals.
+    Standard vaults only, so the target name is server-visible plaintext the recipient may already
+    list."""
+    if claim.revoked or share.status == "revoked":
+        st = "revoked"
+    elif _share_effective_status(share) == "expired":
+        st = "expired"
+    else:
+        st = "active"
+    # A recipient who has LOST access (revoked/expired) must not learn the item's CURRENT name — that
+    # would be a live, post-access rename oracle. Resolve names ONLY for an active claim; an inactive
+    # card shows just the kind + the reason.
+    vault_name = target_name = None
+    if st == "active":
+        vault = db.query(Vault).filter(Vault.id == share.vault_id).first()
+        vault_name = vault.name if vault else None
+        if share.target_type == "folder" and share.target_folder_id:
+            f = db.query(Folder).filter(Folder.id == share.target_folder_id).first()
+            target_name = f.name if f else None
+        elif share.target_type == "file" and share.target_file_id:
+            x = db.query(File).filter(File.id == share.target_file_id).first()
+            target_name = x.original_name if x else None
+    return {
+        "claim_id": str(claim.id),
+        "share_id": str(share.id),
+        "vault_id": str(share.vault_id),
+        "vault_name": vault_name,
+        "target_type": share.target_type,
+        "target_folder_id": str(share.target_folder_id) if share.target_folder_id else None,
+        "target_file_id": str(share.target_file_id) if share.target_file_id else None,
+        "target_name": target_name,
+        "view_only": share.view_only,
+        "status": st,
+        "expires_at": share.expires_at.isoformat() if share.expires_at else None,
+        "max_downloads": share.max_downloads,
+        "download_count": claim.download_count,
+        "claimed_at": claim.claimed_at.isoformat() if claim.claimed_at else None,
+    }
+
+
+def _shared_available_dict(db: Session, share: Share) -> Optional[dict]:
+    """A DIRECT-PUSH share addressed to the current user (named users/departments audience) that they
+    have NOT claimed yet — an 'available' card they can claim in one click. Returns None if the vault is
+    no longer shareable (deleted / zero-knowledge / password-protected), so a stale push isn't offered."""
+    vault = db.query(Vault).filter(Vault.id == share.vault_id, Vault.is_active.is_(True)).first()
+    if not vault or getattr(vault, "type", "standard") == "zero_knowledge" or vault.password_hash:
+        return None
+    # A share whose recipient cap is already full can never be claimed by a new recipient — don't offer
+    # a dead-end 'Claim' card (the claim would just 409). First-come-first-served among the pushed set.
+    if share.max_recipients is not None:
+        active = db.query(ShareClaim).filter(
+            ShareClaim.share_id == share.id, ShareClaim.revoked.is_(False)).count()
+        if active >= share.max_recipients:
+            return None
+    target_name = None
+    if share.target_type == "folder" and share.target_folder_id:
+        f = db.query(Folder).filter(Folder.id == share.target_folder_id).first()
+        target_name = f.name if f else None
+    elif share.target_type == "file" and share.target_file_id:
+        x = db.query(File).filter(File.id == share.target_file_id).first()
+        target_name = x.original_name if x else None
+    return {
+        "claim_id": None,
+        "share_id": str(share.id),
+        "vault_id": str(share.vault_id),
+        "vault_name": vault.name,
+        "target_type": share.target_type,
+        "target_folder_id": str(share.target_folder_id) if share.target_folder_id else None,
+        "target_file_id": str(share.target_file_id) if share.target_file_id else None,
+        "target_name": target_name,
+        "view_only": share.view_only,
+        "status": "available",   # pushed to you; claim to access
+        "expires_at": share.expires_at.isoformat() if share.expires_at else None,
+        "max_downloads": share.max_downloads,
+        "download_count": 0,
+        "claimed_at": None,
+    }
+
+
+@app.get("/shares/shared-with-me")
+async def list_shared_with_me(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The current user's 'Shared with me' tab: shares they have CLAIMED (active/expired/revoked, so the
+    UI can show a reason) PLUS shares they were directly pushed (named users/departments audience) but
+    have not claimed yet ('available'). NEVER a token. A temp session owns nothing."""
+    if getattr(current_user, "_is_temp_session", False):
+        return []
+    rows = (
+        db.query(ShareClaim, Share)
+        .join(Share, Share.id == ShareClaim.share_id)
+        .filter(ShareClaim.user_id == current_user.id)
+        .order_by(ShareClaim.claimed_at.desc())
+        .all()
+    )
+    out = [_shared_with_me_dict(db, claim, share) for claim, share in rows]
+
+    # Direct push: active named-audience shares addressed to this user that they haven't claimed appear
+    # as 'available' cards. Narrowed SERVER-SIDE via JSONB @> containment (GIN-indexed) so we fetch only
+    # the shares addressed to THIS user, instead of scanning every active named-audience share in the
+    # deployment. The Python user_matches_claim_audience check below stays as the authoritative filter.
+    from sqlalchemy import or_, and_
+    claimed_ids = {r[1].id for r in rows}
+    now = datetime.utcnow()
+    gids = [str(g) for g in _user_group_ids(db, current_user.id)]
+    uid = str(current_user.id)
+    audience_or = [and_(Share.claim_audience == "users", Share.audience_user_ids.contains([uid]))]
+    for g in gids:
+        audience_or.append(and_(Share.claim_audience == "departments",
+                                Share.audience_department_ids.contains([g])))
+    pushed = (
+        db.query(Share)
+        .filter(Share.status == "active", Share.expires_at > now, or_(*audience_or))
+        .order_by(Share.created_at.desc())
+        .all()
+    )
+    for share in pushed:
+        if share.id in claimed_ids:
+            continue
+        if sharing_policy.user_matches_claim_audience(
+                share.claim_audience, share.audience_user_ids, share.audience_department_ids,
+                current_user.id, gids):
+            d = _shared_available_dict(db, share)
+            if d is not None:
+                out.append(d)
+    return out
+
+
 @app.post("/groups/{group_id}/members")
 async def add_group_members(
     group_id: uuid.UUID,
@@ -4789,7 +5824,10 @@ async def list_vaults(
         vault_dict = {
             'id': vault.id,
             'name': vault.name,
-            'description': vault.description,
+            # An id-scoped (file/folder share or scoped temp-cred) caller sees only their subtree; the
+            # owner-authored vault description may reference items outside that scope, so mask it too
+            # (same rationale as suppressing the whole-vault aggregates).
+            'description': None if _id_scoped else vault.description,
             'owner_id': vault.owner_id,
             'has_password': vault.password_hash is not None,
             'expire_files_after_days': vault.expire_files_after_days,
@@ -4817,6 +5855,7 @@ async def list_vaults(
 @require_vault_cap("vault.see_info")
 async def get_vault(
     vault_id: uuid.UUID,
+    request: Request,
     x_vault_password: Optional[str] = Header(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -4831,8 +5870,10 @@ async def get_vault(
 
     try:
         # require_password=False means we're just viewing metadata; a supplied X-Vault-Password is
-        # soft-verified (and rate-limited) inside get_vault.
-        vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=False)
+        # soft-verified (and rate-limited) inside get_vault. allow_share=True: a recipient with an
+        # active whole-vault share claim may open the vault (read-only). SFTP never passes this.
+        vault = vault_service.get_vault(vault_id, current_user, x_vault_password,
+                                        require_password=False, allow_share=True)
 
         # Get owner username
         owner = db.query(User).filter(User.id == vault.owner_id).first()
@@ -4844,11 +5885,33 @@ async def get_vault(
         _id_scoped = _scope_ids(current_user, vault_id) is not None
         _fnr = _force_no_remember_vault_password(db)
 
+        # Effective permission for this caller. If they have no owner/member/group access but DID open
+        # the vault, it was via an active share claim: reflect read-only in my_permission and audit the
+        # open ONCE here (not on the polled file-list). base_perms is None only for a share-only caller.
+        base_perms = permission_service.get_vault_permissions(current_user, vault.id)
+        if base_perms is None:
+            share_perms = permission_service.get_vault_permissions(current_user, vault.id, allow_share=True)
+            if share_perms is not None:
+                base_perms = share_perms
+                try:
+                    AuditLogger(db).log_action(
+                        action="share_opened", status="success", user=current_user,
+                        ip_address=get_client_ip(request), details={"vault_id": str(vault.id)})
+                except Exception:
+                    # A failed audit commit leaves the session in a pending-rollback state; roll it
+                    # back so the same-request reads below (e.g. _is_vault_favorite) don't raise
+                    # PendingRollbackError and turn an authorized open into a 500. Losing the audit
+                    # row is acceptable; failing the open is not.
+                    db.rollback()
+
         # Build response dict with has_password and owner_username
         vault_dict = {
             'id': vault.id,
             'name': vault.name,
-            'description': vault.description,
+            # An id-scoped (file/folder share or scoped temp-cred) caller sees only their subtree; the
+            # owner-authored vault description may reference items outside that scope, so mask it too
+            # (same rationale as suppressing the whole-vault aggregates).
+            'description': None if _id_scoped else vault.description,
             'owner_id': vault.owner_id,
             'owner_username': owner_username,
             'has_password': vault.password_hash is not None,
@@ -4863,8 +5926,7 @@ async def get_vault(
             'last_accessed': vault.last_accessed,
             'is_active': vault.is_active,
             'type': vault.type,
-            'my_permission': _effective_vault_permission(
-                vault, permission_service.get_vault_permissions(current_user, vault.id), current_user),
+            'my_permission': _effective_vault_permission(vault, base_perms, current_user),
             'is_favorite': _is_vault_favorite(db, current_user.id, vault.id)
         }
         return VaultResponse(**vault_dict)
@@ -5935,9 +6997,12 @@ async def list_vault_files(
     vault_service = VaultService(db, permission_service)
     
     try:
-        # Verify vault access and password (require_password=True for file access)
-        vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
-        
+        # Verify vault access and password (require_password=True for file access).
+        # allow_share=True: a recipient with an active whole-vault share claim may list
+        # the vault's contents (read-only). SFTP listing never passes this flag.
+        vault = vault_service.get_vault(vault_id, current_user, x_vault_password,
+                                        require_password=True, allow_share=True)
+
         # Parse folder_id if provided
         folder_uuid = uuid.UUID(folder_id) if folder_id else None
         
@@ -7594,10 +8659,15 @@ async def download_file(
     audit_logger = AuditLogger(db)
     
     try:
-        # Verify vault access and password
-        vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+        # Verify vault access and password. allow_share=True: a recipient with an active
+        # whole-vault share claim may open + download from the vault (read-only). SFTP
+        # downloads never pass this flag.
+        vault = vault_service.get_vault(vault_id, current_user, x_vault_password,
+                                        require_password=True, allow_share=True)
         # A path-scoped temp credential may only download a file within its file/folder scope.
         require_file_scope(db, current_user, vault_id, file_id)
+        # A view-only share recipient may see the file but not download it (denied here).
+        require_download_scope(db, current_user, vault_id, file_id)
 
         # Create operation ID for tracking downloads
         operation_id = f"download_{uuid.uuid4()}"
@@ -7617,12 +8687,26 @@ async def download_file(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="File not found"
                 )
-            
-            # Download file
+
+            # Per-recipient max_downloads: consume one download against the covering share claim(s)
+            # BEFORE serving the bytes (an atomic conditional burn, so concurrent GETs can't exceed
+            # the cap). Only for a share recipient (stamped a share scope on this vault by get_vault);
+            # a no-op for owners/members/temp creds and for unlimited shares.
+            if str(vault_id) in (getattr(current_user, '_share_vault_scope', None) or {}):
+                if not permission_service.burn_share_download(
+                        current_user, vault, file_record,
+                        folder_ancestry(db, vault_id, file_record.folder_id)):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="This share has reached its download limit.")
+
+            # Download file. allow_share=True so a whole-vault share claimant (read-only)
+            # can download; SFTP downloads keep the default (False).
             file_content, file_name, mime_type = vault_service.download_file(
                 file_id=file_id,
                 user=current_user,
-                file_password=file_password
+                file_password=file_password,
+                allow_share=True,
             )
 
             # Zero-knowledge: the name is the client's secret. For a SEALED ZK file it's already
@@ -7644,6 +8728,17 @@ async def download_file(
                 details={'vault_id': str(vault_id), 'file_name': audit_name},
                 ip_address=get_client_ip(request)
             )
+
+            # If this download came via a share claim (the recipient was stamped a share scope on this
+            # vault by get_vault; owners/members are not), record a distinct share_downloaded event.
+            if str(vault_id) in (getattr(current_user, '_share_vault_scope', None) or {}):
+                try:
+                    audit_logger.log_action(
+                        action='share_downloaded', status='success', user=current_user,
+                        resource_type='file', resource_id=str(file_id),
+                        details={'vault_id': str(vault_id)}, ip_address=get_client_ip(request))
+                except Exception:
+                    db.rollback()
 
             # Broadcast event to monitoring WebSocket clients
             broadcast_event({
@@ -9112,6 +10207,30 @@ def _run_lightweight_migrations():
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS enc_name TEXT",
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS name_bi VARCHAR(64)",
             "CREATE INDEX IF NOT EXISTS ix_folders_name_bi ON folders (name_bi)",
+            # Sharing: a tag can FORCE view-only on every share it mints (independent of allow_custom).
+            # create_all adds the column on a fresh DB; this backfills it on a vault that already ran an
+            # earlier sharing build. Idempotent + additive.
+            "ALTER TABLE share_tags ADD COLUMN IF NOT EXISTS force_view_only BOOLEAN NOT NULL DEFAULT FALSE",
+            # Sharing: the Share audience id-arrays are queried with JSONB @> containment so the
+            # "shared with me" scan filters server-side + is GIN-indexed (was an unbounded Python scan).
+            # Convert JSON->JSONB only if still json (idempotent; avoids a table rewrite every startup),
+            # then add the GIN indexes. create_all makes them JSONB + GIN on a fresh DB.
+            """DO $$ BEGIN
+                   IF EXISTS (SELECT 1 FROM information_schema.columns
+                              WHERE table_name='shares' AND column_name='audience_user_ids'
+                                AND data_type='json') THEN
+                       ALTER TABLE shares ALTER COLUMN audience_user_ids TYPE JSONB
+                           USING audience_user_ids::jsonb;
+                   END IF;
+                   IF EXISTS (SELECT 1 FROM information_schema.columns
+                              WHERE table_name='shares' AND column_name='audience_department_ids'
+                                AND data_type='json') THEN
+                       ALTER TABLE shares ALTER COLUMN audience_department_ids TYPE JSONB
+                           USING audience_department_ids::jsonb;
+                   END IF;
+               END $$;""",
+            "CREATE INDEX IF NOT EXISTS idx_share_aud_users ON shares USING GIN (audience_user_ids)",
+            "CREATE INDEX IF NOT EXISTS idx_share_aud_depts ON shares USING GIN (audience_department_ids)",
             "ALTER TABLE folders ALTER COLUMN name DROP NOT NULL",
             # Zero-knowledge DEK rotation (forward-only versioning). dek_version is the
             # vault's current ZK DEK epoch; backfills every existing vault to 1, matching

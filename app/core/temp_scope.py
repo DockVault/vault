@@ -256,15 +256,36 @@ def require_cap(user, vault_id, cap: str) -> None:
 
 
 def scope_ids(user, vault_id):
-    """The ID-based per-file/folder restriction this scoped credential holds on `vault_id`: a
-    {"files": [...], "folders": [...]} dict, or None = the WHOLE vault (the default). Returns None
-    for a non-scoped principal and for mode 'all' (which is inherently whole-vault). Used to RESTRICT
-    a scoped session only — never to grant more than it has."""
-    if not is_scoped(user):
-        return None
-    if getattr(user, "_temp_vault_mode", "selected") == "all":
-        return None
-    return (getattr(user, "_temp_vault_scope", {}) or {}).get(str(vault_id))
+    """The ID-based per-file/folder restriction in effect for this principal on `vault_id`: a
+    {"files": [...], "folders": [...]} dict, or None = the WHOLE vault (no id restriction, the
+    default). Honors EITHER a temp-credential scope OR a share-claim scope (mutually exclusive: a
+    share recipient is a real account, never a temp session). Returns None for a non-scoped principal
+    and for temp mode 'all' (inherently whole-vault). Used to RESTRICT a scoped principal only —
+    never to grant more than it has."""
+    # Temp-credential path.
+    if is_scoped(user):
+        if getattr(user, "_temp_vault_mode", "selected") == "all":
+            return None
+        return (getattr(user, "_temp_vault_scope", {}) or {}).get(str(vault_id))
+    # Share-claim path: a real account stamped with its per-vault share subtree (None = whole-vault
+    # share, a {"files","folders"} dict = a file/folder share). None here for a plain owner/member.
+    smap = getattr(user, "_share_vault_scope", None)
+    if smap is not None:
+        return smap.get(str(vault_id))
+    return None
+
+
+def download_scope_ids(user, vault_id):
+    """The DOWNLOADABLE-file id-scope for a SHARE recipient on `vault_id`: the subtree they may
+    DOWNLOAD from (view-only claims contribute to the VISIBLE scope_ids but NOT here). A
+    {"files","folders"} dict restricts; None = no sharing download restriction (a non-share
+    principal, or a recipient holding a downloadable whole-vault share). Distinct from scope_ids so a
+    view-only recipient can see/list (scope_ids) yet be denied download (this). Stamped by
+    PermissionService.stamp_share_scope; used ONLY to RESTRICT, never to grant."""
+    smap = getattr(user, "_share_download_scope", None)
+    if smap is not None:
+        return smap.get(str(vault_id))
+    return None
 
 
 def require_scope(user, vault_id, target_id, ancestor_folder_ids, kind: str = "read") -> None:
@@ -274,14 +295,13 @@ def require_scope(user, vault_id, target_id, ancestor_folder_ids, kind: str = "r
     `target_id` is the file/folder being acted on; `ancestor_folder_ids` is its containing-folder
     chain toward the vault root (from app/services/vault_service.folder_ancestry). `kind`
     ('read'/'write') is informational — both use the same membership check. Fails CLOSED: an
-    unresolved target (empty ancestry that matches nothing) is denied."""
-    if not is_scoped(user):
-        return
+    unresolved target (empty ancestry that matches nothing) is denied. Honors a temp-credential OR a
+    share-claim scope (scope_ids returns whichever applies; None for a non-scoped principal)."""
     scope = scope_ids(user, vault_id)
     if scope is None:
-        return  # whole-vault grant (default) — no per-file limit
+        return  # non-scoped principal OR a whole-vault grant — no per-file limit
     if not id_in_scope(scope, target_id, ancestor_folder_ids):
-        raise PermissionDeniedError("Temporary credential scope does not permit this file or folder")
+        raise PermissionDeniedError("Scope does not permit this file or folder")
 
 
 def require_create_vault_type(user, vault_type: str) -> None:

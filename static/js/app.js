@@ -1349,6 +1349,533 @@ function renderVaults() {
     });
 }
 
+// ---- Shared with me (recipient tab) ----
+// Built with DOM APIs (no innerHTML) so all recipient/creator-controlled strings go through
+// textContent and can never inject markup.
+const _SVGNS = 'http://www.w3.org/2000/svg';
+function _svgIcon(name, cls) {
+    const svg = document.createElementNS(_SVGNS, 'svg');
+    svg.setAttribute('class', 'icon' + (cls ? ' ' + cls : ''));
+    const use = document.createElementNS(_SVGNS, 'use');
+    use.setAttribute('href', '#i-' + name);
+    svg.appendChild(use);
+    return svg;
+}
+function _el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+}
+
+async function loadShared() {
+    setupSharedTabsOnce();
+    switchSharedTab('with-me');  // entering the section always lands on "Shared with me"
+    const container = document.getElementById('shared-list');
+    if (container) container.replaceChildren(_el('div', 'spinner'));
+    wireClaimLinkBox();
+    try {
+        state.sharedWithMe = await apiRequest('/shares/shared-with-me');
+        renderShared();
+    } catch (error) {
+        if (container) container.replaceChildren(_el('div', 'alert alert-error', 'Failed to load shared items: ' + (error.message || '')));
+    }
+}
+
+// Wire the claim-a-link box once (the section markup is static, so guard against re-binding).
+function wireClaimLinkBox() {
+    const btn = document.getElementById('claim-link-btn');
+    const input = document.getElementById('claim-link-input');
+    if (!btn || !input || btn.dataset.wired) return;
+    btn.dataset.wired = '1';
+    const submit = () => claimShareLink(input.value);
+    btn.addEventListener('click', submit);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+}
+
+// A share link may be a full URL (…?token=XYZ or …/something/XYZ) or a bare token; pull out the token.
+function extractShareToken(raw) {
+    const v = (raw || '').trim();
+    if (!v) return '';
+    const m = v.match(/[?&]token=([^&\s]+)/);
+    // decodeURIComponent throws URIError on a malformed percent sequence (e.g. "%zz"); fall back to
+    // the raw match so a mangled paste still produces a token attempt (that then fails cleanly).
+    if (m) { try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; } }
+    if (v.includes('/')) { const parts = v.split(/[/?#]/).filter(Boolean); return parts[parts.length - 1] || v; }
+    return v;
+}
+
+async function claimShareLink(raw) {
+    const btn = document.getElementById('claim-link-btn');
+    if (btn && btn.disabled) return;  // a claim is already in flight (guards the Enter-key path too)
+    const token = extractShareToken(raw);
+    if (!token) { showToast('Paste a share link or token first', 'error'); return; }
+    if (btn) btn.disabled = true;
+    try {
+        await apiRequest('/shares/claim', { method: 'POST', body: JSON.stringify({ token }) });
+        showToast('Share claimed', 'success');
+        const input = document.getElementById('claim-link-input');
+        if (input) input.value = '';
+        await loadShared();
+    } catch (error) {
+        showToast(error.message || 'Could not claim that link', 'error');
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+function _sharedKindLabel(t) { return t === 'vault' ? 'Vault' : (t === 'folder' ? 'Folder' : 'File'); }
+
+function _sharedCard(it) {
+    const active = it.status === 'active';
+    const title = it.target_type === 'vault' ? (it.vault_name || 'Shared vault') : (it.target_name || _sharedKindLabel(it.target_type));
+    const tileIcon = it.target_type === 'file' ? 'file' : (it.target_type === 'folder' ? 'folder' : 'vault');
+
+    const card = _el('div', 'card card-interactive vault-card');
+    card.setAttribute('data-share-id', it.share_id);
+    const body = _el('div', 'vault-card-body');
+
+    const tile = _el('div', 'vault-tile');
+    tile.appendChild(_svgIcon(tileIcon));
+    body.appendChild(tile);
+
+    const main = _el('div', 'vault-card-main');
+    const h = _el('h3', 'vault-name', title);
+    if (it.status === 'available') {
+        h.appendChild(document.createTextNode(' '));
+        h.appendChild(_el('span', 'badge badge-info', 'Available'));
+    } else if (it.status === 'expired' || it.status === 'revoked') {
+        h.appendChild(document.createTextNode(' '));
+        h.appendChild(_el('span', it.status === 'expired' ? 'badge badge-warning' : 'badge badge-error',
+                          it.status === 'expired' ? 'Expired' : 'Revoked'));
+    }
+    main.appendChild(h);
+    main.appendChild(_el('p', 'vault-desc', it.target_type === 'vault'
+        ? 'Whole vault' : (_sharedKindLabel(it.target_type) + ' in ' + (it.vault_name || 'a vault'))));
+
+    const meta = _el('div', 'vault-meta');
+    if (it.view_only) {
+        const s = _el('span'); s.appendChild(_svgIcon('eye', 'icon-sm')); s.appendChild(document.createTextNode(' View only'));
+        meta.appendChild(s);
+    }
+    if (it.max_downloads != null) {
+        const s = _el('span'); s.appendChild(_svgIcon('download', 'icon-sm'));
+        s.appendChild(document.createTextNode(' ' + it.download_count + '/' + it.max_downloads + ' downloads'));
+        meta.appendChild(s);
+    }
+    if (it.status === 'available') meta.appendChild(_el('span', 'text-secondary', 'Shared with you — claim to open'));
+    else if (!active) meta.appendChild(_el('span', 'text-secondary', 'Access ' + it.status));
+    main.appendChild(meta);
+    body.appendChild(main);
+
+    if (active) {
+        const openBtn = _el('button', 'open-shared-btn btn btn-primary btn-sm', 'Open');
+        openBtn.addEventListener('click', (e) => { e.stopPropagation(); openSharedItem(it.vault_id, it.target_folder_id || ''); });
+        body.appendChild(openBtn);
+    } else if (it.status === 'available') {
+        const claimBtn = _el('button', 'btn btn-primary btn-sm', 'Claim');
+        claimBtn.addEventListener('click', (e) => { e.stopPropagation(); claimPushedShare(it.share_id); });
+        body.appendChild(claimBtn);
+    }
+    card.appendChild(body);
+    return card;
+}
+
+// Claim a share you were directly pushed (a named users/departments audience) — by id, no link needed.
+async function claimPushedShare(shareId) {
+    try {
+        await apiRequest('/shares/' + shareId + '/claim', { method: 'POST' });
+        showToast('Share claimed', 'success');
+        await loadShared();
+    } catch (e) { showToast(e.message || 'Could not claim this share', 'error'); }
+}
+
+function renderShared() {
+    const container = document.getElementById('shared-list');
+    if (!container) return;
+    const items = state.sharedWithMe || [];
+    if (items.length === 0) {
+        const wrap = _el('div', 'empty-state-center p-xl');
+        const icon = _el('div'); icon.style.fontSize = '3rem'; icon.style.marginBottom = 'var(--space-md)';
+        icon.appendChild(_svgIcon('link', 'icon-lg'));
+        wrap.appendChild(icon);
+        wrap.appendChild(_el('h3', 'text-xl font-bold mb-xs', 'Nothing shared with you yet'));
+        wrap.appendChild(_el('p', 'text-secondary', 'Paste a share link above to claim access to a shared file, folder, or vault.'));
+        container.replaceChildren(wrap);
+        return;
+    }
+    container.replaceChildren(...items.map(_sharedCard));
+}
+
+// Open a shared item: reuse the standard vault browser (the backend scopes the listing to the shared
+// subtree), then drop into the shared folder when the share targets one.
+async function openSharedItem(vaultId, folderId) {
+    await openVault(vaultId);
+    if (folderId) { try { await navigateToFolder(folderId); } catch (e) { /* root listing still shows the path down */ } }
+}
+
+// ---- Shared sub-tabs + "Shared by me" management (creator) ----
+function setupSharedTabsOnce() {
+    const bar = document.querySelector('#shared-section .tabs');
+    if (!bar || bar.dataset.wired) return;
+    bar.dataset.wired = '1';
+    bar.querySelectorAll('.tab-btn[data-shared-tab]').forEach(btn => {
+        btn.addEventListener('click', () => switchSharedTab(btn.getAttribute('data-shared-tab')));
+    });
+}
+
+function switchSharedTab(which) {
+    document.querySelectorAll('#shared-section .tab-btn[data-shared-tab]').forEach(
+        b => b.classList.toggle('active', b.getAttribute('data-shared-tab') === which));
+    const withMe = document.getElementById('shared-tab-with-me');
+    const byMe = document.getElementById('shared-tab-by-me');
+    if (withMe) withMe.style.display = which === 'with-me' ? '' : 'none';
+    if (byMe) byMe.style.display = which === 'by-me' ? '' : 'none';
+    if (which === 'by-me') loadSharedByMe().catch(err => console.error('Failed to load shared-by-me:', err));
+}
+
+async function loadSharedByMe() {
+    const container = document.getElementById('shared-by-me-list');
+    if (container) container.replaceChildren(_el('div', 'spinner'));
+    try {
+        state.sharedByMe = await apiRequest('/shares');
+        renderSharedByMe();
+    } catch (error) {
+        if (container) container.replaceChildren(_el('div', 'alert alert-error', 'Failed to load your shares: ' + (error.message || '')));
+    }
+}
+
+function _byMeStatusBadge(st) {
+    if (st === 'expired') return _el('span', 'badge badge-warning', 'Expired');
+    if (st === 'revoked') return _el('span', 'badge badge-error', 'Revoked');
+    return _el('span', 'badge badge-success', 'Active');
+}
+
+function _sharedByMeCard(sh) {
+    const active = sh.status === 'active';
+    const kind = sh.target_type === 'vault' ? 'Vault' : (sh.target_type === 'folder' ? 'Folder' : 'File');
+    const title = sh.target_type === 'vault' ? (sh.vault_name || 'Vault') : (sh.target_name || kind);
+    const tileIcon = sh.target_type === 'file' ? 'file' : (sh.target_type === 'folder' ? 'folder' : 'vault');
+
+    const card = _el('div', 'card vault-card');
+    card.setAttribute('data-share-id', sh.id);
+    const body = _el('div', 'vault-card-body');
+    const tile = _el('div', 'vault-tile'); tile.appendChild(_svgIcon(tileIcon)); body.appendChild(tile);
+    const main = _el('div', 'vault-card-main');
+    const h = _el('h3', 'vault-name', title);
+    h.appendChild(document.createTextNode(' ')); h.appendChild(_byMeStatusBadge(sh.status));
+    main.appendChild(h);
+    main.appendChild(_el('p', 'vault-desc', (sh.tag_name ? sh.tag_name + ' · ' : '') +
+        (sh.target_type === 'vault' ? 'Whole vault' : (kind + ' in ' + (sh.vault_name || 'a vault')))));
+    const meta = _el('div', 'vault-meta');
+    meta.appendChild(_el('span', null, (sh.claim_count || 0) + (sh.max_recipients != null ? '/' + sh.max_recipients : '') + ' recipients'));
+    if (sh.view_only) meta.appendChild(_el('span', null, 'View only'));
+    if (sh.max_downloads != null) meta.appendChild(_el('span', null, sh.max_downloads + ' downloads/recipient'));
+    main.appendChild(meta);
+    body.appendChild(main);
+    card.appendChild(body);
+
+    const actions = _el('div', 'flex items-center gap-sm'); actions.style.marginTop = 'var(--space-sm)';
+    if (active) {
+        const revokeBtn = _el('button', 'btn btn-sm', 'Revoke'); revokeBtn.type = 'button'; revokeBtn.style.color = '#dc2626';
+        revokeBtn.addEventListener('click', () => revokeShare(sh.id, title));
+        actions.appendChild(revokeBtn);
+    }
+    card.appendChild(actions);
+
+    if ((sh.claim_count || 0) > 0) {
+        const recipWrap = _el('div'); recipWrap.style.display = 'none'; recipWrap.style.marginTop = 'var(--space-sm)';
+        const recipBtn = _el('button', 'btn btn-secondary btn-sm', 'Recipients (' + sh.claim_count + ')'); recipBtn.type = 'button';
+        recipBtn.addEventListener('click', () => {
+            if (recipWrap.style.display === 'none') { recipWrap.style.display = ''; loadShareClaims(sh.id, recipWrap); }
+            else recipWrap.style.display = 'none';
+        });
+        actions.appendChild(recipBtn);
+        card.appendChild(recipWrap);
+    }
+    return card;
+}
+
+function renderSharedByMe() {
+    const container = document.getElementById('shared-by-me-list');
+    if (!container) return;
+    const items = state.sharedByMe || [];
+    if (items.length === 0) {
+        const wrap = _el('div', 'empty-state-center p-xl');
+        wrap.appendChild(_el('h3', 'text-xl font-bold mb-xs', 'You have not shared anything yet'));
+        wrap.appendChild(_el('p', 'text-secondary', 'Open a vault, file, or folder and use Share to create a share.'));
+        container.replaceChildren(wrap);
+        return;
+    }
+    container.replaceChildren(...items.map(_sharedByMeCard));
+}
+
+async function revokeShare(shareId, title) {
+    const ok = await showConfirm('Revoke the share of "' + title + '"? Everyone will lose access.', 'Revoke share');
+    if (!ok) return;
+    try {
+        await apiRequest('/shares/' + shareId + '/revoke', { method: 'POST' });
+        showToast('Share revoked', 'success');
+        await loadSharedByMe();
+    } catch (e) { showToast(e.message || 'Could not revoke the share', 'error'); }
+}
+
+async function loadShareClaims(shareId, wrap) {
+    wrap.replaceChildren(_el('div', 'spinner'));
+    try {
+        const claims = await apiRequest('/shares/' + shareId + '/claims', { silent: true });
+        renderShareClaims(shareId, claims, wrap);
+    } catch (e) {
+        wrap.replaceChildren(_el('div', 'alert alert-error', 'Failed to load recipients: ' + (e.message || '')));
+    }
+}
+
+function renderShareClaims(shareId, claims, wrap) {
+    if (!claims || claims.length === 0) { wrap.replaceChildren(_el('p', 'text-secondary text-sm', 'No recipients yet.')); return; }
+    wrap.replaceChildren(...claims.map(c => {
+        const row = _el('div', 'flex items-center justify-between'); row.style.padding = '2px 0';
+        row.appendChild(_el('span', 'text-sm',
+            c.username + (c.revoked ? ' (removed)' : '') + ' · ' + (c.download_count || 0) + ' downloads'));
+        if (!c.revoked) {
+            const kick = _el('button', 'btn btn-sm', 'Remove'); kick.type = 'button'; kick.style.color = '#dc2626';
+            kick.addEventListener('click', () => kickShareRecipient(shareId, c.user_id, c.username, wrap));
+            row.appendChild(kick);
+        }
+        return row;
+    }));
+}
+
+async function kickShareRecipient(shareId, userId, username, wrap) {
+    const ok = await showConfirm('Remove ' + username + ' from this share? They lose access immediately.', 'Remove recipient');
+    if (!ok) return;
+    try {
+        await apiRequest('/shares/' + shareId + '/claims/' + userId + '/revoke', { method: 'POST' });
+        showToast('Recipient removed', 'success');
+        await loadShareClaims(shareId, wrap);  // refresh the expanded recipient list in place
+    } catch (e) { showToast(e.message || 'Could not remove the recipient', 'error'); }
+}
+
+// ---- Create-share modal (creator) ----
+// DOM-built (no innerHTML). Reuses the existing openModal/closeModal, copyToClipboard, and the
+// department chip picker (_renderGroupPickerInto); the user picker is a small /users/search wrapper.
+const _shareCreate = { targetType: null, targetId: null, vaultId: null, targetName: null,
+                       policy: null, userIds: [], usersById: {}, deptIds: [], lastLink: '' };
+
+// A share requires a Standard, non-password vault (the backend refuses zero-knowledge + password-
+// protected). Hide the Share affordances for those so they aren't a dead-end.
+function vaultShareable() {
+    const v = state.currentVault;
+    return !!(v && (v.type || 'standard') !== 'zero_knowledge' && !v.has_password);
+}
+
+async function openCreateShareModal(targetType, targetId, targetName) {
+    const vaultId = state.currentVault && state.currentVault.id;
+    if (!vaultId) { showToast('Open a vault first', 'error'); return; }
+    _shareCreate.targetType = targetType;
+    _shareCreate.targetId = (targetType === 'vault') ? null : targetId;
+    _shareCreate.vaultId = vaultId;
+    _shareCreate.userIds = []; _shareCreate.deptIds = []; _shareCreate.usersById = {};
+
+    const label = document.getElementById('share-target-label');
+    if (label) label.textContent = targetType === 'vault' ? (state.currentVault.name || 'this vault') : (targetName || targetType);
+    document.getElementById('share-create-fields').style.display = '';
+    document.getElementById('share-create-result').style.display = 'none';
+    const submitBtn = document.getElementById('share-create-submit');
+    if (submitBtn) { submitBtn.style.display = ''; submitBtn.disabled = true; }
+    // Reset the reused singleton's inputs so a prior share's values don't leak into this one.
+    _shareCreate.lastLink = '';
+    ['share-lifetime-days', 'share-max-recipients', 'share-max-downloads', 'share-user-search'].forEach(id => {
+        const el = document.getElementById(id); if (el) el.value = '';
+    });
+    const results = document.getElementById('share-user-results'); if (results) results.replaceChildren();
+    _shareSetError('');
+    openModal('create-share-modal');
+    setupShareCreateModalOnce();
+
+    const tagSel = document.getElementById('share-tag-select');
+    tagSel.replaceChildren(_el('option', null, 'Loading…'));
+    tagSel.disabled = true;
+    try { _shareCreate.policy = await apiRequest('/share-policy', { silent: true }); }
+    catch (e) { _shareCreate.policy = { sharing_enabled: false, tags: [] }; }
+    await loadSftpPolicyGroups().catch(() => {});  // for the department picker (idempotent)
+    populateShareTags();
+}
+
+function populateShareTags() {
+    const tagSel = document.getElementById('share-tag-select');
+    const submitBtn = document.getElementById('share-create-submit');
+    const tags = (_shareCreate.policy && _shareCreate.policy.tags) || [];
+    tagSel.disabled = false;
+    if (!_shareCreate.policy || !_shareCreate.policy.sharing_enabled || tags.length === 0) {
+        tagSel.replaceChildren(_el('option', null, 'No tags available'));
+        _shareSetError((!_shareCreate.policy || !_shareCreate.policy.sharing_enabled)
+            ? 'Sharing is not enabled on this deployment.'
+            : 'You do not have permission to create shares here.');
+        if (submitBtn) submitBtn.disabled = true;
+        _shareToggleRecipientGroups(null);
+        return;
+    }
+    tagSel.replaceChildren(...tags.map(t => { const o = _el('option', null, t.name); o.value = t.id; return o; }));
+    if (submitBtn) submitBtn.disabled = false;
+    onShareTagChange();
+}
+
+function currentShareTag() {
+    const id = document.getElementById('share-tag-select').value;
+    return ((_shareCreate.policy && _shareCreate.policy.tags) || []).find(t => t.id === id) || null;
+}
+
+const _SHARE_AUD_LABEL = { anyone_internal: 'Anyone with the link', users: 'Specific users', departments: 'Departments' };
+
+function onShareTagChange() {
+    const t = currentShareTag();
+    const audSel = document.getElementById('share-audience-select');
+    if (!t) { audSel.replaceChildren(); _shareToggleRecipientGroups(null); return; }
+    const auds = t.allowed_audiences || [];
+    audSel.replaceChildren(...auds.map(a => { const o = _el('option', null, _SHARE_AUD_LABEL[a] || a); o.value = a; return o; }));
+    const voGroup = document.getElementById('share-viewonly-group');
+    const voInput = document.getElementById('share-view-only');
+    if (t.force_view_only) {
+        // The tag MANDATES view-only: show it, force it on, and lock it (the server enforces this too).
+        voGroup.style.display = '';
+        voInput.checked = true;
+        voInput.disabled = true;
+    } else {
+        voGroup.style.display = t.allow_view_only ? '' : 'none';
+        voInput.checked = !!(t.allow_view_only && t.default_view_only);
+        // The backend only honors a custom view_only when the tag allows customization; otherwise it
+        // forces default_view_only. Reflect that: editable only when allow_custom, else read-only.
+        voInput.disabled = !t.allow_custom;
+    }
+    document.getElementById('share-limits-group').style.display = t.allow_custom ? '' : 'none';
+    _shareCreate.userIds = []; _shareCreate.deptIds = [];
+    onShareAudienceChange();
+}
+
+function onShareAudienceChange() {
+    _shareToggleRecipientGroups(document.getElementById('share-audience-select').value);
+}
+
+function _shareToggleRecipientGroups(aud) {
+    document.getElementById('share-users-group').style.display = aud === 'users' ? '' : 'none';
+    document.getElementById('share-depts-group').style.display = aud === 'departments' ? '' : 'none';
+    if (aud === 'users') renderShareUserChips();
+    if (aud === 'departments') renderShareDeptPicker();
+}
+
+function renderShareUserChips() {
+    const host = document.getElementById('share-user-chips');
+    host.replaceChildren(..._shareCreate.userIds.map(id => {
+        const chip = _el('span', 'chip', _shareCreate.usersById[id] || id);
+        const x = _el('button', 'chip-remove'); x.type = 'button'; x.setAttribute('aria-label', 'Remove');
+        x.appendChild(_svgIcon('x', 'icon-sm'));
+        x.addEventListener('click', () => { _shareCreate.userIds = _shareCreate.userIds.filter(i => i !== id); renderShareUserChips(); });
+        chip.appendChild(x);
+        return chip;
+    }));
+}
+
+let _shareUserSearchTimer = null, _shareUserSearchSeq = 0;
+async function shareUserSearch(q) {
+    q = (q || '').trim();
+    const results = document.getElementById('share-user-results');
+    if (!q) { results.replaceChildren(); return; }
+    const seq = ++_shareUserSearchSeq;
+    try {
+        const users = await apiRequest('/users/search?q=' + encodeURIComponent(q), { silent: true });
+        if (seq !== _shareUserSearchSeq) return;  // a newer keystroke superseded this result
+        results.replaceChildren(...(users || []).slice(0, 8).map(u => {
+            const row = _el('button', 'pick-row', u.username); row.type = 'button';
+            row.addEventListener('click', () => {
+                if (!_shareCreate.userIds.includes(u.id)) { _shareCreate.userIds.push(u.id); _shareCreate.usersById[u.id] = u.username; }
+                document.getElementById('share-user-search').value = '';
+                results.replaceChildren();
+                renderShareUserChips();
+            });
+            return row;
+        }));
+    } catch (e) { /* transient search error — ignore */ }
+}
+
+function renderShareDeptPicker() {
+    _renderGroupPickerInto('share-dept-picker',
+        () => _shareCreate.deptIds, v => { _shareCreate.deptIds = v; },
+        'No departments selected', renderShareDeptPicker, 'share-dept-add', 'share-dept-remove');
+}
+
+function _shareSetError(msg) {
+    const e = document.getElementById('share-create-error');
+    if (!e) return;
+    if (msg) { e.textContent = msg; e.style.display = ''; } else { e.textContent = ''; e.style.display = 'none'; }
+}
+
+let _shareCreateWired = false;
+function setupShareCreateModalOnce() {
+    if (_shareCreateWired) return;
+    _shareCreateWired = true;
+    document.getElementById('share-tag-select').addEventListener('change', onShareTagChange);
+    document.getElementById('share-audience-select').addEventListener('change', onShareAudienceChange);
+    const search = document.getElementById('share-user-search');
+    search.addEventListener('input', () => {
+        clearTimeout(_shareUserSearchTimer);
+        _shareUserSearchTimer = setTimeout(() => shareUserSearch(search.value), 250);
+    });
+    document.getElementById('share-create-submit').addEventListener('click', submitCreateShare);
+    // Copy from the STORED token, not the element text (copyToClipboard swaps the element to a
+    // "Copied!" label for 2s; on a show-once link a re-read would copy that label and lose the token).
+    document.getElementById('share-link-copy').addEventListener('click', () => {
+        const tok = _shareCreate.lastLink || '';
+        if (!tok) return;
+        navigator.clipboard.writeText(tok).then(() => showToast('Link copied', 'success')).catch(() => {});
+    });
+}
+
+async function submitCreateShare() {
+    const t = currentShareTag();
+    if (!t) { _shareSetError('Pick a classification tag.'); return; }
+    const aud = document.getElementById('share-audience-select').value;
+    const payload = {
+        vault_id: _shareCreate.vaultId, tag_id: t.id, target_type: _shareCreate.targetType,
+        claim_audience: aud, with_link: true,
+    };
+    if (_shareCreate.targetType === 'folder') payload.target_folder_id = _shareCreate.targetId;
+    if (_shareCreate.targetType === 'file') payload.target_file_id = _shareCreate.targetId;
+    if (aud === 'users') {
+        if (!_shareCreate.userIds.length) { _shareSetError('Pick at least one recipient.'); return; }
+        payload.audience_user_ids = _shareCreate.userIds;
+    }
+    if (aud === 'departments') {
+        if (!_shareCreate.deptIds.length) { _shareSetError('Pick at least one department.'); return; }
+        payload.audience_department_ids = _shareCreate.deptIds;
+    }
+    // view_only is only honored server-side when the tag allows customization (else the tag default
+    // is forced); only send it then, matching the UI's read-only state for non-custom tags.
+    if (t.allow_view_only && t.allow_custom) payload.view_only = document.getElementById('share-view-only').checked;
+    if (t.allow_custom) {
+        const days = parseInt(document.getElementById('share-lifetime-days').value, 10);
+        const mr = parseInt(document.getElementById('share-max-recipients').value, 10);
+        const md = parseInt(document.getElementById('share-max-downloads').value, 10);
+        if (days > 0) payload.lifetime_minutes = days * 1440;
+        if (mr > 0) payload.max_recipients = mr;
+        if (md > 0) payload.max_downloads = md;
+    }
+    const submitBtn = document.getElementById('share-create-submit');
+    submitBtn.disabled = true;
+    _shareSetError('');
+    try {
+        const res = await apiRequest('/shares', { method: 'POST', body: JSON.stringify(payload) });
+        _shareCreate.lastLink = res.link_token || '';
+        document.getElementById('share-link-value').textContent = res.link_token || '';
+        document.getElementById('share-create-fields').style.display = 'none';
+        document.getElementById('share-create-result').style.display = '';
+        submitBtn.style.display = 'none';
+        showToast('Share created', 'success');
+    } catch (e) {
+        _shareSetError(e.message || 'Could not create the share.');
+        submitBtn.disabled = false;
+    }
+}
+
 // Star / un-star a vault (optimistic; reverts on failure).
 async function toggleVaultFavorite(vaultId) {
     const v = (state.allVaults || []).find(x => x.id === vaultId);
@@ -4251,6 +4778,7 @@ function setupSettingsTabs() {
                 content.classList.add('active');
             }
             if (tabId === 'logs') { loadLogSettings(); }  // refresh on tab open
+            if (tabId === 'sharing') { setupShareTagsUI(); loadShareTags(); }  // wire (idempotent) + refresh
         });
     });
 }
@@ -4600,6 +5128,12 @@ async function loadSettings() {
         // Branding: stored overrides -> values, effective /branding -> placeholders
         await applyBrandFields(settings);
 
+        // Sharing: master switch + the Share Tags manager
+        const shEl = document.getElementById('setting-sharing-enabled');
+        if (shEl) shEl.checked = settings.sharing_enabled === true;
+        setupShareTagsUI();
+        loadShareTags();
+
         console.log('✓ Settings loaded');
     } catch (error) {
         console.log('Settings endpoint not available');
@@ -4682,6 +5216,10 @@ async function saveAllSettings() {
             settings.standard_vault_allowed_groups = standardVaultAllowedGroups.slice();
         }
 
+        // Sharing master switch (the per-tag policy lives in the Share Tags manager, not here)
+        const shEnEl = document.getElementById('setting-sharing-enabled');
+        if (shEnEl) settings.sharing_enabled = shEnEl.checked;
+
         // Only include password if provided
         const smtpPassword = document.getElementById('setting-smtp-password').value;
         if (smtpPassword) {
@@ -4699,6 +5237,379 @@ async function saveAllSettings() {
     } catch (error) {
         console.error('Failed to save settings:', error);
         showError('Failed to save settings: ' + error.message);
+    }
+}
+
+// ---- Share Tags manager (admin Settings -> Sharing) ------------------------
+// The per-tag policy + create-allowlist backing the Sharing feature. The list is rendered
+// from GET /share-tags; add/edit/deactivate go through the interactive-admin /share-tags CRUD.
+// This editor covers the policy, the audiences, and the DEPARTMENT allowlist + auto-enroll;
+// the per-user allow/block lists are managed separately. All controls build via DOM (no innerHTML).
+let shareTagsCache = [];
+let shareTagEditorDeptIds = [];
+let shareTagEditorAllowUserIds = [];
+let shareTagEditorBlockUserIds = [];
+let shareTagUsersById = {};          // id -> username, for rendering the user chips
+let shareTagsUIWired = false;
+const _tagUserSearchTimer = { allow: null, block: null };
+const _tagUserSearchSeq = { allow: 0, block: 0 };
+
+function _stEl(id) { return document.getElementById(id); }
+function _stChecked(id) { const e = _stEl(id); return !!(e && e.checked); }
+function _stNumOrNull(id) {
+    const e = _stEl(id);
+    if (!e || e.value === '' || e.value == null) return null;
+    const n = parseInt(e.value, 10);
+    return Number.isFinite(n) ? n : null;
+}
+
+// Keep the view-only DEFAULT consistent with whether view-only is ALLOWED (mirrors the backend
+// invariant default_view_only requires allow_view_only) so the admin can't submit the invalid pair.
+function _stSyncViewOnly() {
+    const allow = _stEl('share-tag-allow-view-only');
+    const def = _stEl('share-tag-default-view-only');
+    const force = _stEl('share-tag-force-view-only');
+    if (!allow) return;
+    // Forcing view-only requires allowing it — checking force auto-enables allow (mirrors the backend
+    // invariant force_view_only requires allow_view_only), so the admin can't submit the invalid pair.
+    if (force && force.checked && !allow.checked) allow.checked = true;
+    if (def) { if (!allow.checked) def.checked = false; def.disabled = !allow.checked; }
+    if (force) force.disabled = !allow.checked;
+}
+
+function setupShareTagsUI() {
+    if (shareTagsUIWired) return;
+    const add = _stEl('share-tag-add-btn');
+    const save = _stEl('share-tag-save-btn');
+    const cancel = _stEl('share-tag-cancel-btn');
+    if (!add || !save || !cancel) return;  // sharing tab markup not present
+    add.addEventListener('click', () => openShareTagEditor(null));
+    save.addEventListener('click', saveShareTag);
+    cancel.addEventListener('click', closeShareTagEditor);
+    const allowVO = _stEl('share-tag-allow-view-only');
+    if (allowVO) allowVO.addEventListener('change', _stSyncViewOnly);
+    const forceVO = _stEl('share-tag-force-view-only');
+    if (forceVO) forceVO.addEventListener('change', _stSyncViewOnly);
+    const allowSearch = _stEl('share-tag-allow-user-search');
+    if (allowSearch) allowSearch.addEventListener('input', () => {
+        clearTimeout(_tagUserSearchTimer.allow);
+        _tagUserSearchTimer.allow = setTimeout(() => _tagUserSearch('allow'), 250);
+    });
+    const blockSearch = _stEl('share-tag-block-user-search');
+    if (blockSearch) blockSearch.addEventListener('input', () => {
+        clearTimeout(_tagUserSearchTimer.block);
+        _tagUserSearchTimer.block = setTimeout(() => _tagUserSearch('block'), 250);
+    });
+    shareTagsUIWired = true;
+}
+
+async function loadShareTags() {
+    const host = _stEl('share-tags-list');
+    if (!host) return;
+    try {
+        const tags = await apiRequest('/share-tags', { silent: true });
+        shareTagsCache = Array.isArray(tags) ? tags : [];
+    } catch (_) {
+        shareTagsCache = [];
+    }
+    renderShareTagsList();
+}
+
+function renderShareTagsList() {
+    const host = _stEl('share-tags-list');
+    if (!host) return;
+    host.replaceChildren();
+    if (!shareTagsCache.length) {
+        const empty = document.createElement('p');
+        empty.className = 'text-tertiary text-sm';
+        empty.textContent = 'No share tags yet. Add one to let users create shares.';
+        host.appendChild(empty);
+        return;
+    }
+    shareTagsCache.slice().sort((a, b) => a.name.localeCompare(b.name)).forEach(tag => {
+        const row = document.createElement('div');
+        row.className = 'share-tag-row flex justify-between items-center mb-sm';
+        row.setAttribute('data-tag-id', tag.id);
+
+        const left = document.createElement('div');
+        const title = document.createElement('span');
+        title.className = 'font-medium';
+        title.textContent = tag.name;
+        left.appendChild(title);
+        const badge = document.createElement('span');
+        badge.className = 'chip ml-sm';
+        badge.textContent = tag.is_active ? 'active' : 'inactive';
+        left.appendChild(badge);
+        const summary = document.createElement('div');
+        summary.className = 'text-tertiary text-sm';
+        const parts = [
+            `lifetime ≤ ${tag.max_lifetime_minutes}m (default ${tag.default_lifetime_minutes}m)`,
+            `recipients ${tag.max_recipients_cap == null ? '∞' : tag.max_recipients_cap}`,
+            `downloads ${tag.max_downloads_cap == null ? '∞' : tag.max_downloads_cap}`,
+        ];
+        if (Array.isArray(tag.allowed_audiences) && tag.allowed_audiences.length) {
+            parts.push(`audiences: ${tag.allowed_audiences.join(', ')}`);
+        }
+        if (tag.force_view_only) parts.push('view-only forced');
+        else if (tag.default_view_only) parts.push('view-only default');
+        if (tag.auto_enroll_new_users) parts.push('everyone (except blocked)');
+        summary.textContent = parts.join(' · ');
+        left.appendChild(summary);
+        row.appendChild(left);
+
+        const actions = document.createElement('div');
+        actions.className = 'flex gap-sm';
+        const edit = document.createElement('button');
+        edit.type = 'button';
+        edit.className = 'btn btn-secondary';
+        edit.textContent = 'Edit';
+        edit.addEventListener('click', () => openShareTagEditor(tag));
+        actions.appendChild(edit);
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'btn btn-secondary';
+        toggle.textContent = tag.is_active ? 'Deactivate' : 'Reactivate';
+        toggle.addEventListener('click', () => (tag.is_active ? deactivateShareTag(tag.id) : reactivateShareTag(tag.id)));
+        actions.appendChild(toggle);
+        row.appendChild(actions);
+
+        host.appendChild(row);
+    });
+}
+
+function renderShareTagDeptPicker() {
+    _renderGroupPickerInto(
+        'share-tag-dept-picker',
+        () => shareTagEditorDeptIds,
+        v => { shareTagEditorDeptIds = v; },
+        'No departments selected',
+        renderShareTagDeptPicker,
+        'share-tag-dept-add',
+        'share-tag-dept-remove'
+    );
+}
+
+// Per-user create-allowlist pickers (allowed_user_ids / blocked_user_ids). Search is server-side
+// (/users/search, scoped + rate-limited); the admin /users list is fetched once only to resolve the
+// stored ids of an existing tag into usernames for the chips. All rendering is textContent/DOM.
+async function loadShareTagUsers() {
+    try {
+        const users = await apiRequest('/users', { silent: true });
+        (Array.isArray(users) ? users : []).forEach(u => {
+            shareTagUsersById[u.id] = u.username || u.email || String(u.id).slice(0, 8);
+        });
+    } catch (_) { /* names fall back to the id */ }
+}
+
+function _tagUserName(id) { return shareTagUsersById[id] || String(id).slice(0, 8); }
+
+function _renderTagUserChips(chipsId, ids, onRemove) {
+    const host = _stEl(chipsId);
+    if (!host) return;
+    host.replaceChildren();
+    if (!ids.length) {
+        const none = document.createElement('span');
+        none.className = 'text-tertiary text-sm';
+        none.textContent = 'None';
+        host.appendChild(none);
+        return;
+    }
+    ids.forEach(id => {
+        const chip = document.createElement('span');
+        chip.className = 'chip';
+        chip.append(_tagUserName(id));
+        const rm = document.createElement('button');
+        rm.type = 'button';
+        rm.className = 'chip-remove';
+        rm.setAttribute('aria-label', `Remove ${_tagUserName(id)}`);
+        rm.appendChild(svgUseIcon('x', 'icon-sm'));
+        rm.addEventListener('click', () => onRemove(id));
+        chip.appendChild(rm);
+        host.appendChild(chip);
+    });
+}
+
+function _renderTagAllowChips() {
+    _renderTagUserChips('share-tag-allow-user-chips', shareTagEditorAllowUserIds, id => {
+        shareTagEditorAllowUserIds = shareTagEditorAllowUserIds.filter(x => x !== id);
+        _renderTagAllowChips();
+    });
+}
+function _renderTagBlockChips() {
+    _renderTagUserChips('share-tag-block-user-chips', shareTagEditorBlockUserIds, id => {
+        shareTagEditorBlockUserIds = shareTagEditorBlockUserIds.filter(x => x !== id);
+        _renderTagBlockChips();
+    });
+}
+
+function _tagUserPickerIds(kind) {
+    return {
+        search: kind === 'allow' ? 'share-tag-allow-user-search' : 'share-tag-block-user-search',
+        results: kind === 'allow' ? 'share-tag-allow-user-results' : 'share-tag-block-user-results',
+    };
+}
+
+function _tagUserSearch(kind) {
+    const { search, results } = _tagUserPickerIds(kind);
+    const seq = ++_tagUserSearchSeq[kind];
+    const host = _stEl(results);
+    if (!host) return;
+    const q = (_stEl(search)?.value || '').trim();
+    if (q.length < 2) { host.replaceChildren(); return; }
+    apiRequest(`/users/search?q=${encodeURIComponent(q)}`, { silent: true }).then(users => {
+        if (seq !== _tagUserSearchSeq[kind]) return;  // a newer keystroke superseded this one
+        _renderTagUserResults(kind, Array.isArray(users) ? users : []);
+    }).catch(() => {
+        if (seq !== _tagUserSearchSeq[kind]) return;
+        host.replaceChildren();
+    });
+}
+
+function _renderTagUserResults(kind, users) {
+    const { results } = _tagUserPickerIds(kind);
+    const host = _stEl(results);
+    if (!host) return;
+    host.replaceChildren();
+    const already = kind === 'allow' ? shareTagEditorAllowUserIds : shareTagEditorBlockUserIds;
+    const fresh = users.filter(u => !already.includes(u.id));
+    if (!fresh.length) {
+        const none = document.createElement('div');
+        none.className = 'text-tertiary text-sm';
+        none.textContent = 'No matching users.';
+        host.appendChild(none);
+        return;
+    }
+    fresh.forEach(u => {
+        shareTagUsersById[u.id] = u.username || u.email || String(u.id).slice(0, 8);
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'pick-row';
+        row.style.width = '100%';
+        row.style.textAlign = 'left';
+        row.textContent = u.username || u.email || u.id;
+        row.addEventListener('click', () => _addTagUser(kind, u.id));
+        host.appendChild(row);
+    });
+}
+
+function _addTagUser(kind, id) {
+    // allowed and blocked are mutually exclusive in the editor (the backend blocklist wins regardless).
+    shareTagEditorAllowUserIds = shareTagEditorAllowUserIds.filter(x => x !== id);
+    shareTagEditorBlockUserIds = shareTagEditorBlockUserIds.filter(x => x !== id);
+    if (kind === 'allow') shareTagEditorAllowUserIds.push(id);
+    else shareTagEditorBlockUserIds.push(id);
+    _renderTagAllowChips();
+    _renderTagBlockChips();
+    const { search, results } = _tagUserPickerIds(kind);
+    if (_stEl(search)) _stEl(search).value = '';
+    if (_stEl(results)) _stEl(results).replaceChildren();
+}
+
+function openShareTagEditor(tag) {
+    const editor = _stEl('share-tag-editor');
+    if (!editor) return;
+    const t = tag || {};
+    _stEl('share-tag-editor-title').textContent = tag ? 'Edit tag' : 'Add tag';
+    _stEl('share-tag-editor-id').value = tag ? t.id : '';
+    _stEl('share-tag-name').value = t.name || '';
+    _stEl('share-tag-description').value = t.description || '';
+    _stEl('share-tag-color').value = t.color || '';
+    _stEl('share-tag-max-lifetime').value = t.max_lifetime_minutes != null ? t.max_lifetime_minutes : 10080;
+    _stEl('share-tag-default-lifetime').value = t.default_lifetime_minutes != null ? t.default_lifetime_minutes : 1440;
+    _stEl('share-tag-max-recipients-cap').value = t.max_recipients_cap != null ? t.max_recipients_cap : '';
+    _stEl('share-tag-max-recipients-default').value = t.max_recipients_default != null ? t.max_recipients_default : '';
+    _stEl('share-tag-max-downloads-cap').value = t.max_downloads_cap != null ? t.max_downloads_cap : '';
+    _stEl('share-tag-max-downloads-default').value = t.max_downloads_default != null ? t.max_downloads_default : '';
+    const aud = Array.isArray(t.allowed_audiences) ? t.allowed_audiences
+        : (tag ? [] : ['users', 'departments', 'anyone_internal']);
+    _stEl('share-tag-aud-users').checked = aud.includes('users');
+    _stEl('share-tag-aud-departments').checked = aud.includes('departments');
+    _stEl('share-tag-aud-anyone').checked = aud.includes('anyone_internal');
+    _stEl('share-tag-allow-view-only').checked = tag ? !!t.allow_view_only : true;
+    _stEl('share-tag-default-view-only').checked = !!t.default_view_only;
+    _stEl('share-tag-force-view-only').checked = !!t.force_view_only;
+    _stEl('share-tag-allow-custom').checked = tag ? !!t.allow_custom : true;
+    _stEl('share-tag-auto-enroll').checked = !!t.auto_enroll_new_users;
+    shareTagEditorDeptIds = (t.allowed_department_ids || []).map(String);
+    renderShareTagDeptPicker();
+    shareTagEditorAllowUserIds = (t.allowed_user_ids || []).map(String);
+    shareTagEditorBlockUserIds = (t.blocked_user_ids || []).map(String);
+    ['share-tag-allow-user-search', 'share-tag-block-user-search'].forEach(id => { if (_stEl(id)) _stEl(id).value = ''; });
+    ['share-tag-allow-user-results', 'share-tag-block-user-results'].forEach(id => { if (_stEl(id)) _stEl(id).replaceChildren(); });
+    _renderTagAllowChips();
+    _renderTagBlockChips();
+    // resolve the stored ids of an existing tag into usernames (fetch the admin user list once)
+    if (shareTagEditorAllowUserIds.length || shareTagEditorBlockUserIds.length) {
+        loadShareTagUsers().then(() => { _renderTagAllowChips(); _renderTagBlockChips(); });
+    }
+    _stSyncViewOnly();
+    editor.style.display = '';
+    editor.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function closeShareTagEditor() {
+    const editor = _stEl('share-tag-editor');
+    if (editor) editor.style.display = 'none';
+}
+
+async function saveShareTag() {
+    const id = _stEl('share-tag-editor-id').value;
+    const aud = [];
+    if (_stChecked('share-tag-aud-users')) aud.push('users');
+    if (_stChecked('share-tag-aud-departments')) aud.push('departments');
+    if (_stChecked('share-tag-aud-anyone')) aud.push('anyone_internal');
+    const body = {
+        name: _stEl('share-tag-name').value.trim(),
+        description: _stEl('share-tag-description').value.trim() || null,
+        color: _stEl('share-tag-color').value.trim() || null,
+        max_lifetime_minutes: _stNumOrNull('share-tag-max-lifetime') || 1,
+        default_lifetime_minutes: _stNumOrNull('share-tag-default-lifetime') || 1,
+        max_recipients_cap: _stNumOrNull('share-tag-max-recipients-cap'),
+        max_recipients_default: _stNumOrNull('share-tag-max-recipients-default'),
+        max_downloads_cap: _stNumOrNull('share-tag-max-downloads-cap'),
+        max_downloads_default: _stNumOrNull('share-tag-max-downloads-default'),
+        allowed_audiences: aud,
+        allow_view_only: _stChecked('share-tag-allow-view-only'),
+        default_view_only: _stChecked('share-tag-default-view-only'),
+        force_view_only: _stChecked('share-tag-force-view-only'),
+        allow_custom: _stChecked('share-tag-allow-custom'),
+        auto_enroll_new_users: _stChecked('share-tag-auto-enroll'),
+        allowed_department_ids: shareTagEditorDeptIds.slice(),
+        allowed_user_ids: shareTagEditorAllowUserIds.slice(),
+        blocked_user_ids: shareTagEditorBlockUserIds.slice(),
+    };
+    try {
+        if (id) {
+            await apiRequest(`/share-tags/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
+            showSuccess('Tag updated');
+        } else {
+            await apiRequest('/share-tags', { method: 'POST', body: JSON.stringify(body) });
+            showSuccess('Tag created');
+        }
+        closeShareTagEditor();
+        await loadShareTags();
+    } catch (error) {
+        showError('Could not save tag: ' + (error && error.message ? error.message : 'unknown error'));
+    }
+}
+
+async function deactivateShareTag(id) {
+    try {
+        await apiRequest(`/share-tags/${id}`, { method: 'DELETE' });
+        showSuccess('Tag deactivated');
+        await loadShareTags();
+    } catch (error) {
+        showError('Could not deactivate tag: ' + (error && error.message ? error.message : 'unknown error'));
+    }
+}
+
+async function reactivateShareTag(id) {
+    try {
+        await apiRequest(`/share-tags/${id}`, { method: 'PATCH', body: JSON.stringify({ is_active: true }) });
+        showSuccess('Tag reactivated');
+        await loadShareTags();
+    } catch (error) {
+        showError('Could not reactivate tag: ' + (error && error.message ? error.message : 'unknown error'));
     }
 }
 
@@ -5424,8 +6335,9 @@ function fileActionButtons(item, canWrite, opts) {
         if (slot !== 'primary') {  // folders have no download -> primary (left) is empty
             if (canRename) out.push(btn('rename-folder', 'edit', 'Rename'));
             if (canDelete) out.push(btn('delete-folder', 'trash', 'Delete', true));
+            if (vaultShareable()) out.push(btn('share-folder', 'link', 'Share'));
         }
-        if (!canRename && !canDelete && !slot && (!opts || !opts.grid)) out.push('<span class="text-tertiary text-sm">—</span>');
+        if (out.length === 0 && !slot && (!opts || !opts.grid)) out.push('<span class="text-tertiary text-sm">—</span>');
     } else {
         const canDownload = vaultCapAllowed('file.download');
         const canRename = canWrite && vaultCapAllowed('file.rename');
@@ -5434,6 +6346,7 @@ function fileActionButtons(item, canWrite, opts) {
         if (slot !== 'primary') {
             if (canRename) out.push(btn('rename-file', 'edit', 'Rename'));
             if (canDelete) out.push(btn('delete-file', 'trash', 'Delete', true));
+            if (vaultShareable()) out.push(btn('share-file', 'link', 'Share'));
         }
     }
     return out.join('');
@@ -5540,6 +6453,7 @@ function wireFileItemHandlers(container) {
             if (action === 'download') downloadFile(id, name);
             else if (action === 'rename-file' || action === 'rename-folder') renameVaultItem(id, name, action === 'rename-folder' ? 'folder' : 'file');
             else if (action === 'delete-file' || action === 'delete-folder') deleteVaultItem(id, name, action === 'delete-folder' ? 'folder' : 'file');
+            else if (action === 'share-file' || action === 'share-folder') openCreateShareModal(action === 'share-folder' ? 'folder' : 'file', id, name);
         });
     });
     container.querySelectorAll('.file-check').forEach(cb => {
@@ -6741,6 +7655,9 @@ function applyVaultViewPermissions(isOwner, canWrite, canManage) {
     // its scope grants on this vault (matching require_vault_cap server-side).
     show(document.getElementById('upload-file-btn'), canWrite && vaultCapAllowed('file.upload'));
     show(document.getElementById('create-folder-btn'), canWrite && vaultCapAllowed('folder.create'));
+    // Share is only for Standard, non-password vaults (the backend refuses zero-knowledge + password-
+    // protected); hide the affordance otherwise so it isn't a dead-end.
+    show(document.getElementById('share-vault-btn'), vaultShareable());
     // Permissions is open to the owner AND managers (delegated administration);
     // Settings stays owner-only (rename/password/rotate/delete). Don't show dead tabs.
     // Gate on see_permissions specifically — the tab's initial GET /permissions is
@@ -9094,6 +10011,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 // Load data for specific sections
                 if (section === 'vaults') {
                     loadVaults().catch(err => console.error('Failed to load vaults:', err));
+                } else if (section === 'shared') {
+                    loadShared().catch(err => console.error('Failed to load shared items:', err));
                 } else if (section === 'temp-creds') {
                     loadTempCreds().catch(err => console.error('Failed to load temp creds:', err));
                 } else if (section === 'users') {
@@ -9180,7 +10099,16 @@ document.addEventListener('DOMContentLoaded', () => {
     if (createFolderBtn) {
         createFolderBtn.addEventListener('click', createFolder);
     }
-    
+
+    // Share the whole vault
+    const shareVaultBtn = document.getElementById('share-vault-btn');
+    if (shareVaultBtn) {
+        shareVaultBtn.addEventListener('click', () => {
+            const v = state.currentVault;
+            if (v) openCreateShareModal('vault', v.id, v.name);
+        });
+    }
+
     // Create vault button
     const createVaultBtn = document.getElementById('create-vault-btn');
     if (createVaultBtn) {

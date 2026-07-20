@@ -3,14 +3,16 @@ Authorization and permission management system.
 Implements Role-Based Access Control (RBAC) with fine-grained permissions.
 """
 from typing import List, Optional, Set
+from datetime import datetime
 import uuid
 
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, select
+from sqlalchemy import and_, select, update
 
 from app.core.models import (
     User, RoleEnum, PermissionEnum, user_permissions,
-    Vault, vault_members, VaultPermissionEnum, vault_group_access, user_groups
+    Vault, vault_members, VaultPermissionEnum, vault_group_access, user_groups,
+    Share, ShareClaim,
 )
 
 
@@ -242,24 +244,31 @@ class PermissionService:
     def get_vault_permissions(
         self,
         user: User,
-        vault_id: uuid.UUID
+        vault_id: uuid.UUID,
+        allow_share: bool = False,
     ) -> Optional[dict]:
         """
         Get user's permissions for a specific vault.
-        
+
         Args:
             user: User object
             vault_id: Vault UUID
-            
+            allow_share: When True (opt-in at the recipient READ endpoints ONLY),
+                a caller with no owner/member/group access may still be granted
+                READ-ONLY access by an active share claim (a file/folder share is
+                confined to its subtree by stamp_share_scope + the id-scope wrappers).
+                Defaults to False, so every other caller — every write/delete path and
+                ALL SFTP call sites — never sees a share grant (SFTP fail-closed).
+
         Returns:
             Dictionary with read, write, delete permissions or None if no access
         """
         # Check if user owns the vault
         vault = self.db.query(Vault).filter(Vault.id == vault_id).first()
-        
+
         if not vault:
             return None
-        
+
         if vault.owner_id == user.id:
             # Owner has all permissions, including management.
             return {
@@ -268,7 +277,7 @@ class PermissionService:
                 'delete': True,
                 'manage': True
             }
-        
+
         # Check if user is a member
         membership = self.db.execute(
             vault_members.select().where(
@@ -278,25 +287,281 @@ class PermissionService:
                 )
             )
         ).fetchone()
-        
-        if not membership:
+
+        if membership:
+            return {
+                'read': membership.read_permission,
+                'write': membership.write_permission,
+                'delete': membership.delete_permission,
+                # A member granted manage_permission is a vault "Manager".
+                'manage': bool(getattr(membership, 'manage_permission', False)),
+            }
+
+        # No direct membership.
+        if getattr(vault, 'type', 'standard') == 'zero_knowledge':
             # Zero-knowledge vaults are never shared via groups: a group has no
             # key, so a group member holds no wrapped DEK and "access" would only
             # leak metadata. The grant endpoint blocks creating such rows; this is
             # defense-in-depth for any row that predates that block. ZK sharing is
-            # explicit per-user only (owner + direct members).
-            if getattr(vault, 'type', 'standard') == 'zero_knowledge':
-                return None
-            # No direct membership — fall back to group-based access.
-            return self._group_vault_permission(user, vault_id)
+            # explicit per-user only (owner + direct members) — and a share claim
+            # never opens a ZK vault either.
+            return None
 
+        # Fall back to group-based access.
+        group_perms = self._group_vault_permission(user, vault_id)
+        if group_perms is not None:
+            return group_perms
+
+        # No owner/member/group access. Only when the caller explicitly opted in
+        # (a recipient READ endpoint), an active share claim may grant read-only
+        # access. Fail-closed everywhere else.
+        if allow_share:
+            return self._share_vault_permission(user, vault)
+        return None
+
+    def _share_vault_permission(self, user: User, vault: Vault) -> Optional[dict]:
+        """READ-ONLY vault access granted by an active share claim, or None.
+
+        Fail-closed and intentionally NARROW: grants only for
+          * a Standard, non-password vault (zero-knowledge + password-protected are
+            refused; the vault could have gained a password after the claim);
+          * an 'active', not-past-expiry share (INCLUDING view-only — a view-only share
+            grants read so the recipient can open/list/preview; the download path denies
+            file.download separately via the downloadable scope);
+          * a caller holding a non-revoked ShareClaim on that share whose claim-audience the caller
+            STILL matches — re-checked LIVE, so removing a recipient from the targeted department
+            revokes their access on the next request, not just an explicit revoke/kick/expiry.
+        Grants read (the download path re-checks READ) but never write/delete/manage. For a
+        FILE/FOLDER-target share this read is SUBTREE-RESTRICTED by the id-scope wrappers once
+        stamp_share_scope() has stamped the caller's share scope at the get_vault chokepoint — the
+        read grant here and the scope stamp there select the SAME claim set. Only reached with
+        allow_share=True, so a share claim confers nothing over SFTP."""
+        # The deployment-wide sharing master switch is a LIVE kill-switch: disabling sharing
+        # org-wide (e.g. on a suspected leak) stops existing claims from granting access at once,
+        # mirroring how the temp-passcode master switch gates redemption at the vault chokepoint.
+        # Fail-closed: an absent/unreadable setting or any error denies the share grant.
+        if not self._sharing_enabled():
+            return None
+        if getattr(vault, 'type', 'standard') == 'zero_knowledge':
+            return None
+        if vault.password_hash:
+            return None
+        now = datetime.utcnow()
+        rows = (
+            self.db.query(Share.claim_audience, Share.audience_user_ids,
+                          Share.audience_department_ids)
+            .join(ShareClaim, ShareClaim.share_id == Share.id)
+            .filter(
+                ShareClaim.user_id == user.id,
+                ShareClaim.revoked.is_(False),
+                Share.vault_id == vault.id,
+                Share.status == 'active',
+                Share.expires_at > now,
+            )
+            .all()
+        )
+        if not rows:
+            return None
+        # Re-check the claim-audience LIVE (not just at claim time). Grant only if the caller STILL
+        # satisfies at least one held claim's audience — so a recipient removed from the targeted
+        # department loses access on their next request.
+        gids = self._current_group_ids(user)
+        if not any(self._audience_ok(aud, au, ad, user.id, gids) for aud, au, ad in rows):
+            return None
+        return {'read': True, 'write': False, 'delete': False, 'manage': False}
+
+    def _sharing_enabled(self) -> bool:
+        """The deployment-wide sharing master switch, read from SystemSetting('global'). Fail-closed:
+        an absent/unreadable setting or any error returns False (no share access)."""
+        from app.core import sharing_policy
+        from app.core.models import SystemSetting
+        try:
+            row = self.db.query(SystemSetting).filter(SystemSetting.key == 'global').first()
+            cfg = (row.value or {}) if (row and row.value) else {}
+        except Exception:
+            cfg = {}
+        return sharing_policy.sharing_enabled(cfg)
+
+    def _current_group_ids(self, user: User) -> set:
+        """The caller's CURRENT group/department ids (live query) — used to re-evaluate a
+        'departments' claim-audience at ACCESS time so leaving the targeted department cuts access."""
         return {
-            'read': membership.read_permission,
-            'write': membership.write_permission,
-            'delete': membership.delete_permission,
-            # A member granted manage_permission is a vault "Manager".
-            'manage': bool(getattr(membership, 'manage_permission', False)),
+            str(r[0]) for r in self.db.execute(
+                select(user_groups.c.group_id).where(user_groups.c.user_id == user.id)
+            ).fetchall()
         }
+
+    @staticmethod
+    def _audience_ok(claim_audience, audience_user_ids, audience_department_ids,
+                     user_id, user_group_ids) -> bool:
+        """Whether `user_id` STILL satisfies a share's claim-audience, reusing the SAME pure predicate
+        the claim path uses. 'anyone_internal'/'users' are effectively static (the audience is
+        snapshotted at create and included the claimant); 'departments' is re-checked against the
+        caller's live group membership — this is what makes de-provisioning revoke live access."""
+        from app.core import sharing_policy
+        return sharing_policy.user_matches_claim_audience(
+            claim_audience, audience_user_ids, audience_department_ids, user_id, user_group_ids)
+
+    def stamp_share_scope(self, user: User, vault: Vault) -> None:
+        """Stamp a share recipient's per-vault id-subtrees so the generalized id-scope wrappers
+        (temp_scope.scope_ids + vault_service's listing filter / per-file gate) confine a file/folder
+        share to its subtree. share-ONLY: an owner / member / group-member who ALSO holds a claim keeps
+        full (unscoped) access — never downgraded.
+
+        Stamps TWO scopes, each the UNION of the caller's active, non-revoked claims on this vault:
+          * ``_share_vault_scope[vault_id]``  — the VISIBLE scope (ALL claims, incl. view-only): what
+            the recipient may open/list. This is the SAME claim set _share_vault_permission grants
+            read for.
+          * ``_share_download_scope[vault_id]`` — the DOWNLOADABLE scope (NON-view-only claims only):
+            what the recipient may download. A view-only share contributes to the visible scope but
+            NOT the downloadable one, so it is see-but-not-download.
+        For each scope: any qualifying whole-vault claim ⇒ None (no id restriction); otherwise
+        ``{"files": [...], "folders": [...]}`` (empty ⇒ deny-all, fail-closed). If the claim set is
+        unresolvable NOW — sharing just disabled, or the claim revoked/expired between the read-grant
+        query and this one (a read-committed race) — BOTH scopes fail closed to deny-all rather than
+        leaving the caller unstamped, which scope_ids would read as whole-vault (fail-open). No-op for
+        a non-recipient (leaves the stamps untouched)."""
+        if vault.owner_id == user.id:
+            return
+        # A member/group principal is NOT scope-restricted by a share; only a share-only caller is.
+        if self.get_vault_permissions(user, vault.id) is not None:
+            return
+        visible = {"files": [], "folders": []}
+        downloadable = {"files": [], "folders": []}
+        if self._sharing_enabled():
+            now = datetime.utcnow()
+            rows = (
+                self.db.query(Share.target_type, Share.target_folder_id,
+                              Share.target_file_id, Share.view_only,
+                              Share.claim_audience, Share.audience_user_ids,
+                              Share.audience_department_ids)
+                .join(ShareClaim, ShareClaim.share_id == Share.id)
+                .filter(
+                    ShareClaim.user_id == user.id,
+                    ShareClaim.revoked.is_(False),
+                    Share.vault_id == vault.id,
+                    Share.status == 'active',
+                    Share.expires_at > now,
+                )
+                .all()
+            )
+            if rows:
+                gids = self._current_group_ids(user)
+                v_whole = d_whole = False
+                v_files, v_folders = set(), set()
+                d_files, d_folders = set(), set()
+                for (target_type, folder_id, file_id, view_only,
+                     _aud, _au, _ad) in rows:
+                    # Drop a claim whose audience the caller no longer matches (e.g. removed from the
+                    # targeted department) so its item leaves the caller's live scope.
+                    if not self._audience_ok(_aud, _au, _ad, user.id, gids):
+                        continue
+                    # Every active claim contributes to the VISIBLE scope; only a non-view-only claim
+                    # also contributes to the DOWNLOADABLE scope.
+                    if target_type == 'vault':
+                        v_whole = True
+                        if not view_only:
+                            d_whole = True
+                    elif target_type == 'folder' and folder_id is not None:
+                        v_folders.add(str(folder_id))
+                        if not view_only:
+                            d_folders.add(str(folder_id))
+                    elif target_type == 'file' and file_id is not None:
+                        v_files.add(str(file_id))
+                        if not view_only:
+                            d_files.add(str(file_id))
+                visible = None if v_whole else {"files": sorted(v_files), "folders": sorted(v_folders)}
+                downloadable = None if d_whole else {"files": sorted(d_files), "folders": sorted(d_folders)}
+        self._stamp_scope(user, "_share_vault_scope", vault.id, visible)
+        self._stamp_scope(user, "_share_download_scope", vault.id, downloadable)
+
+    @staticmethod
+    def _stamp_scope(user: User, attr: str, vault_id, scope) -> None:
+        smap = getattr(user, attr, None)
+        if smap is None:
+            smap = {}
+            setattr(user, attr, smap)
+        smap[str(vault_id)] = scope
+
+    def burn_share_download(self, user: User, vault: Vault, file, ancestor_folder_ids) -> bool:
+        """Consume ONE download against the per-recipient ``max_downloads`` of the SHARE claims that
+        cover this file (each recipient gets their own per-share download budget). Returns True to allow, False to deny
+        (a covering LIMITED claim is exhausted). MUST be called only for a share recipient (the caller
+        gates on the share-scope stamp); it independently re-resolves the covering claims.
+
+        Coverage: a claim covers `file` if it is a whole-vault share, a folder share whose target
+        folder is `file`'s own folder or an ancestor, or a file share of exactly this file. Only
+        active, non-revoked, non-view-only claims count (a view-only claim can't download, so it can't
+        consume a download). If ANY covering claim is UNLIMITED (max_downloads NULL) the download is
+        unlimited and burns nothing. Otherwise EACH covering LIMITED claim is consumed via an ATOMIC
+        conditional increment (``download_count < max_downloads`` in the WHERE — so concurrent GETs by
+        the same recipient can never exceed the cap); if any is already at its cap the whole burn is
+        rolled back and the download denied. No covering claim => DENY (fail-closed): require_download_scope
+        authorized this file from the SAME claim set, so an empty covering set means the claim vanished
+        after the scope stamp (a revoke/expiry/audience-removal mid-request). The web download endpoint
+        serves the full object (no Range/partial responses), so every successful GET counts once.
+
+        TRANSACTION OWNERSHIP: this commits (on allow) or rolls back (on deny) the request session, so
+        it must be called with NO unrelated pending writes — at the current call site (the download
+        endpoint, after get_vault has committed and only reads follow) that holds."""
+        now = datetime.utcnow()
+        anc = {str(a) for a in (ancestor_folder_ids or [])}
+        fid = str(file.id)
+        rows = (
+            self.db.query(ShareClaim.id, Share.max_downloads, Share.target_type,
+                          Share.target_folder_id, Share.target_file_id,
+                          Share.claim_audience, Share.audience_user_ids,
+                          Share.audience_department_ids)
+            .join(Share, Share.id == ShareClaim.share_id)
+            .filter(
+                ShareClaim.user_id == user.id,
+                ShareClaim.revoked.is_(False),
+                Share.vault_id == vault.id,
+                Share.view_only.is_(False),
+                Share.status == 'active',
+                Share.expires_at > now,
+            )
+            .all()
+        )
+        gids = self._current_group_ids(user)
+        covering = []
+        for (claim_id, max_dl, ttype, tfolder, tfile,
+             _aud, _au, _ad) in rows:
+            # A claim whose audience the caller no longer matches confers nothing (same live check as
+            # the read grant + scope stamp), so it must neither count toward nor block this budget.
+            if not self._audience_ok(_aud, _au, _ad, user.id, gids):
+                continue
+            covers = (
+                ttype == 'vault'
+                or (ttype == 'folder' and tfolder is not None and str(tfolder) in anc)
+                or (ttype == 'file' and tfile is not None and str(tfile) == fid)
+            )
+            if covers:
+                covering.append((claim_id, max_dl))
+        if not covering:
+            # Fail CLOSED: require_download_scope already authorized this download from the SAME claim
+            # set, so reaching here with no covering claim means it vanished after the scope stamp
+            # (a revoke/expiry/audience-removal mid-request) — deny rather than serve an un-metered
+            # download. A legitimately unlimited share has a covering claim with max_downloads NULL,
+            # handled below.
+            return False
+        # An unlimited covering claim ⇒ unlimited downloads for this file (burn nothing).
+        if any(max_dl is None for _, max_dl in covering):
+            return True
+        # All covering claims are limited: atomically consume one from EACH; deny (and roll back the
+        # whole burn) if any is already at its cap. Consuming every covering limited claim keeps each
+        # share's max_downloads a hard ceiling — the multi-claim keying is intentionally strict.
+        for claim_id, max_dl in covering:
+            res = self.db.execute(
+                update(ShareClaim)
+                .where(ShareClaim.id == claim_id, ShareClaim.download_count < max_dl)
+                .values(download_count=ShareClaim.download_count + 1)
+            )
+            if res.rowcount == 0:
+                self.db.rollback()
+                return False
+        self.db.commit()
+        return True
 
     def _group_vault_permission(self, user: User, vault_id: uuid.UUID) -> Optional[dict]:
         """Highest vault permission the user gets via any group that has been
@@ -336,21 +601,24 @@ class PermissionService:
         self,
         user: User,
         vault_id: uuid.UUID,
-        required_permission: VaultPermissionEnum = VaultPermissionEnum.READ
+        required_permission: VaultPermissionEnum = VaultPermissionEnum.READ,
+        allow_share: bool = False,
     ) -> bool:
         """
         Check if user can access a vault with specified permission.
-        
+
         Args:
             user: User object
             vault_id: Vault UUID
             required_permission: Required vault permission
-            
+            allow_share: opt-in to an active whole-vault share claim (see
+                get_vault_permissions). Defaults False → SFTP/write paths fail-closed.
+
         Returns:
             True if user has access, False otherwise
         """
-        perms = self.get_vault_permissions(user, vault_id)
-        
+        perms = self.get_vault_permissions(user, vault_id, allow_share=allow_share)
+
         if not perms:
             return False
         
@@ -366,16 +634,19 @@ class PermissionService:
         self,
         user: User,
         vault_id: uuid.UUID,
-        required_permission: VaultPermissionEnum = VaultPermissionEnum.READ
+        required_permission: VaultPermissionEnum = VaultPermissionEnum.READ,
+        allow_share: bool = False,
     ):
         """
         Require user to have vault access permission.
-        
+
         Args:
             user: User object
             vault_id: Vault UUID
             required_permission: Required vault permission
-            
+            allow_share: opt-in to an active whole-vault share claim (see
+                get_vault_permissions). Defaults False → SFTP/write paths fail-closed.
+
         Raises:
             ResourceNotFoundError: If vault not found
             PermissionDeniedError: If user lacks permission
@@ -383,8 +654,8 @@ class PermissionService:
         vault = self.db.query(Vault).filter(Vault.id == vault_id).first()
         if not vault:
             raise ResourceNotFoundError(f"Vault not found: {vault_id}")
-        
-        if not self.can_access_vault(user, vault_id, required_permission):
+
+        if not self.can_access_vault(user, vault_id, required_permission, allow_share=allow_share):
             raise PermissionDeniedError(
                 f"User lacks {required_permission.value} permission for vault {vault_id}"
             )

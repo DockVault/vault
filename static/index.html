@@ -226,6 +226,10 @@
                         <span class="sidebar-icon"><svg class="icon"><use href="#i-vault"/></svg></span>
                         <span class="sidebar-text">Vaults</span>
                     </a>
+                    <a href="#" class="sidebar-item" data-section="shared">
+                        <span class="sidebar-icon"><svg class="icon"><use href="#i-link"/></svg></span>
+                        <span class="sidebar-text">Shared</span>
+                    </a>
                     <a href="#" class="sidebar-item" data-section="temp-creds">
                         <span class="sidebar-icon"><svg class="icon"><use href="#i-clock"/></svg></span>
                         <span class="sidebar-text">Temp Credentials</span>
@@ -368,6 +372,32 @@
                     <div id="vaults-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: var(--space-md);"></div>
                 </div>
 
+                <!-- Shared with me (recipient tab) -->
+                <div id="shared-section" class="content-section">
+                    <div class="flex justify-between items-center mb-lg">
+                        <h2 class="text-2xl font-bold">Shared</h2>
+                    </div>
+                    <div class="tabs mb-lg" role="tablist">
+                        <button class="tab-btn active" type="button" data-shared-tab="with-me">Shared with me</button>
+                        <button class="tab-btn" type="button" data-shared-tab="by-me">Shared by me</button>
+                    </div>
+                    <div id="shared-tab-with-me" class="shared-tab-content">
+                        <div class="card mb-lg" style="padding: var(--space-md);">
+                            <label for="claim-link-input" class="text-sm font-bold">Claim a share link</label>
+                            <p class="text-secondary text-sm mb-sm">Paste a share link or token to add it to your shared items.</p>
+                            <div class="flex items-center gap-sm">
+                                <input id="claim-link-input" type="text" class="input" style="flex:1;"
+                                       placeholder="Paste a share link or token" autocomplete="off" />
+                                <button id="claim-link-btn" class="btn btn-primary" type="button">Claim</button>
+                            </div>
+                        </div>
+                        <div id="shared-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: var(--space-md);"></div>
+                    </div>
+                    <div id="shared-tab-by-me" class="shared-tab-content" style="display:none;">
+                        <div id="shared-by-me-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: var(--space-md);"></div>
+                    </div>
+                </div>
+
                 <!-- Individual Vault View (Hidden by default) -->
                 <div id="vault-view-section" class="content-section">
                     <!-- Compact vault header: back + title + lock, all inline -->
@@ -401,6 +431,7 @@
                                 <input type="file" id="file-upload-input" multiple style="display: none;">
                                 <button id="upload-file-btn" class="btn btn-primary btn-sm"><svg class="icon icon-sm"><use href="#i-upload"/></svg> Upload File</button>
                                 <button id="create-folder-btn" class="btn btn-secondary btn-sm"><svg class="icon icon-sm"><use href="#i-folder"/></svg> New Folder</button>
+                                <button id="share-vault-btn" class="btn btn-secondary btn-sm"><svg class="icon icon-sm"><use href="#i-link"/></svg> Share</button>
                             </div>
                         </div>
 
@@ -867,6 +898,7 @@
                         <button class="tab-btn" data-tab="storage">Storage</button>
                         <button class="tab-btn" data-tab="email">Email</button>
                         <button class="tab-btn" data-tab="sftp">SFTP &amp; Encryption</button>
+                        <button class="tab-btn" data-tab="sharing">Sharing</button>
                         <button class="tab-btn" data-tab="logs">Log access</button>
                         <button class="tab-btn" data-tab="audit">Audit Log</button>
                     </div>
@@ -1323,6 +1355,127 @@
                         </div>
                     </div>
 
+                    <!-- Sharing Tab -->
+                    <div id="settings-tab-sharing" class="settings-tab-content">
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>Sharing</h3>
+                            </div>
+                            <div class="p-lg">
+                                <label class="flex items-center gap-sm">
+                                    <input type="checkbox" id="setting-sharing-enabled">
+                                    <span>Enable sharing</span>
+                                </label>
+                                <p class="text-secondary text-sm mt-sm">When enabled, users may share a file, folder, or whole standard vault with other authenticated members of this deployment, governed by the tags below. Sharing is never anonymous — every recipient must sign in. Leave off to disable sharing entirely.</p>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header flex justify-between items-center">
+                                <h3>Share Tags</h3>
+                                <button type="button" id="share-tag-add-btn" class="btn btn-secondary">Add tag</button>
+                            </div>
+                            <div class="p-lg">
+                                <p class="text-secondary text-sm mb-md">A tag classifies a share and carries its policy (how long it lasts, how many recipients/downloads, which audiences, whether view-only) plus a create-allowlist controlling who may create shares with it. Deactivating a tag stops new shares under it; existing shares keep the limits they were created with.</p>
+                                <div id="share-tags-list"></div>
+
+                                <!-- Add / edit editor (hidden until Add / Edit) -->
+                                <div id="share-tag-editor" class="card mt-lg" style="display:none;">
+                                    <div class="card-header"><h4 id="share-tag-editor-title">Add tag</h4></div>
+                                    <div class="p-lg">
+                                        <input type="hidden" id="share-tag-editor-id">
+                                        <div class="form-group">
+                                            <label for="share-tag-name">Name</label>
+                                            <input type="text" id="share-tag-name" class="form-control" maxlength="120" placeholder="e.g. Confidential">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="share-tag-description">Description</label>
+                                            <input type="text" id="share-tag-description" class="form-control" placeholder="Optional">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="share-tag-color">Colour</label>
+                                            <input type="text" id="share-tag-color" class="form-control" maxlength="20" placeholder="e.g. indigo" style="max-width:200px;">
+                                        </div>
+
+                                        <div class="form-group mt-md">
+                                            <label>Lifetime (minutes)</label>
+                                            <div class="flex gap-sm">
+                                                <div>
+                                                    <label class="text-sm text-secondary" for="share-tag-max-lifetime">Ceiling</label>
+                                                    <input type="number" id="share-tag-max-lifetime" class="form-control" min="1" style="max-width:160px;">
+                                                </div>
+                                                <div>
+                                                    <label class="text-sm text-secondary" for="share-tag-default-lifetime">Default</label>
+                                                    <input type="number" id="share-tag-default-lifetime" class="form-control" min="1" style="max-width:160px;">
+                                                </div>
+                                            </div>
+                                            <p class="text-secondary text-sm mt-sm">The default must not exceed the ceiling. There is no fixed maximum — a ceiling may be as long as you like.</p>
+                                        </div>
+
+                                        <div class="form-group mt-md">
+                                            <label>Recipients</label>
+                                            <div class="flex gap-sm">
+                                                <div><label class="text-sm text-secondary" for="share-tag-max-recipients-cap">Cap (blank = unlimited)</label><input type="number" id="share-tag-max-recipients-cap" class="form-control" min="1" style="max-width:180px;"></div>
+                                                <div><label class="text-sm text-secondary" for="share-tag-max-recipients-default">Default</label><input type="number" id="share-tag-max-recipients-default" class="form-control" min="1" style="max-width:160px;"></div>
+                                            </div>
+                                        </div>
+
+                                        <div class="form-group mt-md">
+                                            <label>Downloads</label>
+                                            <div class="flex gap-sm">
+                                                <div><label class="text-sm text-secondary" for="share-tag-max-downloads-cap">Cap (blank = unlimited)</label><input type="number" id="share-tag-max-downloads-cap" class="form-control" min="1" style="max-width:180px;"></div>
+                                                <div><label class="text-sm text-secondary" for="share-tag-max-downloads-default">Default</label><input type="number" id="share-tag-max-downloads-default" class="form-control" min="1" style="max-width:160px;"></div>
+                                            </div>
+                                        </div>
+
+                                        <div class="form-group mt-md">
+                                            <label>Allowed audiences</label>
+                                            <p class="text-secondary text-sm mb-sm">Which recipient audiences a creator may choose for a share with this tag.</p>
+                                            <label class="flex items-center gap-sm"><input type="checkbox" id="share-tag-aud-users"><span>Specific users</span></label>
+                                            <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="share-tag-aud-departments"><span>Departments</span></label>
+                                            <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="share-tag-aud-anyone"><span>Anyone internal with the link</span></label>
+                                        </div>
+
+                                        <div class="form-group mt-md">
+                                            <label>Capabilities</label>
+                                            <label class="flex items-center gap-sm"><input type="checkbox" id="share-tag-allow-view-only"><span>Allow view-only shares (no download)</span></label>
+                                            <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="share-tag-default-view-only"><span>Default new shares to view-only</span></label>
+                                            <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="share-tag-force-view-only"><span>Force view-only (creators cannot enable download)</span></label>
+                                            <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="share-tag-allow-custom"><span>Let creators customise limits within the caps</span></label>
+                                        </div>
+
+                                        <div class="form-group mt-md">
+                                            <label>Who may create shares with this tag</label>
+                                            <label class="flex items-center gap-sm"><input type="checkbox" id="share-tag-auto-enroll"><span>Everyone (auto-enroll all users, except any blocked)</span></label>
+                                            <div class="mt-sm">
+                                                <label class="text-sm text-secondary">Allowed departments</label>
+                                                <div id="share-tag-dept-picker"></div>
+                                            </div>
+                                            <div class="mt-sm">
+                                                <label class="text-sm text-secondary" for="share-tag-allow-user-search">Allowed users</label>
+                                                <input type="text" id="share-tag-allow-user-search" class="form-control" placeholder="Search by username (type at least 2 characters)" autocomplete="off">
+                                                <div id="share-tag-allow-user-results" class="share-tag-user-results" style="max-height:180px; overflow:auto;"></div>
+                                                <div id="share-tag-allow-user-chips" class="chip-row mt-sm"></div>
+                                            </div>
+                                            <div class="mt-sm">
+                                                <label class="text-sm text-secondary" for="share-tag-block-user-search">Blocked users</label>
+                                                <input type="text" id="share-tag-block-user-search" class="form-control" placeholder="Search by username (type at least 2 characters)" autocomplete="off">
+                                                <div id="share-tag-block-user-results" class="share-tag-user-results" style="max-height:180px; overflow:auto;"></div>
+                                                <div id="share-tag-block-user-chips" class="chip-row mt-sm"></div>
+                                            </div>
+                                            <p class="text-secondary text-sm mt-sm">If auto-enroll is off and no departments or users are allowed, no one can create shares with this tag until you grant access. A blocked user can never create with this tag, even via a department or auto-enroll.</p>
+                                        </div>
+
+                                        <div class="flex gap-sm mt-lg">
+                                            <button type="button" id="share-tag-save-btn" class="btn btn-primary">Save tag</button>
+                                            <button type="button" id="share-tag-cancel-btn" class="btn btn-secondary">Cancel</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Audit Log Tab -->
                     <div id="settings-tab-audit" class="settings-tab-content">
                         <div class="card mb-lg">
@@ -1461,6 +1614,57 @@
             <!-- Active modals: create vault, create user, edit user, change user password.
                  NOTE: do NOT wrap these in display:none — each .modal is hidden by default
                  and shown via the .active class; a hidden ancestor would make them unreachable. -->
+                <div id="create-share-modal" class="modal">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3>Share</h3>
+                            <button class="close-modal-btn modal-close" aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <p class="text-secondary text-sm mb-sm">Sharing: <span id="share-target-label" class="font-bold"></span></p>
+                            <div id="share-create-fields">
+                                <div class="form-group">
+                                    <label for="share-tag-select">Classification tag</label>
+                                    <select id="share-tag-select" class="input"></select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="share-audience-select">Who can claim this</label>
+                                    <select id="share-audience-select" class="input"></select>
+                                </div>
+                                <div class="form-group" id="share-users-group" style="display:none;">
+                                    <label for="share-user-search">Recipients</label>
+                                    <input id="share-user-search" type="text" class="input" placeholder="Search users…" autocomplete="off" />
+                                    <div id="share-user-results" class="pick-results"></div>
+                                    <div id="share-user-chips" class="chip-row"></div>
+                                </div>
+                                <div class="form-group" id="share-depts-group" style="display:none;">
+                                    <label>Recipient departments</label>
+                                    <div id="share-dept-picker"></div>
+                                </div>
+                                <div class="form-group" id="share-viewonly-group" style="display:none;">
+                                    <label class="checkbox-label"><input type="checkbox" id="share-view-only" /> View only (recipients can preview but not download)</label>
+                                </div>
+                                <div id="share-limits-group" style="display:none;">
+                                    <div class="form-group"><label for="share-lifetime-days">Expires after (days, optional)</label><input id="share-lifetime-days" type="number" min="1" step="1" class="input" /></div>
+                                    <div class="form-group"><label for="share-max-recipients">Max recipients (optional)</label><input id="share-max-recipients" type="number" min="1" step="1" class="input" /></div>
+                                    <div class="form-group"><label for="share-max-downloads">Max downloads per recipient (optional)</label><input id="share-max-downloads" type="number" min="1" step="1" class="input" /></div>
+                                </div>
+                                <div id="share-create-error" class="alert alert-error" style="display:none;"></div>
+                            </div>
+                            <div id="share-create-result" style="display:none;">
+                                <p class="text-secondary text-sm">Share created. Copy the link now — it will not be shown again.</p>
+                                <div class="flex items-center gap-sm">
+                                    <code id="share-link-value" class="input" style="flex:1; overflow:auto; white-space:nowrap;"></code>
+                                    <button id="share-link-copy" class="btn btn-secondary" type="button">Copy</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="close-modal-btn btn btn-secondary" id="share-modal-close">Close</button>
+                            <button id="share-create-submit" class="btn btn-primary" type="button">Create share</button>
+                        </div>
+                    </div>
+                </div>
                 <div id="create-vault-modal" class="modal">
                     <div class="modal-content">
                         <div class="modal-header">

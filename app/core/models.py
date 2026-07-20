@@ -12,7 +12,7 @@ from sqlalchemy import (
     Text, BigInteger, Enum, Table, JSON, Index, CheckConstraint, UniqueConstraint, text
 )
 from sqlalchemy.orm import relationship, declarative_base, backref
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 
 Base = declarative_base()
 
@@ -366,6 +366,130 @@ class TempCredentialVaultAccess(Base):
         UniqueConstraint('temp_credential_id', 'vault_id', name='uq_temp_cred_vault'),
         Index('idx_temp_cred_vault_cred', 'temp_credential_id'),
         Index('idx_temp_cred_vault_vault', 'vault_id'),
+    )
+
+
+class ShareTag(Base):
+    """Admin-owned share classification + policy — the spine of the Sharing feature.
+
+    One row per tag (e.g. Confidential / Internal / Temporary). Carries the POLICY a share minted under
+    it inherits (lifetime ceiling/default, recipient/download caps + defaults, allowed audiences,
+    view-only, whether a creator may customize within caps) AND a CREATE-ALLOWLIST governing who may
+    create shares with it. Soft-deactivated (is_active=False), never hard-deleted while shares reference
+    it — deactivating stops NEW creates; existing shares run out their snapshot. A WHOLE NEW TABLE (not
+    columns on an existing one) so init_db()'s create_all() migrates it cleanly onto already-deployed
+    vaults (create_all never ALTERs). The create-allowlist is evaluated LIVE (never snapshotted); the
+    limit/policy fields are snapshotted onto each Share at creation (see app/core/sharing_policy.py).
+    """
+    __tablename__ = 'share_tags'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(120), nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    color = Column(String(20), nullable=True)  # optional accent tag, e.g. 'indigo'
+    is_active = Column(Boolean, nullable=False, default=True)
+
+    # --- Policy (snapshotted onto a Share at creation; editing a tag does NOT change existing shares) ---
+    # Lifetime is admin-bounded with NO app cap (may be years); hard floor 1 minute (sharing_policy.MIN_LIFETIME_MINUTES).
+    max_lifetime_minutes = Column(Integer, nullable=False, default=10080)     # ceiling (default 7 days)
+    default_lifetime_minutes = Column(Integer, nullable=False, default=1440)  # default (1 day)
+    # NULL cap / NULL default = unlimited on that axis (within the tag). A default may not exceed its cap.
+    max_recipients_cap = Column(Integer, nullable=True)
+    max_recipients_default = Column(Integer, nullable=True)
+    max_downloads_cap = Column(Integer, nullable=True)
+    max_downloads_default = Column(Integer, nullable=True)
+    allow_view_only = Column(Boolean, nullable=False, default=True)   # may a creator CHOOSE view-only?
+    default_view_only = Column(Boolean, nullable=False, default=False)  # is view-only the default (overridable)?
+    # force_view_only MANDATES view-only on every share minted under this tag, regardless of the creator's
+    # request or allow_custom — so an admin can require non-download while still letting creators customize
+    # the other limits (lifetime/recipients/downloads). Distinct from default_view_only (a mere default).
+    force_view_only = Column(Boolean, nullable=False, default=False)
+    allow_custom = Column(Boolean, nullable=False, default=True)  # may a creator override defaults within caps?
+    # Subset of sharing_policy.AUDIENCES the creator may pick for a share's claim-audience.
+    allowed_audiences = Column(JSON, nullable=False, default=list)
+
+    # --- Create-allowlist (evaluated LIVE, never snapshotted): who may create a share with this tag ---
+    allowed_department_ids = Column(JSON, nullable=False, default=list)  # group ids (str)
+    allowed_user_ids = Column(JSON, nullable=False, default=list)        # user ids (str)
+    blocked_user_ids = Column(JSON, nullable=False, default=list)        # user ids (str) — the blocklist wins
+    auto_enroll_new_users = Column(Boolean, nullable=False, default=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+
+    __table_args__ = (
+        Index('idx_share_tag_active', 'is_active'),
+    )
+
+
+class Share(Base):
+    """One shared item — a file, a folder (recursively), or a whole Standard vault — granted to
+    authorized, logged-in internal users and classified by a ShareTag. The tag's LIMIT policy is
+    SNAPSHOTTED here at creation (editing the tag later never changes an existing share); the tag's
+    create-allowlist and any revoke stay LIVE. New table (created by create_all). Standard vaults only
+    (never zero-knowledge); a password-protected vault is refused at create. The link token is stored
+    HASHED (a bearer secret) and the plaintext is shown once at create."""
+    __tablename__ = 'shares'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    creator_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    vault_id = Column(UUID(as_uuid=True), ForeignKey('vaults.id', ondelete='CASCADE'), nullable=False)
+    # RESTRICT: a tag can't be hard-deleted while shares reference it (tags soft-deactivate instead).
+    tag_id = Column(UUID(as_uuid=True), ForeignKey('share_tags.id', ondelete='RESTRICT'), nullable=False)
+
+    target_type = Column(String(10), nullable=False)  # 'vault' | 'folder' | 'file'
+    target_folder_id = Column(UUID(as_uuid=True), ForeignKey('folders.id', ondelete='CASCADE'), nullable=True)
+    target_file_id = Column(UUID(as_uuid=True), ForeignKey('files.id', ondelete='CASCADE'), nullable=True)
+
+    # --- Distribution ---
+    link_token_hash = Column(String(64), nullable=True)  # sha256 hex of the bearer link token; NULL = direct-only
+    claim_audience = Column(String(20), nullable=False)  # 'users' | 'departments' | 'anyone_internal'
+    # JSONB (not JSON) so the "shared with me" scan can filter server-side with @> containment and be
+    # GIN-indexed (below), instead of fetching every active named-audience share and filtering in Python.
+    audience_user_ids = Column(JSONB, nullable=False, default=list)       # only for claim_audience 'users'
+    audience_department_ids = Column(JSONB, nullable=False, default=list)  # only for claim_audience 'departments'
+
+    # --- Limits (SNAPSHOT at creation) ---
+    expires_at = Column(DateTime, nullable=False)
+    max_recipients = Column(Integer, nullable=True)  # NULL = unlimited (within the tag cap at create)
+    max_downloads = Column(Integer, nullable=True)   # NULL = unlimited (within the tag cap at create)
+    view_only = Column(Boolean, nullable=False, default=False)  # capability: view-only vs read+download
+    tag_policy_snapshot = Column(JSON, nullable=True)  # the tag's limit fields at creation (provenance)
+
+    # --- State ---
+    status = Column(String(10), nullable=False, default='active')  # 'active' | 'revoked' | 'expired'
+    revoked_at = Column(DateTime, nullable=True)
+    revoked_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_share_creator', 'creator_id'),
+        Index('idx_share_vault', 'vault_id'),
+        Index('idx_share_token', 'link_token_hash'),
+        # GIN indexes for the JSONB @> containment used by the direct-push "shared with me" scan.
+        Index('idx_share_aud_users', 'audience_user_ids', postgresql_using='gin'),
+        Index('idx_share_aud_depts', 'audience_department_ids', postgresql_using='gin'),
+    )
+
+
+class ShareClaim(Base):
+    """One claimant of a Share (one row per distinct claiming user, created at claim time). Enforces
+    max_recipients (# active rows) and carries the per-recipient download counter + the single-recipient
+    kick. Unique per (share, user)."""
+    __tablename__ = 'share_claims'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    share_id = Column(UUID(as_uuid=True), ForeignKey('shares.id', ondelete='CASCADE'), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    claimed_at = Column(DateTime, default=datetime.utcnow)
+    last_access_at = Column(DateTime, nullable=True)
+    download_count = Column(Integer, nullable=False, default=0)
+    revoked = Column(Boolean, nullable=False, default=False)  # single-recipient kick
+
+    __table_args__ = (
+        UniqueConstraint('share_id', 'user_id', name='uq_share_claim_user'),
+        Index('idx_share_claim_share', 'share_id'),
     )
 
 
