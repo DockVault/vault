@@ -5071,6 +5071,18 @@ def _claim_resolved_share(db: Session, share: Share, current_user: User, request
         if share.status == "active":
             share.status = "expired"  # lazy expiry: flip the stored status for the UI
             db.commit()
+            # Audit the active->expired transition (ids only, name-redacted). The status=='active' guard
+            # above suppresses re-emit on any later claim of the already-flipped share, so sequential
+            # claims emit once; a rare concurrent claim race could still write a duplicate benign audit
+            # row (the flip is idempotent, so no data impact). Expiry is otherwise lazy (no periodic
+            # sweep), so this claim-time flip is the transition event.
+            try:
+                AuditLogger(db).log_action(
+                    action="share_expired", status="success", user=current_user,
+                    ip_address=get_client_ip(request),
+                    details={"share_id": str(share.id), "vault_id": str(share.vault_id)})
+            except Exception:
+                db.rollback()
         raise HTTPException(status_code=410, detail="That share has expired.")
 
     # Defense-in-depth: the vault must still be a shareable Standard, non-password vault (these are refused
