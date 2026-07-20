@@ -453,7 +453,10 @@ if [ "$CERTS_ONLY" -eq 1 ]; then
   [ "$HAVE_ENV" -eq 1 ] || die "no ./.env yet — run a full setup first (sudo ./setup-secure.sh)"
   SERVER_NAME="${SERVER_NAME:-$(read_env SERVER_NAME)}"
   ask SERVER_NAME "Public DNS name (or public IP) clients will use, e.g. vault.example.com"
-  [[ "$SERVER_NAME" =~ [[:space:]] ]] && die "'$SERVER_NAME' contains whitespace"
+  # SERVER_NAME flows single-quoted into .env (ALLOWED_HOSTS/SERVER_NAME), the TLS cert
+  # subject/SAN, and the renewal-hook — restrict it to a safe host charset so a quote or
+  # metacharacter can't mangle any of those (mirrors setup-secure.ps1).
+  case "$SERVER_NAME" in *[!A-Za-z0-9.-]*) die "invalid server name '$SERVER_NAME' (letters, digits, dots, hyphens only)";; esac
   choose_cert_mode
   generate_certs
   _svc="$(app_svc)"
@@ -503,14 +506,20 @@ if [ "$HAVE_ENV" -eq 1 ]; then
   else
     warn "no certificates found in ./$CERT_DIR — generating them now."
     ask SERVER_NAME "Public DNS name (or public IP) clients will use, e.g. vault.example.com"
-    [[ "$SERVER_NAME" =~ [[:space:]] ]] && die "'$SERVER_NAME' contains whitespace"
+    # SERVER_NAME flows single-quoted into .env (ALLOWED_HOSTS/SERVER_NAME), the TLS cert
+  # subject/SAN, and the renewal-hook — restrict it to a safe host charset so a quote or
+  # metacharacter can't mangle any of those (mirrors setup-secure.ps1).
+  case "$SERVER_NAME" in *[!A-Za-z0-9.-]*) die "invalid server name '$SERVER_NAME' (letters, digits, dots, hyphens only)";; esac
     choose_cert_mode
     generate_certs
   fi
 else
   # ------- FIRST RUN: gather settings, generate secrets, write .env, certs -----
   ask SERVER_NAME "Public DNS name (or public IP) clients will use, e.g. vault.example.com"
-  [[ "$SERVER_NAME" =~ [[:space:]] ]] && die "'$SERVER_NAME' contains whitespace"
+  # SERVER_NAME flows single-quoted into .env (ALLOWED_HOSTS/SERVER_NAME), the TLS cert
+  # subject/SAN, and the renewal-hook — restrict it to a safe host charset so a quote or
+  # metacharacter can't mangle any of those (mirrors setup-secure.ps1).
+  case "$SERVER_NAME" in *[!A-Za-z0-9.-]*) die "invalid server name '$SERVER_NAME' (letters, digits, dots, hyphens only)";; esac
   choose_cert_mode
 
   # Values land single-quoted in .env — a single quote in them breaks compose's
