@@ -129,6 +129,37 @@ just an unauthenticated request to GitHub's public release API (the only thing G
 server's egress IP, as with any outbound request), and it **fails silently**, so an air-gapped or
 firewalled install is never affected. Leave it off for offline deployments.
 
+## Upgrading
+
+Upgrading means replacing the container with a newer image — your data lives in named volumes and is
+untouched. The entrypoint automatically fixes volume ownership on the way up, so upgrading from an
+older (root-era) image "just works".
+
+**From source** (works today, no prebuilt image needed):
+
+```bash
+git pull
+docker compose -f docker-compose.secure.yml up -d --build   # or `docker compose up -d --build` for the local trial
+```
+
+**From a prebuilt image** (once a release is published to GHCR) — set `DOCKVAULT_IMAGE` in `.env` to
+the release tag, then pull + restart with no local build:
+
+```bash
+# in .env:  DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.6.0
+docker compose -f docker-compose.secure.yml pull
+docker compose -f docker-compose.secure.yml up -d
+```
+
+Either way, re-running `./setup-secure.sh` also upgrades (it rebuilds, recreates the containers, and
+keeps your `.env` and data). The `build:` path stays in the compose files, so you can always build
+your own (modified) image — which the AGPL license requires you be able to do.
+
+> **Database migrations:** the app creates any missing tables on boot but does **not** yet alter
+> existing columns automatically. A release that changes the schema will call out the migration step
+> in its notes — read the release notes before upgrading across a schema change, and back up the
+> database volume first.
+
 ## Repository layout
 
 | Path | What lives there |

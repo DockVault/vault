@@ -633,6 +633,27 @@ def test_update_check_admin_gated_and_default_off():
         "SECURITY.md must document the update-check phone-home"
 
 
+def test_release_workflow_and_upgrade_docs():
+    import re
+    wf = _read(".github/workflows/release.yml")
+    # Builds + pushes to GHCR, stamps the version, triggers on a version tag.
+    assert "ghcr.io/" in wf and "build-push-action" in wf, "release.yml must build+push to GHCR"
+    assert "APP_VERSION=" in wf, "release.yml must stamp the version via the build-arg"
+    assert "v*.*.*" in wf, "release.yml must trigger on a version tag"
+    # Every action is pinned to a full commit SHA (supply-chain hardening for a public security repo).
+    for use in re.findall(r"uses:\s*(\S+)", wf):
+        assert re.search(r"@[0-9a-f]{40}\b", use), f"action not pinned to a full SHA: {use}"
+    # The compose image is overridable for the pull-based upgrade path.
+    assert "${DOCKVAULT_IMAGE:-dockvault-vault:latest}" in _read("deploy/docker-compose.secure.yml"), \
+        "compose image must honour DOCKVAULT_IMAGE"
+    assert "DOCKVAULT_IMAGE=" in _read(".env.example")
+    # README documents BOTH upgrade paths + the migration caveat.
+    r = _read("README.md")
+    assert "## Upgrading" in r, "README must have an Upgrading section"
+    assert "up -d --build" in r and "pull" in r, "both upgrade paths (build + pull) must be documented"
+    assert "migration" in r.lower(), "the DB-migration caveat must be documented"
+
+
 def test_readme_documents_deployment_modes():
     # The README must explain the combined (default) vs split deployment modes and the combined-mode
     # trade-offs a self-hoster needs to know, so the toggle isn't a silent behaviour change.

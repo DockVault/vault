@@ -103,7 +103,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: dockvault-vault:latest
+    image: ${DOCKVAULT_IMAGE:-dockvault-vault:latest}
     container_name: vault
     env_file:
       - ../.env
@@ -192,7 +192,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: dockvault-vault:latest
+    image: ${DOCKVAULT_IMAGE:-dockvault-vault:latest}
     container_name: vault-api
     env_file:
       - ../.env
@@ -296,7 +296,7 @@ services:
     # (In the DEFAULT combined mode, SFTP runs inside the single `vault` container via
     # RUN_SFTP=1 instead — you do not need split just to get SFTP.)
     profiles: ["split"]
-    image: dockvault-vault:latest
+    image: ${DOCKVAULT_IMAGE:-dockvault-vault:latest}
     container_name: vault-sftp
     env_file:
       - ../.env

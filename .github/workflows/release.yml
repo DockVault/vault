@@ -1,0 +1,63 @@
+name: Release
+
+# Build the DockVault image, publish it to GHCR, and cut a GitHub Release when a version tag is
+# pushed:  git tag v0.6.0 && git push origin v0.6.0
+# The image self-reports the tag version (APP_VERSION build-arg -> /version + /info). The compose
+# files keep their `build:` path, so from-source users are unaffected; this just adds a prebuilt
+# image for the fast `docker compose pull` upgrade path (README "Upgrading").
+#
+# Third-party actions are pinned to a full commit SHA (supply-chain hardening); the trailing
+# comment records the human-readable version. Bump both together when updating an action.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # create the GitHub Release
+  packages: write   # push to GHCR
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Resolve version + image name
+        id: meta
+        run: |
+          ref="${GITHUB_REF_NAME:-}"
+          ver="${ref#v}"
+          if [ -z "$ver" ] || ! printf '%s' "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            ver="$(cat VERSION)"
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/vault" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:v${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:latest
+
+      # Only cut a Release for an actual tag push (skipped on a manual workflow_dispatch build).
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          generate_release_notes: true
