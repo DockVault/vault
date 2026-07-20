@@ -1735,11 +1735,18 @@ function onShareTagChange() {
     audSel.replaceChildren(...auds.map(a => { const o = _el('option', null, _SHARE_AUD_LABEL[a] || a); o.value = a; return o; }));
     const voGroup = document.getElementById('share-viewonly-group');
     const voInput = document.getElementById('share-view-only');
-    voGroup.style.display = t.allow_view_only ? '' : 'none';
-    voInput.checked = !!(t.allow_view_only && t.default_view_only);
-    // The backend only honors a custom view_only when the tag allows customization; otherwise it
-    // forces default_view_only. Reflect that: editable only when allow_custom, else read-only.
-    voInput.disabled = !t.allow_custom;
+    if (t.force_view_only) {
+        // The tag MANDATES view-only: show it, force it on, and lock it (the server enforces this too).
+        voGroup.style.display = '';
+        voInput.checked = true;
+        voInput.disabled = true;
+    } else {
+        voGroup.style.display = t.allow_view_only ? '' : 'none';
+        voInput.checked = !!(t.allow_view_only && t.default_view_only);
+        // The backend only honors a custom view_only when the tag allows customization; otherwise it
+        // forces default_view_only. Reflect that: editable only when allow_custom, else read-only.
+        voInput.disabled = !t.allow_custom;
+    }
     document.getElementById('share-limits-group').style.display = t.allow_custom ? '' : 'none';
     _shareCreate.userIds = []; _shareCreate.deptIds = [];
     onShareAudienceChange();
@@ -5261,9 +5268,13 @@ function _stNumOrNull(id) {
 function _stSyncViewOnly() {
     const allow = _stEl('share-tag-allow-view-only');
     const def = _stEl('share-tag-default-view-only');
-    if (!allow || !def) return;
-    if (!allow.checked) def.checked = false;
-    def.disabled = !allow.checked;
+    const force = _stEl('share-tag-force-view-only');
+    if (!allow) return;
+    // Forcing view-only requires allowing it — checking force auto-enables allow (mirrors the backend
+    // invariant force_view_only requires allow_view_only), so the admin can't submit the invalid pair.
+    if (force && force.checked && !allow.checked) allow.checked = true;
+    if (def) { if (!allow.checked) def.checked = false; def.disabled = !allow.checked; }
+    if (force) force.disabled = !allow.checked;
 }
 
 function setupShareTagsUI() {
@@ -5277,6 +5288,8 @@ function setupShareTagsUI() {
     cancel.addEventListener('click', closeShareTagEditor);
     const allowVO = _stEl('share-tag-allow-view-only');
     if (allowVO) allowVO.addEventListener('change', _stSyncViewOnly);
+    const forceVO = _stEl('share-tag-force-view-only');
+    if (forceVO) forceVO.addEventListener('change', _stSyncViewOnly);
     const allowSearch = _stEl('share-tag-allow-user-search');
     if (allowSearch) allowSearch.addEventListener('input', () => {
         clearTimeout(_tagUserSearchTimer.allow);
@@ -5337,6 +5350,8 @@ function renderShareTagsList() {
         if (Array.isArray(tag.allowed_audiences) && tag.allowed_audiences.length) {
             parts.push(`audiences: ${tag.allowed_audiences.join(', ')}`);
         }
+        if (tag.force_view_only) parts.push('view-only forced');
+        else if (tag.default_view_only) parts.push('view-only default');
         if (tag.auto_enroll_new_users) parts.push('auto-enroll');
         summary.textContent = parts.join(' · ');
         left.appendChild(summary);
@@ -5512,6 +5527,7 @@ function openShareTagEditor(tag) {
     _stEl('share-tag-aud-anyone').checked = aud.includes('anyone_internal');
     _stEl('share-tag-allow-view-only').checked = tag ? !!t.allow_view_only : true;
     _stEl('share-tag-default-view-only').checked = !!t.default_view_only;
+    _stEl('share-tag-force-view-only').checked = !!t.force_view_only;
     _stEl('share-tag-allow-custom').checked = tag ? !!t.allow_custom : true;
     _stEl('share-tag-auto-enroll').checked = !!t.auto_enroll_new_users;
     shareTagEditorDeptIds = (t.allowed_department_ids || []).map(String);
@@ -5555,6 +5571,7 @@ async function saveShareTag() {
         allowed_audiences: aud,
         allow_view_only: _stChecked('share-tag-allow-view-only'),
         default_view_only: _stChecked('share-tag-default-view-only'),
+        force_view_only: _stChecked('share-tag-force-view-only'),
         allow_custom: _stChecked('share-tag-allow-custom'),
         auto_enroll_new_users: _stChecked('share-tag-auto-enroll'),
         allowed_department_ids: shareTagEditorDeptIds.slice(),

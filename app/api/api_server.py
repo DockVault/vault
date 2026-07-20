@@ -678,6 +678,7 @@ class ShareTagCreate(BaseModel):
     max_downloads_default: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
     allow_view_only: bool = True
     default_view_only: bool = False
+    force_view_only: bool = False
     allow_custom: bool = True
     allowed_audiences: List[str] = Field(default_factory=lambda: list(sharing_policy.AUDIENCES))
     allowed_department_ids: List[uuid.UUID] = Field(default_factory=list)
@@ -718,6 +719,7 @@ class ShareTagUpdate(BaseModel):
     max_downloads_default: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
     allow_view_only: Optional[bool] = None
     default_view_only: Optional[bool] = None
+    force_view_only: Optional[bool] = None
     allow_custom: Optional[bool] = None
     allowed_audiences: Optional[List[str]] = None
     allowed_department_ids: Optional[List[uuid.UUID]] = None
@@ -4440,7 +4442,8 @@ async def delete_group(
 # empty-audiences tag. The caps (max_recipients_cap/max_downloads_cap) are nullable -> null clears them.
 _SHARE_TAG_NOT_NULLABLE = frozenset({
     "name", "is_active", "max_lifetime_minutes", "default_lifetime_minutes",
-    "allow_view_only", "default_view_only", "allow_custom", "auto_enroll_new_users", "allowed_audiences",
+    "allow_view_only", "default_view_only", "force_view_only", "allow_custom", "auto_enroll_new_users",
+    "allowed_audiences",
 })
 
 
@@ -4461,6 +4464,7 @@ def _share_tag_dict(t: ShareTag) -> dict:
         "max_downloads_default": t.max_downloads_default,
         "allow_view_only": t.allow_view_only,
         "default_view_only": t.default_view_only,
+        "force_view_only": t.force_view_only,
         "allow_custom": t.allow_custom,
         "allowed_audiences": list(t.allowed_audiences or []),
         "allowed_department_ids": [str(x) for x in (t.allowed_department_ids or [])],
@@ -4508,6 +4512,9 @@ def _validate_share_tag_fields(eff: dict, changed_keys: set, db: Session, existi
     # A view-only DEFAULT is meaningless if view-only isn't even ALLOWED for the tag.
     if eff.get("default_view_only") and eff.get("allow_view_only") is False:
         raise HTTPException(status_code=400, detail="default_view_only requires allow_view_only")
+    # Forcing view-only implies view-only is permitted; the contradictory combo is rejected.
+    if eff.get("force_view_only") and eff.get("allow_view_only") is False:
+        raise HTTPException(status_code=400, detail="force_view_only requires allow_view_only")
     aud = eff.get("allowed_audiences")
     if aud is not None:
         bad = [a for a in aud if a not in sharing_policy.AUDIENCES]
@@ -4691,6 +4698,7 @@ async def get_share_policy(
             "allowed_audiences": sharing_policy.normalize_audiences(t.allowed_audiences),
             "allow_view_only": t.allow_view_only,
             "default_view_only": t.default_view_only,
+            "force_view_only": t.force_view_only,
             "allow_custom": t.allow_custom,
             **eff,
         })
@@ -4888,7 +4896,7 @@ async def create_share(
         "max_recipients_cap": tag.max_recipients_cap, "max_recipients_default": tag.max_recipients_default,
         "max_downloads_cap": tag.max_downloads_cap, "max_downloads_default": tag.max_downloads_default,
         "allow_view_only": tag.allow_view_only, "default_view_only": tag.default_view_only,
-        "allow_custom": tag.allow_custom,
+        "force_view_only": tag.force_view_only, "allow_custom": tag.allow_custom,
     }
     limits, err = sharing_policy.resolve_share_limits(tag_limits, {
         "lifetime_minutes": payload.lifetime_minutes, "max_recipients": payload.max_recipients,
@@ -4911,7 +4919,8 @@ async def create_share(
 
     snapshot = dict(sharing_policy.tag_effective_limits(tag_limits))
     snapshot.update({"allow_view_only": tag.allow_view_only, "default_view_only": tag.default_view_only,
-                     "allow_custom": tag.allow_custom, "tag_name": tag.name})
+                     "force_view_only": tag.force_view_only, "allow_custom": tag.allow_custom,
+                     "tag_name": tag.name})
     share = Share(
         creator_id=current_user.id, vault_id=vault.id, tag_id=tag.id,
         target_type=tt, target_folder_id=tf_folder, target_file_id=tf_file,
@@ -10192,6 +10201,10 @@ def _run_lightweight_migrations():
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS enc_name TEXT",
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS name_bi VARCHAR(64)",
             "CREATE INDEX IF NOT EXISTS ix_folders_name_bi ON folders (name_bi)",
+            # Sharing: a tag can FORCE view-only on every share it mints (independent of allow_custom).
+            # create_all adds the column on a fresh DB; this backfills it on a vault that already ran an
+            # earlier sharing build. Idempotent + additive.
+            "ALTER TABLE share_tags ADD COLUMN IF NOT EXISTS force_view_only BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE folders ALTER COLUMN name DROP NOT NULL",
             # Zero-knowledge DEK rotation (forward-only versioning). dek_version is the
             # vault's current ZK DEK epoch; backfills every existing vault to 1, matching

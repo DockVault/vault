@@ -133,7 +133,8 @@ def resolve_share_limits(tag, requested):
         the tag defaults are used (a caller cannot widen a locked tag).
       - Otherwise each requested value is honored only WITHIN the tag's cap: a request ABOVE a cap is an
         ERROR (not a silent clamp), so the creator learns the share wasn't what they asked for. A
-        requested view-only is honored only if the tag allows view-only. `None`/absent falls to the
+        requested view-only is honored only if the tag allows view-only (a tag with force_view_only
+        MANDATES view-only regardless of the request or allow_custom). `None`/absent falls to the
         tag default. `max_recipients`/`max_downloads` caps of None mean unlimited (any positive value).
     Caps/defaults are read via tag_effective_limits (defaults already clamped to their caps)."""
     eff = tag_effective_limits(tag)
@@ -166,12 +167,17 @@ def resolve_share_limits(tag, requested):
     if err:
         return None, err
 
-    view_only = bool(tag.get("default_view_only", False))
-    if allow_custom and req.get("view_only") is not None:
-        vo = bool(req["view_only"])
-        if vo and not bool(tag.get("allow_view_only", True)):
-            return None, "this tag does not allow view-only shares"
-        view_only = vo
+    if tag.get("force_view_only"):
+        # The tag MANDATES view-only on every share it mints: ignore the creator's request and
+        # allow_custom entirely (the other limits above are still resolved normally).
+        view_only = True
+    else:
+        view_only = bool(tag.get("default_view_only", False))
+        if allow_custom and req.get("view_only") is not None:
+            vo = bool(req["view_only"])
+            if vo and not bool(tag.get("allow_view_only", True)):
+                return None, "this tag does not allow view-only shares"
+            view_only = vo
 
     return {"lifetime_minutes": life, "max_recipients": max_recip,
             "max_downloads": max_dl, "view_only": view_only}, None

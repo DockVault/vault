@@ -398,8 +398,12 @@ class ShareTag(Base):
     max_recipients_default = Column(Integer, nullable=True)
     max_downloads_cap = Column(Integer, nullable=True)
     max_downloads_default = Column(Integer, nullable=True)
-    allow_view_only = Column(Boolean, nullable=False, default=True)
-    default_view_only = Column(Boolean, nullable=False, default=False)
+    allow_view_only = Column(Boolean, nullable=False, default=True)   # may a creator CHOOSE view-only?
+    default_view_only = Column(Boolean, nullable=False, default=False)  # is view-only the default (overridable)?
+    # force_view_only MANDATES view-only on every share minted under this tag, regardless of the creator's
+    # request or allow_custom — so an admin can require non-download while still letting creators customize
+    # the other limits (lifetime/recipients/downloads). Distinct from default_view_only (a mere default).
+    force_view_only = Column(Boolean, nullable=False, default=False)
     allow_custom = Column(Boolean, nullable=False, default=True)  # may a creator override defaults within caps?
     # Subset of sharing_policy.AUDIENCES the creator may pick for a share's claim-audience.
     allowed_audiences = Column(JSON, nullable=False, default=list)
