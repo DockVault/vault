@@ -599,6 +599,22 @@ def test_env_example_documents_every_settings_field():
         assert k in documented, f".env.example must document {k}"
 
 
+def test_app_version_from_version_file_not_hardcoded():
+    import re
+    # A committed VERSION file (valid semver) is the single source of truth for the app's version.
+    ver = _read("VERSION").strip()
+    assert re.match(r"^\d+\.\d+\.\d+", ver), f"VERSION must be semver-ish, got {ver!r}"
+    # branding reads it as the default (not a hardcoded literal); BRAND_APP_VERSION can override.
+    br = _read("app/config/branding.py")
+    assert "default_factory=_read_version_file" in br, "app_version must default to the VERSION file"
+    assert 'default="1.0.0"' not in br, "app_version must not be a hardcoded 1.0.0"
+    # api_server.py must no longer report a hardcoded version.
+    api = _read("app/api/api_server.py")
+    assert 'version="1.0.0"' not in api and '"version": "1.0.0"' not in api, \
+        "api_server.py must report branding.app_version, not a hardcoded 1.0.0"
+    assert "version=branding.app_version" in api, "the FastAPI app must use branding.app_version"
+
+
 def test_readme_documents_deployment_modes():
     # The README must explain the combined (default) vs split deployment modes and the combined-mode
     # trade-offs a self-hoster needs to know, so the toggle isn't a silent behaviour change.

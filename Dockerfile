@@ -45,6 +45,12 @@ RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
 # app-level server; no OS chroot/chown; binds 2222 > 1024). Defense-in-depth is preserved:
 # the actual web/SFTP processes run as appuser.
 
+# App version. By default the image self-reports the baked VERSION file (copied by `COPY . .`
+# above and read by app/config/branding.py). A CI/release build MAY override it with
+# `--build-arg APP_VERSION=x.y.z`; an empty value (the default) falls back to the VERSION file.
+ARG APP_VERSION=
+ENV BRAND_APP_VERSION=${APP_VERSION}
+
 # 8000 - FastAPI web UI / API
 # 2222 - SFTP
 EXPOSE 8000 2222

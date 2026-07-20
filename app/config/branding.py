@@ -37,6 +37,21 @@ from pydantic import Field, validator
 HEX_COLOR_RE = re.compile(r'^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$')
 
 
+def _read_version_file() -> str:
+    """The app's own version, read from the baked VERSION file (repo root, copied to /app/VERSION
+    in the image). Single source of truth: bump VERSION to cut a release. Falls back to a
+    placeholder if the file is missing so branding never fails to load."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in ("/app/VERSION", os.path.join(here, "..", "..", "VERSION")):
+        try:
+            value = open(path, encoding="utf-8").read().strip()
+            if value:
+                return value
+        except OSError:
+            pass
+    return "0.0.0"
+
+
 class BrandingConfig(BaseSettings):
     """
     Application branding configuration.
@@ -77,8 +92,8 @@ class BrandingConfig(BaseSettings):
     )
     
     app_version: str = Field(
-        default="1.0.0",
-        description="Current application version"
+        default_factory=_read_version_file,
+        description="Current application version (from the VERSION file; override with BRAND_APP_VERSION)"
     )
     
     # ========================================
@@ -403,6 +418,13 @@ class BrandingConfig(BaseSettings):
         if '@' not in v:
             raise ValueError(f"Invalid email format: {v}")
         return v.lower()
+
+    @validator('app_version', always=True)
+    def _fill_version(cls, v):
+        """Collapse an empty version (e.g. an unset BRAND_APP_VERSION from a plain image build's
+        empty --build-arg) back to the VERSION file, so the app never reports a blank version."""
+        v = (v or "").strip()
+        return v if v else _read_version_file()
     
     # ========================================
     # Helper Methods

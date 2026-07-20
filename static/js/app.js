@@ -5047,7 +5047,14 @@ async function loadSettings() {
         document.getElementById('setting-app-description').value = settings.app_description || '';
         document.getElementById('setting-max-file-size').value = settings.max_file_size || 100;
         document.getElementById('setting-allowed-types').value = (settings.allowed_file_types || []).join(', ');
-        
+
+        // App version (read-only; from the public /version endpoint)
+        try {
+            const ver = await apiRequest('/version', { silent: true });
+            const vEl = document.getElementById('setting-app-version');
+            if (vEl && ver && ver.version) vEl.textContent = 'v' + ver.version;
+        } catch (e) { /* version display is non-essential */ }
+
         // Security
         document.getElementById('setting-password-min-length').value = settings.password_min_length || 8;  // 8 = the enforced floor
         document.getElementById('setting-require-uppercase').checked = settings.require_uppercase !== false;

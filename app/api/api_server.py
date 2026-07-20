@@ -30,6 +30,7 @@ from pathlib import Path
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
 from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim
 from app.core import sharing_policy
+from app.config.branding import branding
 # NOTE: auth_service and vault_service BOTH define a class named RateLimitExceededError
 # (unrelated: one subclasses AuthenticationError, the other FileServiceError). Import the
 # auth one under an alias so the later vault import below can't shadow it — otherwise the
@@ -79,7 +80,7 @@ def get_active_operations_count() -> int:
 app = FastAPI(
     title="Secure SFTP Management API",
     description="Management API for secure SFTP server with vault system",
-    version="1.0.0",
+    version=branding.app_version,
     # Disable interactive API docs in production to prevent endpoint enumeration
     docs_url="/docs" if settings.environment == "development" else None,
     redoc_url="/redoc" if settings.environment == "development" else None,
@@ -1297,7 +1298,7 @@ async def api_root():
     """API information endpoint."""
     return {
         "message": "Secure SFTP Management API",
-        "version": "1.0.0",
+        "version": branding.app_version,
         "status": "operational"
     }
 
