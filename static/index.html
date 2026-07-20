@@ -3,7 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self' blob:; object-src 'self' blob:;">
+    <!-- No <meta> Content-Security-Policy: the server sends a complete CSP header on every text/html
+         response (app/api/api_server.py), including connect-src 'self' ws: wss: for the monitor
+         WebSocket. A meta copy here was a stale, weaker duplicate (a maintenance hazard). -->
     <title>DockVault</title>
     <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
     <link rel="apple-touch-icon" href="/static/assets/logo.png?v=1">

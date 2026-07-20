@@ -53,17 +53,28 @@ def test_live_page_loads_no_external_resources(page):
     assert external == [], f"{page.name} loads external resources (supply-chain risk): {external}"
 
 
-def test_index_csp_script_src_is_self_only():
-    """The served page's CSP meta must not allow-list any external script origin."""
+def test_index_has_no_meta_csp_header_is_authoritative():
+    """The <meta> CSP was removed: the server sends a COMPLETE CSP header on every text/html
+    response (checked by test_server_side_csp_* below), so a weaker <meta> duplicate was only a
+    maintenance hazard. index.html must not declare a <meta> CSP."""
     html = _read(STATIC / "index.html")
-    m = re.search(r'Content-Security-Policy"\s+content="([^"]+)"', html)
-    assert m, "index.html must declare a Content-Security-Policy meta tag"
-    csp = m.group(1)
-    script_src = next((d for d in csp.split(";") if d.strip().startswith("script-src")), "")
-    assert script_src, "CSP must declare a script-src directive"
-    # only 'self' / 'unsafe-inline' style keywords — no scheme/host source expressions
-    assert "http://" not in script_src and "https://" not in script_src, \
-        f"script-src still allow-lists an external origin: {script_src.strip()!r}"
+    assert not re.search(r'http-equiv="Content-Security-Policy"', html), \
+        "index.html must NOT declare a <meta> CSP (rely on the complete response-header CSP)"
+
+
+def test_served_frontend_has_no_inline_event_handlers():
+    """No inline `on*=` HTML handler ATTRIBUTE may appear in the served frontend: the page CSP
+    (script-src 'self', no unsafe-inline) blocks them, which spammed the console and left the
+    handler dead (the toast × before this fix). Property assignments (`el.onclick = ...`) and
+    addEventListener are CSP-safe and allowed."""
+    files = [STATIC / "index.html"] + sorted((STATIC / "js").glob("*.js"))
+    for f in files:
+        bad = re.findall(r'<[^>]*\son[a-z]+\s*=\s*"[^"]*"', _read(f))
+        assert not bad, f"{f.name} has inline on*= handler attribute(s) (CSP-blocked): {bad[:3]}"
+    # the toast close button is wired programmatically (not via an inline onclick).
+    appjs = _read(STATIC / "js" / "app.js")
+    assert "toast-close" in appjs and "addEventListener('click'" in appjs, \
+        "the toast close button must be wired via addEventListener"
 
 
 def test_server_side_csp_script_src_is_self_only():

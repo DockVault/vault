@@ -481,9 +481,15 @@ function showToast(message, type = 'info', duration = 5000) {
             <div class="toast-title">${titles[type]}</div>
             <div class="toast-message">${escapeHtml(message)}</div>
         </div>
-        <button class="toast-close" onclick="this.parentElement.remove()">×</button>
+        <button class="toast-close" type="button">×</button>
     `;
-    
+
+    // Wire the close button programmatically — an inline onclick= attribute is blocked by the
+    // page CSP (script-src 'self', no unsafe-inline), which both spammed the console and left the
+    // × dead. Remove the whole toast, matching the old this.parentElement.remove().
+    const closeBtn = toast.querySelector('.toast-close');
+    if (closeBtn) closeBtn.addEventListener('click', () => toast.remove());
+
     container.appendChild(toast);
     
     // Auto-remove after duration
