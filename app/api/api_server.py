@@ -4852,8 +4852,8 @@ async def create_share(
         folder = db.query(Folder).filter(Folder.id == payload.target_folder_id, Folder.vault_id == vault.id).first()
         if not folder:
             raise HTTPException(status_code=404, detail="Folder not found in this vault.")
-        # A folder can carry its OWN password gate (enforced on list/download); refuse to share it for the
-        # same reason a password-protected vault is refused — a share would bypass that gate.
+        # A folder may carry its own password_hash; refuse to share such a folder (defense-in-depth, for
+        # the same reason a password-protected vault is refused).
         if folder.password_hash:
             raise HTTPException(status_code=400,
                                 detail="Password-protected folders can't be shared — remove the folder password or add the person as a member.")
@@ -5310,15 +5310,21 @@ async def list_shared_with_me(
     out = [_shared_with_me_dict(db, claim, share) for claim, share in rows]
 
     # Direct push: active named-audience shares addressed to this user that they haven't claimed appear
-    # as 'available' cards. (Filtered in Python against the audience helper — the audience lists are
-    # small; the recipient tab is not a hot poll.)
+    # as 'available' cards. Narrowed SERVER-SIDE via JSONB @> containment (GIN-indexed) so we fetch only
+    # the shares addressed to THIS user, instead of scanning every active named-audience share in the
+    # deployment. The Python user_matches_claim_audience check below stays as the authoritative filter.
+    from sqlalchemy import or_, and_
     claimed_ids = {r[1].id for r in rows}
     now = datetime.utcnow()
-    gids = _user_group_ids(db, current_user.id)
+    gids = [str(g) for g in _user_group_ids(db, current_user.id)]
+    uid = str(current_user.id)
+    audience_or = [and_(Share.claim_audience == "users", Share.audience_user_ids.contains([uid]))]
+    for g in gids:
+        audience_or.append(and_(Share.claim_audience == "departments",
+                                Share.audience_department_ids.contains([g])))
     pushed = (
         db.query(Share)
-        .filter(Share.status == "active", Share.expires_at > now,
-                Share.claim_audience.in_(("users", "departments")))
+        .filter(Share.status == "active", Share.expires_at > now, or_(*audience_or))
         .order_by(Share.created_at.desc())
         .all()
     )
@@ -10205,6 +10211,26 @@ def _run_lightweight_migrations():
             # create_all adds the column on a fresh DB; this backfills it on a vault that already ran an
             # earlier sharing build. Idempotent + additive.
             "ALTER TABLE share_tags ADD COLUMN IF NOT EXISTS force_view_only BOOLEAN NOT NULL DEFAULT FALSE",
+            # Sharing: the Share audience id-arrays are queried with JSONB @> containment so the
+            # "shared with me" scan filters server-side + is GIN-indexed (was an unbounded Python scan).
+            # Convert JSON->JSONB only if still json (idempotent; avoids a table rewrite every startup),
+            # then add the GIN indexes. create_all makes them JSONB + GIN on a fresh DB.
+            """DO $$ BEGIN
+                   IF EXISTS (SELECT 1 FROM information_schema.columns
+                              WHERE table_name='shares' AND column_name='audience_user_ids'
+                                AND data_type='json') THEN
+                       ALTER TABLE shares ALTER COLUMN audience_user_ids TYPE JSONB
+                           USING audience_user_ids::jsonb;
+                   END IF;
+                   IF EXISTS (SELECT 1 FROM information_schema.columns
+                              WHERE table_name='shares' AND column_name='audience_department_ids'
+                                AND data_type='json') THEN
+                       ALTER TABLE shares ALTER COLUMN audience_department_ids TYPE JSONB
+                           USING audience_department_ids::jsonb;
+                   END IF;
+               END $$;""",
+            "CREATE INDEX IF NOT EXISTS idx_share_aud_users ON shares USING GIN (audience_user_ids)",
+            "CREATE INDEX IF NOT EXISTS idx_share_aud_depts ON shares USING GIN (audience_department_ids)",
             "ALTER TABLE folders ALTER COLUMN name DROP NOT NULL",
             # Zero-knowledge DEK rotation (forward-only versioning). dek_version is the
             # vault's current ZK DEK epoch; backfills every existing vault to 1, matching

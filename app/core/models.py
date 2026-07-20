@@ -12,7 +12,7 @@ from sqlalchemy import (
     Text, BigInteger, Enum, Table, JSON, Index, CheckConstraint, UniqueConstraint, text
 )
 from sqlalchemy.orm import relationship, declarative_base, backref
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 
 Base = declarative_base()
 
@@ -445,8 +445,10 @@ class Share(Base):
     # --- Distribution ---
     link_token_hash = Column(String(64), nullable=True)  # sha256 hex of the bearer link token; NULL = direct-only
     claim_audience = Column(String(20), nullable=False)  # 'users' | 'departments' | 'anyone_internal'
-    audience_user_ids = Column(JSON, nullable=False, default=list)       # only for claim_audience 'users'
-    audience_department_ids = Column(JSON, nullable=False, default=list)  # only for claim_audience 'departments'
+    # JSONB (not JSON) so the "shared with me" scan can filter server-side with @> containment and be
+    # GIN-indexed (below), instead of fetching every active named-audience share and filtering in Python.
+    audience_user_ids = Column(JSONB, nullable=False, default=list)       # only for claim_audience 'users'
+    audience_department_ids = Column(JSONB, nullable=False, default=list)  # only for claim_audience 'departments'
 
     # --- Limits (SNAPSHOT at creation) ---
     expires_at = Column(DateTime, nullable=False)
@@ -465,6 +467,9 @@ class Share(Base):
         Index('idx_share_creator', 'creator_id'),
         Index('idx_share_vault', 'vault_id'),
         Index('idx_share_token', 'link_token_hash'),
+        # GIN indexes for the JSONB @> containment used by the direct-push "shared with me" scan.
+        Index('idx_share_aud_users', 'audience_user_ids', postgresql_using='gin'),
+        Index('idx_share_aud_depts', 'audience_department_ids', postgresql_using='gin'),
     )
 
 

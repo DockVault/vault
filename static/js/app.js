@@ -5352,7 +5352,7 @@ function renderShareTagsList() {
         }
         if (tag.force_view_only) parts.push('view-only forced');
         else if (tag.default_view_only) parts.push('view-only default');
-        if (tag.auto_enroll_new_users) parts.push('auto-enroll');
+        if (tag.auto_enroll_new_users) parts.push('everyone (except blocked)');
         summary.textContent = parts.join(' · ');
         left.appendChild(summary);
         row.appendChild(left);
