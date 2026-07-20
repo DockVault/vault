@@ -156,14 +156,28 @@ def _spawn(target: str, label: str) -> None:
 def _wait_api_ready(timeout: float = 60.0) -> bool:
     """Poll the API's /health until it answers, so the SFTP server starts only AFTER the
     API's lifespan has created/migrated the schema the SFTP path reads. Returns False on
-    timeout (we start SFTP anyway — it fails closed on DB errors, never serving stale)."""
+    timeout (we start SFTP anyway — it fails closed on DB errors, never serving stale).
+
+    Probes the scheme the API actually serves: the combined secure deployment terminates TLS
+    in-process (API_USE_HTTPS=true), so a plain-http probe would never succeed and SFTP would
+    only start after the full timeout (the schema gate defeated). Verification is off — this is
+    a same-container liveness probe against a possibly self-signed / public-SAN cert, not a
+    trust decision (mirrors the image HEALTHCHECK)."""
+    https = _truthy(os.environ.get("API_USE_HTTPS"))
+    url = ("https" if https else "http") + "://localhost:8000/health"
+    ctx = None
+    if https:
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         # Stop early if the API process already died — the supervise loop will handle it.
         if _PROCS and _PROCS[0][1].poll() is not None:
             return False
         try:
-            with urllib.request.urlopen("http://localhost:8000/health", timeout=3) as r:
+            with urllib.request.urlopen(url, timeout=3, context=ctx) as r:
                 if r.status == 200:
                     return True
         except Exception:  # noqa: BLE001 — not up yet

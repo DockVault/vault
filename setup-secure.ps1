@@ -267,12 +267,33 @@ if (Test-Path $EnvFile) {
     # A .env written before admin-seeding (e.g. by an older copy of this script) may have NO
     # ADMIN_PASSWORD, in which case no admin is created and login has no valid account. Warn + guide.
     $envText = Get-Content -Raw $EnvFile -ErrorAction SilentlyContinue
+    if ($null -eq $envText) { $envText = '' }
     if ($envText -notmatch "(?m)^\s*ADMIN_PASSWORD\s*=\s*\S") {
         Warn 'your existing ./.env has no ADMIN_PASSWORD, so NO admin account will be created (the login page will have no valid account).'
         Write-Host "    Fix it: add these lines to ./.env, then re-run this script (or restart the stack):"
         Write-Host "        ADMIN_USERNAME='admin'"
         Write-Host "        ADMIN_PASSWORD='$(New-HexSecret 12)'   # example - a strong 12+ char value"
-        Write-Host "    Restart:  docker compose --env-file .env -f deploy/docker-compose.secure.yml up -d"
+        Write-Host "    Restart:  docker compose -f docker-compose.secure.yml up -d"
+    }
+    # Migrate a pre-combined/split .env in place (volumes are shared by name, so nothing moves):
+    # older deploys used COMPOSE_PROFILES=sftp (two containers) or no profile (web only); the
+    # compose now needs exactly one of combined/split.
+    if ($envText -match '(?m)^\s*COMPOSE_PROFILES\s*=.*(combined|split)') {
+        # already on the new scheme
+    } elseif ($envText -match '(?m)^\s*COMPOSE_PROFILES\s*=.*sftp') {
+        Say 'migrating COMPOSE_PROFILES=sftp -> split (keeps the two-container layout)'
+        $newText = [regex]::Replace($envText, '(?m)^\s*COMPOSE_PROFILES\s*=.*$', 'COMPOSE_PROFILES=split')
+        [System.IO.File]::WriteAllText($EnvFile, $newText, (New-Object System.Text.ASCIIEncoding))
+    } else {
+        Say 'setting COMPOSE_PROFILES=combined (single-container default)'
+        if ($envText -match '(?m)^\s*COMPOSE_PROFILES\s*=') {
+            # an existing line with an unrecognized value -> REPLACE it (never duplicate the key)
+            $newText = [regex]::Replace($envText, '(?m)^\s*COMPOSE_PROFILES\s*=.*$', 'COMPOSE_PROFILES=combined')
+            [System.IO.File]::WriteAllText($EnvFile, $newText, (New-Object System.Text.ASCIIEncoding))
+        } else {
+            $sep = if ($envText.EndsWith("`n") -or $envText -eq '') { '' } else { "`n" }
+            [System.IO.File]::AppendAllText($EnvFile, $sep + "COMPOSE_PROFILES=combined`n", (New-Object System.Text.ASCIIEncoding))
+        }
     }
 } else {
     Say 'writing ./.env with freshly generated secrets'
@@ -306,7 +327,10 @@ if (Test-Path $EnvFile) {
         "ADMIN_EMAIL='$AdminEmail'",
         "ADMIN_PASSWORD='$AdminPassword'"
     )
-    if ($EnableSftp) { $lines += 'COMPOSE_PROFILES=sftp' }
+    # Deployment mode: combined (one container; RUN_SFTP toggles the in-container SFTP server).
+    # Set COMPOSE_PROFILES=split by hand for the two-container layout instead.
+    $lines += 'COMPOSE_PROFILES=combined'
+    if ($EnableSftp) { $lines += 'RUN_SFTP=1' }
     # ASCII, no BOM: the app and docker compose read this as a plain env file.
     [System.IO.File]::WriteAllText($EnvFile, (($lines -join "`n") + "`n"), (New-Object System.Text.ASCIIEncoding))
     # Best-effort: this file holds every secret, so drop inherited ACLs and grant only the current

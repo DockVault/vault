@@ -60,6 +60,24 @@ say()  { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Add or replace KEY=VALUE (unquoted value) in ./.env, preserving mode 600. The removal regex
+# matches read_env's tolerance (optional whitespace around the key/'=') so a detected line is
+# always the one replaced — never leaving the old line to duplicate the key.
+set_env() {
+  local k="$1" v="$2" tmp
+  tmp="$(mktemp)"
+  [ -f .env ] && { grep -v -E "^[[:space:]]*${k}[[:space:]]*=" .env > "$tmp" || true; }
+  printf '%s\n' "${k}=${v}" >> "$tmp"
+  cat "$tmp" > .env
+  rm -f "$tmp"
+  chmod 600 .env 2>/dev/null || true
+}
+
+# The app container/service name for the active mode: 'vault' (combined, the default) or
+# 'vault-api' (split). The container_name and the compose service name match in both modes,
+# so this works for `docker inspect <container>` AND `dc restart <service>`.
+app_svc() { grep -Eq '^[[:space:]]*COMPOSE_PROFILES[[:space:]]*=.*\bsplit\b' .env 2>/dev/null && echo vault-api || echo vault; }
+
 # ---------------------------------------------------------------- arguments
 CERTS_ONLY=0
 NO_CACHE=0
@@ -393,8 +411,10 @@ generate_certs() {
 
 install_renewal_hook() {
   # Auto-renewal (certbot's systemd timer runs ~twice daily): copy the renewed
-  # cert into ./certs and restart vault-api — uvicorn does not hot-reload certs.
+  # cert into ./certs and restart the vault app — uvicorn does not hot-reload certs.
   local _hook="/etc/letsencrypt/renewal-hooks/deploy/dockvault-vault.sh"
+  # Bake the CURRENT mode's app service into the hook (vault / vault-api).
+  local _svc; _svc="$(app_svc)"
   mkdir -p "$(dirname "$_hook")"
   # Staged + pair-validated + atomic mv: certbot mints a NEW private key each
   # renewal, so a partial copy must never leave a mismatched cert/key pair
@@ -422,7 +442,7 @@ logger -t dockvault-vault "renewed TLS key perms mirrored from live key (mode \$
 [ "\$(openssl x509 -in "\$CD/.new-cert.pem" -pubkey -noout)" = "\$(openssl pkey -in "\$CD/.new-key.pem" -pubout)" ]
 mv "\$CD/.new-key.pem"  "\$CD/key.pem"
 mv "\$CD/.new-cert.pem" "\$CD/cert.pem"
-cd "$APP_DIR" && docker compose --env-file "$APP_DIR/.env" -f "$APP_DIR/$COMPOSE_FILE" restart vault-api
+cd "$APP_DIR" && docker compose --env-file "$APP_DIR/.env" -f "$APP_DIR/$COMPOSE_FILE" restart $_svc
 EOF
   chmod +x "$_hook"
   say "  renewal deploy hook installed: $_hook"
@@ -436,10 +456,11 @@ if [ "$CERTS_ONLY" -eq 1 ]; then
   [[ "$SERVER_NAME" =~ [[:space:]] ]] && die "'$SERVER_NAME' contains whitespace"
   choose_cert_mode
   generate_certs
-  if docker inspect vault-api >/dev/null 2>&1; then
+  _svc="$(app_svc)"
+  if docker inspect "$_svc" >/dev/null 2>&1; then
     say ""
-    say "Restarting vault-api to pick up the new certificate ..."
-    dc restart vault-api
+    say "Restarting $_svc to pick up the new certificate ..."
+    dc restart "$_svc"
   else
     say ""
     say "The stack is not running yet. Start it with:  sudo ./setup-secure.sh"
@@ -459,7 +480,19 @@ if [ "$HAVE_ENV" -eq 1 ]; then
   say "This run will rebuild the image and recreate the containers to apply changes."
   chmod 600 .env 2>/dev/null || true   # a reused/hand-created .env may be looser; it holds secrets
   ADMIN_USERNAME="$(read_env ADMIN_USERNAME)"
-  grep -Eq '^COMPOSE_PROFILES=.*\bsftp\b' .env && WANT_SFTP=1 || WANT_SFTP=0
+  # Migrate a pre-combined/split .env in place (volumes are shared by name, so nothing moves):
+  # older deploys used COMPOSE_PROFILES=sftp (two containers) or no profile (web only); the
+  # compose now needs exactly one of combined/split.
+  _profiles="$(read_env COMPOSE_PROFILES)"
+  case ",${_profiles}," in
+    *,combined,*|*,split,*) : ;;                                      # already on the new scheme
+    *sftp*) say "Migrating COMPOSE_PROFILES=sftp -> split (keeps the two-container layout)."
+            set_env COMPOSE_PROFILES split ;;
+    *)      say "Setting COMPOSE_PROFILES=combined (single-container default)."
+            set_env COMPOSE_PROFILES combined ;;
+  esac
+  # SFTP is served when RUN_SFTP is truthy (combined mode) or the profile is split.
+  if grep -Eq '^RUN_SFTP=(1|true|yes|on)$' .env || grep -Eq '^COMPOSE_PROFILES=.*split' .env; then WANT_SFTP=1; else WANT_SFTP=0; fi
   ADMIN_PW_GENERATED=0
   SERVER_NAME="$(read_env SERVER_NAME)"
   if [ "$HAVE_CERTS" -eq 1 ]; then
@@ -548,9 +581,12 @@ else
     printf '%s\n' "# (The app ignores these — pydantic Settings uses extra='ignore'.)"
     printf '%s\n' "SERVER_NAME='$SERVER_NAME'"
     printf '%s\n' "CERT_MODE='$CERT_MODE'"
+    # Deployment mode: combined (one container; RUN_SFTP toggles the in-container SFTP
+    # server). Set COMPOSE_PROFILES=split by hand for the two-container layout instead.
+    printf '%s\n' "COMPOSE_PROFILES=combined"
     if [ "$WANT_SFTP" -eq 1 ]; then
-      printf '%s\n' "# Activates the vault-sftp service in deploy/docker-compose.secure.yml."
-      printf '%s\n' "COMPOSE_PROFILES=sftp"
+      printf '%s\n' "# Also run the SFTP server inside the combined container (published on 2322)."
+      printf '%s\n' "RUN_SFTP=1"
     fi
   } > .env
   umask 022
@@ -594,15 +630,16 @@ if [ "$HAVE_CERTS" -eq 0 ] && _remapped_engine; then
 fi
 
 say ""
-say "Waiting for vault-api to become healthy (startup migrations run on first boot) ..."
+APP_SVC="$(app_svc)"   # 'vault' (combined, default) or 'vault-api' (split)
+say "Waiting for $APP_SVC to become healthy (startup migrations run on first boot) ..."
 _status=starting
 for _i in $(seq 1 40); do
-  _status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' vault-api 2>/dev/null || echo missing)"
+  _status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$APP_SVC" 2>/dev/null || echo missing)"
   case "$_status" in
     healthy)     break ;;
     exited|dead) break ;;   # container gave up — stop waiting, diagnose now
     restarting)             # crash-looping — bail once it's clearly not recovering
-      _rc="$(docker inspect -f '{{.RestartCount}}' vault-api 2>/dev/null || echo 0)"
+      _rc="$(docker inspect -f '{{.RestartCount}}' "$APP_SVC" 2>/dev/null || echo 0)"
       [ "${_rc:-0}" -ge 3 ] && break ;;
   esac
   sleep 3
@@ -617,13 +654,13 @@ if [ "$_status" != "healthy" ]; then
     ss -H -ltn 2>/dev/null | grep -Eq '[^0-9]:443[[:space:]]' && _l443=yes || _l443=no
   fi
   say ""
-  warn "vault-api did NOT come up healthy (state: '$_status'; host :443 listening: $_l443)."
+  warn "$APP_SVC did NOT come up healthy (state: '$_status'; host :443 listening: $_l443)."
   say ""
-  say "  ---- docker compose --env-file .env -f $COMPOSE_FILE logs --tail 40 vault-api ----"
-  dc logs --tail 40 --no-color vault-api 2>&1 | sed 's/^/    /' || true
+  say "  ---- docker compose --env-file .env -f $COMPOSE_FILE logs --tail 40 $APP_SVC ----"
+  dc logs --tail 40 --no-color "$APP_SVC" 2>&1 | sed 's/^/    /' || true
   say "  ------------------------------------------------------------------"
-  _logs="$(dc logs --no-color vault-api 2>&1 || true)"
-  _derr="$(docker inspect -f '{{.State.Error}}' vault-api 2>/dev/null || true)"
+  _logs="$(dc logs --no-color "$APP_SVC" 2>&1 || true)"
+  _derr="$(docker inspect -f '{{.State.Error}}' "$APP_SVC" 2>/dev/null || true)"
   say ""
   if printf '%s' "$_logs" | grep -Eqi 'permission denied.*(cert|key|\.pem)|ssl.*(cert|key)|could not.*(read|load).*(cert|key)|no such file.*\.pem'; then
     warn "LIKELY CAUSE: the container can't read the TLS cert/key. On a rootless or"
@@ -640,10 +677,10 @@ if [ "$_status" != "healthy" ]; then
     warn "  or use a rootful daemon:  docker context use default"
     say ""
   fi
-  die "vault-api is not serving on https/443 — fix the cause above and re-run 'sudo ./setup-secure.sh'.
+  die "$APP_SVC is not serving on https/443 — fix the cause above and re-run 'sudo ./setup-secure.sh'.
        (Redis/Postgres/SFTP may be up, but no summary is printed because the web app is down.)"
 fi
-say "  vault-api is healthy."
+say "  $APP_SVC is healthy."
 
 # ---------------------------------------------------------------- summary
 # Resolve the display name: shell var -> .env -> the cert's CN (covers an older
@@ -652,14 +689,14 @@ say "  vault-api is healthy."
 [ -n "${SERVER_NAME:-}" ] || SERVER_NAME="$(read_env SERVER_NAME)"
 [ -n "${SERVER_NAME:-}" ] || SERVER_NAME="$(cert_cn)"
 [ -n "${SERVER_NAME:-}" ] || SERVER_NAME="<your-server-name>"
-[ -n "${WANT_SFTP:-}" ]   || { grep -Eq '^COMPOSE_PROFILES=.*\bsftp\b' .env && WANT_SFTP=1 || WANT_SFTP=0; }
+[ -n "${WANT_SFTP:-}" ]   || { { grep -Eq '^RUN_SFTP=(1|true|yes|on)$' .env || grep -Eq '^COMPOSE_PROFILES=.*split' .env; } && WANT_SFTP=1 || WANT_SFTP=0; }
 say ""
 say "==================================================================="
 say " Web UI / API : https://$SERVER_NAME/          (host port 443 only)"
 if [ "$WANT_SFTP" = "1" ]; then
   say " SFTP (SSH)   : $SERVER_NAME port 2322"
 else
-  say " SFTP         : disabled (re-enable: add COMPOSE_PROFILES=sftp to .env, re-run)"
+  say " SFTP         : disabled (enable: set RUN_SFTP=1 in .env, re-run)"
 fi
 [ -n "${ADMIN_USERNAME:-}" ] && say " Admin login  : $ADMIN_USERNAME"
 if [ "${ADMIN_PW_GENERATED:-0}" -eq 1 ]; then

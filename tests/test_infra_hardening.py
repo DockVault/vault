@@ -530,6 +530,57 @@ def test_setup_scripts_at_root_and_secure_shim():
             f"{name} still references the moved deploy/setup-secure path"
 
 
+def _secure_compose_config(profile):
+    """Render the secure stack via `docker compose config` under COMPOSE_PROFILES=profile;
+    skip cleanly if docker/compose is unavailable or the render fails for an env reason."""
+    import shutil
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    env = dict(os.environ, COMPOSE_PROFILES=profile, VAULT_DB_PASSWORD="testpw",
+               RUN_SFTP="", SFTP_HOST_PORT="2322")
+    try:
+        r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
+                           cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"docker compose unavailable: {exc}")
+    if r.returncode != 0:
+        pytest.skip(f"docker compose config failed: {r.stderr[:200]}")
+    return r.stdout
+
+
+def test_secure_compose_combined_default_and_split_profile():
+    # DEFAULT (combined): ONE 'vault' container runs run_combined.py; the split pair is absent.
+    combined = _secure_compose_config("combined")
+    assert "run_combined.py" in combined, "combined mode must run run_combined.py"
+    assert "app.api.api_server" not in combined and "app.sftp.sftp_server" not in combined, \
+        "combined mode must NOT render the split vault-api/vault-sftp commands"
+    # SPLIT: vault-api + vault-sftp run their own commands; the combined launcher is absent.
+    split = _secure_compose_config("split")
+    assert "app.api.api_server" in split and "app.sftp.sftp_server" in split, \
+        "split mode must render both the web and sftp services"
+    assert "run_combined.py" not in split, "split mode must NOT run the combined launcher"
+    # Both modes mount the SAME named volumes -> switching modes never loses data.
+    for vol in ("vault_storage", "vault_keys"):
+        assert vol in combined and vol in split, f"{vol} must be mounted in both modes"
+
+
+def test_setup_scripts_write_combined_profile_scheme():
+    # The setup scripts must write the new combined/split scheme (RUN_SFTP for SFTP-in-combined),
+    # NOT the retired first-run `COMPOSE_PROFILES=sftp`, or the primary deploy path renders no app.
+    for name in ("setup-secure.sh", "setup-secure.ps1"):
+        s = _read(name)
+        assert "COMPOSE_PROFILES=combined" in s, f"{name} must write COMPOSE_PROFILES=combined"
+        assert "RUN_SFTP=1" in s, f"{name} must set RUN_SFTP=1 when SFTP is enabled in combined mode"
+        # Must not WRITE the retired sftp profile (a quoted env-line value). Bare mentions in
+        # migration comments / "sftp -> split" messages are fine (they have a space after).
+        assert 'COMPOSE_PROFILES=sftp"' not in s and "COMPOSE_PROFILES=sftp'" not in s, \
+            f"{name} must not write the retired sftp profile"
+    # .env.example ships the mode + the SFTP toggle so a manual `cp .env.example .env` just works.
+    envx = _read(".env.example")
+    assert "COMPOSE_PROFILES=combined" in envx and "RUN_SFTP=" in envx, \
+        ".env.example must ship COMPOSE_PROFILES=combined and RUN_SFTP"
+
+
 def test_public_docs_reference_only_shipped_windows_scripts():
     # Operator docs MAY reference a Windows helper that actually ships in this repo (e.g.
     # deploy/setup-secure.ps1), but must never point a self-hoster at a .ps1 that isn't part of this repo
