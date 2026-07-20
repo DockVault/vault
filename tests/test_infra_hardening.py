@@ -581,6 +581,17 @@ def test_setup_scripts_write_combined_profile_scheme():
         ".env.example must ship COMPOSE_PROFILES=combined and RUN_SFTP"
 
 
+def test_readme_documents_deployment_modes():
+    # The README must explain the combined (default) vs split deployment modes and the combined-mode
+    # trade-offs a self-hoster needs to know, so the toggle isn't a silent behaviour change.
+    r = _read("README.md")
+    low = r.lower()
+    assert "combined" in low and "split" in low, "README must document combined vs split modes"
+    assert "COMPOSE_PROFILES" in r and "RUN_SFTP" in r, "README must name the mode + SFTP toggles"
+    # The key limitation: the healthcheck only covers the web half in combined mode.
+    assert "healthcheck" in low and "/health" in r, "README must note the healthcheck covers only web"
+
+
 def test_public_docs_reference_only_shipped_windows_scripts():
     # Operator docs MAY reference a Windows helper that actually ships in this repo (e.g.
     # deploy/setup-secure.ps1), but must never point a self-hoster at a .ps1 that isn't part of this repo

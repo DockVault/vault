@@ -87,6 +87,36 @@ cp .env.example .env      # edit the same secrets as above
 docker compose up -d      # root dev shim; ./.env auto-loads; web/API on http://localhost:8200
 ```
 
+## Deployment modes: combined vs split
+
+For the **production (HTTPS)** stack, `COMPOSE_PROFILES` in `.env` chooses how the web app and SFTP
+run. `./setup-secure.sh` writes it (default **combined**) and `.env.example` ships it.
+
+- **`combined` (default, recommended):** a **single container** runs both the web/API and — when
+  `RUN_SFTP=1` — the SFTP server, supervised by `run_combined.py`. Simplest to operate: one
+  container, one shared storage/keys volume, one restart policy. SFTP is **opt-in** (`RUN_SFTP=1`),
+  so a base install is web-only.
+- **`split`:** the web app and SFTP run as **two containers** (`vault-api` + `vault-sftp`) over the
+  same volumes. Choose this if you want to scale, restart, or resource-limit them independently, or
+  run SFTP on a different host.
+
+Switching between the two never moves or loses data — both mount the same named volumes. Set
+`COMPOSE_PROFILES=split` in `.env` (and re-run `./setup-secure.sh`, or recreate the stack) to switch.
+
+**Know the trade-offs of combined mode:**
+
+- The container **healthcheck only probes the web app** (`/health`). An SFTP-only *hang* isn't caught
+  by the healthcheck — though `run_combined.py` still exits (and the restart policy recreates the
+  container) if **either** process dies.
+- Web and SFTP **share one restart policy and resource limit** — an SFTP crash restarts the whole
+  container (dropping active web sessions), and you can't size them separately. Both log to one
+  stream (each line tagged `[web]` / `[sftp]`).
+- **`split` mode** buys independent scaling / restart / blast-radius / resource limits, at the cost
+  of two containers that **must share** the storage + keys volume.
+
+The **local HTTP trial** (`docker compose up`) always runs the simple two-container dev stack; the
+combined/split choice applies to the production `docker compose.secure.yml` stack.
+
 ## Repository layout
 
 | Path | What lives there |
