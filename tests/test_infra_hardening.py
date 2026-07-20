@@ -581,6 +581,24 @@ def test_setup_scripts_write_combined_profile_scheme():
         ".env.example must ship COMPOSE_PROFILES=combined and RUN_SFTP"
 
 
+def test_env_example_documents_every_settings_field():
+    # .env.example must document every pydantic Settings field (so a self-hoster can discover
+    # each knob) — this lock catches a new config field that never got a .env.example entry.
+    import re
+    cfg = _read("app/core/config.py")
+    m = re.search(r"class Settings\(BaseSettings\):(.*?)\n(?:settings = Settings|class )", cfg, re.S)
+    assert m, "could not locate the Settings class in app/core/config.py"
+    fields = re.findall(r"^    ([a-z_][a-z0-9_]*)\s*:\s*[^=\n]+=\s*Field", m.group(1), re.M)
+    assert len(fields) > 40, "sanity: expected many Settings fields"
+    env = _read(".env.example")
+    documented = set(re.findall(r"^\s*#?\s*([A-Z_][A-Z0-9_]*)\s*=", env, re.M))
+    missing = sorted(f.upper() for f in fields if f.upper() not in documented)
+    assert not missing, f".env.example is missing these Settings keys: {missing}"
+    # The non-Settings toggles a self-hoster sets must be documented too.
+    for k in ("RUN_SFTP", "COMPOSE_PROFILES", "SFTP_HOST_PORT", "CORS_ALLOW_ORIGINS", "ALLOWED_HOSTS"):
+        assert k in documented, f".env.example must document {k}"
+
+
 def test_readme_documents_deployment_modes():
     # The README must explain the combined (default) vs split deployment modes and the combined-mode
     # trade-offs a self-hoster needs to know, so the toggle isn't a silent behaviour change.
