@@ -92,6 +92,15 @@ class Settings(BaseSettings):
     # Environment Configuration
     environment: str = Field(default="production")  # Options: development, production
 
+    # Opt-in self-update check (default OFF). When on, the app checks GitHub Releases at most
+    # once/day for a newer version and shows an admin-only banner. Fail-closed-silent (never
+    # blocks a request, never errors to the user) and NO telemetry / instance identifier — only
+    # the outbound request's egress IP reaches GitHub. See app/services/update_check.py.
+    update_check_enabled: bool = Field(default=False)
+    # A control-plane-managed (SaaS) deployment upgrades via operator promote, not self-service,
+    # so the update banner is SUPPRESSED when this is set (the control plane sets it at provision).
+    managed_deployment: bool = Field(default=False)
+
     # Plan-imposed feature ceiling. The control plane injects these as PLAN_* env
     # vars at provision time so a deployment can't use features its plan excludes —
     # a HARD ceiling (a pushed admin /settings value could be toggled back by the

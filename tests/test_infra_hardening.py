@@ -615,6 +615,24 @@ def test_app_version_from_version_file_not_hardcoded():
     assert "version=branding.app_version" in api, "the FastAPI app must use branding.app_version"
 
 
+def test_update_check_admin_gated_and_default_off():
+    import re
+    api = _read("app/api/api_server.py")
+    assert '@app.get("/api/update-status")' in api, "the update-status endpoint must exist"
+    m = re.search(r'@app\.get\("/api/update-status"\)\s*\n(?:async )?def \w+\((.*?)\):', api, re.S)
+    assert m and "require_interactive_admin" in m.group(1), \
+        "update-status must be gated by an interactive admin (not public like /version)"
+    # Default OFF in config (opt-in; air-gapped installs make no outbound calls).
+    cfg = _read("app/core/config.py")
+    assert "update_check_enabled: bool = Field(default=False)" in cfg, "update check must default OFF"
+    assert "managed_deployment: bool = Field(default=False)" in cfg
+    envx = _read(".env.example")
+    assert "UPDATE_CHECK_ENABLED=false" in envx and "MANAGED_DEPLOYMENT=false" in envx
+    # The phone-home is documented for the operator.
+    assert "UPDATE_CHECK_ENABLED" in _read(".github/SECURITY.md"), \
+        "SECURITY.md must document the update-check phone-home"
+
+
 def test_readme_documents_deployment_modes():
     # The README must explain the combined (default) vs split deployment modes and the combined-mode
     # trade-offs a self-hoster needs to know, so the toggle isn't a silent behaviour change.

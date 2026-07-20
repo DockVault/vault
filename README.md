@@ -117,6 +117,18 @@ Switching between the two never moves or loses data — both mount the same name
 The **local HTTP trial** (`docker compose up`) always runs the simple two-container dev stack; the
 combined/split choice applies to the production `docker compose.secure.yml` stack.
 
+## Update notifications (opt-in)
+
+DockVault can tell an admin when a newer release is available. It is **off by default**; set
+`UPDATE_CHECK_ENABLED=true` in `.env` to turn it on. The running container then checks GitHub at
+most **once a day** and shows a dismissible banner in **Settings → General** when a newer version
+exists (see [Upgrading](#upgrading) for how to apply it).
+
+The check is privacy-preserving: it sends **no** identifier, account data, version, or telemetry —
+just an unauthenticated request to GitHub's public release API (the only thing GitHub sees is your
+server's egress IP, as with any outbound request), and it **fails silently**, so an air-gapped or
+firewalled install is never affected. Leave it off for offline deployments.
+
 ## Repository layout
 
 | Path | What lives there |

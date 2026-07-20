@@ -1303,6 +1303,25 @@ async def api_root():
     }
 
 
+@app.get("/api/update-status")
+def get_update_status_endpoint(current_user: User = Depends(require_interactive_admin)):
+    """Admin-only: whether a newer DockVault release exists (opt-in, default off).
+
+    Deliberately a SYNC endpoint: the (cached, once/day) update check does a BLOCKING urllib
+    request, so FastAPI runs this in a threadpool instead of stalling the async event loop.
+
+    Gated behind an interactive admin so the (mildly fingerprint-aiding) 'outdated?' signal is
+    not exposed publicly like /version is. Returns {enabled, managed, current, latest,
+    update_available, url, notes, checked_at}; the check itself is fail-closed-silent and only
+    ever runs when UPDATE_CHECK_ENABLED is set (and never for a managed/SaaS deployment)."""
+    from app.services import update_check
+    return update_check.get_update_status(
+        current_version=branding.app_version,
+        enabled=settings.update_check_enabled,
+        managed=settings.managed_deployment,
+    )
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""

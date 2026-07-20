@@ -35,6 +35,16 @@ Use the hardened production path, not the local-trial default:
 - Always run behind TLS. Do not expose the plaintext HTTP listener to an untrusted
   network.
 
+## Update check (opt-in phone-home)
+
+The optional update check (`UPDATE_CHECK_ENABLED=true`, **default off**) makes at most one
+outbound request per day to GitHub's public API (`api.github.com` / `raw.githubusercontent.com`)
+to learn the latest published version. It sends **no** instance identifier, account data, version,
+or other telemetry — only the request's egress IP reaches GitHub (inherent to any outbound HTTP).
+It is fail-closed-silent (never blocks a request, never errors), the "update available" status is
+admin-only, and it is suppressed on control-plane-managed deployments. Leave `UPDATE_CHECK_ENABLED`
+at its default `false` to make no outbound calls at all; air-gapped installs are unaffected.
+
 ## Credentials and repository history
 
 **Any credential value that appears anywhere in this repository's git history is a

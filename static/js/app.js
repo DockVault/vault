@@ -5036,6 +5036,34 @@ function revealLogToken(res) {
 }
 
 // Load settings from API
+function renderUpdateBanner(us) {
+    const banner = document.getElementById('update-banner');
+    if (!banner) return;
+    if (!us || !us.update_available || !us.latest) { banner.style.display = 'none'; return; }
+    // Honour a per-version dismissal (re-shows when a NEWER version appears).
+    if (localStorage.getItem('dv-update-dismissed') === us.latest) { banner.style.display = 'none'; return; }
+    const text = document.getElementById('update-banner-text');
+    if (text) {
+        // Normalize any leading 'v' so a v-prefixed release tag doesn't render "vv0.6.1".
+        const latest = String(us.latest).replace(/^v/i, '');
+        const current = String(us.current || '?').replace(/^v/i, '');
+        text.textContent = `A newer version (v${latest}) is available — you’re on v${current}.`;
+    }
+    const link = document.getElementById('update-banner-link');
+    if (link) {
+        // Only trust a github.com https URL from the (network-sourced) response — never a
+        // javascript:/data: link.
+        if (us.url && /^https:\/\/github\.com\//.test(us.url)) { link.href = us.url; link.style.display = ''; }
+        else { link.style.display = 'none'; }
+    }
+    const dismiss = document.getElementById('update-banner-dismiss');
+    if (dismiss) dismiss.onclick = () => {
+        localStorage.setItem('dv-update-dismissed', us.latest);
+        banner.style.display = 'none';
+    };
+    banner.style.display = '';
+}
+
 async function loadSettings() {
     try {
         const settings = await apiRequest('/settings', { silent: true });
@@ -5054,6 +5082,10 @@ async function loadSettings() {
             const vEl = document.getElementById('setting-app-version');
             if (vEl && ver && ver.version) vEl.textContent = 'v' + ver.version;
         } catch (e) { /* version display is non-essential */ }
+
+        // Update-available banner (opt-in, admin-only endpoint; fail-soft). Fire-and-forget so a
+        // slow/unreachable GitHub never delays the rest of the settings form from rendering.
+        apiRequest('/api/update-status', { silent: true }).then(renderUpdateBanner).catch(() => {});
 
         // Security
         document.getElementById('setting-password-min-length').value = settings.password_min_length || 8;  // 8 = the enforced floor
