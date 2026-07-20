@@ -107,7 +107,7 @@ def _clamp_default(default, cap):
 
 
 def tag_effective_limits(tag) -> dict:
-    """The create-time limit envelope the (future) share modal enforces, clamped so a default never
+    """The create-time limit envelope the share modal enforces, clamped so a default never
     exceeds its cap and the lifetime default sits within [1, ceiling]. Pure; reads the tag's
     *_cap / *_default / lifetime fields."""
     max_life = tag.get("max_lifetime_minutes") or MIN_LIFETIME_MINUTES

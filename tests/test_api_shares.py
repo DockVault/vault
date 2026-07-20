@@ -1,4 +1,4 @@
-"""Share creation + list-mine (POST /shares, GET /shares). No claim/enforcement yet.
+"""Share creation + list-mine (POST /shares, GET /shares).
 
 Covers the fail-closed create path (sharing off, temp session, no vault access, zero-knowledge vault,
 password-protected vault, tag create-allowlist, audience-within-tag, limits-within-caps, target-in-vault)

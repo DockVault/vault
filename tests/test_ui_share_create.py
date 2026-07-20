@@ -32,7 +32,7 @@ def fresh_admin(admin):
 
 
 def _make_tag(admin):
-    name = unique("s5tag")
+    name = unique("crtag")
     r = admin.post("/share-tags", json={
         "name": name, "auto_enroll_new_users": True,
         "allowed_audiences": ["anyone_internal", "users"],
@@ -72,7 +72,7 @@ def test_create_whole_vault_share_from_toolbar(page: Page, admin, fresh_admin):
     admin.put("/settings", json={"sharing_enabled": True})
     tag_name = _make_tag(admin)
     fc = fresh_admin["_client"]
-    v = fc.create_vault(name=unique("s5vault"))
+    v = fc.create_vault(name=unique("crvault"))
     try:
         _login(page, fresh_admin["_username"], fresh_admin["_password"])
         _open_vault(page, v["id"])
@@ -86,7 +86,7 @@ def test_create_file_share_from_row(page: Page, admin, fresh_admin):
     admin.put("/settings", json={"sharing_enabled": True})
     tag_name = _make_tag(admin)
     fc = fresh_admin["_client"]
-    v = fc.create_vault(name=unique("s5vf"))
+    v = fc.create_vault(name=unique("crvf"))
     fc.post(f"/vaults/{v['id']}/files", files=[("files", ("shareme.txt", b"data", "text/plain"))])
     try:
         _login(page, fresh_admin["_username"], fresh_admin["_password"])

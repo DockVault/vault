@@ -1,6 +1,6 @@
 """Per-recipient max_downloads on shares.
 
-A share's max_downloads caps how many times EACH recipient may download (O1 per-recipient): the
+A share's max_downloads caps how many times EACH recipient may download (per-recipient): the
 count is atomically consumed against the recipient's ShareClaim before the bytes are served, so a
 recipient is cut off after N and one recipient's downloads never consume another's. An unlimited
 share (no max_downloads) is never capped.

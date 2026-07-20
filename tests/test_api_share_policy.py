@@ -1,4 +1,4 @@
-"""GET /share-policy — the non-admin effective reader that shapes the (future) share modal.
+"""GET /share-policy — the non-admin effective reader that shapes the share modal.
 
 Proves the fail-closed create-allowlist: a user sees ONLY the active tags they may create shares with,
 the create-allowlist internals are never exposed, and the whole surface is empty when sharing is off.

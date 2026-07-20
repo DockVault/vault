@@ -29,7 +29,7 @@ def fresh_admin(admin):
 
 
 def _tag(admin):
-    r = admin.post("/share-tags", json={"name": unique("s52tag"), "auto_enroll_new_users": True,
+    r = admin.post("/share-tags", json={"name": unique("sbmtag"), "auto_enroll_new_users": True,
                                         "allowed_audiences": ["anyone_internal"], "max_recipients_cap": 10})
     assert r.status_code == 200, r.text
     return r.json()
@@ -39,7 +39,7 @@ def test_shared_by_me_list_kick_and_revoke(page: Page, admin, fresh_admin):
     admin.put("/settings", json={"sharing_enabled": True})
     tag = _tag(admin)
     fc = fresh_admin["_client"]
-    v = fc.create_vault(name=unique("s52v"))
+    v = fc.create_vault(name=unique("sbmv"))
     recipient = admin.create_user(role="user")
     rc = ApiClient()
     rc.login(recipient["_username"], recipient["_password"])

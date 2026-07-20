@@ -448,7 +448,7 @@ class PermissionService:
 
     def burn_share_download(self, user: User, vault: Vault, file, ancestor_folder_ids) -> bool:
         """Consume ONE download against the per-recipient ``max_downloads`` of the SHARE claims that
-        cover this file (O1: each recipient gets N per share). Returns True to allow, False to deny
+        cover this file (each recipient gets their own per-share download budget). Returns True to allow, False to deny
         (a covering LIMITED claim is exhausted). MUST be called only for a share recipient (the caller
         gates on the share-scope stamp); it independently re-resolves the covering claims.
 
@@ -500,7 +500,7 @@ class PermissionService:
             return True
         # All covering claims are limited: atomically consume one from EACH; deny (and roll back the
         # whole burn) if any is already at its cap. Consuming every covering limited claim keeps each
-        # share's max_downloads a hard ceiling (INV) — the multi-claim keying is intentionally strict.
+        # share's max_downloads a hard ceiling — the multi-claim keying is intentionally strict.
         for claim_id, max_dl in covering:
             res = self.db.execute(
                 update(ShareClaim)

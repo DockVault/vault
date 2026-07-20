@@ -424,8 +424,8 @@ class Share(Base):
     authorized, logged-in internal users and classified by a ShareTag. The tag's LIMIT policy is
     SNAPSHOTTED here at creation (editing the tag later never changes an existing share); the tag's
     create-allowlist and any revoke stay LIVE. New table (created by create_all). Standard vaults only
-    (never zero-knowledge); a password-protected vault is refused at create. NO claim/enforcement lives
-    here yet — the link token is stored HASHED (a bearer secret) and the plaintext is shown once."""
+    (never zero-knowledge); a password-protected vault is refused at create. The link token is stored
+    HASHED (a bearer secret) and the plaintext is shown once at create."""
     __tablename__ = 'shares'
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -465,9 +465,9 @@ class Share(Base):
 
 
 class ShareClaim(Base):
-    """One claimant of a Share (one row per distinct claiming user; populated at claim time in a later
-    phase). Enforces max_recipients (# active rows) and carries the per-recipient download counter +
-    the single-recipient kick. Unique per (share, user)."""
+    """One claimant of a Share (one row per distinct claiming user, created at claim time). Enforces
+    max_recipients (# active rows) and carries the per-recipient download counter + the single-recipient
+    kick. Unique per (share, user)."""
     __tablename__ = 'share_claims'
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

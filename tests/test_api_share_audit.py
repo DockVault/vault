@@ -1,4 +1,4 @@
-"""Share audit-trail finalization.
+"""Share audit-trail coverage.
 
 Every share lifecycle transition writes a name-redacted audit row (ids + counts only). This file
 covers share_expired — the lazy active->expired transition, emitted once when a claim is attempted on

@@ -693,7 +693,7 @@ class ShareTagCreate(BaseModel):
     @classmethod
     def _clean_description(cls, v):
         # Strip HTML markup at the input boundary like every sibling free-text field (name/username/…),
-        # so a later Tags-manager UI can never render a stored-XSS payload from a tag description.
+        # so the Tags-manager UI can never render a stored-XSS payload from a tag description.
         return _reject_markup_chars(v, 'description') if v is not None else v
 
 
@@ -4643,7 +4643,7 @@ async def get_share_policy(
     db: Session = Depends(get_db),
 ):
     """Effective sharing policy for the CURRENT user — non-admin readable (like /zk-enabled), so the
-    (future) share modal can shape controls without exposing the admin-only /settings or /share-tags.
+    share modal can shape controls without exposing the admin-only /settings or /share-tags.
     Returns whether sharing is on + ONLY the tags this user may CREATE shares with, each carrying its
     effective limit envelope + allowed audiences.
 
@@ -4692,7 +4692,7 @@ async def get_share_policy(
 # ---------------------------------------------------------------------------
 # Shares (create + list-mine). A Share grants ONE item (file / folder / whole Standard vault) to
 # authorized internal users, classified by a ShareTag whose limit policy is SNAPSHOTTED at creation.
-# No claim/enforcement here yet: the link token is a bearer secret stored HASHED and shown once.
+# The link token is a bearer secret: stored HASHED and shown once at create.
 # ---------------------------------------------------------------------------
 def _user_group_ids(db: Session, user_id) -> list:
     return [str(r[0]) for r in db.query(user_groups.c.group_id).filter(user_groups.c.user_id == user_id).all()]
@@ -4758,7 +4758,7 @@ async def create_share(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Create a share of a file / folder / whole Standard vault (no claim/enforcement yet). Fail-closed:
+    """Create a share of a file / folder / whole Standard vault. Fail-closed:
     a temporary session cannot create; sharing must be on; the creator must be able to READ the item;
     zero-knowledge and password-protected vaults are refused; the tag must be active and permit the
     creator (its create-allowlist); the audience must be one the tag allows; limit overrides are honored
@@ -4870,7 +4870,7 @@ async def create_share(
         import secrets as _secrets
         import hashlib as _hashlib
         link_token = _secrets.token_urlsafe(32)   # high-entropy bearer secret
-        link_token_hash = _hashlib.sha256(link_token.encode()).hexdigest()  # stored hashed (O2)
+        link_token_hash = _hashlib.sha256(link_token.encode()).hexdigest()  # only the hash is stored
 
     snapshot = dict(sharing_policy.tag_effective_limits(tag_limits))
     snapshot.update({"allow_view_only": tag.allow_view_only, "default_view_only": tag.default_view_only,
@@ -5017,8 +5017,8 @@ async def list_share_claims(
 
 def _share_claim_dict(claim: ShareClaim, share: Share) -> dict:
     """Recipient-facing view returned to a claimant. Describes WHAT was claimed (so the Shared tab can
-    render a card); it does NOT itself grant access — a later phase authorizes the claim at the vault
-    chokepoint. No token, no creator/allowlist internals."""
+    render a card); it does NOT itself grant access — the claim is authorized at the vault chokepoint on
+    each access. No token, no creator/allowlist internals."""
     return {
         "claim_id": str(claim.id),
         "share_id": str(share.id),
@@ -5043,7 +5043,7 @@ async def claim_share(
     on; the token must resolve to an ACTIVE, non-expired, non-revoked share; the claimant must satisfy
     the share's claim-audience; and the recipient limit must not be exceeded (an existing non-revoked
     claim is returned idempotently, a revoked one is denied). Creates a ShareClaim — this does NOT itself
-    grant access to the shared item; a later phase authorizes the claim at the vault chokepoint."""
+    grant access to the shared item; the claim is authorized at the vault chokepoint on each access."""
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="A temporary session cannot claim shares.")
     if not _sharing_enabled(db):
