@@ -496,9 +496,9 @@ class PermissionService:
         unlimited and burns nothing. Otherwise EACH covering LIMITED claim is consumed via an ATOMIC
         conditional increment (``download_count < max_downloads`` in the WHERE — so concurrent GETs by
         the same recipient can never exceed the cap); if any is already at its cap the whole burn is
-        rolled back and the download denied. No covering claim => allow (this gate enforces ONLY
-        max_downloads; revoke/expiry is enforced at get_vault at request start, so a claim that
-        vanished mid-request is a get_vault concern, not a limit to burn). The web download endpoint
+        rolled back and the download denied. No covering claim => DENY (fail-closed): require_download_scope
+        authorized this file from the SAME claim set, so an empty covering set means the claim vanished
+        after the scope stamp (a revoke/expiry/audience-removal mid-request). The web download endpoint
         serves the full object (no Range/partial responses), so every successful GET counts once.
 
         TRANSACTION OWNERSHIP: this commits (on allow) or rolls back (on deny) the request session, so
@@ -539,7 +539,12 @@ class PermissionService:
             if covers:
                 covering.append((claim_id, max_dl))
         if not covering:
-            return True  # require_download_scope already gated visibility/download; defensive
+            # Fail CLOSED: require_download_scope already authorized this download from the SAME claim
+            # set, so reaching here with no covering claim means it vanished after the scope stamp
+            # (a revoke/expiry/audience-removal mid-request) — deny rather than serve an un-metered
+            # download. A legitimately unlimited share has a covering claim with max_downloads NULL,
+            # handled below.
+            return False
         # An unlimited covering claim ⇒ unlimited downloads for this file (burn nothing).
         if any(max_dl is None for _, max_dl in covering):
             return True

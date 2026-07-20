@@ -655,6 +655,12 @@ class VaultGroupAccessAdd(BaseModel):
     permission: str = 'read'  # 'read' | 'write'
 
 
+# Postgres INTEGER (int4) ceiling. The share limit/lifetime fields map to int4 columns, so bound the
+# Pydantic validators here: a larger value would pass validation and then raise an uncaught DataError
+# (HTTP 500 — only IntegrityError is caught) on INSERT/UPDATE. le= turns it into a clean 422 at the edge.
+_INT4_MAX = 2147483647
+
+
 class ShareTagCreate(BaseModel):
     """Create a share tag (interactive-admin). Policy + create-allowlist. Ints are >= 1; a NULL cap or
     default means unlimited on that axis. Cross-field checks (default <= cap, default_lifetime <=
@@ -664,12 +670,12 @@ class ShareTagCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
     description: Optional[str] = None
     color: Optional[str] = Field(None, max_length=20)
-    max_lifetime_minutes: int = Field(10080, ge=1)     # ceiling (7 days)
-    default_lifetime_minutes: int = Field(1440, ge=1)  # default (1 day)
-    max_recipients_cap: Optional[int] = Field(None, ge=1)
-    max_recipients_default: Optional[int] = Field(None, ge=1)
-    max_downloads_cap: Optional[int] = Field(None, ge=1)
-    max_downloads_default: Optional[int] = Field(None, ge=1)
+    max_lifetime_minutes: int = Field(10080, ge=1, le=_INT4_MAX)     # ceiling (7 days)
+    default_lifetime_minutes: int = Field(1440, ge=1, le=_INT4_MAX)  # default (1 day)
+    max_recipients_cap: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_recipients_default: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_downloads_cap: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_downloads_default: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
     allow_view_only: bool = True
     default_view_only: bool = False
     allow_custom: bool = True
@@ -704,12 +710,12 @@ class ShareTagUpdate(BaseModel):
     description: Optional[str] = None
     color: Optional[str] = Field(None, max_length=20)
     is_active: Optional[bool] = None
-    max_lifetime_minutes: Optional[int] = Field(None, ge=1)
-    default_lifetime_minutes: Optional[int] = Field(None, ge=1)
-    max_recipients_cap: Optional[int] = Field(None, ge=1)
-    max_recipients_default: Optional[int] = Field(None, ge=1)
-    max_downloads_cap: Optional[int] = Field(None, ge=1)
-    max_downloads_default: Optional[int] = Field(None, ge=1)
+    max_lifetime_minutes: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    default_lifetime_minutes: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_recipients_cap: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_recipients_default: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_downloads_cap: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_downloads_default: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
     allow_view_only: Optional[bool] = None
     default_view_only: Optional[bool] = None
     allow_custom: Optional[bool] = None
@@ -747,9 +753,9 @@ class ShareCreate(BaseModel):
     claim_audience: str = Field(..., pattern='^(users|departments|anyone_internal)$')
     audience_user_ids: List[uuid.UUID] = Field(default_factory=list)
     audience_department_ids: List[uuid.UUID] = Field(default_factory=list)
-    lifetime_minutes: Optional[int] = Field(None, ge=1)
-    max_recipients: Optional[int] = Field(None, ge=1)
-    max_downloads: Optional[int] = Field(None, ge=1)
+    lifetime_minutes: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_recipients: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
+    max_downloads: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
     view_only: Optional[bool] = None
     with_link: bool = True
 
@@ -4474,7 +4480,9 @@ def _validate_ids_exist(db: Session, model, ids, field: str) -> None:
     found = {str(r[0]) for r in db.query(model.id).filter(model.id.in_(ids)).all()}
     missing = [i for i in ids if i not in found]
     if missing:
-        raise HTTPException(status_code=400, detail=f"{field} contains unknown id(s): {missing}")
+        # Report only a COUNT, never the ids themselves: echoing the submitted-but-unknown ids back
+        # would turn this into an existence oracle for arbitrary user/group ids.
+        raise HTTPException(status_code=400, detail=f"{field} contains {len(missing)} unknown id(s).")
 
 
 def _validate_share_tag_fields(eff: dict, changed_keys: set, db: Session, existing: dict = None) -> None:
@@ -5094,6 +5102,13 @@ def _claim_resolved_share(db: Session, share: Share, current_user: User, request
     ZK/password refusal, the claim-audience check, idempotent re-open (revoked denied), the row-locked
     max_recipients guard, create the ShareClaim, audit. The caller has already checked the temp-session
     and sharing-enabled gates. Returns the recipient claim dict."""
+    # Audience FIRST — before any status/expiry/vault check — so a caller who holds a share id/token but
+    # is NOT in the audience is denied uniformly and cannot fingerprint the share's lifecycle state
+    # (active vs revoked vs expired vs vault-gone) from the distinct error codes below.
+    if not sharing_policy.user_matches_claim_audience(
+            share.claim_audience, share.audience_user_ids, share.audience_department_ids,
+            current_user.id, _user_group_ids(db, current_user.id)):
+        raise HTTPException(status_code=403, detail="You are not in the audience for this share.")
     if share.status == "revoked":
         raise HTTPException(status_code=410, detail="That share has been revoked.")
     if _share_effective_status(share) == "expired":
@@ -5120,11 +5135,6 @@ def _claim_resolved_share(db: Session, share: Share, current_user: User, request
     if not vault or getattr(vault, "type", "standard") == "zero_knowledge" or vault.password_hash:
         raise HTTPException(status_code=403, detail="That share is no longer available.")
 
-    if not sharing_policy.user_matches_claim_audience(
-            share.claim_audience, share.audience_user_ids, share.audience_department_ids,
-            current_user.id, _user_group_ids(db, current_user.id)):
-        raise HTTPException(status_code=403, detail="You are not in the audience for this share.")
-
     existing = db.query(ShareClaim).filter(
         ShareClaim.share_id == share.id, ShareClaim.user_id == current_user.id).first()
     if existing:
@@ -5135,6 +5145,8 @@ def _claim_resolved_share(db: Session, share: Share, current_user: User, request
     # Serialize the recipient-limit check + insert against the share row, so concurrent claims by
     # DIFFERENT users cannot over-admit past max_recipients (a plain count-then-insert would race; the
     # unique (share,user) constraint only guards the same-user race). The lock releases on commit.
+    # Relies on READ COMMITTED (the engine default) so the post-lock count re-reads the committed
+    # winner; REPEATABLE READ would use a stale snapshot and could reintroduce over-admit.
     locked = db.query(Share).filter(Share.id == share.id).with_for_update().first()
     if locked is not None and locked.max_recipients is not None:
         active = db.query(ShareClaim).filter(
@@ -5797,7 +5809,10 @@ async def list_vaults(
         vault_dict = {
             'id': vault.id,
             'name': vault.name,
-            'description': vault.description,
+            # An id-scoped (file/folder share or scoped temp-cred) caller sees only their subtree; the
+            # owner-authored vault description may reference items outside that scope, so mask it too
+            # (same rationale as suppressing the whole-vault aggregates).
+            'description': None if _id_scoped else vault.description,
             'owner_id': vault.owner_id,
             'has_password': vault.password_hash is not None,
             'expire_files_after_days': vault.expire_files_after_days,
@@ -5878,7 +5893,10 @@ async def get_vault(
         vault_dict = {
             'id': vault.id,
             'name': vault.name,
-            'description': vault.description,
+            # An id-scoped (file/folder share or scoped temp-cred) caller sees only their subtree; the
+            # owner-authored vault description may reference items outside that scope, so mask it too
+            # (same rationale as suppressing the whole-vault aggregates).
+            'description': None if _id_scoped else vault.description,
             'owner_id': vault.owner_id,
             'owner_username': owner_username,
             'has_password': vault.password_hash is not None,
