@@ -29,38 +29,52 @@ setup — it writes `.env` with freshly generated secrets, provisions the TLS ce
 the HTTPS-only stack (web UI/API on port **443**, TLS terminated in-container, no plaintext
 listener; optional SFTP).
 
+The two setup scripts live at the repo **root** — run either from there.
+
 **Linux** — interactive; collects your domain and TLS choice (Let's Encrypt, self-signed, or
 bring-your-own certificate):
 
 ```bash
-sudo ./deploy/setup-secure.sh
+sudo ./setup-secure.sh
 ```
 
 **Windows** (Docker Desktop) — self-signed by default, or point it at your own certificate:
 
 ```powershell
-./deploy/setup-secure.ps1 -ServerName vault.example.com
+./setup-secure.ps1 -ServerName vault.example.com
 # ...or bring your own certificate (recommended for anything public):
-./deploy/setup-secure.ps1 -ServerName vault.example.com -CertMode byo -CertPath fullchain.pem -KeyPath privkey.pem
+./setup-secure.ps1 -ServerName vault.example.com -CertMode byo -CertPath fullchain.pem -KeyPath privkey.pem
 ```
 
 Both are idempotent — re-run any time to rebuild; they **reuse your existing `.env`** and keep your
-data. Both start `deploy/docker-compose.secure.yml`, which you can also run directly (from the repo
-root, so `--env-file` finds the root `.env`) once `./.env` and `./certs/{cert.pem,key.pem}` exist:
-
-```bash
-docker compose --env-file .env -f deploy/docker-compose.secure.yml up -d --build
-```
+data.
 
 The setup script creates the first admin account from the `ADMIN_USERNAME` / `ADMIN_PASSWORD` it
 writes to `.env` (the Windows script prints a generated password once; the Linux script prompts you
 for one). Then open `https://<your-domain>` and log in with those credentials — change the password
 from Settings after the first login. No license key, no activation.
 
+### Production without the script (advanced)
+
+If you'd rather manage `.env` and TLS yourself, provide `./.env` (start from `.env.example`) and
+`./certs/{cert.pem,key.pem}`, then start the production stack straight from the repo root:
+
+```bash
+cp .env.example .env      # then edit it: set ENCRYPTION_KEY, JWT_SECRET_KEY, VAULT_DB_PASSWORD,
+                          # and a strong ADMIN_PASSWORD (boot is refused with the shipped placeholder)
+# ...put your TLS cert + key at ./certs/cert.pem and ./certs/key.pem...
+docker compose -f docker-compose.secure.yml up -d --build
+```
+
+> **`.env` is found automatically — never move it.** The root `docker-compose.secure.yml` (and the
+> `docker-compose.yml` below) are thin `include:` shims over the real files in `deploy/`. Running
+> `docker compose` against a **root** file makes the repo root the Compose project directory, so
+> `./.env` loads on its own — no `--env-file`, and you never copy `.env` into `deploy/`.
+
 > Re-running after changing `VAULT_DB_PASSWORD` (or starting fresh by removing `.env`) requires
 > resetting the database volume, or Postgres keeps the old password:
-> `docker compose --env-file .env -f deploy/docker-compose.secure.yml down -v` then re-run the
-> script. This destroys stored data, so only do it before you have real vaults.
+> `docker compose -f docker-compose.secure.yml down -v` then re-run the setup script. This destroys
+> stored data, so only do it before you have real vaults.
 
 ### Local trial only (HTTP, no TLS) — not for real use
 
@@ -69,9 +83,8 @@ bound to **loopback only** (`127.0.0.1:8200`) and runs in development mode, so i
 supported way to hold real data** — use the production setup above for anything reachable or real.
 
 ```bash
-cp .env.example .env      # then edit it: set ENCRYPTION_KEY, JWT_SECRET_KEY, VAULT_DB_PASSWORD, and
-                          # a strong ADMIN_PASSWORD (boot is refused with the shipped placeholder)
-docker compose up -d      # web/API on http://localhost:8200
+cp .env.example .env      # edit the same secrets as above
+docker compose up -d      # root dev shim; ./.env auto-loads; web/API on http://localhost:8200
 ```
 
 ## Repository layout
@@ -79,15 +92,19 @@ docker compose up -d      # web/API on http://localhost:8200
 | Path | What lives there |
 |------|------------------|
 | `app/` | The Python application — `app/api/` (web/API server + the user-management/dashboard/ECC routers), `app/sftp/` (SFTP server), `app/core/` (config, models, security primitives), `app/services/` (vault/auth/domain services), `app/config/` (branding), `app/routers/` (info endpoints) |
-| `deploy/` | Deployment files — `deploy/docker-compose.yml` (local trial), `deploy/docker-compose.secure.yml` + `deploy/setup-secure.sh` / `deploy/setup-secure.ps1` (production HTTPS) |
+| `setup-secure.sh`, `setup-secure.ps1` | Production setup scripts (Linux / Windows) — run from the repo root |
+| `.env.example` | Config template — copy to `.env` and fill in (documents every key) |
+| `deploy/` | The real Compose stacks — `deploy/docker-compose.yml` (local trial), `deploy/docker-compose.secure.yml` (production HTTPS) |
 | `scripts/` | Operator utilities (`scripts/setup_master_password.py`) |
 | `static/` | The self-hosted web UI (no CDN assets) |
 | `tests/` | pytest + Playwright integration suite (see `tests/README.md`) |
 | `run_combined.py`, `docker-entrypoint.py` | Container entrypoints, kept at the root (the image's ENTRYPOINT/CMD contract) |
 
-The root `docker-compose.yml` is a thin `include:` shim over `deploy/docker-compose.yml`, so
-`docker compose up -d` keeps working from the repository root (and existing deployments keep their
-project and volume names).
+The root `docker-compose.yml` and `docker-compose.secure.yml` are thin `include:` shims over the
+matching files in `deploy/`, so `docker compose [-f docker-compose.secure.yml] up -d` works from the
+repository root and auto-loads the root `.env` (existing deployments keep their project and volume
+names). The three files a self-hoster touches — the two `setup-secure.*` scripts and `.env.example` —
+all live at the root.
 
 ## Security model
 
@@ -104,7 +121,7 @@ project and volume names).
 ## Production checklist
 
 If you front the vault yourself (your own reverse proxy, k8s, `docker run`) rather than using
-`deploy/setup-secure.sh`, confirm all of these — the setup script handles or prompts you for most of
+`./setup-secure.sh`, confirm all of these — the setup script handles or prompts you for most of
 them, but a README-only reader can miss them (the off-host key backup is always yours to do):
 
 - **Back up `ENCRYPTION_KEY` off the host** (e.g. a password manager). Without it, every stored file — and any

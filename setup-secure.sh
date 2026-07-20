@@ -14,17 +14,17 @@
 #
 # Usage (from the REPOSITORY ROOT, on the Linux host, as root — the script
 # lives in deploy/ but anchors itself at the repo root, where .env + certs/ live):
-#   sudo ./deploy/setup-secure.sh                 first run OR rebuild-in-place (the common case)
-#   sudo ./deploy/setup-secure.sh --certs-only    (re)generate certs only, then restart vault-api
-#   sudo ./deploy/setup-secure.sh --no-cache      rebuild the image from scratch (no build cache)
-#   sudo ./deploy/setup-secure.sh --no-start      do setup/certs but don't build or start
-#   sudo ./deploy/setup-secure.sh --help
+#   sudo ./setup-secure.sh                 first run OR rebuild-in-place (the common case)
+#   sudo ./setup-secure.sh --certs-only    (re)generate certs only, then restart vault-api
+#   sudo ./setup-secure.sh --no-cache      rebuild the image from scratch (no build cache)
+#   sudo ./setup-secure.sh --no-start      do setup/certs but don't build or start
+#   sudo ./setup-secure.sh --help
 #
 # Fully unattended first run — preset the answers as env vars (nothing is asked):
 #   sudo -E env SERVER_NAME=vault.example.com CERT_MODE=1 \
 #        ADMIN_USERNAME=admin ADMIN_EMAIL=admin@example.com \
 #        ADMIN_PASSWORD='a-strong-password' WANT_SFTP=0 \
-#        ./deploy/setup-secure.sh
+#        ./setup-secure.sh
 #   (CERT_MODE: 1=self-signed  2=Let's Encrypt [+ACME_EMAIL]  3=bring-your-own [+BYO_CERT/BYO_KEY])
 #
 # SAFETY: an existing ./.env is REUSED, never overwritten. ENCRYPTION_KEY (the
@@ -36,9 +36,9 @@
 
 set -euo pipefail
 
-# This script lives in deploy/ — anchor at the REPOSITORY ROOT (parent dir),
-# where .env, certs/ and the Dockerfile live.
-cd "$(dirname "$0")/.."
+# This script lives at the repository ROOT — anchor here (where .env, certs/ and the
+# Dockerfile live), so ./.env and ./certs resolve regardless of the caller's cwd.
+cd "$(dirname "$0")"
 
 COMPOSE_FILE="deploy/docker-compose.secure.yml"
 CERT_DIR="certs"
@@ -252,7 +252,7 @@ apply_cert_owner() {
       warn "rootless/userns Docker: could not tighten the TLS key to the container's mapped uid (no local"
       warn "helper image yet, or the engine refused), so $CERT_DIR/key.pem is world-readable (644). Host"
       warn "assumed SINGLE-TENANT; on a shared host restrict $CERT_DIR (dedicated user + ACLs) or use"
-      warn "rootful Docker. Re-run 'sudo ./deploy/setup-secure.sh --certs-only' once the stack is up to retry."
+      warn "rootful Docker. Re-run 'sudo ./setup-secure.sh --certs-only' once the stack is up to retry."
     fi
   elif chown "$APP_UID:$APP_UID" "$CERT_DIR" "$CERT_DIR/cert.pem" "$CERT_DIR/key.pem" 2>/dev/null \
        && [ "$(stat -c '%u' "$CERT_DIR/key.pem" 2>/dev/null || echo x)" = "$APP_UID" ]; then
@@ -298,12 +298,12 @@ preflight_ports() {
 }
 
 # ---------------------------------------------------------------- preconditions
-[ "$(id -u)" -eq 0 ] || die "run as root: sudo ./deploy/setup-secure.sh (needed for docker, chown of $CERT_DIR/, and optionally certbot)"
+[ "$(id -u)" -eq 0 ] || die "run as root: sudo ./setup-secure.sh (needed for docker, chown of $CERT_DIR/, and optionally certbot)"
 command -v openssl >/dev/null 2>&1 || die "openssl not found"
 command -v docker  >/dev/null 2>&1 || die "docker not found (install: curl -fsSL https://get.docker.com | sh)"
 docker compose version >/dev/null 2>&1 || die "the 'docker compose' plugin is not available"
 docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon (is it running? are you on the right 'docker context'?)"
-[ -f "$COMPOSE_FILE" ] || die "$COMPOSE_FILE not found — run this script from its repository checkout (it expects the repo root one level above its own deploy/ directory)"
+[ -f "$COMPOSE_FILE" ] || die "$COMPOSE_FILE not found — run this script from the repository root (its deploy/docker-compose.secure.yml must be present)"
 
 HAVE_ENV=0
 [ -f .env ] && HAVE_ENV=1
@@ -430,7 +430,7 @@ EOF
 
 # ================================================================ --certs-only
 if [ "$CERTS_ONLY" -eq 1 ]; then
-  [ "$HAVE_ENV" -eq 1 ] || die "no ./.env yet — run a full setup first (sudo ./deploy/setup-secure.sh)"
+  [ "$HAVE_ENV" -eq 1 ] || die "no ./.env yet — run a full setup first (sudo ./setup-secure.sh)"
   SERVER_NAME="${SERVER_NAME:-$(read_env SERVER_NAME)}"
   ask SERVER_NAME "Public DNS name (or public IP) clients will use, e.g. vault.example.com"
   [[ "$SERVER_NAME" =~ [[:space:]] ]] && die "'$SERVER_NAME' contains whitespace"
@@ -442,7 +442,7 @@ if [ "$CERTS_ONLY" -eq 1 ]; then
     dc restart vault-api
   else
     say ""
-    say "The stack is not running yet. Start it with:  sudo ./deploy/setup-secure.sh"
+    say "The stack is not running yet. Start it with:  sudo ./setup-secure.sh"
   fi
   say "Done (certs only)."
   exit 0
@@ -465,7 +465,7 @@ if [ "$HAVE_ENV" -eq 1 ]; then
   if [ "$HAVE_CERTS" -eq 1 ]; then
     say ""
     say "Certificates already present — keeping them (repairing ownership if needed)."
-    say "  (regenerate later with:  sudo ./deploy/setup-secure.sh --certs-only)"
+    say "  (regenerate later with:  sudo ./setup-secure.sh --certs-only)"
     apply_cert_owner
   else
     warn "no certificates found in ./$CERT_DIR — generating them now."
@@ -563,7 +563,7 @@ fi
 if [ "$NO_START" -eq 1 ]; then
   say ""
   say "Setup + certs done. Skipping build/start (--no-start). Start later with:"
-  say "  sudo ./deploy/setup-secure.sh"
+  say "  sudo ./setup-secure.sh"
   exit 0
 fi
 
@@ -629,7 +629,7 @@ if [ "$_status" != "healthy" ]; then
     warn "LIKELY CAUSE: the container can't read the TLS cert/key. On a rootless or"
     warn "userns-remapped engine the host uid doesn't map into the container, so a"
     warn "mode-600 key is unreadable. Fix:  sudo chmod 644 $CERT_DIR/key.pem"
-    warn "  (or regenerate:  sudo ./deploy/setup-secure.sh --certs-only), then re-run."
+    warn "  (or regenerate:  sudo ./setup-secure.sh --certs-only), then re-run."
     say ""
   fi
   if printf '%s %s' "$_logs" "$_derr" | grep -Eqi 'bind.*443|address already in use|listen tcp.*:443|:443.*permission denied|failed to bind'; then
@@ -640,7 +640,7 @@ if [ "$_status" != "healthy" ]; then
     warn "  or use a rootful daemon:  docker context use default"
     say ""
   fi
-  die "vault-api is not serving on https/443 — fix the cause above and re-run 'sudo ./deploy/setup-secure.sh'.
+  die "vault-api is not serving on https/443 — fix the cause above and re-run 'sudo ./setup-secure.sh'.
        (Redis/Postgres/SFTP may be up, but no summary is printed because the web app is down.)"
 fi
 say "  vault-api is healthy."
@@ -676,7 +676,7 @@ say " Everything else stays internal: Postgres/Redis are not published, and the"
 say " app has no plain-HTTP listener (TLS terminates in the container)."
 [ "${CERT_MODE:-$(read_env CERT_MODE)}" = "1" ] && say " Self-signed cert: your browser/SFTP client will warn until you trust it."
 say ""
-say " Re-run any time to pick up changes:  sudo ./deploy/setup-secure.sh"
+say " Re-run any time to pick up changes:  sudo ./setup-secure.sh"
 say "   (reuses .env, rebuilds the image, recreates containers — data is kept)"
 say ""
 say " *** BACK UP ./.env OFF THIS VM NOW — it holds ENCRYPTION_KEY. ***"

@@ -295,7 +295,7 @@ if (settings.jwt_algorithm or "").strip() not in {"HS256", "HS384", "HS512"}:
 #     "vault2024", "Password1") can't boot the account that reads every non-ZK vault server-side.
 #     Fail SAFE: only an explicit ENVIRONMENT=development is lenient — "production" (the default),
 #     "staging", "prod", or a typo all get the strict tier, matching the plaintext-transport warning.
-# `deploy/setup-secure.sh` forces production, so it passes both tiers. A deployment that deliberately runs in
+# `./setup-secure.sh` forces production, so it passes both tiers. A deployment that deliberately runs in
 # `development` mode is opting into the lenient tier for a trusted/local environment (where the admin
 # password is expected to be set out of band), so only the always-on placeholder check applies there.
 _ADMIN_PASSWORD_SHIPPED_PLACEHOLDERS = {"replace_me"}

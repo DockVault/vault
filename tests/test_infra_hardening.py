@@ -489,9 +489,45 @@ def test_deploy_scripts_hardened():
     assert "iterations=600000" in smp, "PBKDF2 must use >=600k iterations (match the runtime decryptor)"
     assert "'production'" in smp, "the ENVIRONMENT fallback must default to production, not development"
     assert "0o600" in smp, "secret files must be written mode 0600"
-    ss = _read("deploy/setup-secure.sh")
-    assert "REDIS_PASSWORD" in ss, "deploy/setup-secure.sh must generate a REDIS_PASSWORD"
-    assert "ALLOWED_HOSTS" in ss, "deploy/setup-secure.sh must write ALLOWED_HOSTS"
+    ss = _read("setup-secure.sh")
+    assert "REDIS_PASSWORD" in ss, "setup-secure.sh must generate a REDIS_PASSWORD"
+    assert "ALLOWED_HOSTS" in ss, "setup-secure.sh must write ALLOWED_HOSTS"
+
+
+def test_setup_scripts_at_root_and_secure_shim():
+    # The two user-facing setup scripts live at the repo ROOT (not deploy/), and the root
+    # docker-compose.secure.yml include-shim makes `docker compose -f docker-compose.secure.yml
+    # up` auto-load root .env with no --env-file and no moving .env into deploy/.
+    assert (ROOT / "setup-secure.sh").exists(), "setup-secure.sh must live at the repo root"
+    assert (ROOT / "setup-secure.ps1").exists(), "setup-secure.ps1 must live at the repo root"
+    assert not (ROOT / "deploy" / "setup-secure.sh").exists(), "setup-secure.sh must NOT remain in deploy/"
+    assert not (ROOT / "deploy" / "setup-secure.ps1").exists(), "setup-secure.ps1 must NOT remain in deploy/"
+
+    # Lock the path anchors: a root-anchored script must NOT climb to the parent (that would
+    # write .env/certs to the parent directory when run from a nested checkout).
+    sh = _read("setup-secure.sh")
+    assert 'cd "$(dirname "$0")"' in sh, "setup-secure.sh must anchor at its own dir (repo root)"
+    assert '"$(dirname "$0")/.."' not in sh, "setup-secure.sh must not climb to the parent dir"
+    ps = _read("setup-secure.ps1")
+    assert "= $ScriptDir" in ps, "setup-secure.ps1 $Root must be its own dir (repo root)"
+    assert "Split-Path -Parent $ScriptDir" not in ps, "setup-secure.ps1 must not climb to the parent dir"
+
+    # Root secure include-shim exists, pins the project name (for volume stability), and includes
+    # the real deploy file.
+    shim = _read("docker-compose.secure.yml")
+    assert "name: dockvault-vault" in shim, "root secure shim must pin the project name"
+    assert "deploy/docker-compose.secure.yml" in shim and "include:" in shim, \
+        "root secure shim must include: deploy/docker-compose.secure.yml"
+
+    # SECURITY.md moved under .github/ (GitHub still renders it); no stray root copy.
+    assert (ROOT / ".github" / "SECURITY.md").exists(), "SECURITY.md must live under .github/"
+    assert not (ROOT / "SECURITY.md").exists(), "no duplicate SECURITY.md at the root"
+
+    # No doc/compose/source still points at the OLD deploy/setup-secure.* location.
+    for name in ("README.md", ".env.example", "CLAUDE.md", ".github/SECURITY.md",
+                 "deploy/docker-compose.secure.yml", "app/core/config.py", "app/api/api_server.py"):
+        assert "deploy/setup-secure" not in _read(name), \
+            f"{name} still references the moved deploy/setup-secure path"
 
 
 def test_public_docs_reference_only_shipped_windows_scripts():

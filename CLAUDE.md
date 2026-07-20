@@ -2,9 +2,11 @@
 
 This repo is the DockVault vault service: a self-hostable encrypted file vault
 (FastAPI web/API on 8000 + SFTP on 2222, single image, `run_combined.py` runs both).
-Deploy paths: `deploy/setup-secure.sh` + `deploy/docker-compose.secure.yml` (production
-HTTPS), `docker-compose.yml` (local trial; a root `include:` shim over
-`deploy/docker-compose.yml` so `docker compose up` keeps working from the root). The image is also consumed downstream as a
+Deploy paths: the two setup scripts live at the repo ROOT (`./setup-secure.sh` /
+`./setup-secure.ps1`) and drive `deploy/docker-compose.secure.yml` (production HTTPS); root
+`docker-compose.yml` + `docker-compose.secure.yml` are thin `include:` shims over the real
+files in `deploy/` so `docker compose [-f docker-compose.secure.yml] up` works from the root
+and auto-loads root `.env`. The image is also consumed downstream as a
 per-customer container, so **treat `main` as production**: everything tracked here
 ships inside the built image (`Dockerfile` does `COPY . .`, filtered only by
 `.dockerignore`).

@@ -25,7 +25,7 @@ reasonable window to release a fix before any public disclosure.
 
 Use the hardened production path, not the local-trial default:
 
-- `deploy/setup-secure.sh` + `deploy/docker-compose.secure.yml` — TLS-only, non-root, read-only
+- `./setup-secure.sh` + `deploy/docker-compose.secure.yml` — TLS-only, non-root, read-only
   container, the generated `.env` secrets file written at mode `600`, and the
   database/Redis never published to the host. (On rootless / user-namespace-remapped
   engines the TLS private key may be widened to `644` so the remapped container user can
@@ -44,7 +44,7 @@ never be used to access any instance.
 
 - Never copy a password, key, or token out of this repository — its working tree **or**
   its history — into a real deployment.
-- Every install generates its own secrets (`deploy/setup-secure.sh` does this for you;
+- Every install generates its own secrets (`./setup-secure.sh` does this for you;
   `.env.example` ships only non-functional placeholders).
 
 If you believe a credential found in this repository is, or ever was, valid against a

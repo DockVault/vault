@@ -1,6 +1,6 @@
 # setup-secure.ps1 - one-command PRODUCTION (HTTPS) setup for DockVault on Windows.
 #
-# The Windows counterpart of deploy/setup-secure.sh: it writes ./.env with freshly generated
+# The Windows counterpart of ./setup-secure.sh: it writes ./.env with freshly generated
 # secrets, provisions TLS certificates into ./certs, and starts the HTTPS-only stack from
 # deploy/docker-compose.secure.yml (web UI/API on https://<name>, TLS terminated in-container; no
 # plaintext listener). Postgres + Redis stay internal to the compose network.
@@ -8,12 +8,12 @@
 # Requires Docker Desktop (Linux containers). The script lives in deploy/ but anchors
 # itself at the repo root (where .env + certs/ live). Run it from the repo root in PowerShell:
 #
-#   ./deploy/setup-secure.ps1 -ServerName vault.example.com                 # self-signed (default)
-#   ./deploy/setup-secure.ps1 -ServerName vault.example.com -CertMode byo `
+#   ./setup-secure.ps1 -ServerName vault.example.com                 # self-signed (default)
+#   ./setup-secure.ps1 -ServerName vault.example.com -CertMode byo `
 #                             -CertPath C:\certs\fullchain.pem -KeyPath C:\certs\privkey.pem
-#   ./deploy/setup-secure.ps1 -ServerName vault.example.com -EnableSftp     # also expose SFTP
-#   ./deploy/setup-secure.ps1 -ServerName vault.example.com -AdminPassword 'a-strong-12+char-pass'
-#   ./deploy/setup-secure.ps1 -ServerName vault.example.com -NoStart        # set up, do not start
+#   ./setup-secure.ps1 -ServerName vault.example.com -EnableSftp     # also expose SFTP
+#   ./setup-secure.ps1 -ServerName vault.example.com -AdminPassword 'a-strong-12+char-pass'
+#   ./setup-secure.ps1 -ServerName vault.example.com -NoStart        # set up, do not start
 #
 # The first admin account is created at startup from ADMIN_USERNAME/ADMIN_PASSWORD (written to
 # .env). If you don't pass -AdminPassword it prompts, and a blank answer auto-generates a strong
@@ -48,9 +48,9 @@ param(
 $ErrorActionPreference = 'Continue'
 Set-StrictMode -Version 2.0
 
-# This script lives in deploy/ - the repo ROOT (parent dir) is where .env and certs/ live.
+# This script lives at the repo ROOT - where .env and certs/ live.
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Root      = Split-Path -Parent $ScriptDir
+$Root      = $ScriptDir
 $EnvFile   = Join-Path $Root '.env'
 $CertDir   = Join-Path $Root 'certs'
 # Absolute path so `docker compose` finds the file no matter which directory the script is
@@ -124,7 +124,7 @@ function New-FernetKey {
 # The cert + key are bind-mounted read-only into the container and read by uvicorn as the non-root
 # app user (uid 10001). OpenSSL writes the key mode 0600 owned by root, so that user cannot read it
 # (uvicorn then dies with a TLS-key PermissionError). Set-CertReadable (below) fixes the mode after
-# generation; the Linux deploy/setup-secure.sh does the equivalent via a numeric chown.
+# generation; the Linux ./setup-secure.sh does the equivalent via a numeric chown.
 
 # Run OpenSSL from the host if present, otherwise via a throwaway container so the host needs
 # nothing but Docker. Args run with the certs dir as the working directory.

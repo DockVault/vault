@@ -406,7 +406,7 @@ from app.config.effective import BRAND_SETTINGS_KEY, set_brand_overrides
 # to run before any admin exists), so it must become unreachable the moment an instance is
 # set up — otherwise an anonymous request could reconfigure a live production instance
 # (create/alter the admin, rewrite config). "Set up" = ANY admin user exists, which every
-# production deploy has from startup (deploy/setup-secure.sh and the SaaS portal seed the admin
+# production deploy has from startup (./setup-secure.sh and the SaaS portal seed the admin
 # from env). Queried WITHOUT the is_active filter on purpose: a deactivated admin still
 # means the instance is set up and must NOT re-open the wizard. Setup is done by the
 # provisioning script / portal, so the wizard is a first-run-only fallback for a bare deploy.
@@ -10531,7 +10531,7 @@ if __name__ == "__main__":
         print("\n⚠️  WARNING: serving PLAINTEXT HTTP with ENVIRONMENT != development and no TRUSTED_PROXIES set.")
         print("   Login credentials and bearer tokens cross the network in cleartext if this port is")
         print("   reachable off-host. Enable TLS (API_USE_HTTPS=true) or front the app with an HTTPS")
-        print("   reverse proxy (deploy/docker-compose.secure.yml / deploy/setup-secure.sh do this for you).")
+        print("   reverse proxy (deploy/docker-compose.secure.yml / ./setup-secure.sh do this for you).")
 
     uvicorn.run(
         app,

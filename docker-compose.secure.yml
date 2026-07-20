@@ -1,0 +1,13 @@
+# Thin pointer: the real PRODUCTION (HTTPS) stack lives in deploy/docker-compose.secure.yml.
+# Kept at the repo root so `docker compose -f docker-compose.secure.yml up` run from HERE
+# sets the Compose project directory to the repo root, which makes ./.env load automatically
+# for ${VAR} interpolation — no --env-file, and NEVER any need to move .env into deploy/.
+# (Pointing -f directly at deploy/docker-compose.secure.yml instead makes the project dir
+# deploy/, so Compose looks for deploy/.env and the ${VAULT_DB_PASSWORD:?} guard aborts.)
+# Mirrors the docker-compose.yml dev shim. NB: `name:` must be pinned HERE too — a `name:`
+# inside an included file does not propagate to the including project, and the volume names
+# hang off it, so this keeps existing deployments on the same volumes.
+name: dockvault-vault
+
+include:
+  - deploy/docker-compose.secure.yml
