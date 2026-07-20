@@ -328,7 +328,9 @@ class PermissionService:
           * an 'active', not-past-expiry share (INCLUDING view-only — a view-only share
             grants read so the recipient can open/list/preview; the download path denies
             file.download separately via the downloadable scope);
-          * a caller holding a non-revoked ShareClaim on that share.
+          * a caller holding a non-revoked ShareClaim on that share whose claim-audience the caller
+            STILL matches — re-checked LIVE, so removing a recipient from the targeted department
+            revokes their access on the next request, not just an explicit revoke/kick/expiry.
         Grants read (the download path re-checks READ) but never write/delete/manage. For a
         FILE/FOLDER-target share this read is SUBTREE-RESTRICTED by the id-scope wrappers once
         stamp_share_scope() has stamped the caller's share scope at the get_vault chokepoint — the
@@ -345,9 +347,10 @@ class PermissionService:
         if vault.password_hash:
             return None
         now = datetime.utcnow()
-        claim = (
-            self.db.query(ShareClaim)
-            .join(Share, Share.id == ShareClaim.share_id)
+        rows = (
+            self.db.query(Share.claim_audience, Share.audience_user_ids,
+                          Share.audience_department_ids)
+            .join(ShareClaim, ShareClaim.share_id == Share.id)
             .filter(
                 ShareClaim.user_id == user.id,
                 ShareClaim.revoked.is_(False),
@@ -355,9 +358,15 @@ class PermissionService:
                 Share.status == 'active',
                 Share.expires_at > now,
             )
-            .first()
+            .all()
         )
-        if claim is None:
+        if not rows:
+            return None
+        # Re-check the claim-audience LIVE (not just at claim time). Grant only if the caller STILL
+        # satisfies at least one held claim's audience — so a recipient removed from the targeted
+        # department loses access on their next request.
+        gids = self._current_group_ids(user)
+        if not any(self._audience_ok(aud, au, ad, user.id, gids) for aud, au, ad in rows):
             return None
         return {'read': True, 'write': False, 'delete': False, 'manage': False}
 
@@ -372,6 +381,26 @@ class PermissionService:
         except Exception:
             cfg = {}
         return sharing_policy.sharing_enabled(cfg)
+
+    def _current_group_ids(self, user: User) -> set:
+        """The caller's CURRENT group/department ids (live query) — used to re-evaluate a
+        'departments' claim-audience at ACCESS time so leaving the targeted department cuts access."""
+        return {
+            str(r[0]) for r in self.db.execute(
+                select(user_groups.c.group_id).where(user_groups.c.user_id == user.id)
+            ).fetchall()
+        }
+
+    @staticmethod
+    def _audience_ok(claim_audience, audience_user_ids, audience_department_ids,
+                     user_id, user_group_ids) -> bool:
+        """Whether `user_id` STILL satisfies a share's claim-audience, reusing the SAME pure predicate
+        the claim path uses. 'anyone_internal'/'users' are effectively static (the audience is
+        snapshotted at create and included the claimant); 'departments' is re-checked against the
+        caller's live group membership — this is what makes de-provisioning revoke live access."""
+        from app.core import sharing_policy
+        return sharing_policy.user_matches_claim_audience(
+            claim_audience, audience_user_ids, audience_department_ids, user_id, user_group_ids)
 
     def stamp_share_scope(self, user: User, vault: Vault) -> None:
         """Stamp a share recipient's per-vault id-subtrees so the generalized id-scope wrappers
@@ -403,7 +432,9 @@ class PermissionService:
             now = datetime.utcnow()
             rows = (
                 self.db.query(Share.target_type, Share.target_folder_id,
-                              Share.target_file_id, Share.view_only)
+                              Share.target_file_id, Share.view_only,
+                              Share.claim_audience, Share.audience_user_ids,
+                              Share.audience_department_ids)
                 .join(ShareClaim, ShareClaim.share_id == Share.id)
                 .filter(
                     ShareClaim.user_id == user.id,
@@ -415,10 +446,16 @@ class PermissionService:
                 .all()
             )
             if rows:
+                gids = self._current_group_ids(user)
                 v_whole = d_whole = False
                 v_files, v_folders = set(), set()
                 d_files, d_folders = set(), set()
-                for target_type, folder_id, file_id, view_only in rows:
+                for (target_type, folder_id, file_id, view_only,
+                     _aud, _au, _ad) in rows:
+                    # Drop a claim whose audience the caller no longer matches (e.g. removed from the
+                    # targeted department) so its item leaves the caller's live scope.
+                    if not self._audience_ok(_aud, _au, _ad, user.id, gids):
+                        continue
                     # Every active claim contributes to the VISIBLE scope; only a non-view-only claim
                     # also contributes to the DOWNLOADABLE scope.
                     if target_type == 'vault':
@@ -472,7 +509,9 @@ class PermissionService:
         fid = str(file.id)
         rows = (
             self.db.query(ShareClaim.id, Share.max_downloads, Share.target_type,
-                          Share.target_folder_id, Share.target_file_id)
+                          Share.target_folder_id, Share.target_file_id,
+                          Share.claim_audience, Share.audience_user_ids,
+                          Share.audience_department_ids)
             .join(Share, Share.id == ShareClaim.share_id)
             .filter(
                 ShareClaim.user_id == user.id,
@@ -484,8 +523,14 @@ class PermissionService:
             )
             .all()
         )
+        gids = self._current_group_ids(user)
         covering = []
-        for claim_id, max_dl, ttype, tfolder, tfile in rows:
+        for (claim_id, max_dl, ttype, tfolder, tfile,
+             _aud, _au, _ad) in rows:
+            # A claim whose audience the caller no longer matches confers nothing (same live check as
+            # the read grant + scope stamp), so it must neither count toward nor block this budget.
+            if not self._audience_ok(_aud, _au, _ad, user.id, gids):
+                continue
             covers = (
                 ttype == 'vault'
                 or (ttype == 'folder' and tfolder is not None and str(tfolder) in anc)

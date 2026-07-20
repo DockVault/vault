@@ -4698,6 +4698,34 @@ def _user_group_ids(db: Session, user_id) -> list:
     return [str(r[0]) for r in db.query(user_groups.c.group_id).filter(user_groups.c.user_id == user_id).all()]
 
 
+def _validate_share_audience_users(db: Session, current_user: User, aud_users: list) -> None:
+    """A direct-push 'users' audience must be limited to recipients the creator could actually reach
+    through the recipient picker (GET /users/search): active, non-EXTERNAL accounts, and — when the org
+    sets directory_search_scope='same_department' — accounts sharing a department with the creator.
+    Existence is already checked by _validate_ids_exist; this applies the SAME eligibility filter the
+    picker applies, so a crafted POST /shares can't push a share to a user the picker would never
+    surface (an out-of-scope, EXTERNAL, or inactive account). An interactive admin is NOT
+    department-scoped — they have the unrestricted /users directory — mirroring /users/search. Fail-
+    closed: any ineligible id is rejected with a non-enumerating 400 (the specific ids are not echoed)."""
+    if not aud_users:
+        return
+    from sqlalchemy import select as _select
+    q = db.query(User.id).filter(
+        User.id.in_(aud_users),
+        User.is_active == True,  # noqa: E712
+        User.role != RoleEnum.EXTERNAL,
+    )
+    if getattr(current_user, "role", None) != RoleEnum.ADMIN and _directory_search_scope(db) == "same_department":
+        caller_gids = _select(user_groups.c.group_id).where(user_groups.c.user_id == current_user.id)
+        q = q.join(user_groups, User.id == user_groups.c.user_id).filter(
+            user_groups.c.group_id.in_(caller_gids)).distinct()
+    eligible = {str(r[0]) for r in q.all()}
+    if any(str(u) not in eligible for u in aud_users):
+        raise HTTPException(
+            status_code=400,
+            detail="One or more selected recipients aren't eligible to receive this share.")
+
+
 def _share_effective_status(share: Share) -> str:
     """Lazy expiry: an active share past its expiry reads as 'expired' (a periodic sweep can flip the
     stored status later; correctness never depends on it)."""
@@ -4836,6 +4864,7 @@ async def create_share(
         if not aud_users:
             raise HTTPException(status_code=400, detail="Select at least one user for a user-audience share.")
         _validate_ids_exist(db, User, aud_users, "audience_user_ids")
+        _validate_share_audience_users(db, current_user, aud_users)
         aud_depts = []
     elif payload.claim_audience == "departments":
         if not aud_depts:
