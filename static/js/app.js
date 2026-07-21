@@ -5330,8 +5330,9 @@ function _tagUserKeydown(kind, e) {
     const opts = host ? Array.from(host.querySelectorAll('[role="option"]')) : [];
     if (e.key === 'Escape') { if (host) host.replaceChildren(); _collapseTagUser(kind); return; }
     if (!opts.length) return;
-    if (e.key === 'ArrowDown') { e.preventDefault(); _setTagUserActive(kind, (_tagUserActive[kind] + 1) % opts.length); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); _setTagUserActive(kind, (_tagUserActive[kind] - 1 + opts.length) % opts.length); }
+    const cur = _tagUserActive[kind];   // -1 = no selection yet
+    if (e.key === 'ArrowDown') { e.preventDefault(); _setTagUserActive(kind, cur >= opts.length - 1 ? 0 : cur + 1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); _setTagUserActive(kind, cur <= 0 ? opts.length - 1 : cur - 1); }
     else if (e.key === 'Enter') { const i = _tagUserActive[kind]; if (i >= 0 && opts[i]) { e.preventDefault(); opts[i].click(); } }
 }
 
@@ -5666,6 +5667,7 @@ function openShareTagEditor(tag) {
     shareTagEditorBlockUserIds = (t.blocked_user_ids || []).map(String);
     ['share-tag-allow-user-search', 'share-tag-block-user-search'].forEach(id => { if (_stEl(id)) _stEl(id).value = ''; });
     ['share-tag-allow-user-results', 'share-tag-block-user-results'].forEach(id => { if (_stEl(id)) _stEl(id).replaceChildren(); });
+    _collapseTagUser('allow'); _collapseTagUser('block');   // clear stale aria-expanded / aria-activedescendant on reopen
     _renderTagAllowChips();
     _renderTagBlockChips();
     // resolve the stored ids of an existing tag into usernames (fetch the admin user list once)

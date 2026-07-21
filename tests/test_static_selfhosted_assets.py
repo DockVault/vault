@@ -65,7 +65,7 @@ def test_index_has_no_meta_csp_header_is_authoritative():
 def test_form_group_option_labels_exempt_from_block_uppercase():
     """Checkbox/radio OPTION labels (`.flex` / `.checkbox-label`) must be exempt from every
     `.form-group label { display:block; ...uppercase }` base rule, or their flex `gap` goes inert
-    and the option text is forced uppercase (the cramp UIP2 fixed). Any `.form-group label` rule
+    and the option text is forced uppercase (the earlier cramp/uppercase bug). Any `.form-group label` rule
     that sets display:block or text-transform:uppercase must carry :not(.flex):not(.checkbox-label);
     `.checkbox-label` must be defined as a flex row in each skin."""
     css_dir = ROOT / "static" / "css"
@@ -85,7 +85,7 @@ def test_form_group_option_labels_exempt_from_block_uppercase():
 
 def test_share_tag_colour_is_a_swatch_picker():
     """The share-tag colour control is a swatch picker (named swatches + a custom <input type=color>),
-    not a plain text box that accepts the bare word 'indigo' (UIP3). The hidden #share-tag-color the
+    not a plain text box that accepts the bare word 'indigo'. The hidden #share-tag-color the
     save path reads is kept, wired by setShareTagColor (mirrors the Groups colour editor)."""
     html = _read(STATIC / "index.html")
     assert '<input type="hidden" id="share-tag-color"' in html, \
@@ -99,7 +99,7 @@ def test_share_tag_colour_is_a_swatch_picker():
 
 
 def test_share_tag_lifetime_hints_and_no_minute_coercion():
-    """Share-tag lifetime shows live `(~N days)` hints and unified "Maximum" terminology (UIP4),
+    """Share-tag lifetime shows live `(~N days)` hints and unified "Maximum" terminology,
     and saveShareTag must NOT silently coerce an empty/0 lifetime to 1 minute (the old `|| 1` that
     expired every share in a minute) — it validates inline instead."""
     html = _read(STATIC / "index.html")
@@ -117,7 +117,7 @@ def test_share_tag_lifetime_hints_and_no_minute_coercion():
 
 
 def test_sharing_copy_no_stale_zk_caveat():
-    """UIP5: the ZK card must not tell admins to leave zero-knowledge off 'until the browser-crypto
+    """The ZK card must not tell admins to leave zero-knowledge off 'until the browser-crypto
     vault UI is in use' (that UI ships), while keeping the accurate web-only note; and the
     create-share audience label keeps the security-relevant 'internal' qualifier (matching the
     tag editor)."""
@@ -130,10 +130,10 @@ def test_sharing_copy_no_stale_zk_caveat():
 
 
 def test_share_tag_editor_a11y_grouping():
-    """UIP6 (core): the share-tag editor's ambiguous number inputs get UNIQUE accessible names via
+    """The share-tag editor's ambiguous number inputs get UNIQUE accessible names via
     aria-label (no more three identical "Default"s), the checkbox groups are role=group with a
     labelling header, and the user-search fields are combobox/listbox — so a screen reader
-    announces each field unambiguously. (Full keyboard nav / aria-expanded is UIP6b.)"""
+    announces each field unambiguously. (Full keyboard nav / aria-expanded is covered by a separate test.)"""
     html = _read(STATIC / "index.html")
     for lab in ("Lifetime maximum", "Lifetime default", "Recipients maximum", "Recipients default",
                 "Downloads maximum", "Downloads default"):
@@ -146,7 +146,7 @@ def test_share_tag_editor_a11y_grouping():
 
 
 def test_share_tag_user_search_combobox_keyboard_nav():
-    """UIP6b: the allowed/blocked user-search autocompletes are live comboboxes — result rows are
+    """The allowed/blocked user-search autocompletes are live comboboxes — result rows are
     role=option with ids, aria-expanded toggles, aria-activedescendant tracks a highlight, and a
     keydown handler drives ArrowUp/Down/Enter/Escape navigation."""
     appjs = _read(STATIC / "js" / "app.js")
@@ -161,7 +161,7 @@ def test_share_tag_user_search_combobox_keyboard_nav():
 
 
 def test_share_create_403_friendly_message():
-    """UIP7: the create-share flow shows a clearer reason than the raw "You do not have access to
+    """The create-share flow shows a clearer reason than the raw "You do not have access to
     this vault." when it fails closed on a vault reached only via a claim (not owner/member/group)."""
     appjs = _read(STATIC / "js" / "app.js")
     assert "do not have access to this vault" in appjs and \
