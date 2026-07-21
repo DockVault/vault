@@ -1731,7 +1731,7 @@ function currentShareTag() {
     return ((_shareCreate.policy && _shareCreate.policy.tags) || []).find(t => t.id === id) || null;
 }
 
-const _SHARE_AUD_LABEL = { anyone_internal: 'Anyone with the link', users: 'Specific users', departments: 'Departments' };
+const _SHARE_AUD_LABEL = { anyone_internal: 'Anyone internal with the link', users: 'Specific users', departments: 'Departments' };
 
 function onShareTagChange() {
     const t = currentShareTag();

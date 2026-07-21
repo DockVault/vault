@@ -116,6 +116,19 @@ def test_share_tag_lifetime_hints_and_no_minute_coercion():
         "saveShareTag must not coerce an empty/0 lifetime to 1 minute"
 
 
+def test_sharing_copy_no_stale_zk_caveat():
+    """UIP5: the ZK card must not tell admins to leave zero-knowledge off 'until the browser-crypto
+    vault UI is in use' (that UI ships), while keeping the accurate web-only note; and the
+    create-share audience label keeps the security-relevant 'internal' qualifier (matching the
+    tag editor)."""
+    html = _read(STATIC / "index.html")
+    assert "browser-crypto vault UI is in use" not in html, "the stale ZK 'not ready' caveat must be removed"
+    assert "web-only (they are not exposed over SFTP)" in html, "keep the accurate ZK web-only note"
+    appjs = _read(STATIC / "js" / "app.js")
+    assert "Anyone internal with the link" in appjs, \
+        "the create-modal audience label must keep the 'internal' qualifier"
+
+
 def test_served_frontend_has_no_inline_event_handlers():
     """No inline `on*=` HTML handler ATTRIBUTE may appear in the served frontend: the page CSP
     (script-src 'self', no unsafe-inline) blocks them, which spammed the console and left the
