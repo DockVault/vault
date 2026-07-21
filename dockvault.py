@@ -375,6 +375,17 @@ def tighten_secret_file(path):
         return False
 
 
+def _copy_secret(src, dst):
+    """Copy `src` to `dst`, CREATING dst mode-600 on POSIX so a private key is never briefly
+    world-readable before the perms are tightened (Windows perms are set by tighten_secret_file)."""
+    with open(src, "rb") as f:
+        data = f.read()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(dst, flags, 0o600) if os.name != "nt" else os.open(dst, flags)
+    with os.fdopen(fd, "wb") as out:
+        out.write(data)
+
+
 # --- setup: self-signed cert (host openssl or a throwaway container) --------------------------
 def _openssl_args_self_signed(server_name):
     san = ("IP:%s" if is_ipv4(server_name) else "DNS:%s") % server_name
@@ -402,7 +413,13 @@ def generate_self_signed_cert(cert_dir, server_name, run=subprocess.run):
     if shutil.which("openssl") is not None:
         # MSYS_NO_PATHCONV stops Git-for-Windows from mangling the leading-slash -subj into a path.
         env = dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*")
-        if _try(["openssl"] + args, cwd=cert_dir, env=env, timeout=60):
+        old_umask = os.umask(0o077) if os.name != "nt" else None  # openssl writes key.pem mode-600 (no window)
+        try:
+            ok = _try(["openssl"] + args, cwd=cert_dir, env=env, timeout=60)
+        finally:
+            if old_umask is not None:
+                os.umask(old_umask)
+        if ok:
             return True, "generated a self-signed certificate with host openssl"
     if shutil.which("docker") is not None:
         mount = os.path.abspath(cert_dir).replace("\\", "/")  # forward slashes for docker -v on Windows
@@ -415,6 +432,247 @@ def generate_self_signed_cert(cert_dir, server_name, run=subprocess.run):
 def _cert_pair_present(cert_dir):
     return (os.path.exists(os.path.join(cert_dir, "cert.pem"))
             and os.path.exists(os.path.join(cert_dir, "key.pem")))
+
+
+# --- setup: cert parity — bring-your-own, Let's Encrypt, cert-owner/userns, port preflight -----
+# The in-container app user; certs must be readable by it through the read-only bind mount.
+APP_UID = 10001
+CERT_MODES = ("selfsigned", "letsencrypt", "byo")
+
+
+def key_is_encrypted(key_text):
+    """True if a PEM private key is passphrase-encrypted. uvicorn is given no passphrase, so such a
+    key can never serve — bring-your-own must reject it up front. Pure (mirrors `grep ENCRYPTED`)."""
+    return "ENCRYPTED" in (key_text or "")
+
+
+def cert_key_match(cert_path, key_path, run=subprocess.run):
+    """True iff cert + key are a matching pair (public keys agree), via openssl. None when openssl
+    is unavailable or can't parse either (the caller then warns rather than blocking)."""
+    if shutil.which("openssl") is None:
+        return None
+
+    def _pub(args):
+        try:
+            r = run(["openssl"] + args, capture_output=True, text=True, timeout=30)
+        except Exception:  # noqa: BLE001
+            return None
+        return r.stdout.strip() if getattr(r, "returncode", 1) == 0 else None
+
+    cpub = _pub(["x509", "-in", cert_path, "-pubkey", "-noout"])
+    kpub = _pub(["pkey", "-in", key_path, "-pubout"])
+    if cpub is None or kpub is None:
+        return None
+    return cpub == kpub
+
+
+def install_byo_cert(cert_dir, cert_path, key_path, run=subprocess.run):
+    """Install a bring-your-own fullchain cert + key into cert_dir/{cert,key}.pem. Rejects a
+    passphrase-encrypted key and a mismatched pair. Returns (ok, message)."""
+    if not os.path.exists(cert_path):
+        return False, "certificate not found: %s" % cert_path
+    if not os.path.exists(key_path):
+        return False, "private key not found: %s" % key_path
+    if key_is_encrypted(open(key_path, encoding="utf-8", errors="ignore").read()):
+        return False, "the private key is passphrase-encrypted; decrypt it first (uvicorn can't load it)"
+    match = cert_key_match(cert_path, key_path, run=run)
+    if match is False:
+        return False, "the certificate and private key are not a matching pair"
+    os.makedirs(cert_dir, exist_ok=True)
+    shutil.copyfile(cert_path, os.path.join(cert_dir, "cert.pem"))   # the cert is public
+    _copy_secret(key_path, os.path.join(cert_dir, "key.pem"))        # the key is created mode-600 (no window)
+    tighten_secret_file(os.path.join(cert_dir, "key.pem"))
+    caveat = "" if match else " (could not verify the pair - no openssl; ensure they match)"
+    return True, "installed the bring-your-own certificate" + caveat
+
+
+def render_renewal_hook(app_dir, cert_dir, server_name, service):
+    """The certbot deploy-hook script text: on renewal, stage the new fullchain/privkey, preserve
+    the live key's owner+mode, VALIDATE the new pair, atomically swap them into cert_dir, then
+    restart the app service so uvicorn reloads. Pure text (POSIX-only; mirrors setup-secure.sh)."""
+    return "\n".join([
+        "#!/bin/bash",
+        "# Written by dockvault.py - deploys a renewed Let's Encrypt cert into the vault stack and",
+        "# restarts the API so uvicorn picks it up.",
+        "set -e",
+        'CD="%s"' % cert_dir,
+        'install -m 644 "/etc/letsencrypt/live/%s/fullchain.pem" "$CD/.new-cert.pem"' % server_name,
+        'install -m 600 "/etc/letsencrypt/live/%s/privkey.pem"   "$CD/.new-key.pem"' % server_name,
+        '_own="$(stat -c \'%u:%g\' "$CD/key.pem" 2>/dev/null || echo 0:0)"',
+        '_mode="$(stat -c \'%a\' "$CD/key.pem" 2>/dev/null || echo 644)"',
+        'chown "$_own" "$CD/.new-key.pem" "$CD/.new-cert.pem" 2>/dev/null || true',
+        'chmod "$_mode" "$CD/.new-key.pem" 2>/dev/null || chmod 644 "$CD/.new-key.pem"',
+        'chmod 644 "$CD/.new-cert.pem"',
+        '_c="$(openssl x509 -in "$CD/.new-cert.pem" -pubkey -noout)"',
+        '_k="$(openssl pkey -in "$CD/.new-key.pem" -pubout)"',
+        '[ -n "$_c" ] && [ "$_c" = "$_k" ]  # non-empty so a missing openssl fails (never swaps unvalidated)',
+        'mv "$CD/.new-key.pem"  "$CD/key.pem"',
+        'mv "$CD/.new-cert.pem" "$CD/cert.pem"',
+        'cd "%s" && docker compose --env-file "%s/.env" -f "%s/docker-compose.secure.yml" restart %s'
+        % (app_dir, app_dir, app_dir, service),
+        "",
+    ])
+
+
+def install_renewal_hook(app_dir, cert_dir, server_name, service):
+    """Write the certbot deploy hook (POSIX). Returns True on success."""
+    hook = "/etc/letsencrypt/renewal-hooks/deploy/dockvault-vault.sh"
+    try:
+        os.makedirs(os.path.dirname(hook), exist_ok=True)
+        with open(hook, "w", encoding="utf-8", newline="\n") as f:
+            f.write(render_renewal_hook(app_dir, cert_dir, server_name, service))
+        os.chmod(hook, 0o755)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def obtain_letsencrypt_cert(cert_dir, server_name, email, app_dir, service, run=subprocess.run):
+    """Obtain a Let's Encrypt cert via certbot standalone (http-01, binds port 80), install it, and
+    write the auto-renewal deploy hook. POSIX-only (needs certbot + root + a public DNS name reachable
+    on port 80). Returns (ok, message)."""
+    if os.name == "nt":
+        return False, "Let's Encrypt automation is Linux-only here; use --cert-mode byo on Windows."
+    if is_ipv4(server_name):
+        return False, "Let's Encrypt cannot issue for a bare IP - use a DNS name, or self-signed."
+    if shutil.which("certbot") is None:
+        return False, "certbot is not installed (e.g. apt-get install certbot); or use --cert-mode byo."
+    try:
+        r = run(["certbot", "certonly", "--standalone", "--non-interactive", "--agree-tos",
+                 "-m", email or "admin@example.com", "-d", server_name], text=True, timeout=300)
+    except Exception as e:  # noqa: BLE001
+        return False, "certbot failed: %s" % e
+    if getattr(r, "returncode", 1) != 0:
+        return False, "certbot did not obtain a certificate (is port 80 reachable from the internet?)"
+    live = "/etc/letsencrypt/live/%s" % server_name
+    ok, msg = install_byo_cert(cert_dir, live + "/fullchain.pem", live + "/privkey.pem", run=run)
+    if not ok:
+        return False, msg
+    install_renewal_hook(app_dir, cert_dir, server_name, service)
+    return True, "obtained a Let's Encrypt certificate + installed the auto-renewal hook"
+
+
+def parse_subuid_base(subuid_text, user):
+    """The base subordinate uid allocated to `user` in /etc/subuid (or None). Pure — used to resolve
+    the HOST uid a userns-remapped container's app user maps to, so a mode-600 key can be chowned to
+    the right owner instead of made world-readable."""
+    for line in (subuid_text or "").splitlines():
+        parts = line.strip().split(":")
+        if len(parts) >= 2 and parts[0] == user:
+            try:
+                base = int(parts[1])
+            except ValueError:
+                return None
+            return base if base >= 1000 else None  # a subuid base is never a low/system uid
+    return None
+
+
+def _engine_is_remapped(run=subprocess.run):
+    """True if the Docker engine remaps container uids to SUBORDINATE host uids - rootless OR
+    rootful userns-remap. In that case the in-container app user is NOT host uid 10001, so a
+    host-10001-owned mode-600 key is unreadable inside the container unless the mapping is resolvable
+    and the key is chowned to the mapped host uid. Mirrors setup-secure.sh's `_remapped_engine`
+    (which greps `rootless|name=userns`)."""
+    try:
+        r = run(["docker", "info", "--format", "{{join .SecurityOptions \",\"}}"],
+                capture_output=True, text=True, timeout=15)
+    except Exception:  # noqa: BLE001
+        return False
+    opts = getattr(r, "stdout", "") or ""
+    return "rootless" in opts or "name=userns" in opts
+
+
+def apply_cert_owner(cert_dir, run=subprocess.run):
+    """Make cert_dir/{cert,key}.pem readable by the in-container app user through the read-only bind
+    mount. POSIX-only. On a plain rootful engine, chown to APP_UID (10001) keeping the key mode 600.
+    On a userns-remap engine, chown to the MAPPED host uid (resolved from /etc/subuid), keeping 600.
+    On a ROOTLESS engine (or when the mapped uid can't be resolved), the container's uid is a
+    subordinate host uid we cannot target, so fall back to a world-readable key (644, single-tenant
+    host) so the container CAN read it - matching setup-secure.sh, and NEVER falsely reporting a
+    mode-600 key when it would be unreadable. Returns (mode600, message)."""
+    if os.name == "nt":
+        return True, ""  # Docker Desktop bind mounts are readable; no host chown needed
+    key = os.path.join(cert_dir, "key.pem")
+    cert = os.path.join(cert_dir, "cert.pem")
+    for path, mode in ((cert_dir, 0o700), (cert, 0o644), (key, 0o600)):
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+
+    def _world_readable(reason):
+        for path, mode in ((cert_dir, 0o755), (key, 0o644)):
+            try:
+                os.chmod(path, mode)
+            except OSError:
+                pass
+        return False, reason
+
+    if _engine_is_remapped(run):
+        owner = _remapped_cert_owner(run)   # mapped host uid (userns-remap), or None (rootless/unresolvable)
+        if owner is None:
+            return _world_readable(
+                "rootless/userns Docker: the container's app user is a subordinate host uid, so a "
+                "mode-600 key owned by uid %d would be unreadable inside the container. Made the TLS "
+                "key world-readable (644) so the container can read it - host assumed single-tenant, "
+                "restrict access accordingly." % APP_UID)
+    else:
+        owner = APP_UID
+    try:
+        for path in (cert_dir, cert, key):
+            os.chown(path, owner, owner)
+        if os.stat(key).st_uid == owner:
+            return True, "certs owned by uid %d (key mode 600, not world-readable)" % owner
+    except OSError:
+        pass
+    return _world_readable(
+        "could not chown certs to the container uid; made the TLS key world-readable (644) so the "
+        "container can read it - host assumed single-tenant, restrict access accordingly.")
+
+
+def _remapped_cert_owner(run=subprocess.run):
+    """If the Docker engine uses rootful userns-remap, the HOST uid the container's APP_UID maps to
+    (base subuid + APP_UID), else None. Only the rootful userns-remap case is resolvable from the
+    host (rootless needs the daemon-user's subuid + a different offset, so it gets the world-readable
+    fallback)."""
+    try:
+        r = run(["docker", "info", "--format", "{{join .SecurityOptions \",\"}}"],
+                capture_output=True, text=True, timeout=15)
+    except Exception:  # noqa: BLE001
+        return None
+    if "name=userns" not in (getattr(r, "stdout", "") or ""):
+        return None
+    user = "dockremap"
+    try:
+        with open("/etc/docker/daemon.json", encoding="utf-8") as f:
+            m = re.search(r'"userns-remap"\s*:\s*"([^"]*)"', f.read())
+        if m and m.group(1) not in ("", "default"):
+            user = m.group(1).split(":")[0]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        base = parse_subuid_base(open("/etc/subuid", encoding="utf-8").read(), user)
+    except Exception:  # noqa: BLE001
+        return None
+    return (base + APP_UID) if base is not None else None
+
+
+def port_free(port, host="0.0.0.0"):
+    """True if `port` is free to bind on `host` right now. A real bind probe WITHOUT SO_REUSEADDR -
+    that option would let the bind succeed against a port another socket already holds (on Windows
+    SO_REUSEADDR behaves like SO_REUSEPORT), giving a false 'free' for a genuinely busy port. A
+    privileged-port EACCES/EPERM (a non-root probe of a <1024 port like 443) is treated as
+    'can't determine -> not busy', so setup doesn't false-warn when nothing actually holds it."""
+    import errno
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, int(port)))
+        return True
+    except OSError as e:
+        return e.errno in (errno.EACCES, errno.EPERM)
+    finally:
+        s.close()
 
 
 # --- app -------------------------------------------------------------------------------------
@@ -490,18 +748,33 @@ class DockVault:
         tracker.show()
         cert_dir = self._certs_dir()
         if _cert_pair_present(cert_dir):
-            print(pal.paint("  Certificates already present - keeping them.", "green"))
+            print(pal.paint("  Certificates already present - keeping them (repairing ownership).", "green"))
         else:
             server = summary.get("server_name") or "localhost"
             if not validate_server_name(server):   # re-validate a reused .env's SERVER_NAME before it hits openssl
                 print(pal.paint("  SERVER_NAME in .env looks invalid; using 'localhost' for the cert.", "yellow"))
                 server = "localhost"
-            ok, msg = generate_self_signed_cert(cert_dir, server)
+            mode, email, cpath, kpath = self._resolve_cert_cfg(args)
+            svc = "vault-api" if summary.get("compose_profiles") == "split" else "vault"
+            if mode == "byo":
+                if not cpath or not kpath:
+                    self._fail("bring-your-own certs need --cert-path and --key-path")
+                ok, msg = install_byo_cert(cert_dir, cpath, kpath)
+            elif mode == "letsencrypt":
+                ok, msg = obtain_letsencrypt_cert(cert_dir, server, email, self.root, svc)
+            else:
+                ok, msg = generate_self_signed_cert(cert_dir, server)
             if not ok:
                 self._fail(msg)
             print(pal.paint("  " + msg + ".", "green"))
-            if not tighten_secret_file(os.path.join(cert_dir, "key.pem")):
-                print(pal.paint("  WARNING: could not restrict the TLS key's permissions.", "yellow"))
+        # Lock the key file (icacls/chmod), then make it readable by the container uid (POSIX chown;
+        # repairs a reused or root-owned pair too).
+        key = os.path.join(cert_dir, "key.pem")
+        if os.path.exists(key) and not tighten_secret_file(key):
+            print(pal.paint("  WARNING: could not restrict the TLS key's permissions.", "yellow"))
+        owner_ok, owner_msg = apply_cert_owner(cert_dir)
+        if owner_msg:
+            print(pal.paint("  " + owner_msg, "green" if owner_ok else "yellow"))
 
         if no_start:
             print(pal.paint("\n  Setup done (--no-start). Start later with:  python dockvault.py setup\n", "cyan"))
@@ -511,6 +784,10 @@ class DockVault:
         ok, msg = docker_available()
         if not ok:
             self._fail(msg)
+        # Port preflight: warn (don't block) if host 443 is already taken - the web container binds it.
+        if not port_free(443):
+            print(pal.paint("  WARNING: host port 443 is already in use; the web container may fail to "
+                            "bind it. Free it first (e.g. sudo ss -ltnp 'sport = :443').", "yellow"))
         tracker.advance(); tracker.show()               # -> Build + start
         if not self._start_secure_stack():
             self._fail("the stack did not start - check 'docker compose -f docker-compose.secure.yml logs'.")
@@ -581,6 +858,30 @@ class DockVault:
             "log_token_pepper": gen_hex(32) if log_pull else "",
             "_generated_pw": generated,
         }
+
+    def _resolve_cert_cfg(self, args):
+        """Resolve (cert_mode, le_email, cert_path, key_path) from args (unattended) or a prompt.
+        cert_mode is one of selfsigned / letsencrypt / byo (default selfsigned)."""
+        pal = self.pal
+        interactive = not (args and getattr(args, "non_interactive", False))
+        mode = getattr(args, "cert_mode", None) if args else None
+        email = getattr(args, "le_email", None) if args else None
+        cpath = getattr(args, "cert_path", None) if args else None
+        kpath = getattr(args, "key_path", None) if args else None
+        if interactive and not mode:
+            print(pal.paint("\n  Certificate source:", "cyan"))
+            print("    1) Self-signed   (works immediately; browsers warn until trusted)")
+            print("    2) Let's Encrypt (real cert; needs a public DNS name + port 80; Linux only)")
+            print("    3) Bring your own (a fullchain cert + key you already have)")
+            mode = {"2": "letsencrypt", "3": "byo"}.get(ask("Choose 1/2/3", pal, "1").strip(), "selfsigned")
+            if mode == "letsencrypt":
+                email = ask("Email for Let's Encrypt expiry notices", pal, "admin@example.com")
+            elif mode == "byo":
+                cpath = ask("Path to the certificate (fullchain PEM)", pal)
+                kpath = ask("Path to the private key (PEM)", pal)
+        if mode and mode not in CERT_MODES:
+            self._fail("unknown --cert-mode %r (one of %s)" % (mode, ", ".join(CERT_MODES)))
+        return (mode or "selfsigned", email, cpath, kpath)
 
     def _set_env_key(self, path, key, value):
         """Replace/append KEY=value in .env (bare value), preserving perms."""
@@ -696,6 +997,10 @@ def build_parser():
     sp.add_argument("--admin-username", dest="admin_username")
     sp.add_argument("--admin-email", dest="admin_email")
     sp.add_argument("--admin-password", dest="admin_password")
+    sp.add_argument("--cert-mode", dest="cert_mode", choices=CERT_MODES, help="selfsigned | letsencrypt | byo")
+    sp.add_argument("--le-email", dest="le_email", help="email for Let's Encrypt expiry notices")
+    sp.add_argument("--cert-path", dest="cert_path", help="bring-your-own fullchain cert (PEM)")
+    sp.add_argument("--key-path", dest="key_path", help="bring-your-own private key (PEM)")
     sp.add_argument("--enable-sftp", dest="enable_sftp", action="store_true", help="also serve SFTP on 2322")
     sp.add_argument("--split", dest="split", action="store_true", help="two containers (vault-api + vault-sftp)")
     sp.add_argument("--update-check", dest="update_check", action="store_true", help="enable the opt-in update check")

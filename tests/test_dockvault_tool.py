@@ -271,3 +271,106 @@ def test_authored_env_key_parity_with_setup_script():
               "ALLOWED_HOSTS", "SERVER_NAME", "ADMIN_USERNAME", "ADMIN_EMAIL", "ADMIN_PASSWORD",
               "COMPOSE_PROFILES"):
         assert k in keys, "tool .env is missing the setup-script key %s" % k
+
+
+# --- Cert parity: BYO, renewal hook, userns, ports -------------------------------------------
+def test_key_is_encrypted():
+    assert dv.key_is_encrypted("-----BEGIN ENCRYPTED PRIVATE KEY-----\nabc\n")
+    assert not dv.key_is_encrypted("-----BEGIN PRIVATE KEY-----\nabc\n")
+    assert not dv.key_is_encrypted("")
+
+
+def test_render_renewal_hook():
+    hook = dv.render_renewal_hook("/opt/vault", "/opt/vault/certs", "vault.example.com", "vault-api")
+    assert hook.startswith("#!/bin/bash")
+    assert "/etc/letsencrypt/live/vault.example.com/fullchain.pem" in hook
+    assert "openssl x509" in hook and "openssl pkey" in hook            # validates the renewed pair
+    assert '[ -n "$_c" ]' in hook                                       # non-empty guard (missing openssl -> fail)
+    assert 'mv "$CD/.new-key.pem"  "$CD/key.pem"' in hook               # atomic swap
+    assert "docker compose" in hook and "restart vault-api" in hook     # restarts so uvicorn reloads
+
+
+def test_engine_is_remapped_detects_rootless_and_userns():
+    class _R:
+        def __init__(self, out):
+            self.stdout, self.returncode = out, 0
+    assert dv._engine_is_remapped(run=lambda *a, **k: _R("name=seccomp,rootless")) is True   # rootless
+    assert dv._engine_is_remapped(run=lambda *a, **k: _R("name=userns")) is True             # userns-remap
+    assert dv._engine_is_remapped(run=lambda *a, **k: _R("name=seccomp")) is False           # plain rootful
+    assert dv._engine_is_remapped(run=lambda *a, **k: (_ for _ in ()).throw(OSError())) is False
+
+
+def test_parse_subuid_base():
+    txt = "root:0:65536\ndockremap:100000:65536\nlow:500:65536\n"
+    assert dv.parse_subuid_base(txt, "dockremap") == 100000
+    assert dv.parse_subuid_base(txt, "low") is None                    # base < 1000 (system uid) rejected
+    assert dv.parse_subuid_base(txt, "missing") is None
+    assert dv.parse_subuid_base("", "dockremap") is None
+
+
+def test_port_free():
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", 0))
+    s.listen(1)
+    port = s.getsockname()[1]
+    try:
+        assert dv.port_free(port, "127.0.0.1") is False                # bound -> busy
+    finally:
+        s.close()
+    assert dv.port_free(port, "127.0.0.1") is True                     # freed -> free
+
+
+def test_cert_mode_parser():
+    parser = dv.build_parser()
+    ns = parser.parse_args(["setup", "--cert-mode", "byo", "--cert-path", "c.pem", "--key-path", "k.pem"])
+    assert ns.cert_mode == "byo" and ns.cert_path == "c.pem" and ns.key_path == "k.pem"
+    assert parser.parse_args(["setup", "--cert-mode", "letsencrypt", "--le-email", "a@b.com"]).le_email == "a@b.com"
+
+
+def _mkpair(dirpath, cn="localhost"):
+    dirpath.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes",
+         "-keyout", str(dirpath / "k.pem"), "-out", str(dirpath / "c.pem"), "-subj", "/CN=%s" % cn],
+        capture_output=True, text=True, timeout=60,
+        env=dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*"))
+    assert r.returncode == 0, r.stderr
+    return dirpath / "c.pem", dirpath / "k.pem"
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs host openssl to make a test cert pair")
+def test_byo_install_validates_and_copies(tmp_path):
+    cert, key = _mkpair(tmp_path / "src")
+    dest = tmp_path / "certs"
+    ok, msg = dv.install_byo_cert(str(dest), str(cert), str(key))
+    assert ok, msg
+    assert (dest / "cert.pem").exists() and (dest / "key.pem").exists()
+    assert dv.cert_key_match(str(dest / "cert.pem"), str(dest / "key.pem")) is True
+    # a passphrase-encrypted key is rejected up front
+    enc = tmp_path / "src" / "enc.pem"
+    enc.write_text("-----BEGIN ENCRYPTED PRIVATE KEY-----\nx\n-----END ENCRYPTED PRIVATE KEY-----\n")
+    bad, badmsg = dv.install_byo_cert(str(tmp_path / "d2"), str(cert), str(enc))
+    assert not bad and "passphrase" in badmsg
+    # a MISMATCHED pair (a different key) is rejected
+    _, key2 = _mkpair(tmp_path / "other", cn="other")
+    mm, mmmsg = dv.install_byo_cert(str(tmp_path / "d3"), str(cert), str(key2))
+    assert not mm and "not a matching pair" in mmmsg
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs host openssl for a BYO pair")
+def test_setup_byo_cert_mode_installs_pair(tmp_path):
+    cert, key = _mkpair(tmp_path / "src")
+    root = tmp_path / "root"
+    root.mkdir()
+    env = dict(os.environ, DOCKVAULT_ROOT=str(root), NO_COLOR="1")
+    r = subprocess.run(
+        [sys.executable, str(ROOT / "dockvault.py"), "setup", "--non-interactive",
+         "--server-name", "localhost", "--admin-password", "Strong-Pass-1234",
+         "--cert-mode", "byo", "--cert-path", str(cert), "--key-path", str(key), "--no-start"],
+        env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "BEGIN CERTIFICATE" in (root / "certs" / "cert.pem").read_text(encoding="utf-8", errors="ignore")
+    assert dv.cert_key_match(str(root / "certs" / "cert.pem"), str(root / "certs" / "key.pem")) is True
+    assert "bring-your-own" in r.stdout
