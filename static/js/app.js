@@ -1571,8 +1571,11 @@ function _sharedByMeCard(sh) {
     const h = _el('h3', 'vault-name', title);
     h.appendChild(document.createTextNode(' ')); h.appendChild(_byMeStatusBadge(sh.status));
     main.appendChild(h);
-    main.appendChild(_el('p', 'vault-desc', (sh.tag_name ? sh.tag_name + ' · ' : '') +
-        (sh.target_type === 'vault' ? 'Whole vault' : (kind + ' in ' + (sh.vault_name || 'a vault')))));
+    const sub = _el('div', 'flex items-center gap-sm'); sub.style.flexWrap = 'wrap'; sub.style.margin = '.1rem 0 .45rem';
+    if (sh.tag_name) sub.appendChild(_el('span', 'badge badge-secondary', sh.tag_name));
+    sub.appendChild(_el('span', 'text-sm text-secondary',
+        sh.target_type === 'vault' ? 'Whole vault' : (kind + ' in ' + (sh.vault_name || 'a vault'))));
+    main.appendChild(sub);
     const meta = _el('div', 'vault-meta');
     meta.appendChild(_el('span', null, (sh.claim_count || 0) + (sh.max_recipients != null ? '/' + sh.max_recipients : '') + ' recipients'));
     if (sh.view_only) meta.appendChild(_el('span', null, 'View only'));
@@ -1581,24 +1584,27 @@ function _sharedByMeCard(sh) {
     body.appendChild(main);
     card.appendChild(body);
 
-    const actions = _el('div', 'flex items-center gap-sm'); actions.style.marginTop = 'var(--space-sm)';
+    const actions = _el('div', 'flex items-center gap-sm');
     if (active) {
         const revokeBtn = _el('button', 'btn btn-sm', 'Revoke'); revokeBtn.type = 'button'; revokeBtn.style.color = '#dc2626';
         revokeBtn.addEventListener('click', () => revokeShare(sh.id, title));
         actions.appendChild(revokeBtn);
     }
-    card.appendChild(actions);
-
+    let recipWrap = null;
     if ((sh.claim_count || 0) > 0) {
-        const recipWrap = _el('div'); recipWrap.style.display = 'none'; recipWrap.style.marginTop = 'var(--space-sm)';
+        recipWrap = _el('div'); recipWrap.style.display = 'none';
         const recipBtn = _el('button', 'btn btn-secondary btn-sm', 'Recipients (' + sh.claim_count + ')'); recipBtn.type = 'button';
         recipBtn.addEventListener('click', () => {
             if (recipWrap.style.display === 'none') { recipWrap.style.display = ''; loadShareClaims(sh.id, recipWrap); }
             else recipWrap.style.display = 'none';
         });
         actions.appendChild(recipBtn);
-        card.appendChild(recipWrap);
     }
+    // Append the action row (only when it has buttons) + the recipients disclosure INTO the padded
+    // .vault-card-body (a flex column) instead of the padding-less .card, so they align under the
+    // body content in both skins — and an action-less card gets no stray empty row.
+    if (actions.childElementCount) body.appendChild(actions);
+    if (recipWrap) body.appendChild(recipWrap);
     return card;
 }
 

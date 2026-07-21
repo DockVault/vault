@@ -697,12 +697,14 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand-secondar
     display: inline-flex; align-items: center; gap: .3rem;
     font-size: 11px; font-weight: 600; line-height: 1.4;
     text-transform: none; letter-spacing: normal;   /* override base uppercase */
-    padding: .12rem .45rem;
+    padding: .2rem .55rem;                           /* was .12rem .45rem — too cramped; matches the Classic skin */
     border-radius: var(--radius-sm);
     border: 1px solid transparent;
     box-shadow: none;                                /* override base xs shadow */
 }
 .badge .icon { width: 12px; height: 12px; }
+/* Separate an inline status badge (e.g. "Active") from the card title it trails. */
+.vault-name .badge { margin-left: .4rem; vertical-align: middle; }
 
 .badge-success, .badge-user {
     background: color-mix(in srgb, var(--success) 12%, transparent);
