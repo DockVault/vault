@@ -5298,6 +5298,36 @@ let shareTagUsersById = {};          // id -> username, for rendering the user c
 let shareTagsUIWired = false;
 const _tagUserSearchTimer = { allow: null, block: null };
 const _tagUserSearchSeq = { allow: 0, block: 0 };
+const _tagUserActive = { allow: -1, block: -1 };   // highlighted option index per picker (combobox keyboard nav)
+
+// Combobox helpers for the allowed/blocked user-search autocompletes.
+function _collapseTagUser(kind) {
+    const { search } = _tagUserPickerIds(kind);
+    const input = _stEl(search);
+    _tagUserActive[kind] = -1;
+    if (input) { input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant'); }
+}
+function _setTagUserActive(kind, idx) {
+    const { search, results } = _tagUserPickerIds(kind);
+    const host = _stEl(results), input = _stEl(search);
+    const opts = host ? Array.from(host.querySelectorAll('[role="option"]')) : [];
+    _tagUserActive[kind] = idx;
+    opts.forEach((o, i) => o.setAttribute('aria-selected', i === idx ? 'true' : 'false'));
+    if (input) {
+        if (idx >= 0 && opts[idx]) { input.setAttribute('aria-activedescendant', opts[idx].id); opts[idx].scrollIntoView({ block: 'nearest' }); }
+        else input.removeAttribute('aria-activedescendant');
+    }
+}
+function _tagUserKeydown(kind, e) {
+    const { search, results } = _tagUserPickerIds(kind);
+    const host = _stEl(results);
+    const opts = host ? Array.from(host.querySelectorAll('[role="option"]')) : [];
+    if (e.key === 'Escape') { if (host) host.replaceChildren(); _collapseTagUser(kind); return; }
+    if (!opts.length) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); _setTagUserActive(kind, (_tagUserActive[kind] + 1) % opts.length); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); _setTagUserActive(kind, (_tagUserActive[kind] - 1 + opts.length) % opts.length); }
+    else if (e.key === 'Enter') { const i = _tagUserActive[kind]; if (i >= 0 && opts[i]) { e.preventDefault(); opts[i].click(); } }
+}
 
 function _stEl(id) { return document.getElementById(id); }
 function _stChecked(id) { const e = _stEl(id); return !!(e && e.checked); }
@@ -5336,15 +5366,21 @@ function setupShareTagsUI() {
     const forceVO = _stEl('share-tag-force-view-only');
     if (forceVO) forceVO.addEventListener('change', _stSyncViewOnly);
     const allowSearch = _stEl('share-tag-allow-user-search');
-    if (allowSearch) allowSearch.addEventListener('input', () => {
-        clearTimeout(_tagUserSearchTimer.allow);
-        _tagUserSearchTimer.allow = setTimeout(() => _tagUserSearch('allow'), 250);
-    });
+    if (allowSearch) {
+        allowSearch.addEventListener('input', () => {
+            clearTimeout(_tagUserSearchTimer.allow);
+            _tagUserSearchTimer.allow = setTimeout(() => _tagUserSearch('allow'), 250);
+        });
+        allowSearch.addEventListener('keydown', (e) => _tagUserKeydown('allow', e));
+    }
     const blockSearch = _stEl('share-tag-block-user-search');
-    if (blockSearch) blockSearch.addEventListener('input', () => {
-        clearTimeout(_tagUserSearchTimer.block);
-        _tagUserSearchTimer.block = setTimeout(() => _tagUserSearch('block'), 250);
-    });
+    if (blockSearch) {
+        blockSearch.addEventListener('input', () => {
+            clearTimeout(_tagUserSearchTimer.block);
+            _tagUserSearchTimer.block = setTimeout(() => _tagUserSearch('block'), 250);
+        });
+        blockSearch.addEventListener('keydown', (e) => _tagUserKeydown('block', e));
+    }
     shareTagsUIWired = true;
 }
 
@@ -5500,7 +5536,7 @@ function _tagUserSearch(kind) {
     const host = _stEl(results);
     if (!host) return;
     const q = (_stEl(search)?.value || '').trim();
-    if (q.length < 2) { host.replaceChildren(); return; }
+    if (q.length < 2) { host.replaceChildren(); _collapseTagUser(kind); return; }
     apiRequest(`/users/search?q=${encodeURIComponent(q)}`, { silent: true }).then(users => {
         if (seq !== _tagUserSearchSeq[kind]) return;  // a newer keystroke superseded this one
         _renderTagUserResults(kind, Array.isArray(users) ? users : []);
@@ -5511,10 +5547,12 @@ function _tagUserSearch(kind) {
 }
 
 function _renderTagUserResults(kind, users) {
-    const { results } = _tagUserPickerIds(kind);
-    const host = _stEl(results);
+    const { search, results } = _tagUserPickerIds(kind);
+    const host = _stEl(results), input = _stEl(search);
     if (!host) return;
     host.replaceChildren();
+    _tagUserActive[kind] = -1;
+    if (input) input.removeAttribute('aria-activedescendant');
     const already = kind === 'allow' ? shareTagEditorAllowUserIds : shareTagEditorBlockUserIds;
     const fresh = users.filter(u => !already.includes(u.id));
     if (!fresh.length) {
@@ -5522,12 +5560,16 @@ function _renderTagUserResults(kind, users) {
         none.className = 'text-tertiary text-sm';
         none.textContent = 'No matching users.';
         host.appendChild(none);
+        if (input) input.setAttribute('aria-expanded', 'true');   // listbox is shown (with a message)
         return;
     }
-    fresh.forEach(u => {
+    fresh.forEach((u, i) => {
         shareTagUsersById[u.id] = u.username || u.email || String(u.id).slice(0, 8);
         const row = document.createElement('button');
         row.type = 'button';
+        row.id = `${results}-opt-${i}`;
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-selected', 'false');
         row.className = 'pick-row';
         row.style.width = '100%';
         row.style.textAlign = 'left';
@@ -5535,6 +5577,7 @@ function _renderTagUserResults(kind, users) {
         row.addEventListener('click', () => _addTagUser(kind, u.id));
         host.appendChild(row);
     });
+    if (input) input.setAttribute('aria-expanded', 'true');
 }
 
 function _addTagUser(kind, id) {
@@ -5548,6 +5591,7 @@ function _addTagUser(kind, id) {
     const { search, results } = _tagUserPickerIds(kind);
     if (_stEl(search)) _stEl(search).value = '';
     if (_stEl(results)) _stEl(results).replaceChildren();
+    _collapseTagUser(kind);
 }
 
 // Reflect a stored tag colour (a CHIP_COLORS name, a #hex, or '') onto the swatch picker:

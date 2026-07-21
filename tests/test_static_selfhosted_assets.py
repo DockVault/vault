@@ -145,6 +145,21 @@ def test_share_tag_editor_a11y_grouping():
         "the user-search autocompletes must be combobox + listbox"
 
 
+def test_share_tag_user_search_combobox_keyboard_nav():
+    """UIP6b: the allowed/blocked user-search autocompletes are live comboboxes — result rows are
+    role=option with ids, aria-expanded toggles, aria-activedescendant tracks a highlight, and a
+    keydown handler drives ArrowUp/Down/Enter/Escape navigation."""
+    appjs = _read(STATIC / "js" / "app.js")
+    assert "function _tagUserKeydown" in appjs and "function _setTagUserActive" in appjs, \
+        "combobox keyboard-nav helpers must exist"
+    assert "aria-activedescendant" in appjs and "'ArrowDown'" in appjs and "'ArrowUp'" in appjs, \
+        "arrow-key navigation with aria-activedescendant must be wired"
+    assert "setAttribute('role', 'option')" in appjs, "result rows must be role=option"
+    assert "aria-expanded" in appjs, "the combobox must toggle aria-expanded"
+    assert "addEventListener('keydown', (e) => _tagUserKeydown(" in appjs, \
+        "the search inputs must wire the keydown handler"
+
+
 def test_served_frontend_has_no_inline_event_handlers():
     """No inline `on*=` HTML handler ATTRIBUTE may appear in the served frontend: the page CSP
     (script-src 'self', no unsafe-inline) blocks them, which spammed the console and left the
