@@ -29,6 +29,10 @@ ships inside the built image (`Dockerfile` does `COPY . .`, filtered only by
   co-author or generated-by trailer to commit messages or PR bodies.
 - `BRAND_*` env vars (see `app/config/branding.py`) are a public contract consumed
   by downstream provisioning — don't rename or remove them without a deprecation path.
+- **Keep config, `.env.example`, and the setup tooling in sync.** When you add or change an
+  env/config field in `app/core/config.py`, update `.env.example` **and** the setup tooling (the
+  `setup-secure.*` scripts / the management tool) in the SAME change — a new flag with no
+  `.env.example` entry or setup prompt is an incomplete change.
 
 ## Tests
 

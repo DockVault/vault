@@ -599,6 +599,16 @@ def test_env_example_documents_every_settings_field():
         assert k in documented, f".env.example must document {k}"
 
 
+def test_claude_md_carries_config_sync_rule():
+    # CLAUDE.md must document the rule that a new config field is updated in .env.example AND the
+    # setup tooling in the same change (test_env_example_documents_every_settings_field enforces the
+    # .env.example half; this locks the documented rule so the practice isn't silently dropped).
+    md = _read("CLAUDE.md")
+    low = md.lower()
+    assert ".env.example" in md and "setup tooling" in low and "app/core/config.py" in md, \
+        "CLAUDE.md must document keeping config, .env.example, and the setup tooling in sync"
+
+
 def test_app_version_from_version_file_not_hardcoded():
     import re
     # A committed VERSION file (valid semver) is the single source of truth for the app's version.
