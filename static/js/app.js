@@ -6502,11 +6502,12 @@ function fileActionButtons(item, canWrite, opts) {
         const canDownload = vaultCapAllowed('file.download');
         const canRename = canWrite && vaultCapAllowed('file.rename');
         const canDelete = canWrite && vaultCapAllowed('file.delete');
-        if (slot !== 'secondary' && canDownload) out.push(btn('download', 'download', 'Download'));
         if (slot !== 'primary') {
             if (canRename) out.push(btn('rename-file', 'edit', 'Rename'));
             if (canDelete) out.push(btn('delete-file', 'trash', 'Delete', true));
             if (vaultShareable()) out.push(btn('share-file', 'link', 'Share'));
+            // Download last so it renders on the far RIGHT of the action cluster (grid + table).
+            if (canDownload) out.push(btn('download', 'download', 'Download'));
         }
     }
     return out.join('');
@@ -6560,16 +6561,18 @@ function renderFilesGrid(items, canWrite, grid) {
         const primary = fileActionButtons(item, canWrite, { grid: true, slot: 'primary' });
         const secondary = fileActionButtons(item, canWrite, { grid: true, slot: 'secondary' });
         const openLabel = escapeHtml(isFolder ? `Open folder ${item.name}` : `Preview file ${item.name}`);
-        // The name (the primary open action) comes first in DOM so it is the first tab stop and
-        // the destructive Delete is last; the two control clusters are position:absolute, so their
-        // top-left / top-right placement is unchanged by trailing them in source order.
+        // The name (the primary open action) comes first in DOM so it is the first tab stop and the
+        // destructive Delete is last. The action row is an IN-FLOW row below the icon/name/meta
+        // (checkbox left, Rename/Delete/Share/Download right) so the controls never paint over the icon.
         return `
             <div class="file-tile ${isFolder ? 'is-folder' : ''} ${selected ? 'is-selected' : ''}">
                 <div class="tile-icon">${icon}</div>
                 <div class="file-name tile-name" ${nameAttrs} role="button" tabindex="0" aria-label="${openLabel}">${escapeHtml(item.name)}${lockIcon}</div>
                 <div class="tile-meta">${meta}</div>
-                <div class="tile-tl">${check}${primary}</div>
-                <div class="tile-tr file-actions">${secondary}</div>
+                <div class="tile-actions">
+                    <div class="tile-tl">${check}${primary}</div>
+                    <div class="tile-tr file-actions">${secondary}</div>
+                </div>
             </div>`;
     }).join('');
 }
@@ -6599,7 +6602,7 @@ function wireFileItemHandlers(container) {
     // click from firing this a second time.
     container.querySelectorAll('.file-tile').forEach(tile => {
         tile.addEventListener('click', (e) => {
-            if (e.target.closest('button, input, a, .file-actions, .tile-tl, .tile-tr, .file-check, .file-name')) return;
+            if (e.target.closest('button, input, a, .tile-actions, .file-actions, .tile-tl, .tile-tr, .file-check, .file-name')) return;
             const nameEl = tile.querySelector('.file-name');
             if (nameEl) openFromName(nameEl);
         });
