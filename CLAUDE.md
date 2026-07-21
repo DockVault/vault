@@ -2,11 +2,12 @@
 
 This repo is the DockVault vault service: a self-hostable encrypted file vault
 (FastAPI web/API on 8000 + SFTP on 2222, single image, `run_combined.py` runs both).
-Deploy paths: the two setup scripts live at the repo ROOT (`./setup-secure.sh` /
-`./setup-secure.ps1`) and drive `deploy/docker-compose.secure.yml` (production HTTPS); root
-`docker-compose.yml` + `docker-compose.secure.yml` are thin `include:` shims over the real
-files in `deploy/` so `docker compose [-f docker-compose.secure.yml] up` works from the root
-and auto-loads root `.env`. The image is also consumed downstream as a
+Deploy paths: the host-side management tool `dockvault.py` lives at the repo ROOT (stdlib-only,
+needs host `python3`; menu: Setup / Backup & Restore / Volumes / Reset / Update / Logs) and drives
+`deploy/docker-compose.secure.yml` (production HTTPS). The `setup-secure.sh` / `setup-secure.ps1`
+scripts are retired thin shims that exec `dockvault.py setup`. Root `docker-compose.yml` +
+`docker-compose.secure.yml` are thin `include:` shims over the real files in `deploy/` so
+`docker compose [-f docker-compose.secure.yml] up` works from the root and auto-loads root `.env`. The image is also consumed downstream as a
 per-customer container, so **treat `main` as production**: everything tracked here
 ships inside the built image (`Dockerfile` does `COPY . .`, filtered only by
 `.dockerignore`).
@@ -29,10 +30,10 @@ ships inside the built image (`Dockerfile` does `COPY . .`, filtered only by
   co-author or generated-by trailer to commit messages or PR bodies.
 - `BRAND_*` env vars (see `app/config/branding.py`) are a public contract consumed
   by downstream provisioning — don't rename or remove them without a deprecation path.
-- **Keep config, `.env.example`, and the setup tooling in sync.** When you add or change an
-  env/config field in `app/core/config.py`, update `.env.example` **and** the setup tooling (the
-  `setup-secure.*` scripts / the management tool) in the SAME change — a new flag with no
-  `.env.example` entry or setup prompt is an incomplete change.
+- **Keep config, `.env.example`, and the management tool in sync.** When you add or change an
+  env/config field in `app/core/config.py`, update `.env.example` **and** `dockvault.py` (the setup
+  flow / any menu that writes it) in the SAME change — a new flag with no `.env.example` entry or
+  setup prompt is an incomplete change.
 
 ## Tests
 

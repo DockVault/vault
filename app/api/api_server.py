@@ -10606,7 +10606,7 @@ if __name__ == "__main__":
         print("\n⚠️  WARNING: serving PLAINTEXT HTTP with ENVIRONMENT != development and no TRUSTED_PROXIES set.")
         print("   Login credentials and bearer tokens cross the network in cleartext if this port is")
         print("   reachable off-host. Enable TLS (API_USE_HTTPS=true) or front the app with an HTTPS")
-        print("   reverse proxy (deploy/docker-compose.secure.yml / ./setup-secure.sh do this for you).")
+        print("   reverse proxy (deploy/docker-compose.secure.yml / 'python3 dockvault.py setup' do this for you).")
 
     uvicorn.run(
         app,

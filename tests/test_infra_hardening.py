@@ -489,9 +489,10 @@ def test_deploy_scripts_hardened():
     assert "iterations=600000" in smp, "PBKDF2 must use >=600k iterations (match the runtime decryptor)"
     assert "'production'" in smp, "the ENVIRONMENT fallback must default to production, not development"
     assert "0o600" in smp, "secret files must be written mode 0600"
-    ss = _read("setup-secure.sh")
-    assert "REDIS_PASSWORD" in ss, "setup-secure.sh must generate a REDIS_PASSWORD"
-    assert "ALLOWED_HOSTS" in ss, "setup-secure.sh must write ALLOWED_HOSTS"
+    # setup-secure.* are retired shims -> dockvault.py; the secret/.env generation now lives there.
+    dvtool = _read("dockvault.py")
+    assert "REDIS_PASSWORD" in dvtool, "dockvault.py must generate a REDIS_PASSWORD"
+    assert "ALLOWED_HOSTS" in dvtool, "dockvault.py must write ALLOWED_HOSTS"
 
 
 def test_setup_scripts_at_root_and_secure_shim():
@@ -630,21 +631,39 @@ def test_secure_compose_volume_names_honour_prefix():
     assert r.stdout.count("com.dockvault.managed:") >= 5
 
 
-def test_setup_scripts_write_combined_profile_scheme():
-    # The setup scripts must write the new combined/split scheme (RUN_SFTP for SFTP-in-combined),
-    # NOT the retired first-run `COMPOSE_PROFILES=sftp`, or the primary deploy path renders no app.
+def test_setup_scripts_are_retired_shims_delegating_to_dockvault():
+    # The two setup scripts are now thin shims that launch the management tool; the combined/split
+    # profile scheme is written by dockvault.py (build_env_lines), not by the shims.
     for name in ("setup-secure.sh", "setup-secure.ps1"):
         s = _read(name)
-        assert "COMPOSE_PROFILES=combined" in s, f"{name} must write COMPOSE_PROFILES=combined"
-        assert "RUN_SFTP=1" in s, f"{name} must set RUN_SFTP=1 when SFTP is enabled in combined mode"
-        # Must not WRITE the retired sftp profile (a quoted env-line value). Bare mentions in
-        # migration comments / "sftp -> split" messages are fine (they have a space after).
-        assert 'COMPOSE_PROFILES=sftp"' not in s and "COMPOSE_PROFILES=sftp'" not in s, \
-            f"{name} must not write the retired sftp profile"
-    # .env.example ships the mode + the SFTP toggle so a manual `cp .env.example .env` just works.
+        assert "dockvault.py" in s, f"{name} must delegate to dockvault.py"
+        assert "retired" in s.lower(), f"{name} must note it is a retired shim"
+    dvtool = _read("dockvault.py")
+    assert "COMPOSE_PROFILES" in dvtool, "dockvault.py must write COMPOSE_PROFILES"
+    assert 'bare("RUN_SFTP", "1")' in dvtool, "dockvault.py must set RUN_SFTP=1 for SFTP-in-combined"
+    # .env.example still ships the mode + the SFTP toggle so a manual `cp .env.example .env` just works.
     envx = _read(".env.example")
     assert "COMPOSE_PROFILES=combined" in envx and "RUN_SFTP=" in envx, \
         ".env.example must ship COMPOSE_PROFILES=combined and RUN_SFTP"
+
+
+def test_no_stale_setup_secure_command_refs():
+    # setup-secure.* survive only as retired shims. No operator-facing file may still PRESENT them as
+    # THE way to set up - every remaining mention must flag that they're retired/shims; and the README
+    # must show the dockvault.py command.
+    import re
+    for name in ("README.md", ".env.example", "deploy/docker-compose.secure.yml", "CLAUDE.md",
+                 ".github/SECURITY.md"):
+        txt = _read(name)
+        for m in re.finditer(r"setup-secure\.(sh|ps1|\*)", txt):
+            ctx = txt[max(0, m.start() - 140):m.start() + 140].lower()   # window tolerates line wraps
+            assert any(w in ctx for w in ("retired", "shim", "still work", "compatibility")), \
+                f"{name} still presents setup-secure without noting it's retired (near offset {m.start()})"
+    rd = _read("README.md")
+    assert ("python3 dockvault.py setup" in rd or "python dockvault.py setup" in rd), \
+        "README must show the dockvault.py setup command"
+    # the shim scripts themselves must delegate to dockvault.py
+    assert "dockvault.py" in _read("setup-secure.sh") and "dockvault.py" in _read("setup-secure.ps1")
 
 
 def test_env_example_documents_every_settings_field():
@@ -697,8 +716,9 @@ def test_claude_md_carries_config_sync_rule():
     # .env.example half; this locks the documented rule so the practice isn't silently dropped).
     md = _read("CLAUDE.md")
     low = md.lower()
-    assert ".env.example" in md and "setup tooling" in low and "app/core/config.py" in md, \
-        "CLAUDE.md must document keeping config, .env.example, and the setup tooling in sync"
+    assert ".env.example" in md and "app/core/config.py" in md and "in sync" in low \
+        and ("dockvault.py" in md or "management tool" in low), \
+        "CLAUDE.md must document keeping config, .env.example, and dockvault.py in sync"
 
 
 def test_app_version_from_version_file_not_hardcoded():

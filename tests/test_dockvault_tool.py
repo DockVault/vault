@@ -1140,6 +1140,96 @@ def test_backup_restore_round_trip_live(tmp_path):
             run("docker", "volume", "rm", "-f", v)
 
 
+# --- VT update + logs helpers ----------------------------------------------------------------
+def test_update_version_helpers():
+    assert dv.parse_semver("v0.6.0") == (0, 6, 0) and dv.parse_semver("1.2.3-rc1") == (1, 2, 3)
+    assert dv.parse_semver("nightly") is None and dv.parse_semver("") is None
+    assert dv.compare_semver("v0.6.0", "v0.5.9") == 1 and dv.compare_semver("v0.5.0", "v0.6.0") == -1
+    assert dv.compare_semver("1.0.0", "v1.0.0") == 0
+    assert dv.is_downgrade("v0.6.0", "v0.5.0") and not dv.is_downgrade("v0.5.0", "v0.6.0")
+    assert not dv.is_downgrade("unknown", "v0.6.0") and not dv.is_downgrade("v0.6.0", "unknown")
+    data = [{"tag_name": "v0.6.0"}, {"tag_name": "v0.5.4"}, {"tag_name": "nightly"},
+            {"tag_name": "v0.6.0"}, {"nope": 1}, "junk"]
+    assert dv.parse_releases(data) == ["v0.6.0", "v0.5.4"]         # newest-first, semver-only, de-duped
+    assert dv.parse_releases("nope") == [] and dv.parse_releases(None) == []
+    # fail-closed to [] on a network/parse error; parse on success
+    assert dv.fetch_release_tags(fetch=lambda u: (_ for _ in ()).throw(OSError("no net"))) == []
+    assert dv.fetch_release_tags(fetch=lambda u: data) == ["v0.6.0", "v0.5.4"]
+
+
+def test_read_version_file(tmp_path):
+    assert dv.read_version_file(str(tmp_path)) == "unknown"
+    (tmp_path / "VERSION").write_text("0.6.0\n", encoding="utf-8")
+    assert dv.read_version_file(str(tmp_path)) == "0.6.0"
+
+
+def test_logs_enable_opts_in_plan_and_pepper(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    recreated = []
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: recreated.append(build) or True)
+    tool.logs(argparse.Namespace(non_interactive=True, enable=True))
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert env["PLAN_LOG_PULL"] == "true" and len(env.get("LOG_TOKEN_PEPPER", "")) >= 32
+    assert recreated == [False], "an env-only change must recreate WITHOUT --build (no image clobber)"
+
+
+def test_logs_without_enable_changes_nothing(tmp_path, monkeypatch):
+    # the guided helper must ONLY guide opt-in - opting out leaves the (default-off) exposure untouched.
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    before = (tmp_path / ".env").read_text(encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    tool.logs(argparse.Namespace(non_interactive=True, enable=False))
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == before, "logs opt-out must not touch .env"
+
+
+def test_update_cancels_without_a_tag(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    (tmp_path / "VERSION").write_text("0.6.0\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "fetch_release_tags", lambda *a, **k: [])
+    started = []
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: started.append(1) or True)
+    tool.update(argparse.Namespace(non_interactive=True, tag=None, source=False, yes=False))
+    assert started == [], "update with no tag must not recreate the stack"
+
+
+def test_update_from_source_checks_out_and_recreates(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    (tmp_path / "VERSION").write_text("0.6.0\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _Proc(0, ""))
+    started = []
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: started.append(1) or True)
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    # a downgrade, explicitly confirmed via --yes, built from source
+    tool.update(argparse.Namespace(non_interactive=True, tag="v0.5.0", source=True, yes=True))
+    assert any(("checkout" in c and "v0.5.0" in c) for c in calls), "must git checkout the chosen tag"
+    assert started == [1]
+
+
+def test_update_pull_path_sets_image_and_recreates_without_build(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    (tmp_path / "VERSION").write_text("0.6.0\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _Proc(0, ""))
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    tool.update(argparse.Namespace(non_interactive=True, tag="v0.7.0", source=False, yes=True))  # upgrade, pull
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert env["DOCKVAULT_IMAGE"] == "ghcr.io/dockvault/vault:v0.7.0"
+    assert any("pull" in c for c in calls), "pull path must 'docker compose pull'"
+    recreate = [c for c in calls if "up" in c]
+    assert recreate and all("--build" not in c for c in recreate), \
+        "the pull path must recreate WITHOUT --build (else it clobbers the pulled image)"
+
+
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs host openssl for a BYO pair")
 def test_setup_byo_cert_mode_installs_pair(tmp_path):
     cert, key = _mkpair(tmp_path / "src")

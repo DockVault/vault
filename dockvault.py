@@ -993,6 +993,71 @@ def untar_volume(volume, src_dir, archive_name, run=subprocess.run):
     return getattr(r, "returncode", 1) == 0
 
 
+# --- update (release list + upgrade/downgrade) -----------------------------------------------
+RELEASES_URL = "https://api.github.com/repos/DockVault/vault/releases"
+GHCR_IMAGE = "ghcr.io/dockvault/vault"
+
+
+def parse_semver(v):
+    """('v1.2.3-rc1' | '1.2.3') -> (1,2,3); pre-release/build suffix ignored; None if unparseable.
+    Mirrors the app's update-check parser so the tool ranks versions the same way."""
+    if not v:
+        return None
+    m = re.match(r"[vV]?(\d+)\.(\d+)\.(\d+)", str(v).strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def compare_semver(a, b):
+    """-1/0/1 comparing two version strings by (major, minor, patch); an unparseable side sorts LOW."""
+    pa, pb = parse_semver(a) or (-1, -1, -1), parse_semver(b) or (-1, -1, -1)
+    return (pa > pb) - (pa < pb)
+
+
+def is_downgrade(current, target):
+    """True only if BOTH parse and `target` is strictly OLDER than `current`."""
+    return bool(parse_semver(current) and parse_semver(target) and compare_semver(target, current) < 0)
+
+
+def parse_releases(data):
+    """Release tags from the GitHub releases LIST JSON (a list of {tag_name,...}), preserving the
+    API's newest-first order, keeping only version-shaped tags, de-duplicated. Pure; [] on non-list."""
+    if not isinstance(data, list):
+        return []
+    tags = []
+    for rel in data:
+        if not isinstance(rel, dict):
+            continue
+        tag = (rel.get("tag_name") or "").strip()
+        if tag and parse_semver(tag) and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def _default_release_fetch(url):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "dockvault-tool",
+                                               "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=10) as r:  # noqa: S310 (fixed https URL)
+        return json.loads(r.read(1000000).decode("utf-8"))
+
+
+def fetch_release_tags(url=RELEASES_URL, fetch=None):
+    """Best-effort list of release tags newest-first. FAIL-CLOSED to [] on ANY network/parse error so
+    an air-gapped host just falls back to a manual tag entry. `fetch` is injectable for tests."""
+    try:
+        return parse_releases((fetch or _default_release_fetch)(url))
+    except Exception:  # noqa: BLE001 - fail-closed-silent
+        return []
+
+
+def read_version_file(root):
+    """The current version from <root>/VERSION, or 'unknown'."""
+    try:
+        return open(os.path.join(root, "VERSION"), encoding="utf-8").read().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
 # --- secret <-> volume guardrail -------------------------------------------------------------
 # The reported footgun: Postgres bakes VAULT_DB_PASSWORD into vault_pg_data on FIRST init and never
 # re-reads it, so a fresh/changed .env against a populated volume can't authenticate ("password
@@ -1326,9 +1391,20 @@ class DockVault:
                 "-f", os.path.join(self.root, "docker-compose.secure.yml")] + list(args)
 
     def _start_secure_stack(self):
-        r = subprocess.run(self._dc("up", "-d", "--build", "--force-recreate", "--remove-orphans"),
-                           cwd=self.root, text=True)
-        return r.returncode == 0
+        return self._recreate_stack(build=True)
+
+    def _recreate_stack(self, build):
+        """Recreate the stack. build=True builds the local Dockerfile (setup / from-source update);
+        build=False recreates from the already-present image (the pull-update path - must NOT rebuild,
+        or it would overwrite the just-pulled release image with a local build)."""
+        args = ["up", "-d", "--force-recreate", "--remove-orphans"]
+        if build:
+            args.insert(1, "--build")
+        try:
+            r = subprocess.run(self._dc(*args), cwd=self.root, text=True, timeout=600)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return getattr(r, "returncode", 1) == 0
 
     def _start_db_only(self):
         """Start ONLY the postgres service on the existing volume (for the pre-up secret check)."""
@@ -1801,10 +1877,111 @@ class DockVault:
         print(pal.paint("  Run Setup to start a fresh deployment.\n", "cyan"))
 
     def update(self, args=None):
-        _stub("Update", self.pal)
+        """Update menu: show the current version, list releases newest-first (fail-closed to a manual
+        tag), pick one to upgrade OR downgrade to, WARN about the no-down-migration schema risk +
+        recommend a Backup first, then either set DOCKVAULT_IMAGE + pull (default) or git-checkout +
+        build (--source), recreate, and health-wait."""
+        pal = self.pal
+        ok, msg = docker_available()
+        if not ok:
+            self._fail(msg)
+        env = self._load_env()
+        current = read_version_file(self.root)
+        interactive = not (args and getattr(args, "non_interactive", False))
+        print(pal.paint("\n  DockVault update", "cyan"))
+        print("  current version : %s" % current)
+        print("  update check    : %s (every %s min)" % (
+            (env.get("UPDATE_CHECK_ENABLED") or "false"),
+            env.get("UPDATE_CHECK_INTERVAL_MINUTES") or "360"))
+
+        tag = getattr(args, "tag", None) if args else None
+        from_source = bool(getattr(args, "source", False)) if args else False
+        if not tag:
+            tags = fetch_release_tags()
+            if tags:
+                print(pal.paint("\n  Available releases (newest first):", "cyan"))
+                for t in tags[:15]:
+                    print("    %s%s" % (t, "   <- current" if parse_semver(t) == parse_semver(current) else ""))
+            else:
+                print(pal.paint("\n  (couldn't reach GitHub - enter a tag manually)", "yellow"))
+            if interactive:
+                tag = ask("Version tag to switch to (e.g. v0.6.0; blank to cancel)", pal).strip()
+        if not tag:
+            print(pal.paint("  Cancelled.\n", "yellow"))
+            return
+
+        down = is_downgrade(current, tag)
+        print(pal.paint("\n  %s: %s -> %s" % ("DOWNGRADE" if down else "Version change", current, tag),
+                        "red" if down else "yellow"))
+        print(pal.paint("  The database has no down-migrations, so a change across a schema change can fail", "yellow"))
+        print(pal.paint("  to start (a downgrade especially). BACK UP FIRST (Backup & Restore menu).", "yellow"))
+        confirmed = bool(getattr(args, "yes", False)) if args else False
+        if interactive:
+            confirmed = confirm("Proceed with the version change?", pal, default=False)
+        if not confirmed:
+            print(pal.paint("  Cancelled.\n", "yellow"))
+            return
+
+        if from_source:
+            print(pal.paint("  git checkout %s + rebuild ..." % tag, "cyan"))
+            try:
+                r = subprocess.run(["git", "checkout", tag], cwd=self.root, capture_output=True, text=True, timeout=120)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._fail("git checkout failed: %s" % exc)
+            if r.returncode != 0:
+                self._fail("git checkout %s failed: %s" % (tag, (r.stderr or "").strip()[:200]))
+        else:
+            image = "%s:%s" % (GHCR_IMAGE, tag)
+            self._set_env_key(self._env_path(), "DOCKVAULT_IMAGE", image)
+            print(pal.paint("  set DOCKVAULT_IMAGE=%s; pulling ..." % image, "cyan"))
+            try:
+                pr = subprocess.run(self._dc("pull"), cwd=self.root, text=True, timeout=600)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._fail("docker compose pull failed: %s" % exc)
+            if pr.returncode != 0:
+                self._fail("docker compose pull failed - is %s published? (or use --source to build)" % image)
+        # from-source rebuilds the local Dockerfile; the pull path recreates from the pulled image
+        # WITHOUT --build (a rebuild would clobber the just-pulled release image with a local build).
+        if not (self._start_secure_stack() if from_source else self._recreate_stack(build=False)):
+            self._fail("the stack did not come up after the update - check 'docker compose ... logs'.")
+        healthy = self._wait_secure_healthy(self._load_env().get("COMPOSE_PROFILES", "combined"))
+        print(pal.paint("\n  Update to %s: %s.\n" % (tag, "healthy" if healthy else "NOT healthy - check the logs"),
+                        "green" if healthy else "red"))
 
     def logs(self, args=None):
-        _stub("Logs", self.pal)
+        """Guided 'enable authenticated log pull'. The GET /logs endpoint is default-OFF; it needs
+        PLAN_LOG_PULL=true AND a strong LOG_TOKEN_PEPPER, then an admin ticks a component in the UI.
+        This ONLY guides the operator to OPT IN - it opens nothing on its own and changes no other
+        exposure default."""
+        pal = self.pal
+        env = self._load_env()
+        on = (env.get("PLAN_LOG_PULL") or "").strip().lower() in ("1", "true", "yes", "on")
+        pepper_ok = len((env.get("LOG_TOKEN_PEPPER") or "")) >= 32
+        print(pal.paint("\n  Authenticated log pull", "cyan"))
+        print("  The GET /logs endpoint is OFF by default. To use it you must set PLAN_LOG_PULL=true")
+        print("  and a LOG_TOKEN_PEPPER (>=32 chars); then, in the vault UI under Settings -> Logs, tick")
+        print("  the Web/SFTP component and mint a token there. Enabling here opens nothing by itself.")
+        print("  status: PLAN_LOG_PULL=%s, pepper %s" % (on, "set" if pepper_ok else "missing"))
+        interactive = not (args and getattr(args, "non_interactive", False))
+        do_enable = bool(getattr(args, "enable", False)) if args else False
+        if interactive:
+            do_enable = confirm("Enable authenticated log pull now (writes .env + recreates the stack)?",
+                                pal, default=False)
+        if not do_enable:
+            print(pal.paint("  Left unchanged.\n", "yellow"))
+            return
+        self._set_env_key(self._env_path(), "PLAN_LOG_PULL", "true")
+        if not pepper_ok:
+            self._set_env_key(self._env_path(), "LOG_TOKEN_PEPPER", gen_hex(32))
+        print(pal.paint("  Enabled in .env.", "green"))
+        ok, _ = docker_available()
+        if ok:
+            print(pal.paint("  Recreating the stack so it takes effect ...", "cyan"))
+            # env-only change: --force-recreate re-reads .env; do NOT rebuild (would clobber a
+            # release image previously pulled by the Update menu with a local build).
+            self._recreate_stack(build=False)
+        print(pal.paint("  Now open Settings -> Logs in the vault UI, tick the Web/SFTP component, and mint a "
+                        "token there.\n", "green"))
 
     def handler(self, key):
         """Resolve a menu/command key to its bound handler, or None if unknown."""
@@ -1880,6 +2057,16 @@ def build_parser():
     bp.add_argument("--bundle-dir", dest="bundle_dir", help="restore: the bundle directory to restore")
     bp.add_argument("--force", dest="force", action="store_true", help="restore: overwrite existing target volumes")
     bp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
+
+    up = parsers["update"]
+    up.add_argument("--tag", dest="tag", help="version tag to switch to (e.g. v0.6.0)")
+    up.add_argument("--source", dest="source", action="store_true", help="build from source (git checkout) instead of pulling the GHCR image")
+    up.add_argument("--yes", dest="yes", action="store_true", help="confirm the version change (required in --non-interactive)")
+    up.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
+
+    lp = parsers["logs"]
+    lp.add_argument("--enable", dest="enable", action="store_true", help="enable authenticated log pull (opt-in)")
+    lp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
     return p
 
 
