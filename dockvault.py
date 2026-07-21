@@ -1462,93 +1462,150 @@ class DockVault:
 
     def _guard_db_secret(self, env, interactive=False, exists_fn=None, start_fn=None, wait_fn=None,
                          probe_fn=None, stop_fn=None):
-        """Fail-closed guardrail: if vault_pg_data already exists, verify the current .env's
-        VAULT_DB_PASSWORD authenticates against it (and ENCRYPTION_KEY is at least a valid key) BEFORE
-        starting the stack. Returns True to proceed, False to STOP (after printing a secret-free
-        diagnosis). No-op (True) for a fresh volume. When `interactive`, a definite password mismatch
-        offers recovery choices (keep data under a new set / destroy / cancel) instead of just failing.
-        The *_fn hooks are injectable for tests."""
-        pal = self.pal
+        """Guardrail against the 'existing volume + wrong .env' footgun. No-op (True) for a fresh
+        volume. NON-interactive (a script): auto-verify the current .env's DB password and FAIL CLOSED
+        on a mismatch/ambiguous result. INTERACTIVE: do NOT auto-wait - present choices (verify / point
+        at a .env / new set / destroy / cancel) and run the ~30s DB probe only if the operator asks.
+        Never prints a secret. The *_fn hooks are injectable for tests."""
         exists_fn = exists_fn or volume_exists
-        start_fn = start_fn or self._start_db_only
-        wait_fn = wait_fn or self._wait_db_ready
-        probe_fn = probe_fn or probe_pg_password
-        stop_fn = stop_fn or self._stop_db_only
         vol = "%s_vault_pg_data" % volume_prefix(env)
         if not exists_fn(vol):
             return True   # brand-new volume: the .env password is baked in on first init
-        # A stored volume + an ENCRYPTION_KEY that isn't even shaped like a Fernet key is a certain
-        # mismatch (files would be undecryptable) - stop before baking a broken pairing.
-        if not fernet_key_looks_valid(env.get("ENCRYPTION_KEY", "")):
-            self._print_secret_mismatch("encryption_key", vol)
-            return False
-        print(pal.paint("  Existing data volume found - starting the database briefly to verify the .env"
-                        " matches it.\n  This can take ~20-40s (it may pull/start Postgres); please don't"
-                        " press keys while it runs.", "cyan"))
-        if not start_fn() or not wait_fn():
-            stop_fn()
-            self._print_secret_mismatch("ambiguous", vol)
-            return False
-        result = probe_fn("vault-db", PG_USER, PG_DB, env.get("VAULT_DB_PASSWORD", ""))
-        if db_guard_decision(True, result) == "proceed":
-            # Be precise: only VAULT_DB_PASSWORD was AUTHENTICATED against the volume; ENCRYPTION_KEY
-            # was only format-checked (stdlib-only, no decryption), so don't claim a full match.
-            print(pal.paint("  Secret check OK: VAULT_DB_PASSWORD authenticates against the existing "
-                            "data volume (ENCRYPTION_KEY has a valid key format).", "green"))
+        hooks = (start_fn or self._start_db_only, wait_fn or self._wait_db_ready,
+                 probe_fn or probe_pg_password, stop_fn or self._stop_db_only)
+        if interactive:
+            return self._resolve_existing_volume(env, vol, hooks)
+        # non-interactive: verify + fail closed (a script must not auto-destroy or auto-fork).
+        result = self._verify_env_against_volume(env, vol, hooks)
+        if result == "ok":
             return True
-        stop_fn()
-        # A DEFINITE password mismatch, and we're interactive -> offer recovery instead of just failing.
-        if result == "mismatch" and interactive:
-            return self._resolve_secret_mismatch(env)
-        self._print_secret_mismatch("db_password" if result == "mismatch" else "ambiguous", vol)
+        self._print_secret_mismatch(result, vol)
         return False
 
-    def _resolve_secret_mismatch(self, env):
-        """Interactive recovery when the current .env's DB password does NOT match the existing volume.
-        Offers a THIRD way beyond 'restore the .env' / 'destroy the data': deploy a fresh set under a
-        NEW volume name (VAULT_VOLUME_PREFIX), keeping the old data untouched. Returns True to PROCEED
-        (after acting) or False to stop. Never prints a secret."""
+    def _verify_env_against_volume(self, env, vol, hooks):
+        """Start the DB and auth-probe the current .env's VAULT_DB_PASSWORD against `vol`, printing what
+        it's doing at each step. Returns 'ok' | 'mismatch' | 'ambiguous' | 'encryption_key'. Stops the
+        probe DB afterwards. Never prints a secret."""
         pal = self.pal
-        vol = "%s_vault_pg_data" % volume_prefix(env)
-        self._print_secret_mismatch("db_password", vol)
-        print(pal.paint("  Or pick one of these and I'll do it now:", "cyan"))
-        print("    1) Cancel - I'll restore the original .env for this data (default)")
-        print("    2) Keep this data + deploy a NEW empty set under a fresh volume name (new volumes +")
-        print("       a fresh paired .env; your old data is left untouched and can be re-pointed later)")
-        print("    3) DESTROY this data now (docker compose down -v) and start fresh with the current .env")
-        flush_stdin()   # drop any Enter typed during the long verify so it can't auto-pick option 1
-        choice = ask("Choose 1/2/3", pal, "1").strip()
-        if choice == "2":
-            new_id = gen_deployment_id()
-            new_prefix = "%s-%s" % (DEFAULT_PROJECT, new_id)
-            self._archive_env(volume_prefix(env))
-            if write_env(self._env_path(), build_env_lines(new_set_config(env, new_prefix, new_id))):
-                print(pal.paint("  Authored a fresh set '%s' (new volumes + secrets); starting it. Your "
-                                "previous set's .env was saved aside." % new_prefix, "green"))
-            else:
-                print(pal.paint("  Authored a fresh set '%s' - WARNING: could not restrict the new .env's "
-                                "permissions; secure it yourself." % new_prefix, "yellow"))
-            return True
-        if choice == "3":
+        start_fn, wait_fn, probe_fn, stop_fn = hooks
+        if not fernet_key_looks_valid(env.get("ENCRYPTION_KEY", "")):
+            return "encryption_key"
+        print(pal.paint("  Starting the database container to check the password (~20-40s)...", "cyan"))
+        if not start_fn():
+            stop_fn()
+            print(pal.paint("  The database container did not start.", "yellow"))
+            return "ambiguous"
+        print(pal.paint("  Waiting for the database to accept connections...", "cyan"))
+        if not wait_fn():
+            stop_fn()
+            print(pal.paint("  The database did not become ready in time.", "yellow"))
+            return "ambiguous"
+        print(pal.paint("  Authenticating VAULT_DB_PASSWORD against the stored database (vault-db)...", "cyan"))
+        result = probe_fn("vault-db", PG_USER, PG_DB, env.get("VAULT_DB_PASSWORD", ""))
+        stop_fn()
+        return result if result in ("ok", "mismatch") else "ambiguous"
+
+    def _resolve_existing_volume(self, env, vol, hooks):
+        """Interactive menu shown when an existing data volume is found. NOTHING starts until the
+        operator chooses; only 1/2 run the slow DB probe. Returns True to PROCEED (after acting) or
+        False to stop. Never prints a secret."""
+        pal = self.pal
+        print(pal.paint("\n  Found an existing data volume from a previous deployment:", "yellow"))
+        print("    %s" % vol)
+        print("  Postgres bakes the DB password into it on first init, so the CURRENT .env may not open")
+        print("  it. Nothing has started yet - choose what to do (only 1 and 2 start the database):")
+        while True:
+            print(pal.paint("\n    1) Verify the current .env matches it, then reuse   (~20-40s)", "cyan"))
+            print("    2) Point me at a specific .env file and verify THAT one instead")
+            print("    3) Keep this data + deploy a NEW set under a fresh volume name   (instant)")
+            print("    4) DESTROY this data and start fresh with the current .env       (down -v)")
+            print("    5) Cancel")
             flush_stdin()
-            if not confirm("This PERMANENTLY deletes the data in %s. Continue?" % vol, pal, default=False):
-                print(pal.paint("  Cancelled - nothing was deleted.\n", "yellow"))
+            choice = ask("Choose 1-5", pal).strip()
+            if choice == "1":
+                if self._try_verify(env, vol, hooks):
+                    return True
+            elif choice == "2":
+                src = ask("Path to the .env to try (blank = back)", pal).strip()
+                if not src:
+                    continue
+                if not os.path.exists(src):
+                    print(pal.paint("  No file at %s." % src, "red"))
+                    continue
+                _copy_secret(src, self._env_path())
+                tighten_secret_file(self._env_path())
+                env = self._load_env()   # the installed .env may name a different volume set
+                print(pal.paint("  Installed that .env; verifying it...", "cyan"))
+                if self._try_verify(env, "%s_vault_pg_data" % volume_prefix(env), hooks):
+                    return True
+            elif choice == "3":
+                self._new_set_from(env)
+                return True
+            elif choice == "4":
+                if self._destroy_data(vol):
+                    return True
+            elif choice == "5":
+                print(pal.paint("  Cancelled - restore the matching .env and re-run setup.\n", "yellow"))
                 return False
-            try:
-                subprocess.run(self._dc("down", "-v", "--remove-orphans"), cwd=self.root, text=True, timeout=180)
-            except (OSError, subprocess.SubprocessError) as exc:
-                self._fail("teardown failed: %s" % exc)
-            print(pal.paint("  Destroyed the old data; starting fresh with the current .env.", "green"))
+            else:
+                print(pal.paint("  Please enter 1, 2, 3, 4 or 5.", "red"))
+
+    def _try_verify(self, env, vol, hooks):
+        """Run the probe; True if it matches (proceed). On mismatch/ambiguous, explain (no secret) and
+        return False so the caller re-shows the menu instead of dead-ending."""
+        pal = self.pal
+        result = self._verify_env_against_volume(env, vol, hooks)
+        if result == "ok":
+            print(pal.paint("  Match: VAULT_DB_PASSWORD authenticates against this volume (ENCRYPTION_KEY "
+                            "has a valid key format). Continuing.", "green"))
             return True
-        print(pal.paint("  Cancelled - restore the matching .env and re-run setup.\n", "yellow"))
+        if result == "mismatch":
+            print(pal.paint("  That .env's VAULT_DB_PASSWORD does NOT match this volume - pick another option.", "red"))
+        elif result == "encryption_key":
+            print(pal.paint("  That .env's ENCRYPTION_KEY isn't a valid key; stored files couldn't be decrypted.", "red"))
+        else:
+            print(pal.paint("  Couldn't verify (the database didn't start/respond in time) - NOT a confirmed "
+                            "mismatch. Try again, or pick another option.", "yellow"))
         return False
+
+    def _new_set_from(self, env):
+        """Author a fresh set (new prefix + secrets) with its own .env, archiving the current one. The
+        old data is left untouched (re-pointable later from the Volumes menu)."""
+        pal = self.pal
+        new_id = gen_deployment_id()
+        new_prefix = "%s-%s" % (DEFAULT_PROJECT, new_id)
+        self._archive_env(volume_prefix(env))
+        if write_env(self._env_path(), build_env_lines(new_set_config(env, new_prefix, new_id))):
+            print(pal.paint("  Authored a fresh set '%s' (new volumes + secrets); starting it. The previous "
+                            "set's .env was saved aside." % new_prefix, "green"))
+        else:
+            print(pal.paint("  Authored a fresh set '%s' - WARNING: could not restrict the new .env's "
+                            "permissions; secure it yourself." % new_prefix, "yellow"))
+
+    def _destroy_data(self, vol):
+        """Strong-confirm + docker compose down -v. True to proceed (destroyed), False if declined."""
+        pal = self.pal
+        flush_stdin()
+        if not confirm("This PERMANENTLY deletes the data in %s. Continue?" % vol, pal, default=False):
+            print(pal.paint("  Nothing was deleted.", "yellow"))
+            return False
+        try:
+            subprocess.run(self._dc("down", "-v", "--remove-orphans"), cwd=self.root, text=True, timeout=180)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._fail("teardown failed: %s" % exc)
+        print(pal.paint("  Destroyed the old data; starting fresh with the current .env.", "green"))
+        return True
 
     def _print_secret_mismatch(self, kind, vol):
-        """Explain a secret<->volume mismatch + the two recovery paths. NEVER prints a secret value."""
+        """Explain a secret<->volume mismatch + the recovery paths (non-interactive/script path).
+        NEVER prints a secret value."""
         pal = self.pal
-        print(pal.paint("\nERROR: the current .env does NOT match the existing data volume.", "red"))
+        if kind == "ambiguous":
+            print(pal.paint("\nERROR: could NOT verify the current .env against the existing data volume.", "red"))
+        else:
+            print(pal.paint("\nERROR: the current .env does NOT match the existing data volume.", "red"))
         print("  Volume: %s" % vol)
-        if kind == "db_password":
+        if kind in ("db_password", "mismatch"):
             print("  VAULT_DB_PASSWORD in .env fails to authenticate against the stored database.")
             print("  Postgres bakes the DB password into the volume on FIRST init and never re-reads it,")
             print("  so a fresh or changed .env can't open data created under the old password (the app")

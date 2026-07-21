@@ -706,55 +706,94 @@ def test_flush_stdin_is_safe():
     assert dv.flush_stdin() is None            # non-TTY under pytest -> no-op, never raises
 
 
-def test_resolve_secret_mismatch_new_set_keeps_data(tmp_path, monkeypatch):
+def _ask_seq(*answers):
+    """Build an `ask` stand-in that returns the given answers in order (for a menu-loop test)."""
+    it = iter(answers)
+    return lambda *a, **k: next(it)
+
+
+def test_existing_volume_menu_new_set_keeps_data(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
     old = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
-    monkeypatch.setattr(dv, "ask", lambda *a, **k: "2")        # "deploy a NEW set"
-    assert tool._resolve_secret_mismatch(old) is True
+    monkeypatch.setattr(dv, "ask", _ask_seq("3"))               # "deploy a NEW set under a fresh name"
+    assert tool._guard_db_secret(old, interactive=True, exists_fn=lambda v: True) is True
     new = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
-    assert new["VAULT_VOLUME_PREFIX"].startswith("dockvault-vault-")   # a fresh named set (old data untouched)
-    assert new["ENCRYPTION_KEY"] != old["ENCRYPTION_KEY"]              # fresh secrets, born with the new set
-    assert (tmp_path / ".env.dockvault-vault").exists()               # the previous set's .env archived aside
+    assert new["VAULT_VOLUME_PREFIX"].startswith("dockvault-vault-")   # fresh named set (old data untouched)
+    assert new["ENCRYPTION_KEY"] != old["ENCRYPTION_KEY"]              # fresh secrets
+    assert (tmp_path / ".env.dockvault-vault").exists()               # previous set's .env archived aside
 
 
-def test_resolve_secret_mismatch_destroy(tmp_path, monkeypatch):
+def test_existing_volume_menu_verify_probes_only_on_choice(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
-    monkeypatch.setattr(dv, "ask", lambda *a, **k: "3")
+    probes = []
+    hooks = dict(exists_fn=lambda v: True, start_fn=lambda: True, wait_fn=lambda: True,
+                 probe_fn=lambda *a: probes.append(1) or "ok", stop_fn=lambda: None)
+    monkeypatch.setattr(dv, "ask", _ask_seq("1"))               # verify -> ok -> proceed
+    assert tool._guard_db_secret(env, interactive=True, **hooks) is True and probes == [1]
+    probes.clear()
+    monkeypatch.setattr(dv, "ask", _ask_seq("5"))               # cancel -> never probes
+    assert tool._guard_db_secret(env, interactive=True, **hooks) is False and probes == []
+
+
+def test_existing_volume_menu_verify_mismatch_loops_then_cancel(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "ask", _ask_seq("1", "5"))          # verify -> mismatch -> BACK to menu -> cancel
+    assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True,
+                                 start_fn=lambda: True, wait_fn=lambda: True, probe_fn=lambda *a: "mismatch",
+                                 stop_fn=lambda: None) is False
+
+
+def test_existing_volume_menu_destroy(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     calls = []
     monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _Proc(0, ""))
-    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
-    monkeypatch.setattr(dv, "confirm", lambda *a, **k: True)   # confirm the destructive down -v
-    assert tool._resolve_secret_mismatch(env) is True
+    monkeypatch.setattr(dv, "confirm", lambda *a, **k: True)    # confirm the destructive down -v
+    monkeypatch.setattr(dv, "ask", _ask_seq("4"))
+    assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True) is True
     assert any(("down" in c and "-v" in c) for c in calls), "destroy must run down -v"
-    # declining the confirm does NOT destroy
+    # declining loops back to the menu (then cancel); no down -v runs
     calls.clear()
     monkeypatch.setattr(dv, "confirm", lambda *a, **k: False)
-    assert tool._resolve_secret_mismatch(env) is False
+    monkeypatch.setattr(dv, "ask", _ask_seq("4", "5"))
+    assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True) is False
     assert not any("down" in c for c in calls), "a declined destroy must not run down -v"
 
 
-def test_resolve_secret_mismatch_cancel(tmp_path, monkeypatch):
+def test_existing_volume_menu_point_at_env(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
-    before = (tmp_path / ".env").read_text(encoding="utf-8")
+    other = dict(_reusable_env_cfg())
+    src = tmp_path / "saved.env"
+    src.write_text("\n".join(dv.build_env_lines(other)) + "\n", encoding="utf-8")
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
-    monkeypatch.setattr(dv, "ask", lambda *a, **k: "1")        # cancel (default)
-    assert tool._resolve_secret_mismatch(dv.parse_env(before)) is False
-    assert (tmp_path / ".env").read_text(encoding="utf-8") == before, "cancel must not touch .env"
+    monkeypatch.setattr(dv, "ask", _ask_seq("2", str(src)))     # option 2, then the path to try
+    assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True,
+                                 start_fn=lambda: True, wait_fn=lambda: True, probe_fn=lambda *a: "ok",
+                                 stop_fn=lambda: None) is True
+    installed = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert installed["ENCRYPTION_KEY"] == other["encryption_key"]     # the supplied .env was installed
 
 
-def test_guard_routes_interactive_mismatch_to_resolver(tmp_path, monkeypatch):
+def test_guard_interactive_routes_to_menu_not_autoprobe(tmp_path, monkeypatch):
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     env = {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"}
-    hooks = dict(exists_fn=lambda v: True, start_fn=lambda: True, wait_fn=lambda: True,
-                 probe_fn=lambda *a: "mismatch", stop_fn=lambda: None)
     called = []
-    monkeypatch.setattr(tool, "_resolve_secret_mismatch", lambda e: called.append(1) or True)
-    assert tool._guard_db_secret(env, interactive=True, **hooks) is True and called == [1]
-    # non-interactive keeps the old fail-closed behaviour: no prompt, returns False
+    monkeypatch.setattr(tool, "_resolve_existing_volume", lambda e, vol, hooks: called.append(1) or True)
+    # interactive + existing volume -> the menu (nothing probes automatically)
+    assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True) is True and called == [1]
+    # non-interactive -> auto-verify directly, NO menu
     called.clear()
-    assert tool._guard_db_secret(env, interactive=False, **hooks) is False and called == []
+    ok = tool._guard_db_secret(env, interactive=False, exists_fn=lambda v: True,
+                               start_fn=lambda: True, wait_fn=lambda: True, probe_fn=lambda *a: "ok",
+                               stop_fn=lambda: None)
+    assert ok is True and called == []
 
 
 def test_probe_pg_password_live_distinguishes_secrets():
