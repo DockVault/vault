@@ -5550,6 +5550,19 @@ function _addTagUser(kind, id) {
     if (_stEl(results)) _stEl(results).replaceChildren();
 }
 
+// Reflect a stored tag colour (a CHIP_COLORS name, a #hex, or '') onto the swatch picker:
+// set the hidden #share-tag-color the save path reads, highlight the matching swatch, and seed
+// the custom picker from a hex value. Mirrors setGroupColor.
+function setShareTagColor(color) {
+    const hidden = _stEl('share-tag-color');
+    if (hidden) hidden.value = color || '';
+    document.querySelectorAll('#share-tag-color-swatches .accent-swatch').forEach(s => {
+        s.classList.toggle('selected', (s.getAttribute('data-color') || '') === (color || ''));
+    });
+    const custom = _stEl('share-tag-color-custom');
+    if (custom && color && color.charAt(0) === '#') custom.value = color;
+}
+
 function openShareTagEditor(tag) {
     const editor = _stEl('share-tag-editor');
     if (!editor) return;
@@ -5558,7 +5571,7 @@ function openShareTagEditor(tag) {
     _stEl('share-tag-editor-id').value = tag ? t.id : '';
     _stEl('share-tag-name').value = t.name || '';
     _stEl('share-tag-description').value = t.description || '';
-    _stEl('share-tag-color').value = t.color || '';
+    setShareTagColor(t.color || '');
     _stEl('share-tag-max-lifetime').value = t.max_lifetime_minutes != null ? t.max_lifetime_minutes : 10080;
     _stEl('share-tag-default-lifetime').value = t.default_lifetime_minutes != null ? t.default_lifetime_minutes : 1440;
     _stEl('share-tag-max-recipients-cap').value = t.max_recipients_cap != null ? t.max_recipients_cap : '';
@@ -10464,6 +10477,21 @@ document.addEventListener('DOMContentLoaded', () => {
     const groupColorCustom = document.getElementById('group-color-custom');
     if (groupColorCustom) {
         groupColorCustom.addEventListener('input', () => setGroupColor(groupColorCustom.value));
+    }
+    // Share-tag colour picker: named swatches + a custom <input type=color> (mirrors the Groups editor).
+    const shareTagColorSwatches = document.getElementById('share-tag-color-swatches');
+    if (shareTagColorSwatches) {
+        shareTagColorSwatches.addEventListener('click', (e) => {
+            const sw = e.target.closest('.accent-swatch');
+            if (sw) {
+                e.preventDefault();
+                setShareTagColor(sw.getAttribute('data-color') || '');
+            }
+        });
+    }
+    const shareTagColorCustom = document.getElementById('share-tag-color-custom');
+    if (shareTagColorCustom) {
+        shareTagColorCustom.addEventListener('input', () => setShareTagColor(shareTagColorCustom.value));
     }
     // Searchable "Add members" modal
     const addMembersSearch = document.getElementById('add-members-search');

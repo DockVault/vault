@@ -1406,8 +1406,20 @@
                                             <input type="text" id="share-tag-description" class="form-control" placeholder="Optional">
                                         </div>
                                         <div class="form-group">
-                                            <label for="share-tag-color">Colour</label>
-                                            <input type="text" id="share-tag-color" class="form-control" maxlength="20" placeholder="e.g. indigo" style="max-width:200px;">
+                                            <label>Colour</label>
+                                            <input type="hidden" id="share-tag-color" value="">
+                                            <div class="accent-swatches" id="share-tag-color-swatches">
+                                                <button type="button" class="accent-swatch" data-color="" style="background:var(--surface-4)" title="None" aria-label="No color"></button>
+                                                <button type="button" class="accent-swatch" data-color="teal" style="background:#0d9488" title="Teal" aria-label="Teal"></button>
+                                                <button type="button" class="accent-swatch" data-color="indigo" style="background:#4f46e5" title="Indigo" aria-label="Indigo"></button>
+                                                <button type="button" class="accent-swatch" data-color="violet" style="background:#7c3aed" title="Violet" aria-label="Violet"></button>
+                                                <button type="button" class="accent-swatch" data-color="rose" style="background:#e11d48" title="Rose" aria-label="Rose"></button>
+                                                <button type="button" class="accent-swatch" data-color="orange" style="background:#ea580c" title="Orange" aria-label="Orange"></button>
+                                                <button type="button" class="accent-swatch" data-color="sky" style="background:#0284c7" title="Sky" aria-label="Sky"></button>
+                                                <button type="button" class="accent-swatch" data-color="emerald" style="background:#059669" title="Emerald" aria-label="Emerald"></button>
+                                                <button type="button" class="accent-swatch" data-color="amber" style="background:#d97706" title="Amber" aria-label="Amber"></button>
+                                                <input type="color" id="share-tag-color-custom" class="color-custom" value="#0d9488" title="Custom colour" aria-label="Custom colour">
+                                            </div>
                                         </div>
 
                                         <div class="form-group mt-md">

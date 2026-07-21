@@ -83,6 +83,21 @@ def test_form_group_option_labels_exempt_from_block_uppercase():
             f"{skin} must define .checkbox-label as a display:flex row"
 
 
+def test_share_tag_colour_is_a_swatch_picker():
+    """The share-tag colour control is a swatch picker (named swatches + a custom <input type=color>),
+    not a plain text box that accepts the bare word 'indigo' (UIP3). The hidden #share-tag-color the
+    save path reads is kept, wired by setShareTagColor (mirrors the Groups colour editor)."""
+    html = _read(STATIC / "index.html")
+    assert '<input type="hidden" id="share-tag-color"' in html, \
+        "share-tag-color must be a hidden input the save path reads"
+    assert 'id="share-tag-color-swatches"' in html and 'id="share-tag-color-custom"' in html, \
+        "share-tag colour must offer named swatches + a custom <input type=color> picker"
+    assert 'type="text" id="share-tag-color"' not in html, "the plain colour text box must be gone"
+    appjs = _read(STATIC / "js" / "app.js")
+    assert "function setShareTagColor" in appjs and "share-tag-color-swatches" in appjs, \
+        "setShareTagColor must wire the swatch picker"
+
+
 def test_served_frontend_has_no_inline_event_handlers():
     """No inline `on*=` HTML handler ATTRIBUTE may appear in the served frontend: the page CSP
     (script-src 'self', no unsafe-inline) blocks them, which spammed the console and left the
