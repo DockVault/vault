@@ -12,6 +12,11 @@ def _endpoint_present(admin):
     return admin.get("/settings/logs").status_code == 200
 
 
+def _ceiling_on(admin):
+    r = admin.get("/settings/logs")
+    return r.status_code == 200 and bool(r.json().get("ceiling"))
+
+
 def _login(page: Page, username: str, password: str):
     page.goto("/")
     expect(page.locator("#login-screen")).to_be_visible()
@@ -30,6 +35,8 @@ def _open_log_tab(page: Page):
 def test_log_access_tab_generate_and_disable(page: Page, admin_creds, admin):
     if not _endpoint_present(admin):
         pytest.skip("running vault image predates the log-pull endpoint")
+    if not _ceiling_on(admin):
+        pytest.skip("the mint UI is now gated on the log ceiling; needs a ceiling-on instance")
 
     _login(page, admin_creds["username"], admin_creds["password"])
     _open_log_tab(page)
@@ -124,3 +131,67 @@ def test_stealth_toggle_persists(page: Page, admin_creds, admin):
         assert got == target, f"stealth toggle did not persist (wanted {target}, server has {got})"
     finally:
         admin.put("/settings/logs", json={"stealth_404": before})
+
+
+def test_settings_logs_reports_ceiling(admin):
+    """Backend signal the UI gates on: GET /settings/logs exposes a boolean `ceiling` + the
+    per-component flags. No policy change here — the endpoint stays default-off."""
+    if not _endpoint_present(admin):
+        pytest.skip("running vault image predates the log-pull endpoint")
+    body = admin.get("/settings/logs").json()
+    assert isinstance(body.get("ceiling"), bool)
+    assert isinstance(body.get("flags"), dict)
+    assert "web" in body.get("components", [])
+
+
+def test_log_gating_ceiling_off_disables_generator(page: Page, admin_creds, admin):
+    """Ceiling OFF: the UI must NOT hand out a token/curl for an endpoint that only 404s. The
+    Generate button is disabled and an actionable note names the two env vars to set."""
+    if not _endpoint_present(admin):
+        pytest.skip("running vault image predates the log-pull endpoint")
+    if _ceiling_on(admin):
+        pytest.skip("this instance has the log ceiling ON; needs a ceiling-off instance")
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open_log_tab(page)
+    expect(page.locator("#log-token-generate-btn")).to_be_disabled()
+    note = page.locator("#log-ceiling-note")
+    expect(note).to_be_visible()
+    expect(note).to_contain_text("PLAN_LOG_PULL")
+    expect(note).to_contain_text("LOG_TOKEN_PEPPER")
+    # no reveal/curl block is offered
+    expect(page.locator("#log-token-reveal")).to_be_hidden()
+
+
+def test_log_gating_ceiling_on_component_hint_and_reveal_warning(page: Page, admin_creds, admin):
+    """Ceiling ON: the Generate button works; when no component is enabled the note nudges the
+    admin to tick one; and minting a token scoped to a NOT-enabled component surfaces a distinct
+    'not enabled … returns 404' warning next to the curl (the second common 404 cause)."""
+    if not _endpoint_present(admin):
+        pytest.skip("running vault image predates the log-pull endpoint")
+    if not _ceiling_on(admin):
+        pytest.skip("this instance has the log ceiling OFF; needs a ceiling-on instance")
+    before = admin.get("/settings/logs").json().get("flags", {})
+    try:
+        # ensure both components are disabled so a minted token is guaranteed 'not enabled'
+        admin.put("/settings/logs", json={"flags": {"web": False, "sftp": False}})
+        _login(page, admin_creds["username"], admin_creds["password"])
+        _open_log_tab(page)
+        expect(page.locator("#log-token-generate-btn")).to_be_enabled()
+        expect(page.locator("#log-ceiling-note")).to_contain_text("no component is exposed")
+        # mint a token (scope defaults to web/sftp, both disabled) -> the not-enabled warning shows
+        page.click("#log-token-generate-btn")
+        expect(page.locator("#log-token-generate-panel")).to_be_visible()
+        name = "logtok-" + page.evaluate("() => String(Date.now())")
+        page.fill("#log-token-name", name)
+        page.click("#log-token-create-btn")
+        reveal = page.locator("#log-token-reveal")
+        expect(reveal.locator("#log-token-value")).to_be_visible(timeout=10000)
+        expect(reveal).to_contain_text("not enabled")
+        expect(reveal).to_contain_text("returns 404")
+        # clean up the minted token
+        listed = admin.get("/settings/logs").json()["tokens"]
+        mine = next((t for t in listed if t["name"] == name), None)
+        if mine:
+            admin.post(f"/settings/logs/{mine['id']}/disable", json={})
+    finally:
+        admin.put("/settings/logs", json={"flags": before})

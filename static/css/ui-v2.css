@@ -697,12 +697,14 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand-secondar
     display: inline-flex; align-items: center; gap: .3rem;
     font-size: 11px; font-weight: 600; line-height: 1.4;
     text-transform: none; letter-spacing: normal;   /* override base uppercase */
-    padding: .12rem .45rem;
+    padding: .2rem .55rem;                           /* was .12rem .45rem — too cramped; matches the Classic skin */
     border-radius: var(--radius-sm);
     border: 1px solid transparent;
     box-shadow: none;                                /* override base xs shadow */
 }
 .badge .icon { width: 12px; height: 12px; }
+/* Separate an inline status badge (e.g. "Active") from the card title it trails. */
+.vault-name .badge { margin-left: .4rem; vertical-align: middle; }
 
 .badge-success, .badge-user {
     background: color-mix(in srgb, var(--success) 12%, transparent);
@@ -1127,17 +1129,13 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand-secondar
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .file-tile .tile-meta { font-size: var(--text-xs); color: var(--text-tertiary); font-family: var(--font-mono); }
-/* Two positioned control clusters: checkbox + Download top-left (.tile-tl),
-   Edit + Delete top-right (.file-actions). Both reveal on hover; the left one
-   also stays visible while the tile is selected (it holds the checkbox). */
-/* Hidden clusters use pointer-events:none so a tap on an invisible control doesn't
-   swallow the whole-card open on touch (no :hover); they become clickable on reveal. */
-.file-tile .tile-tl { position: absolute; top: .35rem; left: .35rem; display: flex; align-items: center; gap: .25rem;
-    opacity: 0; pointer-events: none; transition: opacity var(--transition-fast); }
-.file-tile:hover .tile-tl, .file-tile.is-selected .tile-tl { opacity: 1; pointer-events: auto; }
-.file-tile .tile-tl .file-check { position: static; opacity: 1; }
-.file-tile .file-actions { position: absolute; top: .35rem; right: .35rem; opacity: 0; pointer-events: none; transition: opacity var(--transition-fast); }
-.file-tile:hover .file-actions { opacity: 1; pointer-events: auto; }
+/* Action row: an IN-FLOW row BELOW the icon/name/meta (checkbox left via .tile-tl, then
+   Rename/Delete/Share/Download right via .file-actions with margin-left:auto) so the controls
+   sit under the tile instead of painting over the icon. Always visible + clickable (no hover
+   reveal) so the row is robust on touch and never overlaps the icon. */
+.file-tile .tile-actions { display: flex; align-items: center; width: 100%; gap: .25rem; margin-top: .1rem; min-height: 26px; cursor: default; }
+.file-tile .tile-tl { display: flex; align-items: center; gap: .25rem; }
+.file-tile .file-actions { margin-left: auto; }
 
 /* Files empty state (rendered inside the grid/table) */
 .files-grid .empty-state-center { min-height: 30vh; }

@@ -19,7 +19,12 @@ def _login(page: Page, username: str, password: str):
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
 
 
-def test_log_token_reveal_shows_usage_curl(page: Page, admin_creds):
+def test_log_token_reveal_shows_usage_curl(page: Page, admin_creds, admin):
+    r = admin.get("/settings/logs")
+    if r.status_code != 200:
+        pytest.skip("running vault image predates the log-pull endpoint")
+    if not bool(r.json().get("ceiling")):
+        pytest.skip("the mint UI is gated on the log ceiling; needs a ceiling-on instance")
     _login(page, admin_creds["username"], admin_creds["password"])
     page.click('[data-section="settings"]')
     page.click('.tab-btn[data-tab="logs"]')

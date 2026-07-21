@@ -1,9 +1,9 @@
 """Grid (gallery) view card interaction.
 
-A file now gets an Edit affordance in grid (it was suppressed), the controls are split into a
-left cluster (checkbox + Download) and a right cluster (Edit + Delete), the whole card is
-clickable to open/preview, and the name is keyboard-operable. Clicking a control must NOT also
-trigger the card's open action.
+A file gets Rename/Delete/Share/Download affordances in grid; the controls live in an in-flow
+action row BELOW the icon — the checkbox in a left cluster, the action buttons right-aligned with
+Download on the far right. The whole card is clickable to open/preview and the name is
+keyboard-operable. Clicking a control must NOT also trigger the card's open action.
 """
 import re
 
@@ -43,10 +43,41 @@ def test_grid_file_edit_and_split_clusters(page: Page, admin, admin_creds):
         # a file now has an Edit(rename) affordance in grid, in the RIGHT cluster
         expect(tile.locator('.tile-tr button[data-action="rename-file"]')).to_have_count(1)
         expect(tile.locator('.tile-tr button[data-action="delete-file"]')).to_have_count(1)
-        # Download + the select checkbox live in the LEFT cluster; no download on the right
-        expect(tile.locator('.tile-tl button[data-action="download"]')).to_have_count(1)
+        # Download moved to the RIGHT cluster (far right); the checkbox stays in the LEFT cluster
+        expect(tile.locator('.tile-tr button[data-action="download"]')).to_have_count(1)
         expect(tile.locator('.tile-tl input.file-check')).to_have_count(1)
-        expect(tile.locator('.tile-tr button[data-action="download"]')).to_have_count(0)
+        expect(tile.locator('.tile-tl button[data-action="download"]')).to_have_count(0)
+    finally:
+        admin.delete_vault(v["id"])
+
+
+def test_grid_action_row_below_icon_and_download_far_right(page: Page, admin, admin_creds):
+    """The tile's action controls sit in an in-flow row BELOW the icon (not painted over it), and
+    Download is the far-right action. Regression guard: the clusters were previously
+    position:absolute pinned to the tile's top corners, overlapping the icon. (The identical fix in
+    both skins is locked by test_static_grid_actions.py.)"""
+    v = admin.create_vault(name="grid-actrow")
+    try:
+        _login(page, admin_creds["username"], admin_creds["password"])
+        _open_vault_grid_with_file(page, v["id"])
+        tile = page.locator("#vault-files-grid .file-tile").first
+        expect(tile).to_be_visible()
+
+        # (1) the action row is in normal flow (not absolute) and sits at/below the icon's bottom
+        actions = tile.locator(".tile-actions")
+        assert actions.evaluate("el => getComputedStyle(el).position") == "static"
+        ab = actions.bounding_box()
+        ib = tile.locator(".tile-icon").bounding_box()
+        assert ab and ib, "missing bounding boxes"
+        assert ab["y"] >= ib["y"] + ib["height"] - 1, f"action row overlaps the icon: {ab} vs {ib}"
+
+        # (2) Download is present in the RIGHT cluster and is the right-most action button
+        dl = tile.locator('.tile-tr button[data-action="download"]')
+        expect(dl).to_have_count(1)
+        assert tile.locator('.tile-tr .action-btn').last.get_attribute("data-action") == "download"
+        dlb = dl.bounding_box()
+        rnb = tile.locator('.tile-tr button[data-action="rename-file"]').bounding_box()
+        assert dlb and rnb and dlb["x"] > rnb["x"], f"Download not right of Rename: {dlb} vs {rnb}"
     finally:
         admin.delete_vault(v["id"])
 

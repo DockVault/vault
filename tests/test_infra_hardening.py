@@ -489,9 +489,10 @@ def test_deploy_scripts_hardened():
     assert "iterations=600000" in smp, "PBKDF2 must use >=600k iterations (match the runtime decryptor)"
     assert "'production'" in smp, "the ENVIRONMENT fallback must default to production, not development"
     assert "0o600" in smp, "secret files must be written mode 0600"
-    ss = _read("setup-secure.sh")
-    assert "REDIS_PASSWORD" in ss, "setup-secure.sh must generate a REDIS_PASSWORD"
-    assert "ALLOWED_HOSTS" in ss, "setup-secure.sh must write ALLOWED_HOSTS"
+    # setup-secure.* are retired shims -> dockvault.py; the secret/.env generation now lives there.
+    dvtool = _read("dockvault.py")
+    assert "REDIS_PASSWORD" in dvtool, "dockvault.py must generate a REDIS_PASSWORD"
+    assert "ALLOWED_HOSTS" in dvtool, "dockvault.py must write ALLOWED_HOSTS"
 
 
 def test_setup_scripts_at_root_and_secure_shim():
@@ -536,8 +537,11 @@ def _secure_compose_config(profile):
     import shutil
     if shutil.which("docker") is None:
         pytest.skip("docker not available")
+    # Pin DEPLOYMENT_ID="" so ${DEPLOYMENT_ID:-default} renders 'default' deterministically: `config`
+    # runs with cwd=ROOT and auto-loads the repo-root .env, which (after a real `setup`) may carry a
+    # stamped DEPLOYMENT_ID that would otherwise leak into the render and break the label assertions.
     env = dict(os.environ, COMPOSE_PROFILES=profile, VAULT_DB_PASSWORD="testpw",
-               RUN_SFTP="", SFTP_HOST_PORT="2322")
+               RUN_SFTP="", SFTP_HOST_PORT="2322", DEPLOYMENT_ID="", VAULT_VOLUME_PREFIX="")
     try:
         r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
                            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
@@ -564,21 +568,102 @@ def test_secure_compose_combined_default_and_split_profile():
         assert vol in combined and vol in split, f"{vol} must be mounted in both modes"
 
 
-def test_setup_scripts_write_combined_profile_scheme():
-    # The setup scripts must write the new combined/split scheme (RUN_SFTP for SFTP-in-combined),
-    # NOT the retired first-run `COMPOSE_PROFILES=sftp`, or the primary deploy path renders no app.
+def test_secure_compose_labels_volumes_as_bundle():
+    # Every named volume carries the DockVault management labels, so the tool can enumerate a
+    # deployment's set (docker volume ls --filter label=com.dockvault.managed=true). With no
+    # DEPLOYMENT_ID set, the bundle label falls back to "default".
+    out = _secure_compose_config("combined")   # combined activates the web service -> all 5 volumes render
+    for role in ("pg", "storage", "keys", "logs", "brand"):
+        assert f"com.dockvault.role: {role}" in out, f"volume role label {role} is missing"
+    assert out.count("com.dockvault.managed:") >= 5, "all five volumes must carry com.dockvault.managed"
+    assert "com.dockvault.bundle: default" in out, "an unset DEPLOYMENT_ID must default the bundle to 'default'"
+
+
+def test_secure_compose_bundle_uses_deployment_id():
+    import shutil
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    env = dict(os.environ, COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
+               RUN_SFTP="", DEPLOYMENT_ID="bundlexyz")
+    try:
+        r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
+                           cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"docker compose unavailable: {exc}")
+    if r.returncode != 0:
+        pytest.skip(f"docker compose config failed: {r.stderr[:200]}")
+    assert r.stdout.count("com.dockvault.bundle: bundlexyz") == 5, \
+        "DEPLOYMENT_ID must set the bundle label on all five volumes"
+
+
+def test_env_example_documents_deployment_id():
+    import re
+    envx = _read(".env.example")
+    assert re.search(r"^DEPLOYMENT_ID=", envx, re.M), ".env.example must ship a DEPLOYMENT_ID key"
+    assert re.search(r"^VAULT_VOLUME_PREFIX=", envx, re.M), ".env.example must ship a VAULT_VOLUME_PREFIX key"
+
+
+def test_secure_compose_default_volume_names_are_historical():
+    # With no VAULT_VOLUME_PREFIX the five volume NAMES must be the historical dockvault-vault_vault_*
+    # names, so existing deployments are byte-identical (no data orphaned by the parameterization).
+    out = _secure_compose_config("combined")
+    for base in ("pg_data", "storage", "keys", "logs", "brand"):
+        assert "name: dockvault-vault_vault_%s" % base in out, f"default name for {base} must be historical"
+
+
+def test_secure_compose_volume_names_honour_prefix():
+    import shutil
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    env = dict(os.environ, COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
+               RUN_SFTP="", VAULT_VOLUME_PREFIX="dockvault-vault-b7")
+    try:
+        r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
+                           cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"docker compose unavailable: {exc}")
+    if r.returncode != 0:
+        pytest.skip(f"docker compose config failed: {r.stderr[:200]}")
+    for base in ("pg_data", "storage", "keys", "logs", "brand"):
+        assert "name: dockvault-vault-b7_vault_%s" % base in r.stdout, \
+            f"VAULT_VOLUME_PREFIX must rename the {base} volume"
+    # the labels still ride along on the prefixed set
+    assert r.stdout.count("com.dockvault.managed:") >= 5
+
+
+def test_setup_scripts_are_retired_shims_delegating_to_dockvault():
+    # The two setup scripts are now thin shims that launch the management tool; the combined/split
+    # profile scheme is written by dockvault.py (build_env_lines), not by the shims.
     for name in ("setup-secure.sh", "setup-secure.ps1"):
         s = _read(name)
-        assert "COMPOSE_PROFILES=combined" in s, f"{name} must write COMPOSE_PROFILES=combined"
-        assert "RUN_SFTP=1" in s, f"{name} must set RUN_SFTP=1 when SFTP is enabled in combined mode"
-        # Must not WRITE the retired sftp profile (a quoted env-line value). Bare mentions in
-        # migration comments / "sftp -> split" messages are fine (they have a space after).
-        assert 'COMPOSE_PROFILES=sftp"' not in s and "COMPOSE_PROFILES=sftp'" not in s, \
-            f"{name} must not write the retired sftp profile"
-    # .env.example ships the mode + the SFTP toggle so a manual `cp .env.example .env` just works.
+        assert "dockvault.py" in s, f"{name} must delegate to dockvault.py"
+        assert "retired" in s.lower(), f"{name} must note it is a retired shim"
+    dvtool = _read("dockvault.py")
+    assert "COMPOSE_PROFILES" in dvtool, "dockvault.py must write COMPOSE_PROFILES"
+    assert 'bare("RUN_SFTP", "1")' in dvtool, "dockvault.py must set RUN_SFTP=1 for SFTP-in-combined"
+    # .env.example still ships the mode + the SFTP toggle so a manual `cp .env.example .env` just works.
     envx = _read(".env.example")
     assert "COMPOSE_PROFILES=combined" in envx and "RUN_SFTP=" in envx, \
         ".env.example must ship COMPOSE_PROFILES=combined and RUN_SFTP"
+
+
+def test_no_stale_setup_secure_command_refs():
+    # setup-secure.* survive only as retired shims. No operator-facing file may still PRESENT them as
+    # THE way to set up - every remaining mention must flag that they're retired/shims; and the README
+    # must show the dockvault.py command.
+    import re
+    for name in ("README.md", ".env.example", "deploy/docker-compose.secure.yml", "CLAUDE.md",
+                 ".github/SECURITY.md"):
+        txt = _read(name)
+        for m in re.finditer(r"setup-secure\.(sh|ps1|\*)", txt):
+            ctx = txt[max(0, m.start() - 140):m.start() + 140].lower()   # window tolerates line wraps
+            assert any(w in ctx for w in ("retired", "shim", "still work", "compatibility")), \
+                f"{name} still presents setup-secure without noting it's retired (near offset {m.start()})"
+    rd = _read("README.md")
+    assert ("python3 dockvault.py setup" in rd or "python dockvault.py setup" in rd), \
+        "README must show the dockvault.py setup command"
+    # the shim scripts themselves must delegate to dockvault.py
+    assert "dockvault.py" in _read("setup-secure.sh") and "dockvault.py" in _read("setup-secure.ps1")
 
 
 def test_env_example_documents_every_settings_field():
@@ -595,8 +680,45 @@ def test_env_example_documents_every_settings_field():
     missing = sorted(f.upper() for f in fields if f.upper() not in documented)
     assert not missing, f".env.example is missing these Settings keys: {missing}"
     # The non-Settings toggles a self-hoster sets must be documented too.
-    for k in ("RUN_SFTP", "COMPOSE_PROFILES", "SFTP_HOST_PORT", "CORS_ALLOW_ORIGINS", "ALLOWED_HOSTS"):
+    for k in ("RUN_SFTP", "COMPOSE_PROFILES", "SFTP_HOST_PORT", "WEB_HOST_PORT",
+              "CORS_ALLOW_ORIGINS", "ALLOWED_HOSTS"):
         assert k in documented, f".env.example must document {k}"
+
+
+def test_secure_compose_web_port_parameterized():
+    # The web host port is configurable via WEB_HOST_PORT (default 443), not hard-coded, in BOTH the
+    # combined and split services, so a self-hoster can publish on a different port.
+    sc = _read("deploy/docker-compose.secure.yml")
+    assert sc.count("${WEB_HOST_PORT:-443}:8000") == 2, "both web services must publish via WEB_HOST_PORT"
+    assert '- "443:8000"' not in sc, "the web host port must not be hard-coded"
+
+
+def test_secure_compose_honours_web_host_port_override():
+    # A WEB_HOST_PORT override must actually take effect in the rendered compose.
+    import shutil
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    env = dict(os.environ, COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
+               RUN_SFTP="", SFTP_HOST_PORT="2322", WEB_HOST_PORT="8443")
+    try:
+        r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
+                           cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"docker compose unavailable: {exc}")
+    if r.returncode != 0:
+        pytest.skip(f"docker compose config failed: {r.stderr[:200]}")
+    assert "8443" in r.stdout, "WEB_HOST_PORT=8443 override must render as the published host port"
+
+
+def test_claude_md_carries_config_sync_rule():
+    # CLAUDE.md must document the rule that a new config field is updated in .env.example AND the
+    # setup tooling in the same change (test_env_example_documents_every_settings_field enforces the
+    # .env.example half; this locks the documented rule so the practice isn't silently dropped).
+    md = _read("CLAUDE.md")
+    low = md.lower()
+    assert ".env.example" in md and "app/core/config.py" in md and "in sync" in low \
+        and ("dockvault.py" in md or "management tool" in low), \
+        "CLAUDE.md must document keeping config, .env.example, and dockvault.py in sync"
 
 
 def test_app_version_from_version_file_not_hardcoded():

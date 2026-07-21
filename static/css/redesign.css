@@ -371,6 +371,8 @@ label.checkbox-label,
 .badge-info, .badge-external { background: color-mix(in srgb, var(--info) 16%, transparent); color: var(--info); }
 .badge-secondary { background: var(--surface-2); color: var(--text-tertiary); }
 .badge-admin { background: color-mix(in srgb, var(--brand-secondary) 16%, transparent); color: var(--brand-secondary); }
+/* Separate an inline status badge (e.g. "Active") from the card title it trails. */
+.vault-name .badge { margin-left: .4rem; vertical-align: middle; }
 
 .alert { border-radius: var(--radius-md); border: 1px solid transparent; padding: var(--space-md); }
 .alert-error   { background: color-mix(in srgb, var(--error) 10%, var(--surface-0));   border-color: color-mix(in srgb, var(--error) 32%, transparent);   color: color-mix(in srgb, var(--error) 72%, var(--text-primary)); }
@@ -869,17 +871,13 @@ button.chip:hover { filter: brightness(1.05); }
     display: block; text-align: center; /* override the flex base so the name centers + ellipsis works */
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-tile .tile-meta { font-size: var(--text-xs, .72rem); color: var(--text-tertiary); font-family: var(--font-mono); }
-/* Two positioned control clusters: checkbox + Download top-left (.tile-tl),
-   Edit + Delete top-right (.file-actions). Both reveal on hover; the left one
-   also stays visible while the tile is selected (it holds the checkbox). */
-/* Hidden clusters use pointer-events:none so a tap on an invisible control doesn't
-   swallow the whole-card open on touch (no :hover); they become clickable on reveal. */
-.file-tile .tile-tl { position: absolute; top: .35rem; left: .35rem; display: flex; align-items: center; gap: .25rem;
-    opacity: 0; pointer-events: none; transition: opacity .12s; }
-.file-tile:hover .tile-tl, .file-tile.is-selected .tile-tl { opacity: 1; pointer-events: auto; }
-.file-tile .tile-tl .file-check { position: static; opacity: 1; }
-.file-tile .file-actions { position: absolute; top: .35rem; right: .35rem; opacity: 0; pointer-events: none; transition: opacity .12s; }
-.file-tile:hover .file-actions { opacity: 1; pointer-events: auto; }
+/* Action row: an IN-FLOW row BELOW the icon/name/meta (checkbox left via .tile-tl, then
+   Rename/Delete/Share/Download right via .file-actions with margin-left:auto) so the controls
+   sit under the tile instead of painting over the icon. Always visible + clickable (no hover
+   reveal) so the row is robust on touch and never overlaps the icon. */
+.file-tile .tile-actions { display: flex; align-items: center; width: 100%; gap: .25rem; margin-top: .1rem; min-height: 26px; cursor: default; }
+.file-tile .tile-tl { display: flex; align-items: center; gap: .25rem; }
+.file-tile .file-actions { margin-left: auto; }
 
 /* ============================================================================
    23. Vault cards — tighter cards, de-emphasized delete, grid/list switch

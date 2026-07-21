@@ -16,18 +16,31 @@ Privacy / safety contract (all HARD requirements):
 """
 import json
 import re
+import threading
 import time
 import urllib.request
 
 GITHUB_LATEST_URL = "https://api.github.com/repos/DockVault/vault/releases/latest"
 RAW_VERSION_URL = "https://raw.githubusercontent.com/DockVault/vault/main/VERSION"
-CACHE_TTL = 24 * 3600   # seconds between outbound checks
+CACHE_TTL = 24 * 3600   # default seconds between outbound checks (used when no interval is passed)
+# Admin-configurable check-interval bounds (minutes). The FLOOR keeps the outbound cadence
+# rate-limit-safe: GitHub's unauthenticated API is ~60 req/hr/IP, and the shared process cache means
+# every admin poll reads the cache while only ONE real request goes out per interval.
+MIN_INTERVAL_MINUTES = 15
+MAX_INTERVAL_MINUTES = 30 * 24 * 60      # 30 days
+DEFAULT_INTERVAL_MINUTES = 360           # 6 hours (more often than daily, still gentle)
+# A forced "check now" bypasses the interval but not this hard minimum age between real requests,
+# so repeated button clicks can't be spammed into the rate limit.
+FORCE_MIN_SECONDS = 60
 TIMEOUT = 5             # per-request seconds (short — never hang a page)
 MAX_BODY_BYTES = 512 * 1024  # cap the response we buffer/parse (fail-closed on anything larger)
 _USER_AGENT = "DockVault-update-check"
 
 # Process-level cache; re-checks after a restart, which is fine (no persistence needed).
 _cache = {"checked_at": 0.0, "latest": None, "url": None, "notes": None}
+# Serialize the outbound fetch so concurrent admin requests (this runs in FastAPI's sync-endpoint
+# threadpool) coalesce into ONE GitHub call per interval instead of a thundering herd at expiry.
+_fetch_lock = threading.Lock()
 
 
 def _parse_semver(v):
@@ -43,6 +56,17 @@ def is_newer(latest, current):
     A never-flags-on-uncertainty comparator: unparseable input => False (no false 'update')."""
     lv, cv = _parse_semver(latest), _parse_semver(current)
     return bool(lv and cv and lv > cv)
+
+
+def clamp_interval_minutes(minutes):
+    """Clamp a requested check interval into [MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES]. A non-int
+    or out-of-range value snaps into range, so a mis-set override can never drive the outbound
+    cadence below the rate-limit-safe floor (or absurdly high). Returns an int number of minutes."""
+    try:
+        m = int(minutes)
+    except (TypeError, ValueError):
+        return DEFAULT_INTERVAL_MINUTES
+    return max(MIN_INTERVAL_MINUTES, min(MAX_INTERVAL_MINUTES, m))
 
 
 def _read_capped(r):
@@ -86,19 +110,35 @@ def _fetch_latest():
     return None, None, None
 
 
-def get_update_status(current_version, enabled, managed, force=False):
+def get_update_status(current_version, enabled, managed, force=False, interval_seconds=None,
+                      force_min_seconds=FORCE_MIN_SECONDS):
     """Return the update-status dict for the admin UI. Fail-closed-silent; safe to call often
-    (it only hits the network at most once per CACHE_TTL)."""
+    (a real outbound request goes out at most once per ``interval_seconds`` — the shared cache
+    protects GitHub's rate limit no matter how frequently the UI polls). ``force`` is a manual
+    "check now" that bypasses the interval but still honours ``force_min_seconds`` between real
+    requests, so repeated clicks can't be spammed into the rate limit."""
     if managed:
         return {"enabled": False, "managed": True, "current": current_version, "update_available": False}
     if not enabled:
         return {"enabled": False, "managed": False, "current": current_version, "update_available": False}
-    if force or _cache["latest"] is None or (time.time() - _cache["checked_at"]) > CACHE_TTL:
-        latest, url, notes = _fetch_latest()
-        # Only advance checked_at on a successful fetch, so a transient outage retries next call
-        # instead of going quiet for a whole TTL.
-        if latest is not None:
-            _cache.update({"checked_at": time.time(), "latest": latest, "url": url, "notes": notes})
+    ttl = CACHE_TTL if interval_seconds is None else max(1, int(interval_seconds))
+
+    def _due():
+        age = time.time() - _cache["checked_at"]
+        if force:
+            return age >= max(0, force_min_seconds)
+        return (_cache["latest"] is None) or (age > ttl)
+
+    if _due():
+        # Double-checked locking: a caller that waited on the lock re-checks and skips the fetch a
+        # peer just did, so concurrent admin requests make ONE outbound call. Only advance
+        # checked_at on a SUCCESSFUL fetch, so a transient outage retries next call rather than
+        # going quiet for a whole interval.
+        with _fetch_lock:
+            if _due():
+                latest, url, notes = _fetch_latest()
+                if latest is not None:
+                    _cache.update({"checked_at": time.time(), "latest": latest, "url": url, "notes": notes})
     latest = _cache["latest"]
     return {
         "enabled": True,

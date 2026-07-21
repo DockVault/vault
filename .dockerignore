@@ -7,6 +7,7 @@
 .env.*
 !.env.example
 certs/
+backups/
 keys/
 storage/
 logs/
@@ -61,10 +62,11 @@ setup.lock
 # pattern matches at the context root only, so the deploy/ copies need their own line.
 docker-compose*.yml
 deploy/docker-compose*.yml
-# Host-side setup scripts (run on the host to build/start the stack) — not part of the
-# runtime image. (The root docker-compose*.yml shims are already excluded above.)
+# Host-side setup / management tooling (run on the host to build/start/operate the stack) — not
+# part of the runtime image. (The root docker-compose*.yml shims are already excluded above.)
 setup-secure.sh
 setup-secure.ps1
+dockvault.py
 .dockerignore
 .gitignore
 # Keep VCS metadata out of the shipped public image (a submodule .git is just a 58-byte gitdir
