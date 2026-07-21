@@ -98,6 +98,24 @@ def test_share_tag_colour_is_a_swatch_picker():
         "setShareTagColor must wire the swatch picker"
 
 
+def test_share_tag_lifetime_hints_and_no_minute_coercion():
+    """Share-tag lifetime shows live `(~N days)` hints and unified "Maximum" terminology (UIP4),
+    and saveShareTag must NOT silently coerce an empty/0 lifetime to 1 minute (the old `|| 1` that
+    expired every share in a minute) — it validates inline instead."""
+    html = _read(STATIC / "index.html")
+    appjs = _read(STATIC / "js" / "app.js")
+    assert 'id="share-tag-max-lifetime-days"' in html and 'id="share-tag-default-lifetime-days"' in html, \
+        "the Lifetime inputs need day-hint spans"
+    assert 'id="share-tag-editor-error"' in html, "an inline error element is needed for validation"
+    assert ">Ceiling<" not in html and "Cap (blank" not in html, \
+        "terminology unified to 'Maximum' (no Ceiling/Cap)"
+    assert "function shareTagDaysHint" in appjs and "updateShareTagLifetimeHints" in appjs, \
+        "the day-hint helpers must exist"
+    # The footgun coercion must be gone.
+    assert "share-tag-max-lifetime') || 1" not in appjs and "share-tag-default-lifetime') || 1" not in appjs, \
+        "saveShareTag must not coerce an empty/0 lifetime to 1 minute"
+
+
 def test_served_frontend_has_no_inline_event_handlers():
     """No inline `on*=` HTML handler ATTRIBUTE may appear in the served frontend: the page CSP
     (script-src 'self', no unsafe-inline) blocks them, which spammed the console and left the

@@ -5388,7 +5388,7 @@ function renderShareTagsList() {
         const summary = document.createElement('div');
         summary.className = 'text-tertiary text-sm';
         const parts = [
-            `lifetime ≤ ${tag.max_lifetime_minutes}m (default ${tag.default_lifetime_minutes}m)`,
+            `lifetime max ${tag.max_lifetime_minutes}m (default ${tag.default_lifetime_minutes}m)`,
             `recipients ${tag.max_recipients_cap == null ? '∞' : tag.max_recipients_cap}`,
             `downloads ${tag.max_downloads_cap == null ? '∞' : tag.max_downloads_cap}`,
         ];
@@ -5563,6 +5563,25 @@ function setShareTagColor(color) {
     if (custom && color && color.charAt(0) === '#') custom.value = color;
 }
 
+// "(~N days)" hint for a minutes value (blank/<=0 => no hint). 1440 -> "~1 day", 10080 -> "~7 days".
+function shareTagDaysHint(minutes) {
+    const m = parseInt(minutes, 10);
+    if (!m || m <= 0) return '';
+    const days = m / 1440;
+    const n = days < 10 ? Math.round(days * 10) / 10 : Math.round(days);
+    if (n <= 0) return '(< 1 day)';   // sub-day lifetime — avoid a misleading "~0 days"
+    return `(~${n} day${n === 1 ? '' : 's'})`;
+}
+
+// Refresh the live day hints beside the Lifetime maximum + default inputs.
+function updateShareTagLifetimeHints() {
+    [['share-tag-max-lifetime', 'share-tag-max-lifetime-days'],
+     ['share-tag-default-lifetime', 'share-tag-default-lifetime-days']].forEach(([inId, hintId]) => {
+        const hint = _stEl(hintId), input = _stEl(inId);
+        if (hint) hint.textContent = shareTagDaysHint(input ? input.value : '');
+    });
+}
+
 function openShareTagEditor(tag) {
     const editor = _stEl('share-tag-editor');
     if (!editor) return;
@@ -5574,6 +5593,9 @@ function openShareTagEditor(tag) {
     setShareTagColor(t.color || '');
     _stEl('share-tag-max-lifetime').value = t.max_lifetime_minutes != null ? t.max_lifetime_minutes : 10080;
     _stEl('share-tag-default-lifetime').value = t.default_lifetime_minutes != null ? t.default_lifetime_minutes : 1440;
+    updateShareTagLifetimeHints();
+    const _stErr = _stEl('share-tag-editor-error');
+    if (_stErr) { _stErr.textContent = ''; _stErr.style.display = 'none'; }
     _stEl('share-tag-max-recipients-cap').value = t.max_recipients_cap != null ? t.max_recipients_cap : '';
     _stEl('share-tag-max-recipients-default').value = t.max_recipients_default != null ? t.max_recipients_default : '';
     _stEl('share-tag-max-downloads-cap').value = t.max_downloads_cap != null ? t.max_downloads_cap : '';
@@ -5616,16 +5638,38 @@ async function saveShareTag() {
     if (_stChecked('share-tag-aud-users')) aud.push('users');
     if (_stChecked('share-tag-aud-departments')) aud.push('departments');
     if (_stChecked('share-tag-aud-anyone')) aud.push('anyone_internal');
+    // Validate client-side with inline errors — no server round-trip on an obvious mistake, and
+    // NEVER coerce an empty/0 lifetime to 1 (the old `|| 1` silently expired every share in a minute).
+    const _err = _stEl('share-tag-editor-error');
+    const _fail = (msg, focusId) => {
+        if (_err) { _err.textContent = msg; _err.style.display = ''; }
+        if (focusId && _stEl(focusId)) _stEl(focusId).focus();
+        return true;
+    };
+    if (_err) { _err.textContent = ''; _err.style.display = 'none'; }
+    const name = _stEl('share-tag-name').value.trim();
+    const maxLife = _stNumOrNull('share-tag-max-lifetime');
+    const defLife = _stNumOrNull('share-tag-default-lifetime');
+    const maxRcp = _stNumOrNull('share-tag-max-recipients-cap');
+    const defRcp = _stNumOrNull('share-tag-max-recipients-default');
+    const maxDl = _stNumOrNull('share-tag-max-downloads-cap');
+    const defDl = _stNumOrNull('share-tag-max-downloads-default');
+    if (!name && _fail('A tag name is required.', 'share-tag-name')) return;
+    if ((!maxLife || maxLife < 1) && _fail('Maximum lifetime must be at least 1 minute.', 'share-tag-max-lifetime')) return;
+    if ((!defLife || defLife < 1) && _fail('Default lifetime must be at least 1 minute.', 'share-tag-default-lifetime')) return;
+    if (defLife > maxLife && _fail('Default lifetime cannot exceed the maximum.', 'share-tag-default-lifetime')) return;
+    if (maxRcp != null && defRcp != null && defRcp > maxRcp && _fail('Default recipients cannot exceed the maximum.', 'share-tag-max-recipients-default')) return;
+    if (maxDl != null && defDl != null && defDl > maxDl && _fail('Default downloads cannot exceed the maximum.', 'share-tag-max-downloads-default')) return;
     const body = {
-        name: _stEl('share-tag-name').value.trim(),
+        name: name,
         description: _stEl('share-tag-description').value.trim() || null,
         color: _stEl('share-tag-color').value.trim() || null,
-        max_lifetime_minutes: _stNumOrNull('share-tag-max-lifetime') || 1,
-        default_lifetime_minutes: _stNumOrNull('share-tag-default-lifetime') || 1,
-        max_recipients_cap: _stNumOrNull('share-tag-max-recipients-cap'),
-        max_recipients_default: _stNumOrNull('share-tag-max-recipients-default'),
-        max_downloads_cap: _stNumOrNull('share-tag-max-downloads-cap'),
-        max_downloads_default: _stNumOrNull('share-tag-max-downloads-default'),
+        max_lifetime_minutes: maxLife,
+        default_lifetime_minutes: defLife,
+        max_recipients_cap: maxRcp,
+        max_recipients_default: defRcp,
+        max_downloads_cap: maxDl,
+        max_downloads_default: defDl,
         allowed_audiences: aud,
         allow_view_only: _stChecked('share-tag-allow-view-only'),
         default_view_only: _stChecked('share-tag-default-view-only'),
@@ -10493,6 +10537,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (shareTagColorCustom) {
         shareTagColorCustom.addEventListener('input', () => setShareTagColor(shareTagColorCustom.value));
     }
+    // Live "(~N days)" hints beside the share-tag Lifetime inputs.
+    ['share-tag-max-lifetime', 'share-tag-default-lifetime'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('input', updateShareTagLifetimeHints);
+    });
     // Searchable "Add members" modal
     const addMembersSearch = document.getElementById('add-members-search');
     if (addMembersSearch) addMembersSearch.addEventListener('input', () => renderAddMembersList(addMembersSearch.value));
