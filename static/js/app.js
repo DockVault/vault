@@ -4577,6 +4577,7 @@ async function initSettings() {
     // Setup tab switching
     setupSettingsTabs();
     setupLogAccess();  // log-access tab wiring
+    setupUpdateControls();  // "check for updates" + interval controls
 
     // Wire the branding color pickers <-> text inputs + logo/favicon uploads
     wireBrandColorInputs();
@@ -5119,6 +5120,80 @@ function renderUpdateBanner(us) {
     banner.style.display = '';
 }
 
+// --- Update-check controls (opt-in; admin-only endpoint) --------------------------------------
+let _updatePollId = null;
+
+function renderUpdateStatus(us) {
+    renderUpdateBanner(us);
+    const controls = document.getElementById('update-controls');
+    if (!controls) return;
+    // Only expose the check-now + interval controls when the check is enabled and not managed.
+    const show = !!(us && us.enabled && !us.managed);
+    controls.style.display = show ? '' : 'none';
+    if (!show) { if (_updatePollId) { clearInterval(_updatePollId); _updatePollId = null; } return; }
+    const last = document.getElementById('update-last-checked');
+    if (last) {
+        last.textContent = us.checked_at
+            ? 'Last checked ' + new Date(us.checked_at * 1000).toLocaleString()
+            : 'Not checked yet';
+    }
+    const input = document.getElementById('update-interval-input');
+    // Don't clobber a value the admin is mid-edit.
+    if (input && document.activeElement !== input && us.interval_minutes != null) {
+        input.value = us.interval_minutes;
+    }
+    scheduleUpdatePoll(us.interval_minutes);
+}
+
+function scheduleUpdatePoll(intervalMinutes) {
+    if (_updatePollId) { clearInterval(_updatePollId); _updatePollId = null; }
+    // The client polls at most every 5 min; the SERVER-side cache is what actually bounds outbound
+    // GitHub requests, so this only refreshes the banner for an open settings page.
+    const mins = Math.max(5, parseInt(intervalMinutes, 10) || 360);
+    _updatePollId = setInterval(() => {
+        apiRequest('/api/update-status', { silent: true }).then(renderUpdateStatus).catch(() => {});
+    }, mins * 60 * 1000);
+}
+
+async function checkForUpdatesNow() {
+    const btn = document.getElementById('update-check-now-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+    try {
+        const us = await apiRequest('/api/update-status?force=1', { silent: true });
+        renderUpdateStatus(us);
+        showSuccess(us && us.update_available ? 'A newer version is available' : 'Checked — you’re up to date');
+    } catch (e) {
+        showError('Could not check for updates');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Check for updates'; }
+    }
+}
+
+async function saveUpdateInterval() {
+    const input = document.getElementById('update-interval-input');
+    if (!input) return;
+    const minutes = parseInt(input.value, 10);
+    if (!minutes || minutes < 15) { showError('Interval must be at least 15 minutes'); return; }
+    try {
+        const res = await apiRequest('/api/update-settings',
+            { method: 'PUT', body: JSON.stringify({ interval_minutes: minutes }) });
+        if (res && res.interval_minutes != null) input.value = res.interval_minutes;  // reflect the clamped value
+        showSuccess('Update interval saved');
+        scheduleUpdatePoll(res && res.interval_minutes);
+    } catch (e) {
+        showError('Could not save the update interval');
+    }
+}
+
+function setupUpdateControls() {
+    // Guard against stacked listeners: initSettings() re-runs on every Settings navigation, and a
+    // duplicate handler would fire duplicate /api/update-status?force=1 + PUT requests per click.
+    const btn = document.getElementById('update-check-now-btn');
+    if (btn && !btn.dataset.wired) { btn.dataset.wired = '1'; btn.addEventListener('click', checkForUpdatesNow); }
+    const save = document.getElementById('update-interval-save-btn');
+    if (save && !save.dataset.wired) { save.dataset.wired = '1'; save.addEventListener('click', saveUpdateInterval); }
+}
+
 async function loadSettings() {
     try {
         const settings = await apiRequest('/settings', { silent: true });
@@ -5138,9 +5213,9 @@ async function loadSettings() {
             if (vEl && ver && ver.version) vEl.textContent = 'v' + ver.version;
         } catch (e) { /* version display is non-essential */ }
 
-        // Update-available banner (opt-in, admin-only endpoint; fail-soft). Fire-and-forget so a
-        // slow/unreachable GitHub never delays the rest of the settings form from rendering.
-        apiRequest('/api/update-status', { silent: true }).then(renderUpdateBanner).catch(() => {});
+        // Update-available banner + check-now/interval controls (opt-in, admin-only endpoint;
+        // fail-soft). Fire-and-forget so a slow/unreachable GitHub never delays the settings form.
+        apiRequest('/api/update-status', { silent: true }).then(renderUpdateStatus).catch(() => {});
 
         // Security
         document.getElementById('setting-password-min-length').value = settings.password_min_length || 8;  // 8 = the enforced floor
