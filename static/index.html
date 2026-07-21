@@ -1427,12 +1427,12 @@
                                             <div class="flex gap-sm">
                                                 <div>
                                                     <label class="text-sm text-secondary" for="share-tag-max-lifetime">Maximum</label>
-                                                    <input type="number" id="share-tag-max-lifetime" class="form-control" min="1" style="max-width:160px;">
+                                                    <input type="number" id="share-tag-max-lifetime" aria-label="Lifetime maximum (minutes)" class="form-control" min="1" style="max-width:160px;">
                                                     <span id="share-tag-max-lifetime-days" class="text-sm text-secondary"></span>
                                                 </div>
                                                 <div>
                                                     <label class="text-sm text-secondary" for="share-tag-default-lifetime">Default</label>
-                                                    <input type="number" id="share-tag-default-lifetime" class="form-control" min="1" style="max-width:160px;">
+                                                    <input type="number" id="share-tag-default-lifetime" aria-label="Lifetime default (minutes)" class="form-control" min="1" style="max-width:160px;">
                                                     <span id="share-tag-default-lifetime-days" class="text-sm text-secondary"></span>
                                                 </div>
                                             </div>
@@ -1442,37 +1442,37 @@
                                         <div class="form-group mt-md">
                                             <label>Recipients</label>
                                             <div class="flex gap-sm">
-                                                <div><label class="text-sm text-secondary" for="share-tag-max-recipients-cap">Maximum (blank = unlimited)</label><input type="number" id="share-tag-max-recipients-cap" class="form-control" min="1" style="max-width:180px;"></div>
-                                                <div><label class="text-sm text-secondary" for="share-tag-max-recipients-default">Default</label><input type="number" id="share-tag-max-recipients-default" class="form-control" min="1" style="max-width:160px;"></div>
+                                                <div><label class="text-sm text-secondary" for="share-tag-max-recipients-cap">Maximum (blank = unlimited)</label><input type="number" id="share-tag-max-recipients-cap" aria-label="Recipients maximum" class="form-control" min="1" style="max-width:180px;"></div>
+                                                <div><label class="text-sm text-secondary" for="share-tag-max-recipients-default">Default</label><input type="number" id="share-tag-max-recipients-default" aria-label="Recipients default" class="form-control" min="1" style="max-width:160px;"></div>
                                             </div>
                                         </div>
 
                                         <div class="form-group mt-md">
                                             <label>Downloads</label>
                                             <div class="flex gap-sm">
-                                                <div><label class="text-sm text-secondary" for="share-tag-max-downloads-cap">Maximum (blank = unlimited)</label><input type="number" id="share-tag-max-downloads-cap" class="form-control" min="1" style="max-width:180px;"></div>
-                                                <div><label class="text-sm text-secondary" for="share-tag-max-downloads-default">Default</label><input type="number" id="share-tag-max-downloads-default" class="form-control" min="1" style="max-width:160px;"></div>
+                                                <div><label class="text-sm text-secondary" for="share-tag-max-downloads-cap">Maximum (blank = unlimited)</label><input type="number" id="share-tag-max-downloads-cap" aria-label="Downloads maximum" class="form-control" min="1" style="max-width:180px;"></div>
+                                                <div><label class="text-sm text-secondary" for="share-tag-max-downloads-default">Default</label><input type="number" id="share-tag-max-downloads-default" aria-label="Downloads default" class="form-control" min="1" style="max-width:160px;"></div>
                                             </div>
                                         </div>
 
-                                        <div class="form-group mt-md">
-                                            <label>Allowed audiences</label>
+                                        <div class="form-group mt-md" role="group" aria-labelledby="share-tag-audiences-legend">
+                                            <label id="share-tag-audiences-legend">Allowed audiences</label>
                                             <p class="text-secondary text-sm mb-sm">Which recipient audiences a creator may choose for a share with this tag.</p>
                                             <label class="flex items-center gap-sm"><input type="checkbox" id="share-tag-aud-users"><span>Specific users</span></label>
                                             <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="share-tag-aud-departments"><span>Departments</span></label>
                                             <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="share-tag-aud-anyone"><span>Anyone internal with the link</span></label>
                                         </div>
 
-                                        <div class="form-group mt-md">
-                                            <label>Capabilities</label>
+                                        <div class="form-group mt-md" role="group" aria-labelledby="share-tag-capabilities-legend">
+                                            <label id="share-tag-capabilities-legend">Capabilities</label>
                                             <label class="flex items-center gap-sm"><input type="checkbox" id="share-tag-allow-view-only"><span>Allow view-only shares (no download)</span></label>
                                             <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="share-tag-default-view-only"><span>Default new shares to view-only</span></label>
                                             <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="share-tag-force-view-only"><span>Force view-only (creators cannot enable download)</span></label>
                                             <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="share-tag-allow-custom"><span>Let creators customise limits within the caps</span></label>
                                         </div>
 
-                                        <div class="form-group mt-md">
-                                            <label>Who may create shares with this tag</label>
+                                        <div class="form-group mt-md" role="group" aria-labelledby="share-tag-whomay-legend">
+                                            <label id="share-tag-whomay-legend">Who may create shares with this tag</label>
                                             <label class="flex items-center gap-sm"><input type="checkbox" id="share-tag-auto-enroll"><span>Everyone (auto-enroll all users, except any blocked)</span></label>
                                             <div class="mt-sm">
                                                 <label class="text-sm text-secondary">Allowed departments</label>
@@ -1480,14 +1480,14 @@
                                             </div>
                                             <div class="mt-sm">
                                                 <label class="text-sm text-secondary" for="share-tag-allow-user-search">Allowed users</label>
-                                                <input type="text" id="share-tag-allow-user-search" class="form-control" placeholder="Search by username (type at least 2 characters)" autocomplete="off">
-                                                <div id="share-tag-allow-user-results" class="share-tag-user-results" style="max-height:180px; overflow:auto;"></div>
+                                                <input type="text" id="share-tag-allow-user-search" class="form-control" placeholder="Search by username (type at least 2 characters)" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="share-tag-allow-user-results">
+                                                <div id="share-tag-allow-user-results" class="share-tag-user-results" role="listbox" aria-label="Allowed-user search results" style="max-height:180px; overflow:auto;"></div>
                                                 <div id="share-tag-allow-user-chips" class="chip-row mt-sm"></div>
                                             </div>
                                             <div class="mt-sm">
                                                 <label class="text-sm text-secondary" for="share-tag-block-user-search">Blocked users</label>
-                                                <input type="text" id="share-tag-block-user-search" class="form-control" placeholder="Search by username (type at least 2 characters)" autocomplete="off">
-                                                <div id="share-tag-block-user-results" class="share-tag-user-results" style="max-height:180px; overflow:auto;"></div>
+                                                <input type="text" id="share-tag-block-user-search" class="form-control" placeholder="Search by username (type at least 2 characters)" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="share-tag-block-user-results">
+                                                <div id="share-tag-block-user-results" class="share-tag-user-results" role="listbox" aria-label="Blocked-user search results" style="max-height:180px; overflow:auto;"></div>
                                                 <div id="share-tag-block-user-chips" class="chip-row mt-sm"></div>
                                             </div>
                                             <p class="text-secondary text-sm mt-sm">If auto-enroll is off and no departments or users are allowed, no one can create shares with this tag until you grant access. A blocked user can never create with this tag, even via a department or auto-enroll.</p>

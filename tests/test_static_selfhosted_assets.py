@@ -129,6 +129,22 @@ def test_sharing_copy_no_stale_zk_caveat():
         "the create-modal audience label must keep the 'internal' qualifier"
 
 
+def test_share_tag_editor_a11y_grouping():
+    """UIP6 (core): the share-tag editor's ambiguous number inputs get UNIQUE accessible names via
+    aria-label (no more three identical "Default"s), the checkbox groups are role=group with a
+    labelling header, and the user-search fields are combobox/listbox — so a screen reader
+    announces each field unambiguously. (Full keyboard nav / aria-expanded is UIP6b.)"""
+    html = _read(STATIC / "index.html")
+    for lab in ("Lifetime maximum", "Lifetime default", "Recipients maximum", "Recipients default",
+                "Downloads maximum", "Downloads default"):
+        assert f'aria-label="{lab}' in html, f"missing unique aria-label for {lab!r}"
+    for legend in ("share-tag-audiences-legend", "share-tag-capabilities-legend", "share-tag-whomay-legend"):
+        assert f'aria-labelledby="{legend}"' in html and f'id="{legend}"' in html, \
+            f"checkbox group label {legend} missing (role=group + aria-labelledby)"
+    assert html.count('role="combobox"') >= 2 and html.count('role="listbox"') >= 2, \
+        "the user-search autocompletes must be combobox + listbox"
+
+
 def test_served_frontend_has_no_inline_event_handlers():
     """No inline `on*=` HTML handler ATTRIBUTE may appear in the served frontend: the page CSP
     (script-src 'self', no unsafe-inline) blocks them, which spammed the console and left the
