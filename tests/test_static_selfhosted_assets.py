@@ -62,6 +62,27 @@ def test_index_has_no_meta_csp_header_is_authoritative():
         "index.html must NOT declare a <meta> CSP (rely on the complete response-header CSP)"
 
 
+def test_form_group_option_labels_exempt_from_block_uppercase():
+    """Checkbox/radio OPTION labels (`.flex` / `.checkbox-label`) must be exempt from every
+    `.form-group label { display:block; ...uppercase }` base rule, or their flex `gap` goes inert
+    and the option text is forced uppercase (the cramp UIP2 fixed). Any `.form-group label` rule
+    that sets display:block or text-transform:uppercase must carry :not(.flex):not(.checkbox-label);
+    `.checkbox-label` must be defined as a flex row in each skin."""
+    css_dir = ROOT / "static" / "css"
+    for name in ("components.css", "ui-v2.css", "redesign.css"):
+        css = _read(css_dir / name)
+        for m in re.finditer(r'([^{}]*\.form-group label[^{}]*)\{([^}]*)\}', css):
+            sel, body = m.group(1), m.group(2)
+            forces = re.search(r'display\s*:\s*block', body) or re.search(r'text-transform\s*:\s*uppercase', body)
+            if forces:
+                assert ":not(.flex)" in sel and ":not(.checkbox-label)" in sel, \
+                    f"{name}: a `.form-group label` block/uppercase rule doesn't exempt option labels: {sel.strip()[:90]!r}"
+    for skin in ("ui-v2.css", "redesign.css"):
+        s = _read(css_dir / skin)
+        assert "label.checkbox-label" in s and re.search(r'\.checkbox-label[^{]*\{[^}]*display\s*:\s*flex', s), \
+            f"{skin} must define .checkbox-label as a display:flex row"
+
+
 def test_served_frontend_has_no_inline_event_handlers():
     """No inline `on*=` HTML handler ATTRIBUTE may appear in the served frontend: the page CSP
     (script-src 'self', no unsafe-inline) blocks them, which spammed the console and left the

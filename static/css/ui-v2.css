@@ -529,12 +529,25 @@ code { background: var(--surface-2); color: var(--text-primary); border-radius: 
    11. Forms
    ---------------------------------------------------------------------------- */
 .form-group { margin-bottom: var(--space-md); }
-.form-group label {
+/* Field-group HEADER labels: the uppercase/tertiary caption above an input. Exempt checkbox/
+   radio OPTION labels (they carry `.flex` or `.checkbox-label`): the block override made their
+   flex `gap` inert and forced the option TEXT uppercase/tertiary (cramped, hard to read). */
+.form-group label:not(.flex):not(.checkbox-label) {
     display: block; margin-bottom: .35rem;
     font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em;
     color: var(--text-tertiary);
 }
 .form-group label.required::after { content: ' *'; color: var(--error); }
+/* Checkbox/radio OPTION labels: a readable sentence-case flex row with a gap from the box —
+   NOT the uppercase header style above. (`.flex` option labels are handled by the :not() exempt;
+   this covers labels that use the .checkbox-label class instead.) */
+label.checkbox-label,
+.form-group label.checkbox-label,
+#settings-section .form-group label.checkbox-label {
+    display: flex; align-items: center; gap: var(--space-sm);
+    margin-bottom: 0; font-size: var(--text-sm); font-weight: 400;
+    letter-spacing: normal; text-transform: none; color: var(--text-primary);
+}
 
 .form-control, .form-input, .form-textarea, .form-select,
 input[type="text"], input[type="email"], input[type="password"], input[type="number"],
@@ -1530,7 +1543,7 @@ button.chip:hover { filter: brightness(1.06); }
     min-height: 32px; padding: .4rem .55rem; font-size: var(--text-sm); border-width: 1px;
 }
 #settings-section .form-textarea { min-height: 72px; }
-#settings-section .form-group label { font-size: var(--text-xs); text-transform: uppercase; letter-spacing: .06em; color: var(--text-tertiary); font-weight: 600; margin-bottom: .35rem; }
+#settings-section .form-group label:not(.flex):not(.checkbox-label) { font-size: var(--text-xs); text-transform: uppercase; letter-spacing: .06em; color: var(--text-tertiary); font-weight: 600; margin-bottom: .35rem; }
 
 /* Audit tab: filter grid + action button row + results table + count badge. */
 #settings-tab-audit .grid.grid-cols-4 { gap: var(--space-md); }
