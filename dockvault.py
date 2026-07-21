@@ -208,6 +208,7 @@ def docker_available(run=subprocess.run):
 
 # --- setup: secrets + .env authoring (the pure, testable core) --------------------------------
 import base64  # noqa: E402
+import glob    # noqa: E402
 import re      # noqa: E402
 
 # The three secrets the compose file demands (an existing .env must carry these to be reusable).
@@ -338,6 +339,10 @@ def build_env_lines(cfg):
     # Stable bundle id: labels this deployment's five volumes so the tool can group them as one set.
     if cfg.get("deployment_id"):
         bare("DEPLOYMENT_ID", cfg["deployment_id"])
+    # Only write a non-default volume prefix (a fresh/repointed set); the default keeps the historical
+    # volume names so existing deployments are byte-identical.
+    if cfg.get("volume_prefix") and cfg["volume_prefix"] != DEFAULT_PROJECT:
+        bare("VAULT_VOLUME_PREFIX", cfg["volume_prefix"])
     if cfg.get("run_sftp"):
         bare("RUN_SFTP", "1")
     # Only write a port line when it differs from the compose default (443 web / 2322 sftp).
@@ -822,6 +827,84 @@ def list_legacy_volumes(run=subprocess.run, project=DEFAULT_PROJECT):
     return sorted(legacy)
 
 
+# --- volume SETS (prefix-based reuse / create-new / repoint) ---------------------------------
+# A "set" is one deployment's five volumes, named <prefix>_vault_<role>. The prefix lives in .env
+# as VAULT_VOLUME_PREFIX (default DEFAULT_PROJECT = the historical names). Switching the prefix (with
+# its paired .env) points the stack at a different set, so multiple sets can sit side by side.
+def volume_prefix(env):
+    """The current set's volume-name prefix from a parsed .env (VAULT_VOLUME_PREFIX, else the
+    historical default). Blank/absent -> DEFAULT_PROJECT."""
+    return (env.get("VAULT_VOLUME_PREFIX") or "").strip() or DEFAULT_PROJECT
+
+
+def set_volume_names(prefix):
+    """The five volume names for a set with this prefix: {role: '<prefix>_<basename>'}."""
+    return {role: "%s_%s" % (prefix, base) for role, base in VOLUME_BASENAMES.items()}
+
+
+def volume_set_prefix(name):
+    """Derive a set's prefix from a DockVault volume name ('<prefix>_vault_<role>'), or None if the
+    name doesn't end in a known volume basename."""
+    for base in VOLUME_BASENAMES.values():
+        suffix = "_" + base
+        if name.endswith(suffix) and len(name) > len(suffix):
+            return name[:-len(suffix)]
+    return None
+
+
+def group_volumes_by_prefix(records):
+    """Group parsed volume records into physical SETS by their name prefix, first-seen order:
+    [(prefix, [records...]), ...]. Records whose name doesn't parse are grouped under their raw
+    name so nothing is silently dropped."""
+    order, groups = [], {}
+    for r in records:
+        key = volume_set_prefix(r["name"]) or r["name"]
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+    return [(k, groups[k]) for k in order]
+
+
+def new_set_config(current_env, new_prefix, new_id):
+    """Config for a FRESH set (born together with its own .env): keep the current .env's NON-secret
+    settings (server, admin, ports, mode, flags) but generate BRAND-NEW secrets - a new set is new
+    data, so it must get its own ENCRYPTION_KEY / DB password - and stamp the new volume prefix +
+    deployment id. The paired secrets and volumes are created together, upholding the bundle invariant."""
+    def truthy(k):
+        return (current_env.get(k) or "").strip().lower() in ("1", "true", "yes", "on")
+    cfg = {
+        "server_name": current_env.get("SERVER_NAME") or current_env.get("ALLOWED_HOSTS") or "localhost",
+        "encryption_key": gen_fernet_key(), "jwt_secret_key": gen_hex(32),
+        "vault_db_password": gen_hex(16), "redis_password": gen_hex(24),
+        "admin_username": current_env.get("ADMIN_USERNAME") or "admin",
+        "admin_email": current_env.get("ADMIN_EMAIL") or "admin@example.com",
+        "admin_password": current_env.get("ADMIN_PASSWORD") or gen_hex(12),
+        "compose_profiles": current_env.get("COMPOSE_PROFILES") or "combined",
+        "deployment_id": new_id, "volume_prefix": new_prefix,
+        "run_sftp": truthy("RUN_SFTP"),
+        "web_host_port": _port_or(current_env.get("WEB_HOST_PORT"), 443),
+        "sftp_host_port": _port_or(current_env.get("SFTP_HOST_PORT"), 2322),
+        "update_check_enabled": truthy("UPDATE_CHECK_ENABLED"),
+        "plan_log_pull": truthy("PLAN_LOG_PULL"),
+        "log_token_pepper": gen_hex(32) if truthy("PLAN_LOG_PULL") else "",
+    }
+    return cfg
+
+
+def plan_volume_action(choice):
+    """Pure planner for the Volumes picker -> the required actions for a choice. Encodes the
+    invariants the tests lock: 'new' MUST author a fresh paired .env; 'repoint' MUST supply a
+    matching .env AND pass the secret guard; 'reuse' changes nothing. Unknown choice -> None."""
+    plans = {
+        "reuse":   {"action": "reuse", "author_env": False, "requires_env": False, "guard": False},
+        "new":     {"action": "new", "archive_current": True, "author_env": True,
+                    "fresh_secrets": True, "requires_env": False, "guard": False},
+        "repoint": {"action": "repoint", "author_env": False, "requires_env": True, "guard": True},
+    }
+    return plans.get(choice)
+
+
 # --- secret <-> volume guardrail -------------------------------------------------------------
 # The reported footgun: Postgres bakes VAULT_DB_PASSWORD into vault_pg_data on FIRST init and never
 # re-reads it, so a fresh/changed .env against a populated volume can't authenticate ("password
@@ -1190,6 +1273,16 @@ class DockVault:
         except (OSError, subprocess.SubprocessError):
             pass
 
+    def _stop_stack(self):
+        """Stop the current stack's CONTAINERS without removing volumes (best-effort). Used before a
+        repoint: the fixed container names mean two sets can't run at once, so the current deployment
+        must be stopped before we point at (and probe) a different set. Data is untouched (no -v)."""
+        try:
+            subprocess.run(self._dc("down", "--remove-orphans"), cwd=self.root,
+                           capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
     def _guard_db_secret(self, env, exists_fn=None, start_fn=None, wait_fn=None, probe_fn=None, stop_fn=None):
         """Fail-closed guardrail: if vault_pg_data already exists, verify the current .env's
         VAULT_DB_PASSWORD authenticates against it (and ENCRYPTION_KEY is at least a valid key) BEFORE
@@ -1201,7 +1294,7 @@ class DockVault:
         wait_fn = wait_fn or self._wait_db_ready
         probe_fn = probe_fn or probe_pg_password
         stop_fn = stop_fn or self._stop_db_only
-        vol = "%s_vault_pg_data" % DEFAULT_PROJECT
+        vol = "%s_vault_pg_data" % volume_prefix(env)
         if not exists_fn(vol):
             return True   # brand-new volume: the .env password is baked in on first init
         # A stored volume + an ENCRYPTION_KEY that isn't even shaped like a Fernet key is a certain
@@ -1291,48 +1384,204 @@ class DockVault:
     def backup(self, args=None):
         _stub("Backup & Restore", self.pal)
 
-    def volumes(self, args=None):
-        """Read-only overview of DockVault-managed volume sets: enumerate the labelled volumes and
-        group them by bundle, plus any legacy (unlabelled) volumes adopted as 'default'. The full
-        picker (reuse / new / repoint) + backup & restore arrive in a later phase."""
-        pal = self.pal
-        ok, msg = docker_available()
-        if not ok:
-            print(pal.paint("\n  %s\n" % msg, "yellow"))
-            return
+    def _load_env(self):
+        """Parse the current .env (best-effort: {} if absent or unreadable)."""
         env, env_path = {}, self._env_path()
         try:
             if os.path.exists(env_path):
                 env = parse_env(open(env_path, encoding="utf-8").read())
         except OSError:
-            pass  # a present-but-unreadable .env (e.g. root-owned secure deploy, tool run non-root)
-                  # -> best-effort, like the rest of this read-only overview
-        current = (env.get("DEPLOYMENT_ID") or "").strip() or ("default" if env else None)
-        print(pal.paint("\n  DockVault volume sets", "cyan"))
-        if current:
-            print("  this deployment's bundle (.env DEPLOYMENT_ID): %s" % current)
+            pass
+        return env
 
-        groups = group_volumes_by_bundle(list_managed_volumes())
-        if groups:
-            for bundle, recs in groups:
-                mark = "   <- current" if bundle == current else ""
-                print(pal.paint("\n  bundle '%s'%s" % (bundle, mark), "green"))
+    def _archive_env(self, label):
+        """Move the current .env aside as .env.<label> so it isn't lost / left live. Collision-safe
+        (never clobbers an existing archive). Returns the archive path, or None if there was no .env."""
+        env_path = self._env_path()
+        if not os.path.exists(env_path):
+            return None
+        base = os.path.join(self.root, ".env." + label)
+        dest, n = base, 1
+        while os.path.exists(dest):
+            dest = "%s.%d" % (base, n)
+            n += 1
+        os.replace(env_path, dest)
+        return dest
+
+    def _volumes_overview(self, env):
+        """Print the managed volume sets grouped physically by prefix, marking the current one."""
+        pal = self.pal
+        cur_prefix = volume_prefix(env) if env else None
+        print(pal.paint("\n  DockVault volume sets", "cyan"))
+        if env:
+            print("  current set (VAULT_VOLUME_PREFIX): %s   bundle: %s"
+                  % (cur_prefix, (env.get("DEPLOYMENT_ID") or "default")))
+        sets = group_volumes_by_prefix(list_managed_volumes())
+        if sets:
+            for prefix, recs in sets:
+                mark = "   <- current" if prefix == cur_prefix else ""
+                print(pal.paint("\n  set '%s'%s" % (prefix, mark), "green"))
                 for r in sorted(recs, key=lambda x: x["name"]):
                     print("    %-9s %s" % (r["role"] or "?", r["name"]))
         else:
             print(pal.paint("\n  (no labelled volume sets yet)", "yellow"))
-
         legacy = list_legacy_volumes()
         if legacy:
-            print(pal.paint("\n  legacy (unlabelled) volumes - adopted as bundle 'default':", "yellow"))
+            print(pal.paint("\n  legacy (unlabelled) volumes - the 'dockvault-vault' set:", "yellow"))
             for name in legacy:
                 print("    %s" % name)
 
-        print(pal.paint("\n  Full volume management (reuse / new / repoint / backup & restore) "
-                        "arrives in a later phase.\n", "cyan"))
+    def volumes(self, args=None):
+        """Volume-set manager: list managed sets and Reuse / Create-new / Repoint. Interactive by
+        default; arg-mode via args.volume_action (reuse|new|repoint) for scripting/tests. Every choice
+        upholds the bundle invariant: a set's volumes and its .env are created / installed together."""
+        pal = self.pal
+        ok, msg = docker_available()
+        if not ok:
+            print(pal.paint("\n  %s\n" % msg, "yellow"))
+            return
+        env = self._load_env()
+        self._volumes_overview(env)
+        interactive = not (args and getattr(args, "non_interactive", False))
+        action = getattr(args, "volume_action", None) if args else None
+        if not action and interactive:
+            print(pal.paint("\n  Actions:", "cyan"))
+            print("    1) Reuse the current set (default - no change)")
+            print("    2) Create a NEW set (fresh volumes + a fresh paired .env; keeps the current set)")
+            print("    3) Repoint to another set (needs that set's .env)")
+            action = {"2": "new", "3": "repoint"}.get(ask("Choose 1/2/3", pal, "1").strip(), "reuse")
+        plan = plan_volume_action(action or "reuse")
+        if not plan:
+            self._fail("unknown volume action %r (reuse/new/repoint)" % action)
+        if plan["action"] == "reuse":
+            print(pal.paint("\n  Keeping the current set. Run Setup to (re)start it.\n", "green"))
+        elif plan["action"] == "new":
+            self._volume_new(env, args)
+        else:
+            self._volume_repoint(env, args)
+
+    def _volume_new(self, env, args=None):
+        """Author a FRESH set (new prefix + brand-new secrets) with its own .env, archiving the current
+        one. Does NOT start it (run Setup next); the current set's volumes are left intact."""
+        pal = self.pal
+        interactive = not (args and getattr(args, "non_interactive", False))
+        if interactive and not confirm(
+                "Create a NEW empty set (fresh secrets + .env)? Your current set is kept.", pal, default=False):
+            print(pal.paint("  Cancelled.\n", "yellow"))
+            return
+        new_id = gen_deployment_id()
+        new_prefix = "%s-%s" % (DEFAULT_PROJECT, new_id)
+        archived = self._archive_env(volume_prefix(env)) if env else None
+        cfg = new_set_config(env, new_prefix, new_id)
+        if write_env(self._env_path(), build_env_lines(cfg)):
+            print(pal.paint("  Wrote a fresh .env for set '%s' (restricted to your user)." % new_prefix, "green"))
+        else:
+            print(pal.paint("  Wrote a fresh .env - WARNING: could not restrict its permissions "
+                            "(it holds ENCRYPTION_KEY); secure it yourself.", "yellow"))
+        if archived:
+            print("  Your previous set's .env was saved at: %s" % archived)
+        print(pal.paint("  Run Setup to build + start the new (empty) set.\n", "cyan"))
+
+    def _volume_repoint(self, env, args=None):
+        """Point the deployment at ANOTHER set. Requires that set's matching .env (auto-found as
+        .env.<prefix>, or --env-source), verifies it names the target set, and validates it against the
+        set's data via the secret guard - refusing on mismatch and RESTORING the current .env."""
+        pal = self.pal
+        interactive = not (args and getattr(args, "non_interactive", False))
+        cur_prefix = volume_prefix(env)
+        others = [p for p, _ in group_volumes_by_prefix(list_managed_volumes()) if p and p != cur_prefix]
+        target = getattr(args, "target_prefix", None) if args else None
+        if not target and interactive:
+            if not others:
+                print(pal.paint("  No other labelled sets to repoint to.\n", "yellow"))
+                return
+            print(pal.paint("\n  Other sets:", "cyan"))
+            for i, p in enumerate(others, 1):
+                print("    %d) %s" % (i, p))
+            sel = ask("Which set number", pal).strip()
+            if not (sel.isdigit() and 1 <= int(sel) <= len(others)):
+                self._fail("not a listed set")
+            target = others[int(sel) - 1]
+        if not target:
+            self._fail("no target set (pass --target-prefix)")
+        # locate the target set's .env: an explicit source, else the auto-archive, else prompt.
+        src = getattr(args, "env_source", None) if args else None
+        if not src:
+            cands = sorted(glob.glob(os.path.join(self.root, ".env." + target)) +
+                           glob.glob(os.path.join(self.root, ".env." + target + ".*")))
+            if cands:
+                src = cands[-1]
+            elif interactive:
+                src = ask("Path to the .env for set '%s'" % target, pal).strip()
+        if not src or not os.path.exists(src):
+            self._fail("need the .env that belongs to set '%s' (not found - pass --env-source)" % target)
+        tgt_env = parse_env(open(src, encoding="utf-8").read())
+        ok, missing = env_is_reusable(tgt_env)
+        if not ok:
+            self._fail("that .env is missing %s - it can't be the set's paired .env" % ", ".join(missing))
+        if volume_prefix(tgt_env) != target:
+            self._fail("that .env points at set '%s', not '%s' - refusing a mismatched pairing"
+                       % (volume_prefix(tgt_env), target))
+        # Switching sets can't run alongside the current stack (fixed container names), so stop it
+        # first (containers only; volumes kept). Then archive the current .env, install the target's,
+        # and validate it against the set's data.
+        self._stop_stack()
+        archived_cur = self._archive_env(cur_prefix)
+        _copy_secret(src, self._env_path())
+        tighten_secret_file(self._env_path())
+        if not self._guard_db_secret(self._load_env()):
+            # the installed .env does NOT match the target set's data -> undo, restore the original.
+            self._stop_db_only()
+            try:
+                os.remove(self._env_path())
+            except OSError:
+                pass
+            if archived_cur:
+                os.replace(archived_cur, self._env_path())
+            print(pal.paint("  Repoint verification FAILED - restored your previous .env. Nothing changed.\n", "red"))
+            return
+        self._stop_db_only()   # the guard started the target's vault-db to probe it; stop it (run Setup to start fully)
+        print(pal.paint("  Repointed to set '%s'. Run Setup to start it.\n" % target, "green"))
 
     def reset(self, args=None):
-        _stub("Reset", self.pal)
+        """DESTROY the current set's data (docker compose down -v) after a strong, typed confirmation,
+        then move .env aside so a later Setup starts truly fresh. IRREVERSIBLE for the volumes' data."""
+        pal = self.pal
+        ok, msg = docker_available()
+        if not ok:
+            self._fail(msg)
+        env = self._load_env()
+        prefix = volume_prefix(env)
+        names = set_volume_names(prefix)
+        print(pal.paint("\n  RESET will PERMANENTLY DELETE this set's data:", "red"))
+        print("    set / prefix : %s" % prefix)
+        for role in VOLUME_ROLES:
+            print("    %-9s %s" % (role, names[role]))
+        print(pal.paint("  This runs 'docker compose down -v': the stored files, database, and keys are", "red"))
+        print(pal.paint("  GONE and cannot be recovered without a backup. Back up first if unsure.", "red"))
+        interactive = not (args and getattr(args, "non_interactive", False))
+        confirmed = bool(getattr(args, "confirm", False)) if args else False
+        if interactive:
+            typed = ask("Type the set name '%s' to confirm (anything else cancels)" % prefix, pal).strip()
+            confirmed = (typed == prefix)
+        if not confirmed:
+            print(pal.paint("  Cancelled - nothing was deleted.\n", "yellow"))
+            return
+        try:
+            r = subprocess.run(self._dc("down", "-v", "--remove-orphans"), cwd=self.root, text=True, timeout=180)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._fail("teardown failed: %s" % exc)
+        if getattr(r, "returncode", 1) != 0:
+            # down -v did NOT succeed (e.g. a volume still in use) -> the data may survive. Do NOT move
+            # the paired .env aside, or a later Setup would mint fresh secrets against surviving volumes
+            # (the exact footgun this toolkit prevents). Leave everything as-is and report honestly.
+            self._fail("'docker compose down -v' failed (exit %d) - the set was NOT destroyed and your "
+                       ".env is untouched. A volume may still be in use; free it and retry." % r.returncode)
+        archived = self._archive_env("removed-" + prefix)   # keep the (now-orphaned) .env, don't leave it live
+        print(pal.paint("\n  Set '%s' destroyed." % prefix, "green"))
+        if archived:
+            print("  Its .env (no longer matching any data) was moved to: %s" % archived)
+        print(pal.paint("  Run Setup to start a fresh deployment.\n", "cyan"))
 
     def update(self, args=None):
         _stub("Update", self.pal)
@@ -1364,7 +1613,12 @@ class DockVault:
             if choice is None:
                 print(self.pal.paint("  not a valid choice", "red"))
                 continue
-            self.handler(MENU[choice - 1][0])()
+            try:
+                self.handler(MENU[choice - 1][0])()
+            except SystemExit:
+                # a handler's _fail (e.g. a bad repoint selection or Docker briefly down) reports its
+                # own error; in the menu loop that shouldn't end the whole session - back to the menu.
+                pass
 
 
 # --- entry -----------------------------------------------------------------------------------
@@ -1389,6 +1643,18 @@ def build_parser():
     sp.add_argument("--enable-log-pull", dest="enable_log_pull", action="store_true", help="enable the log-pull endpoint")
     sp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags/defaults, never prompt")
     sp.add_argument("--no-start", dest="no_start", action="store_true", help="author .env + certs but don't build/start")
+
+    vp = parsers["volumes"]
+    vp.add_argument("--action", dest="volume_action", choices=("reuse", "new", "repoint"),
+                    help="reuse | new (fresh set + .env) | repoint (to another set)")
+    vp.add_argument("--target-prefix", dest="target_prefix", help="repoint: the target set's volume prefix")
+    vp.add_argument("--env-source", dest="env_source", help="repoint: path to the target set's paired .env")
+    vp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
+
+    rp = parsers["reset"]
+    rp.add_argument("--confirm", dest="confirm", action="store_true",
+                    help="confirm the destructive 'down -v' (required in --non-interactive)")
+    rp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
     return p
 
 

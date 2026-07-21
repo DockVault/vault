@@ -184,6 +184,20 @@ List a host's managed volumes with
 first created, so a deployment made before this release keeps its (unlabelled) volumes and is treated
 as the `default` bundle — no data is moved.
 
+The volume **names** carry a `VAULT_VOLUME_PREFIX` (default `dockvault-vault`, which reproduces the
+historical names). Changing the prefix points the stack at a **different set of volumes**, so several
+sets can sit side by side on one host — each paired with its own `.env` (which holds that set's
+secrets). Don't edit the prefix by hand; the management tool's **Volumes** menu manages sets safely:
+
+- **Reuse** — keep the current set (the default).
+- **Create new** — author a fresh set (new volume names) *and* a fresh paired `.env`, born together;
+  your current set is kept, its `.env` saved aside.
+- **Repoint** — point the deployment at another set; you must supply that set's matching `.env`, and
+  the tool verifies it against the set's data (the same secret check as on start) before switching.
+
+The **Reset** menu tears the current set down with `docker compose down -v` (a strong, typed
+confirmation — this destroys the data) and moves the `.env` aside so a later setup starts fresh.
+
 ## Repository layout
 
 | Path | What lives there |

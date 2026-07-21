@@ -380,27 +380,38 @@ volumes:
   # Labels are applied when a volume is first CREATED; a pre-existing (unlabelled) volume keeps its
   # data and is adopted by the tool under the "default" bundle - additive metadata, never a data move.
   # bundle = DEPLOYMENT_ID from .env (defaults to "default" when unset), so a set stays grouped.
+  #
+  # The volume NAMES carry an explicit VAULT_VOLUME_PREFIX so the tool can keep MULTIPLE data sets
+  # side by side (create-new / repoint to a backup set). The default prefix "dockvault-vault" makes
+  # the names identical to the historical <project>_<volume> names, so existing deployments are
+  # untouched. Switching the prefix (in .env) points the stack at a DIFFERENT set - always paired
+  # with its own .env (the .env holds that set's secrets).
   vault_pg_data:
+    name: ${VAULT_VOLUME_PREFIX:-dockvault-vault}_vault_pg_data
     labels:
       com.dockvault.managed: "true"
       com.dockvault.role: "pg"
       com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_storage:
+    name: ${VAULT_VOLUME_PREFIX:-dockvault-vault}_vault_storage
     labels:
       com.dockvault.managed: "true"
       com.dockvault.role: "storage"
       com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_logs:
+    name: ${VAULT_VOLUME_PREFIX:-dockvault-vault}_vault_logs
     labels:
       com.dockvault.managed: "true"
       com.dockvault.role: "logs"
       com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_keys:
+    name: ${VAULT_VOLUME_PREFIX:-dockvault-vault}_vault_keys
     labels:
       com.dockvault.managed: "true"
       com.dockvault.role: "keys"
       com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_brand:
+    name: ${VAULT_VOLUME_PREFIX:-dockvault-vault}_vault_brand
     labels:
       com.dockvault.managed: "true"
       com.dockvault.role: "brand"

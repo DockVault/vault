@@ -540,7 +540,7 @@ def _secure_compose_config(profile):
     # runs with cwd=ROOT and auto-loads the repo-root .env, which (after a real `setup`) may carry a
     # stamped DEPLOYMENT_ID that would otherwise leak into the render and break the label assertions.
     env = dict(os.environ, COMPOSE_PROFILES=profile, VAULT_DB_PASSWORD="testpw",
-               RUN_SFTP="", SFTP_HOST_PORT="2322", DEPLOYMENT_ID="")
+               RUN_SFTP="", SFTP_HOST_PORT="2322", DEPLOYMENT_ID="", VAULT_VOLUME_PREFIX="")
     try:
         r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
                            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
@@ -599,6 +599,35 @@ def test_env_example_documents_deployment_id():
     import re
     envx = _read(".env.example")
     assert re.search(r"^DEPLOYMENT_ID=", envx, re.M), ".env.example must ship a DEPLOYMENT_ID key"
+    assert re.search(r"^VAULT_VOLUME_PREFIX=", envx, re.M), ".env.example must ship a VAULT_VOLUME_PREFIX key"
+
+
+def test_secure_compose_default_volume_names_are_historical():
+    # With no VAULT_VOLUME_PREFIX the five volume NAMES must be the historical dockvault-vault_vault_*
+    # names, so existing deployments are byte-identical (no data orphaned by the parameterization).
+    out = _secure_compose_config("combined")
+    for base in ("pg_data", "storage", "keys", "logs", "brand"):
+        assert "name: dockvault-vault_vault_%s" % base in out, f"default name for {base} must be historical"
+
+
+def test_secure_compose_volume_names_honour_prefix():
+    import shutil
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    env = dict(os.environ, COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
+               RUN_SFTP="", VAULT_VOLUME_PREFIX="dockvault-vault-b7")
+    try:
+        r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
+                           cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"docker compose unavailable: {exc}")
+    if r.returncode != 0:
+        pytest.skip(f"docker compose config failed: {r.stderr[:200]}")
+    for base in ("pg_data", "storage", "keys", "logs", "brand"):
+        assert "name: dockvault-vault-b7_vault_%s" % base in r.stdout, \
+            f"VAULT_VOLUME_PREFIX must rename the {base} volume"
+    # the labels still ride along on the prefixed set
+    assert r.stdout.count("com.dockvault.managed:") >= 5
 
 
 def test_setup_scripts_write_combined_profile_scheme():

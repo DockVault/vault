@@ -731,6 +731,228 @@ def test_probe_pg_password_live_distinguishes_secrets():
         subprocess.run(["docker", "volume", "rm", "-f", vol], capture_output=True, timeout=30)
 
 
+# --- VT volume SETS: prefix + picker (reuse / new / repoint) + reset -------------------------
+def test_volume_prefix_and_set_names():
+    assert dv.volume_prefix({}) == "dockvault-vault"
+    assert dv.volume_prefix({"VAULT_VOLUME_PREFIX": ""}) == "dockvault-vault"       # blank -> default
+    assert dv.volume_prefix({"VAULT_VOLUME_PREFIX": "dockvault-vault-a1"}) == "dockvault-vault-a1"
+    names = dv.set_volume_names("dockvault-vault-a1")
+    assert names["pg"] == "dockvault-vault-a1_vault_pg_data" and names["keys"] == "dockvault-vault-a1_vault_keys"
+    assert set(names) == {"pg", "storage", "keys", "logs", "brand"}
+
+
+def test_volume_set_prefix_and_grouping():
+    assert dv.volume_set_prefix("dockvault-vault_vault_pg_data") == "dockvault-vault"
+    assert dv.volume_set_prefix("dockvault-vault-b7_vault_keys") == "dockvault-vault-b7"
+    assert dv.volume_set_prefix("some_other_volume") is None
+    recs = [{"name": "dockvault-vault_vault_pg_data", "role": "pg", "bundle": "default"},
+            {"name": "dockvault-vault-b1_vault_pg_data", "role": "pg", "bundle": "b1"},
+            {"name": "dockvault-vault-b1_vault_keys", "role": "keys", "bundle": "b1"},
+            {"name": "weird_name_no_match", "role": None, "bundle": "x"}]     # unparse-able name
+    grouped = dict(dv.group_volumes_by_prefix(recs))
+    assert set(grouped) == {"dockvault-vault", "dockvault-vault-b1", "weird_name_no_match"}
+    assert len(grouped["dockvault-vault-b1"]) == 2
+    assert grouped["weird_name_no_match"][0]["name"] == "weird_name_no_match"  # not dropped, keyed raw
+
+
+def test_plan_volume_action():
+    assert dv.plan_volume_action("reuse")["action"] == "reuse"
+    new = dv.plan_volume_action("new")
+    assert new["author_env"] is True and new["fresh_secrets"] is True and new["archive_current"] is True
+    rep = dv.plan_volume_action("repoint")
+    assert rep["requires_env"] is True and rep["guard"] is True    # repoint MUST supply a matching .env + guard
+    assert dv.plan_volume_action("bogus") is None
+
+
+def test_new_set_config_keeps_settings_regenerates_secrets():
+    cur = {"SERVER_NAME": "v.example.com", "ADMIN_USERNAME": "boss", "COMPOSE_PROFILES": "combined",
+           "ENCRYPTION_KEY": "OLD-KEY", "VAULT_DB_PASSWORD": "OLD-PW", "RUN_SFTP": "1"}
+    cfg = dv.new_set_config(cur, "dockvault-vault-z9", "z9")
+    assert cfg["server_name"] == "v.example.com" and cfg["admin_username"] == "boss" and cfg["run_sftp"] is True
+    assert cfg["encryption_key"] != "OLD-KEY" and cfg["vault_db_password"] != "OLD-PW"   # fresh secrets
+    assert cfg["volume_prefix"] == "dockvault-vault-z9" and cfg["deployment_id"] == "z9"
+    env = dv.parse_env("\n".join(dv.build_env_lines(cfg)))
+    assert env["VAULT_VOLUME_PREFIX"] == "dockvault-vault-z9"
+    # a default prefix is NOT written (keeps the historical names)
+    assert "VAULT_VOLUME_PREFIX" not in dv.parse_env("\n".join(dv.build_env_lines(dict(cfg, volume_prefix="dockvault-vault"))))
+
+
+def test_archive_env_is_collision_safe(tmp_path):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    (tmp_path / ".env").write_text("A=1\n", encoding="utf-8")
+    a1 = tool._archive_env("dockvault-vault")
+    assert os.path.basename(a1) == ".env.dockvault-vault"
+    (tmp_path / ".env").write_text("A=2\n", encoding="utf-8")
+    a2 = tool._archive_env("dockvault-vault")
+    assert a1 != a2 and os.path.exists(a1) and os.path.exists(a2)   # never clobbers the first archive
+    assert not os.path.exists(tool._env_path())                     # both were moved aside
+    assert tool._archive_env("dockvault-vault") is None             # nothing left to archive -> None
+
+
+def test_volume_new_authors_fresh_set_and_archives_current(tmp_path):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    old = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    tool._volume_new(old, argparse.Namespace(non_interactive=True))
+    new = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert new["VAULT_VOLUME_PREFIX"].startswith("dockvault-vault-")          # a fresh named set
+    assert new["ENCRYPTION_KEY"] != old["ENCRYPTION_KEY"]                     # born with fresh secrets
+    assert new["VAULT_DB_PASSWORD"] != old["VAULT_DB_PASSWORD"]
+    assert new["SERVER_NAME"] == old["SERVER_NAME"]                           # non-secret settings kept
+    archive = tmp_path / ".env.dockvault-vault"                              # current set's .env saved
+    assert archive.exists()
+    assert dv.parse_env(archive.read_text(encoding="utf-8"))["ENCRYPTION_KEY"] == old["ENCRYPTION_KEY"]
+
+
+def _write_target_set(tmp_path, prefix, did):
+    tcfg = dict(_reusable_env_cfg(), volume_prefix=prefix, deployment_id=did)
+    (tmp_path / (".env." + prefix)).write_text("\n".join(dv.build_env_lines(tcfg)) + "\n", encoding="utf-8")
+    return tcfg
+
+
+def test_volume_repoint_installs_target_when_guard_passes(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    tgt = _write_target_set(tmp_path, "dockvault-vault-t1", "t1")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_guard_db_secret", lambda env, **k: True)
+    monkeypatch.setattr(tool, "_stop_stack", lambda: None)
+    monkeypatch.setattr(tool, "_stop_db_only", lambda: None)
+    monkeypatch.setattr(dv, "list_managed_volumes",
+                        lambda *a, **k: [{"name": "dockvault-vault-t1_vault_pg_data", "role": "pg", "bundle": "t1"}])
+    tool._volume_repoint(dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8")),
+                         argparse.Namespace(non_interactive=True, target_prefix="dockvault-vault-t1", env_source=None))
+    installed = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert dv.volume_prefix(installed) == "dockvault-vault-t1"                # now points at the target set
+    assert installed["ENCRYPTION_KEY"] == tgt["encryption_key"]              # the TARGET set's secrets installed
+    assert (tmp_path / ".env.dockvault-vault").exists()                      # previous set's .env archived
+
+
+def test_volume_repoint_restores_env_when_guard_refuses(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    cur_key = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["ENCRYPTION_KEY"]
+    _write_target_set(tmp_path, "dockvault-vault-t1", "t1")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_guard_db_secret", lambda env, **k: False)    # secret guard rejects the pairing
+    monkeypatch.setattr(tool, "_stop_stack", lambda: None)
+    monkeypatch.setattr(tool, "_stop_db_only", lambda: None)
+    monkeypatch.setattr(dv, "list_managed_volumes",
+                        lambda *a, **k: [{"name": "dockvault-vault-t1_vault_pg_data", "role": "pg", "bundle": "t1"}])
+    tool._volume_repoint(dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8")),
+                         argparse.Namespace(non_interactive=True, target_prefix="dockvault-vault-t1", env_source=None))
+    restored = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert restored["ENCRYPTION_KEY"] == cur_key                             # original .env restored, repoint undone
+    assert dv.volume_prefix(restored) == "dockvault-vault"
+    assert not (tmp_path / ".env.dockvault-vault").exists()                  # archive was moved BACK, not left duplicated
+
+
+def test_volume_repoint_refuses_env_naming_wrong_set(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    cur_key = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["ENCRYPTION_KEY"]
+    wrong = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-OTHER", deployment_id="other")
+    src = tmp_path / "provided.env"
+    src.write_text("\n".join(dv.build_env_lines(wrong)) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "list_managed_volumes",
+                        lambda *a, **k: [{"name": "dockvault-vault-t1_vault_pg_data", "role": "pg", "bundle": "t1"}])
+    with pytest.raises(SystemExit):
+        tool._volume_repoint(dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8")),
+                             argparse.Namespace(non_interactive=True, target_prefix="dockvault-vault-t1", env_source=str(src)))
+    # rejected before any archive/install -> current .env untouched
+    assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["ENCRYPTION_KEY"] == cur_key
+
+
+def test_reset_requires_confirmation_then_down_v_and_archives(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _Proc(0, ""))
+    # unconfirmed (non-interactive) -> no teardown, .env untouched
+    tool.reset(argparse.Namespace(non_interactive=True, confirm=False))
+    assert not any("down" in c for c in calls), "reset must NOT run down -v without confirmation"
+    assert (tmp_path / ".env").exists()
+    # confirmed -> runs down -v and moves .env aside
+    tool.reset(argparse.Namespace(non_interactive=True, confirm=True))
+    assert any(("down" in c and "-v" in c) for c in calls), "confirmed reset must run down -v"
+    assert not (tmp_path / ".env").exists()
+    assert list(tmp_path.glob(".env.removed-*")), "the destroyed set's .env must be archived aside"
+
+
+def test_reset_interactive_typed_confirmation(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _Proc(0, ""))
+    # interactive + WRONG typed name -> cancelled: no down -v, .env kept
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: "not-the-name")
+    tool.reset(argparse.Namespace())        # no non_interactive attr -> interactive path
+    assert not any("down" in c for c in calls) and (tmp_path / ".env").exists()
+    # interactive + CORRECT typed name (the set prefix) -> teardown runs
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: "dockvault-vault")
+    tool.reset(argparse.Namespace())
+    assert any(("down" in c and "-v" in c) for c in calls)
+    assert not (tmp_path / ".env").exists()
+
+
+def test_reset_aborts_and_keeps_env_when_down_v_fails(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: _Proc(1, "", "volume is in use"))  # down -v fails
+    with pytest.raises(SystemExit):
+        tool.reset(argparse.Namespace(non_interactive=True, confirm=True))
+    # a FAILED teardown must NOT move the .env aside (else fresh secrets vs surviving volumes = the footgun)
+    assert (tmp_path / ".env").exists() and not list(tmp_path.glob(".env.removed-*"))
+
+
+def test_volume_sets_coexist_and_down_v_removes_only_current_live(tmp_path):
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    compose = tmp_path / "sets.yml"
+    compose.write_text(
+        'name: ${VAULT_VOLUME_PREFIX:-vt10sets}\n'
+        'services:\n'
+        '  probe:\n'
+        '    image: busybox\n'
+        '    command: ["sh","-c","echo ok; sleep 1"]\n'
+        '    volumes:\n'
+        '      - vault_pg_data:/data\n'
+        'volumes:\n'
+        '  vault_pg_data:\n'
+        '    name: ${VAULT_VOLUME_PREFIX:-vt10sets}_vault_pg_data\n'
+        '    labels:\n'
+        '      com.dockvault.managed: "true"\n'
+        '      com.dockvault.role: "pg"\n', encoding="utf-8")
+    volA, volB = "vt10sets-a_vault_pg_data", "vt10sets-b_vault_pg_data"
+
+    def dc(prefix, *args):
+        env = dict(os.environ, VAULT_VOLUME_PREFIX=prefix)
+        return subprocess.run(["docker", "compose", "-f", str(compose), *args],
+                              env=env, capture_output=True, text=True, timeout=90)
+
+    def exists(name):
+        return subprocess.run(["docker", "volume", "inspect", name],
+                              capture_output=True, timeout=20).returncode == 0
+    try:
+        try:
+            up_a = dc("vt10sets-a", "up", "-d")
+            up_b = dc("vt10sets-b", "up", "-d")
+        except (subprocess.SubprocessError, OSError) as exc:
+            pytest.skip("docker unavailable: %s" % exc)
+        if up_a.returncode != 0 or up_b.returncode != 0:   # daemon/image unavailable -> skip, not fail
+            pytest.skip("docker compose up failed: %s" % ((up_a.stderr or up_b.stderr) or "")[:200])
+        assert exists(volA) and exists(volB), "two prefixed sets must coexist side by side"
+        # down -v on set B removes ONLY B's volume; A is untouched (no cross-set data loss)
+        dc("vt10sets-b", "down", "-v")
+        assert not exists(volB), "down -v must remove the current set's volume"
+        assert exists(volA), "the other set must be left intact"
+    finally:
+        dc("vt10sets-a", "down", "-v")
+        dc("vt10sets-b", "down", "-v")
+        subprocess.run(["docker", "volume", "rm", "-f", volA, volB], capture_output=True, timeout=30)
+
+
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs host openssl for a BYO pair")
 def test_setup_byo_cert_mode_installs_pair(tmp_path):
     cert, key = _mkpair(tmp_path / "src")

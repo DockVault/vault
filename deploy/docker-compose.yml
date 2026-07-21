@@ -241,28 +241,35 @@ services:
 
 volumes:
   # Labelled so dockvault.py can enumerate this deployment's volumes as one bundle (see the
-  # secure compose for the full note). bundle = DEPLOYMENT_ID from .env (default "default").
+  # secure compose for the full note). bundle = DEPLOYMENT_ID from .env (default "default"); the
+  # names carry VAULT_VOLUME_PREFIX (default "dockvault-vault" = the historical names) so the tool
+  # can keep multiple data sets side by side.
   vault_pg_data:
+    name: ${VAULT_VOLUME_PREFIX:-dockvault-vault}_vault_pg_data
     labels:
       com.dockvault.managed: "true"
       com.dockvault.role: "pg"
       com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_storage:
+    name: ${VAULT_VOLUME_PREFIX:-dockvault-vault}_vault_storage
     labels:
       com.dockvault.managed: "true"
       com.dockvault.role: "storage"
       com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_logs:
+    name: ${VAULT_VOLUME_PREFIX:-dockvault-vault}_vault_logs
     labels:
       com.dockvault.managed: "true"
       com.dockvault.role: "logs"
       com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_keys:
+    name: ${VAULT_VOLUME_PREFIX:-dockvault-vault}_vault_keys
     labels:
       com.dockvault.managed: "true"
       com.dockvault.role: "keys"
       com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_brand:
+    name: ${VAULT_VOLUME_PREFIX:-dockvault-vault}_vault_brand
     labels:
       com.dockvault.managed: "true"
       com.dockvault.role: "brand"
