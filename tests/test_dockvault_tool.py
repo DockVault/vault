@@ -3,6 +3,7 @@
 Loaded by file path (the module is pure stdlib — no app imports), so these run without a live
 instance and never touch Docker: the tested surface is the pure colour/prompt/menu/step-tracker
 logic + the arg-mode routing. A subprocess smoke covers --help."""
+import argparse
 import importlib.util
 import os
 import shutil
@@ -546,6 +547,188 @@ def test_list_managed_volumes_live_roundtrip():
     finally:
         for name in names.values():
             subprocess.run(["docker", "volume", "rm", "-f", name], capture_output=True, timeout=30)
+
+
+# --- VT secret<->volume guardrail ------------------------------------------------------------
+def test_classify_pg_probe():
+    assert dv.classify_pg_probe(0, "") == "ok"
+    assert dv.classify_pg_probe(2, 'FATAL:  password authentication failed for user "sftp_user"') == "mismatch"
+    assert dv.classify_pg_probe(1, "FATAL: 28P01") == "mismatch"
+    assert dv.classify_pg_probe(1, "could not connect to server") == "ambiguous"     # fail-closed
+    assert dv.classify_pg_probe(1, "") == "ambiguous"
+
+
+def test_db_guard_decision():
+    assert dv.db_guard_decision(False, "ambiguous") == "proceed"   # fresh volume always proceeds
+    assert dv.db_guard_decision(True, "ok") == "proceed"
+    assert dv.db_guard_decision(True, "mismatch") == "refuse"
+    assert dv.db_guard_decision(True, "ambiguous") == "refuse"     # fail-closed
+
+
+def test_fernet_key_looks_valid():
+    assert dv.fernet_key_looks_valid(dv.gen_fernet_key()) is True
+    assert dv.fernet_key_looks_valid("abc") is False               # too short
+    assert dv.fernet_key_looks_valid("") is False
+    assert dv.fernet_key_looks_valid("!!!not base64!!!") is False
+
+
+def test_volume_exists_best_effort():
+    assert dv.volume_exists("x", run=lambda *a, **k: _Proc(0, "")) is True
+    assert dv.volume_exists("x", run=lambda *a, **k: _Proc(1, "", "no such volume")) is False
+    assert dv.volume_exists("x", run=lambda *a, **k: (_ for _ in ()).throw(OSError("boom"))) is False
+
+
+def test_probe_pg_password_passes_secret_by_env_not_argv():
+    def run(cmd, **kw):
+        if "hostname" in cmd:
+            return _Proc(0, "10.1.2.3\n")
+        # the psql probe: the password must NOT be on argv, must be in env, and must target the
+        # container network IP (not 127.0.0.1 / the socket, which postgres trusts without a password).
+        assert "SUPERSECRET" not in " ".join(cmd), "password must never appear on the psql argv"
+        assert kw.get("env", {}).get("PGPASSWORD") == "SUPERSECRET", "password must be passed via env"
+        assert "-h" in cmd and "10.1.2.3" in cmd, "must probe the container network IP"
+        return _Proc(0, "1\n")
+    assert dv.probe_pg_password("vault-db", "sftp_user", "sftp_db", "SUPERSECRET", run=run) == "ok"
+
+    def run_fail(cmd, **kw):
+        if "hostname" in cmd:
+            return _Proc(0, "10.1.2.3\n")
+        return _Proc(2, "", 'FATAL:  password authentication failed for user "sftp_user"')
+    assert dv.probe_pg_password("vault-db", "sftp_user", "sftp_db", "x", run=run_fail) == "mismatch"
+    # fail-closed on lookup failure / docker error
+    assert dv.probe_pg_password("vault-db", "sftp_user", "sftp_db", "x",
+                                run=lambda *a, **k: _Proc(1, "")) == "ambiguous"
+    assert dv.probe_pg_password("vault-db", "sftp_user", "sftp_db", "x",
+                                run=lambda *a, **k: (_ for _ in ()).throw(OSError("no docker"))) == "ambiguous"
+
+
+def _guard_tool():
+    return dv.DockVault(dv.Palette(False), root=os.path.join("/", "nonexistent-dockvault-root"))
+
+
+def test_guard_db_secret_fresh_volume_proceeds_without_probing():
+    started = {"n": 0}
+    ok = _guard_tool()._guard_db_secret(
+        {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"},
+        exists_fn=lambda v: False,
+        start_fn=lambda: started.__setitem__("n", started["n"] + 1) or True,
+        wait_fn=lambda: True, probe_fn=lambda *a: "ok", stop_fn=lambda: None)
+    assert ok is True and started["n"] == 0, "a fresh volume must proceed without starting/probing the db"
+
+
+def test_guard_db_secret_match_proceeds():
+    ok = _guard_tool()._guard_db_secret(
+        {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"},
+        exists_fn=lambda v: True, start_fn=lambda: True, wait_fn=lambda: True,
+        probe_fn=lambda *a: "ok", stop_fn=lambda: None)
+    assert ok is True
+
+
+def test_guard_db_secret_mismatch_refuses_without_leaking_secret(capsys):
+    stopped = {"n": 0}
+    ok = _guard_tool()._guard_db_secret(
+        {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "TOPSECRETPW_42"},
+        exists_fn=lambda v: True, start_fn=lambda: True, wait_fn=lambda: True,
+        probe_fn=lambda *a: "mismatch", stop_fn=lambda: stopped.__setitem__("n", stopped["n"] + 1))
+    out = capsys.readouterr().out
+    assert ok is False
+    assert "TOPSECRETPW_42" not in out, "the diagnosis must NEVER print the secret value"
+    assert "down -v" in out and "Restore" in out, "both recovery paths must be shown"
+    assert "password authentication failed" in out
+    assert stopped["n"] == 1, "the probe's db must be stopped on refusal"
+
+
+def test_guard_db_secret_invalid_encryption_key_refuses_before_starting_db(capsys):
+    started = {"n": 0}
+    ok = _guard_tool()._guard_db_secret(
+        {"ENCRYPTION_KEY": "not-a-fernet-key", "VAULT_DB_PASSWORD": "x"},
+        exists_fn=lambda v: True,
+        start_fn=lambda: started.__setitem__("n", started["n"] + 1) or True,
+        wait_fn=lambda: True, probe_fn=lambda *a: "ok", stop_fn=lambda: None)
+    out = capsys.readouterr().out
+    assert ok is False and started["n"] == 0, "an invalid ENCRYPTION_KEY must be rejected before starting the db"
+    assert "ENCRYPTION_KEY" in out
+
+
+def test_guard_db_secret_ambiguous_when_db_never_ready(capsys):
+    ok = _guard_tool()._guard_db_secret(
+        {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"},
+        exists_fn=lambda v: True, start_fn=lambda: True, wait_fn=lambda: False,   # never ready
+        probe_fn=lambda *a: "ok", stop_fn=lambda: None)
+    out = capsys.readouterr().out
+    assert ok is False and "did not become reachable" in out          # fail-closed on ambiguity
+
+
+def _reusable_env_cfg():
+    return {
+        "server_name": "localhost", "encryption_key": dv.gen_fernet_key(),
+        "jwt_secret_key": dv.gen_hex(32), "vault_db_password": dv.gen_hex(16),
+        "redis_password": dv.gen_hex(24), "admin_username": "admin",
+        "admin_email": "a@example.com", "admin_password": "Strong-Pass-1234", "compose_profiles": "combined",
+    }
+
+
+def test_setup_stops_and_does_not_start_when_guard_refuses(tmp_path, monkeypatch):
+    # The guard->STOP wiring runs only on a REAL start (after the --no-start early return), so drive
+    # setup() directly with a reusable .env and the guard forced to refuse: setup must raise
+    # SystemExit(1) and NEVER start the stack (the central VT footgun-closing behavior).
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "_cert_pair_present", lambda *a, **k: True)       # skip cert generation
+    monkeypatch.setattr(dv, "apply_cert_owner", lambda *a, **k: (True, ""))    # no real chown/icacls
+    started = []
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: started.append(1) or True)
+    monkeypatch.setattr(tool, "_guard_db_secret", lambda env, **k: False)      # guard refuses
+    with pytest.raises(SystemExit) as exc:
+        tool.setup(argparse.Namespace(no_start=False, non_interactive=True))
+    assert exc.value.code == 1
+    assert started == [], "setup MUST NOT start the stack when the secret guard refuses"
+
+
+def test_setup_proceeds_to_start_when_guard_passes(tmp_path, monkeypatch):
+    # Mirror: when the guard passes, setup proceeds to start the stack.
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "_cert_pair_present", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "apply_cert_owner", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(tool, "_guard_db_secret", lambda env, **k: True)       # guard passes
+    started = []
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: started.append(1) or True)
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    tool.setup(argparse.Namespace(no_start=False, non_interactive=True))
+    assert started == [1], "setup must start the stack when the guard passes"
+
+
+def test_probe_pg_password_live_distinguishes_secrets():
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    import time
+    vol, cont = "vt9live_pgdata", "vt9live_db"
+    try:
+        try:
+            subprocess.run(["docker", "run", "-d", "--rm", "--name", cont,
+                            "-e", "POSTGRES_USER=sftp_user", "-e", "POSTGRES_PASSWORD=passA_1234",
+                            "-e", "POSTGRES_DB=sftp_db", "-v", "%s:/var/lib/postgresql/data" % vol,
+                            "postgres:15-alpine"], check=True, capture_output=True, timeout=90)
+        except (subprocess.SubprocessError, OSError) as exc:
+            pytest.skip("docker daemon/image unavailable: %s" % exc)
+        ready = False
+        for _ in range(30):
+            r = subprocess.run(["docker", "exec", cont, "pg_isready", "-U", "sftp_user", "-d", "sftp_db"],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                ready = True
+                break
+            time.sleep(2)
+        assert ready, "throwaway postgres never became ready"
+        # the SAME scram path the app uses: correct password authenticates, wrong one is a mismatch
+        assert dv.probe_pg_password(cont, "sftp_user", "sftp_db", "passA_1234") == "ok"
+        assert dv.probe_pg_password(cont, "sftp_user", "sftp_db", "wrongB_9999") == "mismatch"
+    finally:
+        subprocess.run(["docker", "rm", "-f", cont], capture_output=True, timeout=30)
+        subprocess.run(["docker", "volume", "rm", "-f", vol], capture_output=True, timeout=30)
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs host openssl for a BYO pair")

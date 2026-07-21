@@ -822,6 +822,87 @@ def list_legacy_volumes(run=subprocess.run, project=DEFAULT_PROJECT):
     return sorted(legacy)
 
 
+# --- secret <-> volume guardrail -------------------------------------------------------------
+# The reported footgun: Postgres bakes VAULT_DB_PASSWORD into vault_pg_data on FIRST init and never
+# re-reads it, so a fresh/changed .env against a populated volume can't authenticate ("password
+# authentication failed for user sftp_user") - and a mismatched ENCRYPTION_KEY makes stored files
+# undecryptable. Before starting on an existing volume the tool verifies the current .env's DB
+# password authenticates against it and refuses-with-explanation (never printing a secret) on a
+# mismatch or an ambiguous result. These vault DB coordinates are fixed by the compose.
+PG_USER = "sftp_user"
+PG_DB = "sftp_db"
+
+
+def volume_exists(name, run=subprocess.run):
+    """True if a docker volume named `name` exists. Best-effort (False on any docker error)."""
+    try:
+        r = run(["docker", "volume", "inspect", name], capture_output=True, text=True, timeout=20)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return getattr(r, "returncode", 1) == 0
+
+
+def fernet_key_looks_valid(key):
+    """True if `key` is shaped like a Fernet key: urlsafe-base64 of exactly 32 bytes. Stdlib-only
+    (no decryption) - a cheap sanity check that ENCRYPTION_KEY isn't missing/garbled, without pulling
+    in a crypto dependency."""
+    try:
+        raw = base64.urlsafe_b64decode((key or "").encode("ascii"))
+    except Exception:   # noqa: BLE001 - any decode failure means "not a Fernet key"
+        return False
+    return len(raw) == 32
+
+
+def classify_pg_probe(returncode, stderr):
+    """Classify a `psql` auth probe -> 'ok' | 'mismatch' | 'ambiguous'. A clean exit is a password
+    MATCH; a Postgres auth failure (28P01 / 'password authentication failed') is a definite MISMATCH;
+    anything else (server not ready, network, unknown) is AMBIGUOUS so the caller fails closed. Pure -
+    it never sees the password."""
+    if returncode == 0:
+        return "ok"
+    s = (stderr or "").lower()
+    if "password authentication failed" in s or "28p01" in s or "28000" in s:
+        return "mismatch"
+    return "ambiguous"
+
+
+def probe_pg_password(container, user, db, password, run=subprocess.run):
+    """Auth-probe a RUNNING postgres `container` with `password` -> classify_pg_probe(...). Connects
+    over the container's OWN network IP (NOT 127.0.0.1 / the unix socket, which the postgres image
+    trusts WITHOUT a password) so the probe exercises the SAME scram password auth the vault app uses.
+    The password is passed via PGPASSWORD INSIDE the container (docker exec -e NAME, value taken from
+    the client env) so it never lands on the host argv or in logs. Ambiguous on any docker/exec error
+    so the caller fails closed."""
+    try:
+        ipr = run(["docker", "exec", container, "hostname", "-i"],
+                  capture_output=True, text=True, timeout=20)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return "ambiguous"
+    if getattr(ipr, "returncode", 1) != 0:
+        return "ambiguous"
+    parts = (getattr(ipr, "stdout", "") or "").split()
+    if not parts:
+        return "ambiguous"
+    ip = parts[0]
+    try:
+        r = run(["docker", "exec", "-e", "PGPASSWORD", container,
+                 "psql", "-h", ip, "-U", user, "-d", db, "-tAc", "SELECT 1"],
+                capture_output=True, text=True, timeout=30,
+                env=dict(os.environ, PGPASSWORD=password))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return "ambiguous"
+    return classify_pg_probe(getattr(r, "returncode", 1), getattr(r, "stderr", ""))
+
+
+def db_guard_decision(volume_exists_flag, probe_result):
+    """The pure guardrail decision: 'proceed' | 'refuse'. A fresh (non-existent) volume always
+    proceeds (the .env password is baked in on first init). An existing volume proceeds ONLY on a
+    confirmed password match; a mismatch OR an ambiguous probe refuses (fail-closed)."""
+    if not volume_exists_flag:
+        return "proceed"
+    return "proceed" if probe_result == "ok" else "refuse"
+
+
 # --- app -------------------------------------------------------------------------------------
 def _stub(name, pal):
     print(pal.paint("\n  '%s' is not implemented yet - coming in a later phase.\n" % name, "yellow"))
@@ -939,6 +1020,12 @@ class DockVault:
         ok, msg = docker_available()
         if not ok:
             self._fail(msg)
+        # Guardrail: if we're (re)starting on an EXISTING data volume, the current .env's DB password
+        # MUST authenticate against it, or the app would loop on a Postgres auth error. Fail closed
+        # with a clear diagnosis (the reported "wrong password after re-setup" footgun).
+        env_now = parse_env(open(env_path, encoding="utf-8").read()) if os.path.exists(env_path) else {}
+        if not self._guard_db_secret(env_now):
+            raise SystemExit(1)   # the guard already printed the diagnosis + recovery paths
         # Port preflight: warn (don't block) if the chosen web port is already taken.
         web_port = summary.get("web_host_port") or 443
         if not port_free(web_port):
@@ -1071,6 +1158,96 @@ class DockVault:
         r = subprocess.run(self._dc("up", "-d", "--build", "--force-recreate", "--remove-orphans"),
                            cwd=self.root, text=True)
         return r.returncode == 0
+
+    def _start_db_only(self):
+        """Start ONLY the postgres service on the existing volume (for the pre-up secret check)."""
+        try:
+            r = subprocess.run(self._dc("up", "-d", "vault-db"), cwd=self.root,
+                               capture_output=True, text=True, timeout=180)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return r.returncode == 0
+
+    def _wait_db_ready(self, tries=20):
+        """Poll pg_isready inside vault-db until it accepts connections (readiness, NOT auth)."""
+        import time
+        for _ in range(tries):
+            try:
+                r = subprocess.run(["docker", "exec", "vault-db", "pg_isready", "-U", PG_USER, "-d", PG_DB],
+                                   capture_output=True, text=True, timeout=15)
+            except (OSError, subprocess.SubprocessError):
+                time.sleep(2); continue
+            if getattr(r, "returncode", 1) == 0:
+                return True
+            time.sleep(2)
+        return False
+
+    def _stop_db_only(self):
+        """Stop the probe's vault-db (best-effort) so a refused setup doesn't leave a lone db running."""
+        try:
+            subprocess.run(self._dc("stop", "vault-db"), cwd=self.root,
+                           capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def _guard_db_secret(self, env, exists_fn=None, start_fn=None, wait_fn=None, probe_fn=None, stop_fn=None):
+        """Fail-closed guardrail: if vault_pg_data already exists, verify the current .env's
+        VAULT_DB_PASSWORD authenticates against it (and ENCRYPTION_KEY is at least a valid key) BEFORE
+        starting the stack. Returns True to proceed, False to STOP (after printing a secret-free
+        diagnosis). No-op (True) for a fresh volume. The *_fn hooks are injectable for tests."""
+        pal = self.pal
+        exists_fn = exists_fn or volume_exists
+        start_fn = start_fn or self._start_db_only
+        wait_fn = wait_fn or self._wait_db_ready
+        probe_fn = probe_fn or probe_pg_password
+        stop_fn = stop_fn or self._stop_db_only
+        vol = "%s_vault_pg_data" % DEFAULT_PROJECT
+        if not exists_fn(vol):
+            return True   # brand-new volume: the .env password is baked in on first init
+        # A stored volume + an ENCRYPTION_KEY that isn't even shaped like a Fernet key is a certain
+        # mismatch (files would be undecryptable) - stop before baking a broken pairing.
+        if not fernet_key_looks_valid(env.get("ENCRYPTION_KEY", "")):
+            self._print_secret_mismatch("encryption_key", vol)
+            return False
+        print(pal.paint("  Existing data volume found - verifying the .env matches it...", "cyan"))
+        if not start_fn() or not wait_fn():
+            stop_fn()
+            self._print_secret_mismatch("ambiguous", vol)
+            return False
+        result = probe_fn("vault-db", PG_USER, PG_DB, env.get("VAULT_DB_PASSWORD", ""))
+        if db_guard_decision(True, result) == "proceed":
+            # Be precise: only VAULT_DB_PASSWORD was AUTHENTICATED against the volume; ENCRYPTION_KEY
+            # was only format-checked (stdlib-only, no decryption), so don't claim a full match.
+            print(pal.paint("  Secret check OK: VAULT_DB_PASSWORD authenticates against the existing "
+                            "data volume (ENCRYPTION_KEY has a valid key format).", "green"))
+            return True
+        stop_fn()
+        self._print_secret_mismatch("db_password" if result == "mismatch" else "ambiguous", vol)
+        return False
+
+    def _print_secret_mismatch(self, kind, vol):
+        """Explain a secret<->volume mismatch + the two recovery paths. NEVER prints a secret value."""
+        pal = self.pal
+        print(pal.paint("\nERROR: the current .env does NOT match the existing data volume.", "red"))
+        print("  Volume: %s" % vol)
+        if kind == "db_password":
+            print("  VAULT_DB_PASSWORD in .env fails to authenticate against the stored database.")
+            print("  Postgres bakes the DB password into the volume on FIRST init and never re-reads it,")
+            print("  so a fresh or changed .env can't open data created under the old password (the app")
+            print("  would loop on 'password authentication failed for user %s')." % PG_USER)
+        elif kind == "encryption_key":
+            print("  ENCRYPTION_KEY in .env is not a valid key, so files stored in this volume could not")
+            print("  be decrypted. It must be the ENCRYPTION_KEY this volume's data was created under.")
+        else:  # ambiguous
+            print("  Could NOT verify the .env against the volume (the database did not become reachable")
+            print("  in time). Refusing to start rather than risk a broken pairing.")
+        print(pal.paint("  Two ways forward:", "yellow"))
+        print("    1) Restore the ORIGINAL .env created WITH this volume - it holds the matching")
+        print("       VAULT_DB_PASSWORD and ENCRYPTION_KEY. (Keep a backup of .env off-host.)")
+        print("    2) Start FRESH - this DESTROYS the stored data:")
+        print("         docker compose -f docker-compose.secure.yml down -v")
+        print("       then re-run setup.")
+        print(pal.paint("  Not starting.\n", "red"))
 
     def _wait_secure_healthy(self, profiles, tries=40):
         import time
