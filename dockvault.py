@@ -20,8 +20,6 @@ Stdlib-only (no `pip install` needed); Python 3.7+. Colour works on Linux and mo
 terminals and is auto-disabled when stdout is not a TTY or NO_COLOR is set (https://no-color.org).
 
 NOTE: this is a HOST-side ops tool — it is excluded from the shipped image (see .dockerignore).
-The interactive area handlers are filled in by later phases; the skeleton wires the menu + the
-pure prompt/colour/step-tracker helpers.
 """
 import argparse
 import os
@@ -34,7 +32,7 @@ import sys
 APP_ROOT = os.environ.get("DOCKVAULT_ROOT") or os.path.dirname(os.path.abspath(__file__))
 
 # The top-level menu: (command-key, human label). Handlers are resolved by key on the app object,
-# so a later phase fills a handler in without touching the menu wiring. The label's text after the
+# so adding a handler needs no change to the menu wiring. The label's text after the
 # ' - ' is reused as the argparse subcommand help. Labels stay ASCII-only so they render on a legacy
 # Windows console (the same reason the .ps1 setup scripts are ASCII-only).
 MENU = [
@@ -1140,13 +1138,9 @@ def db_guard_decision(volume_exists_flag, probe_result):
 
 
 # --- app -------------------------------------------------------------------------------------
-def _stub(name, pal):
-    print(pal.paint("\n  '%s' is not implemented yet - coming in a later phase.\n" % name, "yellow"))
-
-
 class DockVault:
     """The management app: holds the palette + repo root and dispatches menu/arg commands to the
-    per-area handlers (stubbed in this skeleton; filled in by later phases)."""
+    per-area handlers (setup / backup / volumes / reset / update / logs)."""
 
     def __init__(self, pal, root=APP_ROOT):
         self.pal = pal
@@ -1165,9 +1159,9 @@ class DockVault:
         return os.path.join(self.root, "certs")
 
     def setup(self, args=None):
-        """Configure + start the standalone HTTPS vault: author (or reuse) .env, generate a
-        self-signed cert, then build + start the secure stack. This delivers the self-signed path;
-        Let's Encrypt / bring-your-own / rootless-cert-perm handling arrive in a later phase."""
+        """Configure + start the standalone HTTPS vault: author (or reuse) .env, provision a TLS
+        certificate (self-signed / Let's Encrypt / bring-your-own, with rootless-cert-perm handling),
+        then build + start the secure stack."""
         pal = self.pal
         no_start = bool(args and getattr(args, "no_start", False))
         steps = ["Settings", "Write .env", "Certificate"] + ([] if no_start else ["Build + start", "Health check"])
@@ -1586,6 +1580,11 @@ class DockVault:
         bundle = os.path.join(self._backup_root(args), "dockvault-%s-%s" % (prefix, ts))
         try:
             os.makedirs(bundle)
+            # Restrict the whole bundle dir to the owner (makedirs' mode is umask-masked): the volume
+            # tar.gz archives inside include the DB dump + key material, so keep them unreadable to
+            # other local users, matching the mode-600 .env copy. (No-op perms on Windows.)
+            if os.name != "nt":
+                os.chmod(bundle, 0o700)
         except OSError as exc:
             self._fail("could not create the backup directory %s: %s" % (bundle, exc))
         # the paired .env FIRST, mode-600 (it holds ENCRYPTION_KEY)

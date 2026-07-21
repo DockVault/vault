@@ -530,27 +530,27 @@ def test_list_legacy_volumes_only_unlabelled_wellknown():
 def test_list_managed_volumes_live_roundtrip():
     if shutil.which("docker") is None:
         pytest.skip("docker not available")
-    names = {"pg": "vt8live_pg", "storage": "vt8live_storage"}
+    names = {"pg": "dvmanaged_pg", "storage": "dvmanaged_storage"}
     try:
         try:
             for role, name in names.items():
                 subprocess.run(["docker", "volume", "create",
                                 "--label", "com.dockvault.managed=true",
                                 "--label", "com.dockvault.role=%s" % role,
-                                "--label", "com.dockvault.bundle=vt8livebundle", name],
+                                "--label", "com.dockvault.bundle=dvmanagedbundle", name],
                                check=True, capture_output=True, timeout=30)
         except (subprocess.SubprocessError, OSError) as exc:   # binary present but daemon down -> skip, not error
             pytest.skip("docker daemon unavailable: %s" % exc)
-        recs = [r for r in dv.list_managed_volumes() if r["bundle"] == "vt8livebundle"]
+        recs = [r for r in dv.list_managed_volumes() if r["bundle"] == "dvmanagedbundle"]
         assert {r["role"] for r in recs} == {"pg", "storage"}
         groups = dict(dv.group_volumes_by_bundle(recs))
-        assert "vt8livebundle" in groups and len(groups["vt8livebundle"]) == 2
+        assert "dvmanagedbundle" in groups and len(groups["dvmanagedbundle"]) == 2
     finally:
         for name in names.values():
             subprocess.run(["docker", "volume", "rm", "-f", name], capture_output=True, timeout=30)
 
 
-# --- VT secret<->volume guardrail ------------------------------------------------------------
+# --- secret<->volume guardrail ------------------------------------------------------------
 def test_classify_pg_probe():
     assert dv.classify_pg_probe(0, "") == "ok"
     assert dv.classify_pg_probe(2, 'FATAL:  password authentication failed for user "sftp_user"') == "mismatch"
@@ -672,7 +672,7 @@ def _reusable_env_cfg():
 def test_setup_stops_and_does_not_start_when_guard_refuses(tmp_path, monkeypatch):
     # The guard->STOP wiring runs only on a REAL start (after the --no-start early return), so drive
     # setup() directly with a reusable .env and the guard forced to refuse: setup must raise
-    # SystemExit(1) and NEVER start the stack (the central VT footgun-closing behavior).
+    # SystemExit(1) and NEVER start the stack (the core footgun-closing behaviour).
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
@@ -706,7 +706,7 @@ def test_probe_pg_password_live_distinguishes_secrets():
     if shutil.which("docker") is None:
         pytest.skip("docker not available")
     import time
-    vol, cont = "vt9live_pgdata", "vt9live_db"
+    vol, cont = "dvpgprobe_pgdata", "dvpgprobe_db"
     try:
         try:
             subprocess.run(["docker", "run", "-d", "--rm", "--name", cont,
@@ -732,7 +732,7 @@ def test_probe_pg_password_live_distinguishes_secrets():
         subprocess.run(["docker", "volume", "rm", "-f", vol], capture_output=True, timeout=30)
 
 
-# --- VT volume SETS: prefix + picker (reuse / new / repoint) + reset -------------------------
+# --- volume SETS: prefix + picker (reuse / new / repoint) + reset -------------------------
 def test_volume_prefix_and_set_names():
     assert dv.volume_prefix({}) == "dockvault-vault"
     assert dv.volume_prefix({"VAULT_VOLUME_PREFIX": ""}) == "dockvault-vault"       # blank -> default
@@ -912,7 +912,7 @@ def test_volume_sets_coexist_and_down_v_removes_only_current_live(tmp_path):
         pytest.skip("docker not available")
     compose = tmp_path / "sets.yml"
     compose.write_text(
-        'name: ${VAULT_VOLUME_PREFIX:-vt10sets}\n'
+        'name: ${VAULT_VOLUME_PREFIX:-dvvolsets}\n'
         'services:\n'
         '  probe:\n'
         '    image: busybox\n'
@@ -921,11 +921,11 @@ def test_volume_sets_coexist_and_down_v_removes_only_current_live(tmp_path):
         '      - vault_pg_data:/data\n'
         'volumes:\n'
         '  vault_pg_data:\n'
-        '    name: ${VAULT_VOLUME_PREFIX:-vt10sets}_vault_pg_data\n'
+        '    name: ${VAULT_VOLUME_PREFIX:-dvvolsets}_vault_pg_data\n'
         '    labels:\n'
         '      com.dockvault.managed: "true"\n'
         '      com.dockvault.role: "pg"\n', encoding="utf-8")
-    volA, volB = "vt10sets-a_vault_pg_data", "vt10sets-b_vault_pg_data"
+    volA, volB = "dvvolsets-a_vault_pg_data", "dvvolsets-b_vault_pg_data"
 
     def dc(prefix, *args):
         env = dict(os.environ, VAULT_VOLUME_PREFIX=prefix)
@@ -937,24 +937,24 @@ def test_volume_sets_coexist_and_down_v_removes_only_current_live(tmp_path):
                               capture_output=True, timeout=20).returncode == 0
     try:
         try:
-            up_a = dc("vt10sets-a", "up", "-d")
-            up_b = dc("vt10sets-b", "up", "-d")
+            up_a = dc("dvvolsets-a", "up", "-d")
+            up_b = dc("dvvolsets-b", "up", "-d")
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker unavailable: %s" % exc)
         if up_a.returncode != 0 or up_b.returncode != 0:   # daemon/image unavailable -> skip, not fail
             pytest.skip("docker compose up failed: %s" % ((up_a.stderr or up_b.stderr) or "")[:200])
         assert exists(volA) and exists(volB), "two prefixed sets must coexist side by side"
         # down -v on set B removes ONLY B's volume; A is untouched (no cross-set data loss)
-        dc("vt10sets-b", "down", "-v")
+        dc("dvvolsets-b", "down", "-v")
         assert not exists(volB), "down -v must remove the current set's volume"
         assert exists(volA), "the other set must be left intact"
     finally:
-        dc("vt10sets-a", "down", "-v")
-        dc("vt10sets-b", "down", "-v")
+        dc("dvvolsets-a", "down", "-v")
+        dc("dvvolsets-b", "down", "-v")
         subprocess.run(["docker", "volume", "rm", "-f", volA, volB], capture_output=True, timeout=30)
 
 
-# --- VT backup / restore (atomic {.env + volumes} bundle) ------------------------------------
+# --- backup / restore (atomic {.env + volumes} bundle) ------------------------------------
 def test_coupling_fingerprint_and_manifest_carry_no_secret():
     env = {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": dv.gen_hex(16)}
     salt = dv.gen_salt()
@@ -1096,12 +1096,13 @@ def test_backup_writes_env_600_and_manifest_without_secret(tmp_path, monkeypatch
     assert (bundle / "env").exists()                          # the paired .env is copied in
     if os.name != "nt":
         assert (os.stat(bundle / "env").st_mode & 0o077) == 0, "the backup .env must be mode-600"
+        assert (os.stat(bundle).st_mode & 0o077) == 0, "the bundle dir must be owner-only (0700)"
 
 
 def test_backup_restore_round_trip_live(tmp_path):
     if shutil.which("docker") is None:
         pytest.skip("docker not available")
-    prefix = "vt10blive"
+    prefix = "dvbaklive"
     cfg = dict(_reusable_env_cfg(), volume_prefix=prefix, deployment_id="live")
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
@@ -1140,7 +1141,7 @@ def test_backup_restore_round_trip_live(tmp_path):
             run("docker", "volume", "rm", "-f", v)
 
 
-# --- VT update + logs helpers ----------------------------------------------------------------
+# --- update + logs helpers ----------------------------------------------------------------
 def test_update_version_helpers():
     assert dv.parse_semver("v0.6.0") == (0, 6, 0) and dv.parse_semver("1.2.3-rc1") == (1, 2, 3)
     assert dv.parse_semver("nightly") is None and dv.parse_semver("") is None
