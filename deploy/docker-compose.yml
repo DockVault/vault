@@ -87,7 +87,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: dockvault-vault:latest
+    image: ${DOCKVAULT_IMAGE:-dockvault-vault:latest}
     container_name: vault-api
     env_file:
       - ../.env
@@ -168,7 +168,7 @@ services:
     restart: unless-stopped
 
   vault-sftp:
-    image: dockvault-vault:latest
+    image: ${DOCKVAULT_IMAGE:-dockvault-vault:latest}
     container_name: vault-sftp
     env_file:
       - ../.env

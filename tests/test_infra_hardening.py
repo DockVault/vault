@@ -489,9 +489,180 @@ def test_deploy_scripts_hardened():
     assert "iterations=600000" in smp, "PBKDF2 must use >=600k iterations (match the runtime decryptor)"
     assert "'production'" in smp, "the ENVIRONMENT fallback must default to production, not development"
     assert "0o600" in smp, "secret files must be written mode 0600"
-    ss = _read("deploy/setup-secure.sh")
-    assert "REDIS_PASSWORD" in ss, "deploy/setup-secure.sh must generate a REDIS_PASSWORD"
-    assert "ALLOWED_HOSTS" in ss, "deploy/setup-secure.sh must write ALLOWED_HOSTS"
+    ss = _read("setup-secure.sh")
+    assert "REDIS_PASSWORD" in ss, "setup-secure.sh must generate a REDIS_PASSWORD"
+    assert "ALLOWED_HOSTS" in ss, "setup-secure.sh must write ALLOWED_HOSTS"
+
+
+def test_setup_scripts_at_root_and_secure_shim():
+    # The two user-facing setup scripts live at the repo ROOT (not deploy/), and the root
+    # docker-compose.secure.yml include-shim makes `docker compose -f docker-compose.secure.yml
+    # up` auto-load root .env with no --env-file and no moving .env into deploy/.
+    assert (ROOT / "setup-secure.sh").exists(), "setup-secure.sh must live at the repo root"
+    assert (ROOT / "setup-secure.ps1").exists(), "setup-secure.ps1 must live at the repo root"
+    assert not (ROOT / "deploy" / "setup-secure.sh").exists(), "setup-secure.sh must NOT remain in deploy/"
+    assert not (ROOT / "deploy" / "setup-secure.ps1").exists(), "setup-secure.ps1 must NOT remain in deploy/"
+
+    # Lock the path anchors: a root-anchored script must NOT climb to the parent (that would
+    # write .env/certs to the parent directory when run from a nested checkout).
+    sh = _read("setup-secure.sh")
+    assert 'cd "$(dirname "$0")"' in sh, "setup-secure.sh must anchor at its own dir (repo root)"
+    assert '"$(dirname "$0")/.."' not in sh, "setup-secure.sh must not climb to the parent dir"
+    ps = _read("setup-secure.ps1")
+    assert "= $ScriptDir" in ps, "setup-secure.ps1 $Root must be its own dir (repo root)"
+    assert "Split-Path -Parent $ScriptDir" not in ps, "setup-secure.ps1 must not climb to the parent dir"
+
+    # Root secure include-shim exists, pins the project name (for volume stability), and includes
+    # the real deploy file.
+    shim = _read("docker-compose.secure.yml")
+    assert "name: dockvault-vault" in shim, "root secure shim must pin the project name"
+    assert "deploy/docker-compose.secure.yml" in shim and "include:" in shim, \
+        "root secure shim must include: deploy/docker-compose.secure.yml"
+
+    # SECURITY.md moved under .github/ (GitHub still renders it); no stray root copy.
+    assert (ROOT / ".github" / "SECURITY.md").exists(), "SECURITY.md must live under .github/"
+    assert not (ROOT / "SECURITY.md").exists(), "no duplicate SECURITY.md at the root"
+
+    # No doc/compose/source still points at the OLD deploy/setup-secure.* location.
+    for name in ("README.md", ".env.example", "CLAUDE.md", ".github/SECURITY.md",
+                 "deploy/docker-compose.secure.yml", "app/core/config.py", "app/api/api_server.py"):
+        assert "deploy/setup-secure" not in _read(name), \
+            f"{name} still references the moved deploy/setup-secure path"
+
+
+def _secure_compose_config(profile):
+    """Render the secure stack via `docker compose config` under COMPOSE_PROFILES=profile;
+    skip cleanly if docker/compose is unavailable or the render fails for an env reason."""
+    import shutil
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    env = dict(os.environ, COMPOSE_PROFILES=profile, VAULT_DB_PASSWORD="testpw",
+               RUN_SFTP="", SFTP_HOST_PORT="2322")
+    try:
+        r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
+                           cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"docker compose unavailable: {exc}")
+    if r.returncode != 0:
+        pytest.skip(f"docker compose config failed: {r.stderr[:200]}")
+    return r.stdout
+
+
+def test_secure_compose_combined_default_and_split_profile():
+    # DEFAULT (combined): ONE 'vault' container runs run_combined.py; the split pair is absent.
+    combined = _secure_compose_config("combined")
+    assert "run_combined.py" in combined, "combined mode must run run_combined.py"
+    assert "app.api.api_server" not in combined and "app.sftp.sftp_server" not in combined, \
+        "combined mode must NOT render the split vault-api/vault-sftp commands"
+    # SPLIT: vault-api + vault-sftp run their own commands; the combined launcher is absent.
+    split = _secure_compose_config("split")
+    assert "app.api.api_server" in split and "app.sftp.sftp_server" in split, \
+        "split mode must render both the web and sftp services"
+    assert "run_combined.py" not in split, "split mode must NOT run the combined launcher"
+    # Both modes mount the SAME named volumes -> switching modes never loses data.
+    for vol in ("vault_storage", "vault_keys"):
+        assert vol in combined and vol in split, f"{vol} must be mounted in both modes"
+
+
+def test_setup_scripts_write_combined_profile_scheme():
+    # The setup scripts must write the new combined/split scheme (RUN_SFTP for SFTP-in-combined),
+    # NOT the retired first-run `COMPOSE_PROFILES=sftp`, or the primary deploy path renders no app.
+    for name in ("setup-secure.sh", "setup-secure.ps1"):
+        s = _read(name)
+        assert "COMPOSE_PROFILES=combined" in s, f"{name} must write COMPOSE_PROFILES=combined"
+        assert "RUN_SFTP=1" in s, f"{name} must set RUN_SFTP=1 when SFTP is enabled in combined mode"
+        # Must not WRITE the retired sftp profile (a quoted env-line value). Bare mentions in
+        # migration comments / "sftp -> split" messages are fine (they have a space after).
+        assert 'COMPOSE_PROFILES=sftp"' not in s and "COMPOSE_PROFILES=sftp'" not in s, \
+            f"{name} must not write the retired sftp profile"
+    # .env.example ships the mode + the SFTP toggle so a manual `cp .env.example .env` just works.
+    envx = _read(".env.example")
+    assert "COMPOSE_PROFILES=combined" in envx and "RUN_SFTP=" in envx, \
+        ".env.example must ship COMPOSE_PROFILES=combined and RUN_SFTP"
+
+
+def test_env_example_documents_every_settings_field():
+    # .env.example must document every pydantic Settings field (so a self-hoster can discover
+    # each knob) — this lock catches a new config field that never got a .env.example entry.
+    import re
+    cfg = _read("app/core/config.py")
+    m = re.search(r"class Settings\(BaseSettings\):(.*?)\n(?:settings = Settings|class )", cfg, re.S)
+    assert m, "could not locate the Settings class in app/core/config.py"
+    fields = re.findall(r"^    ([a-z_][a-z0-9_]*)\s*:\s*[^=\n]+=\s*Field", m.group(1), re.M)
+    assert len(fields) > 40, "sanity: expected many Settings fields"
+    env = _read(".env.example")
+    documented = set(re.findall(r"^\s*#?\s*([A-Z_][A-Z0-9_]*)\s*=", env, re.M))
+    missing = sorted(f.upper() for f in fields if f.upper() not in documented)
+    assert not missing, f".env.example is missing these Settings keys: {missing}"
+    # The non-Settings toggles a self-hoster sets must be documented too.
+    for k in ("RUN_SFTP", "COMPOSE_PROFILES", "SFTP_HOST_PORT", "CORS_ALLOW_ORIGINS", "ALLOWED_HOSTS"):
+        assert k in documented, f".env.example must document {k}"
+
+
+def test_app_version_from_version_file_not_hardcoded():
+    import re
+    # A committed VERSION file (valid semver) is the single source of truth for the app's version.
+    ver = _read("VERSION").strip()
+    assert re.match(r"^\d+\.\d+\.\d+", ver), f"VERSION must be semver-ish, got {ver!r}"
+    # branding reads it as the default (not a hardcoded literal); BRAND_APP_VERSION can override.
+    br = _read("app/config/branding.py")
+    assert "default_factory=_read_version_file" in br, "app_version must default to the VERSION file"
+    assert 'default="1.0.0"' not in br, "app_version must not be a hardcoded 1.0.0"
+    # api_server.py must no longer report a hardcoded version.
+    api = _read("app/api/api_server.py")
+    assert 'version="1.0.0"' not in api and '"version": "1.0.0"' not in api, \
+        "api_server.py must report branding.app_version, not a hardcoded 1.0.0"
+    assert "version=branding.app_version" in api, "the FastAPI app must use branding.app_version"
+
+
+def test_update_check_admin_gated_and_default_off():
+    import re
+    api = _read("app/api/api_server.py")
+    assert '@app.get("/api/update-status")' in api, "the update-status endpoint must exist"
+    m = re.search(r'@app\.get\("/api/update-status"\)\s*\n(?:async )?def \w+\((.*?)\):', api, re.S)
+    assert m and "require_interactive_admin" in m.group(1), \
+        "update-status must be gated by an interactive admin (not public like /version)"
+    # Default OFF in config (opt-in; air-gapped installs make no outbound calls).
+    cfg = _read("app/core/config.py")
+    assert "update_check_enabled: bool = Field(default=False)" in cfg, "update check must default OFF"
+    assert "managed_deployment: bool = Field(default=False)" in cfg
+    envx = _read(".env.example")
+    assert "UPDATE_CHECK_ENABLED=false" in envx and "MANAGED_DEPLOYMENT=false" in envx
+    # The phone-home is documented for the operator.
+    assert "UPDATE_CHECK_ENABLED" in _read(".github/SECURITY.md"), \
+        "SECURITY.md must document the update-check phone-home"
+
+
+def test_release_workflow_and_upgrade_docs():
+    import re
+    wf = _read(".github/workflows/release.yml")
+    # Builds + pushes to GHCR, stamps the version, triggers on a version tag.
+    assert "ghcr.io/" in wf and "build-push-action" in wf, "release.yml must build+push to GHCR"
+    assert "APP_VERSION=" in wf, "release.yml must stamp the version via the build-arg"
+    assert "v*.*.*" in wf, "release.yml must trigger on a version tag"
+    # Every action is pinned to a full commit SHA (supply-chain hardening for a public security repo).
+    for use in re.findall(r"uses:\s*(\S+)", wf):
+        assert re.search(r"@[0-9a-f]{40}\b", use), f"action not pinned to a full SHA: {use}"
+    # The compose image is overridable for the pull-based upgrade path.
+    assert "${DOCKVAULT_IMAGE:-dockvault-vault:latest}" in _read("deploy/docker-compose.secure.yml"), \
+        "compose image must honour DOCKVAULT_IMAGE"
+    assert "DOCKVAULT_IMAGE=" in _read(".env.example")
+    # README documents BOTH upgrade paths + the migration caveat.
+    r = _read("README.md")
+    assert "## Upgrading" in r, "README must have an Upgrading section"
+    assert "up -d --build" in r and "pull" in r, "both upgrade paths (build + pull) must be documented"
+    assert "migration" in r.lower(), "the DB-migration caveat must be documented"
+
+
+def test_readme_documents_deployment_modes():
+    # The README must explain the combined (default) vs split deployment modes and the combined-mode
+    # trade-offs a self-hoster needs to know, so the toggle isn't a silent behaviour change.
+    r = _read("README.md")
+    low = r.lower()
+    assert "combined" in low and "split" in low, "README must document combined vs split modes"
+    assert "COMPOSE_PROFILES" in r and "RUN_SFTP" in r, "README must name the mode + SFTP toggles"
+    # The key limitation: the healthcheck only covers the web half in combined mode.
+    assert "healthcheck" in low and "/health" in r, "README must note the healthcheck covers only web"
 
 
 def test_public_docs_reference_only_shipped_windows_scripts():

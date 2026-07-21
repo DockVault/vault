@@ -231,7 +231,10 @@
     margin-bottom: var(--space-lg);
 }
 
-.form-group label {
+/* Header labels only — exempt checkbox/radio OPTION labels (`.flex` / `.checkbox-label`), whose
+   flex `gap` this shared display:block base otherwise makes inert (cramped). This is the base
+   rule both skins load; the skin CSS carries the matching exemption + the .checkbox-label rule. */
+.form-group label:not(.flex):not(.checkbox-label) {
     display: block;
     margin-bottom: var(--space-sm);
     font-weight: 500;

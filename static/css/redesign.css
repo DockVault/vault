@@ -305,7 +305,14 @@ code { background: color-mix(in srgb, var(--brand-secondary) 12%, var(--surface-
    10. Forms
    ---------------------------------------------------------------------------- */
 .form-group { margin-bottom: var(--space-md); }
-.form-group label { display: block; margin-bottom: .4rem; font-size: var(--text-sm); font-weight: 500; color: var(--text-secondary); }
+/* Header labels only — exempt checkbox/radio OPTION labels (`.flex`/`.checkbox-label`), whose
+   flex gap the block override otherwise made inert (Classic skin: cramped, but not uppercase). */
+.form-group label:not(.flex):not(.checkbox-label) { display: block; margin-bottom: .4rem; font-size: var(--text-sm); font-weight: 500; color: var(--text-secondary); }
+label.checkbox-label,
+.form-group label.checkbox-label {
+    display: flex; align-items: center; gap: var(--space-sm);
+    margin-bottom: 0; font-weight: 400; color: var(--text-primary);
+}
 .form-control, .form-input, .form-textarea, .form-select, input[type="text"], input[type="email"], input[type="password"], input[type="number"], input[type="datetime-local"], select, textarea {
     width: 100%;
     font-family: var(--font-sans); font-size: var(--text-sm);

@@ -92,6 +92,15 @@ class Settings(BaseSettings):
     # Environment Configuration
     environment: str = Field(default="production")  # Options: development, production
 
+    # Opt-in self-update check (default OFF). When on, the app checks GitHub Releases at most
+    # once/day for a newer version and shows an admin-only banner. Fail-closed-silent (never
+    # blocks a request, never errors to the user) and NO telemetry / instance identifier — only
+    # the outbound request's egress IP reaches GitHub. See app/services/update_check.py.
+    update_check_enabled: bool = Field(default=False)
+    # A control-plane-managed (SaaS) deployment upgrades via operator promote, not self-service,
+    # so the update banner is SUPPRESSED when this is set (the control plane sets it at provision).
+    managed_deployment: bool = Field(default=False)
+
     # Plan-imposed feature ceiling. The control plane injects these as PLAN_* env
     # vars at provision time so a deployment can't use features its plan excludes —
     # a HARD ceiling (a pushed admin /settings value could be toggled back by the
@@ -295,7 +304,7 @@ if (settings.jwt_algorithm or "").strip() not in {"HS256", "HS384", "HS512"}:
 #     "vault2024", "Password1") can't boot the account that reads every non-ZK vault server-side.
 #     Fail SAFE: only an explicit ENVIRONMENT=development is lenient — "production" (the default),
 #     "staging", "prod", or a typo all get the strict tier, matching the plaintext-transport warning.
-# `deploy/setup-secure.sh` forces production, so it passes both tiers. A deployment that deliberately runs in
+# `./setup-secure.sh` forces production, so it passes both tiers. A deployment that deliberately runs in
 # `development` mode is opting into the lenient tier for a trusted/local environment (where the admin
 # password is expected to be set out of band), so only the always-on placeholder check applies there.
 _ADMIN_PASSWORD_SHIPPED_PLACEHOLDERS = {"replace_me"}

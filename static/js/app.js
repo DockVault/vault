@@ -481,9 +481,15 @@ function showToast(message, type = 'info', duration = 5000) {
             <div class="toast-title">${titles[type]}</div>
             <div class="toast-message">${escapeHtml(message)}</div>
         </div>
-        <button class="toast-close" onclick="this.parentElement.remove()">×</button>
+        <button class="toast-close" type="button">×</button>
     `;
-    
+
+    // Wire the close button programmatically — an inline onclick= attribute is blocked by the
+    // page CSP (script-src 'self', no unsafe-inline), which both spammed the console and left the
+    // × dead. Remove the whole toast, matching the old this.parentElement.remove().
+    const closeBtn = toast.querySelector('.toast-close');
+    if (closeBtn) closeBtn.addEventListener('click', () => toast.remove());
+
     container.appendChild(toast);
     
     // Auto-remove after duration
@@ -1725,7 +1731,7 @@ function currentShareTag() {
     return ((_shareCreate.policy && _shareCreate.policy.tags) || []).find(t => t.id === id) || null;
 }
 
-const _SHARE_AUD_LABEL = { anyone_internal: 'Anyone with the link', users: 'Specific users', departments: 'Departments' };
+const _SHARE_AUD_LABEL = { anyone_internal: 'Anyone internal with the link', users: 'Specific users', departments: 'Departments' };
 
 function onShareTagChange() {
     const t = currentShareTag();
@@ -1871,7 +1877,13 @@ async function submitCreateShare() {
         submitBtn.style.display = 'none';
         showToast('Share created', 'success');
     } catch (e) {
-        _shareSetError(e.message || 'Could not create the share.');
+        const msg = (e && e.message) || '';
+        // create_share fails closed for a vault the user only reached via a claim (not owner /
+        // member / group) — surface a clearer reason than the raw "You do not have access…".
+        const friendly = /do not have access to this vault/i.test(msg)
+            ? 'You can only create shares in a vault you own or are a member of.'
+            : (msg || 'Could not create the share.');
+        _shareSetError(friendly);
         submitBtn.disabled = false;
     }
 }
@@ -5036,6 +5048,34 @@ function revealLogToken(res) {
 }
 
 // Load settings from API
+function renderUpdateBanner(us) {
+    const banner = document.getElementById('update-banner');
+    if (!banner) return;
+    if (!us || !us.update_available || !us.latest) { banner.style.display = 'none'; return; }
+    // Honour a per-version dismissal (re-shows when a NEWER version appears).
+    if (localStorage.getItem('dv-update-dismissed') === us.latest) { banner.style.display = 'none'; return; }
+    const text = document.getElementById('update-banner-text');
+    if (text) {
+        // Normalize any leading 'v' so a v-prefixed release tag doesn't render "vv0.6.1".
+        const latest = String(us.latest).replace(/^v/i, '');
+        const current = String(us.current || '?').replace(/^v/i, '');
+        text.textContent = `A newer version (v${latest}) is available — you’re on v${current}.`;
+    }
+    const link = document.getElementById('update-banner-link');
+    if (link) {
+        // Only trust a github.com https URL from the (network-sourced) response — never a
+        // javascript:/data: link.
+        if (us.url && /^https:\/\/github\.com\//.test(us.url)) { link.href = us.url; link.style.display = ''; }
+        else { link.style.display = 'none'; }
+    }
+    const dismiss = document.getElementById('update-banner-dismiss');
+    if (dismiss) dismiss.onclick = () => {
+        localStorage.setItem('dv-update-dismissed', us.latest);
+        banner.style.display = 'none';
+    };
+    banner.style.display = '';
+}
+
 async function loadSettings() {
     try {
         const settings = await apiRequest('/settings', { silent: true });
@@ -5047,7 +5087,18 @@ async function loadSettings() {
         document.getElementById('setting-app-description').value = settings.app_description || '';
         document.getElementById('setting-max-file-size').value = settings.max_file_size || 100;
         document.getElementById('setting-allowed-types').value = (settings.allowed_file_types || []).join(', ');
-        
+
+        // App version (read-only; from the public /version endpoint)
+        try {
+            const ver = await apiRequest('/version', { silent: true });
+            const vEl = document.getElementById('setting-app-version');
+            if (vEl && ver && ver.version) vEl.textContent = 'v' + ver.version;
+        } catch (e) { /* version display is non-essential */ }
+
+        // Update-available banner (opt-in, admin-only endpoint; fail-soft). Fire-and-forget so a
+        // slow/unreachable GitHub never delays the rest of the settings form from rendering.
+        apiRequest('/api/update-status', { silent: true }).then(renderUpdateBanner).catch(() => {});
+
         // Security
         document.getElementById('setting-password-min-length').value = settings.password_min_length || 8;  // 8 = the enforced floor
         document.getElementById('setting-require-uppercase').checked = settings.require_uppercase !== false;
@@ -5253,6 +5304,37 @@ let shareTagUsersById = {};          // id -> username, for rendering the user c
 let shareTagsUIWired = false;
 const _tagUserSearchTimer = { allow: null, block: null };
 const _tagUserSearchSeq = { allow: 0, block: 0 };
+const _tagUserActive = { allow: -1, block: -1 };   // highlighted option index per picker (combobox keyboard nav)
+
+// Combobox helpers for the allowed/blocked user-search autocompletes.
+function _collapseTagUser(kind) {
+    const { search } = _tagUserPickerIds(kind);
+    const input = _stEl(search);
+    _tagUserActive[kind] = -1;
+    if (input) { input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant'); }
+}
+function _setTagUserActive(kind, idx) {
+    const { search, results } = _tagUserPickerIds(kind);
+    const host = _stEl(results), input = _stEl(search);
+    const opts = host ? Array.from(host.querySelectorAll('[role="option"]')) : [];
+    _tagUserActive[kind] = idx;
+    opts.forEach((o, i) => o.setAttribute('aria-selected', i === idx ? 'true' : 'false'));
+    if (input) {
+        if (idx >= 0 && opts[idx]) { input.setAttribute('aria-activedescendant', opts[idx].id); opts[idx].scrollIntoView({ block: 'nearest' }); }
+        else input.removeAttribute('aria-activedescendant');
+    }
+}
+function _tagUserKeydown(kind, e) {
+    const { search, results } = _tagUserPickerIds(kind);
+    const host = _stEl(results);
+    const opts = host ? Array.from(host.querySelectorAll('[role="option"]')) : [];
+    if (e.key === 'Escape') { if (host) host.replaceChildren(); _collapseTagUser(kind); return; }
+    if (!opts.length) return;
+    const cur = _tagUserActive[kind];   // -1 = no selection yet
+    if (e.key === 'ArrowDown') { e.preventDefault(); _setTagUserActive(kind, cur >= opts.length - 1 ? 0 : cur + 1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); _setTagUserActive(kind, cur <= 0 ? opts.length - 1 : cur - 1); }
+    else if (e.key === 'Enter') { const i = _tagUserActive[kind]; if (i >= 0 && opts[i]) { e.preventDefault(); opts[i].click(); } }
+}
 
 function _stEl(id) { return document.getElementById(id); }
 function _stChecked(id) { const e = _stEl(id); return !!(e && e.checked); }
@@ -5291,15 +5373,21 @@ function setupShareTagsUI() {
     const forceVO = _stEl('share-tag-force-view-only');
     if (forceVO) forceVO.addEventListener('change', _stSyncViewOnly);
     const allowSearch = _stEl('share-tag-allow-user-search');
-    if (allowSearch) allowSearch.addEventListener('input', () => {
-        clearTimeout(_tagUserSearchTimer.allow);
-        _tagUserSearchTimer.allow = setTimeout(() => _tagUserSearch('allow'), 250);
-    });
+    if (allowSearch) {
+        allowSearch.addEventListener('input', () => {
+            clearTimeout(_tagUserSearchTimer.allow);
+            _tagUserSearchTimer.allow = setTimeout(() => _tagUserSearch('allow'), 250);
+        });
+        allowSearch.addEventListener('keydown', (e) => _tagUserKeydown('allow', e));
+    }
     const blockSearch = _stEl('share-tag-block-user-search');
-    if (blockSearch) blockSearch.addEventListener('input', () => {
-        clearTimeout(_tagUserSearchTimer.block);
-        _tagUserSearchTimer.block = setTimeout(() => _tagUserSearch('block'), 250);
-    });
+    if (blockSearch) {
+        blockSearch.addEventListener('input', () => {
+            clearTimeout(_tagUserSearchTimer.block);
+            _tagUserSearchTimer.block = setTimeout(() => _tagUserSearch('block'), 250);
+        });
+        blockSearch.addEventListener('keydown', (e) => _tagUserKeydown('block', e));
+    }
     shareTagsUIWired = true;
 }
 
@@ -5343,7 +5431,7 @@ function renderShareTagsList() {
         const summary = document.createElement('div');
         summary.className = 'text-tertiary text-sm';
         const parts = [
-            `lifetime ≤ ${tag.max_lifetime_minutes}m (default ${tag.default_lifetime_minutes}m)`,
+            `lifetime max ${tag.max_lifetime_minutes}m (default ${tag.default_lifetime_minutes}m)`,
             `recipients ${tag.max_recipients_cap == null ? '∞' : tag.max_recipients_cap}`,
             `downloads ${tag.max_downloads_cap == null ? '∞' : tag.max_downloads_cap}`,
         ];
@@ -5455,7 +5543,7 @@ function _tagUserSearch(kind) {
     const host = _stEl(results);
     if (!host) return;
     const q = (_stEl(search)?.value || '').trim();
-    if (q.length < 2) { host.replaceChildren(); return; }
+    if (q.length < 2) { host.replaceChildren(); _collapseTagUser(kind); return; }
     apiRequest(`/users/search?q=${encodeURIComponent(q)}`, { silent: true }).then(users => {
         if (seq !== _tagUserSearchSeq[kind]) return;  // a newer keystroke superseded this one
         _renderTagUserResults(kind, Array.isArray(users) ? users : []);
@@ -5466,10 +5554,12 @@ function _tagUserSearch(kind) {
 }
 
 function _renderTagUserResults(kind, users) {
-    const { results } = _tagUserPickerIds(kind);
-    const host = _stEl(results);
+    const { search, results } = _tagUserPickerIds(kind);
+    const host = _stEl(results), input = _stEl(search);
     if (!host) return;
     host.replaceChildren();
+    _tagUserActive[kind] = -1;
+    if (input) input.removeAttribute('aria-activedescendant');
     const already = kind === 'allow' ? shareTagEditorAllowUserIds : shareTagEditorBlockUserIds;
     const fresh = users.filter(u => !already.includes(u.id));
     if (!fresh.length) {
@@ -5477,12 +5567,16 @@ function _renderTagUserResults(kind, users) {
         none.className = 'text-tertiary text-sm';
         none.textContent = 'No matching users.';
         host.appendChild(none);
+        if (input) input.setAttribute('aria-expanded', 'true');   // listbox is shown (with a message)
         return;
     }
-    fresh.forEach(u => {
+    fresh.forEach((u, i) => {
         shareTagUsersById[u.id] = u.username || u.email || String(u.id).slice(0, 8);
         const row = document.createElement('button');
         row.type = 'button';
+        row.id = `${results}-opt-${i}`;
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-selected', 'false');
         row.className = 'pick-row';
         row.style.width = '100%';
         row.style.textAlign = 'left';
@@ -5490,6 +5584,7 @@ function _renderTagUserResults(kind, users) {
         row.addEventListener('click', () => _addTagUser(kind, u.id));
         host.appendChild(row);
     });
+    if (input) input.setAttribute('aria-expanded', 'true');
 }
 
 function _addTagUser(kind, id) {
@@ -5503,6 +5598,39 @@ function _addTagUser(kind, id) {
     const { search, results } = _tagUserPickerIds(kind);
     if (_stEl(search)) _stEl(search).value = '';
     if (_stEl(results)) _stEl(results).replaceChildren();
+    _collapseTagUser(kind);
+}
+
+// Reflect a stored tag colour (a CHIP_COLORS name, a #hex, or '') onto the swatch picker:
+// set the hidden #share-tag-color the save path reads, highlight the matching swatch, and seed
+// the custom picker from a hex value. Mirrors setGroupColor.
+function setShareTagColor(color) {
+    const hidden = _stEl('share-tag-color');
+    if (hidden) hidden.value = color || '';
+    document.querySelectorAll('#share-tag-color-swatches .accent-swatch').forEach(s => {
+        s.classList.toggle('selected', (s.getAttribute('data-color') || '') === (color || ''));
+    });
+    const custom = _stEl('share-tag-color-custom');
+    if (custom && color && color.charAt(0) === '#') custom.value = color;
+}
+
+// "(~N days)" hint for a minutes value (blank/<=0 => no hint). 1440 -> "~1 day", 10080 -> "~7 days".
+function shareTagDaysHint(minutes) {
+    const m = parseInt(minutes, 10);
+    if (!m || m <= 0) return '';
+    const days = m / 1440;
+    const n = days < 10 ? Math.round(days * 10) / 10 : Math.round(days);
+    if (n <= 0) return '(< 1 day)';   // sub-day lifetime — avoid a misleading "~0 days"
+    return `(~${n} day${n === 1 ? '' : 's'})`;
+}
+
+// Refresh the live day hints beside the Lifetime maximum + default inputs.
+function updateShareTagLifetimeHints() {
+    [['share-tag-max-lifetime', 'share-tag-max-lifetime-days'],
+     ['share-tag-default-lifetime', 'share-tag-default-lifetime-days']].forEach(([inId, hintId]) => {
+        const hint = _stEl(hintId), input = _stEl(inId);
+        if (hint) hint.textContent = shareTagDaysHint(input ? input.value : '');
+    });
 }
 
 function openShareTagEditor(tag) {
@@ -5513,9 +5641,12 @@ function openShareTagEditor(tag) {
     _stEl('share-tag-editor-id').value = tag ? t.id : '';
     _stEl('share-tag-name').value = t.name || '';
     _stEl('share-tag-description').value = t.description || '';
-    _stEl('share-tag-color').value = t.color || '';
+    setShareTagColor(t.color || '');
     _stEl('share-tag-max-lifetime').value = t.max_lifetime_minutes != null ? t.max_lifetime_minutes : 10080;
     _stEl('share-tag-default-lifetime').value = t.default_lifetime_minutes != null ? t.default_lifetime_minutes : 1440;
+    updateShareTagLifetimeHints();
+    const _stErr = _stEl('share-tag-editor-error');
+    if (_stErr) { _stErr.textContent = ''; _stErr.style.display = 'none'; }
     _stEl('share-tag-max-recipients-cap').value = t.max_recipients_cap != null ? t.max_recipients_cap : '';
     _stEl('share-tag-max-recipients-default').value = t.max_recipients_default != null ? t.max_recipients_default : '';
     _stEl('share-tag-max-downloads-cap').value = t.max_downloads_cap != null ? t.max_downloads_cap : '';
@@ -5536,6 +5667,7 @@ function openShareTagEditor(tag) {
     shareTagEditorBlockUserIds = (t.blocked_user_ids || []).map(String);
     ['share-tag-allow-user-search', 'share-tag-block-user-search'].forEach(id => { if (_stEl(id)) _stEl(id).value = ''; });
     ['share-tag-allow-user-results', 'share-tag-block-user-results'].forEach(id => { if (_stEl(id)) _stEl(id).replaceChildren(); });
+    _collapseTagUser('allow'); _collapseTagUser('block');   // clear stale aria-expanded / aria-activedescendant on reopen
     _renderTagAllowChips();
     _renderTagBlockChips();
     // resolve the stored ids of an existing tag into usernames (fetch the admin user list once)
@@ -5558,16 +5690,38 @@ async function saveShareTag() {
     if (_stChecked('share-tag-aud-users')) aud.push('users');
     if (_stChecked('share-tag-aud-departments')) aud.push('departments');
     if (_stChecked('share-tag-aud-anyone')) aud.push('anyone_internal');
+    // Validate client-side with inline errors — no server round-trip on an obvious mistake, and
+    // NEVER coerce an empty/0 lifetime to 1 (the old `|| 1` silently expired every share in a minute).
+    const _err = _stEl('share-tag-editor-error');
+    const _fail = (msg, focusId) => {
+        if (_err) { _err.textContent = msg; _err.style.display = ''; }
+        if (focusId && _stEl(focusId)) _stEl(focusId).focus();
+        return true;
+    };
+    if (_err) { _err.textContent = ''; _err.style.display = 'none'; }
+    const name = _stEl('share-tag-name').value.trim();
+    const maxLife = _stNumOrNull('share-tag-max-lifetime');
+    const defLife = _stNumOrNull('share-tag-default-lifetime');
+    const maxRcp = _stNumOrNull('share-tag-max-recipients-cap');
+    const defRcp = _stNumOrNull('share-tag-max-recipients-default');
+    const maxDl = _stNumOrNull('share-tag-max-downloads-cap');
+    const defDl = _stNumOrNull('share-tag-max-downloads-default');
+    if (!name && _fail('A tag name is required.', 'share-tag-name')) return;
+    if ((!maxLife || maxLife < 1) && _fail('Maximum lifetime must be at least 1 minute.', 'share-tag-max-lifetime')) return;
+    if ((!defLife || defLife < 1) && _fail('Default lifetime must be at least 1 minute.', 'share-tag-default-lifetime')) return;
+    if (defLife > maxLife && _fail('Default lifetime cannot exceed the maximum.', 'share-tag-default-lifetime')) return;
+    if (maxRcp != null && defRcp != null && defRcp > maxRcp && _fail('Default recipients cannot exceed the maximum.', 'share-tag-max-recipients-default')) return;
+    if (maxDl != null && defDl != null && defDl > maxDl && _fail('Default downloads cannot exceed the maximum.', 'share-tag-max-downloads-default')) return;
     const body = {
-        name: _stEl('share-tag-name').value.trim(),
+        name: name,
         description: _stEl('share-tag-description').value.trim() || null,
         color: _stEl('share-tag-color').value.trim() || null,
-        max_lifetime_minutes: _stNumOrNull('share-tag-max-lifetime') || 1,
-        default_lifetime_minutes: _stNumOrNull('share-tag-default-lifetime') || 1,
-        max_recipients_cap: _stNumOrNull('share-tag-max-recipients-cap'),
-        max_recipients_default: _stNumOrNull('share-tag-max-recipients-default'),
-        max_downloads_cap: _stNumOrNull('share-tag-max-downloads-cap'),
-        max_downloads_default: _stNumOrNull('share-tag-max-downloads-default'),
+        max_lifetime_minutes: maxLife,
+        default_lifetime_minutes: defLife,
+        max_recipients_cap: maxRcp,
+        max_recipients_default: defRcp,
+        max_downloads_cap: maxDl,
+        max_downloads_default: defDl,
         allowed_audiences: aud,
         allow_view_only: _stChecked('share-tag-allow-view-only'),
         default_view_only: _stChecked('share-tag-default-view-only'),
@@ -10420,6 +10574,26 @@ document.addEventListener('DOMContentLoaded', () => {
     if (groupColorCustom) {
         groupColorCustom.addEventListener('input', () => setGroupColor(groupColorCustom.value));
     }
+    // Share-tag colour picker: named swatches + a custom <input type=color> (mirrors the Groups editor).
+    const shareTagColorSwatches = document.getElementById('share-tag-color-swatches');
+    if (shareTagColorSwatches) {
+        shareTagColorSwatches.addEventListener('click', (e) => {
+            const sw = e.target.closest('.accent-swatch');
+            if (sw) {
+                e.preventDefault();
+                setShareTagColor(sw.getAttribute('data-color') || '');
+            }
+        });
+    }
+    const shareTagColorCustom = document.getElementById('share-tag-color-custom');
+    if (shareTagColorCustom) {
+        shareTagColorCustom.addEventListener('input', () => setShareTagColor(shareTagColorCustom.value));
+    }
+    // Live "(~N days)" hints beside the share-tag Lifetime inputs.
+    ['share-tag-max-lifetime', 'share-tag-default-lifetime'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('input', updateShareTagLifetimeHints);
+    });
     // Searchable "Add members" modal
     const addMembersSearch = document.getElementById('add-members-search');
     if (addMembersSearch) addMembersSearch.addEventListener('input', () => renderAddMembersList(addMembersSearch.value));

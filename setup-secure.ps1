@@ -1,6 +1,6 @@
 # setup-secure.ps1 - one-command PRODUCTION (HTTPS) setup for DockVault on Windows.
 #
-# The Windows counterpart of deploy/setup-secure.sh: it writes ./.env with freshly generated
+# The Windows counterpart of ./setup-secure.sh: it writes ./.env with freshly generated
 # secrets, provisions TLS certificates into ./certs, and starts the HTTPS-only stack from
 # deploy/docker-compose.secure.yml (web UI/API on https://<name>, TLS terminated in-container; no
 # plaintext listener). Postgres + Redis stay internal to the compose network.
@@ -8,12 +8,12 @@
 # Requires Docker Desktop (Linux containers). The script lives in deploy/ but anchors
 # itself at the repo root (where .env + certs/ live). Run it from the repo root in PowerShell:
 #
-#   ./deploy/setup-secure.ps1 -ServerName vault.example.com                 # self-signed (default)
-#   ./deploy/setup-secure.ps1 -ServerName vault.example.com -CertMode byo `
+#   ./setup-secure.ps1 -ServerName vault.example.com                 # self-signed (default)
+#   ./setup-secure.ps1 -ServerName vault.example.com -CertMode byo `
 #                             -CertPath C:\certs\fullchain.pem -KeyPath C:\certs\privkey.pem
-#   ./deploy/setup-secure.ps1 -ServerName vault.example.com -EnableSftp     # also expose SFTP
-#   ./deploy/setup-secure.ps1 -ServerName vault.example.com -AdminPassword 'a-strong-12+char-pass'
-#   ./deploy/setup-secure.ps1 -ServerName vault.example.com -NoStart        # set up, do not start
+#   ./setup-secure.ps1 -ServerName vault.example.com -EnableSftp     # also expose SFTP
+#   ./setup-secure.ps1 -ServerName vault.example.com -AdminPassword 'a-strong-12+char-pass'
+#   ./setup-secure.ps1 -ServerName vault.example.com -NoStart        # set up, do not start
 #
 # The first admin account is created at startup from ADMIN_USERNAME/ADMIN_PASSWORD (written to
 # .env). If you don't pass -AdminPassword it prompts, and a blank answer auto-generates a strong
@@ -48,9 +48,9 @@ param(
 $ErrorActionPreference = 'Continue'
 Set-StrictMode -Version 2.0
 
-# This script lives in deploy/ - the repo ROOT (parent dir) is where .env and certs/ live.
+# This script lives at the repo ROOT - where .env and certs/ live.
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Root      = Split-Path -Parent $ScriptDir
+$Root      = $ScriptDir
 $EnvFile   = Join-Path $Root '.env'
 $CertDir   = Join-Path $Root 'certs'
 # Absolute path so `docker compose` finds the file no matter which directory the script is
@@ -124,7 +124,7 @@ function New-FernetKey {
 # The cert + key are bind-mounted read-only into the container and read by uvicorn as the non-root
 # app user (uid 10001). OpenSSL writes the key mode 0600 owned by root, so that user cannot read it
 # (uvicorn then dies with a TLS-key PermissionError). Set-CertReadable (below) fixes the mode after
-# generation; the Linux deploy/setup-secure.sh does the equivalent via a numeric chown.
+# generation; the Linux ./setup-secure.sh does the equivalent via a numeric chown.
 
 # Run OpenSSL from the host if present, otherwise via a throwaway container so the host needs
 # nothing but Docker. Args run with the certs dir as the working directory.
@@ -267,12 +267,33 @@ if (Test-Path $EnvFile) {
     # A .env written before admin-seeding (e.g. by an older copy of this script) may have NO
     # ADMIN_PASSWORD, in which case no admin is created and login has no valid account. Warn + guide.
     $envText = Get-Content -Raw $EnvFile -ErrorAction SilentlyContinue
+    if ($null -eq $envText) { $envText = '' }
     if ($envText -notmatch "(?m)^\s*ADMIN_PASSWORD\s*=\s*\S") {
         Warn 'your existing ./.env has no ADMIN_PASSWORD, so NO admin account will be created (the login page will have no valid account).'
         Write-Host "    Fix it: add these lines to ./.env, then re-run this script (or restart the stack):"
         Write-Host "        ADMIN_USERNAME='admin'"
         Write-Host "        ADMIN_PASSWORD='$(New-HexSecret 12)'   # example - a strong 12+ char value"
-        Write-Host "    Restart:  docker compose --env-file .env -f deploy/docker-compose.secure.yml up -d"
+        Write-Host "    Restart:  docker compose -f docker-compose.secure.yml up -d"
+    }
+    # Migrate a pre-combined/split .env in place (volumes are shared by name, so nothing moves):
+    # older deploys used COMPOSE_PROFILES=sftp (two containers) or no profile (web only); the
+    # compose now needs exactly one of combined/split.
+    if ($envText -match '(?m)^\s*COMPOSE_PROFILES\s*=.*(combined|split)') {
+        # already on the new scheme
+    } elseif ($envText -match '(?m)^\s*COMPOSE_PROFILES\s*=.*sftp') {
+        Say 'migrating COMPOSE_PROFILES=sftp -> split (keeps the two-container layout)'
+        $newText = [regex]::Replace($envText, '(?m)^\s*COMPOSE_PROFILES\s*=.*$', 'COMPOSE_PROFILES=split')
+        [System.IO.File]::WriteAllText($EnvFile, $newText, (New-Object System.Text.ASCIIEncoding))
+    } else {
+        Say 'setting COMPOSE_PROFILES=combined (single-container default)'
+        if ($envText -match '(?m)^\s*COMPOSE_PROFILES\s*=') {
+            # an existing line with an unrecognized value -> REPLACE it (never duplicate the key)
+            $newText = [regex]::Replace($envText, '(?m)^\s*COMPOSE_PROFILES\s*=.*$', 'COMPOSE_PROFILES=combined')
+            [System.IO.File]::WriteAllText($EnvFile, $newText, (New-Object System.Text.ASCIIEncoding))
+        } else {
+            $sep = if ($envText.EndsWith("`n") -or $envText -eq '') { '' } else { "`n" }
+            [System.IO.File]::AppendAllText($EnvFile, $sep + "COMPOSE_PROFILES=combined`n", (New-Object System.Text.ASCIIEncoding))
+        }
     }
 } else {
     Say 'writing ./.env with freshly generated secrets'
@@ -306,7 +327,10 @@ if (Test-Path $EnvFile) {
         "ADMIN_EMAIL='$AdminEmail'",
         "ADMIN_PASSWORD='$AdminPassword'"
     )
-    if ($EnableSftp) { $lines += 'COMPOSE_PROFILES=sftp' }
+    # Deployment mode: combined (one container; RUN_SFTP toggles the in-container SFTP server).
+    # Set COMPOSE_PROFILES=split by hand for the two-container layout instead.
+    $lines += 'COMPOSE_PROFILES=combined'
+    if ($EnableSftp) { $lines += 'RUN_SFTP=1' }
     # ASCII, no BOM: the app and docker compose read this as a plain env file.
     [System.IO.File]::WriteAllText($EnvFile, (($lines -join "`n") + "`n"), (New-Object System.Text.ASCIIEncoding))
     # Best-effort: this file holds every secret, so drop inherited ACLs and grant only the current

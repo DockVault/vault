@@ -30,6 +30,7 @@ from pathlib import Path
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
 from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim
 from app.core import sharing_policy
+from app.config.branding import branding
 # NOTE: auth_service and vault_service BOTH define a class named RateLimitExceededError
 # (unrelated: one subclasses AuthenticationError, the other FileServiceError). Import the
 # auth one under an alias so the later vault import below can't shadow it — otherwise the
@@ -79,7 +80,7 @@ def get_active_operations_count() -> int:
 app = FastAPI(
     title="Secure SFTP Management API",
     description="Management API for secure SFTP server with vault system",
-    version="1.0.0",
+    version=branding.app_version,
     # Disable interactive API docs in production to prevent endpoint enumeration
     docs_url="/docs" if settings.environment == "development" else None,
     redoc_url="/redoc" if settings.environment == "development" else None,
@@ -406,7 +407,7 @@ from app.config.effective import BRAND_SETTINGS_KEY, set_brand_overrides
 # to run before any admin exists), so it must become unreachable the moment an instance is
 # set up — otherwise an anonymous request could reconfigure a live production instance
 # (create/alter the admin, rewrite config). "Set up" = ANY admin user exists, which every
-# production deploy has from startup (deploy/setup-secure.sh and the SaaS portal seed the admin
+# production deploy has from startup (./setup-secure.sh and the SaaS portal seed the admin
 # from env). Queried WITHOUT the is_active filter on purpose: a deactivated admin still
 # means the instance is set up and must NOT re-open the wizard. Setup is done by the
 # provisioning script / portal, so the wizard is a first-run-only fallback for a bare deploy.
@@ -1297,9 +1298,28 @@ async def api_root():
     """API information endpoint."""
     return {
         "message": "Secure SFTP Management API",
-        "version": "1.0.0",
+        "version": branding.app_version,
         "status": "operational"
     }
+
+
+@app.get("/api/update-status")
+def get_update_status_endpoint(current_user: User = Depends(require_interactive_admin)):
+    """Admin-only: whether a newer DockVault release exists (opt-in, default off).
+
+    Deliberately a SYNC endpoint: the (cached, once/day) update check does a BLOCKING urllib
+    request, so FastAPI runs this in a threadpool instead of stalling the async event loop.
+
+    Gated behind an interactive admin so the (mildly fingerprint-aiding) 'outdated?' signal is
+    not exposed publicly like /version is. Returns {enabled, managed, current, latest,
+    update_available, url, notes, checked_at}; the check itself is fail-closed-silent and only
+    ever runs when UPDATE_CHECK_ENABLED is set (and never for a managed/SaaS deployment)."""
+    from app.services import update_check
+    return update_check.get_update_status(
+        current_version=branding.app_version,
+        enabled=settings.update_check_enabled,
+        managed=settings.managed_deployment,
+    )
 
 
 @app.get("/health")
@@ -10531,7 +10551,7 @@ if __name__ == "__main__":
         print("\n⚠️  WARNING: serving PLAINTEXT HTTP with ENVIRONMENT != development and no TRUSTED_PROXIES set.")
         print("   Login credentials and bearer tokens cross the network in cleartext if this port is")
         print("   reachable off-host. Enable TLS (API_USE_HTTPS=true) or front the app with an HTTPS")
-        print("   reverse proxy (deploy/docker-compose.secure.yml / deploy/setup-secure.sh do this for you).")
+        print("   reverse proxy (deploy/docker-compose.secure.yml / ./setup-secure.sh do this for you).")
 
     uvicorn.run(
         app,
