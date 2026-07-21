@@ -198,6 +198,19 @@ secrets). Don't edit the prefix by hand; the management tool's **Volumes** menu 
 The **Reset** menu tears the current set down with `docker compose down -v` (a strong, typed
 confirmation — this destroys the data) and moves the `.env` aside so a later setup starts fresh.
 
+### Backup & restore
+
+The **Backup & Restore** menu treats a set as one atomic bundle. **Backup** writes a timestamped
+directory containing a `tar.gz` of each data volume (`vault_pg_data`, `vault_storage`, `vault_keys`,
+and `vault_brand` if present), a copy of the paired **`.env`**, and a `manifest.json`. The manifest
+holds **no secret** — only a salted one-way fingerprint that lets restore confirm the `.env` in the
+bundle really is the one those volumes were created with. **Restore** verifies that fingerprint,
+recreates the volumes, and installs the paired `.env`; it refuses a bundle whose `.env` doesn't match
+its volumes, and won't overwrite existing volumes unless you pass `--force`.
+
+> **The `env` file in a backup holds `ENCRYPTION_KEY`.** Treat the whole bundle as a secret — store it
+> off-host, encrypted or access-controlled. Anyone with the bundle can read the vault's data.
+
 ## Repository layout
 
 | Path | What lives there |

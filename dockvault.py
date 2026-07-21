@@ -207,9 +207,11 @@ def docker_available(run=subprocess.run):
 
 
 # --- setup: secrets + .env authoring (the pure, testable core) --------------------------------
-import base64  # noqa: E402
-import glob    # noqa: E402
-import re      # noqa: E402
+import base64   # noqa: E402
+import glob     # noqa: E402
+import hashlib  # noqa: E402
+import json     # noqa: E402
+import re       # noqa: E402
 
 # The three secrets the compose file demands (an existing .env must carry these to be reusable).
 REQUIRED_SECRET_KEYS = ("ENCRYPTION_KEY", "JWT_SECRET_KEY", "VAULT_DB_PASSWORD")
@@ -842,6 +844,13 @@ def set_volume_names(prefix):
     return {role: "%s_%s" % (prefix, base) for role, base in VOLUME_BASENAMES.items()}
 
 
+def valid_volume_prefix(prefix):
+    """True if `prefix` is a safe docker volume-name prefix (docker's own rule: an alnum start then
+    alnum/_/./-, no slash or traversal). Used to reject a crafted backup manifest whose prefix could
+    otherwise redirect a restore's `-v` bind mount to an arbitrary host path."""
+    return bool(prefix) and re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", prefix) is not None
+
+
 def volume_set_prefix(name):
     """Derive a set's prefix from a DockVault volume name ('<prefix>_vault_<role>'), or None if the
     name doesn't end in a known volume basename."""
@@ -903,6 +912,85 @@ def plan_volume_action(choice):
         "repoint": {"action": "repoint", "author_env": False, "requires_env": True, "guard": True},
     }
     return plans.get(choice)
+
+
+# --- backup / restore (atomic {.env + volumes} bundle) ---------------------------------------
+# A backup is ONE directory holding: `env` (the paired .env - it carries ENCRYPTION_KEY, so the whole
+# bundle is sensitive), a tar.gz per data volume, and manifest.json. The manifest carries NO secret -
+# only a salted one-way commitment over the .env's two random per-set secrets, so restore can confirm
+# the .env in the bundle really is the one those volumes were created with (a swapped/wrong .env fails).
+BACKUP_ROLES = ("pg", "storage", "keys", "brand")   # order restored in; brand is optional
+
+
+def gen_salt():
+    """A random, NON-secret salt for a backup's coupling fingerprint."""
+    return gen_hex(16)
+
+
+def _timestamp():
+    """A filesystem-safe local timestamp (YYYYmmdd-HHMMSS) for a backup bundle name."""
+    import datetime
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def compute_coupling_fingerprint(env, salt):
+    """A NON-secret, one-way commitment coupling a set's volumes to its .env: a salted SHA-256 over the
+    two random per-set secrets. Reveals neither (both are cryptographically random, so the digest is not
+    reversible), yet matches ONLY that exact .env. Stdlib hashlib."""
+    material = "%s\x00%s\x00%s" % (salt, env.get("ENCRYPTION_KEY", ""), env.get("VAULT_DB_PASSWORD", ""))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def build_backup_manifest(prefix, bundle_id, volumes, salt, env, created=""):
+    """The backup manifest dict (NO secrets): identifies the set + records the salted coupling
+    fingerprint of the paired .env. `volumes` is a list of {role, name, archive}."""
+    return {
+        "dockvault_backup": 1,
+        "created": created,
+        "volume_prefix": prefix,
+        "bundle_id": bundle_id or "default",
+        "volumes": list(volumes),
+        "env_file": "env",
+        "coupling": {"salt": salt, "sha256": compute_coupling_fingerprint(env, salt)},
+        "note": "The 'env' file in this backup holds ENCRYPTION_KEY - protect the whole bundle off-host.",
+    }
+
+
+def verify_backup_coupling(env, manifest):
+    """True iff `env` is the .env this manifest was built from (recompute the salted fingerprint and
+    compare). A wrong/swapped .env -> False, so restore refuses a mismatched bundle. A malformed
+    manifest (not a dict, or a non-dict/empty `coupling`) -> False, never a crash."""
+    coupling = manifest.get("coupling") if isinstance(manifest, dict) else None
+    if not isinstance(coupling, dict):
+        return False
+    salt, expected = coupling.get("salt"), coupling.get("sha256")
+    if not (salt and expected):
+        return False
+    return compute_coupling_fingerprint(env, salt) == expected
+
+
+def tar_volume(volume, dest_dir, archive_name, run=subprocess.run):
+    """Archive a docker volume to <dest_dir>/<archive_name> via a throwaway busybox container (read-only
+    source mount). Returns True on success. Best-effort False on any docker error."""
+    try:
+        r = run(["docker", "run", "--rm", "-v", "%s:/src:ro" % volume, "-v", "%s:/dest" % dest_dir,
+                 "busybox", "sh", "-c", "cd /src && tar czf /dest/%s ." % archive_name],
+                capture_output=True, text=True, timeout=600)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return getattr(r, "returncode", 1) == 0
+
+
+def untar_volume(volume, src_dir, archive_name, run=subprocess.run):
+    """Restore <src_dir>/<archive_name> into a docker volume via a throwaway busybox container (the -v
+    mount creates the volume if absent). Returns True on success."""
+    try:
+        r = run(["docker", "run", "--rm", "-v", "%s:/dest" % volume, "-v", "%s:/src:ro" % src_dir,
+                 "busybox", "sh", "-c", "cd /dest && tar xzf /src/%s" % archive_name],
+                capture_output=True, text=True, timeout=600)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return getattr(r, "returncode", 1) == 0
 
 
 # --- secret <-> volume guardrail -------------------------------------------------------------
@@ -1382,7 +1470,136 @@ class DockVault:
         print(pal.paint("===================================================================\n", "blue"))
 
     def backup(self, args=None):
-        _stub("Backup & Restore", self.pal)
+        """Backup & Restore menu: dump the current set ({.env + volumes}) into one bundle, or restore a
+        bundle back. Interactive by default; arg-mode via args.backup_action (backup|restore)."""
+        pal = self.pal
+        ok, msg = docker_available()
+        if not ok:
+            self._fail(msg)
+        interactive = not (args and getattr(args, "non_interactive", False))
+        action = getattr(args, "backup_action", None) if args else None
+        if not action and interactive:
+            print(pal.paint("\n  1) Backup the current set   2) Restore a bundle", "cyan"))
+            action = {"2": "restore"}.get(ask("Choose 1/2", pal, "1").strip(), "backup")
+        if (action or "backup") == "restore":
+            self._do_restore(args)
+        else:
+            self._do_backup(self._load_env(), args)
+
+    def _backup_root(self, args):
+        d = (getattr(args, "backup_dir", None) if args else None)
+        return d or os.path.join(self.root, "backups")
+
+    def _fail_backup(self, bundle, msg):
+        """Abort a backup: DELETE the partial bundle first (it already holds a mode-600 copy of .env
+        with ENCRYPTION_KEY, so a half-written bundle must never be left on disk), then fail."""
+        shutil.rmtree(bundle, ignore_errors=True)
+        self._fail("%s - the incomplete backup was removed." % msg)
+
+    def _do_backup(self, env, args=None):
+        """Dump the current set into ONE bundle dir: the paired .env (mode-600), a tar.gz per data
+        volume, and a manifest with a NON-secret coupling fingerprint. Skips a volume that doesn't
+        exist (e.g. brand). Does NOT stop the stack (a running Postgres is crash-consistent for a
+        restore-then-start; note it)."""
+        pal = self.pal
+        prefix = volume_prefix(env)
+        if not env:
+            self._fail("no .env found - nothing to back up (run Setup first)")
+        names = set_volume_names(prefix)
+        ts = _timestamp()
+        bundle = os.path.join(self._backup_root(args), "dockvault-%s-%s" % (prefix, ts))
+        try:
+            os.makedirs(bundle)
+        except OSError as exc:
+            self._fail("could not create the backup directory %s: %s" % (bundle, exc))
+        # the paired .env FIRST, mode-600 (it holds ENCRYPTION_KEY)
+        _copy_secret(self._env_path(), os.path.join(bundle, "env"))
+        tighten_secret_file(os.path.join(bundle, "env"))
+        entries = []
+        for role in BACKUP_ROLES:
+            vol = names[role]
+            if not volume_exists(vol):
+                continue                                     # e.g. brand isn't always present
+            archive = "%s.tar.gz" % VOLUME_BASENAMES[role]
+            print(pal.paint("  archiving %s ..." % vol, "cyan"))
+            if not tar_volume(vol, bundle, archive):
+                self._fail_backup(bundle, "failed to archive volume %s (backup incomplete)" % vol)
+            entries.append({"role": role, "name": vol, "archive": archive})
+        manifest = build_backup_manifest(prefix, env.get("DEPLOYMENT_ID", "default"), entries,
+                                          gen_salt(), env, created=ts)
+        try:
+            with open(os.path.join(bundle, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+        except OSError as exc:
+            self._fail_backup(bundle, "failed to write the manifest: %s" % exc)
+        print(pal.paint("\n  Backup written to: %s" % bundle, "green"))
+        print("    %d volume(s) + the paired .env + manifest.json" % len(entries))
+        print(pal.paint("  *** This bundle's 'env' holds ENCRYPTION_KEY - store the whole bundle "
+                        "somewhere safe (off-host). ***\n", "yellow"))
+
+    def _do_restore(self, args=None):
+        """Restore a bundle: verify the bundle's .env matches its volumes (coupling fingerprint),
+        recreate the volumes, and install the paired .env. Refuses a mismatched bundle, a bundle
+        missing its .env/manifest, or clobbering existing volumes (unless --force)."""
+        pal = self.pal
+        interactive = not (args and getattr(args, "non_interactive", False))
+        bundle = getattr(args, "bundle_dir", None) if args else None
+        if not bundle and interactive:
+            root = self._backup_root(args)
+            cands = sorted(glob.glob(os.path.join(root, "dockvault-*")))
+            if not cands:
+                self._fail("no backups found under %s (pass --bundle-dir)" % root)
+            print(pal.paint("\n  Backups:", "cyan"))
+            for i, c in enumerate(cands, 1):
+                print("    %d) %s" % (i, os.path.basename(c)))
+            sel = ask("Which backup number", pal).strip()
+            if not (sel.isdigit() and 1 <= int(sel) <= len(cands)):
+                self._fail("not a listed backup")
+            bundle = cands[int(sel) - 1]
+        if not bundle or not os.path.isdir(bundle):
+            self._fail("backup bundle not found (pass --bundle-dir)")
+        man_path, env_path = os.path.join(bundle, "manifest.json"), os.path.join(bundle, "env")
+        if not (os.path.exists(man_path) and os.path.exists(env_path)):
+            self._fail("that bundle is missing manifest.json or env - refusing to restore")
+        try:
+            manifest = json.load(open(man_path, encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            self._fail("could not read the manifest: %s" % exc)
+        bundle_env = parse_env(open(env_path, encoding="utf-8").read())
+        # COUPLING: the bundle's .env must be the one its volumes were created with - never restore
+        # volumes without their matching .env (same rule the pre-start secret guard enforces).
+        if not verify_backup_coupling(bundle_env, manifest):
+            self._fail("the 'env' in this backup does NOT match its volumes (coupling check failed) - "
+                       "refusing to restore a mismatched bundle.")
+        prefix = manifest.get("volume_prefix") or volume_prefix(bundle_env)
+        # NEVER trust the volume NAMES / archive filenames from the (possibly crafted) manifest - a
+        # hostile `name` like "/etc" would redirect the `-v` mount to the host. Validate the prefix and
+        # RECONSTRUCT each volume name + archive from the prefix + a known role instead.
+        if not valid_volume_prefix(prefix):
+            self._fail("the backup's volume_prefix %r is not a valid name - refusing to restore" % prefix)
+        names = set_volume_names(prefix)
+        plan = []
+        for e in (manifest.get("volumes") or []):
+            role = e.get("role") if isinstance(e, dict) else None
+            if role not in VOLUME_BASENAMES:
+                self._fail("the backup manifest lists an unknown volume role %r - refusing to restore" % role)
+            plan.append((names[role], "%s.tar.gz" % VOLUME_BASENAMES[role]))
+        force = bool(getattr(args, "force", False)) if args else False
+        existing = [v for v, _ in plan if volume_exists(v)]
+        if existing and not force:
+            self._fail("these target volumes already exist: %s - Reset them first, or pass --force to "
+                       "overwrite (this replaces their contents)." % ", ".join(existing))
+        for vol, archive in plan:
+            if not os.path.exists(os.path.join(bundle, archive)):
+                self._fail("the bundle is missing %s (for volume %s) - refusing to restore" % (archive, vol))
+            print(pal.paint("  restoring %s ..." % vol, "cyan"))
+            if not untar_volume(vol, bundle, archive):
+                self._fail("failed to restore volume %s from %s" % (vol, archive))
+        # install the paired .env (mode-600) so the set is whole again.
+        _copy_secret(env_path, self._env_path())
+        tighten_secret_file(self._env_path())
+        print(pal.paint("\n  Restored set '%s' (%d volume(s)) + its .env." % (prefix, len(plan)), "green"))
+        print(pal.paint("  Run Setup to start it (the secret check will confirm the pairing).\n", "cyan"))
 
     def _load_env(self):
         """Parse the current .env (best-effort: {} if absent or unreadable)."""
@@ -1655,6 +1872,14 @@ def build_parser():
     rp.add_argument("--confirm", dest="confirm", action="store_true",
                     help="confirm the destructive 'down -v' (required in --non-interactive)")
     rp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
+
+    bp = parsers["backup"]
+    bp.add_argument("--action", dest="backup_action", choices=("backup", "restore"),
+                    help="backup the current set | restore a bundle")
+    bp.add_argument("--backup-dir", dest="backup_dir", help="directory to write/list bundles (default <root>/backups)")
+    bp.add_argument("--bundle-dir", dest="bundle_dir", help="restore: the bundle directory to restore")
+    bp.add_argument("--force", dest="force", action="store_true", help="restore: overwrite existing target volumes")
+    bp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
     return p
 
 

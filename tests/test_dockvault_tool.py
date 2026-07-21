@@ -5,6 +5,7 @@ instance and never touch Docker: the tested surface is the pure colour/prompt/me
 logic + the arg-mode routing. A subprocess smoke covers --help."""
 import argparse
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -951,6 +952,192 @@ def test_volume_sets_coexist_and_down_v_removes_only_current_live(tmp_path):
         dc("vt10sets-a", "down", "-v")
         dc("vt10sets-b", "down", "-v")
         subprocess.run(["docker", "volume", "rm", "-f", volA, volB], capture_output=True, timeout=30)
+
+
+# --- VT backup / restore (atomic {.env + volumes} bundle) ------------------------------------
+def test_coupling_fingerprint_and_manifest_carry_no_secret():
+    env = {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": dv.gen_hex(16)}
+    salt = dv.gen_salt()
+    fp = dv.compute_coupling_fingerprint(env, salt)
+    assert len(fp) == 64 and all(c in "0123456789abcdef" for c in fp)     # sha256 hex, not the secret
+    assert dv.compute_coupling_fingerprint(env, salt) == fp               # deterministic per env+salt
+    assert dv.compute_coupling_fingerprint(env, dv.gen_salt()) != fp      # salted -> varies per bundle
+    man = dv.build_backup_manifest("dockvault-vault-b1", "b1",
+                                   [{"role": "pg", "name": "dockvault-vault-b1_vault_pg_data", "archive": "vault_pg_data.tar.gz"}],
+                                   salt, env, created="20260721-000000")
+    blob = json.dumps(man)
+    assert env["ENCRYPTION_KEY"] not in blob and env["VAULT_DB_PASSWORD"] not in blob   # NO secret in the manifest
+    assert man["volume_prefix"] == "dockvault-vault-b1" and man["bundle_id"] == "b1" and man["env_file"] == "env"
+
+
+def test_verify_backup_coupling_matches_only_its_own_env():
+    env = {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": dv.gen_hex(16)}
+    man = dv.build_backup_manifest("p", "b", [], dv.gen_salt(), env)
+    assert dv.verify_backup_coupling(env, man) is True
+    assert dv.verify_backup_coupling(dict(env, ENCRYPTION_KEY=dv.gen_fernet_key()), man) is False  # swapped key
+    assert dv.verify_backup_coupling(dict(env, VAULT_DB_PASSWORD="other"), man) is False           # swapped pw
+    assert dv.verify_backup_coupling(env, {}) is False                                             # no coupling
+    assert dv.verify_backup_coupling(env, {"coupling": {"salt": "", "sha256": ""}}) is False
+
+
+def _write_bundle(tmp_path, cfg, entries, env_override=None, name="bundle"):
+    bundle = tmp_path / name
+    bundle.mkdir(exist_ok=True)
+    env_text = "\n".join(dv.build_env_lines(cfg)) + "\n"
+    (bundle / "env").write_text(env_text, encoding="utf-8")
+    manifest_env = dv.parse_env(env_text) if env_override is None else env_override
+    man = dv.build_backup_manifest(cfg.get("volume_prefix", "dockvault-vault"),
+                                   cfg.get("deployment_id", "default"), entries, dv.gen_salt(), manifest_env)
+    (bundle / "manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    return bundle
+
+
+def test_restore_refuses_mismatched_env(tmp_path):
+    # manifest coupling is built from env A, but the bundle's `env` file is a DIFFERENT env -> refuse.
+    cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-r1", deployment_id="r1")
+    other = {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": dv.gen_hex(16)}
+    bundle = _write_bundle(tmp_path, cfg, [], env_override=other)   # manifest fingerprints `other`, env file is cfg
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    with pytest.raises(SystemExit):
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=False))
+
+
+def test_valid_volume_prefix():
+    assert dv.valid_volume_prefix("dockvault-vault") and dv.valid_volume_prefix("dockvault-vault-a1")
+    assert not dv.valid_volume_prefix("")
+    assert not dv.valid_volume_prefix("/etc")            # slash -> reject (bind-mount redirection)
+    assert not dv.valid_volume_prefix("../evil")
+    assert not dv.valid_volume_prefix("a b")             # space
+    assert not dv.valid_volume_prefix("-leading")        # must start alnum (docker's own rule)
+
+
+def test_restore_rejects_crafted_manifest(tmp_path, monkeypatch):
+    # a hostile bundle can't redirect the restore's -v mount or inject via the archive name: restore
+    # reconstructs names/archives from the validated prefix + a known role, never from manifest strings.
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: False)
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    # (1) hostile prefix "/etc" -> refused before any docker call
+    b1 = _write_bundle(tmp_path, dict(_reusable_env_cfg(), volume_prefix="/etc", deployment_id="x"),
+                       [{"role": "pg", "name": "/etc", "archive": "a.tgz; rm -rf /"}], name="b1")
+    with pytest.raises(SystemExit):
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(b1), force=False))
+    # (2) unknown volume role -> refused even with a valid prefix
+    b2 = _write_bundle(tmp_path, dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-ok", deployment_id="x"),
+                       [{"role": "evil", "name": "n", "archive": "a"}], name="b2")
+    with pytest.raises(SystemExit):
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(b2), force=False))
+
+
+def test_restore_refuses_incomplete_bundle(tmp_path):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "manifest.json").write_text("{}", encoding="utf-8")   # no `env` file alongside
+    with pytest.raises(SystemExit):
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=False))
+
+
+def test_verify_backup_coupling_tolerates_malformed_manifest():
+    env = {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": dv.gen_hex(16)}
+    for bad in ("hello", 5, [1, 2], None, {"coupling": "x"}, {"coupling": 5}, {"coupling": {}}):
+        assert dv.verify_backup_coupling(env, bad) is False, "a malformed manifest must be a clean False, not a crash"
+
+
+def test_restore_refuses_missing_archive(tmp_path, monkeypatch):
+    # a bundle whose manifest is well-formed and coupled, valid prefix + known role, but with the
+    # actual tar.gz missing -> refuse (don't restore a half-bundle).
+    cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-r3", deployment_id="r3")
+    entries = [{"role": "pg", "name": "dockvault-vault-r3_vault_pg_data", "archive": "vault_pg_data.tar.gz"}]
+    bundle = _write_bundle(tmp_path, cfg, entries, name="b3")     # _write_bundle does NOT create the tar.gz
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: False)   # not clobbering
+    with pytest.raises(SystemExit):
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=False))
+
+
+def test_backup_aborts_and_removes_partial_on_tar_failure(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(
+        dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-fail", deployment_id="f"))) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: name.endswith("_vault_pg_data"))
+    monkeypatch.setattr(dv, "tar_volume", lambda *a, **k: False)        # archiving fails
+    with pytest.raises(SystemExit):
+        tool._do_backup(dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8")),
+                        argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
+    # the partial, secret-bearing bundle (it holds a copy of .env) must be gone - no manifest left behind
+    assert not list((tmp_path / "backups").glob("dockvault-*")), "a failed backup must leave no partial bundle"
+
+
+def test_restore_refuses_clobbering_existing_volumes(tmp_path, monkeypatch):
+    cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-r2", deployment_id="r2")
+    entries = [{"role": "pg", "name": "dockvault-vault-r2_vault_pg_data", "archive": "vault_pg_data.tar.gz"}]
+    bundle = _write_bundle(tmp_path, cfg, entries)
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)   # the target volume already exists
+    with pytest.raises(SystemExit):    # refuse without --force (coupling passes, but won't clobber)
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=False))
+
+
+def test_backup_writes_env_600_and_manifest_without_secret(tmp_path, monkeypatch):
+    # unit-level backup (no docker): stub tar + volume_exists so only the .env-copy + manifest run.
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(
+        dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-b9", deployment_id="b9"))) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: name.endswith("_vault_pg_data"))  # only pg present
+    monkeypatch.setattr(dv, "tar_volume", lambda *a, **k: True)
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
+    bundles = list((tmp_path / "backups").glob("dockvault-dockvault-vault-b9-*"))
+    assert len(bundles) == 1
+    bundle = bundles[0]
+    man = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    assert [e["role"] for e in man["volumes"]] == ["pg"]     # only the existing volume recorded
+    assert env["ENCRYPTION_KEY"] not in json.dumps(man)       # no secret in the manifest
+    assert (bundle / "env").exists()                          # the paired .env is copied in
+    if os.name != "nt":
+        assert (os.stat(bundle / "env").st_mode & 0o077) == 0, "the backup .env must be mode-600"
+
+
+def test_backup_restore_round_trip_live(tmp_path):
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    prefix = "vt10blive"
+    cfg = dict(_reusable_env_cfg(), volume_prefix=prefix, deployment_id="live")
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    names = dv.set_volume_names(prefix)
+    vols = [names["pg"], names["storage"], names["keys"]]
+
+    def run(*a):
+        return subprocess.run(list(a), capture_output=True, text=True, timeout=90)
+    try:
+        try:
+            for v in vols:
+                run("docker", "volume", "create", v)
+            seed = run("docker", "run", "--rm", "-v", names["keys"] + ":/d", "busybox",
+                       "sh", "-c", "echo SECRET-DATA-42 > /d/marker.txt")
+            if seed.returncode != 0:
+                pytest.skip("docker run unavailable: %s" % seed.stderr[:120])
+        except (subprocess.SubprocessError, OSError) as exc:
+            pytest.skip("docker unavailable: %s" % exc)
+        backup_dir = tmp_path / "backups"
+        tool._do_backup(dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8")),
+                        argparse.Namespace(non_interactive=True, backup_dir=str(backup_dir)))
+        bundles = list(backup_dir.glob("dockvault-%s-*" % prefix))
+        assert len(bundles) == 1
+        bundle = bundles[0]
+        assert cfg["encryption_key"] not in (bundle / "manifest.json").read_text(encoding="utf-8")
+        # simulate a down -v: destroy the volumes, then restore
+        for v in vols:
+            run("docker", "volume", "rm", "-f", v)
+        assert not any(dv.volume_exists(v) for v in vols)
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=False))
+        got = run("docker", "run", "--rm", "-v", names["keys"] + ":/d:ro", "busybox", "cat", "/d/marker.txt")
+        assert "SECRET-DATA-42" in got.stdout, "the restored volume must contain the original file"
+        assert (tmp_path / ".env").exists()          # the paired .env was installed
+    finally:
+        for v in vols:
+            run("docker", "volume", "rm", "-f", v)
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs host openssl for a BYO pair")
