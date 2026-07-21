@@ -1877,7 +1877,13 @@ async function submitCreateShare() {
         submitBtn.style.display = 'none';
         showToast('Share created', 'success');
     } catch (e) {
-        _shareSetError(e.message || 'Could not create the share.');
+        const msg = (e && e.message) || '';
+        // create_share fails closed for a vault the user only reached via a claim (not owner /
+        // member / group) — surface a clearer reason than the raw "You do not have access…".
+        const friendly = /do not have access to this vault/i.test(msg)
+            ? 'You can only create shares in a vault you own or are a member of.'
+            : (msg || 'Could not create the share.');
+        _shareSetError(friendly);
         submitBtn.disabled = false;
     }
 }

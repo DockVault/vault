@@ -160,6 +160,15 @@ def test_share_tag_user_search_combobox_keyboard_nav():
         "the search inputs must wire the keydown handler"
 
 
+def test_share_create_403_friendly_message():
+    """UIP7: the create-share flow shows a clearer reason than the raw "You do not have access to
+    this vault." when it fails closed on a vault reached only via a claim (not owner/member/group)."""
+    appjs = _read(STATIC / "js" / "app.js")
+    assert "do not have access to this vault" in appjs and \
+        "You can only create shares in a vault you own or are a member of." in appjs, \
+        "the create-share 403 must map to a clearer message"
+
+
 def test_served_frontend_has_no_inline_event_handlers():
     """No inline `on*=` HTML handler ATTRIBUTE may appear in the served frontend: the page CSP
     (script-src 'self', no unsafe-inline) blocks them, which spammed the console and left the
