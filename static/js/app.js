@@ -4826,15 +4826,30 @@ async function loadLogSettings() {
     if (!data || !Array.isArray(data.components)) return;
     window._logSettings = data;
     const note = document.getElementById('log-ceiling-note');
+    const genBtn = document.getElementById('log-token-generate-btn');
+    const anyEnabled = (data.components || []).some(c => (data.flags || {})[c]);
     if (note) {
         if (!data.ceiling) {
-            note.textContent = 'The log-pull endpoint is disabled for this deployment’s plan, '
-                + 'so tokens will not return logs until the plan enables it. You can still prepare '
-                + 'components and tokens here.';
+            // Self-host-correct guidance: the endpoint 404s until BOTH env vars are set. Don't
+            // advertise a token/curl that is guaranteed to 404.
+            note.textContent = 'The log endpoint is currently disabled, so a token cannot return logs '
+                + '(every request returns 404). To enable it: set PLAN_LOG_PULL=true and a 32+ character '
+                + 'LOG_TOKEN_PEPPER in this deployment’s .env, restart, then tick a component below.';
+            note.style.display = '';
+        } else if (!anyEnabled) {
+            // Ceiling on but nothing exposed yet — the second, easy-to-miss reason /logs 404s.
+            note.textContent = 'The endpoint is enabled, but no component is exposed to /logs yet — '
+                + 'tick Web (and/or SFTP) below and a token scoped to it will return logs.';
             note.style.display = '';
         } else {
             note.style.display = 'none';
         }
+    }
+    if (genBtn) {
+        // Don't let an admin mint a token + copy a curl for an endpoint that can only 404.
+        genBtn.disabled = !data.ceiling;
+        genBtn.title = data.ceiling ? '' : 'Enable the log endpoint first (see the note above).';
+        if (!data.ceiling) toggleLogTokenGenerate(false);  // collapse the mint panel if it was open
     }
     renderLogFlags(data);
     const stealth = document.getElementById('log-stealth-toggle');
@@ -4977,6 +4992,11 @@ function toggleLogTokenGenerate(show) {
 }
 
 async function generateLogToken() {
+    // Defense-in-depth: never mint a token + curl the endpoint can't answer (the button is also disabled).
+    if (window._logSettings && !window._logSettings.ceiling) {
+        showError('The log endpoint is disabled — set PLAN_LOG_PULL and LOG_TOKEN_PEPPER in .env and restart first.');
+        return;
+    }
     const name = (document.getElementById('log-token-name').value || '').trim();
     const scope = Array.from(
         document.querySelectorAll('#log-token-scope input[type=checkbox]:checked')).map(cb => cb.value);
@@ -5049,6 +5069,23 @@ function revealLogToken(res) {
     note.className = 'form-help';
     note.textContent = 'Same host/port as this page. Append &tail=N (max 5000) inside the quotes for more lines. A missing/unknown service, a component switched off above, or the log endpoint being disabled for this deployment all return 404.';
     usage.appendChild(note);
+
+    // Distinct, actionable hint for the scope-vs-enable mismatch: a component the token is scoped for
+    // but NOT enabled above returns 404 even though the token is valid — the second common 404 cause.
+    const flags = (window._logSettings && window._logSettings.flags) || {};
+    const notEnabled = granted.filter(s => !flags[s]);
+    if (notEnabled.length) {
+        const warn2 = document.createElement('p');
+        warn2.className = 'text-sm';
+        warn2.style.color = 'var(--warning)';
+        warn2.style.marginTop = '.5rem';
+        const many = notEnabled.length > 1;
+        warn2.textContent = notEnabled.map(s => LOG_COMPONENT_LABELS[s] || s).join(', ')
+            + (many ? ' are' : ' is') + ' not enabled under “Components exposed to /logs” above, so this '
+            + 'token returns 404 for ' + (many ? 'them' : 'it') + ' until you tick '
+            + (many ? 'them' : 'it') + '.';
+        usage.appendChild(warn2);
+    }
 
     host.append(warn, box, usage);
 }
