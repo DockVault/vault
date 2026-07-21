@@ -374,11 +374,37 @@ services:
     restart: unless-stopped
 
 volumes:
+  # DockVault labels every named volume so the management tool (dockvault.py) can enumerate a
+  # deployment's volumes as one atomic bundle:
+  #   docker volume ls --filter label=com.dockvault.managed=true
+  # Labels are applied when a volume is first CREATED; a pre-existing (unlabelled) volume keeps its
+  # data and is adopted by the tool under the "default" bundle - additive metadata, never a data move.
+  # bundle = DEPLOYMENT_ID from .env (defaults to "default" when unset), so a set stays grouped.
   vault_pg_data:
+    labels:
+      com.dockvault.managed: "true"
+      com.dockvault.role: "pg"
+      com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_storage:
+    labels:
+      com.dockvault.managed: "true"
+      com.dockvault.role: "storage"
+      com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_logs:
+    labels:
+      com.dockvault.managed: "true"
+      com.dockvault.role: "logs"
+      com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_keys:
+    labels:
+      com.dockvault.managed: "true"
+      com.dockvault.role: "keys"
+      com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_brand:
+    labels:
+      com.dockvault.managed: "true"
+      com.dockvault.role: "brand"
+      com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
 
 networks:
   vault-network:

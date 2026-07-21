@@ -18,6 +18,12 @@ dv = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(dv)
 
 
+class _Proc:
+    """A stand-in for subprocess.CompletedProcess (injected `run` return value)."""
+    def __init__(self, returncode, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
 class _TTY:
     def isatty(self):
         return True
@@ -256,6 +262,42 @@ def test_setup_reuse_does_not_regenerate(tmp_path):
     assert "Reusing" in r2.stdout
 
 
+@pytest.mark.skipif(not _cert_tool_available(), reason="needs openssl or docker for cert generation")
+def test_setup_new_stamps_deployment_id(tmp_path):
+    env = dict(os.environ, DOCKVAULT_ROOT=str(tmp_path), NO_COLOR="1")
+    proc = subprocess.run(_SETUP, env=env, capture_output=True, text=True, timeout=240)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    did = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8")).get("DEPLOYMENT_ID", "")
+    assert len(did) == 8 and all(c in "0123456789abcdef" for c in did), \
+        "a fresh setup must stamp a short hex DEPLOYMENT_ID (got %r)" % did
+
+
+@pytest.mark.skipif(not _cert_tool_available(), reason="needs openssl or docker for cert generation")
+def test_setup_reuse_adopts_legacy_deployment_id(tmp_path):
+    # A pre-label ("legacy") .env carries every secret but no DEPLOYMENT_ID. Reusing it must ADOPT the
+    # deployment under bundle 'default' - additive + idempotent - without regenerating any secret.
+    cfg = {
+        "server_name": "localhost", "encryption_key": dv.gen_fernet_key(),
+        "jwt_secret_key": dv.gen_hex(32), "vault_db_password": dv.gen_hex(16),
+        "redis_password": dv.gen_hex(24), "admin_username": "admin",
+        "admin_email": "a@example.com", "admin_password": "Strong-Pass-1234", "compose_profiles": "combined",
+    }
+    legacy = dv.build_env_lines(cfg)
+    assert not any(l.startswith("DEPLOYMENT_ID") for l in legacy), "seed must be truly legacy (no id)"
+    (tmp_path / ".env").write_text("\n".join(legacy) + "\n", encoding="utf-8")
+    env = dict(os.environ, DOCKVAULT_ROOT=str(tmp_path), NO_COLOR="1")
+    r1 = subprocess.run(_SETUP, env=env, capture_output=True, text=True, timeout=240)
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+    p1 = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert p1["DEPLOYMENT_ID"] == "default", "reuse must adopt a legacy deployment as bundle 'default'"
+    assert p1["ENCRYPTION_KEY"] == cfg["encryption_key"], "reuse must NOT regenerate ENCRYPTION_KEY"
+    # idempotent: a second reuse leaves DEPLOYMENT_ID=default untouched (no drift, no re-adopt)
+    r2 = subprocess.run(_SETUP, env=env, capture_output=True, text=True, timeout=240)
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    p2 = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert p2["DEPLOYMENT_ID"] == "default" and p2["ENCRYPTION_KEY"] == cfg["encryption_key"]
+
+
 def test_authored_env_key_parity_with_setup_script():
     # The tool must author the same load-bearing keys the setup-secure.sh script writes, so a
     # tool-authored .env starts the same secure stack (parity).
@@ -416,6 +458,94 @@ def test_build_env_lines_writes_ports_only_when_nondefault():
     env4 = dv.parse_env("\n".join(dv.build_env_lines(dict(
         base, compose_profiles="split", web_host_port=443, run_sftp=False, sftp_host_port=2200))))
     assert env4["SFTP_HOST_PORT"] == "2200"
+
+
+def test_gen_deployment_id_is_short_hex():
+    ids = {dv.gen_deployment_id() for _ in range(25)}
+    assert all(len(i) == 8 and all(c in "0123456789abcdef" for c in i) for i in ids)
+    assert len(ids) > 1, "deployment ids must vary, not be constant"
+
+
+def test_build_env_lines_writes_deployment_id():
+    base = {
+        "server_name": "localhost", "encryption_key": dv.gen_fernet_key(),
+        "jwt_secret_key": dv.gen_hex(32), "vault_db_password": dv.gen_hex(16),
+        "redis_password": dv.gen_hex(24), "admin_username": "admin",
+        "admin_email": "a@example.com", "admin_password": "Strong-Pass-1234", "compose_profiles": "combined",
+    }
+    env = dv.parse_env("\n".join(dv.build_env_lines(dict(base, deployment_id="deadbeef"))))
+    assert env["DEPLOYMENT_ID"] == "deadbeef"
+    # no id -> no line (the compose ${DEPLOYMENT_ID:-default} fallback applies)
+    env2 = dv.parse_env("\n".join(dv.build_env_lines(base)))
+    assert "DEPLOYMENT_ID" not in env2
+
+
+def test_parse_and_group_volumes():
+    out = ("dockvault-vault_vault_pg_data\tpg\tabc123\n"
+           "dockvault-vault_vault_storage\tstorage\tabc123\n"
+           "otherproj_vault_keys\tkeys\tzzz999\n"
+           "\n"                       # blank line -> skipped
+           "novol\t\t\n")            # empty role -> None, empty bundle -> 'default'
+    recs = dv.parse_volume_ls(out)
+    assert len(recs) == 4
+    assert recs[0] == {"name": "dockvault-vault_vault_pg_data", "role": "pg", "bundle": "abc123"}
+    assert recs[3]["role"] is None and recs[3]["bundle"] == "default"
+    groups = dict(dv.group_volumes_by_bundle(recs))
+    assert set(groups) == {"abc123", "zzz999", "default"}
+    assert [r["name"] for r in groups["abc123"]] == [
+        "dockvault-vault_vault_pg_data", "dockvault-vault_vault_storage"]
+
+
+def test_list_managed_volumes_parses_and_fails_soft():
+    def ok_run(cmd, **kw):
+        assert "label=com.dockvault.managed=true" in cmd
+        return _Proc(0, "v_pg\tpg\tb1\nv_st\tstorage\tb1\n")
+    recs = dv.list_managed_volumes(run=ok_run)
+    assert [(r["role"], r["bundle"]) for r in recs] == [("pg", "b1"), ("storage", "b1")]
+    # docker missing / query failure -> [] (best-effort read, never raises)
+    assert dv.list_managed_volumes(run=lambda *a, **k: (_ for _ in ()).throw(OSError("no docker"))) == []
+    assert dv.list_managed_volumes(run=lambda *a, **k: _Proc(1, "")) == []
+
+
+def test_list_legacy_volumes_only_unlabelled_wellknown():
+    def run(cmd, **kw):
+        return _Proc(0,
+            "dockvault-vault_vault_pg_data\t\n"      # legacy (unlabelled) -> included
+            "dockvault-vault_vault_storage\ttrue\n"   # already managed -> excluded
+            "dockvault-vault_vault_keys\t\n"          # legacy -> included
+            "someones_other_volume\t\n"               # not a well-known name -> excluded
+            "dockvault-vault_vault_logs\t\n"
+            "dockvault-vault_vault_brand\t\n")
+    legacy = dv.list_legacy_volumes(run=run)
+    assert legacy == sorted([
+        "dockvault-vault_vault_pg_data", "dockvault-vault_vault_keys",
+        "dockvault-vault_vault_logs", "dockvault-vault_vault_brand"])
+    # fail-soft parity with list_managed_volumes: docker missing / nonzero -> [] (never raises)
+    assert dv.list_legacy_volumes(run=lambda *a, **k: (_ for _ in ()).throw(OSError("no docker"))) == []
+    assert dv.list_legacy_volumes(run=lambda *a, **k: _Proc(1, "")) == []
+
+
+def test_list_managed_volumes_live_roundtrip():
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    names = {"pg": "vt8live_pg", "storage": "vt8live_storage"}
+    try:
+        try:
+            for role, name in names.items():
+                subprocess.run(["docker", "volume", "create",
+                                "--label", "com.dockvault.managed=true",
+                                "--label", "com.dockvault.role=%s" % role,
+                                "--label", "com.dockvault.bundle=vt8livebundle", name],
+                               check=True, capture_output=True, timeout=30)
+        except (subprocess.SubprocessError, OSError) as exc:   # binary present but daemon down -> skip, not error
+            pytest.skip("docker daemon unavailable: %s" % exc)
+        recs = [r for r in dv.list_managed_volumes() if r["bundle"] == "vt8livebundle"]
+        assert {r["role"] for r in recs} == {"pg", "storage"}
+        groups = dict(dv.group_volumes_by_bundle(recs))
+        assert "vt8livebundle" in groups and len(groups["vt8livebundle"]) == 2
+    finally:
+        for name in names.values():
+            subprocess.run(["docker", "volume", "rm", "-f", name], capture_output=True, timeout=30)
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs host openssl for a BYO pair")

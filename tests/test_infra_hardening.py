@@ -536,8 +536,11 @@ def _secure_compose_config(profile):
     import shutil
     if shutil.which("docker") is None:
         pytest.skip("docker not available")
+    # Pin DEPLOYMENT_ID="" so ${DEPLOYMENT_ID:-default} renders 'default' deterministically: `config`
+    # runs with cwd=ROOT and auto-loads the repo-root .env, which (after a real `setup`) may carry a
+    # stamped DEPLOYMENT_ID that would otherwise leak into the render and break the label assertions.
     env = dict(os.environ, COMPOSE_PROFILES=profile, VAULT_DB_PASSWORD="testpw",
-               RUN_SFTP="", SFTP_HOST_PORT="2322")
+               RUN_SFTP="", SFTP_HOST_PORT="2322", DEPLOYMENT_ID="")
     try:
         r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
                            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
@@ -562,6 +565,40 @@ def test_secure_compose_combined_default_and_split_profile():
     # Both modes mount the SAME named volumes -> switching modes never loses data.
     for vol in ("vault_storage", "vault_keys"):
         assert vol in combined and vol in split, f"{vol} must be mounted in both modes"
+
+
+def test_secure_compose_labels_volumes_as_bundle():
+    # Every named volume carries the DockVault management labels, so the tool can enumerate a
+    # deployment's set (docker volume ls --filter label=com.dockvault.managed=true). With no
+    # DEPLOYMENT_ID set, the bundle label falls back to "default".
+    out = _secure_compose_config("combined")   # combined activates the web service -> all 5 volumes render
+    for role in ("pg", "storage", "keys", "logs", "brand"):
+        assert f"com.dockvault.role: {role}" in out, f"volume role label {role} is missing"
+    assert out.count("com.dockvault.managed:") >= 5, "all five volumes must carry com.dockvault.managed"
+    assert "com.dockvault.bundle: default" in out, "an unset DEPLOYMENT_ID must default the bundle to 'default'"
+
+
+def test_secure_compose_bundle_uses_deployment_id():
+    import shutil
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    env = dict(os.environ, COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
+               RUN_SFTP="", DEPLOYMENT_ID="bundlexyz")
+    try:
+        r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
+                           cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"docker compose unavailable: {exc}")
+    if r.returncode != 0:
+        pytest.skip(f"docker compose config failed: {r.stderr[:200]}")
+    assert r.stdout.count("com.dockvault.bundle: bundlexyz") == 5, \
+        "DEPLOYMENT_ID must set the bundle label on all five volumes"
+
+
+def test_env_example_documents_deployment_id():
+    import re
+    envx = _read(".env.example")
+    assert re.search(r"^DEPLOYMENT_ID=", envx, re.M), ".env.example must ship a DEPLOYMENT_ID key"
 
 
 def test_setup_scripts_write_combined_profile_scheme():

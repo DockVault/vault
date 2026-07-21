@@ -162,6 +162,28 @@ your own (modified) image — which the AGPL license requires you be able to do.
 > in its notes — read the release notes before upgrading across a schema change, and back up the
 > database volume first.
 
+## Data volumes
+
+A deployment keeps its data in five named volumes — `vault_pg_data` (database), `vault_storage`
+(files), `vault_keys` (per-vault key material), `vault_logs`, and `vault_brand`. These volumes **and
+the `.env` that holds their secrets** are one atomic set: `.env` carries `ENCRYPTION_KEY` (which the
+stored files are encrypted under) and `VAULT_DB_PASSWORD` (which is baked into `vault_pg_data` on
+first init), so a fresh `.env` against existing volumes fails to start — keep them together, and back
+them up together.
+
+The compose files label every volume so tooling can find a deployment's set at a glance:
+
+| Label | Value |
+|-------|-------|
+| `com.dockvault.managed` | `true` on every DockVault volume |
+| `com.dockvault.role` | `pg` / `storage` / `keys` / `logs` / `brand` |
+| `com.dockvault.bundle` | the deployment's `DEPLOYMENT_ID` (or `default` when unset) |
+
+List a host's managed volumes with
+`docker volume ls --filter label=com.dockvault.managed=true`. Labels are applied when a volume is
+first created, so a deployment made before this release keeps its (unlabelled) volumes and is treated
+as the `default` bundle — no data is moved.
+
 ## Repository layout
 
 | Path | What lives there |

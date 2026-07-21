@@ -335,6 +335,9 @@ def build_env_lines(cfg):
     q("ADMIN_EMAIL")
     q("ADMIN_PASSWORD")
     bare("COMPOSE_PROFILES", cfg.get("compose_profiles", "combined"))
+    # Stable bundle id: labels this deployment's five volumes so the tool can group them as one set.
+    if cfg.get("deployment_id"):
+        bare("DEPLOYMENT_ID", cfg["deployment_id"])
     if cfg.get("run_sftp"):
         bare("RUN_SFTP", "1")
     # Only write a port line when it differs from the compose default (443 web / 2322 sftp).
@@ -730,6 +733,95 @@ def prompt_free_port(pal, label, default, ask_fn=None, free_fn=None):
             return port
 
 
+# --- volume management (labels + bundle enumeration) -----------------------------------------
+# A deployment's data lives in five named volumes that MUST stay together with the .env that holds
+# their secrets ({.env, pg_data, storage, keys} is one atomic bundle). The deploy composes label
+# every volume (com.dockvault.managed=true / role=<...> / bundle=${DEPLOYMENT_ID:-default}) so the
+# tool can enumerate a deployment's volumes as one set. Labels are applied at CREATE time only, so a
+# pre-label ("legacy") deployment keeps its (unlabelled) volumes and is adopted under the "default"
+# bundle - additive metadata, never a data move.
+VOLUME_ROLES = ("pg", "storage", "keys", "logs", "brand")
+VOLUME_BASENAMES = {"pg": "vault_pg_data", "storage": "vault_storage", "keys": "vault_keys",
+                    "logs": "vault_logs", "brand": "vault_brand"}
+DEFAULT_PROJECT = "dockvault-vault"
+_VOL_LS_FORMAT = '{{.Name}}\t{{.Label "com.dockvault.role"}}\t{{.Label "com.dockvault.bundle"}}'
+
+
+def gen_deployment_id():
+    """A short, stable, label-safe bundle id for a fresh deployment (8 lowercase hex chars). Used as
+    DEPLOYMENT_ID in .env so the deployment's volumes are labelled/grouped as one bundle."""
+    return gen_hex(4)
+
+
+def parse_volume_ls(output):
+    """Parse the tab-separated `docker volume ls --format <_VOL_LS_FORMAT>` output into a list of
+    {name, role, bundle} records. Blank lines are skipped; an empty bundle field falls back to
+    'default' (matching the compose ${DEPLOYMENT_ID:-default}); an empty role stays None. Pure."""
+    records = []
+    for line in (output or "").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        name = parts[0].strip()
+        if not name:
+            continue
+        role = (parts[1].strip() if len(parts) > 1 else "") or None
+        bundle = (parts[2].strip() if len(parts) > 2 else "") or "default"
+        records.append({"name": name, "role": role, "bundle": bundle})
+    return records
+
+
+def group_volumes_by_bundle(records):
+    """Group parsed volume records by their bundle id, preserving first-seen order. Returns
+    [(bundle, [records...]), ...]. Pure."""
+    order, groups = [], {}
+    for r in records:
+        b = r["bundle"]
+        if b not in groups:
+            groups[b] = []
+            order.append(b)
+        groups[b].append(r)
+    return [(b, groups[b]) for b in order]
+
+
+def list_managed_volumes(run=subprocess.run):
+    """Enumerate DockVault-managed volumes by their labels. Returns [{name, role, bundle}] (possibly
+    empty). Returns [] when docker is unavailable or the query fails - a best-effort read."""
+    try:
+        r = run(["docker", "volume", "ls", "--filter", "label=com.dockvault.managed=true",
+                 "--format", _VOL_LS_FORMAT], capture_output=True, text=True, timeout=30)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    if getattr(r, "returncode", 1) != 0:
+        return []
+    return parse_volume_ls(r.stdout or "")
+
+
+def list_legacy_volumes(run=subprocess.run, project=DEFAULT_PROJECT):
+    """The canonical <project>_<basename> volumes that EXIST but carry no com.dockvault.managed
+    label - a pre-label deployment. Returns their names (sorted). The tool adopts them under the
+    'default' bundle. Best-effort: [] when docker is unavailable."""
+    wanted = {"%s_%s" % (project, base) for base in VOLUME_BASENAMES.values()}
+    fmt = '{{.Name}}\t{{.Label "com.dockvault.managed"}}'
+    try:
+        r = run(["docker", "volume", "ls", "--format", fmt],
+                capture_output=True, text=True, timeout=30)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    if getattr(r, "returncode", 1) != 0:
+        return []
+    legacy = []
+    for line in (r.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        name = parts[0].strip()
+        managed = (parts[1].strip() if len(parts) > 1 else "")
+        if name in wanted and managed != "true":
+            legacy.append(name)
+    return sorted(legacy)
+
+
 # --- app -------------------------------------------------------------------------------------
 def _stub(name, pal):
     print(pal.paint("\n  '%s' is not implemented yet - coming in a later phase.\n" % name, "yellow"))
@@ -781,6 +873,11 @@ class DockVault:
             migrated = migrate_compose_profiles(existing.get("COMPOSE_PROFILES"))
             if existing.get("COMPOSE_PROFILES") != migrated:
                 self._set_env_key(env_path, "COMPOSE_PROFILES", migrated)
+            # Adopt a pre-label deployment: pin DEPLOYMENT_ID=default so this .env names the bundle
+            # its (unlabelled) volumes are grouped under. Additive + idempotent - no data move, and a
+            # second run keeps whatever id is already there.
+            if not (existing.get("DEPLOYMENT_ID") or "").strip():
+                self._set_env_key(env_path, "DEPLOYMENT_ID", "default")
             summary = {"server_name": existing.get("SERVER_NAME") or existing.get("ALLOWED_HOSTS") or "",
                        "admin_username": existing.get("ADMIN_USERNAME") or "admin",
                        "compose_profiles": migrated,
@@ -916,6 +1013,7 @@ class DockVault:
             "admin_email": admin_email,
             "admin_password": admin_pw,
             "compose_profiles": "split" if split else "combined",
+            "deployment_id": gen_deployment_id(),
             "run_sftp": enable_sftp,
             "web_host_port": web_port,
             "sftp_host_port": sftp_port,
@@ -1017,7 +1115,44 @@ class DockVault:
         _stub("Backup & Restore", self.pal)
 
     def volumes(self, args=None):
-        _stub("Volumes", self.pal)
+        """Read-only overview of DockVault-managed volume sets: enumerate the labelled volumes and
+        group them by bundle, plus any legacy (unlabelled) volumes adopted as 'default'. The full
+        picker (reuse / new / repoint) + backup & restore arrive in a later phase."""
+        pal = self.pal
+        ok, msg = docker_available()
+        if not ok:
+            print(pal.paint("\n  %s\n" % msg, "yellow"))
+            return
+        env, env_path = {}, self._env_path()
+        try:
+            if os.path.exists(env_path):
+                env = parse_env(open(env_path, encoding="utf-8").read())
+        except OSError:
+            pass  # a present-but-unreadable .env (e.g. root-owned secure deploy, tool run non-root)
+                  # -> best-effort, like the rest of this read-only overview
+        current = (env.get("DEPLOYMENT_ID") or "").strip() or ("default" if env else None)
+        print(pal.paint("\n  DockVault volume sets", "cyan"))
+        if current:
+            print("  this deployment's bundle (.env DEPLOYMENT_ID): %s" % current)
+
+        groups = group_volumes_by_bundle(list_managed_volumes())
+        if groups:
+            for bundle, recs in groups:
+                mark = "   <- current" if bundle == current else ""
+                print(pal.paint("\n  bundle '%s'%s" % (bundle, mark), "green"))
+                for r in sorted(recs, key=lambda x: x["name"]):
+                    print("    %-9s %s" % (r["role"] or "?", r["name"]))
+        else:
+            print(pal.paint("\n  (no labelled volume sets yet)", "yellow"))
+
+        legacy = list_legacy_volumes()
+        if legacy:
+            print(pal.paint("\n  legacy (unlabelled) volumes - adopted as bundle 'default':", "yellow"))
+            for name in legacy:
+                print("    %s" % name)
+
+        print(pal.paint("\n  Full volume management (reuse / new / repoint / backup & restore) "
+                        "arrives in a later phase.\n", "cyan"))
 
     def reset(self, args=None):
         _stub("Reset", self.pal)

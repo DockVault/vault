@@ -240,11 +240,33 @@ services:
     restart: unless-stopped
 
 volumes:
+  # Labelled so dockvault.py can enumerate this deployment's volumes as one bundle (see the
+  # secure compose for the full note). bundle = DEPLOYMENT_ID from .env (default "default").
   vault_pg_data:
+    labels:
+      com.dockvault.managed: "true"
+      com.dockvault.role: "pg"
+      com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_storage:
+    labels:
+      com.dockvault.managed: "true"
+      com.dockvault.role: "storage"
+      com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_logs:
+    labels:
+      com.dockvault.managed: "true"
+      com.dockvault.role: "logs"
+      com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_keys:
+    labels:
+      com.dockvault.managed: "true"
+      com.dockvault.role: "keys"
+      com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
   vault_brand:
+    labels:
+      com.dockvault.managed: "true"
+      com.dockvault.role: "brand"
+      com.dockvault.bundle: "${DEPLOYMENT_ID:-default}"
 
 networks:
   vault-network:
