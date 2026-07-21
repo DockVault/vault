@@ -130,9 +130,11 @@ services:
       SETUP_STATE_FILE: /app/run/setup_state.json
     command: ["python", "run_combined.py"]
     ports:
-      # HTTPS on 443 (always) + SFTP on ${SFTP_HOST_PORT:-2322} (only actually served when
-      # RUN_SFTP=1 — nothing binds 2222 in-container otherwise, so the mapping is inert).
-      - "443:8000"
+      # HTTPS on ${WEB_HOST_PORT:-443} + SFTP on ${SFTP_HOST_PORT:-2322} (only actually served when
+      # RUN_SFTP=1 — nothing binds 2222 in-container otherwise, so the mapping is inert). Set
+      # WEB_HOST_PORT / SFTP_HOST_PORT in .env to publish on a different host port (the container
+      # keeps 8000/2222); ./setup-secure.* / dockvault.py can pick free ports for you.
+      - "${WEB_HOST_PORT:-443}:8000"
       - "${SFTP_HOST_PORT:-2322}:2222"
     depends_on:
       vault-db:
@@ -220,9 +222,9 @@ services:
       SETUP_STATE_FILE: /app/run/setup_state.json
     command: ["python", "-m", "app.api.api_server"]
     ports:
-      # The ONLY published web port: HTTPS on 443. The container process stays
-      # unprivileged (binds 8000 as uid 10001); Docker maps host 443 onto it.
-      - "443:8000"
+      # The ONLY published web port: HTTPS on ${WEB_HOST_PORT:-443}. The container process stays
+      # unprivileged (binds 8000 as uid 10001); Docker maps the host port onto it.
+      - "${WEB_HOST_PORT:-443}:8000"
     depends_on:
       vault-db:
         condition: service_healthy

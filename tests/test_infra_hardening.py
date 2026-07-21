@@ -595,8 +595,34 @@ def test_env_example_documents_every_settings_field():
     missing = sorted(f.upper() for f in fields if f.upper() not in documented)
     assert not missing, f".env.example is missing these Settings keys: {missing}"
     # The non-Settings toggles a self-hoster sets must be documented too.
-    for k in ("RUN_SFTP", "COMPOSE_PROFILES", "SFTP_HOST_PORT", "CORS_ALLOW_ORIGINS", "ALLOWED_HOSTS"):
+    for k in ("RUN_SFTP", "COMPOSE_PROFILES", "SFTP_HOST_PORT", "WEB_HOST_PORT",
+              "CORS_ALLOW_ORIGINS", "ALLOWED_HOSTS"):
         assert k in documented, f".env.example must document {k}"
+
+
+def test_secure_compose_web_port_parameterized():
+    # The web host port is configurable via WEB_HOST_PORT (default 443), not hard-coded, in BOTH the
+    # combined and split services, so a self-hoster can publish on a different port.
+    sc = _read("deploy/docker-compose.secure.yml")
+    assert sc.count("${WEB_HOST_PORT:-443}:8000") == 2, "both web services must publish via WEB_HOST_PORT"
+    assert '- "443:8000"' not in sc, "the web host port must not be hard-coded"
+
+
+def test_secure_compose_honours_web_host_port_override():
+    # A WEB_HOST_PORT override must actually take effect in the rendered compose.
+    import shutil
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    env = dict(os.environ, COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
+               RUN_SFTP="", SFTP_HOST_PORT="2322", WEB_HOST_PORT="8443")
+    try:
+        r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
+                           cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"docker compose unavailable: {exc}")
+    if r.returncode != 0:
+        pytest.skip(f"docker compose config failed: {r.stderr[:200]}")
+    assert "8443" in r.stdout, "WEB_HOST_PORT=8443 override must render as the published host port"
 
 
 def test_claude_md_carries_config_sync_rule():

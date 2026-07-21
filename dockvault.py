@@ -253,6 +253,21 @@ def parse_env(text):
     return out
 
 
+def _int_or(value, default):
+    """int(value), or `default` if value is None / not an integer (a hand-edited .env port)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _port_or(value, default):
+    """A valid host port (1..65535) parsed from `value`, else `default` — tolerates a hand-edited or
+    CLI-supplied out-of-range / non-numeric port instead of crashing later."""
+    p = _int_or(value, default)
+    return p if 1 <= p <= 65535 else default
+
+
 def validate_server_name(name):
     """True if `name` is a plain host name / IP (letters, digits, dots, hyphens only) — the charset
     the setup scripts enforce before it flows into .env, the TLS cert subject, and docker args."""
@@ -322,6 +337,13 @@ def build_env_lines(cfg):
     bare("COMPOSE_PROFILES", cfg.get("compose_profiles", "combined"))
     if cfg.get("run_sftp"):
         bare("RUN_SFTP", "1")
+    # Only write a port line when it differs from the compose default (443 web / 2322 sftp).
+    if cfg.get("web_host_port") and int(cfg["web_host_port"]) != 443:
+        bare("WEB_HOST_PORT", int(cfg["web_host_port"]))
+    # split mode always runs the SFTP container, so honour a custom SFTP port there too.
+    sftp_active = cfg.get("run_sftp") or cfg.get("compose_profiles") == "split"
+    if sftp_active and cfg.get("sftp_host_port") and int(cfg["sftp_host_port"]) != 2322:
+        bare("SFTP_HOST_PORT", int(cfg["sftp_host_port"]))
     if cfg.get("update_check_enabled"):
         bare("UPDATE_CHECK_ENABLED", "true")
     if cfg.get("plan_log_pull"):
@@ -669,10 +691,43 @@ def port_free(port, host="0.0.0.0"):
     try:
         s.bind((host, int(port)))
         return True
+    except OverflowError:
+        return False  # a port outside 0..65535 (hand-edited/CLI) is not bindable
     except OSError as e:
         return e.errno in (errno.EACCES, errno.EPERM)
     finally:
         s.close()
+
+
+def prompt_free_port(pal, label, default, ask_fn=None, free_fn=None):
+    """Prompt for a host port, RE-PROMPTING until the entered port is free to bind (or the operator
+    frees the port and re-enters the same one). Returns the chosen int port. If the SAME answer comes
+    back twice in a row (e.g. a non-TTY stdin returning the default each time), it stops re-prompting
+    to avoid an endless loop. `ask_fn`/`free_fn` are injectable for tests."""
+    ask_fn = ask_fn or ask
+    free_fn = free_fn or port_free
+    last = object()  # a sentinel that won't equal any real answer on the first pass
+    while True:
+        raw = ask_fn("%s host port" % label, pal, str(default))
+        repeated, last = (raw == last), raw
+        try:
+            port = int(str(raw).strip())
+        except (TypeError, ValueError):
+            print(pal.paint("  enter a number between 1 and 65535", "red"))
+            if repeated:
+                return int(default)
+            continue
+        if not (1 <= port <= 65535):
+            print(pal.paint("  the port must be between 1 and 65535", "red"))
+            if repeated:
+                return int(default)
+            continue
+        if free_fn(port):
+            return port
+        print(pal.paint("  port %d is already in use - free it and re-enter, or choose another." % port, "yellow"))
+        if repeated:
+            print(pal.paint("  using %d anyway (it may be busy); free it before starting." % port, "yellow"))
+            return port
 
 
 # --- app -------------------------------------------------------------------------------------
@@ -729,7 +784,9 @@ class DockVault:
             summary = {"server_name": existing.get("SERVER_NAME") or existing.get("ALLOWED_HOSTS") or "",
                        "admin_username": existing.get("ADMIN_USERNAME") or "admin",
                        "compose_profiles": migrated,
-                       "run_sftp": (existing.get("RUN_SFTP") or "").strip() in ("1", "true", "yes", "on")}
+                       "run_sftp": (existing.get("RUN_SFTP") or "").strip() in ("1", "true", "yes", "on"),
+                       "web_host_port": _port_or(existing.get("WEB_HOST_PORT"), 443),
+                       "sftp_host_port": _port_or(existing.get("SFTP_HOST_PORT"), 2322)}
         else:
             cfg = self._collect_setup_config(args)
             tracker.advance(); tracker.show()          # -> Write .env
@@ -740,6 +797,7 @@ class DockVault:
                                 "yourself (it holds ENCRYPTION_KEY).", "yellow"))
             summary = {"server_name": cfg["server_name"], "admin_username": cfg["admin_username"],
                        "compose_profiles": cfg["compose_profiles"], "run_sftp": cfg["run_sftp"],
+                       "web_host_port": cfg["web_host_port"], "sftp_host_port": cfg["sftp_host_port"],
                        "admin_password": cfg["admin_password"] if cfg["_generated_pw"] else None}
 
         # ---- certificate (self-signed; keep an existing pair) ----
@@ -784,10 +842,11 @@ class DockVault:
         ok, msg = docker_available()
         if not ok:
             self._fail(msg)
-        # Port preflight: warn (don't block) if host 443 is already taken - the web container binds it.
-        if not port_free(443):
-            print(pal.paint("  WARNING: host port 443 is already in use; the web container may fail to "
-                            "bind it. Free it first (e.g. sudo ss -ltnp 'sport = :443').", "yellow"))
+        # Port preflight: warn (don't block) if the chosen web port is already taken.
+        web_port = summary.get("web_host_port") or 443
+        if not port_free(web_port):
+            print(pal.paint("  WARNING: host port %d is already in use; the web container may fail to bind "
+                            "it. Free it first (e.g. sudo ss -ltnp 'sport = :%d')." % (web_port, web_port), "yellow"))
         tracker.advance(); tracker.show()               # -> Build + start
         if not self._start_secure_stack():
             self._fail("the stack did not start - check 'docker compose -f docker-compose.secure.yml logs'.")
@@ -834,12 +893,17 @@ class DockVault:
             self._fail("admin password %s" % prob)
 
         if interactive:
-            enable_sftp = confirm("Enable SFTP (SSH-encrypted, publishes port 2322)?", pal, default=False)
+            enable_sftp = confirm("Enable SFTP (SSH-encrypted, publishes a second port)?", pal, default=False)
             split = confirm("Run web + SFTP as TWO containers (split) instead of one combined?", pal, default=False)
+            web_port = prompt_free_port(pal, "Web (HTTPS)", 443)
+            # split mode always runs the SFTP container, so offer a custom SFTP port there too.
+            sftp_port = prompt_free_port(pal, "SFTP", 2322) if (enable_sftp or split) else 2322
             update_check = confirm("Enable the opt-in 'update available' check (asks GitHub, no telemetry)?", pal, default=False)
             log_pull = confirm("Enable the authenticated log-pull endpoint (sets a pepper; still off until a component is ticked)?", pal, default=False)
         else:
             enable_sftp, split = bool(a("enable_sftp")), bool(a("split"))
+            web_port = _port_or(a("web_port"), 443)
+            sftp_port = _port_or(a("sftp_port"), 2322)
             update_check, log_pull = bool(a("update_check")), bool(a("enable_log_pull"))
 
         return {
@@ -853,6 +917,8 @@ class DockVault:
             "admin_password": admin_pw,
             "compose_profiles": "split" if split else "combined",
             "run_sftp": enable_sftp,
+            "web_host_port": web_port,
+            "sftp_host_port": sftp_port,
             "update_check_enabled": update_check,
             "plan_log_pull": log_pull,
             "log_token_pepper": gen_hex(32) if log_pull else "",
@@ -935,9 +1001,11 @@ class DockVault:
             print(pal.paint(" The vault did NOT report healthy - check the logs:", "red"))
             print("   docker compose -f docker-compose.secure.yml logs --tail 40")
             return
-        print(pal.paint(" Web UI / API : https://%s/          (host port 443)" % name, "bold", "green"))
+        webp = summary.get("web_host_port") or 443
+        url = "https://%s/" % name if webp == 443 else "https://%s:%d/" % (name, webp)
+        print(pal.paint(" Web UI / API : %s          (host port %d)" % (url, webp), "bold", "green"))
         if summary.get("run_sftp"):
-            print(" SFTP (SSH)   : %s port 2322" % name)
+            print(" SFTP (SSH)   : %s port %d" % (name, summary.get("sftp_host_port") or 2322))
         if summary.get("admin_username"):
             print(" Admin login  : %s" % summary["admin_username"])
         if summary.get("admin_password"):
@@ -1001,7 +1069,9 @@ def build_parser():
     sp.add_argument("--le-email", dest="le_email", help="email for Let's Encrypt expiry notices")
     sp.add_argument("--cert-path", dest="cert_path", help="bring-your-own fullchain cert (PEM)")
     sp.add_argument("--key-path", dest="key_path", help="bring-your-own private key (PEM)")
-    sp.add_argument("--enable-sftp", dest="enable_sftp", action="store_true", help="also serve SFTP on 2322")
+    sp.add_argument("--web-port", dest="web_port", type=int, help="host port for HTTPS (default 443)")
+    sp.add_argument("--sftp-port", dest="sftp_port", type=int, help="host port for SFTP (default 2322)")
+    sp.add_argument("--enable-sftp", dest="enable_sftp", action="store_true", help="also serve SFTP")
     sp.add_argument("--split", dest="split", action="store_true", help="two containers (vault-api + vault-sftp)")
     sp.add_argument("--update-check", dest="update_check", action="store_true", help="enable the opt-in update check")
     sp.add_argument("--enable-log-pull", dest="enable_log_pull", action="store_true", help="enable the log-pull endpoint")

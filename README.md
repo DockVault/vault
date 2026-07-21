@@ -26,8 +26,10 @@ Licensed under **AGPL-3.0** — self-host it freely.
 DockVault is meant to run in **production**: HTTPS with a real (or self-signed) TLS certificate,
 `ENVIRONMENT=production`, and Postgres/Redis kept off the host network. One script does the whole
 setup — it writes `.env` with freshly generated secrets, provisions the TLS certificate, and starts
-the HTTPS-only stack (web UI/API on port **443**, TLS terminated in-container, no plaintext
-listener; optional SFTP).
+the HTTPS-only stack (web UI/API on port **443** by default, TLS terminated in-container, no
+plaintext listener; optional SFTP). The published host ports are configurable in `.env` —
+`WEB_HOST_PORT` (default 443) and `SFTP_HOST_PORT` (default 2322); the container ports stay
+8000/2222. The setup tooling checks a port is free before using it.
 
 The two setup scripts live at the repo **root** — run either from there.
 

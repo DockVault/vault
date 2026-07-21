@@ -320,6 +320,15 @@ def test_port_free():
     finally:
         s.close()
     assert dv.port_free(port, "127.0.0.1") is True                     # freed -> free
+    assert dv.port_free(99999) is False and dv.port_free(-1) is False  # out-of-range -> not bindable (no crash)
+
+
+def test_port_or_clamps():
+    assert dv._port_or("8443", 443) == 8443
+    assert dv._port_or("99999", 443) == 443    # out of range -> default
+    assert dv._port_or("-1", 443) == 443
+    assert dv._port_or("bad", 443) == 443       # non-numeric -> default
+    assert dv._port_or(None, 2322) == 2322
 
 
 def test_cert_mode_parser():
@@ -357,6 +366,56 @@ def test_byo_install_validates_and_copies(tmp_path):
     _, key2 = _mkpair(tmp_path / "other", cn="other")
     mm, mmmsg = dv.install_byo_cert(str(tmp_path / "d3"), str(cert), str(key2))
     assert not mm and "not a matching pair" in mmmsg
+
+
+def test_prompt_free_port_loops_until_free():
+    pal = dv.Palette(False)
+    # ask returns a busy port then a free one; free_fn: only 8443 is free -> loops to 8443
+    answers = iter(["443", "8443"])
+    assert dv.prompt_free_port(pal, "Web", 443,
+                               ask_fn=lambda prompt, p, default=None: next(answers),
+                               free_fn=lambda port: port == 8443) == 8443
+    # a non-numeric answer is re-prompted, then accepted
+    answers2 = iter(["notaport", "0", "9000"])   # non-int, out-of-range, then valid
+    assert dv.prompt_free_port(pal, "Web", 443,
+                               ask_fn=lambda prompt, p, default=None: next(answers2),
+                               free_fn=lambda port: True) == 9000
+
+
+def test_prompt_free_port_breaks_on_repeat_non_tty():
+    # a non-TTY stdin returns the same default every time -> must NOT loop forever.
+    pal = dv.Palette(False)
+    calls = {"n": 0}
+    def always_default(prompt, p, default=None):
+        calls["n"] += 1
+        assert calls["n"] < 10, "prompt_free_port looped instead of breaking on a repeated answer"
+        return "443"
+    # 443 is 'busy' -> it re-prompts once, gets 443 again, then gives up and returns it.
+    assert dv.prompt_free_port(pal, "Web", 443,
+                               ask_fn=always_default, free_fn=lambda port: False) == 443
+    assert calls["n"] == 2
+
+
+def test_build_env_lines_writes_ports_only_when_nondefault():
+    base = {
+        "server_name": "localhost", "encryption_key": dv.gen_fernet_key(),
+        "jwt_secret_key": dv.gen_hex(32), "vault_db_password": dv.gen_hex(16),
+        "redis_password": dv.gen_hex(24), "admin_username": "admin",
+        "admin_email": "a@example.com", "admin_password": "Strong-Pass-1234", "compose_profiles": "combined",
+    }
+    # defaults -> no port lines (the compose defaults 443/2322 apply)
+    env = dv.parse_env("\n".join(dv.build_env_lines(dict(base, web_host_port=443, run_sftp=False, sftp_host_port=2322))))
+    assert "WEB_HOST_PORT" not in env and "SFTP_HOST_PORT" not in env
+    # non-default web port + SFTP on with a non-default sftp port -> both written
+    env2 = dv.parse_env("\n".join(dv.build_env_lines(dict(base, web_host_port=8443, run_sftp=True, sftp_host_port=2200))))
+    assert env2["WEB_HOST_PORT"] == "8443" and env2["SFTP_HOST_PORT"] == "2200"
+    # a non-default sftp port is ignored when SFTP is off (combined mode)
+    env3 = dv.parse_env("\n".join(dv.build_env_lines(dict(base, web_host_port=443, run_sftp=False, sftp_host_port=2200))))
+    assert "SFTP_HOST_PORT" not in env3
+    # split mode always runs the SFTP container -> a non-default SFTP port IS written even with run_sftp off
+    env4 = dv.parse_env("\n".join(dv.build_env_lines(dict(
+        base, compose_profiles="split", web_host_port=443, run_sftp=False, sftp_host_port=2200))))
+    assert env4["SFTP_HOST_PORT"] == "2200"
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs host openssl for a BYO pair")
