@@ -923,6 +923,20 @@
                                         <button type="button" id="update-banner-dismiss" class="btn btn-sm" style="margin-left:.5rem;">Dismiss</button>
                                     </div>
                                 </div>
+                                <div class="form-group" id="update-controls" style="display:none;">
+                                    <label>Update checks</label>
+                                    <div class="flex items-center gap-sm" style="flex-wrap:wrap;">
+                                        <button type="button" id="update-check-now-btn" class="btn btn-outline btn-sm">Check for updates</button>
+                                        <span id="update-last-checked" class="text-secondary text-sm"></span>
+                                    </div>
+                                    <div class="flex items-center gap-sm" style="margin-top:.5rem;flex-wrap:wrap;">
+                                        <label for="update-interval-input" class="text-sm" style="margin:0;">Check every</label>
+                                        <input type="number" id="update-interval-input" class="form-control" style="width:6rem;" min="15" step="1">
+                                        <span class="text-sm text-secondary">minutes</span>
+                                        <button type="button" id="update-interval-save-btn" class="btn btn-outline btn-sm">Save</button>
+                                    </div>
+                                    <small class="text-secondary" style="display:block;margin-top:.35rem;">All admins see a banner when a newer release is found. Minimum 15 minutes; the check makes at most one request per interval.</small>
+                                </div>
                                 <div class="form-group">
                                     <label for="setting-app-name">Application Name</label>
                                     <input type="text" id="setting-app-name" class="form-control" placeholder="e.g. Secure Vault">

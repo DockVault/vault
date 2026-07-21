@@ -1303,23 +1303,78 @@ async def api_root():
     }
 
 
+_UPDATE_SETTINGS_KEY = "update_check"
+
+
+def _effective_update_interval_minutes(db) -> int:
+    """The effective update-check interval: a live DB override (SystemSetting 'update_check') if set,
+    else the env default (settings.update_check_interval_minutes) — ALWAYS clamped to the
+    rate-limit-safe range. Fail-safe to the clamped env default on any read error."""
+    from app.services import update_check
+    default = update_check.clamp_interval_minutes(settings.update_check_interval_minutes)
+    try:
+        from app.core.models import SystemSetting
+        row = db.query(SystemSetting).filter(SystemSetting.key == _UPDATE_SETTINGS_KEY).first()
+        val = (row.value or {}).get("interval_minutes") if (row and row.value) else None
+        return update_check.clamp_interval_minutes(val) if val is not None else default
+    except Exception:  # noqa: BLE001
+        return default
+
+
 @app.get("/api/update-status")
-def get_update_status_endpoint(current_user: User = Depends(require_interactive_admin)):
+def get_update_status_endpoint(force: bool = False,
+                               current_user: User = Depends(require_interactive_admin),
+                               db: Session = Depends(get_db)):
     """Admin-only: whether a newer DockVault release exists (opt-in, default off).
 
-    Deliberately a SYNC endpoint: the (cached, once/day) update check does a BLOCKING urllib
-    request, so FastAPI runs this in a threadpool instead of stalling the async event loop.
+    Deliberately a SYNC endpoint: the (cached) update check does a BLOCKING urllib request, so
+    FastAPI runs this in a threadpool instead of stalling the async event loop. A real request goes
+    out at most once per the admin-set interval (the shared cache protects GitHub's rate limit no
+    matter how often the UI polls). `force=1` is a manual "check now" that bypasses the interval but
+    is still throttled server-side (never spammable into the rate limit).
 
     Gated behind an interactive admin so the (mildly fingerprint-aiding) 'outdated?' signal is
     not exposed publicly like /version is. Returns {enabled, managed, current, latest,
-    update_available, url, notes, checked_at}; the check itself is fail-closed-silent and only
-    ever runs when UPDATE_CHECK_ENABLED is set (and never for a managed/SaaS deployment)."""
+    update_available, url, notes, checked_at, interval_minutes}; the check itself is
+    fail-closed-silent and only ever runs when UPDATE_CHECK_ENABLED is set (never when managed)."""
     from app.services import update_check
-    return update_check.get_update_status(
+    interval = _effective_update_interval_minutes(db)
+    status = update_check.get_update_status(
         current_version=branding.app_version,
         enabled=settings.update_check_enabled,
         managed=settings.managed_deployment,
+        force=bool(force),
+        interval_seconds=interval * 60,
     )
+    status["interval_minutes"] = interval
+    return status
+
+
+@app.put("/api/update-settings")
+def set_update_settings_endpoint(payload: dict, request: Request,
+                                 current_user: User = Depends(require_interactive_admin),
+                                 db: Session = Depends(get_db)):
+    """Admin-only: set the LIVE update-check interval (minutes), clamped to the rate-limit-safe
+    range (a mis-set value snaps into range). Stored in SystemSetting('update_check'); takes effect
+    without a restart. Does NOT enable the check — that stays the UPDATE_CHECK_ENABLED env flag."""
+    from app.services import update_check
+    from app.core.models import SystemSetting
+    raw = payload.get("interval_minutes") if isinstance(payload, dict) else None
+    if raw is None:
+        raise HTTPException(status_code=400, detail="interval_minutes is required")
+    minutes = update_check.clamp_interval_minutes(raw)
+    row = db.query(SystemSetting).filter(SystemSetting.key == _UPDATE_SETTINGS_KEY).first()
+    if row is None:
+        db.add(SystemSetting(key=_UPDATE_SETTINGS_KEY, value={"interval_minutes": minutes}))
+    else:
+        row.value = {**(dict(row.value) if row.value else {}), "interval_minutes": minutes}
+    db.commit()
+    try:
+        AuditLogger(db).log_action(action="update_settings_updated", status="success", user=current_user,
+                                   ip_address=get_client_ip(request), details={"interval_minutes": minutes})
+    except Exception:
+        pass
+    return {"interval_minutes": minutes}
 
 
 @app.get("/health")
@@ -10551,7 +10606,7 @@ if __name__ == "__main__":
         print("\n⚠️  WARNING: serving PLAINTEXT HTTP with ENVIRONMENT != development and no TRUSTED_PROXIES set.")
         print("   Login credentials and bearer tokens cross the network in cleartext if this port is")
         print("   reachable off-host. Enable TLS (API_USE_HTTPS=true) or front the app with an HTTPS")
-        print("   reverse proxy (deploy/docker-compose.secure.yml / ./setup-secure.sh do this for you).")
+        print("   reverse proxy (deploy/docker-compose.secure.yml / 'python3 dockvault.py setup' do this for you).")
 
     uvicorn.run(
         app,

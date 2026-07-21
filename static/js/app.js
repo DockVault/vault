@@ -1571,8 +1571,11 @@ function _sharedByMeCard(sh) {
     const h = _el('h3', 'vault-name', title);
     h.appendChild(document.createTextNode(' ')); h.appendChild(_byMeStatusBadge(sh.status));
     main.appendChild(h);
-    main.appendChild(_el('p', 'vault-desc', (sh.tag_name ? sh.tag_name + ' · ' : '') +
-        (sh.target_type === 'vault' ? 'Whole vault' : (kind + ' in ' + (sh.vault_name || 'a vault')))));
+    const sub = _el('div', 'flex items-center gap-sm'); sub.style.flexWrap = 'wrap'; sub.style.margin = '.1rem 0 .45rem';
+    if (sh.tag_name) sub.appendChild(_el('span', 'badge badge-secondary', sh.tag_name));
+    sub.appendChild(_el('span', 'text-sm text-secondary',
+        sh.target_type === 'vault' ? 'Whole vault' : (kind + ' in ' + (sh.vault_name || 'a vault'))));
+    main.appendChild(sub);
     const meta = _el('div', 'vault-meta');
     meta.appendChild(_el('span', null, (sh.claim_count || 0) + (sh.max_recipients != null ? '/' + sh.max_recipients : '') + ' recipients'));
     if (sh.view_only) meta.appendChild(_el('span', null, 'View only'));
@@ -1581,24 +1584,27 @@ function _sharedByMeCard(sh) {
     body.appendChild(main);
     card.appendChild(body);
 
-    const actions = _el('div', 'flex items-center gap-sm'); actions.style.marginTop = 'var(--space-sm)';
+    const actions = _el('div', 'flex items-center gap-sm');
     if (active) {
         const revokeBtn = _el('button', 'btn btn-sm', 'Revoke'); revokeBtn.type = 'button'; revokeBtn.style.color = '#dc2626';
         revokeBtn.addEventListener('click', () => revokeShare(sh.id, title));
         actions.appendChild(revokeBtn);
     }
-    card.appendChild(actions);
-
+    let recipWrap = null;
     if ((sh.claim_count || 0) > 0) {
-        const recipWrap = _el('div'); recipWrap.style.display = 'none'; recipWrap.style.marginTop = 'var(--space-sm)';
+        recipWrap = _el('div'); recipWrap.style.display = 'none';
         const recipBtn = _el('button', 'btn btn-secondary btn-sm', 'Recipients (' + sh.claim_count + ')'); recipBtn.type = 'button';
         recipBtn.addEventListener('click', () => {
             if (recipWrap.style.display === 'none') { recipWrap.style.display = ''; loadShareClaims(sh.id, recipWrap); }
             else recipWrap.style.display = 'none';
         });
         actions.appendChild(recipBtn);
-        card.appendChild(recipWrap);
     }
+    // Append the action row (only when it has buttons) + the recipients disclosure INTO the padded
+    // .vault-card-body (a flex column) instead of the padding-less .card, so they align under the
+    // body content in both skins — and an action-less card gets no stray empty row.
+    if (actions.childElementCount) body.appendChild(actions);
+    if (recipWrap) body.appendChild(recipWrap);
     return card;
 }
 
@@ -4571,6 +4577,7 @@ async function initSettings() {
     // Setup tab switching
     setupSettingsTabs();
     setupLogAccess();  // log-access tab wiring
+    setupUpdateControls();  // "check for updates" + interval controls
 
     // Wire the branding color pickers <-> text inputs + logo/favicon uploads
     wireBrandColorInputs();
@@ -4820,15 +4827,30 @@ async function loadLogSettings() {
     if (!data || !Array.isArray(data.components)) return;
     window._logSettings = data;
     const note = document.getElementById('log-ceiling-note');
+    const genBtn = document.getElementById('log-token-generate-btn');
+    const anyEnabled = (data.components || []).some(c => (data.flags || {})[c]);
     if (note) {
         if (!data.ceiling) {
-            note.textContent = 'The log-pull endpoint is disabled for this deployment’s plan, '
-                + 'so tokens will not return logs until the plan enables it. You can still prepare '
-                + 'components and tokens here.';
+            // Self-host-correct guidance: the endpoint 404s until BOTH env vars are set. Don't
+            // advertise a token/curl that is guaranteed to 404.
+            note.textContent = 'The log endpoint is currently disabled, so a token cannot return logs '
+                + '(every request returns 404). To enable it: set PLAN_LOG_PULL=true and a 32+ character '
+                + 'LOG_TOKEN_PEPPER in this deployment’s .env, restart, then tick a component below.';
+            note.style.display = '';
+        } else if (!anyEnabled) {
+            // Ceiling on but nothing exposed yet — the second, easy-to-miss reason /logs 404s.
+            note.textContent = 'The endpoint is enabled, but no component is exposed to /logs yet — '
+                + 'tick Web (and/or SFTP) below and a token scoped to it will return logs.';
             note.style.display = '';
         } else {
             note.style.display = 'none';
         }
+    }
+    if (genBtn) {
+        // Don't let an admin mint a token + copy a curl for an endpoint that can only 404.
+        genBtn.disabled = !data.ceiling;
+        genBtn.title = data.ceiling ? '' : 'Enable the log endpoint first (see the note above).';
+        if (!data.ceiling) toggleLogTokenGenerate(false);  // collapse the mint panel if it was open
     }
     renderLogFlags(data);
     const stealth = document.getElementById('log-stealth-toggle');
@@ -4971,6 +4993,11 @@ function toggleLogTokenGenerate(show) {
 }
 
 async function generateLogToken() {
+    // Defense-in-depth: never mint a token + curl the endpoint can't answer (the button is also disabled).
+    if (window._logSettings && !window._logSettings.ceiling) {
+        showError('The log endpoint is disabled — set PLAN_LOG_PULL and LOG_TOKEN_PEPPER in .env and restart first.');
+        return;
+    }
     const name = (document.getElementById('log-token-name').value || '').trim();
     const scope = Array.from(
         document.querySelectorAll('#log-token-scope input[type=checkbox]:checked')).map(cb => cb.value);
@@ -5044,6 +5071,23 @@ function revealLogToken(res) {
     note.textContent = 'Same host/port as this page. Append &tail=N (max 5000) inside the quotes for more lines. A missing/unknown service, a component switched off above, or the log endpoint being disabled for this deployment all return 404.';
     usage.appendChild(note);
 
+    // Distinct, actionable hint for the scope-vs-enable mismatch: a component the token is scoped for
+    // but NOT enabled above returns 404 even though the token is valid — the second common 404 cause.
+    const flags = (window._logSettings && window._logSettings.flags) || {};
+    const notEnabled = granted.filter(s => !flags[s]);
+    if (notEnabled.length) {
+        const warn2 = document.createElement('p');
+        warn2.className = 'text-sm';
+        warn2.style.color = 'var(--warning)';
+        warn2.style.marginTop = '.5rem';
+        const many = notEnabled.length > 1;
+        warn2.textContent = notEnabled.map(s => LOG_COMPONENT_LABELS[s] || s).join(', ')
+            + (many ? ' are' : ' is') + ' not enabled under “Components exposed to /logs” above, so this '
+            + 'token returns 404 for ' + (many ? 'them' : 'it') + ' until you tick '
+            + (many ? 'them' : 'it') + '.';
+        usage.appendChild(warn2);
+    }
+
     host.append(warn, box, usage);
 }
 
@@ -5076,6 +5120,80 @@ function renderUpdateBanner(us) {
     banner.style.display = '';
 }
 
+// --- Update-check controls (opt-in; admin-only endpoint) --------------------------------------
+let _updatePollId = null;
+
+function renderUpdateStatus(us) {
+    renderUpdateBanner(us);
+    const controls = document.getElementById('update-controls');
+    if (!controls) return;
+    // Only expose the check-now + interval controls when the check is enabled and not managed.
+    const show = !!(us && us.enabled && !us.managed);
+    controls.style.display = show ? '' : 'none';
+    if (!show) { if (_updatePollId) { clearInterval(_updatePollId); _updatePollId = null; } return; }
+    const last = document.getElementById('update-last-checked');
+    if (last) {
+        last.textContent = us.checked_at
+            ? 'Last checked ' + new Date(us.checked_at * 1000).toLocaleString()
+            : 'Not checked yet';
+    }
+    const input = document.getElementById('update-interval-input');
+    // Don't clobber a value the admin is mid-edit.
+    if (input && document.activeElement !== input && us.interval_minutes != null) {
+        input.value = us.interval_minutes;
+    }
+    scheduleUpdatePoll(us.interval_minutes);
+}
+
+function scheduleUpdatePoll(intervalMinutes) {
+    if (_updatePollId) { clearInterval(_updatePollId); _updatePollId = null; }
+    // The client polls at most every 5 min; the SERVER-side cache is what actually bounds outbound
+    // GitHub requests, so this only refreshes the banner for an open settings page.
+    const mins = Math.max(5, parseInt(intervalMinutes, 10) || 360);
+    _updatePollId = setInterval(() => {
+        apiRequest('/api/update-status', { silent: true }).then(renderUpdateStatus).catch(() => {});
+    }, mins * 60 * 1000);
+}
+
+async function checkForUpdatesNow() {
+    const btn = document.getElementById('update-check-now-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+    try {
+        const us = await apiRequest('/api/update-status?force=1', { silent: true });
+        renderUpdateStatus(us);
+        showSuccess(us && us.update_available ? 'A newer version is available' : 'Checked — you’re up to date');
+    } catch (e) {
+        showError('Could not check for updates');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Check for updates'; }
+    }
+}
+
+async function saveUpdateInterval() {
+    const input = document.getElementById('update-interval-input');
+    if (!input) return;
+    const minutes = parseInt(input.value, 10);
+    if (!minutes || minutes < 15) { showError('Interval must be at least 15 minutes'); return; }
+    try {
+        const res = await apiRequest('/api/update-settings',
+            { method: 'PUT', body: JSON.stringify({ interval_minutes: minutes }) });
+        if (res && res.interval_minutes != null) input.value = res.interval_minutes;  // reflect the clamped value
+        showSuccess('Update interval saved');
+        scheduleUpdatePoll(res && res.interval_minutes);
+    } catch (e) {
+        showError('Could not save the update interval');
+    }
+}
+
+function setupUpdateControls() {
+    // Guard against stacked listeners: initSettings() re-runs on every Settings navigation, and a
+    // duplicate handler would fire duplicate /api/update-status?force=1 + PUT requests per click.
+    const btn = document.getElementById('update-check-now-btn');
+    if (btn && !btn.dataset.wired) { btn.dataset.wired = '1'; btn.addEventListener('click', checkForUpdatesNow); }
+    const save = document.getElementById('update-interval-save-btn');
+    if (save && !save.dataset.wired) { save.dataset.wired = '1'; save.addEventListener('click', saveUpdateInterval); }
+}
+
 async function loadSettings() {
     try {
         const settings = await apiRequest('/settings', { silent: true });
@@ -5095,9 +5213,9 @@ async function loadSettings() {
             if (vEl && ver && ver.version) vEl.textContent = 'v' + ver.version;
         } catch (e) { /* version display is non-essential */ }
 
-        // Update-available banner (opt-in, admin-only endpoint; fail-soft). Fire-and-forget so a
-        // slow/unreachable GitHub never delays the rest of the settings form from rendering.
-        apiRequest('/api/update-status', { silent: true }).then(renderUpdateBanner).catch(() => {});
+        // Update-available banner + check-now/interval controls (opt-in, admin-only endpoint;
+        // fail-soft). Fire-and-forget so a slow/unreachable GitHub never delays the settings form.
+        apiRequest('/api/update-status', { silent: true }).then(renderUpdateStatus).catch(() => {});
 
         // Security
         document.getElementById('setting-password-min-length').value = settings.password_min_length || 8;  // 8 = the enforced floor
@@ -6496,11 +6614,12 @@ function fileActionButtons(item, canWrite, opts) {
         const canDownload = vaultCapAllowed('file.download');
         const canRename = canWrite && vaultCapAllowed('file.rename');
         const canDelete = canWrite && vaultCapAllowed('file.delete');
-        if (slot !== 'secondary' && canDownload) out.push(btn('download', 'download', 'Download'));
         if (slot !== 'primary') {
             if (canRename) out.push(btn('rename-file', 'edit', 'Rename'));
             if (canDelete) out.push(btn('delete-file', 'trash', 'Delete', true));
             if (vaultShareable()) out.push(btn('share-file', 'link', 'Share'));
+            // Download last so it renders on the far RIGHT of the action cluster (grid + table).
+            if (canDownload) out.push(btn('download', 'download', 'Download'));
         }
     }
     return out.join('');
@@ -6554,16 +6673,18 @@ function renderFilesGrid(items, canWrite, grid) {
         const primary = fileActionButtons(item, canWrite, { grid: true, slot: 'primary' });
         const secondary = fileActionButtons(item, canWrite, { grid: true, slot: 'secondary' });
         const openLabel = escapeHtml(isFolder ? `Open folder ${item.name}` : `Preview file ${item.name}`);
-        // The name (the primary open action) comes first in DOM so it is the first tab stop and
-        // the destructive Delete is last; the two control clusters are position:absolute, so their
-        // top-left / top-right placement is unchanged by trailing them in source order.
+        // The name (the primary open action) comes first in DOM so it is the first tab stop and the
+        // destructive Delete is last. The action row is an IN-FLOW row below the icon/name/meta
+        // (checkbox left, Rename/Delete/Share/Download right) so the controls never paint over the icon.
         return `
             <div class="file-tile ${isFolder ? 'is-folder' : ''} ${selected ? 'is-selected' : ''}">
                 <div class="tile-icon">${icon}</div>
                 <div class="file-name tile-name" ${nameAttrs} role="button" tabindex="0" aria-label="${openLabel}">${escapeHtml(item.name)}${lockIcon}</div>
                 <div class="tile-meta">${meta}</div>
-                <div class="tile-tl">${check}${primary}</div>
-                <div class="tile-tr file-actions">${secondary}</div>
+                <div class="tile-actions">
+                    <div class="tile-tl">${check}${primary}</div>
+                    <div class="tile-tr file-actions">${secondary}</div>
+                </div>
             </div>`;
     }).join('');
 }
@@ -6593,7 +6714,7 @@ function wireFileItemHandlers(container) {
     // click from firing this a second time.
     container.querySelectorAll('.file-tile').forEach(tile => {
         tile.addEventListener('click', (e) => {
-            if (e.target.closest('button, input, a, .file-actions, .tile-tl, .tile-tr, .file-check, .file-name')) return;
+            if (e.target.closest('button, input, a, .tile-actions, .file-actions, .tile-tl, .tile-tr, .file-check, .file-name')) return;
             const nameEl = tile.querySelector('.file-name');
             if (nameEl) openFromName(nameEl);
         });

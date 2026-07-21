@@ -100,6 +100,10 @@ class Settings(BaseSettings):
     # A control-plane-managed (SaaS) deployment upgrades via operator promote, not self-service,
     # so the update banner is SUPPRESSED when this is set (the control plane sets it at provision).
     managed_deployment: bool = Field(default=False)
+    # How often (minutes) an ENABLED update check may make a real outbound request to GitHub. This
+    # is the env default; an admin can override it live in Settings. Both are clamped to a
+    # rate-limit-safe floor (see app/services/update_check.py: MIN/MAX_INTERVAL_MINUTES).
+    update_check_interval_minutes: int = Field(default=360)
 
     # Plan-imposed feature ceiling. The control plane injects these as PLAN_* env
     # vars at provision time so a deployment can't use features its plan excludes —

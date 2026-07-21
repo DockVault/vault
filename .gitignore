@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# Volume backups written by dockvault.py (each bundle holds a copy of .env = secrets)
+backups/
+
 # Python
 __pycache__/
 *.py[cod]
