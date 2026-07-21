@@ -136,6 +136,24 @@ def render_steps(steps, current):
 
 
 # --- thin interactive wrappers (built on the parsers above) ----------------------------------
+def flush_stdin():
+    """Drain any typed-ahead input so a stray keypress (e.g. an Enter pressed during a long docker
+    wait, thinking it hung) isn't swallowed by the NEXT prompt. Best-effort + cross-platform; a no-op
+    when stdin isn't an interactive terminal."""
+    try:
+        if not sys.stdin.isatty():
+            return
+        if os.name == "nt":
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getwch()
+        else:
+            import termios
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except Exception:  # noqa: BLE001 - never break a flow because we couldn't flush the buffer
+        pass
+
+
 def ask(prompt, pal, default=None):
     suffix = " [%s]" % default if default not in (None, "") else ""
     try:
@@ -1254,7 +1272,8 @@ class DockVault:
         # MUST authenticate against it, or the app would loop on a Postgres auth error. Fail closed
         # with a clear diagnosis (the reported "wrong password after re-setup" footgun).
         env_now = parse_env(open(env_path, encoding="utf-8").read()) if os.path.exists(env_path) else {}
-        if not self._guard_db_secret(env_now):
+        interactive = not (args and getattr(args, "non_interactive", False))
+        if not self._guard_db_secret(env_now, interactive=interactive):
             raise SystemExit(1)   # the guard already printed the diagnosis + recovery paths
         # Port preflight: warn (don't block) if the chosen web port is already taken.
         web_port = summary.get("web_host_port") or 443
@@ -1441,11 +1460,14 @@ class DockVault:
         except (OSError, subprocess.SubprocessError):
             pass
 
-    def _guard_db_secret(self, env, exists_fn=None, start_fn=None, wait_fn=None, probe_fn=None, stop_fn=None):
+    def _guard_db_secret(self, env, interactive=False, exists_fn=None, start_fn=None, wait_fn=None,
+                         probe_fn=None, stop_fn=None):
         """Fail-closed guardrail: if vault_pg_data already exists, verify the current .env's
         VAULT_DB_PASSWORD authenticates against it (and ENCRYPTION_KEY is at least a valid key) BEFORE
         starting the stack. Returns True to proceed, False to STOP (after printing a secret-free
-        diagnosis). No-op (True) for a fresh volume. The *_fn hooks are injectable for tests."""
+        diagnosis). No-op (True) for a fresh volume. When `interactive`, a definite password mismatch
+        offers recovery choices (keep data under a new set / destroy / cancel) instead of just failing.
+        The *_fn hooks are injectable for tests."""
         pal = self.pal
         exists_fn = exists_fn or volume_exists
         start_fn = start_fn or self._start_db_only
@@ -1460,7 +1482,9 @@ class DockVault:
         if not fernet_key_looks_valid(env.get("ENCRYPTION_KEY", "")):
             self._print_secret_mismatch("encryption_key", vol)
             return False
-        print(pal.paint("  Existing data volume found - verifying the .env matches it...", "cyan"))
+        print(pal.paint("  Existing data volume found - starting the database briefly to verify the .env"
+                        " matches it.\n  This can take ~20-40s (it may pull/start Postgres); please don't"
+                        " press keys while it runs.", "cyan"))
         if not start_fn() or not wait_fn():
             stop_fn()
             self._print_secret_mismatch("ambiguous", vol)
@@ -1473,7 +1497,50 @@ class DockVault:
                             "data volume (ENCRYPTION_KEY has a valid key format).", "green"))
             return True
         stop_fn()
+        # A DEFINITE password mismatch, and we're interactive -> offer recovery instead of just failing.
+        if result == "mismatch" and interactive:
+            return self._resolve_secret_mismatch(env)
         self._print_secret_mismatch("db_password" if result == "mismatch" else "ambiguous", vol)
+        return False
+
+    def _resolve_secret_mismatch(self, env):
+        """Interactive recovery when the current .env's DB password does NOT match the existing volume.
+        Offers a THIRD way beyond 'restore the .env' / 'destroy the data': deploy a fresh set under a
+        NEW volume name (VAULT_VOLUME_PREFIX), keeping the old data untouched. Returns True to PROCEED
+        (after acting) or False to stop. Never prints a secret."""
+        pal = self.pal
+        vol = "%s_vault_pg_data" % volume_prefix(env)
+        self._print_secret_mismatch("db_password", vol)
+        print(pal.paint("  Or pick one of these and I'll do it now:", "cyan"))
+        print("    1) Cancel - I'll restore the original .env for this data (default)")
+        print("    2) Keep this data + deploy a NEW empty set under a fresh volume name (new volumes +")
+        print("       a fresh paired .env; your old data is left untouched and can be re-pointed later)")
+        print("    3) DESTROY this data now (docker compose down -v) and start fresh with the current .env")
+        flush_stdin()   # drop any Enter typed during the long verify so it can't auto-pick option 1
+        choice = ask("Choose 1/2/3", pal, "1").strip()
+        if choice == "2":
+            new_id = gen_deployment_id()
+            new_prefix = "%s-%s" % (DEFAULT_PROJECT, new_id)
+            self._archive_env(volume_prefix(env))
+            if write_env(self._env_path(), build_env_lines(new_set_config(env, new_prefix, new_id))):
+                print(pal.paint("  Authored a fresh set '%s' (new volumes + secrets); starting it. Your "
+                                "previous set's .env was saved aside." % new_prefix, "green"))
+            else:
+                print(pal.paint("  Authored a fresh set '%s' - WARNING: could not restrict the new .env's "
+                                "permissions; secure it yourself." % new_prefix, "yellow"))
+            return True
+        if choice == "3":
+            flush_stdin()
+            if not confirm("This PERMANENTLY deletes the data in %s. Continue?" % vol, pal, default=False):
+                print(pal.paint("  Cancelled - nothing was deleted.\n", "yellow"))
+                return False
+            try:
+                subprocess.run(self._dc("down", "-v", "--remove-orphans"), cwd=self.root, text=True, timeout=180)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._fail("teardown failed: %s" % exc)
+            print(pal.paint("  Destroyed the old data; starting fresh with the current .env.", "green"))
+            return True
+        print(pal.paint("  Cancelled - restore the matching .env and re-run setup.\n", "yellow"))
         return False
 
     def _print_secret_mismatch(self, kind, vol):

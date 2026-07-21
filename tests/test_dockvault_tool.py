@@ -702,6 +702,61 @@ def test_setup_proceeds_to_start_when_guard_passes(tmp_path, monkeypatch):
     assert started == [1], "setup must start the stack when the guard passes"
 
 
+def test_flush_stdin_is_safe():
+    assert dv.flush_stdin() is None            # non-TTY under pytest -> no-op, never raises
+
+
+def test_resolve_secret_mismatch_new_set_keeps_data(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    old = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: "2")        # "deploy a NEW set"
+    assert tool._resolve_secret_mismatch(old) is True
+    new = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert new["VAULT_VOLUME_PREFIX"].startswith("dockvault-vault-")   # a fresh named set (old data untouched)
+    assert new["ENCRYPTION_KEY"] != old["ENCRYPTION_KEY"]              # fresh secrets, born with the new set
+    assert (tmp_path / ".env.dockvault-vault").exists()               # the previous set's .env archived aside
+
+
+def test_resolve_secret_mismatch_destroy(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: "3")
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _Proc(0, ""))
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    monkeypatch.setattr(dv, "confirm", lambda *a, **k: True)   # confirm the destructive down -v
+    assert tool._resolve_secret_mismatch(env) is True
+    assert any(("down" in c and "-v" in c) for c in calls), "destroy must run down -v"
+    # declining the confirm does NOT destroy
+    calls.clear()
+    monkeypatch.setattr(dv, "confirm", lambda *a, **k: False)
+    assert tool._resolve_secret_mismatch(env) is False
+    assert not any("down" in c for c in calls), "a declined destroy must not run down -v"
+
+
+def test_resolve_secret_mismatch_cancel(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    before = (tmp_path / ".env").read_text(encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: "1")        # cancel (default)
+    assert tool._resolve_secret_mismatch(dv.parse_env(before)) is False
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == before, "cancel must not touch .env"
+
+
+def test_guard_routes_interactive_mismatch_to_resolver(tmp_path, monkeypatch):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    env = {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"}
+    hooks = dict(exists_fn=lambda v: True, start_fn=lambda: True, wait_fn=lambda: True,
+                 probe_fn=lambda *a: "mismatch", stop_fn=lambda: None)
+    called = []
+    monkeypatch.setattr(tool, "_resolve_secret_mismatch", lambda e: called.append(1) or True)
+    assert tool._guard_db_secret(env, interactive=True, **hooks) is True and called == [1]
+    # non-interactive keeps the old fail-closed behaviour: no prompt, returns False
+    called.clear()
+    assert tool._guard_db_secret(env, interactive=False, **hooks) is False and called == []
+
+
 def test_probe_pg_password_live_distinguishes_secrets():
     if shutil.which("docker") is None:
         pytest.skip("docker not available")
