@@ -30,12 +30,34 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 10
     groups:
+      # These four move as ONE unit or not at all — they pin each other narrowly enough that any
+      # single-package bump is unresolvable:
+      #   fastapi 0.115 requires starlette <0.42, so a starlette major alone breaks the build
+      #   fastapi 0.139 requires starlette >=0.46 AND pydantic >=2.9
+      #   pydantic-settings 2.14 requires pydantic >=2.7
+      # Splitting them by update-type produced exactly that: a routine fastapi bump landed
+      # alongside a pinned starlette and pip could not resolve the pair. No update-types filter
+      # here on purpose — majors included, because the coupling does not care about semver.
+      # (paramiko, bcrypt, cryptography and redis only ever ask for >=3.x of each other, so they
+      # are safe to move independently and are deliberately not listed.)
+      fastapi-stack:
+        applies-to: version-updates
+        patterns:
+          - "fastapi"
+          - "starlette"
+          - "pydantic"
+          - "pydantic-settings"
       # Routine currency. Patch and minor releases are, by semver, additive — safe to review as
       # one batch. Keeping them out of the majors' way is what stops the list going stale.
       pip-routine:
         applies-to: version-updates
         patterns:
           - "*"
+        exclude-patterns:
+          - "fastapi"
+          - "starlette"
+          - "pydantic"
+          - "pydantic-settings"
         update-types:
           - "patch"
           - "minor"
