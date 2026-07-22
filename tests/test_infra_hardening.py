@@ -939,6 +939,56 @@ def test_forwarded_proto_scheme_resolution():
     )
 
 
+def _version_tuple(v):
+    """Numeric release segments, so 0.0.32 sorts above 0.0.18 (a string compare does not).
+
+    Trailing non-numeric parts (rc/post/dev) are truncated rather than ordered — these are
+    security floors, and a prerelease of the floor version is not something to assert about.
+    """
+    parts = []
+    for chunk in v.split("."):
+        digits = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            digits += ch
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _at_least(active, package, floor, why):
+    """Assert requirements.txt pins `package` at or above `floor`."""
+    pinned = None
+    for line in active:
+        name = line.split("==")[0].split("[")[0].strip().lower()
+        if name == package and "==" in line:
+            pinned = line.split("==", 1)[1].strip()
+            break
+    assert pinned is not None, f"{package} should be pinned in requirements.txt"
+    assert _version_tuple(pinned) >= _version_tuple(floor), (
+        f"{package}=={pinned} is below the {floor} floor, which carries {why}"
+    )
+
+
+def test_version_floor_helper_orders_numerically():
+    """The helper is the whole point of the guard below, so pin its ordering.
+
+    A plain string compare gets 0.0.32 vs 0.0.18 wrong, and that is exactly the pair that
+    matters here.
+    """
+    assert _version_tuple("0.0.32") > _version_tuple("0.0.18")
+    assert _version_tuple("1.3.1") > _version_tuple("0.40")
+    assert _version_tuple("0.139.2") > _version_tuple("0.115.6")
+    assert _version_tuple("44.0.1") == _version_tuple("44.0.1")
+    assert not _version_tuple("43.0.0") >= _version_tuple("44.0.1")
+    # a floor must still fail when the pin genuinely regresses
+    import pytest as _pytest
+    with _pytest.raises(AssertionError):
+        _at_least(["cryptography==43.0.0"], "cryptography", "44.0.1", "a CVE fix")
+    with _pytest.raises(AssertionError):
+        _at_least(["fastapi==0.115.6"], "starlette", "0.40", "a CVE fix")
+
+
 def test_requirements_drop_unused_and_refresh_crypto():
     active = [l.strip() for l in _read("requirements.txt").splitlines()
               if l.strip() and not l.strip().startswith("#")]
@@ -946,10 +996,13 @@ def test_requirements_drop_unused_and_refresh_crypto():
     assert "requests" not in names, "unused requests should be removed from the image deps"
     assert "python-jose" not in names, "the unmaintained python-jose should be dropped in favour of PyJWT"
     assert "pyjwt" in names, "the JWT path is now the maintained PyJWT"
-    assert "cryptography==44.0.1" in active, "cryptography should carry the CVE-2024-12797 fix"
-    assert "python-multipart==0.0.18" in active, "python-multipart should carry the multipart-DoS fix"
-    assert "fastapi==0.115.6" in active, "fastapi should pair with starlette>=0.40 (CVE-2024-47874)"
-    assert "starlette==0.41.3" in active, "starlette should be >=0.40 (CVE-2024-47874)"
+    # Security FLOORS, not exact pins. These guard "at least the release that carries the fix";
+    # asserting the literal pin made every routine upgrade fail this test even when the upgrade
+    # moved further past the floor, which is the opposite of what the guard is for.
+    _at_least(active, "cryptography", "44.0.1", "CVE-2024-12797")
+    _at_least(active, "python-multipart", "0.0.18", "the multipart-DoS fix (CVE-2024-53981)")
+    _at_least(active, "fastapi", "0.115.6", "the starlette>=0.40 pairing (CVE-2024-47874)")
+    _at_least(active, "starlette", "0.40", "CVE-2024-47874")
 
 
 def test_no_stray_import_of_dropped_libs_in_shipped_code():
