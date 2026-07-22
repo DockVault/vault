@@ -1,0 +1,244 @@
+name: Tests
+
+# Build the image, stand up the real stack (Postgres + Redis + web + SFTP), and run the full
+# pytest suite against it on every pull request. Without this, a dependency PR arrives with no
+# signal at all and the only way to judge it is to rebuild the stack by hand.
+#
+# The suite in tests/ is an INTEGRATION suite: it drives the deployed container over HTTP and a
+# real browser rather than importing the app. That is why this job runs the stack instead of just
+# installing the requirements.
+#
+# Deliberately uses no secrets: every credential below is generated fresh for the run and thrown
+# away with the runner. That keeps the job working on pull requests from Dependabot and from
+# forks, both of which get a read-only token and no access to repository secrets.
+#
+# Third-party actions are pinned to a full commit SHA (supply-chain hardening), matching
+# release.yml; the trailing comment records the human-readable version. Bump both together.
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# A second push to the same branch cancels the first — the suite is long and there is no point
+# finishing a run whose commit is already superseded.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: Full suite (API + browser)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Do not leave the job's GITHUB_TOKEN behind in .git/config. This job goes on to build
+          # and run a Dockerfile that, on a fork or Dependabot pull request, is attacker-authored
+          # content; nothing here needs to push, so the credential should not be on disk for it
+          # to read.
+          persist-credentials: false
+
+      - name: Generate a throwaway .env
+        # The compose stack reads ../.env, and app/core/config.py fails closed on a weak or
+        # placeholder secret, so these have to be real values rather than dummies:
+        #   ENCRYPTION_KEY  must be a valid Fernet key (urlsafe-base64 of exactly 32 bytes)
+        #   JWT_SECRET_KEY  must be >= 32 chars and not on the placeholder denylist
+        #   ADMIN_PASSWORD  must not be a known sample value
+        # Generated per-run so nothing here is ever a credential worth stealing.
+        run: |
+          set -euo pipefail
+          ENCRYPTION_KEY="$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
+          ADMIN_PASSWORD="$(openssl rand -base64 24)"
+          # Actions does not mask values just because they were generated here, and this is a
+          # public repo whose logs anyone can read. Register them before they can be echoed by a
+          # failing command, a `set -x`, or a test that dumps its request.
+          echo "::add-mask::${ENCRYPTION_KEY}"
+          echo "::add-mask::${ADMIN_PASSWORD}"
+          {
+            echo "ENCRYPTION_KEY=${ENCRYPTION_KEY}"
+            echo "JWT_SECRET_KEY=$(openssl rand -hex 32)"
+            echo "VAULT_DB_PASSWORD=$(openssl rand -hex 16)"
+            echo "ADMIN_USERNAME=admin"
+            echo "ADMIN_EMAIL=admin@ci.invalid"
+            echo "ADMIN_PASSWORD=${ADMIN_PASSWORD}"
+            echo "API_USE_HTTPS=false"
+            echo "ENVIRONMENT=development"
+            # Rate limits, raised for the suite. NOT cosmetic: the login throttle allows
+            # rate_limit_login_attempts per username and DOUBLE that per IP per 300s window, and
+            # the vault-unlock throttle allows 5/20 per window. Every test here arrives from one
+            # address (127.0.0.1) and the suite drives hundreds of logins and vault opens, so at
+            # the shipped defaults most of the run dies on 429 rather than testing anything.
+            # This mirrors what a dev stack does; test_login_throttle.py documents the same and
+            # skips itself when the limit is raised — the throttle step at the end of this job
+            # puts the shipped limits back and exercises it for real.
+            echo "RATE_LIMIT_LOGIN_ATTEMPTS=2000"
+            echo "RATE_LIMIT_VAULT_ATTEMPTS=2000"
+            echo "RATE_LIMIT_VAULT_ATTEMPTS_ADMIN=2000"
+            # Plus the general API middleware: 100 req/min overall, 10 auth, 20 upload,
+            # 50 download. Left ENABLED so the middleware still executes on every request —
+            # only the budget is raised beyond what the suite can exhaust.
+            echo "RATE_LIMIT_API_DEFAULT=100000"
+            echo "RATE_LIMIT_API_AUTH=100000"
+            echo "RATE_LIMIT_API_UPLOAD=100000"
+            echo "RATE_LIMIT_API_DOWNLOAD=100000"
+          } > .env
+          # Hand the admin credentials to pytest directly. conftest.py can also read them back
+          # out of ../.env, but being explicit means a future .env-parsing change cannot quietly
+          # turn every authenticated test into a skip.
+          {
+            echo "VAULT_ADMIN_USER=admin"
+            echo "VAULT_ADMIN_PASS=${ADMIN_PASSWORD}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build the image and start the stack
+        run: docker compose up -d --build
+
+      - name: Wait for the vault to become healthy
+        # First real gate. conftest.py SKIPS the whole suite when the container is unreachable,
+        # so a stack that never came up would otherwise produce a green run with zero tests.
+        # Failing here instead makes that impossible.
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            body="$(curl -fsS --max-time 5 http://127.0.0.1:8200/health 2>/dev/null || true)"
+            case "$body" in
+              *'"database":"connected"'*)
+                echo "Vault healthy after ${attempt} attempt(s): ${body}"
+                exit 0
+                ;;
+            esac
+            sleep 5
+          done
+          echo "::error::Vault never reported healthy at http://127.0.0.1:8200/health"
+          docker compose ps
+          docker compose logs --no-color --tail=200
+          exit 1
+
+      - name: Wait for the SFTP port
+        # The SFTP round-trip tests skip themselves when port 2322 is closed. Same reasoning as
+        # above: a silent skip is worse than a failure, so prove the port is open before running.
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            # Read the SSH identification banner, not just a successful connect: docker-proxy
+            # binds the published host port the moment the container is created, so a bare TCP
+            # connect returns success while paramiko inside is still starting. Only a real
+            # "SSH-2.0-..." greeting proves the server is actually serving.
+            banner="$(timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2322; head -c 4 <&3' 2>/dev/null || true)"
+            case "$banner" in
+              SSH-*)
+                echo "SFTP greeting received after ${attempt} attempt(s)"
+                exit 0
+                ;;
+            esac
+            sleep 2
+          done
+          echo "::error::SFTP never started listening on 127.0.0.1:2322"
+          docker compose logs --no-color vault-sftp
+          exit 1
+
+      - name: Install test dependencies
+        # Uses the runner's preinstalled Python rather than actions/setup-python: the suite is an
+        # HTTP/browser client, not the app under test, so its interpreter version is not part of
+        # what we are validating — and skipping the action keeps one less pinned SHA to maintain.
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r tests/requirements-test.txt
+          python3 -m playwright install --with-deps chromium
+
+      - name: Run the full test suite
+        working-directory: tests
+        # --junitxml feeds the skip audit below. `|| true` keeps the job alive so that audit and
+        # the log dump still run on failure; the real pass/fail verdict is the audit step, which
+        # reads the XML and re-raises.
+        run: |
+          set -o pipefail
+          python3 -m pytest -ra --junitxml=../pytest-results.xml || true
+
+      - name: Audit the results (fail on failures OR on a silently skipped suite)
+        # The suite is designed to skip cleanly rather than error when its environment is missing.
+        # That is right for a laptop and dangerous in CI: pytest exits 0 when every test skipped,
+        # so "all green" and "nothing ran" look identical. This step separates them.
+        run: |
+          python3 - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          # Two independent guards, because a floor alone is weak: the suite is ~1100 tests, so
+          # hundreds could skip and still clear any absolute floor worth setting.
+          #   - the floor catches a total environment collapse
+          #   - the ratio catches a partial one (e.g. SFTP down, or the admin credential missing,
+          #     which quietly turns a whole class of tests into skips)
+          # The observed steady-state skip rate is ~1%; 15% is loose enough not to flap and tight
+          # enough that a silently-missing dependency cannot hide.
+          MIN_TESTS_ACTUALLY_RUN = 50
+          MAX_SKIP_RATIO = 0.15
+
+          try:
+              root = ET.parse("pytest-results.xml").getroot()
+          except (OSError, ET.ParseError) as exc:
+              sys.exit(f"::error::No usable pytest report ({exc}). The suite did not run.")
+
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          total = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          ran = total - skipped
+
+          print(f"collected={total} ran={ran} skipped={skipped} failed={failures} errored={errors}")
+
+          problems = []
+          if failures or errors:
+              problems.append(f"{failures} failed, {errors} errored")
+          if ran < MIN_TESTS_ACTUALLY_RUN:
+              problems.append(
+                  f"only {ran} of {total} tests actually ran (floor is {MIN_TESTS_ACTUALLY_RUN}) "
+                  "- the suite skipped itself instead of testing anything"
+              )
+          elif total and skipped / total > MAX_SKIP_RATIO:
+              problems.append(
+                  f"{skipped} of {total} tests skipped "
+                  f"({skipped / total:.0%}, ceiling is {MAX_SKIP_RATIO:.0%}) "
+                  "- part of the environment is missing, not just a few opt-in tests"
+              )
+          if problems:
+              sys.exit("::error::" + "; ".join(problems))
+          print("OK")
+          PY
+
+      - name: Exercise the login throttle at shipped limits
+        # The main run raises the limits so the suite can execute at all, which makes
+        # test_login_throttle.py skip itself. Put the shipped defaults back and run just that
+        # file, so brute-force protection is actually covered rather than permanently skipped.
+        run: |
+          set -euo pipefail
+          sed -i 's/^RATE_LIMIT_LOGIN_ATTEMPTS=.*/RATE_LIMIT_LOGIN_ATTEMPTS=5/' .env
+          docker compose up -d --force-recreate vault-api
+          for attempt in $(seq 1 40); do
+            body="$(curl -fsS --max-time 5 http://127.0.0.1:8200/health 2>/dev/null || true)"
+            case "$body" in *'"database":"connected"'*) break ;; esac
+            [ "$attempt" -eq 40 ] && { echo "::error::vault-api did not come back up"; exit 1; }
+            sleep 3
+          done
+          # Clear the sliding-window counters the main run filled, so the throttle test starts
+          # from an empty bucket rather than an already-exhausted one.
+          docker compose exec -T vault-redis redis-cli FLUSHALL
+          cd tests && python3 -m pytest test_login_throttle.py -ra
+
+      - name: Container logs
+        if: failure()
+        run: docker compose logs --no-color --tail=400
+
+      - name: Tear the stack down
+        if: always()
+        run: docker compose down -v --remove-orphans
