@@ -60,6 +60,21 @@ RATE_LIMIT_API_DOWNLOAD=100000
 JWT_ACCESS_TOKEN_EXPIRE_MINUTES=240
 ```
 
+### The env values are only a fallback — seed the stored settings too
+
+`_global_setting()` prefers a positive value stored in the admin settings blob over the env var,
+and `test_ui_branding.py` clicks **Save All Changes**, which writes back every field the Settings
+page is displaying. With nothing stored the page shows the shipped `max_login_attempts` of 5 and
+saves it — and from that point it overrides the env limits for the rest of the run, so everything
+sorting after the browser files (`ui_*`, `vault_*`, `zk_*`) 429s. Storing the values you want
+first makes that save a no-op:
+
+```
+curl -X PUT http://localhost:8200/settings -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"max_login_attempts": 2000, "session_timeout": 240, "lockout_duration": 0}'
+```
+
 Also check `ADMIN_EMAIL`: pydantic's `EmailStr` rejects special-use TLDs, so an address at
 `.local`, `.invalid`, `.test` or `.example` makes every endpoint that validates the admin's own
 email return 422 (`test_api_self_account.py` is the one that notices). Deliverability is not
