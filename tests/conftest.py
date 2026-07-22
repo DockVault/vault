@@ -344,7 +344,7 @@ def admin(admin_creds):
     return client
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(autouse=True)
 def _clear_stored_auth_overrides(request):
     """Undo the Settings page's habit of persisting login limits it was only displaying.
 
@@ -355,13 +355,16 @@ def _clear_stored_auth_overrides(request):
     every test arrives from one address, everything sorting after it dies on 429. It presents as
     broken sharing, broken zero-knowledge and broken SFTP; it is one settings write.
 
-    Zero means "use the deployment default", so restoring zero after each browser module keeps one
-    module's incidental save out of the next one's way. The admin client is resolved during setup,
-    not teardown, so non-browser modules (including the pure-helper ones that run with no stack)
-    never trigger a login.
+    Zero means "use the deployment default", so restoring zero after each browser TEST keeps one
+    test's incidental save out of the way of everything that follows. Per-test rather than
+    per-module on purpose: test_ui_e2e.py saves settings a few tests in and then runs another
+    thirty-odd, so a module-scoped cleanup still leaves most of its own file throttled.
+
+    The admin client is resolved during setup, not teardown, so non-browser tests (including the
+    pure-helper ones that run with no stack) never trigger a login.
     """
     client = None
-    if request.module.__name__.startswith("test_ui_"):
+    if request.node.get_closest_marker("ui") is not None:
         client = request.getfixturevalue("admin")
     yield
     if client is None:
