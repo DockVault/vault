@@ -61,6 +61,21 @@ RATE_LIMIT_API_DOWNLOAD=100000
 Leave `RATE_LIMIT_API_ENABLED` at `true` — raising the budget keeps the middleware on the request
 path, whereas disabling it stops exercising that code entirely.
 
+Two more session-state traps worth knowing:
+
+* **Never kill a run mid-flight.** `test_api_auth_settings.py` writes `max_login_attempts` and
+  restores it in a `finally`. Interrupt it and the value stays in the database, where it
+  *overrides* the env limits above for every later login — so the next run 429s from wherever
+  that setting landed, and so does every run after it, because the value is persisted in the
+  Postgres volume. If a run was interrupted, reset it before the next one:
+  `UPDATE system_settings SET value = jsonb_set(value::jsonb,'{max_login_attempts}','0') WHERE key='global';`
+* **The test venv's paramiko must match the image's.** The SFTP suite is a paramiko client
+  talking to the vault's paramiko server, and the two negotiate algorithms. A paramiko 5 client
+  against a paramiko 3 server fails every SFTP test with `AuthenticationException` while the
+  server logs `Incompatible ssh server (no acceptable ciphers)` — a version skew, not a bug.
+  `requirements-test.txt` deliberately floors paramiko at the version `requirements.txt` pins;
+  bump them together.
+
 `test_login_throttle.py` detects the raised limit and **skips itself**, by design — CI puts the
 shipped defaults back and runs that file on its own so the throttle still gets covered. The ECC
 key-management throttle is hardcoded, not env-driven, so `test_zk_ecc_hardening.py` is unaffected.
