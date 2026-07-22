@@ -37,7 +37,7 @@ bcrypt==4.1.2
 # to the maintained PyJWT. app/core/config.py rejects a non-HMAC jwt_algorithm at startup, defeating any
 # alg-confusion regardless of library.
 PyJWT==2.13.0
-keyring==24.3.0
+keyring==25.7.0
 
 # NOTE: `requests` was removed — the only outbound HTTP is a stdlib-urllib localhost /health probe.
 # (The test suite's own `requests` dependency lives in tests/requirements-test.txt, not in the image.)
