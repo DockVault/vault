@@ -4,23 +4,23 @@
 # Web framework + server
 # fastapi 0.115 / starlette >=0.40 close CVE-2024-47874 (unbounded multipart buffering -> OOM DoS on
 # the upload endpoints). starlette is pinned explicitly for reproducibility (it arrives via fastapi).
-fastapi==0.115.6
+fastapi==0.139.2
 starlette==0.41.3
-uvicorn[standard]==0.24.0
+uvicorn[standard]==0.51.0
 # 0.0.18 closes CVE-2024-53981 (many-part malformed multipart -> CPU-exhaustion DoS) on top of the
 # earlier 0.0.7 Content-Type option-parsing ReDoS fix (CVE-2024-24762). Pairs with the fastapi/starlette
 # >=0.40 upgrade above (the module imports as `python_multipart`, which fastapi 0.115 resolves).
-python-multipart==0.0.18
+python-multipart==0.0.32
 
 # Config / validation
-pydantic==2.5.2
-pydantic-settings==2.1.0
-python-dotenv==1.0.0
-email-validator==2.1.0.post1
+pydantic==2.13.4
+pydantic-settings==2.14.2
+python-dotenv==1.2.2
+email-validator==2.3.0
 
 # Database + cache
-sqlalchemy==2.0.23
-psycopg2-binary==2.9.9
+sqlalchemy==2.0.51
+psycopg2-binary==2.9.12
 redis==5.0.1
 
 # SFTP
@@ -36,7 +36,7 @@ bcrypt==4.1.2
 # not reachable here since decode pins a single-element algorithms allowlist and the app is JWS-only)
 # to the maintained PyJWT. app/core/config.py rejects a non-HMAC jwt_algorithm at startup, defeating any
 # alg-confusion regardless of library.
-PyJWT==2.10.1
+PyJWT==2.13.0
 keyring==24.3.0
 
 # NOTE: `requests` was removed — the only outbound HTTP is a stdlib-urllib localhost /health probe.
