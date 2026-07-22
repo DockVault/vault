@@ -8,15 +8,18 @@ Usage (run from the repository root, where .env lives):
     python scripts/setup_master_password.py
 
 What it does:
-    1. Prompts for a master password (min 16 chars)
+    1. Prompts for a master password (min 16 characters, max 72 bytes)
     2. Encrypts all sensitive .env variables
     3. Generates new .env.secure file
     4. Original credentials are encrypted and safe
 
 Security:
     - Password is never stored (only bcrypt hash for verification)
+    - bcrypt reads at most the first 72 BYTES of a password, so anything longer is refused
+      rather than silently truncated. Counted in bytes, not characters: Greek and accented
+      letters cost 2 each in UTF-8, emoji up to 4.
     - All secrets encrypted with PBKDF2-derived key
-    - 100,000 iterations (OWASP recommended)
+    - 600,000 iterations (current OWASP guidance for PBKDF2-HMAC-SHA256)
     - Unique salt generated
 """
 
@@ -30,6 +33,12 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import bcrypt
 from dotenv import load_dotenv
+
+# Run as `python scripts/setup_master_password.py`, so sys.path[0] is scripts/ and the
+# repo root is not importable by default. Add it so the bcrypt input limit stays a single
+# shared definition with the runtime verifier instead of a second copy that can drift.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from app.core.startup_security import BCRYPT_MAX_PASSWORD_BYTES, bcrypt_password_bytes
 
 def generate_salt() -> str:
     """Generate a random salt for PBKDF2"""
@@ -58,17 +67,41 @@ def get_master_password() -> str:
     print("⚠️  WARNING: If you forget this password, data is UNRECOVERABLE!")
     print("\nRequirements:")
     print("  • Minimum 16 characters")
+    print(f"  • Maximum {BCRYPT_MAX_PASSWORD_BYTES} bytes (bcrypt's hard limit — see below)")
     print("  • Use a password manager to store it securely")
     print("  • Never share this password")
     print()
-    
+
     while True:
         password = getpass.getpass("Enter master password: ")
-        
+
         if len(password) < 16:
             print("❌ Password must be at least 16 characters!\n")
             continue
-        
+
+        # bcrypt ignores everything past the first 72 BYTES. Older bcrypt releases dropped the
+        # excess silently, which quietly capped a long passphrase's real strength; bcrypt >= 5.0
+        # raises instead. Refuse it here so the operator finds out now, while they can still pick
+        # a different password, rather than believing in protection they do not have.
+        # Counted in BYTES: UTF-8 spends 2 on a Greek or accented letter and up to 4 on an emoji.
+        encoded_length = len(password.encode("utf-8"))
+        if encoded_length > BCRYPT_MAX_PASSWORD_BYTES:
+            print(
+                f"❌ Password is {encoded_length} bytes; the maximum is "
+                f"{BCRYPT_MAX_PASSWORD_BYTES} bytes."
+            )
+            print(
+                "   Everything past that point is ignored by bcrypt, so a longer password "
+                "would not actually be stronger."
+            )
+            print(
+                "   Note this counts BYTES, not characters: plain ASCII is 1 byte per character, "
+                "but Greek or accented letters take 2 and emoji up to 4 — so a 37-character "
+                "Greek passphrase can already be over the limit."
+            )
+            print(f"   Yours is {len(password)} characters / {encoded_length} bytes.\n")
+            continue
+
         password_confirm = getpass.getpass("Confirm master password: ")
         
         if password != password_confirm:
@@ -128,8 +161,12 @@ def create_secure_env(password: str, secrets: dict) -> tuple[str, str, str]:
     password_key = derive_key_from_password(password, salt)
     fernet = Fernet(password_key)
     
-    # Hash password for verification
-    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    # Hash password for verification. get_master_password() already rejects anything over the
+    # limit, so this clamp is a no-op for interactive use — it is here so a caller that imports
+    # create_secure_env() directly still produces a hash the runtime verifier can check, instead
+    # of a ValueError from bcrypt >= 5.0. The PBKDF2 key derivation above deliberately uses the
+    # FULL password: only bcrypt carries the 72-byte limit.
+    password_hash = bcrypt.hashpw(bcrypt_password_bytes(password), bcrypt.gensalt()).decode()
     
     # Encrypt all secrets
     encrypted_secrets = {}

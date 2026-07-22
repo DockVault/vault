@@ -1,6 +1,27 @@
 # Automated dependency scanning + update PRs. Keeps the Python deps and the Docker base image
 # current so security patches (e.g. the multipart / cryptography CVEs) are surfaced automatically
 # instead of the stack silently freezing. Only active on the public GitHub repo.
+#
+# Grouping is deliberate. An earlier config grouped EVERY pip update into one PR — including a
+# breaking major — so the list was always too large to merge on sight and went stale instead.
+# The tiers below sort updates by how much review each one actually deserves:
+#
+#   (security)     one PR per advisory, ungrouped     -> merge on sight
+#   pip-routine    one batched PR, patch + minor      -> skim, merge as a batch
+#   (ungrouped)    every MAJOR gets its own PR        -> review individually
+#
+# There is deliberately NO group for security updates. A `groups` entry without `applies-to`
+# covers version updates only, so security advisories are already raised individually — and
+# adding `applies-to: security-updates` with patterns ["*"] would BATCH every advisory of the
+# week into one PR, so one component that breaks the suite would block the unrelated fix beside
+# it. Ungrouped is the strongest form of "merge on sight".
+#
+# NB: none of that fires unless Dependabot security updates are switched on under
+# Settings > Code security. This file cannot enable them.
+#
+# Majors are grouped nowhere on purpose: an unlisted dependency gets an individual PR, which is
+# exactly what a breaking-change upgrade needs. .github/workflows/tests.yml runs the full suite
+# against each of these, so every PR arrives with a real pass/fail instead of silence.
 version: 2
 updates:
   - package-ecosystem: "pip"
@@ -9,10 +30,30 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 10
     groups:
-      python-deps:
+      # Routine currency. Patch and minor releases are, by semver, additive — safe to review as
+      # one batch. Keeping them out of the majors' way is what stops the list going stale.
+      pip-routine:
+        applies-to: version-updates
         patterns:
           - "*"
+        update-types:
+          - "patch"
+          - "minor"
+
+  # Base image (the `FROM python:...` line in the Dockerfile). No `ignore` rule here on purpose:
+  # a Python major-version bump SHOULD keep being proposed. Note it can only ever be merged
+  # together with, or after, a pip update that carries wheels for the new interpreter — an older
+  # pinned psycopg2-binary has no prebuilt package for a newer Python and falls back to a source
+  # build the slim image has no compiler for.
   - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Keeps the pinned action SHAs in release.yml and tests.yml from going stale. Those pins are a
+  # supply-chain control: they stop a moved tag from silently changing what CI executes, but they
+  # also mean nothing updates them unless something asks.
+  - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"

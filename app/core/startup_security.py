@@ -26,6 +26,32 @@ except ImportError:
     print("⚠️  System keychain integration will be unavailable")
 
 
+# bcrypt hashes at most the first 72 BYTES of its input — a hard limit of the
+# algorithm, not of any one library. bcrypt < 5.0 truncated past that silently;
+# bcrypt >= 5.0 raises ValueError instead. We clamp on the way in so a hash
+# written under EITHER version still verifies: rejecting long input here would
+# permanently lock out a deployment whose master password was set while the old
+# truncating behaviour applied, with no way back in.
+#
+# The limit is BYTES, not characters — UTF-8 spends 2 bytes on a Greek or
+# accented letter and up to 4 on an emoji, so a 37-character Greek passphrase
+# already exceeds it. Setup-time input is capped at the same limit (see
+# scripts/setup_master_password.py) so a NEW password is never silently
+# weakened; the clamp here is only for compatibility with older hashes.
+BCRYPT_MAX_PASSWORD_BYTES = 72
+
+
+def bcrypt_password_bytes(password: str) -> bytes:
+    """UTF-8 encode a password and clamp it to bcrypt's 72-byte input limit.
+
+    Slicing the encoded bytes (not the string) reproduces exactly what
+    bcrypt < 5.0 did internally, so existing hashes keep verifying. A trailing
+    multi-byte character may be cut mid-sequence — that is intended: bcrypt
+    takes an opaque byte string and never decodes it.
+    """
+    return password.encode("utf-8")[:BCRYPT_MAX_PASSWORD_BYTES]
+
+
 class CredentialManager:
     """
     Manages encrypted credentials and master password authentication.
@@ -106,7 +132,7 @@ class CredentialManager:
             return False
 
         try:
-            return bcrypt.checkpw(password.encode(), password_hash.encode())
+            return bcrypt.checkpw(bcrypt_password_bytes(password), password_hash.encode())
         except Exception:
             # Do not log hash bytes or exception detail — the master-password hash /
             # its salt must never reach container stdout.
