@@ -45,6 +45,7 @@ python -m venv .venv
 | `RATE_LIMIT_LOGIN_ATTEMPTS` | `5` (IP limit is 2x = 10 / 5 min) | login 429s; most tests error at fixture setup |
 | `RATE_LIMIT_VAULT_ATTEMPTS` / `_ADMIN` | `5` / `20` per 5 min | vault-open 429s across the file + vault suites |
 | `RATE_LIMIT_API_DEFAULT` / `_AUTH` / `_UPLOAD` / `_DOWNLOAD` | `100` / `10` / `20` / `50` per min | the general middleware 429s almost everything |
+| `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` | `30` | the admin logs in ONCE (session fixture) and the run takes ~35 min, so the token expires ~two thirds through and everything after it 401s |
 
 Put these in the stack's `.env` before running (this is what a dev stack does):
 
@@ -56,7 +57,28 @@ RATE_LIMIT_API_DEFAULT=100000
 RATE_LIMIT_API_AUTH=100000
 RATE_LIMIT_API_UPLOAD=100000
 RATE_LIMIT_API_DOWNLOAD=100000
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=240
 ```
+
+### The env values are only a fallback — seed the stored settings too
+
+`_global_setting()` prefers a positive value stored in the admin settings blob over the env var,
+and `test_ui_branding.py` clicks **Save All Changes**, which writes back every field the Settings
+page is displaying. With nothing stored the page shows the shipped `max_login_attempts` of 5 and
+saves it — and from that point it overrides the env limits for the rest of the run, so everything
+sorting after the browser files (`ui_*`, `vault_*`, `zk_*`) 429s. Storing the values you want
+first makes that save a no-op:
+
+```
+curl -X PUT http://localhost:8200/settings -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"max_login_attempts": 2000, "session_timeout": 240, "lockout_duration": 0}'
+```
+
+Also check `ADMIN_EMAIL`: pydantic's `EmailStr` rejects special-use TLDs, so an address at
+`.local`, `.invalid`, `.test` or `.example` makes every endpoint that validates the admin's own
+email return 422 (`test_api_self_account.py` is the one that notices). Deliverability is not
+checked, so the domain need not resolve — it just must not be reserved.
 
 Leave `RATE_LIMIT_API_ENABLED` at `true` — raising the budget keeps the middleware on the request
 path, whereas disabling it stops exercising that code entirely.

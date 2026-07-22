@@ -66,10 +66,21 @@ jobs:
             echo "JWT_SECRET_KEY=$(openssl rand -hex 32)"
             echo "VAULT_DB_PASSWORD=$(openssl rand -hex 16)"
             echo "ADMIN_USERNAME=admin"
-            echo "ADMIN_EMAIL=admin@ci.invalid"
+            # Not a special-use TLD. Pydantic's EmailStr rejects .local / .invalid / .test /
+            # .example outright, so an address there fails every endpoint that echoes the admin's
+            # own email back through a validated model. Deliverability is not checked, so the
+            # domain does not need to resolve — it just must not be reserved.
+            echo "ADMIN_EMAIL=admin@dockvault-ci.com"
             echo "ADMIN_PASSWORD=${ADMIN_PASSWORD}"
             echo "API_USE_HTTPS=false"
             echo "ENVIRONMENT=development"
+            # conftest.py logs the admin in ONCE, session-scoped, and reuses that token for the
+            # whole run. The suite takes ~35 minutes, so at the shipped 30-minute TTL the token
+            # expires around two thirds of the way through and every remaining test 401s — which
+            # surfaces as failures in whatever happens to sort late (sftp_*, ui_*, zk_*) and
+            # looks like a broken feature rather than an expired session. Four hours is well
+            # clear of the runtime without disabling expiry altogether.
+            echo "JWT_ACCESS_TOKEN_EXPIRE_MINUTES=240"
             # Rate limits, raised for the suite. NOT cosmetic: the login throttle allows
             # rate_limit_login_attempts per username and DOUBLE that per IP per 300s window, and
             # the vault-unlock throttle allows 5/20 per window. Every test here arrives from one

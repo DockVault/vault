@@ -344,6 +344,41 @@ def admin(admin_creds):
     return client
 
 
+@pytest.fixture(autouse=True)
+def _clear_stored_auth_overrides(request):
+    """Undo the Settings page's habit of persisting login limits it was only displaying.
+
+    "Save All Changes" writes back every field the admin Settings page is showing, and the page
+    substitutes the shipped default (5) whenever nothing is stored. auth_service._global_setting()
+    prefers a positive STORED value over RATE_LIMIT_LOGIN_ATTEMPTS, so a single browser test that
+    saves settings pins the rest of the session to 5 logins per user / 10 per IP — and because
+    every test arrives from one address, everything sorting after it dies on 429. It presents as
+    broken sharing, broken zero-knowledge and broken SFTP; it is one settings write.
+
+    Zero means "use the deployment default", so restoring zero after each browser TEST keeps one
+    test's incidental save out of the way of everything that follows. Per-test rather than
+    per-module on purpose: test_ui_e2e.py saves settings a few tests in and then runs another
+    thirty-odd, so a module-scoped cleanup still leaves most of its own file throttled.
+
+    The admin client is resolved during setup, not teardown, so non-browser tests (including the
+    pure-helper ones that run with no stack) never trigger a login.
+    """
+    client = None
+    if request.node.get_closest_marker("ui") is not None:
+        client = request.getfixturevalue("admin")
+    yield
+    if client is None:
+        return
+    try:
+        client.put("/settings", json={
+            "max_login_attempts": 0,
+            "lockout_duration": 0,
+            "session_timeout": 0,
+        })
+    except Exception:  # noqa: BLE001 — best effort; cleanup must never fail a passing module
+        pass
+
+
 @pytest.fixture
 def anon():
     """An unauthenticated ApiClient."""
