@@ -1,10 +1,13 @@
 """Unit tests for the host-side management tool (dockvault.py).
 
 Loaded by file path (the module is pure stdlib — no app imports), so these run without a live
-instance and never touch Docker: the tested surface is the pure colour/prompt/menu/step-tracker
-logic + the arg-mode routing. A subprocess smoke covers --help."""
+instance: the tested surface is the pure colour/prompt/menu/step-tracker logic, the arg-mode
+routing, and the docker/compose call SHAPES (via an injected/patched `run`). A subprocess smoke
+covers --help. A handful of tests marked as needing a live engine do drive real Docker - they skip
+cleanly when `docker` is absent."""
 import argparse
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -603,6 +606,11 @@ def test_probe_pg_password_passes_secret_by_env_not_argv():
                                 run=lambda *a, **k: (_ for _ in ()).throw(OSError("no docker"))) == "ambiguous"
 
 
+# The coupling-stamp hooks, stubbed OUT: these tests exercise the authoritative live-probe path.
+# (The stamp fast path has its own tests below.)
+_NO_STAMP = dict(marker_fn=lambda vol: None, stamp_fn=lambda vol, env: True)
+
+
 def _guard_tool():
     return dv.DockVault(dv.Palette(False), root=os.path.join("/", "nonexistent-dockvault-root"))
 
@@ -613,7 +621,7 @@ def test_guard_db_secret_fresh_volume_proceeds_without_probing():
         {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"},
         exists_fn=lambda v: False,
         start_fn=lambda: started.__setitem__("n", started["n"] + 1) or True,
-        wait_fn=lambda: True, probe_fn=lambda *a: "ok", stop_fn=lambda: None)
+        wait_fn=lambda: True, probe_fn=lambda *a: "ok", stop_fn=lambda: None, **_NO_STAMP)
     assert ok is True and started["n"] == 0, "a fresh volume must proceed without starting/probing the db"
 
 
@@ -621,7 +629,7 @@ def test_guard_db_secret_match_proceeds():
     ok = _guard_tool()._guard_db_secret(
         {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"},
         exists_fn=lambda v: True, start_fn=lambda: True, wait_fn=lambda: True,
-        probe_fn=lambda *a: "ok", stop_fn=lambda: None)
+        probe_fn=lambda *a: "ok", stop_fn=lambda: None, **_NO_STAMP)
     assert ok is True
 
 
@@ -630,7 +638,7 @@ def test_guard_db_secret_mismatch_refuses_without_leaking_secret(capsys):
     ok = _guard_tool()._guard_db_secret(
         {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "TOPSECRETPW_42"},
         exists_fn=lambda v: True, start_fn=lambda: True, wait_fn=lambda: True,
-        probe_fn=lambda *a: "mismatch", stop_fn=lambda: stopped.__setitem__("n", stopped["n"] + 1))
+        probe_fn=lambda *a: "mismatch", stop_fn=lambda: stopped.__setitem__("n", stopped["n"] + 1), **_NO_STAMP)
     out = capsys.readouterr().out
     assert ok is False
     assert "TOPSECRETPW_42" not in out, "the diagnosis must NEVER print the secret value"
@@ -645,7 +653,7 @@ def test_guard_db_secret_invalid_encryption_key_refuses_before_starting_db(capsy
         {"ENCRYPTION_KEY": "not-a-fernet-key", "VAULT_DB_PASSWORD": "x"},
         exists_fn=lambda v: True,
         start_fn=lambda: started.__setitem__("n", started["n"] + 1) or True,
-        wait_fn=lambda: True, probe_fn=lambda *a: "ok", stop_fn=lambda: None)
+        wait_fn=lambda: True, probe_fn=lambda *a: "ok", stop_fn=lambda: None, **_NO_STAMP)
     out = capsys.readouterr().out
     assert ok is False and started["n"] == 0, "an invalid ENCRYPTION_KEY must be rejected before starting the db"
     assert "ENCRYPTION_KEY" in out
@@ -655,7 +663,7 @@ def test_guard_db_secret_ambiguous_when_db_never_ready(capsys):
     ok = _guard_tool()._guard_db_secret(
         {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"},
         exists_fn=lambda v: True, start_fn=lambda: True, wait_fn=lambda: False,   # never ready
-        probe_fn=lambda *a: "ok", stop_fn=lambda: None)
+        probe_fn=lambda *a: "ok", stop_fn=lambda: None, **_NO_STAMP)
     out = capsys.readouterr().out
     assert ok is False and "did not become reachable" in out          # fail-closed on ambiguity
 
@@ -678,6 +686,7 @@ def test_setup_stops_and_does_not_start_when_guard_refuses(tmp_path, monkeypatch
     monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
     monkeypatch.setattr(dv, "_cert_pair_present", lambda *a, **k: True)       # skip cert generation
     monkeypatch.setattr(dv, "apply_cert_owner", lambda *a, **k: (True, ""))    # no real chown/icacls
+    monkeypatch.setattr(dv, "cert_readable_by_app_uid", lambda *a, **k: True)  # no real docker probe
     started = []
     monkeypatch.setattr(tool, "_start_secure_stack", lambda: started.append(1) or True)
     monkeypatch.setattr(tool, "_guard_db_secret", lambda env, **k: False)      # guard refuses
@@ -694,6 +703,7 @@ def test_setup_proceeds_to_start_when_guard_passes(tmp_path, monkeypatch):
     monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
     monkeypatch.setattr(dv, "_cert_pair_present", lambda *a, **k: True)
     monkeypatch.setattr(dv, "apply_cert_owner", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "cert_readable_by_app_uid", lambda *a, **k: True)  # no real docker probe
     monkeypatch.setattr(tool, "_guard_db_secret", lambda env, **k: True)       # guard passes
     started = []
     monkeypatch.setattr(tool, "_start_secure_stack", lambda: started.append(1) or True)
@@ -717,7 +727,7 @@ def test_existing_volume_menu_new_set_keeps_data(tmp_path, monkeypatch):
     old = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     monkeypatch.setattr(dv, "ask", _ask_seq("3"))               # "deploy a NEW set under a fresh name"
-    assert tool._guard_db_secret(old, interactive=True, exists_fn=lambda v: True) is True
+    assert tool._guard_db_secret(old, interactive=True, exists_fn=lambda v: True, **_NO_STAMP) is True
     new = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
     assert new["VAULT_VOLUME_PREFIX"].startswith("dockvault-vault-")   # fresh named set (old data untouched)
     assert new["ENCRYPTION_KEY"] != old["ENCRYPTION_KEY"]              # fresh secrets
@@ -732,10 +742,10 @@ def test_existing_volume_menu_verify_probes_only_on_choice(tmp_path, monkeypatch
     hooks = dict(exists_fn=lambda v: True, start_fn=lambda: True, wait_fn=lambda: True,
                  probe_fn=lambda *a: probes.append(1) or "ok", stop_fn=lambda: None)
     monkeypatch.setattr(dv, "ask", _ask_seq("1"))               # verify -> ok -> proceed
-    assert tool._guard_db_secret(env, interactive=True, **hooks) is True and probes == [1]
+    assert tool._guard_db_secret(env, interactive=True, **hooks, **_NO_STAMP) is True and probes == [1]
     probes.clear()
     monkeypatch.setattr(dv, "ask", _ask_seq("5"))               # cancel -> never probes
-    assert tool._guard_db_secret(env, interactive=True, **hooks) is False and probes == []
+    assert tool._guard_db_secret(env, interactive=True, **hooks, **_NO_STAMP) is False and probes == []
 
 
 def test_existing_volume_menu_verify_mismatch_loops_then_cancel(tmp_path, monkeypatch):
@@ -745,7 +755,7 @@ def test_existing_volume_menu_verify_mismatch_loops_then_cancel(tmp_path, monkey
     monkeypatch.setattr(dv, "ask", _ask_seq("1", "5"))          # verify -> mismatch -> BACK to menu -> cancel
     assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True,
                                  start_fn=lambda: True, wait_fn=lambda: True, probe_fn=lambda *a: "mismatch",
-                                 stop_fn=lambda: None) is False
+                                 stop_fn=lambda: None, **_NO_STAMP) is False
 
 
 def test_existing_volume_menu_destroy(tmp_path, monkeypatch):
@@ -756,13 +766,13 @@ def test_existing_volume_menu_destroy(tmp_path, monkeypatch):
     monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _Proc(0, ""))
     monkeypatch.setattr(dv, "confirm", lambda *a, **k: True)    # confirm the destructive down -v
     monkeypatch.setattr(dv, "ask", _ask_seq("4"))
-    assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True) is True
+    assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True, **_NO_STAMP) is True
     assert any(("down" in c and "-v" in c) for c in calls), "destroy must run down -v"
     # declining loops back to the menu (then cancel); no down -v runs
     calls.clear()
     monkeypatch.setattr(dv, "confirm", lambda *a, **k: False)
     monkeypatch.setattr(dv, "ask", _ask_seq("4", "5"))
-    assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True) is False
+    assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True, **_NO_STAMP) is False
     assert not any("down" in c for c in calls), "a declined destroy must not run down -v"
 
 
@@ -776,7 +786,7 @@ def test_existing_volume_menu_point_at_env(tmp_path, monkeypatch):
     monkeypatch.setattr(dv, "ask", _ask_seq("2", str(src)))     # option 2, then the path to try
     assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True,
                                  start_fn=lambda: True, wait_fn=lambda: True, probe_fn=lambda *a: "ok",
-                                 stop_fn=lambda: None) is True
+                                 stop_fn=lambda: None, **_NO_STAMP) is True
     installed = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
     assert installed["ENCRYPTION_KEY"] == other["encryption_key"]     # the supplied .env was installed
 
@@ -787,12 +797,12 @@ def test_guard_interactive_routes_to_menu_not_autoprobe(tmp_path, monkeypatch):
     called = []
     monkeypatch.setattr(tool, "_resolve_existing_volume", lambda e, vol, hooks: called.append(1) or True)
     # interactive + existing volume -> the menu (nothing probes automatically)
-    assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True) is True and called == [1]
+    assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True, **_NO_STAMP) is True and called == [1]
     # non-interactive -> auto-verify directly, NO menu
     called.clear()
     ok = tool._guard_db_secret(env, interactive=False, exists_fn=lambda v: True,
                                start_fn=lambda: True, wait_fn=lambda: True, probe_fn=lambda *a: "ok",
-                               stop_fn=lambda: None)
+                               stop_fn=lambda: None, **_NO_STAMP)
     assert ok is True and called == []
 
 
@@ -1340,3 +1350,406 @@ def test_setup_byo_cert_mode_installs_pair(tmp_path):
     assert "BEGIN CERTIFICATE" in (root / "certs" / "cert.pem").read_text(encoding="utf-8", errors="ignore")
     assert dv.cert_key_match(str(root / "certs" / "cert.pem"), str(root / "certs" / "key.pem")) is True
     assert "bring-your-own" in r.stdout
+
+
+# --- docker compose must never block on an invisible prompt -----------------------------------
+def test_compose_calls_close_stdin(tmp_path, monkeypatch):
+    """Every `docker compose` invocation runs with stdin CLOSED.
+
+    Compose asks a BLOCKING yes/no on stdin when an existing volume's labels don't match the compose
+    file ("Volume X exists but doesn't match configuration in compose file. Recreate (data will be
+    lost)?"). With stdin inherited that prompt hangs the tool - and with the output captured it is
+    also INVISIBLE, so the operator sees a frozen screen and a stray 'y' would destroy the data
+    volume. DEVNULL makes Compose take its safe default (keep the volume)."""
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    seen = []
+    monkeypatch.setattr(dv.subprocess, "run",
+                        lambda cmd, **k: seen.append((cmd, k)) or _Proc(0, ""))
+    tool._start_db_only()
+    tool._stop_db_only()
+    tool._stop_stack()
+    tool._recreate_stack(build=True)
+    assert seen, "no compose call was made"
+    for cmd, kw in seen:
+        assert cmd[:2] == ["docker", "compose"]
+        assert kw.get("stdin") is dv.subprocess.DEVNULL, \
+            "%s ran with stdin open - Compose could block on an unseen prompt" % " ".join(cmd[:4])
+
+
+def test_start_db_only_streams_so_docker_errors_are_visible(tmp_path, monkeypatch):
+    """The db-only start must NOT capture output: Compose's own progress/errors are the operator's
+    only diagnosis when it fails, and a captured stream is what made the prompt invisible."""
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    seen = {}
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: seen.update(k) or _Proc(1, ""))
+    assert tool._start_db_only() is False                      # non-zero exit is reported honestly
+    assert seen.get("capture_output") is not True, "compose output must reach the terminal"
+
+
+def test_wait_db_ready_reports_progress_and_closes_stdin(tmp_path, monkeypatch):
+    import time as _t
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    seen = []
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: seen.append(k) or _Proc(1, ""))
+    monkeypatch.setattr(_t, "sleep", lambda *_a: None)
+    ticks = []
+    assert tool._wait_db_ready(tries=3, tick=ticks.append) is False
+    assert len(ticks) == 3, "each poll must report progress so a 40s wait never looks frozen"
+    assert all(k.get("stdin") is dv.subprocess.DEVNULL for k in seen)
+
+
+def test_waiting_tick_prints_only_every_ten_seconds(capsys):
+    tool = dv.DockVault(dv.Palette(False))
+    for s in (0, 2, 4, 6, 8, 10, 12, 20):
+        tool._waiting_tick(s)
+    out = capsys.readouterr().out
+    assert out.count("still waiting") == 2 and "(10s)" in out and "(20s)" in out
+
+
+# --- failures show the logs instead of a bare "check the logs" --------------------------------
+def test_tail_logs_prints_container_output(tmp_path, monkeypatch, capsys):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    cmds = []
+    monkeypatch.setattr(dv.subprocess, "run",
+                        lambda cmd, **k: cmds.append(cmd) or _Proc(0, "PermissionError: [Errno 13]"))
+    tool._tail_logs("vault-api", lines=25)
+    out = capsys.readouterr().out
+    assert "PermissionError" in out, "the operator must see the actual failure, not a pointer to it"
+    assert cmds and "logs" in cmds[0] and "vault-api" in cmds[0] and "25" in cmds[0]
+
+
+def test_web_service_per_profile():
+    assert dv.DockVault._web_service("split") == "vault-api"
+    assert dv.DockVault._web_service("combined") == "vault"
+    assert dv.DockVault._web_service(None) == "vault"
+
+
+def test_setup_tails_logs_and_fails_when_the_stack_does_not_start(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "_cert_pair_present", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "apply_cert_owner", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "cert_readable_by_app_uid", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_guard_db_secret", lambda env, **k: True)
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: False)            # the stack fails
+    tailed = []
+    monkeypatch.setattr(tool, "_tail_logs", lambda svc=None, lines=40: tailed.append(svc))
+    with pytest.raises(SystemExit):
+        tool.setup(argparse.Namespace(no_start=False, non_interactive=True))
+    assert tailed == ["vault"], "a failed start must surface the failing container's logs"
+
+
+# --- the TLS key must be readable by the container's app user ---------------------------------
+def test_cert_readable_probe_classifies_docker_failure_as_undetermined(monkeypatch):
+    monkeypatch.setattr(dv.shutil, "which", lambda *_a: "/usr/bin/docker")
+    assert dv.cert_readable_by_app_uid("/c", run=lambda *a, **k: _Proc(0)) is True
+    assert dv.cert_readable_by_app_uid("/c", run=lambda *a, **k: _Proc(1)) is False
+    for rc in (125, 126, 127):     # docker itself failed -> "unknown", never a permission verdict
+        assert dv.cert_readable_by_app_uid("/c", run=lambda *a, **k: _Proc(rc)) is None
+    assert dv.cert_readable_by_app_uid(
+        "/c", run=lambda *a, **k: (_ for _ in ()).throw(OSError("boom"))) is None
+    monkeypatch.setattr(dv.shutil, "which", lambda *_a: None)
+    assert dv.cert_readable_by_app_uid("/c") is None            # no docker -> undetermined
+
+
+def test_cert_probe_never_emits_key_bytes(monkeypatch, capsys):
+    """Even if the probe container somehow emitted key material, none of it may reach the operator's
+    screen or the return value: the verdict comes from the exit code alone."""
+    monkeypatch.setattr(dv.shutil, "which", lambda *_a: "docker")
+    secret = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----"
+    seen = {}
+    out = dv.cert_readable_by_app_uid(
+        "/c", run=lambda cmd, **k: seen.update(cmd=cmd) or _Proc(0, secret, secret))
+    assert out is True                                    # the verdict, never the bytes
+    printed = capsys.readouterr()
+    assert secret not in printed.out and secret not in printed.err
+    script = seen["cmd"][-1]                              # and the container discards them at source
+    assert ">/dev/null" in script and "head -c 1" in script
+
+
+def test_apply_cert_owner_on_windows_repairs_via_container(monkeypatch):
+    """openssl writes key.pem mode 600 owned by uid 0; on a Docker Desktop bind mount the host has
+    no chown that can hand it to uid 10001, so the repair must run INSIDE a container - and the
+    result must be verified, never assumed (the old code returned 'ok' without checking, which
+    surfaced as an endless restart loop)."""
+    monkeypatch.setattr(dv.os, "name", "nt")
+    monkeypatch.setattr(dv.shutil, "which", lambda *_a: "docker")
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        joined = " ".join(cmd)
+        if "chown" in joined:
+            return _Proc(0)
+        # unreadable until the chown has run
+        repaired = any("chown" in " ".join(c) for c in calls[:-1])
+        return _Proc(0) if repaired else _Proc(1)
+
+    ok, msg = dv.apply_cert_owner("/certs", run=fake_run)
+    assert ok is True and "re-owned" in msg
+    assert any("chown 10001:10001" in " ".join(c) for c in calls)
+
+
+def test_apply_cert_owner_on_windows_reports_failure_honestly(monkeypatch):
+    monkeypatch.setattr(dv.os, "name", "nt")
+    monkeypatch.setattr(dv.shutil, "which", lambda *_a: "docker")
+    ok, msg = dv.apply_cert_owner("/certs", run=lambda *a, **k: _Proc(1))   # never readable
+    assert ok is False and "PermissionError" in msg and "re-run setup" in msg
+
+
+def test_setup_refuses_to_start_with_an_unreadable_key(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "_cert_pair_present", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "apply_cert_owner", lambda *a, **k: (False, "unreadable"))
+    monkeypatch.setattr(dv, "cert_readable_by_app_uid", lambda *a, **k: False)
+    started = []
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: started.append(1) or True)
+    monkeypatch.setattr(tool, "_guard_db_secret", lambda env, **k: True)
+    # Keep it hermetic: without these, REVERTING the gate makes this test fall through into the
+    # real health poll (minutes of live docker traffic) instead of failing fast.
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: False)
+    monkeypatch.setattr(tool, "_tail_logs", lambda *a, **k: False)
+    with pytest.raises(SystemExit) as exc:
+        tool.setup(argparse.Namespace(no_start=False, non_interactive=True))
+    assert exc.value.code == 1 and started == [], \
+        "an unreadable TLS key must fail BEFORE the start, not become a restart loop"
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="needs a live docker engine")
+def test_cert_readability_probe_and_repair_roundtrip(tmp_path):
+    """Live: a mode-600 root-owned key really IS unreadable to uid 10001, and the container-side
+    repair really does fix it (the exact mechanism behind the reported restart loop)."""
+    d = tmp_path / "certs"
+    d.mkdir()
+    mount = str(d).replace("\\", "/")
+    seed = subprocess.run(
+        ["docker", "run", "--rm", "-v", "%s:/c" % mount, "busybox", "sh", "-c",
+         "echo c > /c/cert.pem; echo k > /c/key.pem; chmod 644 /c/cert.pem; chmod 600 /c/key.pem; "
+         "chown 0:0 /c/cert.pem /c/key.pem"], capture_output=True, text=True, timeout=300)
+    if seed.returncode != 0:
+        pytest.skip("could not seed the cert dir: %s" % seed.stderr.strip()[:120])
+    assert dv.cert_readable_by_app_uid(str(d)) is False, "a root-owned 0600 key must read as DENIED"
+    assert dv._chown_certs_in_container(str(d)) is True
+    assert dv.cert_readable_by_app_uid(str(d)) is True, "the container-side chown must fix it"
+
+
+# --- the instant coupling stamp ---------------------------------------------------------------
+def test_coupling_marker_verdict_confirms_only():
+    env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    salt = dv.gen_salt()
+    good = {"salt": salt, "sha256": dv.compute_coupling_fingerprint(env, salt)}
+    assert dv.coupling_marker_verdict({"coupling": good}, env) == "ok"
+    # a stale/absent/garbled stamp is "unknown" (None) - never a refusal, because a rotated DB
+    # password would otherwise lock the operator out of their own data.
+    assert dv.coupling_marker_verdict(None, env) is None
+    assert dv.coupling_marker_verdict({}, env) is None
+    assert dv.coupling_marker_verdict({"coupling": {"salt": salt, "sha256": "0" * 64}}, env) is None
+    other = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    assert dv.coupling_marker_verdict({"coupling": good}, other) is None
+
+
+def test_coupling_marker_carries_no_secret():
+    env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    seen = {}
+    dv.write_volume_coupling("vol", env, run=lambda cmd, **k: seen.update(cmd=cmd, kw=k) or _Proc(0))
+    blob = " ".join(seen["cmd"]) + str(seen["kw"].get("input"))
+    assert env["ENCRYPTION_KEY"] not in blob and env["VAULT_DB_PASSWORD"] not in blob
+    assert '"sha256"' in seen["kw"]["input"], "the stamp is written over stdin, not argv"
+
+
+def test_read_volume_coupling_soft_fails():
+    assert dv.read_volume_coupling("v", run=lambda *a, **k: _Proc(1, "")) is None
+    assert dv.read_volume_coupling("v", run=lambda *a, **k: _Proc(0, "not json")) is None
+    assert dv.read_volume_coupling("v", run=lambda *a, **k: _Proc(0, "[1,2]")) is None
+    assert dv.read_volume_coupling("v", run=lambda *a, **k: _Proc(0, '{"salt":"a"}')) == {"salt": "a"}
+    assert dv.read_volume_coupling(
+        "v", run=lambda *a, **k: (_ for _ in ()).throw(OSError("x"))) is None
+
+
+def test_read_volume_coupling_never_creates_a_stray_volume():
+    """`docker run -v <name>:...` CREATES a missing volume, so the stamp read must check existence
+    first - the menu can ask about a set that has never been deployed."""
+    cmds = []
+
+    def run(cmd, **k):
+        cmds.append(cmd)
+        return _Proc(1, "") if "inspect" in cmd else _Proc(0, "{}")
+
+    assert dv.read_volume_coupling("never-deployed", run=run) is None
+    assert all("run" not in c for c in cmds), "no `docker run` may touch a volume that doesn't exist"
+
+
+def test_stamped_volume_verifies_without_starting_the_database(tmp_path, capsys):
+    """The reported pain: 'must I really wait 20-40s to learn whether this .env matches?' - a
+    stamped set answers instantly and never touches the database."""
+    env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    salt = dv.gen_salt()
+    marker = {"coupling": {"salt": salt, "sha256": dv.compute_coupling_fingerprint(env, salt)}}
+    started = []
+    ok = tool._guard_db_secret(
+        env, exists_fn=lambda v: True,
+        start_fn=lambda: started.append(1) or True, wait_fn=lambda: True,
+        probe_fn=lambda *a: "ok", stop_fn=lambda: None,
+        marker_fn=lambda vol: marker, stamp_fn=lambda vol, e: True)
+    assert ok is True and started == [], "a stamped set must NOT start the database"
+    assert "no database start needed" in capsys.readouterr().out
+
+
+def test_live_probe_stamps_the_volume_so_the_next_check_is_instant(tmp_path):
+    env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    stamped = []
+    assert tool._guard_db_secret(
+        env, exists_fn=lambda v: True, start_fn=lambda: True, wait_fn=lambda: True,
+        probe_fn=lambda *a: "ok", stop_fn=lambda: None,
+        marker_fn=lambda vol: None, stamp_fn=lambda vol, e: stamped.append(vol) or True) is True
+    assert stamped == ["dockvault-vault_vault_pg_data"]
+
+
+def test_a_mismatched_set_is_never_stamped(tmp_path):
+    env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    stamped = []
+    assert tool._guard_db_secret(
+        env, exists_fn=lambda v: True, start_fn=lambda: True, wait_fn=lambda: True,
+        probe_fn=lambda *a: "mismatch", stop_fn=lambda: None,
+        marker_fn=lambda vol: None, stamp_fn=lambda vol, e: stamped.append(vol) or True) is False
+    assert stamped == [], "only a CONFIRMED pairing may be stamped"
+
+
+def test_unbuffer_stdout_is_best_effort():
+    class _NoReconfigure:
+        pass
+    assert dv.unbuffer_stdout(_NoReconfigure()) is False       # never raises on an odd stdout
+    assert dv.unbuffer_stdout(io.TextIOWrapper(io.BytesIO())) is True
+
+
+# --- review follow-ups -------------------------------------------------------------------------
+def _capture_stamp(env, salt=None):
+    """Run the REAL writer and return the marker document it actually put in the volume."""
+    seen = {}
+
+    def run(cmd, **k):
+        seen.update(cmd=cmd, kw=k)
+        return _Proc(0, "")
+
+    assert dv.write_volume_coupling("vol", env, salt=salt, run=run) is True
+    return json.loads(seen["kw"]["input"])
+
+
+def test_coupling_stamp_round_trips_writer_to_verdict():
+    """The bug this test exists for: the writer emitted a FLAT {salt, sha256} document while the
+    verifier read a NESTED {"coupling": {...}} one, so a stamp the tool wrote could never confirm
+    anything and the whole 'instant' path was dead code - while every hand-built-marker test stayed
+    green. Never hand-build the marker here: take whatever the writer actually produces."""
+    env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    marker = _capture_stamp(env)
+    assert dv.coupling_marker_verdict(marker, env) == "ok"
+    other = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    assert dv.coupling_marker_verdict(marker, other) is None
+
+
+def test_coupling_stamp_round_trips_through_the_volume_reader():
+    """Full chain: writer payload -> read_volume_coupling's parse -> verdict."""
+    env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    payload = json.dumps(_capture_stamp(env))
+
+    def run(cmd, **k):
+        return _Proc(0, "") if "inspect" in cmd else _Proc(0, payload)
+
+    assert dv.coupling_marker_verdict(dv.read_volume_coupling("vol", run=run), env) == "ok"
+
+
+def test_setup_flow_uses_the_stamp_it_just_wrote(tmp_path, capsys):
+    """End to end through the guard: the first check probes the DB and stamps; a second check with
+    that same stamp in place is instant and never starts the database."""
+    env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    store = {}
+    hooks = dict(exists_fn=lambda v: True, wait_fn=lambda: True, probe_fn=lambda *a: "ok",
+                 stop_fn=lambda: None,
+                 marker_fn=lambda vol: store.get(vol),
+                 stamp_fn=lambda vol, e: store.__setitem__(vol, dv.build_coupling_marker(e)) or True)
+    starts = []
+    assert tool._guard_db_secret(env, start_fn=lambda: starts.append(1) or True, **hooks) is True
+    assert starts == [1] and store, "the first check must probe the live DB and leave a stamp"
+    assert tool._guard_db_secret(env, start_fn=lambda: starts.append(1) or True, **hooks) is True
+    assert starts == [1], "the second check must be answered by the stamp alone"
+    assert "no database start needed" in capsys.readouterr().out
+
+
+def test_write_volume_coupling_never_creates_a_stray_volume():
+    cmds = []
+
+    def run(cmd, **k):
+        cmds.append(cmd)
+        return _Proc(1, "") if "inspect" in cmd else _Proc(0, "")
+
+    env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    assert dv.write_volume_coupling("never-deployed", env, run=run) is False
+    assert all("run" not in c for c in cmds)
+
+
+def test_undetermined_cert_probe_is_not_reported_as_denied(monkeypatch):
+    """A stopped Docker engine must never be diagnosed as 'the key is unreadable - delete certs/':
+    that talks an operator into destroying a bring-your-own or Let's Encrypt pair."""
+    monkeypatch.setattr(dv.os, "name", "nt")
+    monkeypatch.setattr(dv.shutil, "which", lambda *_a: "docker")
+    ok, msg = dv.apply_cert_owner("/certs", run=lambda *a, **k: _Proc(125, "", "cannot connect"))
+    assert ok is False
+    assert "did not answer" in msg and "untouched" in msg
+    assert "delete" not in msg.lower(), "undetermined must not carry destructive advice"
+    # ...while a PROVEN denial still gets the actionable message.
+    _, denied = dv.apply_cert_owner("/certs", run=lambda *a, **k: _Proc(1))
+    assert "PermissionError" in denied
+
+
+def test_docker_absent_leaves_certs_undetermined_not_denied(monkeypatch):
+    monkeypatch.setattr(dv.os, "name", "nt")
+    monkeypatch.setattr(dv.shutil, "which", lambda *_a: None)     # no docker at all
+    ok, msg = dv.apply_cert_owner("/certs")
+    assert ok is False and "did not answer" in msg and "delete" not in msg.lower()
+
+
+def test_tail_logs_reports_whether_anything_was_shown(tmp_path, monkeypatch, capsys):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: _Proc(0, "   \n  "))
+    assert tool._tail_logs("vault") is False, "empty output must not count as 'logs shown'"
+    assert "end of logs" not in capsys.readouterr().out
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: _Proc(0, "boom"))
+    assert tool._tail_logs("vault") is True
+
+
+def test_tail_logs_falls_back_to_the_whole_stack(tmp_path, monkeypatch):
+    """A build failure never creates the named container, so a per-service tail is empty - fall back
+    to the stack rather than printing nothing."""
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    cmds = []
+
+    def run(cmd, **k):
+        cmds.append(cmd)
+        return _Proc(0, "") if "vault-api" in cmd else _Proc(0, "stack-wide failure")
+
+    monkeypatch.setattr(dv.subprocess, "run", run)
+    assert tool._tail_logs("vault-api") is True
+    assert len(cmds) == 2 and "vault-api" not in cmds[1]
+
+
+def test_setup_does_not_claim_logs_are_above_when_there_are_none(tmp_path, monkeypatch, capsys):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "_cert_pair_present", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "apply_cert_owner", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "cert_readable_by_app_uid", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_guard_db_secret", lambda env, **k: True)
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: False)
+    monkeypatch.setattr(tool, "_tail_logs", lambda *a, **k: False)      # nothing to show
+    with pytest.raises(SystemExit):
+        tool.setup(argparse.Namespace(no_start=False, non_interactive=True))
+    out = capsys.readouterr().out
+    assert "log lines are above" not in out and "docker output above" in out

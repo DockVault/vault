@@ -71,6 +71,18 @@ cp .env.example .env      # then edit it: set ENCRYPTION_KEY, JWT_SECRET_KEY, VA
 docker compose -f docker-compose.secure.yml up -d --build
 ```
 
+> **The TLS key must be readable by the container's app user (uid `10001`).** `/app/certs` is a
+> read-only bind mount of `./certs`, and the app runs unprivileged — a key that is mode `600` owned
+> by `root` makes uvicorn exit with `PermissionError: [Errno 13]` in a restart loop. Check and fix
+> it from inside a container (this also works on Docker Desktop, where a host `chown` cannot):
+>
+> ```bash
+> docker run --rm --user 10001:10001 -v "$PWD/certs:/certs:ro" busybox head -c1 /certs/key.pem >/dev/null && echo readable
+> docker run --rm -v "$PWD/certs:/certs" busybox sh -c 'chown 10001:10001 /certs/*.pem && chmod 600 /certs/key.pem && chmod 644 /certs/cert.pem'
+> ```
+>
+> `dockvault.py setup` does this for you and refuses to start if the key is still unreadable.
+
 > **`.env` is found automatically — never move it.** The root `docker-compose.secure.yml` (and the
 > `docker-compose.yml` below) are thin `include:` shims over the real files in `deploy/`. Running
 > `docker compose` against a **root** file makes the repo root the Compose project directory, so

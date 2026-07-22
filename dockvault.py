@@ -630,16 +630,91 @@ def _engine_is_remapped(run=subprocess.run):
     return "rootless" in opts or "name=userns" in opts
 
 
+def _cert_mount(cert_dir):
+    """The `docker -v` source for the cert dir (forward slashes so a Windows path is accepted)."""
+    return os.path.abspath(cert_dir).replace("\\", "/")
+
+
+def cert_readable_by_app_uid(cert_dir, run=subprocess.run):
+    """Can the in-container app user (uid APP_UID) actually READ cert.pem AND key.pem through the
+    read-only bind mount? True / False / None (couldn't determine: no docker, or the probe itself
+    failed). This is the ONLY honest check - host permissions do not predict what the container
+    sees (a Docker Desktop bind mount carries POSIX modes written from inside a container, and a
+    remapped engine shifts the uid) - and it catches the failure that otherwise surfaces only as
+    uvicorn's `PermissionError: [Errno 13]` in an endless restart loop. Reads ONE byte and discards
+    it, so the private key never reaches the host's stdout or a log."""
+    if shutil.which("docker") is None:
+        return None
+    probe = ("head -c 1 /certs/cert.pem >/dev/null 2>&1 && head -c 1 /certs/key.pem >/dev/null 2>&1")
+    try:
+        r = run(["docker", "run", "--rm", "--user", "%d:%d" % (APP_UID, APP_UID),
+                 "-v", "%s:/certs:ro" % _cert_mount(cert_dir), "busybox", "sh", "-c", probe],
+                capture_output=True, text=True, timeout=120)
+    except Exception:  # noqa: BLE001 - an unavailable/slow docker is "undetermined", not "unreadable"
+        return None
+    rc = getattr(r, "returncode", 125)
+    if rc in (125, 126, 127):
+        return None      # docker itself failed (bad image/mount) - not a permission verdict
+    return rc == 0
+
+
+def _chown_certs_in_container(cert_dir, run=subprocess.run):
+    """Set cert ownership + modes from INSIDE a throwaway container. On an engine whose bind mounts
+    carry POSIX metadata the host cannot express (Docker Desktop on Windows/macOS), this is the only
+    way to hand the key to the app uid: openssl writes key.pem mode 600 owned by uid 0, and host
+    ACLs cannot re-own it. Keeps the key at 600 (owner-only) rather than making it world-readable."""
+    if shutil.which("docker") is None:
+        return False
+    fix = ("chown %d:%d /certs/cert.pem /certs/key.pem && chmod 644 /certs/cert.pem "
+           "&& chmod 600 /certs/key.pem" % (APP_UID, APP_UID))
+    try:
+        r = run(["docker", "run", "--rm", "-v", "%s:/certs" % _cert_mount(cert_dir),
+                 "busybox", "sh", "-c", fix], capture_output=True, text=True, timeout=120)
+    except Exception:  # noqa: BLE001
+        return False
+    return getattr(r, "returncode", 1) == 0
+
+
+_CERT_DENIED = ("the container's app user (uid %d) cannot read certs/key.pem - the vault would fail "
+                "to start with 'PermissionError: [Errno 13]'. Re-install the pair, or delete the "
+                "certs/ directory and re-run setup to regenerate a self-signed one." % APP_UID)
+_CERT_UNKNOWN = ("could not check whether the container can read certs/ (the Docker engine did not "
+                 "answer) - the certificates themselves are untouched. Re-run setup once Docker is "
+                 "running.")
+
+
+def _apply_cert_owner_container(cert_dir, run=subprocess.run):
+    """The Windows/Docker-Desktop path for apply_cert_owner: re-own the pair to APP_UID from inside
+    a container, then VERIFY the app uid can read it. Returns (mode600, message) like its caller.
+
+    Keeps the probe's THREE states apart. 'Could not determine' (Docker not running, image missing)
+    must never be reported as 'the key is unreadable' with advice to delete the certificates - that
+    would talk an operator into destroying a bring-your-own or Let's Encrypt pair over a stopped
+    daemon."""
+    verdict = cert_readable_by_app_uid(cert_dir, run)
+    if verdict is True:
+        return True, "certs are readable by the container's app user (key mode 600)"
+    if not _chown_certs_in_container(cert_dir, run):
+        return False, (_CERT_UNKNOWN if verdict is None else _CERT_DENIED)
+    after = cert_readable_by_app_uid(cert_dir, run)
+    if after is True:
+        return True, "certs re-owned to uid %d for the container (key mode 600, not world-readable)" % APP_UID
+    return False, (_CERT_UNKNOWN if after is None else _CERT_DENIED)
+
+
 def apply_cert_owner(cert_dir, run=subprocess.run):
     """Make cert_dir/{cert,key}.pem readable by the in-container app user through the read-only bind
-    mount. POSIX-only. On a plain rootful engine, chown to APP_UID (10001) keeping the key mode 600.
+    mount. On a plain rootful engine, chown to APP_UID (10001) keeping the key mode 600.
     On a userns-remap engine, chown to the MAPPED host uid (resolved from /etc/subuid), keeping 600.
     On a ROOTLESS engine (or when the mapped uid can't be resolved), the container's uid is a
     subordinate host uid we cannot target, so fall back to a world-readable key (644, single-tenant
     host) so the container CAN read it - matching setup-secure.sh, and NEVER falsely reporting a
     mode-600 key when it would be unreadable. Returns (mode600, message)."""
     if os.name == "nt":
-        return True, ""  # Docker Desktop bind mounts are readable; no host chown needed
+        # NOT a no-op: a Docker Desktop bind mount carries the POSIX mode of whatever wrote the file,
+        # and openssl writes key.pem 0600 owned by uid 0 - unreadable to the app's uid 10001. The host
+        # has no chown to fix that, so do it from inside a container and verify.
+        return _apply_cert_owner_container(cert_dir, run)
     key = os.path.join(cert_dir, "key.pem")
     cert = os.path.join(cert_dir, "cert.pem")
     for path, mode in ((cert_dir, 0o700), (cert, 0o644), (key, 0o600)):
@@ -957,6 +1032,68 @@ def compute_coupling_fingerprint(env, salt):
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+# A NON-secret coupling stamp written into the postgres data volume the first time a .env is proven
+# to open it. Lets a later run answer "does THIS .env match THIS volume?" in about a second, instead
+# of booting postgres for a ~20-40s auth probe. Postgres ignores unrecognised files in its data
+# directory (it only requires an EMPTY directory at initdb time, long before this is written).
+COUPLING_MARKER = "dockvault_coupling.json"
+
+
+def read_volume_coupling(volume, run=subprocess.run):
+    """Read the coupling marker out of `volume` via a throwaway busybox (read-only mount). Returns
+    the parsed dict, or None when absent/unreadable/garbled - every one of which means 'unknown',
+    never 'mismatch'. Checks existence FIRST: `docker run -v <name>:...` CREATES a missing volume,
+    and this must never leave a stray empty one behind (the menu can ask about a set that has never
+    been deployed)."""
+    if not volume_exists(volume, run=run):
+        return None
+    try:
+        r = run(["docker", "run", "--rm", "-v", "%s:/v:ro" % volume, "busybox",
+                 "cat", "/v/%s" % COUPLING_MARKER], capture_output=True, text=True, timeout=120)
+    except Exception:  # noqa: BLE001
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    try:
+        marker = json.loads(getattr(r, "stdout", "") or "")
+    except ValueError:
+        return None
+    return marker if isinstance(marker, dict) else None
+
+
+def build_coupling_marker(env, salt=None):
+    """The marker document, in the SAME shape verify_backup_coupling() reads (the digest nested
+    under "coupling") so the writer and the reader can never drift apart. Salt + digest only."""
+    salt = salt or gen_salt()
+    return {"dockvault_coupling": 1,
+            "coupling": {"salt": salt, "sha256": compute_coupling_fingerprint(env, salt)}}
+
+
+def write_volume_coupling(volume, env, salt=None, run=subprocess.run):
+    """Stamp the coupling marker into `volume`. Best-effort: returns True on success, False on any
+    failure (a set that can't be stamped simply keeps using the live probe). Writes the salt +
+    digest ONLY - never a secret - and pipes it over stdin so nothing lands on the host argv.
+    Refuses a volume that doesn't exist: `docker run -v <name>:...` would CREATE it."""
+    if not volume_exists(volume, run=run):
+        return False
+    payload = json.dumps(build_coupling_marker(env, salt))
+    try:
+        r = run(["docker", "run", "--rm", "-i", "-v", "%s:/v" % volume, "busybox",
+                 "sh", "-c", "cat > /v/%s" % COUPLING_MARKER],
+                input=payload, capture_output=True, text=True, timeout=120)
+    except Exception:  # noqa: BLE001
+        return False
+    return getattr(r, "returncode", 1) == 0
+
+
+def coupling_marker_verdict(marker, env):
+    """Pure: 'ok' when `marker` proves `env` is the .env this volume was stamped with, else None.
+    NEVER returns a negative verdict - a stamp can go stale (the DB password was rotated in
+    postgres and in .env), and only the live auth probe may refuse a start. Shares ONE digest
+    comparison with the backup manifests (verify_backup_coupling)."""
+    return "ok" if verify_backup_coupling(env, marker or {}) else None
+
+
 def build_backup_manifest(prefix, bundle_id, volumes, salt, env, created=""):
     """The backup manifest dict (NO secrets): identifies the set + records the salted coupling
     fingerprint of the paired .env. `volumes` is a list of {role, name, archive}."""
@@ -1239,7 +1376,7 @@ class DockVault:
                 print(pal.paint("  SERVER_NAME in .env looks invalid; using 'localhost' for the cert.", "yellow"))
                 server = "localhost"
             mode, email, cpath, kpath = self._resolve_cert_cfg(args)
-            svc = "vault-api" if summary.get("compose_profiles") == "split" else "vault"
+            svc = self._web_service(summary.get("compose_profiles"))
             if mode == "byo":
                 if not cpath or not kpath:
                     self._fail("bring-your-own certs need --cert-path and --key-path")
@@ -1259,7 +1396,6 @@ class DockVault:
         owner_ok, owner_msg = apply_cert_owner(cert_dir)
         if owner_msg:
             print(pal.paint("  " + owner_msg, "green" if owner_ok else "yellow"))
-
         if no_start:
             print(pal.paint("\n  Setup done (--no-start). Start later with:  python dockvault.py setup\n", "cyan"))
             return
@@ -1268,6 +1404,13 @@ class DockVault:
         ok, msg = docker_available()
         if not ok:
             self._fail(msg)
+        # PROVE the container can read the TLS pair before starting anything. Host permissions do not
+        # predict the container's view, and getting this wrong costs an endless restart loop whose
+        # only symptom is uvicorn's "PermissionError: [Errno 13]" buried in the logs.
+        if cert_readable_by_app_uid(cert_dir) is False:
+            self._fail("the vault container (uid %d) cannot read certs/key.pem, so it could never "
+                       "serve HTTPS. Delete the certs/ directory and re-run setup to regenerate a "
+                       "readable pair." % APP_UID)
         # Guardrail: if we're (re)starting on an EXISTING data volume, the current .env's DB password
         # MUST authenticate against it, or the app would loop on a Postgres auth error. Fail closed
         # with a clear diagnosis (the reported "wrong password after re-setup" footgun).
@@ -1281,11 +1424,25 @@ class DockVault:
             print(pal.paint("  WARNING: host port %d is already in use; the web container may fail to bind "
                             "it. Free it first (e.g. sudo ss -ltnp 'sport = :%d')." % (web_port, web_port), "yellow"))
         tracker.advance(); tracker.show()               # -> Build + start
+        profiles = summary.get("compose_profiles", "combined")
         if not self._start_secure_stack():
-            self._fail("the stack did not start - check 'docker compose -f docker-compose.secure.yml logs'.")
+            shown = self._tail_logs(self._web_service(profiles))
+            self._fail("the stack did not start - %s." % ("the last log lines are above" if shown
+                       else "see the docker output above"))
         tracker.advance(); tracker.show()               # -> Health check
-        healthy = self._wait_secure_healthy(summary.get("compose_profiles", "combined"))
-        self._print_setup_summary(summary, healthy)
+        healthy = self._wait_secure_healthy(profiles)
+        logs_shown = False if healthy else self._tail_logs(self._web_service(profiles))
+        self._print_setup_summary(summary, healthy, logs_shown)
+        # NOTE: the coupling stamp is written ONLY where a pairing has been PROVEN - after a
+        # successful psql auth probe in _verify_env_against_volume. Stamping here would be
+        # fail-OPEN: the interactive guard can rewrite .env mid-run (choosing "deploy a NEW set"
+        # archives the current .env and authors another), so the env read before the guard may name
+        # a volume it was never proven to open - and a later run would then trust that stamp.
+
+    @staticmethod
+    def _web_service(profiles):
+        """The service that serves the web/API half in the active deployment mode."""
+        return "vault-api" if profiles == "split" else "vault"
 
     def _collect_setup_config(self, args):
         """Resolve the full setup config (secrets + flags) from args (unattended) and/or interactive
@@ -1403,6 +1560,26 @@ class DockVault:
         return ["docker", "compose", "--env-file", self._env_path(),
                 "-f", os.path.join(self.root, "docker-compose.secure.yml")] + list(args)
 
+    def _run_dc(self, *args, **kw):
+        """Run `docker compose ...` with stdin CLOSED, always.
+
+        Compose asks a BLOCKING yes/no question on stdin when a named volume already exists but its
+        labels don't match the compose file - "Volume X exists but doesn't match configuration in
+        compose file. Recreate (data will be lost)?" - which fires for every volume created before
+        the com.dockvault.* labels existed, and whenever DEPLOYMENT_ID changes. With stdin inherited
+        AND the output captured, that prompt is INVISIBLE: the tool looks hung until the operator
+        blindly presses a key, and a stray 'y' would DESTROY the data volume. stdin=DEVNULL makes
+        Compose take its safe default (keep the volume) and return immediately.
+
+        `capture` (default True) captures stdout/stderr; pass capture=False to stream Compose's own
+        progress straight to the terminal for long steps."""
+        capture = kw.pop("capture", True)
+        kw.setdefault("cwd", self.root)
+        kw.setdefault("text", True)
+        if capture:
+            kw.setdefault("capture_output", True)
+        return subprocess.run(self._dc(*args), stdin=subprocess.DEVNULL, **kw)
+
     def _start_secure_stack(self):
         return self._recreate_stack(build=True)
 
@@ -1414,39 +1591,48 @@ class DockVault:
         if build:
             args.insert(1, "--build")
         try:
-            r = subprocess.run(self._dc(*args), cwd=self.root, text=True, timeout=600)
+            r = self._run_dc(*args, capture=False, timeout=600)
         except (OSError, subprocess.SubprocessError):
             return False
         return getattr(r, "returncode", 1) == 0
 
     def _start_db_only(self):
-        """Start ONLY the postgres service on the existing volume (for the pre-up secret check)."""
+        """Start ONLY the postgres service on the existing volume (for the pre-up secret check).
+        Streams Compose's own progress (capture=False) so a slow pull/create is visibly WORKING
+        rather than looking hung, and so any Compose error is on screen when this returns False."""
         try:
-            r = subprocess.run(self._dc("up", "-d", "vault-db"), cwd=self.root,
-                               capture_output=True, text=True, timeout=180)
+            r = self._run_dc("up", "-d", "vault-db", capture=False, timeout=180)
         except (OSError, subprocess.SubprocessError):
             return False
-        return r.returncode == 0
+        return getattr(r, "returncode", 1) == 0
 
-    def _wait_db_ready(self, tries=20):
-        """Poll pg_isready inside vault-db until it accepts connections (readiness, NOT auth)."""
+    def _wait_db_ready(self, tries=20, tick=None):
+        """Poll pg_isready inside vault-db until it accepts connections (readiness, NOT auth).
+        Reports progress through `tick` (default: a live '...still waiting (Ns)' line) so a 40s wait
+        never looks like a hang."""
         import time
-        for _ in range(tries):
+        tick = tick or self._waiting_tick
+        for i in range(tries):
             try:
                 r = subprocess.run(["docker", "exec", "vault-db", "pg_isready", "-U", PG_USER, "-d", PG_DB],
-                                   capture_output=True, text=True, timeout=15)
+                                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
             except (OSError, subprocess.SubprocessError):
-                time.sleep(2); continue
+                tick(i * 2); time.sleep(2); continue
             if getattr(r, "returncode", 1) == 0:
                 return True
+            tick(i * 2)
             time.sleep(2)
         return False
+
+    def _waiting_tick(self, seconds):
+        """Print a coarse 'still waiting' heartbeat (every ~10s) so a long poll shows life."""
+        if seconds and seconds % 10 == 0:
+            print(self.pal.paint("    ...still waiting (%ds)" % seconds, "grey"), flush=True)
 
     def _stop_db_only(self):
         """Stop the probe's vault-db (best-effort) so a refused setup doesn't leave a lone db running."""
         try:
-            subprocess.run(self._dc("stop", "vault-db"), cwd=self.root,
-                           capture_output=True, text=True, timeout=60)
+            self._run_dc("stop", "vault-db", timeout=60)
         except (OSError, subprocess.SubprocessError):
             pass
 
@@ -1455,13 +1641,36 @@ class DockVault:
         repoint: the fixed container names mean two sets can't run at once, so the current deployment
         must be stopped before we point at (and probe) a different set. Data is untouched (no -v)."""
         try:
-            subprocess.run(self._dc("down", "--remove-orphans"), cwd=self.root,
-                           capture_output=True, text=True, timeout=120)
+            self._run_dc("down", "--remove-orphans", timeout=120)
         except (OSError, subprocess.SubprocessError):
             pass
 
+    def _tail_logs(self, service=None, lines=40):
+        """Print the tail of the stack's (or one service's) logs. Called when a start/health step
+        fails, so the operator sees the ACTUAL error (e.g. a TLS key the container can't read)
+        without having to re-run docker compose by hand. Falls back to the WHOLE stack when the
+        named service produced nothing (a build failure never creates a container). Returns True
+        only if something was actually printed, so a caller never claims 'the logs are above' when
+        the screen is empty."""
+        pal = self.pal
+        for svc in ([service, None] if service else [None]):
+            args = ["logs", "--no-color", "--tail", str(lines)] + ([svc] if svc else [])
+            try:
+                r = self._run_dc(*args, timeout=60)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            out = ((getattr(r, "stdout", "") or "") + (getattr(r, "stderr", "") or "")).strip()
+            if not out:
+                continue
+            print(pal.paint("\n  --- last %d log lines%s ---"
+                            % (lines, (" (%s)" % svc) if svc else ""), "grey"))
+            print(out)
+            print(pal.paint("  --- end of logs ---\n", "grey"), flush=True)
+            return True
+        return False
+
     def _guard_db_secret(self, env, interactive=False, exists_fn=None, start_fn=None, wait_fn=None,
-                         probe_fn=None, stop_fn=None):
+                         probe_fn=None, stop_fn=None, marker_fn=None, stamp_fn=None):
         """Guardrail against the 'existing volume + wrong .env' footgun. No-op (True) for a fresh
         volume. NON-interactive (a script): auto-verify the current .env's DB password and FAIL CLOSED
         on a mismatch/ambiguous result. INTERACTIVE: do NOT auto-wait - present choices (verify / point
@@ -1472,7 +1681,8 @@ class DockVault:
         if not exists_fn(vol):
             return True   # brand-new volume: the .env password is baked in on first init
         hooks = (start_fn or self._start_db_only, wait_fn or self._wait_db_ready,
-                 probe_fn or probe_pg_password, stop_fn or self._stop_db_only)
+                 probe_fn or probe_pg_password, stop_fn or self._stop_db_only,
+                 marker_fn or read_volume_coupling, stamp_fn or write_volume_coupling)
         if interactive:
             return self._resolve_existing_volume(env, vol, hooks)
         # non-interactive: verify + fail closed (a script must not auto-destroy or auto-fork).
@@ -1483,26 +1693,38 @@ class DockVault:
         return False
 
     def _verify_env_against_volume(self, env, vol, hooks):
-        """Start the DB and auth-probe the current .env's VAULT_DB_PASSWORD against `vol`, printing what
-        it's doing at each step. Returns 'ok' | 'mismatch' | 'ambiguous' | 'encryption_key'. Stops the
+        """Decide whether `env` is the .env that opens `vol`. Tries the instant path first (the
+        volume's coupling stamp); otherwise starts the DB and auth-probes VAULT_DB_PASSWORD,
+        narrating each step. Returns 'ok' | 'mismatch' | 'ambiguous' | 'encryption_key'. Stops the
         probe DB afterwards. Never prints a secret."""
         pal = self.pal
-        start_fn, wait_fn, probe_fn, stop_fn = hooks
+        start_fn, wait_fn, probe_fn, stop_fn, marker_fn, stamp_fn = hooks
         if not fernet_key_looks_valid(env.get("ENCRYPTION_KEY", "")):
             return "encryption_key"
-        print(pal.paint("  Starting the database container to check the password (~20-40s)...", "cyan"))
+        # Fast path: a set this tool has already verified carries a non-secret coupling stamp, so the
+        # answer takes about a second. A stamp can only ever CONFIRM - if it is absent, unreadable or
+        # stale (the DB password was rotated), fall through to the authoritative live probe.
+        print(pal.paint("  Checking the volume's coupling stamp (instant)...", "cyan"), flush=True)
+        if coupling_marker_verdict(marker_fn(vol), env) == "ok":
+            print(pal.paint("  Stamp matches this .env - no database start needed.", "green"), flush=True)
+            return "ok"
+        print(pal.paint("  No usable stamp; starting the database container to check the password "
+                        "(~20-40s)...", "cyan"), flush=True)
         if not start_fn():
             stop_fn()
-            print(pal.paint("  The database container did not start.", "yellow"))
+            print(pal.paint("  The database container did not start (the docker output is above).", "yellow"))
             return "ambiguous"
-        print(pal.paint("  Waiting for the database to accept connections...", "cyan"))
+        print(pal.paint("  Waiting for the database to accept connections...", "cyan"), flush=True)
         if not wait_fn():
             stop_fn()
             print(pal.paint("  The database did not become ready in time.", "yellow"))
             return "ambiguous"
-        print(pal.paint("  Authenticating VAULT_DB_PASSWORD against the stored database (vault-db)...", "cyan"))
+        print(pal.paint("  Authenticating VAULT_DB_PASSWORD against the stored database (vault-db)...",
+                        "cyan"), flush=True)
         result = probe_fn("vault-db", PG_USER, PG_DB, env.get("VAULT_DB_PASSWORD", ""))
         stop_fn()
+        if result == "ok":
+            stamp_fn(vol, env)   # best-effort: make the next check instant
         return result if result in ("ok", "mismatch") else "ambiguous"
 
     def _resolve_existing_volume(self, env, vol, hooks):
@@ -1515,7 +1737,8 @@ class DockVault:
         print("  Postgres bakes the DB password into it on first init, so the CURRENT .env may not open")
         print("  it. Nothing has started yet - choose what to do (only 1 and 2 start the database):")
         while True:
-            print(pal.paint("\n    1) Verify the current .env matches it, then reuse   (~20-40s)", "cyan"))
+            print(pal.paint("\n    1) Verify the current .env matches it, then reuse   (instant if the "
+                            "set is stamped, else ~20-40s)", "cyan"))
             print("    2) Point me at a specific .env file and verify THAT one instead")
             print("    3) Keep this data + deploy a NEW set under a fresh volume name   (instant)")
             print("    4) DESTROY this data and start fresh with the current .env       (down -v)")
@@ -1590,7 +1813,7 @@ class DockVault:
             print(pal.paint("  Nothing was deleted.", "yellow"))
             return False
         try:
-            subprocess.run(self._dc("down", "-v", "--remove-orphans"), cwd=self.root, text=True, timeout=180)
+            self._run_dc("down", "-v", "--remove-orphans", capture=False, timeout=180)
         except (OSError, subprocess.SubprocessError) as exc:
             self._fail("teardown failed: %s" % exc)
         print(pal.paint("  Destroyed the old data; starting fresh with the current .env.", "green"))
@@ -1626,7 +1849,7 @@ class DockVault:
 
     def _wait_secure_healthy(self, profiles, tries=40):
         import time
-        svc = "vault-api" if profiles == "split" else "vault"
+        svc = self._web_service(profiles)
         fmt = "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}"
         for _ in range(tries):
             try:
@@ -1643,13 +1866,14 @@ class DockVault:
             time.sleep(3)
         return False
 
-    def _print_setup_summary(self, summary, healthy):
+    def _print_setup_summary(self, summary, healthy, logs_shown=False):
         pal = self.pal
         name = summary.get("server_name") or "<your-server-name>"
         print(pal.paint("\n===================================================================", "blue"))
         if not healthy:
-            print(pal.paint(" The vault did NOT report healthy - check the logs:", "red"))
-            print("   docker compose -f docker-compose.secure.yml logs --tail 40")
+            print(pal.paint(" The vault did NOT report healthy%s."
+                            % (" - its last log lines are above" if logs_shown else ""), "red"))
+            print("   Full logs:  docker compose -f docker-compose.secure.yml logs --tail 100")
             return
         webp = summary.get("web_host_port") or 443
         url = "https://%s/" % name if webp == 443 else "https://%s:%d/" % (name, webp)
@@ -1984,7 +2208,7 @@ class DockVault:
             print(pal.paint("  Cancelled - nothing was deleted.\n", "yellow"))
             return
         try:
-            r = subprocess.run(self._dc("down", "-v", "--remove-orphans"), cwd=self.root, text=True, timeout=180)
+            r = self._run_dc("down", "-v", "--remove-orphans", capture=False, timeout=180)
         except (OSError, subprocess.SubprocessError) as exc:
             self._fail("teardown failed: %s" % exc)
         if getattr(r, "returncode", 1) != 0:
@@ -2058,7 +2282,7 @@ class DockVault:
             self._set_env_key(self._env_path(), "DOCKVAULT_IMAGE", image)
             print(pal.paint("  set DOCKVAULT_IMAGE=%s; pulling ..." % image, "cyan"))
             try:
-                pr = subprocess.run(self._dc("pull"), cwd=self.root, text=True, timeout=600)
+                pr = self._run_dc("pull", capture=False, timeout=600)
             except (OSError, subprocess.SubprocessError) as exc:
                 self._fail("docker compose pull failed: %s" % exc)
             if pr.returncode != 0:
@@ -2193,8 +2417,22 @@ def build_parser():
     return p
 
 
+def unbuffer_stdout(stream=None):
+    """Line-buffer stdout so progress lines appear WHEN THEY HAPPEN. Python block-buffers stdout in
+    8 KB chunks whenever it is not a terminal (a pipe, `tee`, a CI log, an MSYS/mintty console), which
+    makes a long docker step look frozen and then dumps everything at once. Best-effort: a stream
+    without reconfigure() (Python < 3.7 / a replaced stdout) is left alone."""
+    stream = sys.stdout if stream is None else stream
+    try:
+        stream.reconfigure(line_buffering=True)
+        return True
+    except Exception:  # noqa: BLE001 - buffering is cosmetic; never fail startup over it
+        return False
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    unbuffer_stdout()
     enable_windows_vt()
     pal = Palette(color_enabled())
     app = DockVault(pal)
