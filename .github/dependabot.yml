@@ -53,7 +53,16 @@ updates:
   # Keeps the pinned action SHAs in release.yml and tests.yml from going stale. Those pins are a
   # supply-chain control: they stop a moved tag from silently changing what CI executes, but they
   # also mean nothing updates them unless something asks.
+  #
+  # Grouped into ONE pull request, majors included — unlike the pip majors, which each get their
+  # own. The asymmetry is deliberate: an action upgrade either lets the workflow run or it does
+  # not, and the workflow itself is the test, so there is nothing to be gained by isolating them.
+  # Ungrouped, a single sweep opened five separate pull requests for what is one decision.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
