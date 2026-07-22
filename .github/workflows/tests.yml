@@ -155,32 +155,6 @@ jobs:
           docker compose logs --no-color vault-sftp
           exit 1
 
-      - name: Seed the stored auth settings
-        # The env limits above are only a FALLBACK. app/services/auth_service.py::_global_setting
-        # prefers a positive value stored in the admin settings blob, and that stored value wins.
-        #
-        # It matters because the browser suite saves that form: test_ui_branding.py clicks
-        # "Save All Changes", which writes back every field the page is showing — including
-        # max_login_attempts. With nothing stored, the page shows the shipped default and saves 5,
-        # which from that moment overrides the env limit for the REST OF THE RUN. Everything that
-        # sorts after the UI files (ui_*, vault_*, zk_*) then 429s, which reads as three broken
-        # subsystems rather than one settings write.
-        #
-        # Storing the values we actually want makes the page display them and save them back
-        # unchanged, so the round-trip is a no-op instead of a landmine.
-        run: |
-          set -euo pipefail
-          token="$(curl -fsS -X POST http://127.0.0.1:8200/auth/login \
-            -H 'Content-Type: application/json' \
-            -d "{\"username\":\"admin\",\"password\":\"${VAULT_ADMIN_PASS}\"}" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
-          curl -fsS -X PUT http://127.0.0.1:8200/settings \
-            -H "Authorization: Bearer ${token}" \
-            -H 'Content-Type: application/json' \
-            -d '{"max_login_attempts": 2000, "session_timeout": 240, "lockout_duration": 0}' \
-            -o /dev/null
-          echo "stored auth settings seeded"
-
       - name: Install test dependencies
         # Uses the runner's preinstalled Python rather than actions/setup-python: the suite is an
         # HTTP/browser client, not the app under test, so its interpreter version is not part of
