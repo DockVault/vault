@@ -5,7 +5,7 @@
 # Install:  python -m venv .venv && .venv\Scripts\pip install -r requirements-test.txt
 # Browsers: .venv\Scripts\playwright install chromium
 pytest>=8.0,<9.0
-requests>=2.31
+requests>=2.34.2
 playwright>=1.40
 pytest-playwright>=0.5
 websocket-client>=1.6
