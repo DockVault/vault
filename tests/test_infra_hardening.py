@@ -723,9 +723,11 @@ def test_claude_md_carries_config_sync_rule():
 
 def test_app_version_from_version_file_not_hardcoded():
     import re
-    # A committed VERSION file (valid semver) is the single source of truth for the app's version.
-    ver = _read("VERSION").strip()
-    assert re.match(r"^\d+\.\d+\.\d+", ver), f"VERSION must be semver-ish, got {ver!r}"
+    # A committed VERSION file (canonical ASCII semver + one LF) is the single source of truth.
+    raw_version = (ROOT / "VERSION").read_bytes()
+    pattern = rb"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\n"
+    assert re.fullmatch(pattern, raw_version), \
+        f"VERSION must be canonical ASCII X.Y.Z plus one LF, got {raw_version!r}"
     # branding reads it as the default (not a hardcoded literal); BRAND_APP_VERSION can override.
     br = _read("app/config/branding.py")
     assert "default_factory=_read_version_file" in br, "app_version must default to the VERSION file"

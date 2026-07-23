@@ -1,4 +1,4 @@
-﻿"""
+"""
 API Catalog - Comprehensive mapping of all API endpoints to functional groups.
 
 This module defines all API endpoints, their security requirements, and functionality groupings.

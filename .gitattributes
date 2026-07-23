@@ -1,0 +1,26 @@
+# Repository text is UTF-8 without a byte-order mark and uses LF line endings.
+*.py text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+*.md text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.json text eol=lf
+*.html text eol=lf
+*.txt text eol=lf
+*.ini text eol=lf
+.env.example text eol=lf
+.gitattributes text eol=lf
+.editorconfig text eol=lf
+.gitignore text eol=lf
+.dockerignore text eol=lf
+LICENSE text eol=lf
+VERSION text eol=lf
+
+# Shipped binary assets must never be line-ending normalized.
+*.png binary
+*.woff2 binary
