@@ -771,6 +771,31 @@ def test_probe_refuses_a_running_database_serving_a_different_volume_set(monkeyp
     assert probes == [1]
 
 
+def test_probe_refuses_when_running_database_volume_cannot_be_inspected(monkeypatch, capsys):
+    """Docker must identify a running database's volume before it can answer for that volume.
+
+    A transient inspect failure cannot safely be read as the ordinary single-set case: the fixed
+    container name can belong to another set, and an "ok" probe would stamp the wrong volume.
+    """
+    tool = _guard_tool()
+    calls = []
+    monkeypatch.setattr(dv.DockVault, "_run_dc", lambda self, *a, **k: calls.append(a) or _Proc(0))
+    monkeypatch.setattr(dv, "container_running", lambda name: True)
+    monkeypatch.setattr(dv, "container_mounts", lambda name: None)
+
+    probes = []
+    result = tool._verify_env_against_volume(
+        {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"},
+        "dockvault-vault_vault_pg_data",
+        (tool._start_db_only, lambda: True, lambda *a: probes.append(1) or "ok",
+         tool._stop_db_only, lambda vol: None, lambda vol, env: True))
+
+    assert result == "ambiguous", "unknown mount ownership must fail closed"
+    assert probes == [], "the probe authenticated against a database whose volume was unknown"
+    assert not any(a[0] == "stop" for a in calls), "and it must not stop that deployment either"
+    assert "Could not inspect" in capsys.readouterr().out
+
+
 def test_containers_publishing_parses_names_and_fails_soft():
     assert dv.containers_publishing(
         443, run=lambda *a, **k: _Proc(0, "vault\nvault-sftp\n")) == ["vault", "vault-sftp"]

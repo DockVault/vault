@@ -1688,13 +1688,20 @@ class DockVault:
         things. Recreating the container to force them together is exactly what must not happen
         here (it would take a live deployment's database away from its app), so when they diverge
         the honest answer is 'cannot check this volume' - the caller treats that as ambiguous and
-        fails closed. Unknown mounts (docker unreadable) are TRUSTED, matching the single-set case
-        every other path assumes; the guardrail's own probe is the real gate."""
+        fails closed. An unreadable mount list is ambiguous for the same reason: the password probe
+        must never answer a question about a volume it cannot identify."""
         vol = getattr(self, "_guard_vol", None)
         if not vol:
             return True
         mounts = container_mounts(DB_CONTAINER)
-        if mounts is None or vol in mounts:
+        if mounts is None:
+            print(self.pal.paint(
+                "  Could not inspect the running database's volumes, so this .env cannot be checked\n"
+                "  against %s without risking a different deployment's data. Try again once Docker\n"
+                "  is reachable, or stop the running deployment first (docker compose down)." % vol,
+                "yellow"))
+            return False
+        if vol in mounts:
             return True
         print(self.pal.paint(
             "  A different deployment's database is already running under the name '%s', serving\n"
