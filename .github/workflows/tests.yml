@@ -9,7 +9,13 @@ on:
   push:
     branches: ["main"]
   workflow_dispatch: {}
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      expected_sha:
+        description: Commit that every release gate must test
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -21,6 +27,8 @@ concurrency:
 jobs:
   preflight:
     uses: ./.github/workflows/preflight.yml
+    with:
+      expected_sha: ${{ inputs.expected_sha }}
     permissions:
       contents: read
   integration:
@@ -32,7 +40,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.expected_sha || github.sha }}
           persist-credentials: false
+
+      - name: Verify requested commit
+        if: ${{ inputs.expected_sha != '' }}
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: Set up Python 3.14
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0

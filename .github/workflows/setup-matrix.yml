@@ -22,7 +22,13 @@ on:
     - cron: "0 3 * * *"
   workflow_dispatch: {}
   pull_request:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      expected_sha:
+        description: Commit that every release gate must test
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -42,6 +48,8 @@ env:
 jobs:
   preflight:
     uses: ./.github/workflows/preflight.yml
+    with:
+      expected_sha: ${{ inputs.expected_sha }}
     permissions:
       contents: read
 
@@ -54,9 +62,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.expected_sha || github.sha }}
           # Nothing here pushes, and the job builds and runs a Dockerfile that is
           # attacker-authored on a fork pull request.
           persist-credentials: false
+
+      - name: Verify requested commit
+        if: ${{ inputs.expected_sha != '' }}
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: Generate and mask the throwaway admin credential
         shell: bash

@@ -1,0 +1,6 @@
+# GitHub added concurrency.queue in May 2026. Remove this narrow compatibility rule once
+# actionlint's workflow schema recognizes it; the release contract separately locks queue: max.
+paths:
+  .github/workflows/release.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'
