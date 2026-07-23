@@ -24,7 +24,7 @@ psycopg2-binary==2.9.12
 redis==8.0.1
 
 # SFTP
-paramiko==3.4.0
+paramiko==5.0.0
 
 # Security / crypto
 # 44.0.1 picks up CVE-2024-12797 (and bundled-OpenSSL patches); underpins the Fernet at-rest crypto
