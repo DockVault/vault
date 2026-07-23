@@ -29,7 +29,7 @@ paramiko==3.4.0
 # Security / crypto
 # 44.0.1 picks up CVE-2024-12797 (and bundled-OpenSSL patches); underpins the Fernet at-rest crypto
 # and TLS on a crypto product, so it should not lag.
-cryptography==44.0.1
+cryptography==49.0.0
 argon2-cffi==25.1.0
 bcrypt==5.0.0
 # JWTs are HS256 (symmetric) only. Migrated off the unmaintained python-jose (CVE-2024-33663/33664 —
