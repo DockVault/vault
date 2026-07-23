@@ -8,13 +8,16 @@ up a key; registering a keypair clears the invites and the manager re-shares.
 HTTP suite against the live vault (conftest).
 """
 import contextlib
+import os
 import subprocess
 
 import pytest
 
 from conftest import ApiClient, ensure_ecc_keypair, create_zk_vault, unique
 
-DB_CONTAINER = "vault-db"
+# Env-overridable so the suite can be pointed at a second stack instead of silently
+# targeting whatever "vault-db" happens to be running.
+DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 
 
 def _psql(sql: str) -> str:

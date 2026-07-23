@@ -14,6 +14,7 @@ Covers the hardening of the temp-credential subsystem:
 * creating credentials for another user is interactive-admin only;
 * the password endpoint carries the same ownership + confinement guard as its siblings.
 """
+import os
 import shutil
 import subprocess
 import threading
@@ -21,6 +22,10 @@ import threading
 import pytest
 
 from conftest import ApiClient, BASE_URL, unique
+
+# The vault's Postgres container. Env-overridable so the suite can be pointed at a second
+# stack instead of silently targeting whatever "vault-db" happens to be running.
+_DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 
 
 # --------------------------------------------------------------------------- helpers
@@ -196,9 +201,9 @@ def _pg_ident():
     if not shutil.which("docker"):
         return None
     try:
-        u = subprocess.run(["docker", "exec", "vault-db", "printenv", "POSTGRES_USER"],
+        u = subprocess.run(["docker", "exec", _DB_CONTAINER, "printenv", "POSTGRES_USER"],
                            capture_output=True, text=True, timeout=10)
-        d = subprocess.run(["docker", "exec", "vault-db", "printenv", "POSTGRES_DB"],
+        d = subprocess.run(["docker", "exec", _DB_CONTAINER, "printenv", "POSTGRES_DB"],
                            capture_output=True, text=True, timeout=10)
     except Exception:  # noqa: BLE001
         return None
@@ -213,7 +218,7 @@ def _backdate_deactivate_at(temp_username):
         return False
     user, db = ident
     r = subprocess.run(
-        ["docker", "exec", "vault-db", "psql", "-U", user, "-d", db, "-c",
+        ["docker", "exec", _DB_CONTAINER, "psql", "-U", user, "-d", db, "-c",
          "UPDATE temporary_credentials SET deactivate_at = NOW() - INTERVAL '5 minutes' "
          f"WHERE temp_username = '{temp_username}';"],
         capture_output=True, text=True, timeout=15)

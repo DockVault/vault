@@ -20,20 +20,24 @@ import pytest
 
 from conftest import ApiClient, BASE_URL, unique, create_zk_vault, zk_chunked_upload
 
+# The vault's Postgres container. Env-overridable so the suite can be pointed at a second
+# stack instead of silently targeting whatever "vault-db" happens to be running.
+_DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
+
 
 # --------------------------------------------------------------------------- helpers
 def _psql(sql):
     if not shutil.which("docker"):
         return None
     try:
-        u = subprocess.run(["docker", "exec", "vault-db", "printenv", "POSTGRES_USER"],
+        u = subprocess.run(["docker", "exec", _DB_CONTAINER, "printenv", "POSTGRES_USER"],
                            capture_output=True, text=True, timeout=10)
-        d = subprocess.run(["docker", "exec", "vault-db", "printenv", "POSTGRES_DB"],
+        d = subprocess.run(["docker", "exec", _DB_CONTAINER, "printenv", "POSTGRES_DB"],
                            capture_output=True, text=True, timeout=10)
         if u.returncode != 0 or d.returncode != 0:
             return None
         return subprocess.run(
-            ["docker", "exec", "vault-db", "psql", "-U", u.stdout.strip(), "-d", d.stdout.strip(),
+            ["docker", "exec", _DB_CONTAINER, "psql", "-U", u.stdout.strip(), "-d", d.stdout.strip(),
              "-t", "-A", "-c", sql], capture_output=True, text=True, timeout=15)
     except Exception:  # noqa: BLE001
         return None

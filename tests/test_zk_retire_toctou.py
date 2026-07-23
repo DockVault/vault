@@ -24,6 +24,9 @@ from conftest import (create_zk_vault, ensure_ecc_keypair, unique, zk_chunked_up
 
 _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _HOLD = 4  # seconds the detached psql holds the vault-row lock
+# Env-overridable so the suite can be pointed at a second stack instead of silently
+# targeting whatever "vault-db" happens to be running.
+DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 
 
 @contextlib.contextmanager
@@ -43,7 +46,7 @@ def _assert_blocks_on_vault_lock(vid, fire):
            f"SELECT pg_sleep({_HOLD}); COMMIT;")
     try:
         holder = subprocess.Popen(
-            ["docker", "exec", "vault-db", "psql", "-U", "sftp_user", "-d", "sftp_db",
+            ["docker", "exec", DB_CONTAINER, "psql", "-U", "sftp_user", "-d", "sftp_db",
              "-v", "ON_ERROR_STOP=1", "-tAc", sql],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except FileNotFoundError as exc:
