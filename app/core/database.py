@@ -7,6 +7,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import NullPool
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 from app.core.config import settings
 from app.core.models import Base
@@ -37,7 +39,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 # fail-closed (it falls back to a durable DB throttle when Redis is unavailable), but that
 # fallback only helps if the Redis attempt gives up quickly — a 5s connect timeout per
 # request made logins crawl during an outage. Paired with the rate-limiter circuit breaker,
-# which trips after a few failures and skips Redis entirely for a short cooldown.
+# which trips after the first failure and skips Redis entirely for a short cooldown.
 redis_client = redis.Redis(
     host=settings.redis_host,
     port=settings.redis_port,
@@ -47,7 +49,10 @@ redis_client = redis.Redis(
     socket_connect_timeout=settings.redis_connect_timeout,
     socket_timeout=settings.redis_socket_timeout,
     socket_keepalive=True,
-    health_check_interval=30
+    health_check_interval=30,
+    # redis-py 8 defaults to ten retries, multiplying a two-second socket timeout
+    # into a minute-long auth stall. The application circuit breaker owns retries.
+    retry=Retry(NoBackoff(), 0),
 )
 
 

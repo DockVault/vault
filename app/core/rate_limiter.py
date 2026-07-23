@@ -50,18 +50,18 @@ class RateLimiterUnavailable(Exception):
 # --- Redis circuit breaker -------------------------------------------------
 # Even with a short Redis connect timeout, paying it on EVERY request during a sustained
 # outage makes logins crawl — and the timeout doesn't even bound DNS resolution (a dead
-# Redis host can stall getaddrinfo for several seconds per call). After a couple of
-# consecutive Redis failures we OPEN the breaker and skip Redis entirely for a cooldown —
+# Redis host can stall getaddrinfo for several seconds per call). After the first
+# Redis failure we OPEN the breaker and skip Redis entirely for a cooldown —
 # so the fail-closed auth path drops to its DB fallback instantly, and general (fail-open)
 # traffic isn't delayed at all. After the cooldown the next call probes Redis again
 # (half-open); a success resets, a failure re-opens. The cooldown is comfortably longer than
 # any burst of requests so the breaker stays open through an outage instead of re-probing
 # (and re-stalling) every few requests. Process-local state — fine for our single worker.
-_CB_FAIL_THRESHOLD = 2
+_CB_FAIL_THRESHOLD = 1
 # Cooldown the breaker stays open before a half-open probe. Long enough to outlast any burst of
 # requests during an outage (so it stays open instead of re-probing/re-stalling every few
-# requests), short enough that rate limiting resumes quickly after Redis recovers. With DNS now
-# bounded to ~1s (RES_OPTIONS), a re-probe is cheap, so this can be modest.
+# requests), short enough that rate limiting resumes quickly after Redis recovers. A half-open
+# probe may pay one resolver delay, so the breaker re-opens immediately on failure.
 _CB_COOLDOWN_SECONDS = 10
 _cb_consecutive_failures = 0
 _cb_open_until = 0.0
@@ -69,6 +69,11 @@ _cb_open_until = 0.0
 
 def _cb_is_open(now: float) -> bool:
     return now < _cb_open_until
+
+
+def redis_circuit_open() -> bool:
+    """Return whether this process recently observed a Redis backend failure."""
+    return _cb_is_open(time.time())
 
 
 def _cb_record_success() -> None:

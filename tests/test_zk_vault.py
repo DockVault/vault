@@ -16,6 +16,8 @@ import os
 
 from conftest import unique, ensure_ecc_keypair, create_zk_vault, zk_chunked_upload
 
+_API_CONTAINER = os.environ.get("VAULT_API_CONTAINER", "vault-api")
+
 
 def _upload(client, vault_id, name, content):
     """Standard-vault multipart upload (plaintext name + bytes). Zero-knowledge vaults reject
@@ -71,12 +73,18 @@ def _stored_sha256(vault_id, file_id):
     if it can't be read (docker unavailable / different layout)."""
     path = f"/app/storage/{vault_id}/files/{file_id}"
     out = subprocess.run(
-        ["docker", "exec", "vault-api", "sha256sum", path],
+        ["docker", "exec", _API_CONTAINER, "sha256sum", path],
         capture_output=True,
+        text=True,
     )
     if out.returncode != 0:
+        if os.environ.get("VAULT_SAME_COMMIT_CI", "").lower() in {"1", "true", "yes"}:
+            detail = out.stderr.strip() or out.stdout.strip() or f"exit code {out.returncode}"
+            pytest.fail(
+                f"could not hash {path} in same-commit container {_API_CONTAINER}: {detail}"
+            )
         return None
-    return out.stdout.decode(errors="ignore").split()[0]
+    return out.stdout.split()[0]
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="docker CLI not available")

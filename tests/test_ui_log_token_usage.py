@@ -7,6 +7,8 @@ granted component, header-only (never a ?token= query param).
 import pytest
 from playwright.sync_api import Page, expect
 
+from conftest import skip_for_older_deployment
+
 pytestmark = pytest.mark.ui
 
 
@@ -22,7 +24,7 @@ def _login(page: Page, username: str, password: str):
 def test_log_token_reveal_shows_usage_curl(page: Page, admin_creds, admin):
     r = admin.get("/settings/logs")
     if r.status_code != 200:
-        pytest.skip("running vault image predates the log-pull endpoint")
+        skip_for_older_deployment("running vault image predates the log-pull endpoint")
     if not bool(r.json().get("ceiling")):
         pytest.skip("the mint UI is gated on the log ceiling; needs a ceiling-on instance")
     _login(page, admin_creds["username"], admin_creds["password"])

@@ -15,7 +15,7 @@ import uuid
 import pytest
 import requests
 
-from conftest import BASE_URL, unique
+from conftest import BASE_URL, skip_for_older_deployment, unique
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -23,7 +23,7 @@ def _require_endpoint(admin):
     """Skip cleanly if the running vault image predates the log-pull endpoint."""
     r = admin.get("/settings/logs")
     if r.status_code == 404:
-        pytest.skip("running vault image predates the log-pull endpoint (rebuild+redeploy)")
+        skip_for_older_deployment("running vault image predates the log-pull endpoint (rebuild+redeploy)")
 
 
 def _mint(admin, scope=("web",), name=None):

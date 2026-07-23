@@ -115,6 +115,19 @@ def test_db_throttle_hit_counts_and_denies():
     assert "RETRY3=0" not in proc.stdout, "an over-limit deny must carry a positive retry-after"
 
 
+def test_redis_client_disables_hidden_retries():
+    # A socket timeout is not an end-to-end bound if redis-py silently retries it.
+    # The application circuit breaker owns retries and must open on the first failure.
+    proc = _in_container(args=[
+        "python", "-c",
+        "from app.core.database import redis_client; "
+        "from app.core.rate_limiter import _CB_FAIL_THRESHOLD; "
+        "retry=redis_client.connection_pool.connection_kwargs['retry']; "
+        "print('RETRIES=%s THRESHOLD=%s' % (retry._retries, _CB_FAIL_THRESHOLD))"
+    ])
+    assert "RETRIES=0 THRESHOLD=1" in proc.stdout, f"{proc.stdout}\n{proc.stderr}"
+
+
 def test_sftp_key_clear_resets_db_fallback_row():
     # A successful SSH key auth must clear the DURABLE DB-fallback counter (not only the Redis one),
     # or a legitimate multi-key client would accumulate offers it never resets and lock itself out
@@ -216,19 +229,37 @@ def test_detection_degraded_signal_fires_and_is_throttled():
     # operators know threshold-based detection is blind. A rapid second signal is throttled IN-PROCESS
     # (at most one DB write per cooldown per process), so an outage can't hammer a hot alert row.
     script = "\n".join([
+        "import uuid",
         "from app.core.database import get_db_context",
         "from app.services.security_monitor import SecurityMonitor, SecurityEventType",
         "from app.core.models import SecurityAlert",
+        "marker = 'dd-test-' + uuid.uuid4().hex",
         "with get_db_context() as db:",
         "    m = SecurityMonitor(db)",
-        "    m._signal_detection_degraded()",
-        "    a1 = db.query(SecurityAlert).filter(SecurityAlert.event_type==SecurityEventType.DETECTION_DEGRADED).order_by(SecurityAlert.timestamp.desc()).first()",
-        "    ok = a1 is not None and (a1.details or {}).get('reason') == 'redis_counter_unavailable'",
-        "    id1 = str(a1.id); rc1 = int((a1.details or {}).get('repeat_count', 1))",
-        "    m._signal_detection_degraded()",
-        "    a2 = db.query(SecurityAlert).filter(SecurityAlert.event_type==SecurityEventType.DETECTION_DEGRADED).order_by(SecurityAlert.timestamp.desc()).first()",
-        "    id2 = str(a2.id); rc2 = int((a2.details or {}).get('repeat_count', 1))",
-        "    print('OK=%s SAME=%s THROTTLED=%s' % (ok, id1==id2, rc2==rc1))",
+        "    real_raise = m._raise_alert",
+        "    created = []",
+        "    def raise_test_alert(**kwargs):",
+        "        kwargs['ip_address'] = marker",
+        "        alert = real_raise(**kwargs)",
+        "        created.append(alert.id)",
+        "        return alert",
+        "    m._raise_alert = raise_test_alert",
+        "    m._broadcast_alert = lambda alert: (_ for _ in ()).throw(AssertionError('Redis broadcast attempted during known outage'))",
+        "    try:",
+        "        m._signal_detection_degraded()",
+        "        a1 = db.query(SecurityAlert).filter(SecurityAlert.event_type==SecurityEventType.DETECTION_DEGRADED, SecurityAlert.ip_address==marker).one_or_none()",
+        "        assert a1 is not None",
+        "        ok = (a1.details or {}).get('reason') == 'redis_counter_unavailable'",
+        "        id1 = str(a1.id); rc1 = int((a1.details or {}).get('repeat_count', 1))",
+        "        m._signal_detection_degraded()",
+        "        a2 = db.query(SecurityAlert).filter(SecurityAlert.event_type==SecurityEventType.DETECTION_DEGRADED, SecurityAlert.ip_address==marker).one()",
+        "        id2 = str(a2.id); rc2 = int((a2.details or {}).get('repeat_count', 1))",
+        "        out = 'OK=%s SAME=%s THROTTLED=%s' % (ok, id1==id2, rc2==rc1)",
+        "    finally:",
+        "        if created:",
+        "            db.query(SecurityAlert).filter(SecurityAlert.id.in_(created)).delete(synchronize_session=False)",
+        "            db.commit()",
+        "    print(out)",
     ])
     proc = _in_container(args=["python", "-"], stdin=script)
     assert "OK=True" in proc.stdout, f"the degraded signal must create a DETECTION_DEGRADED alert\n{proc.stdout}\n{proc.stderr}"

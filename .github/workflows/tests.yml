@@ -1,19 +1,8 @@
 name: Tests
 
-# Build the image, stand up the real stack (Postgres + Redis + web + SFTP), and run the full
-# pytest suite against it on every pull request. Without this, a dependency PR arrives with no
-# signal at all and the only way to judge it is to rebuild the stack by hand.
-#
-# The suite in tests/ is an INTEGRATION suite: it drives the deployed container over HTTP and a
-# real browser rather than importing the app. That is why this job runs the stack instead of just
-# installing the requirements.
-#
-# Deliberately uses no secrets: every credential below is generated fresh for the run and thrown
-# away with the runner. That keeps the job working on pull requests from Dependabot and from
-# forks, both of which get a read-only token and no access to repository secrets.
-#
-# Third-party actions are pinned to a full commit SHA (supply-chain hardening), matching
-# release.yml; the trailing comment records the human-readable version. Bump both together.
+# Run strict collection and the offline lane before any image build or browser install.
+# The full job then exercises the same-commit image over the real Postgres, Redis, API,
+# browser, and SFTP stack. Every credential is generated for one disposable runner.
 
 on:
   pull_request:
@@ -24,25 +13,21 @@ on:
 permissions:
   contents: read
 
-# A second push to the same branch cancels the first — the suite is long and there is no point
-# finishing a run whose commit is already superseded.
 concurrency:
   group: tests-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  integration:
-    name: Full suite (API + browser)
+  preflight:
+    name: Strict collection and offline tests
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
+    outputs:
+      test-count: ${{ steps.collection.outputs.test_count }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Do not leave the job's GITHUB_TOKEN behind in .git/config. This job goes on to build
-          # and run a Dockerfile that, on a fork or Dependabot pull request, is attacker-authored
-          # content; nothing here needs to push, so the credential should not be on disk for it
-          # to read.
           persist-credentials: false
 
       - name: Set up Python 3.14
@@ -52,86 +37,106 @@ jobs:
           cache: pip
           cache-dependency-path: tests/requirements-test.lock
 
-      - name: Generate a throwaway .env
-        # The compose stack reads ../.env, and app/core/config.py fails closed on a weak or
-        # placeholder secret, so these have to be real values rather than dummies:
-        #   ENCRYPTION_KEY  must be a valid Fernet key (urlsafe-base64 of exactly 32 bytes)
-        #   JWT_SECRET_KEY  must be >= 32 chars and not on the placeholder denylist
-        #   ADMIN_PASSWORD  must not be a known sample value
-        # Generated per-run so nothing here is ever a credential worth stealing.
+      - name: Install locked test dependencies
+        run: python -m pip install -r tests/requirements-test.lock
+
+      - name: Collect the strict full suite
+        id: collection
+        shell: bash
         run: |
           set -euo pipefail
-          ENCRYPTION_KEY="$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
+          python -m pytest --collect-only -q 2>&1 | tee pytest-collection.txt
+          python - <<'PY' > test-count.txt
+          import re
+          import sys
+          from pathlib import Path
+
+          output = Path("pytest-collection.txt").read_text(encoding="utf-8")
+          matches = re.findall(r"^(\d+) tests? collected in .+$", output, re.MULTILINE)
+          if len(matches) != 1 or int(matches[0]) == 0:
+              sys.exit("could not determine one non-zero strict collection count")
+          print(matches[0])
+          PY
+          echo "test_count=$(cat test-count.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Run the offline fast lane
+        run: python -m pytest -m "unit and not docker" --maxfail=1
+
+  integration:
+    name: Full suite (API + browser + SFTP)
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: tests/requirements-test.lock
+
+      - name: Generate and mask throwaway credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENCRYPTION_KEY="$(python -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
+          JWT_SECRET_KEY="$(openssl rand -hex 32)"
+          VAULT_DB_PASSWORD="$(openssl rand -hex 16)"
           ADMIN_PASSWORD="$(openssl rand -base64 24)"
-          # Actions does not mask values just because they were generated here, and this is a
-          # public repo whose logs anyone can read. Register them before they can be echoed by a
-          # failing command, a `set -x`, or a test that dumps its request.
-          echo "::add-mask::${ENCRYPTION_KEY}"
-          echo "::add-mask::${ADMIN_PASSWORD}"
+          for value in "$ENCRYPTION_KEY" "$JWT_SECRET_KEY" "$VAULT_DB_PASSWORD" "$ADMIN_PASSWORD"; do
+            echo "::add-mask::${value}"
+          done
           {
             echo "ENCRYPTION_KEY=${ENCRYPTION_KEY}"
-            echo "JWT_SECRET_KEY=$(openssl rand -hex 32)"
-            echo "VAULT_DB_PASSWORD=$(openssl rand -hex 16)"
+            echo "JWT_SECRET_KEY=${JWT_SECRET_KEY}"
+            echo "VAULT_DB_PASSWORD=${VAULT_DB_PASSWORD}"
             echo "ADMIN_USERNAME=admin"
-            # Not a special-use TLD. Pydantic's EmailStr rejects .local / .invalid / .test /
-            # .example outright, so an address there fails every endpoint that echoes the admin's
-            # own email back through a validated model. Deliverability is not checked, so the
-            # domain does not need to resolve — it just must not be reserved.
             echo "ADMIN_EMAIL=admin@dockvault-ci.com"
             echo "ADMIN_PASSWORD=${ADMIN_PASSWORD}"
             echo "API_USE_HTTPS=false"
             echo "ENVIRONMENT=development"
-            # conftest.py logs the admin in ONCE, session-scoped, and reuses that token for the
-            # whole run. The suite takes ~35 minutes, so at the shipped 30-minute TTL the token
-            # expires around two thirds of the way through and every remaining test 401s — which
-            # surfaces as failures in whatever happens to sort late (sftp_*, ui_*, zk_*) and
-            # looks like a broken feature rather than an expired session. Four hours is well
-            # clear of the runtime without disabling expiry altogether.
             echo "JWT_ACCESS_TOKEN_EXPIRE_MINUTES=240"
-            # Rate limits, raised for the suite. NOT cosmetic: the login throttle allows
-            # rate_limit_login_attempts per username and DOUBLE that per IP per 300s window, and
-            # the vault-unlock throttle allows 5/20 per window. Every test here arrives from one
-            # address (127.0.0.1) and the suite drives hundreds of logins and vault opens, so at
-            # the shipped defaults most of the run dies on 429 rather than testing anything.
-            # This mirrors what a dev stack does; test_login_throttle.py documents the same and
-            # skips itself when the limit is raised — the throttle step at the end of this job
-            # puts the shipped limits back and exercises it for real.
             echo "RATE_LIMIT_LOGIN_ATTEMPTS=2000"
             echo "RATE_LIMIT_VAULT_ATTEMPTS=2000"
             echo "RATE_LIMIT_VAULT_ATTEMPTS_ADMIN=2000"
-            # Plus the general API middleware: 100 req/min overall, 10 auth, 20 upload,
-            # 50 download. Left ENABLED so the middleware still executes on every request —
-            # only the budget is raised beyond what the suite can exhaust.
             echo "RATE_LIMIT_API_DEFAULT=100000"
             echo "RATE_LIMIT_API_AUTH=100000"
             echo "RATE_LIMIT_API_UPLOAD=100000"
             echo "RATE_LIMIT_API_DOWNLOAD=100000"
           } > .env
-          # Hand the admin credentials to pytest directly. conftest.py can also read them back
-          # out of ../.env, but being explicit means a future .env-parsing change cannot quietly
-          # turn every authenticated test into a skip.
           {
             echo "VAULT_ADMIN_USER=admin"
             echo "VAULT_ADMIN_PASS=${ADMIN_PASSWORD}"
+            echo "VAULT_API_CONTAINER=vault-api"
+            echo "VAULT_DB_CONTAINER=vault-db"
+            echo "VAULT_REDIS_CONTAINER=vault-redis"
+            echo "VAULT_SFTP_HOST=127.0.0.1"
+            echo "VAULT_SFTP_PORT=2322"
+            echo "VAULT_SAME_COMMIT_CI=1"
           } >> "$GITHUB_ENV"
 
       - name: Build the image and start the stack
         run: docker compose up -d --build
 
-      - name: Wait for the vault to become healthy
-        # First real gate. conftest.py SKIPS the whole suite when the container is unreachable,
-        # so a stack that never came up would otherwise produce a green run with zero tests.
-        # Failing here instead makes that impossible.
+      - name: Wait for the API health gate
+        shell: bash
         run: |
           set -euo pipefail
           for attempt in $(seq 1 60); do
-            body="$(curl -fsS --max-time 5 http://127.0.0.1:8200/health 2>/dev/null || true)"
-            case "$body" in
-              *'"database":"connected"'*)
-                echo "Vault healthy after ${attempt} attempt(s): ${body}"
-                exit 0
-                ;;
-            esac
+            body=""
+            if body="$(curl -fsS --max-time 5 http://127.0.0.1:8200/health 2>/dev/null)"; then
+              case "$body" in
+                *'"database":"connected"'*)
+                  echo "Vault healthy after ${attempt} attempt(s): ${body}"
+                  exit 0
+                  ;;
+              esac
+            fi
             sleep 5
           done
           echo "::error::Vault never reported healthy at http://127.0.0.1:8200/health"
@@ -139,119 +144,81 @@ jobs:
           docker compose logs --no-color --tail=200
           exit 1
 
-      - name: Wait for the SFTP port
-        # The SFTP round-trip tests skip themselves when port 2322 is closed. Same reasoning as
-        # above: a silent skip is worse than a failure, so prove the port is open before running.
+      - name: Wait for the SFTP banner
+        shell: bash
         run: |
           set -euo pipefail
           for attempt in $(seq 1 30); do
-            # Read the SSH identification banner, not just a successful connect: docker-proxy
-            # binds the published host port the moment the container is created, so a bare TCP
-            # connect returns success while paramiko inside is still starting. Only a real
-            # "SSH-2.0-..." greeting proves the server is actually serving.
-            banner="$(timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2322; head -c 4 <&3' 2>/dev/null || true)"
-            case "$banner" in
-              SSH-*)
-                echo "SFTP greeting received after ${attempt} attempt(s)"
-                exit 0
-                ;;
-            esac
+            banner=""
+            if banner="$(timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2322; head -c 4 <&3' 2>/dev/null)"; then
+              case "$banner" in
+                SSH-*)
+                  echo "SFTP greeting received after ${attempt} attempt(s)"
+                  exit 0
+                  ;;
+              esac
+            fi
             sleep 2
           done
-          echo "::error::SFTP never started listening on 127.0.0.1:2322"
-          docker compose logs --no-color vault-sftp
+          echo "::error::SFTP never presented an SSH banner on 127.0.0.1:2322"
+          docker compose logs --no-color --tail=200 vault-sftp
           exit 1
 
-      - name: Install test dependencies
-        # Uses the runner's preinstalled Python rather than actions/setup-python: the suite is an
-        # HTTP/browser client, not the app under test, so its interpreter version is not part of
-        # what we are validating — and skipping the action keeps one less pinned SHA to maintain.
+      - name: Install locked test dependencies and Chromium
         run: |
           set -euo pipefail
-          python3 --version
-          python3 -m pip install --upgrade pip
-          python3 -m pip install -r tests/requirements-test.lock
-          python3 -m playwright install --with-deps chromium
+          python -m pip install -r tests/requirements-test.lock
+          python -m playwright install --with-deps chromium
 
-      - name: Run the full test suite
-        working-directory: tests
-        # --junitxml feeds the skip audit below. `|| true` keeps the job alive so that audit and
-        # the log dump still run on failure; the real pass/fail verdict is the audit step, which
-        # reads the XML and re-raises.
+      - name: Verify Chromium launches against the API
         run: |
-          set -o pipefail
-          python3 -m pytest -ra --junitxml=../pytest-results.xml || true
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
 
-      - name: Audit the results (fail on failures OR on a silently skipped suite)
-        # The suite is designed to skip cleanly rather than error when its environment is missing.
-        # That is right for a laptop and dangerous in CI: pytest exits 0 when every test skipped,
-        # so "all green" and "nothing ran" look identical. This step separates them.
-        run: |
-          python3 - <<'PY'
-          import sys
-          import xml.etree.ElementTree as ET
-
-          # Two independent guards, because a floor alone is weak: the suite is ~1100 tests, so
-          # hundreds could skip and still clear any absolute floor worth setting.
-          #   - the floor catches a total environment collapse
-          #   - the ratio catches a partial one (e.g. SFTP down, or the admin credential missing,
-          #     which quietly turns a whole class of tests into skips)
-          # The observed steady-state skip rate is ~1%; 15% is loose enough not to flap and tight
-          # enough that a silently-missing dependency cannot hide.
-          MIN_TESTS_ACTUALLY_RUN = 50
-          MAX_SKIP_RATIO = 0.15
-
-          try:
-              root = ET.parse("pytest-results.xml").getroot()
-          except (OSError, ET.ParseError) as exc:
-              sys.exit(f"::error::No usable pytest report ({exc}). The suite did not run.")
-
-          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
-          total = sum(int(s.get("tests", 0)) for s in suites)
-          skipped = sum(int(s.get("skipped", 0)) for s in suites)
-          failures = sum(int(s.get("failures", 0)) for s in suites)
-          errors = sum(int(s.get("errors", 0)) for s in suites)
-          ran = total - skipped
-
-          print(f"collected={total} ran={ran} skipped={skipped} failed={failures} errored={errors}")
-
-          problems = []
-          if failures or errors:
-              problems.append(f"{failures} failed, {errors} errored")
-          if ran < MIN_TESTS_ACTUALLY_RUN:
-              problems.append(
-                  f"only {ran} of {total} tests actually ran (floor is {MIN_TESTS_ACTUALLY_RUN}) "
-                  "- the suite skipped itself instead of testing anything"
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(headless=True)
+              page = browser.new_page()
+              response = page.goto(
+                  "http://127.0.0.1:8200/",
+                  wait_until="domcontentloaded",
+                  timeout=15_000,
               )
-          elif total and skipped / total > MAX_SKIP_RATIO:
-              problems.append(
-                  f"{skipped} of {total} tests skipped "
-                  f"({skipped / total:.0%}, ceiling is {MAX_SKIP_RATIO:.0%}) "
-                  "- part of the environment is missing, not just a few opt-in tests"
-              )
-          if problems:
-              sys.exit("::error::" + "; ".join(problems))
-          print("OK")
+              if response is None or not response.ok:
+                  raise SystemExit("Chromium could not load the running vault")
+              browser.close()
           PY
 
-      - name: Exercise the login throttle at shipped limits
-        # The main run raises the limits so the suite can execute at all, which makes
-        # test_login_throttle.py skip itself. Put the shipped defaults back and run just that
-        # file, so brute-force protection is actually covered rather than permanently skipped.
+      - name: Run the full test suite
+        run: python -m pytest --maxfail=1 --junitxml=pytest-results.xml
+
+      - name: Audit the successful full report
+        run: >-
+          python .github/scripts/pytest_result_audit.py pytest-results.xml
+          --expected-total "${{ needs.preflight.outputs.test-count }}"
+
+      - name: Exercise login throttling and Redis outage fallback
+        shell: bash
         run: |
           set -euo pipefail
           sed -i 's/^RATE_LIMIT_LOGIN_ATTEMPTS=.*/RATE_LIMIT_LOGIN_ATTEMPTS=5/' .env
           docker compose up -d --force-recreate vault-api
           for attempt in $(seq 1 40); do
-            body="$(curl -fsS --max-time 5 http://127.0.0.1:8200/health 2>/dev/null || true)"
-            case "$body" in *'"database":"connected"'*) break ;; esac
-            [ "$attempt" -eq 40 ] && { echo "::error::vault-api did not come back up"; exit 1; }
+            body=""
+            if body="$(curl -fsS --max-time 5 http://127.0.0.1:8200/health 2>/dev/null)"; then
+              case "$body" in
+                *'"database":"connected"'*) break ;;
+              esac
+            fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "::error::vault-api did not return after restoring shipped limits"
+              exit 1
+            fi
             sleep 3
           done
-          # Clear the sliding-window counters the main run filled, so the throttle test starts
-          # from an empty bucket rather than an already-exhausted one.
           docker compose exec -T vault-redis redis-cli FLUSHALL
-          cd tests && python3 -m pytest test_login_throttle.py -ra
+          VAULT_REDIS_OUTAGE_TEST=1 \
+          VAULT_REDIS_CONTAINER=vault-redis \
+            python -m pytest tests/test_login_throttle.py --maxfail=1
 
       - name: Container logs
         if: failure()

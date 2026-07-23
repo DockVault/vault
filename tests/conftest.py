@@ -56,6 +56,13 @@ def unique(prefix: str = "t") -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
+def skip_for_older_deployment(reason: str) -> None:
+    """Keep compatibility skips local-only; same-commit CI must test the new image."""
+    if os.environ.get("VAULT_SAME_COMMIT_CI", "").lower() in {"1", "true", "yes"}:
+        pytest.fail(f"{reason}; the newly built image must advertise this endpoint")
+    pytest.skip(reason)
+
+
 def compute_registration_pop(client, priv, public_key_pem: str) -> dict:
     """Client-side registration proof-of-possession — a faithful Python mirror of
     app/services/ecc_pop.py / ecc_crypto.js.computeRegistrationPoP. Fetches a challenge, does
