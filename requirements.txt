@@ -31,7 +31,7 @@ paramiko==3.4.0
 # and TLS on a crypto product, so it should not lag.
 cryptography==44.0.1
 argon2-cffi==25.1.0
-bcrypt==4.1.2
+bcrypt==5.0.0
 # JWTs are HS256 (symmetric) only. Migrated off the unmaintained python-jose (CVE-2024-33663/33664 —
 # not reachable here since decode pins a single-element algorithms allowlist and the app is JWS-only)
 # to the maintained PyJWT. app/core/config.py rejects a non-HMAC jwt_algorithm at startup, defeating any
