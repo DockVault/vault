@@ -1,10 +1,23 @@
-# Vault-service integration tests
+# Vault-service test suite
 
-End-to-end tests that run on the **host** and exercise the live container at
-`http://localhost:8200` over HTTP (API) and a real browser (UI). Apart from two
-pure-helper unit files (one imports `app.services.log_pull`, one imports the
-`run_combined` entrypoint), nothing here imports the app — it tests the deployed
-surface.
+Tests are split by execution environment. The offline fast lane runs pure policy, helper, static,
+and management-tool tests without a DockVault deployment. Integration tests exercise a healthy
+stack over HTTP, WebSocket, SFTP, or a real browser. Tests that create isolated Docker resources
+carry an additional `docker` marker.
+
+## Test taxonomy
+
+| Marker | Contract |
+|--------|----------|
+| `unit` | Does not require a running DockVault deployment |
+| `integration` | Requires a healthy deployed stack (the default for otherwise-unclassified tests) |
+| `docker` | Creates throwaway Docker containers or volumes; excluded from the offline fast lane |
+| `ui` | Uses Playwright and Chromium against the deployed web UI |
+| `websocket` | Opens the deployed `/ws/monitor` WebSocket |
+| `sftp` | Connects to the deployed SFTP service |
+
+Every collected test receives exactly one of `unit` or `integration`. Strict marker and config
+validation are enabled from the repository-root `pytest.ini`.
 
 ## Layout
 
@@ -29,10 +42,10 @@ hardening, and more) — the table lists the core surfaces; see the file names.
 ## Setup (once)
 
 ```powershell
-cd tests   # from the repository root
-python -m venv .venv
-.venv\Scripts\pip install -r requirements-test.txt
-.venv\Scripts\playwright install chromium
+# from the repository root
+python -m venv tests/.venv
+tests\.venv\Scripts\pip install -r tests/requirements-test.lock
+tests\.venv\Scripts\playwright install chromium
 ```
 
 ## Prerequisite: raise the rate limits
@@ -105,17 +118,30 @@ key-management throttle is hardcoded, not env-driven, so `test_zk_ecc_hardening.
 
 ## Run
 
-Make sure the stack is up first (`docker compose up -d`), then:
+Run the offline lane from the repository root. It does not probe localhost and does not need
+Docker:
 
 ```powershell
-# everything
-.venv\Scripts\python -m pytest
+tests\.venv\Scripts\python -m pytest -m "unit and not docker" --maxfail=1
+```
 
-# API only (skip the browser tests)
-.venv\Scripts\python -m pytest -m "not ui"
+For integration tests, start the stack first (`docker compose up -d`) and install Chromium, then:
+
+```powershell
+# everything, including UI and SFTP
+tests\.venv\Scripts\python -m pytest
+
+# deployed API tests only
+tests\.venv\Scripts\python -m pytest -m "integration and not ui and not sftp"
 
 # UI only, headed (watch it click)
-.venv\Scripts\python -m pytest -m ui --headed
+tests\.venv\Scripts\python -m pytest -m ui --headed
+```
+
+The real-Docker management-tool tests are opt-in locally:
+
+```powershell
+tests\.venv\Scripts\python -m pytest -m docker
 ```
 
 ## Config (env vars, all optional)
@@ -125,4 +151,4 @@ Make sure the stack is up first (`docker compose up -d`), then:
 | `VAULT_BASE_URL` | `http://localhost:8200` |
 | `VAULT_ADMIN_USER` / `VAULT_ADMIN_PASS` | read from `../.env` (`ADMIN_USERNAME` / `ADMIN_PASSWORD`) |
 
-If the container isn't reachable the whole suite **skips** (it won't error).
+If the container isn't reachable, integration tests **skip** cleanly while the offline unit lane still runs.

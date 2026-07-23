@@ -17,10 +17,18 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
 ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("dockvault_mod", ROOT / "dockvault.py")
 dv = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(dv)
+
+
+@pytest.fixture(autouse=True)
+def _keep_secret_acl_changes_hermetic(monkeypatch):
+    """Unit tests never change the host ACL of their temporary secret files."""
+    monkeypatch.setattr(dv, "tighten_secret_file", lambda _path: True)
 
 
 class _Proc:
@@ -229,15 +237,28 @@ def test_write_env_reports_tighten_result(tmp_path, monkeypatch):
 
 
 def _cert_tool_available():
-    return shutil.which("openssl") is not None or shutil.which("docker") is not None
+    if shutil.which("openssl") is not None:
+        try:
+            if subprocess.run(
+                ["openssl", "version"], capture_output=True, timeout=10
+            ).returncode == 0:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return dv.docker_available()[0]
+
+@pytest.fixture
+def _working_cert_tool():
+    if not _cert_tool_available():
+        pytest.skip("needs openssl or docker for cert generation")
 
 
 _SETUP = [sys.executable, str(ROOT / "dockvault.py"), "setup", "--non-interactive",
           "--server-name", "localhost", "--admin-password", "Strong-Pass-1234", "--no-start"]
 
 
-@pytest.mark.skipif(not _cert_tool_available(), reason="needs openssl or docker for cert generation")
-def test_setup_no_start_authors_env_and_cert(tmp_path):
+@pytest.mark.docker
+def test_setup_no_start_authors_env_and_cert(tmp_path, _working_cert_tool):
     env = dict(os.environ, DOCKVAULT_ROOT=str(tmp_path), NO_COLOR="1")
     proc = subprocess.run(_SETUP + ["--enable-log-pull", "--update-check"],
                           env=env, capture_output=True, text=True, timeout=240)
@@ -254,8 +275,8 @@ def test_setup_no_start_authors_env_and_cert(tmp_path):
     assert "BEGIN CERTIFICATE" in cert and "PRIVATE KEY" in key
 
 
-@pytest.mark.skipif(not _cert_tool_available(), reason="needs openssl or docker for cert generation")
-def test_setup_reuse_does_not_regenerate(tmp_path):
+@pytest.mark.docker
+def test_setup_reuse_does_not_regenerate(tmp_path, _working_cert_tool):
     env = dict(os.environ, DOCKVAULT_ROOT=str(tmp_path), NO_COLOR="1")
     r1 = subprocess.run(_SETUP, env=env, capture_output=True, text=True, timeout=240)
     assert r1.returncode == 0, r1.stdout + r1.stderr
@@ -267,8 +288,8 @@ def test_setup_reuse_does_not_regenerate(tmp_path):
     assert "Reusing" in r2.stdout
 
 
-@pytest.mark.skipif(not _cert_tool_available(), reason="needs openssl or docker for cert generation")
-def test_setup_new_stamps_deployment_id(tmp_path):
+@pytest.mark.docker
+def test_setup_new_stamps_deployment_id(tmp_path, _working_cert_tool):
     env = dict(os.environ, DOCKVAULT_ROOT=str(tmp_path), NO_COLOR="1")
     proc = subprocess.run(_SETUP, env=env, capture_output=True, text=True, timeout=240)
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -277,8 +298,8 @@ def test_setup_new_stamps_deployment_id(tmp_path):
         "a fresh setup must stamp a short hex DEPLOYMENT_ID (got %r)" % did
 
 
-@pytest.mark.skipif(not _cert_tool_available(), reason="needs openssl or docker for cert generation")
-def test_setup_reuse_adopts_legacy_deployment_id(tmp_path):
+@pytest.mark.docker
+def test_setup_reuse_adopts_legacy_deployment_id(tmp_path, _working_cert_tool):
     # A pre-label ("legacy") .env carries every secret but no DEPLOYMENT_ID. Reusing it must ADOPT the
     # deployment under bundle 'default' - additive + idempotent - without regenerating any secret.
     cfg = {
@@ -530,6 +551,7 @@ def test_list_legacy_volumes_only_unlabelled_wellknown():
     assert dv.list_legacy_volumes(run=lambda *a, **k: _Proc(1, "")) == []
 
 
+@pytest.mark.docker
 def test_list_managed_volumes_live_roundtrip():
     if shutil.which("docker") is None:
         pytest.skip("docker not available")
@@ -957,6 +979,7 @@ def test_guard_interactive_routes_to_menu_not_autoprobe(tmp_path, monkeypatch):
     assert ok is True and called == []
 
 
+@pytest.mark.docker
 def test_probe_pg_password_live_distinguishes_secrets():
     if shutil.which("docker") is None:
         pytest.skip("docker not available")
@@ -1162,6 +1185,7 @@ def test_reset_aborts_and_keeps_env_when_down_v_fails(tmp_path, monkeypatch):
     assert (tmp_path / ".env").exists() and not list(tmp_path.glob(".env.removed-*"))
 
 
+@pytest.mark.docker
 def test_volume_sets_coexist_and_down_v_removes_only_current_live(tmp_path):
     if shutil.which("docker") is None:
         pytest.skip("docker not available")
@@ -1354,6 +1378,7 @@ def test_backup_writes_env_600_and_manifest_without_secret(tmp_path, monkeypatch
         assert (os.stat(bundle).st_mode & 0o077) == 0, "the bundle dir must be owner-only (0700)"
 
 
+@pytest.mark.docker
 def test_backup_restore_round_trip_live(tmp_path):
     if shutil.which("docker") is None:
         pytest.skip("docker not available")
@@ -1673,6 +1698,7 @@ def test_setup_refuses_to_start_with_an_unreadable_key(tmp_path, monkeypatch):
         "an unreadable TLS key must fail BEFORE the start, not become a restart loop"
 
 
+@pytest.mark.docker
 @pytest.mark.skipif(shutil.which("docker") is None, reason="needs a live docker engine")
 def test_cert_readability_probe_and_repair_roundtrip(tmp_path):
     """Live: a mode-600 root-owned key really IS unreadable to uid 10001, and the container-side

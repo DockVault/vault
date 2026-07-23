@@ -1,8 +1,8 @@
-# Test dependencies for the DockVault vault-service integration suite.
-# These run on the HOST (not in the container) and exercise the live API/UI
-# at http://localhost:8200.
+# Test dependency inputs for the DockVault host-side unit and integration suites.
+# The fully resolved Python 3.14 environment is requirements-test.lock.
 #
-# Install:  python -m venv .venv && .venv\Scripts\pip install -r requirements-test.txt
+# Resolve:  pip-compile --strip-extras --output-file requirements-test.lock requirements-test.txt
+# Install:  python -m venv .venv && .venv\Scripts\pip install -r requirements-test.lock
 # Browsers: .venv\Scripts\playwright install chromium
 pytest>=9.1.1,<10.0
 requests>=2.34.2

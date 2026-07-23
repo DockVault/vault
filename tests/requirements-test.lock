@@ -1,0 +1,72 @@
+# Fully resolved test environment for Python 3.14.
+# Regenerate with: pip-compile --strip-extras --output-file tests/requirements-test.lock tests/requirements-test.txt
+#
+bcrypt==5.0.0
+    # via
+    #   -r tests/requirements-test.txt
+    #   paramiko
+certifi==2026.7.22
+    # via requests
+cffi==2.1.0
+    # via
+    #   cryptography
+    #   pynacl
+charset-normalizer==3.4.9
+    # via requests
+colorama==0.4.6
+    # via pytest
+cryptography==49.0.0
+    # via
+    #   -r tests/requirements-test.txt
+    #   paramiko
+greenlet==3.5.4
+    # via playwright
+idna==3.18
+    # via requests
+iniconfig==2.3.0
+    # via pytest
+invoke==3.0.3
+    # via paramiko
+packaging==26.2
+    # via pytest
+paramiko==5.0.0
+    # via -r tests/requirements-test.txt
+playwright==1.61.0
+    # via
+    #   -r tests/requirements-test.txt
+    #   pytest-playwright
+pluggy==1.6.0
+    # via pytest
+pycparser==3.0
+    # via cffi
+pyee==13.0.1
+    # via playwright
+pygments==2.20.0
+    # via pytest
+pynacl==1.6.2
+    # via paramiko
+pytest==9.1.1
+    # via
+    #   -r tests/requirements-test.txt
+    #   pytest-base-url
+    #   pytest-playwright
+pytest-base-url==2.1.0
+    # via pytest-playwright
+pytest-playwright==0.8.0
+    # via -r tests/requirements-test.txt
+python-dotenv==1.2.2
+    # via -r tests/requirements-test.txt
+python-slugify==8.0.4
+    # via pytest-playwright
+requests==2.34.2
+    # via
+    #   -r tests/requirements-test.txt
+    #   pytest-base-url
+text-unidecode==1.3
+    # via python-slugify
+typing-extensions==4.16.0
+    # via pyee
+urllib3==2.7.0
+    # via requests
+websocket-client==1.9.0
+    # via -r tests/requirements-test.txt

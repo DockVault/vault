@@ -13,6 +13,7 @@ Config (all optional, sensible defaults):
 """
 import os
 import random
+import socket
 import uuid
 from pathlib import Path
 
@@ -302,10 +303,11 @@ class ApiClient:
 
 
 # ---------------------------------------------------------------------------
-# Session-wide guard: skip the whole suite cleanly if the container is down.
+# Live-deployment guard. Unit tests bypass this; every other test is
+# classified as integration during collection and must see a healthy stack.
 # ---------------------------------------------------------------------------
-@pytest.fixture(scope="session", autouse=True)
-def _require_running_container():
+@pytest.fixture(scope="session")
+def _live_container_health():
     try:
         r = requests.get(f"{BASE_URL}/health", timeout=5)
         r.raise_for_status()
@@ -319,6 +321,43 @@ def _require_running_container():
     if health.get("database") != "connected":
         pytest.skip(f"Vault DB not connected: {health}", allow_module_level=True)
     return health
+
+
+@pytest.fixture(scope="session")
+def _sftp_service_health():
+    host = os.environ.get("VAULT_SFTP_HOST", "127.0.0.1")
+    port = int(os.environ.get("VAULT_SFTP_PORT", "2322"))
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            return {"host": host, "port": port}
+    except OSError as exc:
+        pytest.skip(
+            f"SFTP server not reachable at {host}:{port} ({exc})",
+            allow_module_level=True,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _require_running_container(request):
+    if request.node.get_closest_marker("unit") is not None:
+        return None
+    health = request.getfixturevalue("_live_container_health")
+    if request.node.get_closest_marker("sftp") is not None:
+        request.getfixturevalue("_sftp_service_health")
+    return health
+
+
+def pytest_collection_modifyitems(items):
+    """Give every test exactly one execution-environment classification."""
+    for item in items:
+        unit = item.get_closest_marker("unit")
+        integration = item.get_closest_marker("integration")
+        if unit is not None and integration is not None:
+            raise pytest.UsageError(
+                f"{item.nodeid} is marked both unit and integration"
+            )
+        if unit is None and integration is None:
+            item.add_marker(pytest.mark.integration)
 
 
 @pytest.fixture(scope="session")

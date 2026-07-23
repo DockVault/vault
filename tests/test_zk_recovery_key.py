@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
 _NODE_RECOVERY = r'''
 const { webcrypto } = require('crypto');
 global.window = { crypto: webcrypto };

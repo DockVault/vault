@@ -5,6 +5,10 @@ no app import, no running vault.
 import os
 import sys
 
+import pytest
+
+pytestmark = pytest.mark.unit
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services import log_pull  # noqa: E402

@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
 
 ROOT = Path(__file__).resolve().parent.parent
 TEXT_SUFFIXES = {
@@ -38,11 +40,6 @@ SEMVER_LF = re.compile(
     rb"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\n"
 )
 
-
-@pytest.fixture(scope="session", autouse=True)
-def _require_running_container():
-    """These repository-byte checks deliberately run without a deployed vault."""
-    return None
 
 
 def _tracked_relative_paths() -> list[Path]:

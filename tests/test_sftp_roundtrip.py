@@ -42,18 +42,7 @@ _DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 _REVOKED_EXC = (IOError, OSError, paramiko.SSHException, EOFError)
 
 
-def _sftp_reachable() -> bool:
-    try:
-        with socket.create_connection((SFTP_HOST, SFTP_PORT), timeout=5):
-            return True
-    except OSError:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _sftp_reachable(),
-    reason=f"SFTP server not reachable at {SFTP_HOST}:{SFTP_PORT}",
-)
+pytestmark = pytest.mark.sftp
 
 
 def _wait_until(predicate, timeout=10.0, interval=0.2):

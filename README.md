@@ -244,7 +244,7 @@ its volumes, and won't overwrite existing volumes unless you pass `--force`.
 | `deploy/` | The real Compose stacks — `deploy/docker-compose.yml` (local trial), `deploy/docker-compose.secure.yml` (production HTTPS) |
 | `scripts/` | Operator utilities (`scripts/setup_master_password.py`) |
 | `static/` | The self-hosted web UI (no CDN assets) |
-| `tests/` | pytest + Playwright integration suite (see `tests/README.md`) |
+| `tests/` | pytest offline + deployed integration suite (see `tests/README.md`) |
 | `run_combined.py`, `docker-entrypoint.py` | Container entrypoints, kept at the root (the image's ENTRYPOINT/CMD contract) |
 
 The root `docker-compose.yml` and `docker-compose.secure.yml` are thin `include:` shims over the

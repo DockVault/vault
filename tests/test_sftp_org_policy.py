@@ -4,7 +4,6 @@ SSH-key automation). Stored in the admin Settings store under the key
 'sftp_require_temp_cred_groups'; enforced in the SFTP auth path.
 """
 import os
-import socket
 import contextlib
 
 import pytest
@@ -17,15 +16,7 @@ SFTP_HOST = os.environ.get("VAULT_SFTP_HOST", "127.0.0.1")
 SFTP_PORT = int(os.environ.get("VAULT_SFTP_PORT", "2322"))
 
 
-def _reachable() -> bool:
-    try:
-        with socket.create_connection((SFTP_HOST, SFTP_PORT), timeout=5):
-            return True
-    except OSError:
-        return False
-
-
-pytestmark = pytest.mark.skipif(not _reachable(), reason=f"SFTP not reachable at {SFTP_HOST}:{SFTP_PORT}")
+pytestmark = pytest.mark.sftp
 _AUTH_ERR = (paramiko.SSHException, EOFError, OSError)
 
 

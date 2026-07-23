@@ -2,6 +2,10 @@
 import importlib.util
 import pathlib
 
+import pytest
+
+pytestmark = pytest.mark.unit
+
 _p = pathlib.Path(__file__).resolve().parents[1] / "app" / "core" / "upload_policy.py"
 _spec = importlib.util.spec_from_file_location("upload_policy_under_test", _p)
 up = importlib.util.module_from_spec(_spec)
