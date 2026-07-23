@@ -1245,6 +1245,19 @@ def container_running(name, run=subprocess.run):
     return (getattr(r, "stdout", "") or "").strip() == "true"
 
 
+def container_mounts(name, run=subprocess.run):
+    """The named volumes a container has mounted, or None if docker could not be asked. Bind
+    mounts have no .Name and come back blank, so they are dropped."""
+    try:
+        r = run(["docker", "inspect", "-f", "{{range .Mounts}}{{.Name}} {{end}}", name],
+                capture_output=True, text=True, timeout=20)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    return (getattr(r, "stdout", "") or "").split()
+
+
 def containers_publishing(port, run=subprocess.run):
     """The names of running containers publishing host `port`, or None if docker could not be
     asked. An empty list means 'nothing of docker's is on that port' - distinct from None, which
@@ -1334,6 +1347,8 @@ class DockVault:
         self.root = root
         # Set by _start_db_only: whether vault-db was already up before the secret probe.
         self._db_was_running = False
+        # Set by _verify_env_against_volume: the pg volume the current check is about.
+        self._guard_vol = None
 
     # Area handlers — accept an optional argparse namespace so the SAME handler serves both the
     # interactive menu (args=None) and arg-mode (args=<namespace>).
@@ -1646,8 +1661,9 @@ class DockVault:
         return getattr(r, "returncode", 1) == 0
 
     def _start_db_only(self):
-        """Start ONLY the postgres service on the existing volume (for the pre-up secret check).
-        Streams Compose's own progress (capture=False) so a slow pull/create is visibly WORKING
+        """Make the postgres service available for the pre-up secret check, WITHOUT disturbing a
+        deployment that is already running. Returns False if it could not be made available.
+        Compose's own progress is streamed (capture=False) so a slow pull/create is visibly WORKING
         rather than looking hung, and so any Compose error is on screen when this returns False."""
         # The composes pin fixed container names, so this acts on whatever vault-db exists on the
         # host - which, when an operator re-runs setup, is a LIVE deployment's database. Leave a
@@ -1657,12 +1673,35 @@ class DockVault:
         # stop a database it started itself.
         self._db_was_running = container_running(DB_CONTAINER)
         if self._db_was_running:
-            return True
+            return self._live_db_serves_guarded_volume()
         try:
             r = self._run_dc("up", "-d", DB_CONTAINER, capture=False, timeout=180)
         except (OSError, subprocess.SubprocessError):
             return False
         return getattr(r, "returncode", 1) == 0
+
+    def _live_db_serves_guarded_volume(self):
+        """Is the ALREADY-RUNNING vault-db the database for the volume being guarded?
+
+        `container_name: vault-db` is pinned globally while the volume name varies with
+        VAULT_VOLUME_PREFIX, so on a host that has more than one set the two can name different
+        things. Recreating the container to force them together is exactly what must not happen
+        here (it would take a live deployment's database away from its app), so when they diverge
+        the honest answer is 'cannot check this volume' - the caller treats that as ambiguous and
+        fails closed. Unknown mounts (docker unreadable) are TRUSTED, matching the single-set case
+        every other path assumes; the guardrail's own probe is the real gate."""
+        vol = getattr(self, "_guard_vol", None)
+        if not vol:
+            return True
+        mounts = container_mounts(DB_CONTAINER)
+        if mounts is None or vol in mounts:
+            return True
+        print(self.pal.paint(
+            "  A different deployment's database is already running under the name '%s', serving\n"
+            "  another volume set - so this .env cannot be checked against %s without taking that\n"
+            "  deployment down. Stop it first (docker compose down), then re-run."
+            % (DB_CONTAINER, vol), "yellow"))
+        return False
 
     def _wait_db_ready(self, tries=20, tick=None):
         """Poll pg_isready inside vault-db until it accepts connections (readiness, NOT auth).
@@ -1764,6 +1803,10 @@ class DockVault:
         probe DB afterwards. Never prints a secret."""
         pal = self.pal
         start_fn, wait_fn, probe_fn, stop_fn, marker_fn, stamp_fn = hooks
+        # Which volume the answer is ABOUT. _start_db_only reads it to confirm that an
+        # already-running vault-db is this set's database and not another set's (the container
+        # name is pinned globally; the volume name is not).
+        self._guard_vol = vol
         if not fernet_key_looks_valid(env.get("ENCRYPTION_KEY", "")):
             return "encryption_key"
         # Fast path: a set this tool has already verified carries a non-secret coupling stamp, so the

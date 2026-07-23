@@ -676,6 +676,17 @@ def test_container_running_reads_docker_inspect():
         "vault-db", run=lambda *a, **k: (_ for _ in ()).throw(OSError("no docker"))) is False
 
 
+def test_container_mounts_lists_named_volumes_and_fails_soft():
+    assert dv.container_mounts(
+        "vault-db", run=lambda *a, **k: _Proc(0, "dockvault-vault_vault_pg_data \n")
+    ) == ["dockvault-vault_vault_pg_data"]
+    assert dv.container_mounts("vault-db", run=lambda *a, **k: _Proc(0, "  \n")) == []
+    # None = "could not ask", which callers must not read as "mounts nothing".
+    assert dv.container_mounts("vault-db", run=lambda *a, **k: _Proc(1, "", "no such object")) is None
+    assert dv.container_mounts(
+        "vault-db", run=lambda *a, **k: (_ for _ in ()).throw(OSError("no docker"))) is None
+
+
 def test_secret_probe_leaves_an_already_running_database_alone(monkeypatch):
     """The probe may only touch a database it started itself.
 
@@ -712,6 +723,9 @@ def test_refused_guard_does_not_stop_a_live_deployments_database(monkeypatch):
     monkeypatch.setattr(dv.DockVault, "_run_dc",
                         lambda self, *a, **k: calls.append(a) or _Proc(0))
     monkeypatch.setattr(dv, "container_running", lambda name: True)
+    # Stubbed, not left to the host: whether a real vault-db is running here, and what it mounts,
+    # must not decide what this asserts.
+    monkeypatch.setattr(dv, "container_mounts", lambda name: ["dockvault-vault_vault_pg_data"])
     ok = tool._guard_db_secret(
         {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"},
         exists_fn=lambda v: True, wait_fn=lambda: True,     # real start_fn / stop_fn on purpose
@@ -719,6 +733,42 @@ def test_refused_guard_does_not_stop_a_live_deployments_database(monkeypatch):
     assert ok is False, "a mismatched .env must still be refused"
     assert not any(a[0] == "stop" for a in calls), \
         "the refused setup stopped the running deployment's database"
+
+
+def test_probe_refuses_a_running_database_serving_a_different_volume_set(monkeypatch, capsys):
+    """Leaving a running database alone must not mean probing the WRONG one.
+
+    `container_name: vault-db` is pinned globally while the volume name varies with
+    VAULT_VOLUME_PREFIX, so on a host with two sets the running container can be serving someone
+    else's data. Recreating it to force the two together is exactly what must not happen here, so
+    a divergence has to fail closed instead of answering a question about the wrong volume.
+    """
+    tool = _guard_tool()
+    calls = []
+    monkeypatch.setattr(dv.DockVault, "_run_dc", lambda self, *a, **k: calls.append(a) or _Proc(0))
+    monkeypatch.setattr(dv, "container_running", lambda name: True)
+    monkeypatch.setattr(dv, "container_mounts", lambda name: ["dockvault-vault-OTHER_vault_pg_data"])
+
+    probes = []
+    result = tool._verify_env_against_volume(
+        {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"},
+        "dockvault-vault_vault_pg_data",
+        (tool._start_db_only, lambda: True, lambda *a: probes.append(1) or "ok",
+         tool._stop_db_only, lambda vol: None, lambda vol, env: True))
+
+    assert result == "ambiguous", "a database serving another set must not answer for this one"
+    assert probes == [], "the probe authenticated against another volume set's database"
+    assert not any(a[0] == "stop" for a in calls), "and it must not stop that deployment either"
+    assert "another volume set" in capsys.readouterr().out
+
+    # The single-set case — same container, the volume actually being guarded — still probes.
+    monkeypatch.setattr(dv, "container_mounts", lambda name: ["dockvault-vault_vault_pg_data"])
+    assert tool._verify_env_against_volume(
+        {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"},
+        "dockvault-vault_vault_pg_data",
+        (tool._start_db_only, lambda: True, lambda *a: probes.append(1) or "ok",
+         tool._stop_db_only, lambda vol: None, lambda vol, env: True)) == "ok"
+    assert probes == [1]
 
 
 def test_containers_publishing_parses_names_and_fails_soft():
