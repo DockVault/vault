@@ -1651,6 +1651,8 @@ class DockVault:
         """Recreate the stack. build=True builds the local Dockerfile (setup / from-source update);
         build=False recreates from the already-present image (the pull-update path - must NOT rebuild,
         or it would overwrite the just-pulled release image with a local build)."""
+        if not self._remove_inactive_profile():
+            return False
         args = ["up", "-d", "--force-recreate", "--remove-orphans"]
         if build:
             args.insert(1, "--build")
@@ -1659,6 +1661,28 @@ class DockVault:
         except (OSError, subprocess.SubprocessError):
             return False
         return getattr(r, "returncode", 1) == 0
+
+    def _remove_inactive_profile(self):
+        """Remove only app containers from the profile that is no longer selected.
+
+        Compose does not consider services behind an inactive profile to be orphans, so a
+        combined-to-split rerun otherwise leaves ``vault`` holding the web/SFTP ports (and the
+        reverse transition leaves ``vault-api``/``vault-sftp``). ``compose rm`` stops and removes
+        only those inactive app containers; database/cache containers and every named volume stay
+        in place. Fail closed before ``up`` if reconciliation itself fails.
+        """
+        profile = self._load_env().get("COMPOSE_PROFILES", "combined")
+        if profile == "split":
+            args = ("--profile", "combined", "rm", "-s", "-f", "vault")
+        elif profile == "combined":
+            args = ("--profile", "split", "rm", "-s", "-f", "vault-api", "vault-sftp")
+        else:
+            return False
+        try:
+            result = self._run_dc(*args, capture=False, timeout=120)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return getattr(result, "returncode", 1) == 0
 
     def _start_db_only(self):
         """Make the postgres service available for the pre-up secret check, WITHOUT disturbing a

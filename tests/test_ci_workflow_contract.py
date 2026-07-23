@@ -21,6 +21,7 @@ pytestmark = pytest.mark.unit
 
 _ROOT = Path(__file__).parents[1]
 _WORKFLOW = (_ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+_PREFLIGHT = (_ROOT / ".github" / "workflows" / "preflight.yml").read_text(encoding="utf-8")
 
 
 def _step(name: str, next_name: str) -> str:
@@ -28,14 +29,16 @@ def _step(name: str, next_name: str) -> str:
 
 
 def test_preflight_blocks_expensive_integration_work():
-    preflight = _WORKFLOW.split("  preflight:", 1)[1].split("  integration:", 1)[0]
+    caller = _WORKFLOW.split("  preflight:", 1)[1].split("  integration:", 1)[0]
     integration = _WORKFLOW.split("  integration:", 1)[1]
 
+    assert "uses: ./.github/workflows/preflight.yml" in caller
+    assert "workflow_call:" in _PREFLIGHT
     assert "needs: preflight" in integration
-    assert "--collect-only -q" in preflight
-    assert '-m "unit and not docker" --maxfail=1' in preflight
-    assert "docker compose" not in preflight
-    assert "playwright install" not in preflight
+    assert "--collect-only -q" in _PREFLIGHT
+    assert '-m "unit and not docker" --maxfail=1' in _PREFLIGHT
+    assert "docker compose" not in _PREFLIGHT
+    assert "playwright install" not in _PREFLIGHT
 
 
 def test_full_suite_exit_and_result_count_are_authoritative():

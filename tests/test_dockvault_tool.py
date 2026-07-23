@@ -1554,6 +1554,44 @@ def test_compose_calls_close_stdin(tmp_path, monkeypatch):
         assert kw.get("stdin") is dv.subprocess.DEVNULL, \
             "%s ran with stdin open - Compose could block on an unseen prompt" % " ".join(cmd[:4])
 
+@pytest.mark.parametrize(
+    ("profile", "inactive"),
+    [
+        ("split", ("--profile", "combined", "rm", "-s", "-f", "vault")),
+        ("combined", ("--profile", "split", "rm", "-s", "-f", "vault-api", "vault-sftp")),
+    ],
+)
+def test_recreate_removes_only_inactive_app_profile_before_up(
+        tmp_path, monkeypatch, profile, inactive):
+    (tmp_path / ".env").write_text(f"COMPOSE_PROFILES={profile}\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(
+        tool,
+        "_run_dc",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or _Proc(0, ""),
+    )
+
+    assert tool._recreate_stack(build=True) is True
+    assert calls[0][0] == inactive
+    assert calls[0][1]["capture"] is False
+    assert "-v" not in calls[0][0]
+    assert calls[1][0] == ("up", "--build", "-d", "--force-recreate", "--remove-orphans")
+
+
+def test_recreate_fails_closed_when_inactive_profile_cleanup_fails(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("COMPOSE_PROFILES=split\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(
+        tool,
+        "_run_dc",
+        lambda *args, **kwargs: calls.append(args) or _Proc(1, ""),
+    )
+
+    assert tool._recreate_stack(build=True) is False
+    assert calls == [("--profile", "combined", "rm", "-s", "-f", "vault")]
+
 
 def test_start_db_only_streams_so_docker_errors_are_visible(tmp_path, monkeypatch):
     """The db-only start must NOT capture output: Compose's own progress/errors are the operator's
