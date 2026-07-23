@@ -1,0 +1,251 @@
+name: Setup matrix
+
+# Drives dockvault.py against real Docker, in the states a self-hosting operator actually reaches:
+# a first install, a re-run over existing data, a backup/restore round trip, a mismatched .env, a
+# split deployment. tests/test_dockvault_tool.py already covers the tool's REASONING thoroughly —
+# 124 tests — but every one of them injects a fake `run` hook, so nothing has ever checked that the
+# tool can actually stand a deployment up, or that re-running it leaves a user's data where it was.
+#
+# That gap is not theoretical: the guardrail protecting an operator from "existing volume + fresh
+# .env" (Postgres bakes its password in on first init and never re-reads it) is only ever exercised
+# by hand today.
+#
+# Safe here in a way it is not on a workstation: the composes pin `name: dockvault-vault` and fixed
+# container_names, so two deployments cannot coexist on one Docker daemon — a runner is a throwaway
+# VM with none, so scenarios cannot collide with anything real.
+#
+# Not on every pull request: the app suite in tests.yml already gates those, and this adds ~10
+# minutes. It runs when the installer or the thing it deploys changes, plus nightly on main.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "dockvault.py"
+      - "Dockerfile"
+      - "docker-compose*.yml"
+      - "deploy/**"
+      - "docker-entrypoint.py"
+      - "run_combined.py"
+      - ".github/workflows/setup-matrix.yml"
+      - ".github/scripts/deployment_state.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: setup-matrix-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Fixed for the run so every scenario can log back in and compare. Throwaway: this deployment
+  # exists for ~10 minutes inside a runner and is never reachable from outside it.
+  ADMIN_USER: admin
+  ADMIN_PASS: Dv-Matrix-2026-9x7k
+  BASE: https://localhost:8443
+  WEB_PORT: "8443"
+  SFTP_PORT: "2222"
+
+jobs:
+  scenarios:
+    name: dockvault.py against real Docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Nothing here pushes, and the job builds and runs a Dockerfile that is
+          # attacker-authored on a fork pull request.
+          persist-credentials: false
+
+      - name: Scenario A — first install
+        run: |
+          set -euo pipefail
+          python3 dockvault.py setup --non-interactive \
+            --server-name localhost \
+            --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
+            --admin-password "$ADMIN_PASS" \
+            --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" --enable-sftp
+          test -f .env || { echo "::error::setup did not write .env"; exit 1; }
+          test -f certs/cert.pem || { echo "::error::setup did not write a certificate"; exit 1; }
+          python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS"
+          echo "A: installed and reachable"
+
+      - name: Scenario A2 — SFTP actually answers
+        # --enable-sftp is a claim about a listening service, so read the SSH banner rather than
+        # trusting a successful TCP connect: docker-proxy binds the published port as soon as the
+        # container is created, whether or not anything inside is serving.
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 20); do
+            banner="$(timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/${SFTP_PORT}; head -c 4 <&3" 2>/dev/null || true)"
+            case "$banner" in SSH-*) echo "A2: SFTP greeted after ${attempt} attempt(s)"; exit 0 ;; esac
+            sleep 3
+          done
+          echo "::error::SFTP never presented an SSH banner on ${SFTP_PORT}"
+          docker compose -f docker-compose.secure.yml logs --no-color --tail=100
+          exit 1
+
+      - name: Plant data to prove continuity against
+        run: |
+          set -euo pipefail
+          token="$(curl -sS --cacert certs/cert.pem -X POST "$BASE/auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+          curl -sS --cacert certs/cert.pem -X POST "$BASE/vaults" \
+            -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+            -d '{"name":"matrix-marker","description":"planted before the re-runs"}' -o /dev/null
+          python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS" > /tmp/state-planted.json
+          grep -q matrix-marker <(curl -sS --cacert certs/cert.pem "$BASE/vaults" -H "Authorization: Bearer $token") \
+            || { echo "::error::the marker vault was not created"; exit 1; }
+          echo "planted: $(cat /tmp/state-planted.json)"
+
+      - name: Scenario B — re-run over existing data keeps it
+        # The upgrade path. Re-running setup must adopt the existing .env and leave the deployment
+        # identical; regenerating secrets here would strand the data behind a password Postgres
+        # will not re-read.
+        run: |
+          set -euo pipefail
+          python3 dockvault.py setup --non-interactive \
+            --server-name localhost \
+            --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
+            --admin-password "$ADMIN_PASS" \
+            --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" --enable-sftp \
+            | tee /tmp/setup-rerun.log
+          grep -qi "reusing the existing .env" /tmp/setup-rerun.log \
+            || { echo "::error::the re-run did not report reusing the existing .env"; exit 1; }
+          python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS" > /tmp/state-after-rerun.json
+          diff /tmp/state-planted.json /tmp/state-after-rerun.json \
+            || { echo "::error::the deployment changed across a setup re-run"; exit 1; }
+          echo "B: data, users and vault ids all survived"
+
+      - name: Scenario C — the coupling stamp makes the next run instant
+        # The first re-run pays a ~30s database auth probe and stamps the volume; every run after
+        # should recognise the stamp instead of starting Postgres again. If this regresses, the
+        # only symptom is a slower setup, so nothing else would ever catch it.
+        run: |
+          set -euo pipefail
+          python3 dockvault.py setup --non-interactive \
+            --server-name localhost \
+            --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
+            --admin-password "$ADMIN_PASS" \
+            --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" --enable-sftp \
+            | tee /tmp/setup-third.log
+          grep -qi "stamp matches" /tmp/setup-third.log \
+            || { echo "::error::the coupling stamp was not used on the third run"; sed -n '1,60p' /tmp/setup-third.log; exit 1; }
+          echo "C: stamp fast path used"
+
+      - name: Scenario D — backup, destroy, restore
+        run: |
+          set -euo pipefail
+          python3 dockvault.py backup --non-interactive --action backup --backup-dir /tmp/dvbundles
+          bundle="$(find /tmp/dvbundles -mindepth 1 -maxdepth 1 -type d | head -1)"
+          test -n "$bundle" || { echo "::error::backup produced no bundle"; exit 1; }
+          echo "bundle: $bundle"
+
+          python3 dockvault.py reset --non-interactive --confirm
+          docker volume ls --format '{{.Name}}' | grep -q '^dockvault-vault_vault_pg_data$' \
+            && { echo "::error::reset left the data volume behind"; exit 1; } || true
+
+          python3 dockvault.py backup --non-interactive --action restore --bundle-dir "$bundle" --force
+          python3 dockvault.py setup --non-interactive \
+            --server-name localhost \
+            --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
+            --admin-password "$ADMIN_PASS" \
+            --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" --enable-sftp
+          python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS" > /tmp/state-restored.json
+          diff /tmp/state-planted.json /tmp/state-restored.json \
+            || { echo "::error::restore did not bring the deployment back intact"; exit 1; }
+          echo "D: backup -> destroy -> restore round-tripped"
+
+      - name: Scenario E — a mismatched .env must be refused, not started
+        # The data-safety guardrail. Postgres bakes its password into the volume on first init, so
+        # a regenerated .env cannot open existing data — the app would loop on "password
+        # authentication failed". Setup has to refuse, keep the volume, and say so without printing
+        # a secret. A pass here that started the stack anyway would be the worst outcome in the file.
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.secure.yml down --remove-orphans >/dev/null 2>&1 || true
+          mv .env /tmp/env.good
+          set +e
+          python3 dockvault.py setup --non-interactive \
+            --server-name localhost \
+            --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
+            --admin-password "$ADMIN_PASS" \
+            --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" --enable-sftp \
+            > /tmp/setup-mismatch.log 2>&1
+          set -e
+          grep -qiE "does NOT match the existing data volume" /tmp/setup-mismatch.log \
+            || { echo "::error::a mismatched .env was not detected"; cat /tmp/setup-mismatch.log; exit 1; }
+          grep -qi "not starting" /tmp/setup-mismatch.log \
+            || { echo "::error::setup did not refuse to start on a mismatched .env"; exit 1; }
+          # the refusal must not leak either secret it compared
+          for secret in "$(grep '^VAULT_DB_PASSWORD=' /tmp/env.good | cut -d= -f2-)" \
+                        "$(grep '^ENCRYPTION_KEY=' /tmp/env.good | cut -d= -f2-)"; do
+            if [ -n "$secret" ] && grep -qF -- "$secret" /tmp/setup-mismatch.log; then
+              echo "::error::the mismatch report printed a secret"; exit 1
+            fi
+          done
+          docker volume ls --format '{{.Name}}' | grep -q '^dockvault-vault_vault_pg_data$' \
+            || { echo "::error::the refusal destroyed the data volume"; exit 1; }
+          # and the original .env still opens it
+          mv /tmp/env.good .env
+          python3 dockvault.py setup --non-interactive \
+            --server-name localhost \
+            --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
+            --admin-password "$ADMIN_PASS" \
+            --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" --enable-sftp
+          python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS" > /tmp/state-recovered.json
+          diff /tmp/state-planted.json /tmp/state-recovered.json \
+            || { echo "::error::the documented recovery path did not restore access"; exit 1; }
+          echo "E: refused the mismatch, kept the data, and the real .env still opens it"
+
+      - name: Scenario F — split deployment
+        run: |
+          set -euo pipefail
+          python3 dockvault.py reset --non-interactive --confirm
+          rm -f .env
+          python3 dockvault.py setup --non-interactive \
+            --server-name localhost \
+            --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
+            --admin-password "$ADMIN_PASS" \
+            --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" \
+            --enable-sftp --split
+          python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS"
+          running="$(docker ps --format '{{.Names}}')"
+          echo "$running" | grep -q '^vault-api$'  || { echo "::error::split did not start vault-api"; echo "$running"; exit 1; }
+          echo "$running" | grep -q '^vault-sftp$' || { echo "::error::split did not start vault-sftp"; echo "$running"; exit 1; }
+          echo "F: split deployment healthy on both containers"
+
+      - name: Scenario G — --no-start authors config without deploying
+        run: |
+          set -euo pipefail
+          python3 dockvault.py reset --non-interactive --confirm
+          rm -f .env
+          python3 dockvault.py setup --non-interactive --no-start \
+            --server-name localhost \
+            --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
+            --admin-password "$ADMIN_PASS" \
+            --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT"
+          test -f .env || { echo "::error::--no-start did not write .env"; exit 1; }
+          test -f certs/cert.pem || { echo "::error::--no-start did not write a certificate"; exit 1; }
+          if [ -n "$(docker ps --format '{{.Names}}' | grep -E '^vault(-api|-sftp|-db|-redis)?$' || true)" ]; then
+            echo "::error::--no-start started containers anyway"; docker ps; exit 1
+          fi
+          echo "G: authored config, deployed nothing"
+
+      - name: Deployment logs
+        if: failure()
+        run: |
+          docker ps -a || true
+          docker compose -f docker-compose.secure.yml logs --no-color --tail=300 || true
+
+      - name: Tear down
+        if: always()
+        run: |
+          python3 dockvault.py reset --non-interactive --confirm || true
+          docker compose -f docker-compose.secure.yml down -v --remove-orphans || true
