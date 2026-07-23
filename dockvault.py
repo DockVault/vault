@@ -1220,6 +1220,7 @@ def read_version_file(root):
 # mismatch or an ambiguous result. These vault DB coordinates are fixed by the compose.
 PG_USER = "sftp_user"
 PG_DB = "sftp_db"
+DB_CONTAINER = "vault-db"
 
 
 def volume_exists(name, run=subprocess.run):
@@ -1229,6 +1230,33 @@ def volume_exists(name, run=subprocess.run):
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
     return getattr(r, "returncode", 1) == 0
+
+
+def container_running(name, run=subprocess.run):
+    """True if a container named `name` exists AND is running. Best-effort: any docker error
+    answers False, which callers must treat as 'not known to be running'."""
+    try:
+        r = run(["docker", "inspect", "-f", "{{.State.Running}}", name],
+                capture_output=True, text=True, timeout=20)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    if getattr(r, "returncode", 1) != 0:
+        return False
+    return (getattr(r, "stdout", "") or "").strip() == "true"
+
+
+def containers_publishing(port, run=subprocess.run):
+    """The names of running containers publishing host `port`, or None if docker could not be
+    asked. An empty list means 'nothing of docker's is on that port' - distinct from None, which
+    means 'unknown', so a caller can tell "not ours" from "could not tell"."""
+    try:
+        r = run(["docker", "ps", "--filter", "publish=%s" % port, "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=20)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    return [line.strip() for line in (getattr(r, "stdout", "") or "").splitlines() if line.strip()]
 
 
 def fernet_key_looks_valid(key):
@@ -1297,9 +1325,15 @@ class DockVault:
     """The management app: holds the palette + repo root and dispatches menu/arg commands to the
     per-area handlers (setup / backup / volumes / reset / update / logs)."""
 
+    # Every container this deployment can run. The composes pin these names globally, so a
+    # container answering to one of them IS this deployment - two sets cannot coexist.
+    OWN_CONTAINERS = frozenset({"vault", "vault-api", "vault-sftp", DB_CONTAINER, "vault-redis"})
+
     def __init__(self, pal, root=APP_ROOT):
         self.pal = pal
         self.root = root
+        # Set by _start_db_only: whether vault-db was already up before the secret probe.
+        self._db_was_running = False
 
     # Area handlers — accept an optional argparse namespace so the SAME handler serves both the
     # interactive menu (args=None) and arg-mode (args=<namespace>).
@@ -1418,13 +1452,15 @@ class DockVault:
         interactive = not (args and getattr(args, "non_interactive", False))
         if not self._guard_db_secret(env_now, interactive=interactive):
             raise SystemExit(1)   # the guard already printed the diagnosis + recovery paths
-        # Port preflight: warn (don't block) if the chosen web port is already taken.
+        profiles = summary.get("compose_profiles", "combined")
+        # Port preflight: warn (don't block) if the chosen web port is held by something ELSE.
+        # A re-run over a running deployment finds its OWN container on the port - the one compose
+        # is about to recreate - and warning there is just noise the operator has to second-guess.
         web_port = summary.get("web_host_port") or 443
-        if not port_free(web_port):
+        if not port_free(web_port) and not self._port_is_ours(web_port):
             print(pal.paint("  WARNING: host port %d is already in use; the web container may fail to bind "
                             "it. Free it first (e.g. sudo ss -ltnp 'sport = :%d')." % (web_port, web_port), "yellow"))
         tracker.advance(); tracker.show()               # -> Build + start
-        profiles = summary.get("compose_profiles", "combined")
         if not self._start_secure_stack():
             shown = self._tail_logs(self._web_service(profiles))
             self._fail("the stack did not start - %s." % ("the last log lines are above" if shown
@@ -1443,6 +1479,19 @@ class DockVault:
     def _web_service(profiles):
         """The service that serves the web/API half in the active deployment mode."""
         return "vault-api" if profiles == "split" else "vault"
+
+    def _port_is_ours(self, port, ps_fn=None):
+        """True if `port` is held solely by THIS deployment's own containers.
+
+        A setup re-run over a live deployment always finds the web port busy - held by the very
+        container `docker compose up` is about to recreate on that same port. Warning about it
+        sends the operator hunting for a conflict that does not exist. Answers False when docker
+        cannot be asked, or when anything outside the deployment is on the port, so a REAL
+        conflict is still reported."""
+        names = (ps_fn or containers_publishing)(port)
+        if not names:                       # None = could not ask; [] = nothing docker knows of
+            return False
+        return all(name in self.OWN_CONTAINERS for name in names)
 
     def _collect_setup_config(self, args):
         """Resolve the full setup config (secrets + flags) from args (unattended) and/or interactive
@@ -1600,8 +1649,17 @@ class DockVault:
         """Start ONLY the postgres service on the existing volume (for the pre-up secret check).
         Streams Compose's own progress (capture=False) so a slow pull/create is visibly WORKING
         rather than looking hung, and so any Compose error is on screen when this returns False."""
+        # The composes pin fixed container names, so this acts on whatever vault-db exists on the
+        # host - which, when an operator re-runs setup, is a LIVE deployment's database. Leave a
+        # running one strictly alone: `compose up -d` under a DIFFERENT .env would RECREATE it (its
+        # POSTGRES_* environment changed) and knock the running app off its connection, for a check
+        # that only needs to connect. _stop_db_only reads the same flag, so the probe can only ever
+        # stop a database it started itself.
+        self._db_was_running = container_running(DB_CONTAINER)
+        if self._db_was_running:
+            return True
         try:
-            r = self._run_dc("up", "-d", "vault-db", capture=False, timeout=180)
+            r = self._run_dc("up", "-d", DB_CONTAINER, capture=False, timeout=180)
         except (OSError, subprocess.SubprocessError):
             return False
         return getattr(r, "returncode", 1) == 0
@@ -1614,7 +1672,7 @@ class DockVault:
         tick = tick or self._waiting_tick
         for i in range(tries):
             try:
-                r = subprocess.run(["docker", "exec", "vault-db", "pg_isready", "-U", PG_USER, "-d", PG_DB],
+                r = subprocess.run(["docker", "exec", DB_CONTAINER, "pg_isready", "-U", PG_USER, "-d", PG_DB],
                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
             except (OSError, subprocess.SubprocessError):
                 tick(i * 2); time.sleep(2); continue
@@ -1630,9 +1688,16 @@ class DockVault:
             print(self.pal.paint("    ...still waiting (%ds)" % seconds, "grey"), flush=True)
 
     def _stop_db_only(self):
-        """Stop the probe's vault-db (best-effort) so a refused setup doesn't leave a lone db running."""
+        """Stop the probe's vault-db (best-effort) so a refused setup doesn't leave a lone db running.
+
+        NO-OP when the database was already up before the probe: that is a running deployment's
+        database, not ours to stop. Stopping it broke the deployment outright when the guard then
+        REFUSED - the tool exits, and the operator is left with a live vault whose database this
+        tool shut down underneath it."""
+        if getattr(self, "_db_was_running", False):
+            return
         try:
-            self._run_dc("stop", "vault-db", timeout=60)
+            self._run_dc("stop", DB_CONTAINER, timeout=60)
         except (OSError, subprocess.SubprocessError):
             pass
 
@@ -1721,7 +1786,7 @@ class DockVault:
             return "ambiguous"
         print(pal.paint("  Authenticating VAULT_DB_PASSWORD against the stored database (vault-db)...",
                         "cyan"), flush=True)
-        result = probe_fn("vault-db", PG_USER, PG_DB, env.get("VAULT_DB_PASSWORD", ""))
+        result = probe_fn(DB_CONTAINER, PG_USER, PG_DB, env.get("VAULT_DB_PASSWORD", ""))
         stop_fn()
         if result == "ok":
             stamp_fn(vol, env)   # best-effort: make the next check instant
