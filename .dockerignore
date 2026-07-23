@@ -29,6 +29,7 @@ tmp/
 # Build hygiene (never needed inside the image)
 tests/
 CLAUDE.md
+AGENTS.md
 # TypeScript sources / JS build tooling: the served crypto is the hand-maintained
 # static/js/*.js; no .ts is compiled at build, so none of this belongs in the image.
 **/*.ts

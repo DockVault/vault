@@ -28,6 +28,9 @@ build/
 *.swo
 *~
 
+# Local repository instructions (the tracked project guide remains canonical)
+AGENTS.md
+
 # OS
 .DS_Store
 Thumbs.db
