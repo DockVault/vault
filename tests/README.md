@@ -60,19 +60,20 @@ RATE_LIMIT_API_DOWNLOAD=100000
 JWT_ACCESS_TOKEN_EXPIRE_MINUTES=240
 ```
 
-### The env values are only a fallback — seed the stored settings too
+### The env values are a fallback the stored settings can override
 
-`_global_setting()` prefers a positive value stored in the admin settings blob over the env var,
-and `test_ui_branding.py` clicks **Save All Changes**, which writes back every field the Settings
-page is displaying. With nothing stored the page shows the shipped `max_login_attempts` of 5 and
-saves it — and from that point it overrides the env limits for the rest of the run, so everything
-sorting after the browser files (`ui_*`, `vault_*`, `zk_*`) 429s. Storing the values you want
-first makes that save a no-op:
+`_global_setting()` prefers a *positive* value stored in the admin settings blob over the env var;
+a stored `0` means "use the env value". Leave those settings unset and the env block above is what
+is in force — the Settings page renders such fields blank and saves `0`, so the browser tests that
+click **Save All Changes** (`test_ui_branding.py` and friends) leave the limits alone.
+
+If you *do* store a limit — by hand, or by typing one into Settings — it wins over the env for
+every later run, because it lives in the Postgres volume. To hand the deployment back to its env:
 
 ```
 curl -X PUT http://localhost:8200/settings -H "Authorization: Bearer $TOKEN" \
      -H 'Content-Type: application/json' \
-     -d '{"max_login_attempts": 2000, "session_timeout": 240, "lockout_duration": 0}'
+     -d '{"max_login_attempts": 0, "session_timeout": 0, "lockout_duration": 0}'
 ```
 
 Also check `ADMIN_EMAIL`: pydantic's `EmailStr` rejects special-use TLDs, so an address at

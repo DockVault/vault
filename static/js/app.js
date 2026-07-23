@@ -5203,7 +5203,10 @@ async function loadSettings() {
         // General
         document.getElementById('setting-app-name').value = settings.app_name || '';
         document.getElementById('setting-app-description').value = settings.app_description || '';
-        document.getElementById('setting-max-file-size').value = settings.max_file_size || 100;
+        // Blank when unset/0 — the backend then applies the deployment's MAX_FILE_SIZE_MB cap
+        // (see upload_policy.effective_max_file_bytes). Rendering 100 for a stored 0 made "Save All
+        // Changes" persist 100 and silently clamp a 1024MB deployment to 100MB.
+        document.getElementById('setting-max-file-size').value = (settings.max_file_size > 0) ? settings.max_file_size : '';
         document.getElementById('setting-allowed-types').value = (settings.allowed_file_types || []).join(', ');
 
         // App version (read-only; from the public /version endpoint)
@@ -5223,9 +5226,14 @@ async function loadSettings() {
         document.getElementById('setting-require-lowercase').checked = settings.require_lowercase !== false;
         document.getElementById('setting-require-numbers').checked = settings.require_numbers !== false;
         document.getElementById('setting-require-special').checked = settings.require_special !== false;
-        document.getElementById('setting-session-timeout').value = settings.session_timeout || 60;
-        document.getElementById('setting-max-login-attempts').value = settings.max_login_attempts || 5;
-        document.getElementById('setting-lockout-duration').value = settings.lockout_duration || 30;
+        // Auth limits: 0/unset means "use the deployment's env value" (JWT_ACCESS_TOKEN_EXPIRE_MINUTES /
+        // RATE_LIMIT_LOGIN_ATTEMPTS / ACCOUNT_LOCKOUT_MINUTES — see auth_service._global_setting), so
+        // render BLANK, never the shipped default. `|| 5` displayed 5 for a stored 0 and "Save All
+        // Changes" then PERSISTED 5, dropping an operator who set RATE_LIMIT_LOGIN_ATTEMPTS=50 in .env
+        // back to 5 without touching a field. Same footgun as the old `|| 1` share lifetime.
+        document.getElementById('setting-session-timeout').value = (settings.session_timeout > 0) ? settings.session_timeout : '';
+        document.getElementById('setting-max-login-attempts').value = (settings.max_login_attempts > 0) ? settings.max_login_attempts : '';
+        document.getElementById('setting-lockout-duration').value = (settings.lockout_duration > 0) ? settings.lockout_duration : '';
         
         // Storage
         // Show the actual stored quota, or BLANK when unset/0 (which the backend treats as
@@ -5319,7 +5327,8 @@ async function saveAllSettings() {
             // General
             app_name: document.getElementById('setting-app-name').value,
             app_description: document.getElementById('setting-app-description').value,
-            max_file_size: parseInt(document.getElementById('setting-max-file-size').value) || 100,
+            // Blank -> 0 (use the deployment's MAX_FILE_SIZE_MB cap); the backend ignores 0.
+            max_file_size: parseInt(document.getElementById('setting-max-file-size').value) || 0,
             allowed_file_types: document.getElementById('setting-allowed-types').value
                 .split(',')
                 .map(t => t.trim())
@@ -5331,9 +5340,11 @@ async function saveAllSettings() {
             require_lowercase: document.getElementById('setting-require-lowercase').checked,
             require_numbers: document.getElementById('setting-require-numbers').checked,
             require_special: document.getElementById('setting-require-special').checked,
-            session_timeout: parseInt(document.getElementById('setting-session-timeout').value) || 60,
-            max_login_attempts: parseInt(document.getElementById('setting-max-login-attempts').value) || 5,
-            lockout_duration: parseInt(document.getElementById('setting-lockout-duration').value) || 30,
+            // Blank -> 0 (keep the deployment's env value); the backend ignores 0. NEVER substitute
+            // the shipped default here — that is what silently overrode a configured .env limit.
+            session_timeout: parseInt(document.getElementById('setting-session-timeout').value) || 0,
+            max_login_attempts: parseInt(document.getElementById('setting-max-login-attempts').value) || 0,
+            lockout_duration: parseInt(document.getElementById('setting-lockout-duration').value) || 0,
             
             // Storage
             // Blank -> 0 (unlimited); the backend enforces a positive value and ignores 0.
