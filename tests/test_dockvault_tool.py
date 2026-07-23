@@ -668,6 +668,157 @@ def test_guard_db_secret_ambiguous_when_db_never_ready(capsys):
     assert ok is False and "did not become reachable" in out          # fail-closed on ambiguity
 
 
+def test_container_running_reads_docker_inspect():
+    assert dv.container_running("vault-db", run=lambda *a, **k: _Proc(0, "true\n")) is True
+    assert dv.container_running("vault-db", run=lambda *a, **k: _Proc(0, "false\n")) is False
+    assert dv.container_running("vault-db", run=lambda *a, **k: _Proc(1, "", "No such object")) is False
+    assert dv.container_running(
+        "vault-db", run=lambda *a, **k: (_ for _ in ()).throw(OSError("no docker"))) is False
+
+
+def test_container_mounts_lists_named_volumes_and_fails_soft():
+    assert dv.container_mounts(
+        "vault-db", run=lambda *a, **k: _Proc(0, "dockvault-vault_vault_pg_data \n")
+    ) == ["dockvault-vault_vault_pg_data"]
+    assert dv.container_mounts("vault-db", run=lambda *a, **k: _Proc(0, "  \n")) == []
+    # None = "could not ask", which callers must not read as "mounts nothing".
+    assert dv.container_mounts("vault-db", run=lambda *a, **k: _Proc(1, "", "no such object")) is None
+    assert dv.container_mounts(
+        "vault-db", run=lambda *a, **k: (_ for _ in ()).throw(OSError("no docker"))) is None
+
+
+def test_secret_probe_leaves_an_already_running_database_alone(monkeypatch):
+    """The probe may only touch a database it started itself.
+
+    The composes pin `container_name: vault-db` globally, so `compose stop vault-db` acts on
+    whatever vault-db is on the host — including a LIVE deployment's. Stopping that took a running
+    deployment's database down, and if the guard then refused, left it down. `up -d` is no better:
+    under a different .env compose RECREATES the container and knocks the running app off its
+    connection. A running database gets probed exactly as it stands.
+    """
+    tool = _guard_tool()
+    calls = []
+    monkeypatch.setattr(dv.DockVault, "_run_dc",
+                        lambda self, *a, **k: calls.append(a) or _Proc(0))
+
+    monkeypatch.setattr(dv, "container_running", lambda name: True)     # a live deployment
+    assert tool._start_db_only() is True, "an already-running database counts as started"
+    tool._stop_db_only()
+    assert calls == [], \
+        "the probe ran compose against a database that was already running - that is someone's " \
+        f"deployment: {calls}"
+
+    calls.clear()
+    monkeypatch.setattr(dv, "container_running", lambda name: False)    # nothing was running
+    tool._start_db_only()
+    tool._stop_db_only()
+    assert ("stop", "vault-db") in calls, "a probe-started database must still be cleaned up"
+
+
+def test_refused_guard_does_not_stop_a_live_deployments_database(monkeypatch):
+    """End to end through the real _start_db_only/_stop_db_only: a REFUSAL on a running deployment
+    must leave the deployment running. This is the state an operator re-running setup lands in."""
+    tool = _guard_tool()
+    calls = []
+    monkeypatch.setattr(dv.DockVault, "_run_dc",
+                        lambda self, *a, **k: calls.append(a) or _Proc(0))
+    monkeypatch.setattr(dv, "container_running", lambda name: True)
+    # Stubbed, not left to the host: whether a real vault-db is running here, and what it mounts,
+    # must not decide what this asserts.
+    monkeypatch.setattr(dv, "container_mounts", lambda name: ["dockvault-vault_vault_pg_data"])
+    ok = tool._guard_db_secret(
+        {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"},
+        exists_fn=lambda v: True, wait_fn=lambda: True,     # real start_fn / stop_fn on purpose
+        probe_fn=lambda *a: "mismatch", **_NO_STAMP)
+    assert ok is False, "a mismatched .env must still be refused"
+    assert not any(a[0] == "stop" for a in calls), \
+        "the refused setup stopped the running deployment's database"
+
+
+def test_probe_refuses_a_running_database_serving_a_different_volume_set(monkeypatch, capsys):
+    """Leaving a running database alone must not mean probing the WRONG one.
+
+    `container_name: vault-db` is pinned globally while the volume name varies with
+    VAULT_VOLUME_PREFIX, so on a host with two sets the running container can be serving someone
+    else's data. Recreating it to force the two together is exactly what must not happen here, so
+    a divergence has to fail closed instead of answering a question about the wrong volume.
+    """
+    tool = _guard_tool()
+    calls = []
+    monkeypatch.setattr(dv.DockVault, "_run_dc", lambda self, *a, **k: calls.append(a) or _Proc(0))
+    monkeypatch.setattr(dv, "container_running", lambda name: True)
+    monkeypatch.setattr(dv, "container_mounts", lambda name: ["dockvault-vault-OTHER_vault_pg_data"])
+
+    probes = []
+    result = tool._verify_env_against_volume(
+        {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"},
+        "dockvault-vault_vault_pg_data",
+        (tool._start_db_only, lambda: True, lambda *a: probes.append(1) or "ok",
+         tool._stop_db_only, lambda vol: None, lambda vol, env: True))
+
+    assert result == "ambiguous", "a database serving another set must not answer for this one"
+    assert probes == [], "the probe authenticated against another volume set's database"
+    assert not any(a[0] == "stop" for a in calls), "and it must not stop that deployment either"
+    assert "another volume set" in capsys.readouterr().out
+
+    # The single-set case — same container, the volume actually being guarded — still probes.
+    monkeypatch.setattr(dv, "container_mounts", lambda name: ["dockvault-vault_vault_pg_data"])
+    assert tool._verify_env_against_volume(
+        {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"},
+        "dockvault-vault_vault_pg_data",
+        (tool._start_db_only, lambda: True, lambda *a: probes.append(1) or "ok",
+         tool._stop_db_only, lambda vol: None, lambda vol, env: True)) == "ok"
+    assert probes == [1]
+
+
+def test_probe_refuses_when_running_database_volume_cannot_be_inspected(monkeypatch, capsys):
+    """Docker must identify a running database's volume before it can answer for that volume.
+
+    A transient inspect failure cannot safely be read as the ordinary single-set case: the fixed
+    container name can belong to another set, and an "ok" probe would stamp the wrong volume.
+    """
+    tool = _guard_tool()
+    calls = []
+    monkeypatch.setattr(dv.DockVault, "_run_dc", lambda self, *a, **k: calls.append(a) or _Proc(0))
+    monkeypatch.setattr(dv, "container_running", lambda name: True)
+    monkeypatch.setattr(dv, "container_mounts", lambda name: None)
+
+    probes = []
+    result = tool._verify_env_against_volume(
+        {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"},
+        "dockvault-vault_vault_pg_data",
+        (tool._start_db_only, lambda: True, lambda *a: probes.append(1) or "ok",
+         tool._stop_db_only, lambda vol: None, lambda vol, env: True))
+
+    assert result == "ambiguous", "unknown mount ownership must fail closed"
+    assert probes == [], "the probe authenticated against a database whose volume was unknown"
+    assert not any(a[0] == "stop" for a in calls), "and it must not stop that deployment either"
+    assert "Could not inspect" in capsys.readouterr().out
+
+
+def test_containers_publishing_parses_names_and_fails_soft():
+    assert dv.containers_publishing(
+        443, run=lambda *a, **k: _Proc(0, "vault\nvault-sftp\n")) == ["vault", "vault-sftp"]
+    assert dv.containers_publishing(443, run=lambda *a, **k: _Proc(0, "\n")) == []
+    # "could not ask" must be distinguishable from "nothing there", or a real conflict gets hidden.
+    assert dv.containers_publishing(443, run=lambda *a, **k: _Proc(1, "", "boom")) is None
+    assert dv.containers_publishing(
+        443, run=lambda *a, **k: (_ for _ in ()).throw(OSError("no docker"))) is None
+
+
+def test_port_preflight_ignores_the_deployments_own_container():
+    """A re-run over a live deployment finds its own container on the web port — the one compose is
+    about to recreate there. Warning about that sends the operator hunting for nothing; warning
+    about anything else is still correct."""
+    tool = _guard_tool()
+    assert tool._port_is_ours(8443, ps_fn=lambda p: ["vault"]) is True         # combined
+    assert tool._port_is_ours(8443, ps_fn=lambda p: ["vault-api"]) is True     # split
+    assert tool._port_is_ours(8443, ps_fn=lambda p: ["nginx"]) is False        # a real conflict
+    assert tool._port_is_ours(8443, ps_fn=lambda p: ["vault", "nginx"]) is False
+    assert tool._port_is_ours(8443, ps_fn=lambda p: []) is False               # not docker's at all
+    assert tool._port_is_ours(8443, ps_fn=lambda p: None) is False             # unknown -> still warn
+
+
 def _reusable_env_cfg():
     return {
         "server_name": "localhost", "encryption_key": dv.gen_fernet_key(),
@@ -1365,6 +1516,9 @@ def test_compose_calls_close_stdin(tmp_path, monkeypatch):
     seen = []
     monkeypatch.setattr(dv.subprocess, "run",
                         lambda cmd, **k: seen.append((cmd, k)) or _Proc(0, ""))
+    # Nothing already running, so the probe issues its compose calls for real. Stubbed rather than
+    # left to the host: whether a vault-db happens to exist here must not decide what this asserts.
+    monkeypatch.setattr(dv, "container_running", lambda name: False)
     tool._start_db_only()
     tool._stop_db_only()
     tool._stop_stack()
@@ -1382,6 +1536,7 @@ def test_start_db_only_streams_so_docker_errors_are_visible(tmp_path, monkeypatc
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     seen = {}
     monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: seen.update(k) or _Proc(1, ""))
+    monkeypatch.setattr(dv, "container_running", lambda name: False)   # host-independent
     assert tool._start_db_only() is False                      # non-zero exit is reported honestly
     assert seen.get("capture_output") is not True, "compose output must reach the terminal"
 

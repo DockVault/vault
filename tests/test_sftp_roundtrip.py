@@ -31,6 +31,10 @@ from conftest import ADMIN_USER, ADMIN_PASS, unique, ensure_ecc_keypair, create_
 
 SFTP_HOST = os.environ.get("VAULT_SFTP_HOST", "127.0.0.1")
 SFTP_PORT = int(os.environ.get("VAULT_SFTP_PORT", "2322"))
+# The vault's Postgres container. Env-overridable so the suite can be pointed at a second
+# stack instead of silently targeting whatever "vault-db" happens to be running.
+_DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
+
 
 # After a revocation, the next op may either be cleanly denied (SFTP status ->
 # IOError) or hit an already-force-closed transport (SSHException/EOFError),
@@ -500,14 +504,14 @@ def _backdate_deactivate_at(temp_username):
     if not shutil.which("docker"):
         return False
     try:
-        u = subprocess.run(["docker", "exec", "vault-db", "printenv", "POSTGRES_USER"],
+        u = subprocess.run(["docker", "exec", _DB_CONTAINER, "printenv", "POSTGRES_USER"],
                            capture_output=True, text=True, timeout=10)
-        d = subprocess.run(["docker", "exec", "vault-db", "printenv", "POSTGRES_DB"],
+        d = subprocess.run(["docker", "exec", _DB_CONTAINER, "printenv", "POSTGRES_DB"],
                            capture_output=True, text=True, timeout=10)
         if u.returncode != 0 or d.returncode != 0:
             return False
         r = subprocess.run(
-            ["docker", "exec", "vault-db", "psql", "-U", u.stdout.strip(), "-d", d.stdout.strip(),
+            ["docker", "exec", _DB_CONTAINER, "psql", "-U", u.stdout.strip(), "-d", d.stdout.strip(),
              "-c", "UPDATE temporary_credentials SET deactivate_at = NOW() - INTERVAL '5 minutes' "
                    f"WHERE temp_username = '{temp_username}';"],
             capture_output=True, text=True, timeout=15)
@@ -590,14 +594,14 @@ def _psql(sql):
     if not shutil.which("docker"):
         return None
     try:
-        u = subprocess.run(["docker", "exec", "vault-db", "printenv", "POSTGRES_USER"],
+        u = subprocess.run(["docker", "exec", _DB_CONTAINER, "printenv", "POSTGRES_USER"],
                            capture_output=True, text=True, timeout=10)
-        d = subprocess.run(["docker", "exec", "vault-db", "printenv", "POSTGRES_DB"],
+        d = subprocess.run(["docker", "exec", _DB_CONTAINER, "printenv", "POSTGRES_DB"],
                            capture_output=True, text=True, timeout=10)
         if u.returncode != 0 or d.returncode != 0:
             return None
         return subprocess.run(
-            ["docker", "exec", "vault-db", "psql", "-U", u.stdout.strip(), "-d", d.stdout.strip(),
+            ["docker", "exec", _DB_CONTAINER, "psql", "-U", u.stdout.strip(), "-d", d.stdout.strip(),
              "-c", sql], capture_output=True, text=True, timeout=15)
     except Exception:  # noqa: BLE001
         return None

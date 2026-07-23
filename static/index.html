@@ -947,7 +947,8 @@
                                 </div>
                                 <div class="form-group">
                                     <label for="setting-max-file-size">Max File Upload Size (MB)</label>
-                                    <input type="number" id="setting-max-file-size" class="form-control" placeholder="100" min="1">
+                                    <input type="number" id="setting-max-file-size" class="form-control" placeholder="Deployment default" min="1">
+                                    <small class="text-secondary">May only LOWER the deployment's <code>MAX_FILE_SIZE_MB</code> ceiling. <strong>Blank = use that ceiling.</strong></small>
                                 </div>
                                 <div class="form-group">
                                     <label for="setting-allowed-types">Allowed File Types (comma-separated)</label>
@@ -1142,15 +1143,18 @@
                                 </div>
                                 <div class="form-group">
                                     <label for="setting-session-timeout">Session Timeout (minutes)</label>
-                                    <input type="number" id="setting-session-timeout" class="form-control" placeholder="60" min="5" max="1440">
+                                    <input type="number" id="setting-session-timeout" class="form-control" placeholder="Deployment default" min="5" max="1440">
+                                    <small class="text-secondary">Overrides <code>JWT_ACCESS_TOKEN_EXPIRE_MINUTES</code>. <strong>Blank = use the deployment's value.</strong></small>
                                 </div>
                                 <div class="form-group">
                                     <label for="setting-max-login-attempts">Max Login Attempts</label>
-                                    <input type="number" id="setting-max-login-attempts" class="form-control" placeholder="5" min="3" max="10">
+                                    <input type="number" id="setting-max-login-attempts" class="form-control" placeholder="Deployment default" min="1" max="10000">
+                                    <small class="text-secondary">Failed logins per username per window (the per-IP limit is twice this). Overrides <code>RATE_LIMIT_LOGIN_ATTEMPTS</code>. <strong>Blank = use the deployment's value.</strong></small>
                                 </div>
                                 <div class="form-group">
                                     <label for="setting-lockout-duration">Account Lockout Duration (minutes)</label>
-                                    <input type="number" id="setting-lockout-duration" class="form-control" placeholder="30" min="5" max="1440">
+                                    <input type="number" id="setting-lockout-duration" class="form-control" placeholder="Deployment default" min="1" max="1440">
+                                    <small class="text-secondary">Overrides <code>ACCOUNT_LOCKOUT_MINUTES</code>. <strong>Blank = use the deployment's value.</strong></small>
                                 </div>
                             </div>
                         </div>

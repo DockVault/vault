@@ -16,7 +16,9 @@ import pytest
 from conftest import (create_zk_vault, ensure_ecc_keypair, unique, zk_chunked_upload,
                       zk_encrypt_name, zk_name_blind_index, zk_decrypt_name)
 
-DB_CONTAINER = "vault-db"
+# Env-overridable so the suite can be pointed at a second stack instead of silently
+# targeting whatever "vault-db" happens to be running.
+DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 
 
 def _psql(sql: str) -> str:

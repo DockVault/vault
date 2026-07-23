@@ -118,6 +118,11 @@ jobs:
             | tee /tmp/setup-rerun.log
           grep -qi "reusing the existing .env" /tmp/setup-rerun.log \
             || { echo "::error::the re-run did not report reusing the existing .env"; exit 1; }
+          # The web port IS busy on a re-run — held by the deployment's own container, which compose
+          # is about to recreate on that same port. Warning there sends the operator hunting for a
+          # conflict that does not exist.
+          grep -qi "already in use" /tmp/setup-rerun.log \
+            && { echo "::error::the re-run false-warned about its own web port"; exit 1; } || true
           python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS" > /tmp/state-after-rerun.json
           diff /tmp/state-planted.json /tmp/state-after-rerun.json \
             || { echo "::error::the deployment changed across a setup re-run"; exit 1; }
@@ -137,6 +142,8 @@ jobs:
             | tee /tmp/setup-third.log
           grep -qi "stamp matches" /tmp/setup-third.log \
             || { echo "::error::the coupling stamp was not used on the third run"; sed -n '1,60p' /tmp/setup-third.log; exit 1; }
+          grep -qi "already in use" /tmp/setup-third.log \
+            && { echo "::error::the re-run false-warned about its own web port"; exit 1; } || true
           echo "C: stamp fast path used"
 
       - name: Scenario D — backup, destroy, restore
@@ -237,6 +244,50 @@ jobs:
             echo "::error::--no-start started containers anyway"; docker ps; exit 1
           fi
           echo "G: authored config, deployed nothing"
+
+      - name: Scenario H — a refused re-run must leave a RUNNING deployment running
+        # The state an operator actually reaches: a live deployment, and a setup re-run whose
+        # guardrail refuses. The secret probe drives `docker compose ... vault-db`, and the
+        # composes pin `container_name: vault-db` globally — so it acts on the live deployment's
+        # database. Stopping it (or recreating it under a different .env) takes the deployment down
+        # and, because the guard then exits, leaves it down. Refusing must cost the operator
+        # nothing but the run.
+        run: |
+          set -euo pipefail
+          # G left a .env and no containers; stand the deployment back up and prove it healthy.
+          python3 dockvault.py setup --non-interactive \
+            --server-name localhost \
+            --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
+            --admin-password "$ADMIN_PASS" \
+            --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" --enable-sftp
+          python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS" > /tmp/state-h-before.json
+
+          # Force a refusal WITHOUT taking the deployment down first (unlike scenario E): setup
+          # authors a fresh .env, whose VAULT_DB_PASSWORD cannot open the existing volume.
+          mv .env /tmp/env.h-good
+          set +e
+          python3 dockvault.py setup --non-interactive \
+            --server-name localhost \
+            --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
+            --admin-password "$ADMIN_PASS" \
+            --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" --enable-sftp \
+            > /tmp/setup-h-refused.log 2>&1
+          rc=$?
+          set -e
+          [ "$rc" -ne 0 ] || { echo "::error::the mismatched re-run exited 0"; cat /tmp/setup-h-refused.log; exit 1; }
+          grep -qi "not starting" /tmp/setup-h-refused.log \
+            || { echo "::error::setup did not refuse"; cat /tmp/setup-h-refused.log; exit 1; }
+
+          # The assertion this scenario exists for.
+          running="$(docker inspect -f '{{.State.Running}}' vault-db 2>/dev/null || echo missing)"
+          [ "$running" = "true" ] || {
+            echo "::error::the refused re-run left the running deployment's database $running"
+            docker ps -a; exit 1; }
+          mv /tmp/env.h-good .env
+          python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS" > /tmp/state-h-after.json
+          diff /tmp/state-h-before.json /tmp/state-h-after.json \
+            || { echo "::error::the deployment did not survive a refused re-run intact"; exit 1; }
+          echo "H: refused without touching the live deployment"
 
       - name: Deployment logs
         if: failure()
