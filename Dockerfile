@@ -1,22 +1,35 @@
-FROM python:3.14-slim
+FROM python:3.14-alpine@sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92
 
 WORKDIR /app
 
 # Bound DNS resolution so a Redis (or DB) outage fails FAST. socket_connect_timeout does NOT
 # cover getaddrinfo, so a dead/removed host can stall name resolution for ~8s per attempt —
 # which made every Redis call (login throttle, security monitor, broadcasts) crawl during an
-# outage. RES_OPTIONS is honoured by the glibc resolver and is baked into the image (portable
-# to every deployment), unlike a docker --dns-option. timeout:1 attempts:1 => ~1s fail.
+# outage. RES_OPTIONS is baked into the image (portable to every deployment), unlike a
+# docker --dns-option. timeout:1 attempts:1 => ~1s fail.
 ENV RES_OPTIONS="timeout:1 attempts:1"
 
-# All Python deps ship manylinux wheels for cp311, so no compiler/apt build
-# packages are needed. curl is only here for the container HEALTHCHECK fallback.
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
+# Install the fully resolved, hash-locked production dependencies first for layer caching.
+# The healthcheck uses Python's standard library, so the runtime needs no apt packages.
+COPY requirements.lock .
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock \
+    && pip check \
+    && python -m pip uninstall --yes pip
 
-# Install Python dependencies first for better layer caching
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Python 3.14.6 predates three reviewed 3.14-branch security fixes. Vendor the exact upstream
+# standard-library snapshot, verify it byte-for-byte before installation, and retain its PSF
+# license in the image. Grype still identifies the interpreter as 3.14.6, so release VEX records
+# these code-level backports against the immutable image digest.
+COPY security/cpython-backports /tmp/cpython-backports
+RUN cd /tmp/cpython-backports \
+    && echo "3c8d585a77d7d376aea66e5e11a4d53c2605100d4c05a71b5385ed54bc526f51  Lib/tarfile.py" | sha256sum -c - \
+    && echo "5c5ed245889135564e75dfed9a47aeb6b4d3e5a2e9614d918a986767e3747539  Lib/html/parser.py" | sha256sum -c - \
+    && echo "b0e25a78cffb43f4d92de8b61ccfa1f1f98ecbc22330b54b5251e7b6ba010231  PSF-LICENSE.txt" | sha256sum -c - \
+    && cp Lib/tarfile.py /usr/local/lib/python3.14/tarfile.py \
+    && cp Lib/html/parser.py /usr/local/lib/python3.14/html/parser.py \
+    && mkdir -p /usr/share/licenses/cpython-backports \
+    && cp PSF-LICENSE.txt /usr/share/licenses/cpython-backports/PSF-LICENSE.txt \
+    && rm -rf /tmp/cpython-backports
 
 # Copy application code
 COPY . .
@@ -33,7 +46,7 @@ RUN mkdir -p storage logs keys certs brand
 # root-in-container is the most valuable to drop. chown /app so the runtime dirs (storage/
 # logs/keys/certs) are appuser-owned, and a fresh named volume mounted over them inherits it.
 ENV PYTHONDONTWRITEBYTECODE=1
-RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
+RUN adduser -D -u 10001 appuser && chown -R appuser:appuser /app
 
 # NOTE: we deliberately do NOT `USER appuser`. The container starts as root so the entrypoint
 # (docker-entrypoint.py) can chown persistent volumes that an OLDER, root-era image may have
@@ -50,6 +63,16 @@ RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
 # `--build-arg APP_VERSION=x.y.z`; an empty value (the default) falls back to the VERSION file.
 ARG APP_VERSION=
 ENV BRAND_APP_VERSION=${APP_VERSION}
+
+# Standard OCI identity. Release builds replace the development defaults with the exact
+# public source URL, semantic version, and tested commit before publication.
+ARG OCI_SOURCE=https://github.com/DockVault/vault
+ARG OCI_VERSION=development
+ARG OCI_REVISION=unknown
+LABEL org.opencontainers.image.source=${OCI_SOURCE} \
+      org.opencontainers.image.version=${OCI_VERSION} \
+      org.opencontainers.image.revision=${OCI_REVISION} \
+      org.opencontainers.image.licenses=AGPL-3.0-only
 
 # 8000 - FastAPI web UI / API
 # 2222 - SFTP

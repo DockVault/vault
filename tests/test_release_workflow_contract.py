@@ -112,7 +112,7 @@ def test_each_reusable_gate_checks_out_and_verifies_the_requested_sha():
     assert "expected_sha: ${{ inputs.expected_sha }}" in _SETUP
 
 
-def test_publication_is_serial_and_login_push_release_order_is_fail_closed():
+def test_publication_is_serial_and_scan_auth_push_release_order_is_fail_closed():
     concurrency = _WORKFLOW.split("concurrency:", 1)[1].split("jobs:", 1)[0]
     publish = _job("publish")
 
@@ -122,16 +122,35 @@ def test_publication_is_serial_and_login_push_release_order_is_fail_closed():
     assert ".github/workflows/release.yml:" in _ACTIONLINT
     assert 'unexpected key "queue" for "concurrency" section' in _ACTIONLINT
     assert publish.index("Fetch current release refs") < publish.index(
-        "Revalidate immediately before authentication"
+        "Validate publication inputs before build"
     )
-    assert publish.count("release_gate.py") == 1
+    assert publish.index(
+        "Refresh release refs immediately before authentication"
+    ) < publish.index("Revalidate immediately before authentication")
+    assert publish.count("release_gate.py") == 2
+    assert publish.count("release_push_digest.py") == 2
+    assert 'test "$latest_digest" = "$version_digest"' in publish
+    assert 'test "$resolved_version" = "$version_digest"' in publish
+    assert 'test "$resolved_latest" = "$version_digest"' in publish
+    assert 'echo "digest=${version_digest}" >> "$GITHUB_OUTPUT"' in publish
     assert "+refs/heads/main:refs/remotes/origin/main" in publish
     assert "+refs/tags/${EXPECTED_TAG}:refs/tags/${EXPECTED_TAG}" in publish
-    assert publish.index("Revalidate immediately before authentication") < publish.index(
-        "Log in to GHCR"
-    )
-    assert publish.index("Log in to GHCR") < publish.index("Build and push image")
-    assert publish.index("Build and push image") < publish.index("Create GitHub Release")
+    order = [
+        publish.index("Validate publication inputs before build"),
+        publish.index("Build the tested image locally"),
+        publish.index("Generate the SPDX SBOM"),
+        publish.index("Render the revision-bound scan VEX"),
+        publish.index("Scan the exact local image"),
+        publish.index("Refresh release refs immediately before authentication"),
+        publish.index("Revalidate immediately before authentication"),
+        publish.index("Log in to GHCR"),
+        publish.index("Push the scanned image and resolve its digest"),
+        publish.index("Bind release VEX to the published registry digest"),
+        publish.index("Attest build provenance"),
+        publish.index("Attest the SBOM"),
+        publish.index("Create GitHub Release"),
+    ]
+    assert order == sorted(order)
     assert "steps.publish_gate.outputs.version" in publish
     assert "steps.publish_gate.outputs.image" in publish
     assert "steps.publish_gate.outputs.tag" in publish

@@ -75,6 +75,8 @@ jobs:
     permissions:
       contents: write
       packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -95,7 +97,7 @@ jobs:
             "+refs/heads/main:refs/remotes/origin/main" \
             "+refs/tags/${EXPECTED_TAG}:refs/tags/${EXPECTED_TAG}"
 
-      - name: Revalidate immediately before authentication
+      - name: Validate publication inputs before build
         id: publish_gate
         env:
           EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
@@ -111,6 +113,80 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
+      - name: Build the tested image locally
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          load: true
+          push: false
+          build-args: |
+            APP_VERSION=${{ steps.publish_gate.outputs.version }}
+            OCI_SOURCE=https://github.com/${{ github.repository }}
+            OCI_VERSION=${{ steps.publish_gate.outputs.version }}
+            OCI_REVISION=${{ needs.validate.outputs.sha }}
+          tags: |
+            ${{ steps.publish_gate.outputs.image }}:${{ steps.publish_gate.outputs.tag }}
+            ${{ steps.publish_gate.outputs.image }}:latest
+
+      - name: Generate the SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.publish_gate.outputs.image }}:${{ steps.publish_gate.outputs.tag }}
+          format: spdx-json
+          syft-version: v1.44.0
+          output-file: dockvault-${{ steps.publish_gate.outputs.tag }}.spdx.json
+          artifact-name: dockvault-${{ steps.publish_gate.outputs.tag }}-sbom
+          upload-artifact: true
+          upload-release-assets: false
+
+      - name: Render the revision-bound scan VEX
+        shell: bash
+        env:
+          IMAGE: ${{ steps.publish_gate.outputs.image }}
+          TAG: ${{ steps.publish_gate.outputs.tag }}
+          SOURCE_REVISION: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          image_reference="${IMAGE}:${TAG}"
+          local_digest="$(docker image inspect --format '{{.Id}}' "$image_reference")"
+          python3 .github/scripts/render_release_vex.py \
+            --template security/vex.openvex.json \
+            --output "dockvault-${TAG}.openvex.json" \
+            --image-digest "$local_digest" \
+            --image-reference "$image_reference" \
+            --source-revision "$SOURCE_REVISION"
+
+      - name: Scan the exact local image
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: ${{ steps.publish_gate.outputs.image }}:${{ steps.publish_gate.outputs.tag }}
+          grype-version: v0.112.0
+          fail-build: true
+          severity-cutoff: high
+          vex: dockvault-${{ steps.publish_gate.outputs.tag }}.openvex.json
+
+      - name: Refresh release refs immediately before authentication
+        env:
+          EXPECTED_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          git fetch --force --no-tags --prune origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/tags/${EXPECTED_TAG}:refs/tags/${EXPECTED_TAG}"
+
+      - name: Revalidate immediately before authentication
+        id: auth_gate
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          EXPECTED_TAG: ${{ needs.validate.outputs.tag }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          python3 .github/scripts/release_gate.py \
+            --ref "refs/tags/${EXPECTED_TAG}" \
+            --event-sha "$EXPECTED_SHA" \
+            --repository-owner "$REPOSITORY_OWNER" \
+            --github-output "$GITHUB_OUTPUT"
+
       - name: Log in to GHCR
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
@@ -118,18 +194,64 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      - name: Push the scanned image and resolve its digest
+        id: push
+        shell: bash
+        env:
+          IMAGE: ${{ steps.publish_gate.outputs.image }}
+          TAG: ${{ steps.publish_gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version_log="$RUNNER_TEMP/dockvault-push-version.log"
+          latest_log="$RUNNER_TEMP/dockvault-push-latest.log"
+          docker push "${IMAGE}:${TAG}" 2>&1 | tee "$version_log"
+          version_digest="$(python3 .github/scripts/release_push_digest.py "$version_log")"
+          docker push "${IMAGE}:latest" 2>&1 | tee "$latest_log"
+          latest_digest="$(python3 .github/scripts/release_push_digest.py "$latest_log")"
+          test "$latest_digest" = "$version_digest"
+
+          resolved_version="$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          resolved_latest="$(docker buildx imagetools inspect "${IMAGE}:latest" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          test "$resolved_version" = "$version_digest"
+          test "$resolved_latest" = "$version_digest"
+          echo "digest=${version_digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Bind release VEX to the published registry digest
+        env:
+          IMAGE: ${{ steps.publish_gate.outputs.image }}
+          TAG: ${{ steps.publish_gate.outputs.tag }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          SOURCE_REVISION: ${{ needs.validate.outputs.sha }}
+        run: |
+          python3 .github/scripts/render_release_vex.py \
+            --template security/vex.openvex.json \
+            --output "dockvault-${TAG}.openvex.json" \
+            --image-digest "$DIGEST" \
+            --image-reference "${IMAGE}:${TAG}" \
+            --source-revision "$SOURCE_REVISION"
+
+      - name: Attest build provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
-          context: .
-          push: true
-          build-args: APP_VERSION=${{ steps.publish_gate.outputs.version }}
-          tags: |
-            ${{ steps.publish_gate.outputs.image }}:${{ steps.publish_gate.outputs.tag }}
-            ${{ steps.publish_gate.outputs.image }}:latest
+          subject-name: ${{ steps.publish_gate.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest the SBOM
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-name: ${{ steps.publish_gate.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: dockvault-${{ steps.publish_gate.outputs.tag }}.spdx.json
+          push-to-registry: true
+          create-storage-record: false
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ steps.publish_gate.outputs.tag }}
           generate_release_notes: true
+          files: |
+            dockvault-${{ steps.publish_gate.outputs.tag }}.spdx.json
+            dockvault-${{ steps.publish_gate.outputs.tag }}.openvex.json

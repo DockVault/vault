@@ -16,3 +16,7 @@ paramiko>=3.4  # SFTP client for the web<->SFTP round-trip tests
 bcrypt>=5.0
 cryptography>=44  # app/core/startup_security.py + scripts/setup_master_password.py
 python-dotenv>=1.2.2  # imported by scripts/setup_master_password.py, which test_master_password_limit.py loads
+
+# Preflight regenerates and audits the production lock with these pinned supply-chain tools.
+pip-tools==7.6.0
+pip-audit==2.10.1

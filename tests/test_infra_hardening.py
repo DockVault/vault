@@ -791,12 +791,19 @@ def test_update_check_admin_gated_and_default_off():
 def test_release_workflow_and_upgrade_docs():
     import re
     wf = _read(".github/workflows/release.yml")
-    # Builds + pushes to GHCR, stamps the version, triggers on a version tag.
-    assert "ghcr.io/" in wf and "build-push-action" in wf, "release.yml must build+push to GHCR"
+    # Builds locally, then pushes the scanned tags to GHCR, stamps the version, and triggers on a
+    # version tag. The release gate emits the canonical image name, so this workflow intentionally
+    # contains the registry host rather than a duplicated literal ghcr.io/<owner>/vault path.
+    assert "build-push-action" in wf, "release.yml must build the release image"
+    assert "registry: ghcr.io" in wf and 'docker push "${IMAGE}:${TAG}"' in wf, \
+        "release.yml must authenticate to GHCR and push the scanned release tag"
     assert "APP_VERSION=" in wf, "release.yml must stamp the version via the build-arg"
     assert "v*.*.*" in wf, "release.yml must trigger on a version tag"
-    # Every action is pinned to a full commit SHA (supply-chain hardening for a public security repo).
+    # Every external action is pinned to a full commit SHA (supply-chain hardening for a public
+    # security repo). Local reusable workflows are already pinned by the validated checkout SHA.
     for use in re.findall(r"uses:\s*(\S+)", wf):
+        if use.startswith("./"):
+            continue
         assert re.search(r"@[0-9a-f]{40}\b", use), f"action not pinned to a full SHA: {use}"
     # The compose image is overridable for the pull-based upgrade path.
     assert "${DOCKVAULT_IMAGE:-dockvault-vault:latest}" in _read("deploy/docker-compose.secure.yml"), \

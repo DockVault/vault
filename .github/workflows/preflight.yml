@@ -46,6 +46,26 @@ jobs:
       - name: Install locked test dependencies
         run: python -m pip install -r tests/requirements-test.lock
 
+      - name: Verify and audit the production lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp requirements.lock "$RUNNER_TEMP/requirements.lock.checked"
+          rm requirements.lock
+          CUSTOM_COMPILE_COMMAND="python -m piptools compile --generate-hashes --strip-extras --output-file requirements.lock requirements.txt" \
+            python -m piptools compile \
+              --generate-hashes \
+              --strip-extras \
+              --output-file requirements.lock \
+              requirements.txt
+          cmp requirements.lock "$RUNNER_TEMP/requirements.lock.checked"
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip check
+          python -m pip_audit \
+            --require-hashes \
+            --disable-pip \
+            -r requirements.lock
+
       - name: Collect the strict full suite
         id: collection
         shell: bash

@@ -1,0 +1,60 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/DockVault/vault/security/vex/__SOURCE_REVISION__",
+  "author": "DockVault maintainers",
+  "timestamp": "__GENERATED_AT__",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {"name": "CVE-2026-11940"},
+      "products": [
+        {
+          "@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
+          "subcomponents": [{"@id": "pkg:generic/python@3.14.6"}]
+        },
+        {
+          "@id": "__IMAGE_REFERENCE__",
+          "subcomponents": [{"@id": "pkg:generic/python@3.14.6"}]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "The release image replaces Lib/tarfile.py with the CPython 3.14 security-backport snapshot at 07efb08123ba9367a7107325adb9d5626dca1ca9, verified during the image build for source revision __SOURCE_REVISION__.",
+      "timestamp": "__GENERATED_AT__"
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-11972"},
+      "products": [
+        {
+          "@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
+          "subcomponents": [{"@id": "pkg:generic/python@3.14.6"}]
+        },
+        {
+          "@id": "__IMAGE_REFERENCE__",
+          "subcomponents": [{"@id": "pkg:generic/python@3.14.6"}]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "The release image replaces Lib/tarfile.py with the CPython 3.14 security-backport snapshot at 07efb08123ba9367a7107325adb9d5626dca1ca9, verified during the image build for source revision __SOURCE_REVISION__.",
+      "timestamp": "__GENERATED_AT__"
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-15308"},
+      "products": [
+        {
+          "@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
+          "subcomponents": [{"@id": "pkg:generic/python@3.14.6"}]
+        },
+        {
+          "@id": "__IMAGE_REFERENCE__",
+          "subcomponents": [{"@id": "pkg:generic/python@3.14.6"}]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "The release image replaces Lib/html/parser.py with the CPython 3.14 security-backport snapshot at 07efb08123ba9367a7107325adb9d5626dca1ca9, verified during the image build for source revision __SOURCE_REVISION__.",
+      "timestamp": "__GENERATED_AT__"
+    }
+  ]
+}
