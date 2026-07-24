@@ -68,6 +68,21 @@ def _publish_job() -> str:
     return _RELEASE.split("  publish:", 1)[1]
 
 
+def _direct_pins(path: Path) -> dict[str, str]:
+    pins = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        match = re.fullmatch(
+            r"(?P<name>[A-Za-z0-9_.-]+)(?:\[[A-Za-z0-9_,.-]+\])?"
+            r"==(?P<version>[^=\s\\]+)(?:\s+\\)?",
+            line,
+        )
+        if match:
+            name = re.sub(r"[-_.]+", "-", match.group("name")).lower()
+            pins[name] = match.group("version")
+    return pins
+
+
 def test_runtime_and_sidecars_use_reviewed_manifest_list_digests():
     assert _DOCKERFILE.startswith(f"FROM {_PYTHON_DIGEST}\n")
 
@@ -153,6 +168,60 @@ def test_production_lock_is_fully_pinned_and_hashed():
         assert re.search(r"--hash=sha256:[0-9a-f]{64}", block)
 
 
+def test_cross_platform_test_lock_tracks_the_explicit_host_import_subset():
+    host_import_packages = {
+        "argon2-cffi",
+        "bcrypt",
+        "cryptography",
+        "email-validator",
+        "fastapi",
+        "paramiko",
+        "psycopg2-binary",
+        "pydantic",
+        "pydantic-settings",
+        "pyjwt",
+        "python-dotenv",
+        "python-multipart",
+        "redis",
+        "sqlalchemy",
+        "starlette",
+    }
+    production_pins = _direct_pins(_ROOT / "requirements.txt")
+    test_input_pins = _direct_pins(_ROOT / "tests" / "requirements-test.txt")
+    production_lock_pins = _direct_pins(_ROOT / "requirements.lock")
+    test_lock_pins = _direct_pins(_ROOT / "tests" / "requirements-test.lock")
+
+    for pins in (
+        production_pins,
+        test_input_pins,
+        production_lock_pins,
+        test_lock_pins,
+    ):
+        assert host_import_packages <= pins.keys()
+    assert {
+        name: test_input_pins.get(name) for name in host_import_packages
+    } == {
+        name: production_pins.get(name) for name in host_import_packages
+    }
+    assert {
+        name: test_lock_pins.get(name) for name in host_import_packages
+    } == {
+        name: production_lock_pins.get(name) for name in host_import_packages
+    }
+
+    common_packages = production_lock_pins.keys() & test_lock_pins.keys()
+    assert common_packages
+    assert {
+        name: test_lock_pins[name] for name in common_packages
+    } == {
+        name: production_lock_pins[name] for name in common_packages
+    }
+
+    forbidden_packages = {"keyring", "uvicorn", "uvloop"}
+    assert forbidden_packages.isdisjoint(test_input_pins)
+    assert forbidden_packages.isdisjoint(test_lock_pins)
+
+
 def test_preflight_reproduces_installs_checks_and_audits_the_lock():
     expected_command = (
         "python -m piptools compile --generate-hashes --strip-extras "
@@ -171,7 +240,10 @@ def test_preflight_reproduces_installs_checks_and_audits_the_lock():
     ]
     assert order == sorted(order)
     assert "git diff --exit-code -- requirements.lock" not in _PREFLIGHT
-    assert "python -m pip install --require-hashes -r requirements.lock" in _PREFLIGHT
+    assert (
+        "python -m pip install --force-reinstall --require-hashes -r requirements.lock"
+        in _PREFLIGHT
+    )
     assert "python -m pip check" in _PREFLIGHT
     assert "python -m pip_audit" in _PREFLIGHT
     assert "--require-hashes" in _PREFLIGHT

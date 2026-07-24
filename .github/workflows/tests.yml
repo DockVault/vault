@@ -54,7 +54,9 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
-          cache-dependency-path: tests/requirements-test.lock
+          cache-dependency-path: |
+            requirements.lock
+            tests/requirements-test.lock
 
       - name: Generate and mask throwaway credentials
         shell: bash
@@ -144,6 +146,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install -r tests/requirements-test.lock
+          python -m pip install --force-reinstall --require-hashes -r requirements.lock
+          python -m pip check
           python -m playwright install --with-deps chromium
 
       - name: Verify Chromium launches against the API

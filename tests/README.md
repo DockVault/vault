@@ -44,9 +44,14 @@ hardening, and more) — the table lists the core surfaces; see the file names.
 ```powershell
 # from the repository root
 python -m venv tests/.venv
-tests\.venv\Scripts\pip install -r tests/requirements-test.lock
+tests\.venv\Scripts\python -m pip install -r tests/requirements-test.lock
+tests\.venv\Scripts\python -m pip check
 tests\.venv\Scripts\playwright install chromium
 ```
+
+The test lock includes the cross-platform application imports required by host-side tests.
+Linux preflight and full-suite CI additionally install the hash-locked production environment;
+the Fast workflow uses only the test lock so the same lane works on Linux and Windows.
 
 ## Prerequisite: raise the rate limits
 
@@ -109,8 +114,8 @@ Two more session-state traps worth knowing:
   talking to the vault's paramiko server, and the two negotiate algorithms. A paramiko 5 client
   against a paramiko 3 server fails every SFTP test with `AuthenticationException` while the
   server logs `Incompatible ssh server (no acceptable ciphers)` — a version skew, not a bug.
-  `requirements-test.txt` deliberately floors paramiko at the version `requirements.txt` pins;
-  bump them together.
+  The test and production inputs pin Paramiko to the same exact version, and the supply-chain
+  contract rejects lock drift. Update both inputs and regenerate both locks together.
 
 `test_login_throttle.py` detects the raised limit and **skips itself**, by design — CI puts the
 shipped defaults back and runs that file on its own so the throttle still gets covered. The ECC

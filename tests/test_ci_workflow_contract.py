@@ -21,6 +21,9 @@ pytestmark = pytest.mark.unit
 
 _ROOT = Path(__file__).parents[1]
 _WORKFLOW = (_ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+_FAST_WORKFLOW = (_ROOT / ".github" / "workflows" / "fast-tests.yml").read_text(
+    encoding="utf-8"
+)
 _PREFLIGHT = (_ROOT / ".github" / "workflows" / "preflight.yml").read_text(encoding="utf-8")
 
 
@@ -39,6 +42,68 @@ def test_preflight_blocks_expensive_integration_work():
     assert '-m "unit and not docker" --maxfail=1' in _PREFLIGHT
     assert "docker compose" not in _PREFLIGHT
     assert "playwright install" not in _PREFLIGHT
+
+
+def test_fast_host_pytest_job_installs_the_cross_platform_locked_environment():
+    test_install = "python -m pip install -r tests/requirements-test.lock"
+    dependency_check = "python -m pip check"
+    pytest_command = 'python -m pytest -m "unit and not docker" --maxfail=1'
+    install_order = [
+        _FAST_WORKFLOW.index(test_install),
+        _FAST_WORKFLOW.index(dependency_check),
+        _FAST_WORKFLOW.index(pytest_command),
+    ]
+
+    assert _FAST_WORKFLOW.count(test_install) == 1
+    assert _FAST_WORKFLOW.count(dependency_check) == 1
+    assert (
+        _FAST_WORKFLOW.count(
+            "cache-dependency-path: tests/requirements-test.lock"
+        )
+        == 1
+    )
+    assert (
+        "python -m pip install --force-reinstall --require-hashes -r requirements.lock"
+        not in _FAST_WORKFLOW
+    )
+    assert "requirements.txt" not in _FAST_WORKFLOW
+    assert install_order == sorted(install_order)
+
+
+@pytest.mark.parametrize(
+    ("workflow", "first_pytest_command"),
+    [
+        (_PREFLIGHT, "python -m pytest --collect-only -q"),
+        (_WORKFLOW, "python -m pytest --maxfail=1 --junitxml=pytest-results.xml"),
+    ],
+)
+def test_linux_host_pytest_jobs_layer_the_hash_locked_production_environment(
+    workflow: str, first_pytest_command: str
+):
+    cache_inputs = (
+        "cache-dependency-path: |\n"
+        "            requirements.lock\n"
+        "            tests/requirements-test.lock"
+    )
+    test_install = "python -m pip install -r tests/requirements-test.lock"
+    production_install = (
+        "python -m pip install --force-reinstall --require-hashes -r requirements.lock"
+    )
+    dependency_check = "python -m pip check"
+    install_order = [
+        workflow.index(test_install),
+        workflow.index(production_install),
+        workflow.index(dependency_check),
+        workflow.index(first_pytest_command),
+    ]
+
+    assert workflow.count(test_install) == 1
+    assert workflow.count(production_install) == 1
+    assert workflow.count(dependency_check) == 1
+    assert workflow.count(cache_inputs) == 1
+    assert "python -m pip install -r requirements.txt" not in workflow
+    assert cache_inputs in workflow
+    assert install_order == sorted(install_order)
 
 
 def test_full_suite_exit_and_result_count_are_authoritative():

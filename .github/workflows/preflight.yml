@@ -41,7 +41,9 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
-          cache-dependency-path: tests/requirements-test.lock
+          cache-dependency-path: |
+            requirements.lock
+            tests/requirements-test.lock
 
       - name: Install locked test dependencies
         run: python -m pip install -r tests/requirements-test.lock
@@ -59,7 +61,7 @@ jobs:
               --output-file requirements.lock \
               requirements.txt
           cmp requirements.lock "$RUNNER_TEMP/requirements.lock.checked"
-          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install --force-reinstall --require-hashes -r requirements.lock
           python -m pip check
           python -m pip_audit \
             --require-hashes \
