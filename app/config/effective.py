@@ -1,16 +1,14 @@
 """Effective branding — DB ``SystemSetting('brand')`` overrides layered over env defaults.
 
-The single source of truth for what the running vault should render. Three stores
+The single source of truth for what the running vault should render. Two stores
 historically drifted apart:
 
-  * env  -> :class:`BrandingConfig` singleton -> ``/info`` (read by no HTML)
-  * DB   -> ``SystemSetting`` via the admin Settings form (read by nothing that renders)
-  * JSON -> ``setup_state.json`` written by the setup wizard
+  * env  -> :class:`BrandingConfig` defaults
+  * DB   -> ``SystemSetting`` overrides written by the admin Settings form
 
 This module merges the DB brand overrides on top of the env :class:`BrandingConfig`
-so every reader — the ``/branding`` endpoint, the UI shell, the setup wizard and
-email identity — sees the same *effective* values, editable at runtime with no
-process restart.
+so the ``/branding`` endpoint, UI shell, Settings forms, and email identity all see
+the same *effective* values, editable at runtime with no process restart.
 
 Readers MUST call :func:`get_effective_branding` (which re-reads the DB each call)
 rather than the module-level ``branding`` singleton, or admin edits stay stale until
@@ -70,8 +68,8 @@ def set_brand_overrides(db, updates: Dict[str, Any] = None, remove_keys=None) ->
     A non-empty value in ``updates`` sets that key; an empty/whitespace/``None`` value
     (or a key in ``remove_keys``) drops it, reverting that field to the env default.
     The **single low-level writer** for every branding path — the admin Settings editor
-    , logo/favicon uploads and the setup wizard — so all three feed the
-    same effective store. The caller commits (and is responsible for validating values;
+    and logo/favicon uploads — so both feed the same effective store. The caller commits
+    (and is responsible for validating values;
     the read-time :func:`merge_branding` guard drops anything invalid as defence in depth).
     """
     from app.core.models import SystemSetting  # lazy: keep this module importable without the ORM

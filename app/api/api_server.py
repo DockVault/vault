@@ -457,14 +457,6 @@ app.include_router(info_router)
 from app.config.branding import HEX_COLOR_RE
 from app.config.effective import BRAND_SETTINGS_KEY, set_brand_overrides
 
-# First-run gate for the ENTIRE setup surface. The setup wizard is UNAUTHENTICATED (it has
-# to run before any admin exists), so it must become unreachable the moment an instance is
-# set up — otherwise an anonymous request could reconfigure a live production instance
-# (create/alter the admin, rewrite config). "Set up" = ANY admin user exists, which every
-# production deploy has from startup (./setup-secure.sh and the SaaS portal seed the admin
-# from env). Queried WITHOUT the is_active filter on purpose: a deactivated admin still
-# means the instance is set up and must NOT re-open the wizard. Setup is done by the
-# provisioning script / portal, so the wizard is a first-run-only fallback for a bare deploy.
 # Import and include ECC router (Elliptic Curve Cryptography)
 from app.api.ecc_router import router as ecc_router
 app.include_router(ecc_router, prefix="/ecc")
@@ -2095,7 +2087,7 @@ async def update_settings(
     # whitespace value drops that override -> back to the env default.
     brand_keys = _BRAND_FIELDS & set((payload or {}).keys())
     if brand_keys:
-        # shared writer (also used by the asset uploads + the setup wizard): non-empty sets, empty
+        # Shared writer (also used by asset uploads): non-empty sets, empty
         # clears -> env default. Values were validated by _validate_brand_overrides above.
         set_brand_overrides(db, updates={key: payload[key] for key in brand_keys})
     db.commit()
@@ -5582,7 +5574,7 @@ def _effective_vault_permission(vault, perms, user) -> str:
 
 # Confidentiality tiers we recognise. Only 'standard' (server-encrypted,
 # SFTP-capable) is functional today; 'zero_knowledge' (browser crypto, web-only)
-# is a later tier — see docs/vault-zero-trust-and-sftp-design.md §2.
+# is web-only because the server never receives the browser-held decryption keys.
 VAULT_TYPES = {"standard", "zero_knowledge"}
 
 
@@ -10303,8 +10295,8 @@ async def cleanup_expired_sessions():
 def _seed_admin_user():
     """
     Bootstrap an admin user from ADMIN_USERNAME/ADMIN_PASSWORD when no users
-    exist yet. This lets env-configured (Docker) deployments log in without
-    running the interactive setup wizard. No-op if an admin already exists or
+    exist yet. This lets env-configured deployments log in without manual database
+    bootstrap. No-op if an admin already exists or
     no admin password is configured.
     """
     try:
@@ -10461,7 +10453,7 @@ def _run_lightweight_migrations():
             # public key; team_key_version = the team-KEYPAIR epoch, SEPARATE from dek_version
             # (bumps only on a team-keypair rotation, not a routine DEK rotation). team_key (the
             # DEK->team-pubkey wrap map) + key_wrapping_mode already exist. Additive; default
-            # mode stays 'direct' so existing vaults are untouched. See docs/vault-zk-team-key-design.md.
+            # mode stays 'direct' so existing vaults retain their direct member wraps.
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS team_public_key TEXT",
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS team_key_version INTEGER NOT NULL DEFAULT 1",
             # Zero-knowledge filename/MIME encryption (client-side, vault DEK). ZK file/folder

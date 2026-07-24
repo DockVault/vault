@@ -1239,8 +1239,8 @@ async def rekey_vault(
     old-epoch wrapped rows to read them); only NEW uploads use the new epoch, which the
     revoked member never receives. This gives forward secrecy for new content; content the
     removed member could already read is, by design, assumed already compromised (the DEK
-    is extractable in the browser). Full user-facing semantics + the honest claims boundary:
-    docs/vault-zk-dek-rotation.md.
+    is extractable in the browser). This is forward secrecy for content created after
+    removal, not retroactive secrecy for content the removed member already accessed.
 
     Authorization: owner / global admin / Manager (parity with /vaults permission changes —
     a security-critical op must not be a weaker authz surface than a plain permission edit).

@@ -3,7 +3,7 @@ Custom SFTP server implementation using Paramiko.
 
 Implements secure SFTP with vault support and hierarchical access control.
 
-Design (Standard-vault SFTP, see docs/vault-zero-trust-and-sftp-design.md §1):
+Standard-vault SFTP security model:
   * The SFTP client IS the UI; we expose a *virtual* tree — the principal's
     accessible vaults as top-level folders, their folders/files inside
     (``/Finance-Vault/report.pdf``). There is no real on-disk directory the

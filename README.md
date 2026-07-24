@@ -117,8 +117,32 @@ run. `dockvault.py setup` writes it (default **combined**) and `.env.example` sh
   same volumes. Choose this if you want to scale, restart, or resource-limit them independently, or
   run SFTP on a different host.
 
-Switching between the two never moves or loses data — both mount the same named volumes. Set
-`COMPOSE_PROFILES=split` in `.env` (and re-run `dockvault.py setup`, or recreate the stack) to switch.
+Switching between the two never moves or loses persistent data — both mount the same named volumes.
+`COMPOSE_PROFILES` must contain exactly one value: `combined` or `split`. Change that value in
+`.env`, then re-run `python3 dockvault.py setup`; the tool removes only the inactive app
+container(s), preserves the database and every named volume, and recreates the selected layout.
+Redis cache contents may be cleared because Redis uses temporary storage and is recreated.
+
+If you operate Compose directly, reconcile the inactive layout explicitly before `up`. To switch
+to `split`:
+
+```bash
+docker compose -f docker-compose.secure.yml --profile combined rm -s -f vault
+docker compose -f docker-compose.secure.yml up --build -d --force-recreate --remove-orphans
+```
+
+To switch back to `combined`:
+
+```bash
+docker compose -f docker-compose.secure.yml --profile split rm -s -f vault-api vault-sftp
+docker compose -f docker-compose.secure.yml up --build -d --force-recreate --remove-orphans
+```
+
+If Compose says an existing volume does not match the configuration and asks to recreate it with
+data loss, answer **no**. Use `dockvault.py setup`, which takes the safe default without exposing
+that prompt, and resolve the deployment/environment pairing before retrying. Keep `-v` out of
+profile reconciliation: it is unnecessary on `compose rm`, and `compose down -v` removes the named
+data volumes.
 
 **Know the trade-offs of combined mode:**
 

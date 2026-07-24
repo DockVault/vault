@@ -317,14 +317,39 @@ def admin_password_problem(pw, environment="production"):
 
 
 def migrate_compose_profiles(existing):
-    """Normalise a COMPOSE_PROFILES value to the current scheme: keep combined/split; a legacy
-    'sftp' -> 'split'; anything else / empty -> 'combined'. Pure (mirrors the setup scripts)."""
+    """Return the one selected app profile, migrating only supported legacy values.
+
+    Empty values predate profiles and migrate to ``combined``; the former single ``sftp``
+    profile migrates to ``split``.  Every non-empty current value must select exactly one of
+    ``combined`` or ``split``.  Silently picking one item from a multi-profile or misspelled
+    value can start both app layouts against the same ports, so those values fail closed.
+    """
     parts = [p.strip().lower() for p in (existing or "").split(",") if p.strip()]
-    if "combined" in parts:
+    if not parts:
         return "combined"
-    if "split" in parts or "sftp" in parts:
+    if len(parts) != 1:
+        raise ValueError(
+            "COMPOSE_PROFILES must select exactly one profile: combined or split"
+        )
+    if parts[0] == "sftp":
         return "split"
-    return "combined"
+    if parts[0] in ("combined", "split"):
+        return parts[0]
+    raise ValueError(
+        "COMPOSE_PROFILES must select exactly one profile: combined or split"
+    )
+
+
+def profile_reconciliation_args(profile):
+    """Compose arguments that remove only the inactive app layout for ``profile``.
+
+    The targeted ``compose rm`` intentionally has no volume flag: database/cache services and
+    all named data volumes survive a combined/split transition.
+    """
+    selected = migrate_compose_profiles(profile)
+    if selected == "split":
+        return ("--profile", "combined", "rm", "-s", "-f", "vault")
+    return ("--profile", "split", "rm", "-s", "-f", "vault-api", "vault-sftp")
 
 
 def build_env_lines(cfg):
@@ -353,7 +378,8 @@ def build_env_lines(cfg):
     q("ADMIN_USERNAME")
     q("ADMIN_EMAIL")
     q("ADMIN_PASSWORD")
-    bare("COMPOSE_PROFILES", cfg.get("compose_profiles", "combined"))
+    compose_profile = migrate_compose_profiles(cfg.get("compose_profiles", "combined"))
+    bare("COMPOSE_PROFILES", compose_profile)
     # Stable bundle id: labels this deployment's five volumes so the tool can group them as one set.
     if cfg.get("deployment_id"):
         bare("DEPLOYMENT_ID", cfg["deployment_id"])
@@ -367,7 +393,7 @@ def build_env_lines(cfg):
     if cfg.get("web_host_port") and int(cfg["web_host_port"]) != 443:
         bare("WEB_HOST_PORT", int(cfg["web_host_port"]))
     # split mode always runs the SFTP container, so honour a custom SFTP port there too.
-    sftp_active = cfg.get("run_sftp") or cfg.get("compose_profiles") == "split"
+    sftp_active = cfg.get("run_sftp") or compose_profile == "split"
     if sftp_active and cfg.get("sftp_host_port") and int(cfg["sftp_host_port"]) != 2322:
         bare("SFTP_HOST_PORT", int(cfg["sftp_host_port"]))
     if cfg.get("update_check_enabled"):
@@ -1384,10 +1410,12 @@ class DockVault:
                            "Reset (destroys data) and start fresh." % ", ".join(missing))
             reusing = True
             print(pal.paint("  Reusing the existing .env (keeping ENCRYPTION_KEY + all data).", "green"))
-            # migrate a legacy COMPOSE_PROFILES in place (sftp -> split, none -> combined)
-            migrated = migrate_compose_profiles(existing.get("COMPOSE_PROFILES"))
-            if existing.get("COMPOSE_PROFILES") != migrated:
-                self._set_env_key(env_path, "COMPOSE_PROFILES", migrated)
+            # Migrate a supported legacy profile in place and reject ambiguous/unknown selections
+            # before changing any deployment state.
+            try:
+                migrated = self._normalize_compose_profile()
+            except (OSError, ValueError) as exc:
+                self._fail(str(exc))
             # Adopt a pre-label deployment: pin DEPLOYMENT_ID=default so this .env names the bundle
             # its (unlabelled) volumes are grouped under. Additive + idempotent - no data move, and a
             # second run keeps whatever id is already there.
@@ -1467,7 +1495,30 @@ class DockVault:
         interactive = not (args and getattr(args, "non_interactive", False))
         if not self._guard_db_secret(env_now, interactive=interactive):
             raise SystemExit(1)   # the guard already printed the diagnosis + recovery paths
-        profiles = summary.get("compose_profiles", "combined")
+        # The interactive guard can install a different .env or author a fresh set. Re-read it,
+        # persist any supported legacy profile, and refresh every profile/port value used below.
+        try:
+            profiles = self._normalize_compose_profile()
+        except (OSError, ValueError) as exc:
+            self._fail(str(exc))
+        env_now = self._load_env()
+        generated_password = summary.get("admin_password")
+        summary.update({
+            "server_name": env_now.get("SERVER_NAME") or env_now.get("ALLOWED_HOSTS") or "",
+            "admin_username": env_now.get("ADMIN_USERNAME") or "admin",
+            "compose_profiles": profiles,
+            "run_sftp": (
+                profiles == "split"
+                or (env_now.get("RUN_SFTP") or "").strip().lower() in ("1", "true", "yes", "on")
+            ),
+            "web_host_port": _port_or(env_now.get("WEB_HOST_PORT"), 443),
+            "sftp_host_port": _port_or(env_now.get("SFTP_HOST_PORT"), 2322),
+            "admin_password": (
+                generated_password
+                if generated_password and env_now.get("ADMIN_PASSWORD") == generated_password
+                else None
+            ),
+        })
         # Port preflight: warn (don't block) if the chosen web port is held by something ELSE.
         # A re-run over a running deployment finds its OWN container on the port - the one compose
         # is about to recreate - and warning there is just noise the operator has to second-guess.
@@ -1619,6 +1670,25 @@ class DockVault:
             f.write("\n".join(lines) + "\n")
         tighten_secret_file(path)
 
+    def _normalize_compose_profile(self):
+        """Persist the one supported app profile before any Compose command reads ``.env``.
+
+        Legacy or empty values are migrated in place. Ambiguous/unknown values and a missing or
+        unreadable ``.env`` fail closed so reconciliation cannot choose one layout while the
+        following ``compose up`` reads another.
+        """
+        env_path = self._env_path()
+        try:
+            with open(env_path, encoding="utf-8") as handle:
+                env = parse_env(handle.read())
+        except OSError as exc:
+            raise ValueError("could not read .env: %s" % exc)
+        current = env.get("COMPOSE_PROFILES")
+        selected = migrate_compose_profiles(current)
+        if current != selected:
+            self._set_env_key(env_path, "COMPOSE_PROFILES", selected)
+        return selected
+
     def _dc(self, *args):
         """docker compose against the root secure shim, anchored to the root .env."""
         return ["docker", "compose", "--env-file", self._env_path(),
@@ -1671,12 +1741,9 @@ class DockVault:
         only those inactive app containers; database/cache containers and every named volume stay
         in place. Fail closed before ``up`` if reconciliation itself fails.
         """
-        profile = self._load_env().get("COMPOSE_PROFILES", "combined")
-        if profile == "split":
-            args = ("--profile", "combined", "rm", "-s", "-f", "vault")
-        elif profile == "combined":
-            args = ("--profile", "split", "rm", "-s", "-f", "vault-api", "vault-sftp")
-        else:
+        try:
+            args = profile_reconciliation_args(self._normalize_compose_profile())
+        except (OSError, ValueError):
             return False
         try:
             result = self._run_dc(*args, capture=False, timeout=120)
@@ -1896,6 +1963,11 @@ class DockVault:
                     continue
                 _copy_secret(src, self._env_path())
                 tighten_secret_file(self._env_path())
+                try:
+                    self._normalize_compose_profile()
+                except (OSError, ValueError) as exc:
+                    print(pal.paint("  That .env is not deployable: %s." % exc, "red"))
+                    continue
                 env = self._load_env()   # the installed .env may name a different volume set
                 print(pal.paint("  Installed that .env; verifying it...", "cyan"))
                 if self._try_verify(env, "%s_vault_pg_data" % volume_prefix(env), hooks):

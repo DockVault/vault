@@ -554,7 +554,7 @@ class Vault(Base):
     #   {"<dek_version>": {"wrapped_dek": <b64>, "ephemeral_public_key": <b64>, "team_key_version": <T>}}
     # The team PRIVATE key is wrapped per-member in VaultMemberKey rows tagged
     # wrapping_algorithm='ECDH-P384-AES-GCM-TEAMPRIV', keyed by team_key_version. The server holds
-    # only public keys + opaque wraps. See docs/vault-zk-team-key-design.md.
+    # only public keys + opaque wraps and can never reconstruct the team private key.
     team_key = Column(Text, nullable=True)            # JSON map: DEK epoch -> {wrapped_dek, eph, team_key_version}
     team_public_key = Column(Text, nullable=True)     # the CURRENT team public key (PEM/SPKI)
     # The team-KEYPAIR epoch, SEPARATE from dek_version. Bumps ONLY on a team-keypair rotation
@@ -596,8 +596,8 @@ class Vault(Base):
 
     # Confidentiality tier (per-vault, effectively immutable). 'standard' =
     # server-side encryption, SFTP-capable (the only behaviour built today).
-    # 'zero_knowledge' (browser-side crypto, web-only) slots in later — see
-    # docs/vault-zero-trust-and-sftp-design.md §2. Defaulting every vault to
+    # 'zero_knowledge' (browser-side crypto, web-only because SFTP has no browser-held
+    # decryption keys) slots in later. Defaulting every vault to
     # 'standard' keeps today's behaviour unchanged.
     type = Column(String(20), nullable=False, default='standard', server_default='standard')
 

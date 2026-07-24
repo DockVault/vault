@@ -190,6 +190,28 @@ def test_migrate_compose_profiles():
     assert dv.migrate_compose_profiles("sftp") == "split"   # legacy scheme -> split
     assert dv.migrate_compose_profiles("") == "combined"
     assert dv.migrate_compose_profiles(None) == "combined"
+    assert dv.migrate_compose_profiles("  SPLIT  ") == "split"
+
+
+@pytest.mark.parametrize("value", ["combined,split", "split,split", "bogus"])
+def test_migrate_compose_profiles_rejects_ambiguous_or_unknown_values(value):
+    with pytest.raises(ValueError, match="exactly one profile"):
+        dv.migrate_compose_profiles(value)
+
+
+def test_profile_reconciliation_args_are_targeted_and_never_remove_volumes():
+    combined = dv.profile_reconciliation_args("combined")
+    split = dv.profile_reconciliation_args("split")
+    assert combined == ("--profile", "split", "rm", "-s", "-f", "vault-api", "vault-sftp")
+    assert split == ("--profile", "combined", "rm", "-s", "-f", "vault")
+    assert "-v" not in combined + split
+
+
+def test_build_env_lines_rejects_multiple_profiles():
+    cfg = _reusable_env_cfg()
+    cfg["compose_profiles"] = "combined,split"
+    with pytest.raises(ValueError, match="exactly one profile"):
+        dv.build_env_lines(cfg)
 
 
 def test_build_env_lines_and_roundtrip():
@@ -867,6 +889,68 @@ def test_setup_stops_and_does_not_start_when_guard_refuses(tmp_path, monkeypatch
         tool.setup(argparse.Namespace(no_start=False, non_interactive=True))
     assert exc.value.code == 1
     assert started == [], "setup MUST NOT start the stack when the secret guard refuses"
+
+
+def test_setup_refreshes_profile_and_ports_after_guard_replaces_env(tmp_path, monkeypatch):
+    initial = _reusable_env_cfg()
+    initial.update({"web_host_port": 8443, "sftp_host_port": 2222})
+    replacement = _reusable_env_cfg()
+    replacement.update({
+        "server_name": "replacement.example.com",
+        "compose_profiles": "sftp",
+        "run_sftp": False,
+        "web_host_port": 9443,
+        "sftp_host_port": 3322,
+    })
+    env_path = tmp_path / ".env"
+    env_path.write_text("\n".join(dv.build_env_lines(initial)) + "\n", encoding="utf-8")
+    replacement_text = "\n".join(dv.build_env_lines(replacement)) + "\n"
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "_cert_pair_present", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "apply_cert_owner", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "cert_readable_by_app_uid", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "port_free", lambda *a, **k: True)
+
+    def replace_env(_env, **kwargs):
+        assert kwargs["interactive"] is True
+        env_path.write_text(replacement_text, encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(tool, "_guard_db_secret", replace_env)
+    starts = []
+    health_profiles = []
+    summaries = []
+    monkeypatch.setattr(
+        tool,
+        "_start_secure_stack",
+        lambda: starts.append(dv.parse_env(env_path.read_text(encoding="utf-8"))) or True,
+    )
+    monkeypatch.setattr(
+        tool,
+        "_wait_secure_healthy",
+        lambda profile: health_profiles.append(profile) or True,
+    )
+    monkeypatch.setattr(
+        tool,
+        "_print_setup_summary",
+        lambda summary, healthy, logs_shown=False: summaries.append(dict(summary)),
+    )
+
+    tool.setup(argparse.Namespace(no_start=False, non_interactive=False))
+
+    assert starts[0]["COMPOSE_PROFILES"] == "split"
+    assert health_profiles == ["split"]
+    assert summaries == [{
+        "server_name": "replacement.example.com",
+        "admin_username": "admin",
+        "compose_profiles": "split",
+        "run_sftp": True,
+        "web_host_port": 9443,
+        "sftp_host_port": 3322,
+        "admin_password": None,
+    }]
 
 
 def test_setup_proceeds_to_start_when_guard_passes(tmp_path, monkeypatch):
@@ -1579,6 +1663,35 @@ def test_recreate_removes_only_inactive_app_profile_before_up(
     assert calls[1][0] == ("up", "--build", "-d", "--force-recreate", "--remove-orphans")
 
 
+@pytest.mark.parametrize(
+    ("env_line", "selected", "inactive"),
+    [
+        ("COMPOSE_PROFILES=sftp\n", "split", ("--profile", "combined", "rm", "-s", "-f", "vault")),
+        ("COMPOSE_PROFILES=\n", "combined", ("--profile", "split", "rm", "-s", "-f", "vault-api", "vault-sftp")),
+        ("SERVER_NAME=localhost\n", "combined", ("--profile", "split", "rm", "-s", "-f", "vault-api", "vault-sftp")),
+    ],
+)
+def test_recreate_persists_legacy_or_empty_profile_before_compose(
+        tmp_path, monkeypatch, env_line, selected, inactive):
+    env_path = tmp_path / ".env"
+    env_path.write_text(env_line, encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+
+    def run_dc(*args, **kwargs):
+        persisted = dv.parse_env(env_path.read_text(encoding="utf-8"))
+        assert persisted["COMPOSE_PROFILES"] == selected
+        calls.append((args, kwargs))
+        return _Proc(0, "")
+
+    monkeypatch.setattr(tool, "_run_dc", run_dc)
+
+    assert tool._recreate_stack(build=False) is True
+    assert calls[0][0] == inactive
+    assert calls[1][0] == ("up", "-d", "--force-recreate", "--remove-orphans")
+    assert dv.parse_env(env_path.read_text(encoding="utf-8"))["COMPOSE_PROFILES"] == selected
+
+
 def test_recreate_fails_closed_when_inactive_profile_cleanup_fails(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text("COMPOSE_PROFILES=split\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
@@ -1591,6 +1704,42 @@ def test_recreate_fails_closed_when_inactive_profile_cleanup_fails(tmp_path, mon
 
     assert tool._recreate_stack(build=True) is False
     assert calls == [("--profile", "combined", "rm", "-s", "-f", "vault")]
+
+
+@pytest.mark.parametrize("profile", ["combined,split", "split,split", "bogus"])
+def test_recreate_fails_closed_before_compose_for_invalid_profile(
+        tmp_path, monkeypatch, profile):
+    (tmp_path / ".env").write_text(f"COMPOSE_PROFILES={profile}\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(
+        tool,
+        "_run_dc",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or _Proc(0, ""),
+    )
+
+    assert tool._recreate_stack(build=True) is False
+    assert calls == []
+
+
+def test_setup_rejects_invalid_profile_before_mutating_existing_env(tmp_path):
+    lines = dv.build_env_lines(_reusable_env_cfg())
+    lines = [
+        "COMPOSE_PROFILES=combined,split"
+        if line.startswith("COMPOSE_PROFILES=")
+        else line
+        for line in lines
+    ]
+    env_path = tmp_path / ".env"
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    before = env_path.read_bytes()
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+
+    with pytest.raises(SystemExit) as exc:
+        tool.setup(argparse.Namespace(no_start=True))
+
+    assert exc.value.code == 1
+    assert env_path.read_bytes() == before
 
 
 def test_start_db_only_streams_so_docker_errors_are_visible(tmp_path, monkeypatch):

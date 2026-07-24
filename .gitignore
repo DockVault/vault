@@ -67,8 +67,6 @@ docker-compose.override.yml
 *.old
 
 # Generated files
-setup_state.json
-setup.lock
 
 # Testing
 .coverage

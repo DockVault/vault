@@ -201,7 +201,7 @@ def decrypt_gcm_chunk_stream(file_handle, vault_id, file_id) -> bytes:
 # encrypted IN THE BROWSER under the per-vault DEK (which the server never holds). Such
 # blobs are stored verbatim in the SAME enc_name/enc_mime columns but carry the marker
 # prefix below so the server can tell them apart and never tries (and fails) to decrypt
-# them. See docs/vault-zk-name-encryption.md and static/js/ecc_crypto.js.
+# them. The wire format must remain aligned with static/js/ecc_crypto.js.
 #
 # ZK_NAME_PREFIX MUST match the prefix the browser writes (ecc_crypto.js encryptName):
 # enc_name/enc_mime for a ZK object = ZK_NAME_PREFIX + base64(iv||ciphertext+tag).
