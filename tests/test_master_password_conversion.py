@@ -73,6 +73,48 @@ def _decrypted_values(setup, path):
     }
 
 
+def test_windows_owner_only_acl_semantics_reject_permission_drift(setup_module):
+    expected = {
+        "protected": True,
+        "ace_count": 1,
+        "ace_type": 0,
+        "ace_flags": 0,
+        "access_mask": 0x001F01FF,
+        "sid_matches": True,
+    }
+    assert setup_module._windows_acl_semantics_are_owner_only(**expected)
+
+    for field, invalid_value in (
+        ("protected", False),
+        ("ace_count", 0),
+        ("ace_count", 2),
+        ("ace_type", 1),
+        ("ace_flags", 0x10),
+        ("access_mask", 0x00120089),
+        ("sid_matches", False),
+    ):
+        candidate = {**expected, field: invalid_value}
+        assert not setup_module._windows_acl_semantics_are_owner_only(**candidate)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DACL")
+def test_windows_owner_only_acl_verification_is_sddl_independent(
+    setup_module,
+    tmp_path,
+    monkeypatch,
+):
+    restricted = tmp_path / "restricted.tmp"
+    restricted.write_bytes(b"")
+    setup_module._restrict_file(restricted)
+    monkeypatch.setattr(
+        setup_module.re,
+        "fullmatch",
+        lambda *_args: pytest.fail("semantic ACL verification used SDDL text"),
+    )
+
+    assert setup_module._windows_acl_is_owner_only(restricted)
+
+
 def test_selected_source_is_transformed_without_ambient_or_unknown_key_loss(
     setup_module,
     tmp_path,
@@ -645,7 +687,3 @@ def test_source_and_backup_have_verified_owner_only_dacls(setup_module, tmp_path
 
     for path in (source, result.backup_path):
         assert setup_module._windows_acl_is_owner_only(path)
-        sddl = setup_module._windows_dacl_sddl(path)
-        assert sddl.startswith("D:P")
-        assert sddl.count("(") == 1
-        assert setup_module._windows_current_sid() in sddl

@@ -552,13 +552,103 @@ def _windows_current_sid() -> str:
         kernel32.CloseHandle(token)
 
 
-def _windows_dacl_sddl(path: Path) -> str:
+def _windows_acl_semantics_are_owner_only(
+    *,
+    protected: bool,
+    ace_count: int,
+    ace_type: int,
+    ace_flags: int,
+    access_mask: int,
+    sid_matches: bool,
+) -> bool:
+    return (
+        protected
+        and ace_count == 1
+        and ace_type == 0
+        and ace_flags == 0
+        and access_mask == 0x001F01FF
+        and sid_matches
+    )
+
+
+def _windows_acl_is_owner_only(path: Path) -> bool:
     from ctypes import wintypes
 
     se_file_object = 1
     dacl_security_information = 0x00000004
+    se_dacl_protected = 0x1000
+    acl_size_information = 2
+
+    class AclSizeInformation(ctypes.Structure):
+        _fields_ = [
+            ("ace_count", wintypes.DWORD),
+            ("acl_bytes_in_use", wintypes.DWORD),
+            ("acl_bytes_free", wintypes.DWORD),
+        ]
+
+    class AceHeader(ctypes.Structure):
+        _fields_ = [
+            ("ace_type", wintypes.BYTE),
+            ("ace_flags", wintypes.BYTE),
+            ("ace_size", wintypes.WORD),
+        ]
+
+    class AccessAllowedAce(ctypes.Structure):
+        _fields_ = [
+            ("header", AceHeader),
+            ("mask", wintypes.DWORD),
+            ("sid_start", wintypes.DWORD),
+        ]
+
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    void_pointer_pointer = ctypes.POINTER(ctypes.c_void_p)
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        void_pointer_pointer,
+        void_pointer_pointer,
+        void_pointer_pointer,
+        void_pointer_pointer,
+        void_pointer_pointer,
+    ]
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.GetSecurityDescriptorControl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetSecurityDescriptorControl.restype = wintypes.BOOL
+    advapi32.IsValidAcl.argtypes = [ctypes.c_void_p]
+    advapi32.IsValidAcl.restype = wintypes.BOOL
+    advapi32.GetAclInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    advapi32.GetAclInformation.restype = wintypes.BOOL
+    advapi32.GetAce.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        void_pointer_pointer,
+    ]
+    advapi32.GetAce.restype = wintypes.BOOL
+    advapi32.ConvertStringSidToSidW.argtypes = [
+        wintypes.LPCWSTR,
+        void_pointer_pointer,
+    ]
+    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+    advapi32.IsValidSid.argtypes = [ctypes.c_void_p]
+    advapi32.IsValidSid.restype = wintypes.BOOL
+    advapi32.GetLengthSid.argtypes = [ctypes.c_void_p]
+    advapi32.GetLengthSid.restype = wintypes.DWORD
+    advapi32.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    advapi32.EqualSid.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
     security_descriptor = ctypes.c_void_p()
     dacl = ctypes.c_void_p()
     status = advapi32.GetNamedSecurityInfoW(
@@ -574,32 +664,74 @@ def _windows_dacl_sddl(path: Path) -> str:
     if status:
         raise OSError(status, ctypes.FormatError(status))
     try:
-        sddl_pointer = wintypes.LPWSTR()
-        if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        if not dacl or not advapi32.IsValidAcl(dacl):
+            return False
+        control = wintypes.WORD()
+        revision = wintypes.DWORD()
+        if not advapi32.GetSecurityDescriptorControl(
             security_descriptor,
-            1,
-            dacl_security_information,
-            ctypes.byref(sddl_pointer),
-            None,
+            ctypes.byref(control),
+            ctypes.byref(revision),
+        ):
+            error = ctypes.get_last_error()
+            raise OSError(error, ctypes.FormatError(error))
+
+        size_information = AclSizeInformation()
+        if not advapi32.GetAclInformation(
+            dacl,
+            ctypes.byref(size_information),
+            ctypes.sizeof(size_information),
+            acl_size_information,
+        ):
+            error = ctypes.get_last_error()
+            raise OSError(error, ctypes.FormatError(error))
+        if size_information.ace_count != 1:
+            return False
+
+        ace_pointer = ctypes.c_void_p()
+        if not advapi32.GetAce(dacl, 0, ctypes.byref(ace_pointer)):
+            error = ctypes.get_last_error()
+            raise OSError(error, ctypes.FormatError(error))
+        ace = ctypes.cast(
+            ace_pointer,
+            ctypes.POINTER(AccessAllowedAce),
+        ).contents
+        sid_offset = AccessAllowedAce.sid_start.offset
+        ace_offset = ace_pointer.value - dacl.value
+        if (
+            ace.header.ace_size < sid_offset + 8
+            or ace_offset < 0
+            or ace_offset + ace.header.ace_size
+            > size_information.acl_bytes_in_use
+        ):
+            return False
+
+        ace_sid = ctypes.c_void_p(ace_pointer.value + sid_offset)
+        if not advapi32.IsValidSid(ace_sid):
+            return False
+        if sid_offset + advapi32.GetLengthSid(ace_sid) > ace.header.ace_size:
+            return False
+
+        expected_sid = ctypes.c_void_p()
+        if not advapi32.ConvertStringSidToSidW(
+            _windows_current_sid(),
+            ctypes.byref(expected_sid),
         ):
             error = ctypes.get_last_error()
             raise OSError(error, ctypes.FormatError(error))
         try:
-            return sddl_pointer.value
+            return _windows_acl_semantics_are_owner_only(
+                protected=bool(control.value & se_dacl_protected),
+                ace_count=size_information.ace_count,
+                ace_type=ace.header.ace_type,
+                ace_flags=ace.header.ace_flags,
+                access_mask=ace.mask,
+                sid_matches=bool(advapi32.EqualSid(ace_sid, expected_sid)),
+            )
         finally:
-            kernel32.LocalFree(sddl_pointer)
+            kernel32.LocalFree(expected_sid)
     finally:
         kernel32.LocalFree(security_descriptor)
-
-
-def _windows_acl_is_owner_only(path: Path) -> bool:
-    sid = _windows_current_sid()
-    return bool(
-        re.fullmatch(
-            rf"D:P(?:AI)?\(A;;FA;;;{re.escape(sid)}\)",
-            _windows_dacl_sddl(path),
-        )
-    )
 
 
 def _restrict_file(path: Path) -> None:
@@ -619,6 +751,35 @@ def _restrict_file(path: Path) -> None:
     expected_sddl = f"D:P(A;;FA;;;{sid})"
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    void_pointer_pointer = ctypes.POINTER(ctypes.c_void_p)
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        void_pointer_pointer,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = (
+        wintypes.BOOL
+    )
+    advapi32.GetSecurityDescriptorDacl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+        void_pointer_pointer,
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+    advapi32.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
     security_descriptor = ctypes.c_void_p()
     if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
         expected_sddl,
