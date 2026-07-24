@@ -83,7 +83,9 @@ class ProgressTracker:
         username: str,
         operation_type: str,
         file_name: str,
-        total_size: int
+        total_size: int,
+        temp_credential_id: Optional[str] = None,
+        vault_id: Optional[str] = None,
     ) -> Optional[Dict]:
         """
         Start tracking a new operation.
@@ -104,6 +106,10 @@ class ProgressTracker:
                 "operation_id": operation_id,
                 "user_id": user_id,
                 "username": username,
+                "temp_credential_id": (
+                    str(temp_credential_id) if temp_credential_id is not None else None
+                ),
+                "vault_id": str(vault_id) if vault_id is not None else None,
                 "type": operation_type,
                 "file_name": file_name,
                 "total_size": total_size,
@@ -144,28 +150,35 @@ class ProgressTracker:
         operation_id: str,
         success: bool = True
     ) -> Optional[Dict]:
-        """
-        Mark operation as complete.
-        
-        Args:
-            operation_id: Operation identifier
-            success: Whether operation completed successfully
-        
-        Returns:
-            Final operation data if successful, None otherwise
-        """
+        """Atomically transition a live operation to completed or failed."""
         try:
             key = self._get_operation_key(operation_id)
-            data = self.redis.get(key)
-            
+            data = self.redis.eval(
+                """
+                local raw = redis.call('GET', KEYS[1])
+                if not raw then return false end
+                local operation = cjson.decode(raw)
+                if operation['status'] ~= 'in_progress'
+                    or operation['cancelled'] == true then
+                    return false
+                end
+                operation['status'] = ARGV[1]
+                operation['completed_time'] = tonumber(ARGV[2])
+                local encoded = cjson.encode(operation)
+                redis.call('DEL', KEYS[1])
+                return encoded
+                """,
+                1,
+                key,
+                "completed" if success else "failed",
+                str(time.time()),
+            )
             if not data:
                 return None
-            
+            if isinstance(data, bytes):
+                data = data.decode("utf-8")
             operation = json.loads(data)
-            operation["status"] = "completed" if success else "failed"
-            operation["completed_time"] = time.time()
-            
-            # Broadcast completion
+
             event = {
                 "type": "operation_complete",
                 "operation_id": operation_id,
@@ -173,16 +186,10 @@ class ProgressTracker:
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
             self.broadcaster.broadcast_sync(event)
-            
-            # Delete from Redis after a short delay (allow clients to receive completion)
-            self.redis.delete(key)
-            
             return operation
-            
         except Exception as e:
             print(f"Error completing operation: {e}")
             return None
-    
     def is_cancelled(self, operation_id: str) -> bool:
         """
         Check if operation has been cancelled by admin.
@@ -207,43 +214,59 @@ class ProgressTracker:
             print(f"Error checking cancellation: {e}")
             return False
     
-    def cancel_operation(self, operation_id: str, requester_id=None, is_admin=False) -> bool:
-        """
-        Mark an operation as cancelled.
-
-        Authorization: the caller must OWN the operation (its stored user_id matches
-        requester_id) or be an admin — otherwise a user could cancel another principal's
-        in-flight transfer via a leaked/guessed operation id.
-
-        Args:
-            operation_id: Operation identifier
-            requester_id: id of the calling principal (compared to the operation owner)
-            is_admin: True bypasses the ownership check
-
-        Returns:
-            True if successfully cancelled, False otherwise
-        """
+    def cancel_operation(
+        self,
+        operation_id: str,
+        requester_id=None,
+        requester_temp_credential_id=None,
+        is_admin=False,
+    ) -> bool:
+        """Atomically cancel a live operation for its exact principal or a full admin."""
         try:
             key = self._get_operation_key(operation_id)
-            data = self.redis.get(key)
-
+            data = self.redis.eval(
+                """
+                local raw = redis.call('GET', KEYS[1])
+                if not raw then return false end
+                local operation = cjson.decode(raw)
+                if operation['status'] ~= 'in_progress'
+                    or operation['cancelled'] == true then
+                    return false
+                end
+                if ARGV[3] ~= '1' then
+                    if ARGV[1] == '' or tostring(operation['user_id']) ~= ARGV[1] then
+                        return false
+                    end
+                    local owner_credential = operation['temp_credential_id']
+                    if owner_credential == nil or owner_credential == cjson.null then
+                        owner_credential = ''
+                    else
+                        owner_credential = tostring(owner_credential)
+                    end
+                    if owner_credential ~= ARGV[2] then return false end
+                end
+                operation['cancelled'] = true
+                operation['status'] = 'cancelled'
+                operation['cancelled_time'] = tonumber(ARGV[5])
+                local encoded = cjson.encode(operation)
+                redis.call('SETEX', KEYS[1], tonumber(ARGV[4]), encoded)
+                return encoded
+                """,
+                1,
+                key,
+                str(requester_id) if requester_id is not None else "",
+                (
+                    str(requester_temp_credential_id)
+                    if requester_temp_credential_id is not None
+                    else ""
+                ),
+                "1" if is_admin else "0",
+                str(self.ttl),
+                str(time.time()),
+            )
             if not data:
                 return False
 
-            operation = json.loads(data)
-
-            # Ownership / admin gate: only the owner or an admin may cancel.
-            owner_id = operation.get("user_id")
-            if not is_admin and (requester_id is None or str(owner_id) != str(requester_id)):
-                return False
-
-            operation["cancelled"] = True
-            operation["status"] = "cancelled"
-
-            # Update in Redis
-            self.redis.setex(key, self.ttl, json.dumps(operation))
-
-            # Broadcast cancellation
             event = {
                 "type": "operation_cancelled",
                 "operation_id": operation_id,
@@ -251,10 +274,7 @@ class ProgressTracker:
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
             self.broadcaster.broadcast_sync(event)
-
             return True
-            
         except Exception as e:
             print(f"Error cancelling operation: {e}")
             return False
-    

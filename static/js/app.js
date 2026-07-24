@@ -3749,7 +3749,7 @@ function renderPermissionToggles(userId, userPerms) {
                         <input type="checkbox" class="perm-toggle" data-group="${g.name}" ${granted.has(g.name) ? 'checked' : ''} ${isAdminTarget ? 'disabled' : ''}>
                         <span class="perm-text">
                             <span class="perm-name">${escapeHtml(g.display_name)}</span>
-                            <span class="perm-desc">${escapeHtml(g.description || '')}${g.dependencies && g.dependencies.length ? ` · needs ${g.dependencies.join(', ')}` : ''}</span>
+                            <span class="perm-desc">${escapeHtml(g.description || '')}${g.dependencies && g.dependencies.length ? ` · also grants ${g.dependencies.map(dep => escapeHtml(dep)).join(', ')}` : ''}</span>
                         </span>
                     </label>`).join('')}
             </div>`).join('')}`;
@@ -3761,11 +3761,16 @@ function renderPermissionToggles(userId, userPerms) {
 
 async function togglePermission(userId, group, grant, cb) {
     try {
+        let result;
         if (grant) {
-            await apiRequest(`/permissions/users/${userId}/grant`, { method: 'POST', body: JSON.stringify({ endpoint_group: group }) });
+            result = await apiRequest(`/permissions/users/${userId}/grant`, { method: 'POST', body: JSON.stringify({ endpoint_group: group }) });
         } else {
-            await apiRequest(`/permissions/users/${userId}/revoke/${group}`, { method: 'DELETE' });
+            result = await apiRequest(`/permissions/users/${userId}/revoke/${group}`, { method: 'DELETE' });
         }
+        const changedGroups = new Set(grant ? result.granted_groups : result.revoked_groups);
+        document.querySelectorAll('.perm-toggle').forEach(toggle => {
+            if (changedGroups.has(toggle.dataset.group)) toggle.checked = grant;
+        });
     } catch (e) {
         showError('Failed to update permission: ' + e.message);
         if (cb) cb.checked = !grant; // revert the toggle on failure

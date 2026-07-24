@@ -231,6 +231,26 @@ API_CATALOG = {
         ]
     ),
     
+    "AUDIT_VIEW": FunctionalityGroup(
+        name="AUDIT_VIEW",
+        display_name="View User Activity",
+        description="View your own activity log (administrators can view any user)",
+        ui_section="Audit",
+        default_for_roles=["user", "admin"],
+        endpoints=[
+            APIEndpoint(
+                method="GET",
+                path="/api/user-management/users/{user_id}/activity",
+                function_name="get_user_activity",
+                description="View a user's activity log",
+                role_requirement=RoleRequirement.USER,
+                requires_ownership=True,
+                resource_type="user",
+                ui_widgets=["user-activity-log"]
+            ),
+        ]
+    ),
+
     # ------------------------------------------------------------------------
     # DASHBOARD & STATISTICS
     # ------------------------------------------------------------------------
@@ -358,7 +378,9 @@ API_CATALOG = {
         description="Grant/revoke vault access to users (owner only)",
         ui_section="Vaults",
         default_for_roles=["user", "admin"],
-        dependencies=["VAULT_VIEW", "USER_VIEW"],
+        # User-directory access is an independent administrator boundary. Vault
+        # owners can manage known members without inheriting fleet-wide USER_VIEW.
+        dependencies=["VAULT_VIEW"],
         endpoints=[
             APIEndpoint(
                 method="GET",
@@ -493,9 +515,58 @@ API_CATALOG = {
 }
 
 
+# Health and authentication are catalogued for documentation, but they are
+# infrastructure boundaries rather than permissions an administrator can toggle.
+NON_GRANTABLE_ENDPOINT_GROUPS = frozenset({"SYSTEM_HEALTH", "AUTH_LOGIN"})
+GRANTABLE_API_CATALOG = {
+    name: group
+    for name, group in API_CATALOG.items()
+    if name not in NON_GRANTABLE_ENDPOINT_GROUPS
+}
+
+
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
+
+def dependency_closure(group_name: str) -> List[str]:
+    """Return transitive prerequisites in dependency-first order."""
+    if group_name not in GRANTABLE_API_CATALOG:
+        raise ValueError(f"Unknown grantable endpoint group: {group_name}")
+
+    ordered = []
+    visiting = set()
+    visited = set()
+
+    def visit(name: str) -> None:
+        if name in visiting:
+            raise ValueError(f"Cyclic endpoint-permission dependency at {name}")
+        if name in visited:
+            return
+        group = GRANTABLE_API_CATALOG.get(name)
+        if group is None:
+            raise ValueError(f"Unknown grantable endpoint dependency: {name}")
+        visiting.add(name)
+        for dependency in group.dependencies:
+            visit(dependency)
+        visiting.remove(name)
+        visited.add(name)
+        if name != group_name:
+            ordered.append(name)
+
+    visit(group_name)
+    return ordered
+
+
+def dependent_closure(group_name: str) -> List[str]:
+    """Return every grantable group that transitively requires ``group_name``."""
+    if group_name not in GRANTABLE_API_CATALOG:
+        raise ValueError(f"Unknown grantable endpoint group: {group_name}")
+    return [
+        candidate
+        for candidate in GRANTABLE_API_CATALOG
+        if candidate != group_name and group_name in dependency_closure(candidate)
+    ]
 
 def get_all_endpoints() -> List[APIEndpoint]:
     """Get flat list of all endpoints across all groups"""
@@ -518,7 +589,7 @@ def get_endpoints_by_ui_widget(widget_name: str) -> List[APIEndpoint]:
 def get_groups_for_role(role: str) -> List[str]:
     """Get all functionality groups that a role should have by default"""
     groups = []
-    for group_name, group in API_CATALOG.items():
+    for group_name, group in GRANTABLE_API_CATALOG.items():
         if role in group.default_for_roles:
             groups.append(group_name)
     return groups
@@ -579,11 +650,20 @@ def validate_catalog():
                 errors.append(f"Duplicate endpoint: {key} in {group_name} and {seen_paths[key]}")
             seen_paths[key] = group_name
     
-    # Check dependencies exist
+    # Check dependencies exist and never cross into infrastructure-only groups.
     for group_name, group in API_CATALOG.items():
         for dep in group.dependencies:
             if dep not in API_CATALOG:
                 errors.append(f"Group {group_name} depends on non-existent group {dep}")
+            elif group_name in GRANTABLE_API_CATALOG and dep not in GRANTABLE_API_CATALOG:
+                errors.append(f"Grantable group {group_name} depends on non-grantable group {dep}")
+
+    # Check the complete dependency graph, including indirect cycles.
+    for group_name in GRANTABLE_API_CATALOG:
+        try:
+            dependency_closure(group_name)
+        except ValueError as exc:
+            errors.append(str(exc))
     
     return errors
 

@@ -187,8 +187,9 @@ def test_id_scope_no_whole_vault_aggregate_leak(admin):
         # dashboard: the scoped credential gets no owner-aggregate file count / storage ...
         stats = c.get("/api/dashboard/stats").json()
         assert "files" not in stats and "storage_mb" not in stats
-        # ... and no audit-trail feed (it shares the admin's user_id).
-        assert c.get("/api/dashboard/recent-events").json() == []
+        # Dashboard access is a separate grant: this credential intentionally
+        # has only the vaults page, so the alternate dashboard router fails closed.
+        assert c.get("/api/dashboard/recent-events").status_code == 403
     finally:
         admin.delete_vault(vid)
 

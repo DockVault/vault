@@ -14,6 +14,7 @@ from sqlalchemy import func, desc, select
 
 from app.core.database import get_db
 from app.core.models import User, Vault, vault_members, TemporaryCredential, AuditLog, ActiveSession, RoleEnum
+from app.core.endpoint_permissions import require_endpoint_permission
 from app.core.response_hash_utils import handle_conditional_response
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -51,6 +52,7 @@ def _is_interactive_admin(user) -> bool:
 
 
 @router.get("/stats")
+@require_endpoint_permission("DASHBOARD_VIEW")
 async def get_dashboard_stats(
     request: Request,
     current_user: User = Depends(get_current_user),
@@ -143,6 +145,7 @@ async def get_dashboard_stats(
 
 
 @router.get("/recent-events")
+@require_endpoint_permission("DASHBOARD_VIEW")
 async def get_recent_events(
     request: Request,
     limit: int = 10,
@@ -194,6 +197,7 @@ async def get_recent_events(
 
 
 @router.get("/active-connections")
+@require_endpoint_permission("DASHBOARD_VIEW")
 async def get_active_connections(
     request: Request,
     current_user: User = Depends(get_current_user),
