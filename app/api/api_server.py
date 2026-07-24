@@ -323,21 +323,67 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         
         return response
 
-# General API rate limiter. The sliding-window limiter in app/core/rate_limiter.py was fully implemented
-# but never attached to the app, so the documented RATE_LIMIT_API_* knobs were inert and the whole
-# API surface had no framework throttle (only the login path and /ecc/* self-throttled). Wire it
-# here, gated on the config flag. It buckets by authenticated user when a bearer token is present,
-# else by trusted-proxy-aware IP; excludes static assets / health / docs (one SPA page load pulls
-# many static files); and fails OPEN on a Redis outage (availability over a brief throttling gap —
-# the separate fail-CLOSED login throttle is unaffected). Registered BEFORE SecurityHeadersMiddleware
-# so it sits inside it and a 429 response still carries the hardening headers on the way out.
+_RATE_LIMIT_API_CATEGORIES = ("default", "auth", "upload", "download")
+_RATE_LIMIT_API_SETTING_KEYS = tuple(
+    key
+    for category in _RATE_LIMIT_API_CATEGORIES
+    for key in (f"rate_limit_api_{category}", f"rate_limit_api_{category}_window")
+)
+
+
+def _api_rate_limit_deployment_defaults() -> dict:
+    return {key: int(getattr(settings, key)) for key in _RATE_LIMIT_API_SETTING_KEYS}
+
+
+def _load_stored_api_rate_limit_overrides() -> dict:
+    from app.core.database import SessionLocal
+    from app.core.models import SystemSetting
+
+    db = SessionLocal()
+    try:
+        row = db.query(SystemSetting).filter(SystemSetting.key == "global").first()
+        return dict(row.value) if row and row.value else {}
+    finally:
+        db.close()
+
+
+# The deployment flag is authoritative. When enabled, a five-second process-local cache
+# avoids per-request PostgreSQL reads; Settings writes replace it immediately, while the
+# bounded refresh propagates another worker's update. General API traffic preserves the
+# documented Redis-outage fail-open policy; dedicated login/vault/SFTP throttles are separate.
+_api_rate_limit_policy_cache = None
 if getattr(settings, 'rate_limit_api_enabled', True):
-    from app.core.rate_limiter import RateLimitMiddleware, rate_limiter as _api_rate_limiter
+    from app.core.rate_limiter import (
+        ApiRateLimitPolicyCache,
+        RateLimitMiddleware,
+        RateLimitRule,
+        rate_limiter as _api_rate_limiter,
+    )
+    deployment = _api_rate_limit_deployment_defaults()
+    deployment_rules = {
+        category: RateLimitRule(
+            deployment[f"rate_limit_api_{category}"],
+            deployment[f"rate_limit_api_{category}_window"],
+        )
+        for category in _RATE_LIMIT_API_CATEGORIES
+    }
+    _api_rate_limit_policy_cache = ApiRateLimitPolicyCache(
+        deployment_rules,
+        _load_stored_api_rate_limit_overrides,
+        ttl_seconds=5,
+    )
     app.add_middleware(
         RateLimitMiddleware,
         rate_limiter=_api_rate_limiter,
         default_limit=settings.rate_limit_api_default,
         default_window=settings.rate_limit_api_default_window,
+        auth_limit=settings.rate_limit_api_auth,
+        auth_window=settings.rate_limit_api_auth_window,
+        upload_limit=settings.rate_limit_api_upload,
+        upload_window=settings.rate_limit_api_upload_window,
+        download_limit=settings.rate_limit_api_download,
+        download_window=settings.rate_limit_api_download_window,
+        policy_provider=_api_rate_limit_policy_cache.get,
         exclude_paths=["/health", "/static", "/favicon.ico", "/brand-assets",
                        "/docs", "/redoc", "/openapi.json"],
     )
@@ -1872,6 +1918,36 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Settings payload must be an object")
 
+    for managed_key in ("rate_limit_api_enabled", "rate_limit_api_deployment_defaults"):
+        if managed_key in payload:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{managed_key} is managed by the deployment environment",
+            )
+
+    from app.core.rate_limiter import (
+        API_RATE_LIMIT_MAX_REQUESTS,
+        API_RATE_LIMIT_MAX_WINDOW_SECONDS,
+    )
+    for category in _RATE_LIMIT_API_CATEGORIES:
+        for key, maximum in (
+            (f"rate_limit_api_{category}", API_RATE_LIMIT_MAX_REQUESTS),
+            (f"rate_limit_api_{category}_window", API_RATE_LIMIT_MAX_WINDOW_SECONDS),
+        ):
+            if key not in payload:
+                continue
+            value = payload[key]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                or value > maximum
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{key} must be an integer from 0 to {maximum}",
+                )
+
     for bool_key in ("zero_knowledge_enabled", "force_zero_knowledge", "force_no_remember_vault_password",
                      "sharing_enabled"):
         if bool_key in payload and not isinstance(payload[bool_key], bool):
@@ -1977,6 +2053,12 @@ async def get_settings(
     data["zk_idle_lock_minutes"] = _zk_idle_lock_minutes(db)
     # Effective Sharing master switch (default OFF) so the Settings -> Sharing toggle reflects reality.
     data["sharing_enabled"] = _sharing_enabled(db)
+    # Stored zero means "use deployment default"; expose those defaults separately so the UI
+    # can explain the effective fallback without persisting it on an unrelated save.
+    for key in _RATE_LIMIT_API_SETTING_KEYS:
+        data.setdefault(key, 0)
+    data["rate_limit_api_enabled"] = bool(settings.rate_limit_api_enabled)
+    data["rate_limit_api_deployment_defaults"] = _api_rate_limit_deployment_defaults()
     return data
 
 
@@ -2014,6 +2096,11 @@ async def update_settings(
         # clears -> env default. Values were validated by _validate_brand_overrides above.
         set_brand_overrides(db, updates={key: payload[key] for key in brand_keys})
     db.commit()
+    if (
+        _api_rate_limit_policy_cache is not None
+        and any(key in (payload or {}) for key in _RATE_LIMIT_API_SETTING_KEYS)
+    ):
+        _api_rate_limit_policy_cache.replace(merged)
     try:
         AuditLogger(db).log_action(
             action="settings_updated",

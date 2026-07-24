@@ -5272,6 +5272,29 @@ async function loadSettings() {
         document.getElementById('setting-session-timeout').value = (settings.session_timeout > 0) ? settings.session_timeout : '';
         document.getElementById('setting-max-login-attempts').value = (settings.max_login_attempts > 0) ? settings.max_login_attempts : '';
         document.getElementById('setting-lockout-duration').value = (settings.lockout_duration > 0) ? settings.lockout_duration : '';
+        const apiRateDefaults = settings.rate_limit_api_deployment_defaults || {};
+        const apiRateFields = [
+            ['rate_limit_api_default', 'setting-rate-limit-api-default'],
+            ['rate_limit_api_default_window', 'setting-rate-limit-api-default-window'],
+            ['rate_limit_api_auth', 'setting-rate-limit-api-auth'],
+            ['rate_limit_api_auth_window', 'setting-rate-limit-api-auth-window'],
+            ['rate_limit_api_upload', 'setting-rate-limit-api-upload'],
+            ['rate_limit_api_upload_window', 'setting-rate-limit-api-upload-window'],
+            ['rate_limit_api_download', 'setting-rate-limit-api-download'],
+            ['rate_limit_api_download_window', 'setting-rate-limit-api-download-window'],
+        ];
+        for (const [key, id] of apiRateFields) {
+            const el = document.getElementById(id);
+            if (!el) continue;
+            el.value = (settings[key] > 0) ? settings[key] : '';
+            if (apiRateDefaults[key] > 0) el.placeholder = `Deployment default: ${apiRateDefaults[key]}`;
+        }
+        const apiRateStatus = document.getElementById('setting-rate-limit-api-status');
+        if (apiRateStatus) {
+            apiRateStatus.textContent = settings.rate_limit_api_enabled
+                ? 'General API rate limiting is enabled by the deployment; saved changes apply live.'
+                : 'General API rate limiting is disabled by the deployment; saved values remain inactive until an operator enables it.';
+        }
         
         // Storage
         // Show the actual stored quota, or BLANK when unset/0 (which the backend treats as
@@ -5383,6 +5406,14 @@ async function saveAllSettings() {
             session_timeout: parseInt(document.getElementById('setting-session-timeout').value) || 0,
             max_login_attempts: parseInt(document.getElementById('setting-max-login-attempts').value) || 0,
             lockout_duration: parseInt(document.getElementById('setting-lockout-duration').value) || 0,
+            rate_limit_api_default: parseInt(document.getElementById('setting-rate-limit-api-default').value) || 0,
+            rate_limit_api_default_window: parseInt(document.getElementById('setting-rate-limit-api-default-window').value) || 0,
+            rate_limit_api_auth: parseInt(document.getElementById('setting-rate-limit-api-auth').value) || 0,
+            rate_limit_api_auth_window: parseInt(document.getElementById('setting-rate-limit-api-auth-window').value) || 0,
+            rate_limit_api_upload: parseInt(document.getElementById('setting-rate-limit-api-upload').value) || 0,
+            rate_limit_api_upload_window: parseInt(document.getElementById('setting-rate-limit-api-upload-window').value) || 0,
+            rate_limit_api_download: parseInt(document.getElementById('setting-rate-limit-api-download').value) || 0,
+            rate_limit_api_download_window: parseInt(document.getElementById('setting-rate-limit-api-download-window').value) || 0,
             
             // Storage
             // Blank -> 0 (unlimited); the backend enforces a positive value and ignores 0.

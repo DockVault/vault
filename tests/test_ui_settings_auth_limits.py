@@ -1,9 +1,8 @@
 """UI — the Settings page must not invent values for limits the deployment configures.
 
-`max_login_attempts`, `session_timeout`, `lockout_duration` and `max_file_size` are all stored as
-"0 = use the value from the environment" (auth_service._global_setting / api_server._setting_int /
-upload_policy.effective_max_file_bytes each read a stored 0 as absent). The Settings page renders
-every field it knows and "Save All Changes" writes back every field it rendered — so a page that
+The authentication, upload-size, and general API rate-limit settings below are stored as
+"0 = use the value from the environment". The Settings page renders every field it knows and
+"Save All Changes" writes back every field it rendered — so a page that
 substitutes the SHIPPED default for a stored 0 does not merely display the wrong number, it
 persists it on the next save and permanently overrides the operator's .env.
 
@@ -17,8 +16,21 @@ from playwright.sync_api import Page, expect
 
 pytestmark = pytest.mark.ui
 
-# The four settings whose stored 0 means "defer to the deployment env". One defect, one fix.
-ENV_BACKED_KEYS = ("max_login_attempts", "session_timeout", "lockout_duration", "max_file_size")
+# Settings whose stored 0 means "defer to the deployment env".
+ENV_BACKED_KEYS = (
+    "max_login_attempts",
+    "session_timeout",
+    "lockout_duration",
+    "max_file_size",
+    "rate_limit_api_default",
+    "rate_limit_api_default_window",
+    "rate_limit_api_auth",
+    "rate_limit_api_auth_window",
+    "rate_limit_api_upload",
+    "rate_limit_api_upload_window",
+    "rate_limit_api_download",
+    "rate_limit_api_download_window",
+)
 
 # Field ids, and which Settings tab each one lives on.
 FIELDS = {
@@ -26,12 +38,19 @@ FIELDS = {
     "session_timeout": ("security", "#setting-session-timeout"),
     "lockout_duration": ("security", "#setting-lockout-duration"),
     "max_file_size": ("general", "#setting-max-file-size"),
+    "rate_limit_api_default": ("security", "#setting-rate-limit-api-default"),
+    "rate_limit_api_default_window": ("security", "#setting-rate-limit-api-default-window"),
+    "rate_limit_api_auth": ("security", "#setting-rate-limit-api-auth"),
+    "rate_limit_api_auth_window": ("security", "#setting-rate-limit-api-auth-window"),
+    "rate_limit_api_upload": ("security", "#setting-rate-limit-api-upload"),
+    "rate_limit_api_upload_window": ("security", "#setting-rate-limit-api-upload-window"),
+    "rate_limit_api_download": ("security", "#setting-rate-limit-api-download"),
+    "rate_limit_api_download_window": ("security", "#setting-rate-limit-api-download-window"),
 }
 
-# Populated on every load (loadSettings renders it as `password_min_length || 8`), and assigned
-# AFTER the general-tab fields and IMMEDIATELY BEFORE the three auth-limit fields. Waiting for it
-# to be non-empty therefore proves the whole form has been populated — without it, an assertion
-# that a field is blank could simply be racing the fetch and passing vacuously.
+# Populated on every load (loadSettings renders it as `password_min_length || 8`). It is a
+# positive control for the payload value; data-settings-ready below proves all asynchronous
+# population has completed before a blank-field assertion is allowed to pass.
 LOAD_SENTINEL = "#setting-password-min-length"
 
 
@@ -51,6 +70,9 @@ def _open_settings(page: Page, expected_sentinel: str):
     page.wait_for_function(
         "sel => { const el = document.querySelector(sel); return !!el && el.value !== ''; }",
         arg=LOAD_SENTINEL, timeout=15000,
+    )
+    expect(page.locator("#save-all-settings-btn")).to_have_attribute(
+        "data-settings-ready", "true", timeout=15000
     )
     # Positive control: the sentinel shows what the server actually returned, so the blank
     # assertions below are being made against freshly loaded data.
@@ -133,6 +155,14 @@ def test_configured_override_survives_a_settings_save(page: Page, admin, fresh_a
         "session_timeout": 240,
         "lockout_duration": 1,
         "max_file_size": 4096,
+        "rate_limit_api_default": 100000,
+        "rate_limit_api_default_window": 120,
+        "rate_limit_api_auth": 100000,
+        "rate_limit_api_auth_window": 120,
+        "rate_limit_api_upload": 100000,
+        "rate_limit_api_upload_window": 120,
+        "rate_limit_api_download": 100000,
+        "rate_limit_api_download_window": 120,
     }
     admin.put("/settings", json=configured)
 

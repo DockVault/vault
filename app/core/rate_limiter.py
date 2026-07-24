@@ -10,20 +10,144 @@ Features:
 - FastAPI middleware for automatic application
 """
 import time
+import threading
 import uuid
-from typing import Tuple, Optional, Dict
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Callable, Dict, Mapping, Optional, Tuple
+
 from functools import wraps
 
 from fastapi import Request, HTTPException, status
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response, JSONResponse
+from starlette.responses import JSONResponse
 
 from app.core.database import redis_client
-from app.core.config import settings
+
 import logging
 
 logger = logging.getLogger(__name__)
+
+API_RATE_LIMIT_CLASSES = ("default", "auth", "upload", "download")
+API_RATE_LIMIT_MAX_REQUESTS = 1_000_000
+API_RATE_LIMIT_MAX_WINDOW_SECONDS = 86_400
+
+
+@dataclass(frozen=True)
+class RateLimitRule:
+    limit: int
+    window: int
+
+
+def classify_api_rate_limit(method: str, path: str) -> str:
+    """Return one general-API class with auth > upload > download > default precedence.
+
+    Auth covers every /auth route plus logout. Upload covers direct file POSTs and
+    chunk-init/chunk-write/complete routes. Download covers the file-content GET route.
+    Everything else is default; method checks prevent lookalike paths changing class.
+    """
+    method = (method or "").upper()
+    path = (path or "/").rstrip("/") or "/"
+    if path == "/auth" or path.startswith("/auth/") or path == "/api/logout":
+        return "auth"
+
+    parts = path.strip("/").split("/")
+    if parts[:1] == ["vaults"]:
+        if method == "POST" and len(parts) == 3 and parts[2] in {"files", "uploads"}:
+            return "upload"
+        if (
+            method == "PUT"
+            and len(parts) == 6
+            and parts[2] == "uploads"
+            and parts[4] == "chunks"
+        ):
+            return "upload"
+        if (
+            method == "POST"
+            and len(parts) == 5
+            and parts[2] == "uploads"
+            and parts[4] == "complete"
+        ):
+            return "upload"
+        if (
+            method == "GET"
+            and len(parts) == 5
+            and parts[2] == "files"
+            and parts[4] == "download"
+        ):
+            return "download"
+    return "default"
+
+
+def resolve_api_rate_limit_policy(
+    defaults: Mapping[str, RateLimitRule],
+    overrides: Mapping[str, object] | None,
+) -> Mapping[str, RateLimitRule]:
+    """Apply positive stored fields; zero/invalid fields retain deployment defaults."""
+    overrides = overrides if isinstance(overrides, Mapping) else {}
+    resolved = {}
+    for category in API_RATE_LIMIT_CLASSES:
+        fallback = defaults[category]
+        limit = overrides.get(f"rate_limit_api_{category}", 0)
+        window = overrides.get(f"rate_limit_api_{category}_window", 0)
+        resolved[category] = RateLimitRule(
+            limit
+            if (
+                isinstance(limit, int)
+                and not isinstance(limit, bool)
+                and 0 < limit <= API_RATE_LIMIT_MAX_REQUESTS
+            )
+            else fallback.limit,
+            window
+            if (
+                isinstance(window, int)
+                and not isinstance(window, bool)
+                and 0 < window <= API_RATE_LIMIT_MAX_WINDOW_SECONDS
+            )
+            else fallback.window,
+        )
+    return MappingProxyType(resolved)
+
+
+class ApiRateLimitPolicyCache:
+    """Bounded DB refresh plus immediate same-process replacement after Settings writes."""
+
+    def __init__(
+        self,
+        defaults: Mapping[str, RateLimitRule],
+        loader: Callable[[], Mapping[str, object]],
+        *,
+        ttl_seconds: float = 5.0,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        self._defaults = MappingProxyType(dict(defaults))
+        self._loader = loader
+        self._ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._lock = threading.RLock()
+        self._policy = resolve_api_rate_limit_policy(self._defaults, {})
+        self._expires_at = 0.0
+
+    def get(self) -> Mapping[str, RateLimitRule]:
+        now = self._clock()
+        with self._lock:
+            if now < self._expires_at:
+                return self._policy
+            try:
+                loaded = self._loader()
+            except Exception:  # noqa: BLE001 - keep serving the last known bounded policy
+                logger.warning("Could not refresh the API rate-limit policy; using last known values")
+            else:
+                self._policy = resolve_api_rate_limit_policy(self._defaults, loaded)
+            self._expires_at = now + self._ttl_seconds
+            return self._policy
+
+    def replace(self, overrides: Mapping[str, object]) -> None:
+        with self._lock:
+            self._policy = resolve_api_rate_limit_policy(self._defaults, overrides)
+            self._expires_at = self._clock() + self._ttl_seconds
 
 
 class RateLimitExceeded(Exception):
@@ -97,7 +221,37 @@ class RateLimiter:
     - Fixed window: Can get 2x limit at window boundary
     - Sliding window: Smooth, accurate limit enforcement
     """
-    
+
+    _SLIDING_WINDOW_SCRIPT = """
+local key = KEYS[1]
+local window_start = tonumber(ARGV[1])
+local now = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+local entry_id = ARGV[5]
+local window = tonumber(ARGV[6])
+
+redis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)
+local current_count = redis.call('ZCARD', key)
+if current_count >= limit then
+    local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+    local reset_at = math.ceil(now + window)
+    if oldest[2] then
+        reset_at = math.ceil(tonumber(oldest[2]) + window)
+    end
+    return {0, 0, tostring(reset_at)}
+end
+
+redis.call('ZADD', key, now, entry_id)
+redis.call('EXPIRE', key, ttl)
+local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+local reset_at = math.ceil(now + window)
+if oldest[2] then
+    reset_at = math.ceil(tonumber(oldest[2]) + window)
+end
+return {1, limit - current_count - 1, tostring(reset_at)}
+"""
+
     def __init__(self, redis_client):
         self.redis = redis_client
     
@@ -137,37 +291,24 @@ class RateLimiter:
             return True, limit, int(now + window)
 
         try:
-            # Use pipeline for atomic operations
-            pipe = self.redis.pipeline()
-
-            # Remove old entries outside the window
-            pipe.zremrangebyscore(key, 0, window_start)
-
-            # Count current entries in the window
-            pipe.zcard(key)
-
-            # Execute pipeline
-            results = pipe.execute()
+            # Prune, count, decide, and insert as one Redis-side operation. A pipeline
+            # alone cannot stop concurrent requests from all observing the same count.
+            results = self.redis.eval(
+                self._SLIDING_WINDOW_SCRIPT,
+                1,
+                key,
+                window_start,
+                now,
+                limit,
+                window + 1,
+                str(uuid.uuid4()),
+                window,
+            )
             _cb_record_success()  # Redis is healthy — reset the breaker
-            current_count = results[1]
-            
-            # Calculate remaining and reset time
-            remaining = max(0, limit - current_count)
-            reset_time = int(now + window)
-            
-            if current_count >= limit:
-                # Rate limit exceeded
-                return False, 0, reset_time
-            
-            # Add new entry with current timestamp as score
-            entry_id = str(uuid.uuid4())
-            self.redis.zadd(key, {entry_id: now})
-            
-            # Set expiration (cleanup)
-            self.redis.expire(key, window + 1)
-            
-            remaining -= 1  # Account for the request we just added
-            return True, remaining, reset_time
+            allowed = bool(int(results[0]))
+            remaining = max(0, int(results[1]))
+            reset_time = int(results[2])
+            return allowed, remaining, reset_time
             
         except Exception as e:
             _cb_record_failure(time.time())  # trip the breaker after repeated failures
@@ -270,12 +411,35 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         rate_limiter: RateLimiter,
         default_limit: int = 100,
         default_window: int = 60,
-        exclude_paths: Optional[list] = None
+        auth_limit: Optional[int] = None,
+        auth_window: Optional[int] = None,
+        upload_limit: Optional[int] = None,
+        upload_window: Optional[int] = None,
+        download_limit: Optional[int] = None,
+        download_window: Optional[int] = None,
+        policy_provider: Optional[Callable[[], Mapping[str, RateLimitRule]]] = None,
+        exclude_paths: Optional[list] = None,
     ):
         super().__init__(app)
         self.rate_limiter = rate_limiter
         self.default_limit = default_limit
         self.default_window = default_window
+        self.policy_provider = policy_provider
+        self._static_policy = MappingProxyType({
+            "default": RateLimitRule(default_limit, default_window),
+            "auth": RateLimitRule(
+                auth_limit if auth_limit is not None else default_limit,
+                auth_window if auth_window is not None else default_window,
+            ),
+            "upload": RateLimitRule(
+                upload_limit if upload_limit is not None else default_limit,
+                upload_window if upload_window is not None else default_window,
+            ),
+            "download": RateLimitRule(
+                download_limit if download_limit is not None else default_limit,
+                download_window if download_window is not None else default_window,
+            ),
+        })
         self.exclude_paths = exclude_paths or ["/docs", "/openapi.json", "/redoc", "/health"]
     
     def _get_client_identifier(self, request: Request) -> str:
@@ -329,42 +493,46 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not self._should_rate_limit(path):
             return await call_next(request)
         
-        # Get client identifier
+        # Resolve one deterministic class, then one rule. The provider is a bounded
+        # cache; no request performs an unconditional PostgreSQL query.
+        category = classify_api_rate_limit(request.method, path)
+        policy = self._static_policy
+        if self.policy_provider is not None:
+            try:
+                candidate = self.policy_provider()
+                if category in candidate:
+                    policy = candidate
+            except Exception:  # noqa: BLE001 - retain deployment defaults on provider failure
+                logger.warning("Could not resolve the live API rate-limit policy; using deployment defaults")
+        rule = policy.get(category, self._static_policy["default"])
         identifier = self._get_client_identifier(request)
-        
-        # Check rate limit
+
+        # Class prefixes isolate budgets: traffic in one class cannot consume another.
         allowed, remaining, reset_time = self.rate_limiter.check_rate_limit(
             identifier,
-            self.default_limit,
-            self.default_window,
-            prefix="rate_limit:api"
+            rule.limit,
+            rule.window,
+            prefix=f"rate_limit:api:{category}",
         )
-        
-        # Add rate limit headers
         headers = self.rate_limiter.get_rate_limit_headers(
-            self.default_limit,
+            rule.limit,
             remaining,
-            reset_time
+            reset_time,
         )
-        
+
         if not allowed:
-            # Rate limit exceeded - return 429
-            retry_after = reset_time - int(time.time())
+            retry_after = max(1, reset_time - int(time.time()))
             headers["Retry-After"] = str(retry_after)
-            
             return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 content={
                     "detail": "Rate limit exceeded. Please try again later.",
-                    "retry_after": retry_after
+                    "retry_after": retry_after,
                 },
-                headers=headers
+                headers=headers,
             )
-        
-        # Process request
+
         response = await call_next(request)
-        
-        # Add rate limit headers to response
         for header_name, header_value in headers.items():
             response.headers[header_name] = header_value
         
