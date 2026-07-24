@@ -145,12 +145,16 @@ def test_publication_is_serial_and_scan_auth_push_release_order_is_fail_closed()
         publish.index("Revalidate immediately before authentication"),
         publish.index("Log in to GHCR"),
         publish.index("Push the scanned image and resolve its digest"),
+        publish.index("Verify published digest is anonymously pullable"),
         publish.index("Bind release VEX to the published registry digest"),
         publish.index("Attest build provenance"),
         publish.index("Attest the SBOM"),
         publish.index("Create GitHub Release"),
     ]
     assert order == sorted(order)
+    assert 'anonymous_config="$(mktemp -d "$RUNNER_TEMP/docker-anon.XXXXXX")"' in publish
+    assert "printf '%s\\n' '{\"auths\":{}}'" in publish
+    assert 'DOCKER_CONFIG="$anonymous_config" docker pull "${IMAGE}@${DIGEST}"' in publish
     assert "steps.publish_gate.outputs.version" in publish
     assert "steps.publish_gate.outputs.image" in publish
     assert "steps.publish_gate.outputs.tag" in publish

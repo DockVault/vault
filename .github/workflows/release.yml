@@ -216,6 +216,18 @@ jobs:
           test "$resolved_latest" = "$version_digest"
           echo "digest=${version_digest}" >> "$GITHUB_OUTPUT"
 
+      - name: Verify published digest is anonymously pullable
+        shell: bash
+        env:
+          IMAGE: ${{ steps.publish_gate.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          anonymous_config="$(mktemp -d "$RUNNER_TEMP/docker-anon.XXXXXX")"
+          trap 'rm -rf "$anonymous_config"' EXIT
+          printf '%s\n' '{"auths":{}}' > "$anonymous_config/config.json"
+          DOCKER_CONFIG="$anonymous_config" docker pull "${IMAGE}@${DIGEST}"
+
       - name: Bind release VEX to the published registry digest
         env:
           IMAGE: ${{ steps.publish_gate.outputs.image }}

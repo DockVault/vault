@@ -6,7 +6,6 @@ ALLOW (default): a ZK vault is selectable, but selecting it forces an acknowledg
 """
 import os
 import subprocess
-import time
 import uuid
 
 import pytest
@@ -106,16 +105,17 @@ def test_allow_all_vaults_mode_requires_acknowledgment(page: Page, admin, admin_
     """An 'all vaults' scope reaches every ZK vault, so it too triggers the master-key acknowledgment."""
     admin.put("/settings", json={"temp_cred_allow_zk_vaults": True})
     vid = _zk_vault(admin)  # owned by admin -> in scope of an 'all' mint
+    held_vault_routes = []
     try:
-        def delay_vault_list(route):
-            time.sleep(0.75)
-            route.continue_()
-
-        page.route("**/vaults", delay_vault_list)
         _login(page, admin_creds["username"], admin_creds["password"])
-        _open_temp_modal(page)
+        page.route("**/vaults", lambda route: held_vault_routes.append(route))
+        with page.expect_request("**/vaults"):
+            _open_temp_modal(page)
         submit = page.locator('#generate-temp-creds-form button[type="submit"]')
         expect(submit).to_be_disabled()
+        assert submit.get_attribute("data-temp-scope-ready") is None
+        assert held_vault_routes, "the modal did not request the current vault list"
+        held_vault_routes.pop(0).continue_()
         page.check("#tc-scope-enable")
         page.check('input[name="tc-vault-mode"][value="all"]')
         expect(submit).to_have_attribute("data-temp-scope-ready", "true", timeout=8000)
@@ -123,6 +123,11 @@ def test_allow_all_vaults_mode_requires_acknowledgment(page: Page, admin, admin_
         expect(page.locator("#tc-zk-ack-modal")).to_be_visible(timeout=8000)
         expect(page.locator("#temp-creds-modal")).to_have_count(0)  # not minted until acknowledged
     finally:
+        for route in held_vault_routes:
+            try:
+                route.abort()
+            except Exception:
+                pass
         page.unroute("**/vaults")
         _psql(f"UPDATE vaults SET type='standard' WHERE id='{vid}';")
         admin.delete_vault(vid)

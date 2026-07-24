@@ -281,6 +281,7 @@ def test_release_scans_before_auth_and_attests_one_push_bound_registry_digest(
         publish.index("Revalidate immediately before authentication"),
         publish.index("Log in to GHCR"),
         publish.index("Push the scanned image and resolve its digest"),
+        publish.index("Verify published digest is anonymously pullable"),
         publish.index("Bind release VEX to the published registry digest"),
         publish.index("Attest build provenance"),
         publish.index("Attest the SBOM"),
@@ -308,6 +309,9 @@ def test_release_scans_before_auth_and_attests_one_push_bound_registry_digest(
     assert 'echo "digest=${resolved_version}"' not in publish
     assert publish.count("subject-digest: ${{ steps.push.outputs.digest }}") == 2
     assert publish.count("push-to-registry: true") == 2
+    assert 'anonymous_config="$(mktemp -d "$RUNNER_TEMP/docker-anon.XXXXXX")"' in publish
+    assert "printf '%s\\n' '{\"auths\":{}}'" in publish
+    assert 'DOCKER_CONFIG="$anonymous_config" docker pull "${IMAGE}@${DIGEST}"' in publish
     assert (
         "sbom-path: dockvault-${{ steps.publish_gate.outputs.tag }}.spdx.json"
         in publish
