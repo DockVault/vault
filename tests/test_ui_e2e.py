@@ -515,6 +515,9 @@ def _open_sftp_settings_tab(page: Page):
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
     page.click('.tab-btn[data-tab="sftp"]')
     expect(page.locator("#settings-tab-sftp")).to_be_visible(timeout=5000)
+    save = page.locator("#save-all-settings-btn")
+    expect(save).to_have_attribute("data-settings-ready", "true", timeout=15000)
+    expect(save).to_be_enabled()
 
 
 def test_settings_zero_knowledge_toggle_persists(logged_in: Page, admin):
