@@ -27,6 +27,11 @@ import shutil
 import traceback
 from pathlib import Path
 
+# Importing this module is itself the API launch contract (including ASGI import-string
+# launchers), so runtime settings must be installed before the app or middleware captures them.
+from app.core.config import bootstrap_entrypoint
+bootstrap_entrypoint("API")
+
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
 from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim
 from app.core import sharing_policy
@@ -45,8 +50,11 @@ from sqlalchemy.exc import IntegrityError
 from app.services.audit_logger import AuditLogger
 from app.services import log_pull  # pure helpers for the authenticated log-pull endpoint
 from app.core.security import create_access_token, verify_access_token
-from app.core.config import settings
-from app.core.endpoint_permissions import require_endpoint_permission
+from app.core.config import initialize_runtime, settings
+from app.core.endpoint_permissions import (
+    require_endpoint_permission,
+    validate_endpoint_permission_contract,
+)
 from app.core.temp_scope import require_vault_cap
 from app.api.user_management_api import router as user_management_router
 from app.core.paths import PROJECT_ROOT
@@ -318,21 +326,67 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         
         return response
 
-# General API rate limiter. The sliding-window limiter in app/core/rate_limiter.py was fully implemented
-# but never attached to the app, so the documented RATE_LIMIT_API_* knobs were inert and the whole
-# API surface had no framework throttle (only the login path and /ecc/* self-throttled). Wire it
-# here, gated on the config flag. It buckets by authenticated user when a bearer token is present,
-# else by trusted-proxy-aware IP; excludes static assets / health / docs (one SPA page load pulls
-# many static files); and fails OPEN on a Redis outage (availability over a brief throttling gap —
-# the separate fail-CLOSED login throttle is unaffected). Registered BEFORE SecurityHeadersMiddleware
-# so it sits inside it and a 429 response still carries the hardening headers on the way out.
+_RATE_LIMIT_API_CATEGORIES = ("default", "auth", "upload", "download")
+_RATE_LIMIT_API_SETTING_KEYS = tuple(
+    key
+    for category in _RATE_LIMIT_API_CATEGORIES
+    for key in (f"rate_limit_api_{category}", f"rate_limit_api_{category}_window")
+)
+
+
+def _api_rate_limit_deployment_defaults() -> dict:
+    return {key: int(getattr(settings, key)) for key in _RATE_LIMIT_API_SETTING_KEYS}
+
+
+def _load_stored_api_rate_limit_overrides() -> dict:
+    from app.core.database import SessionLocal
+    from app.core.models import SystemSetting
+
+    db = SessionLocal()
+    try:
+        row = db.query(SystemSetting).filter(SystemSetting.key == "global").first()
+        return dict(row.value) if row and row.value else {}
+    finally:
+        db.close()
+
+
+# The deployment flag is authoritative. When enabled, a five-second process-local cache
+# avoids per-request PostgreSQL reads; Settings writes replace it immediately, while the
+# bounded refresh propagates another worker's update. General API traffic preserves the
+# documented Redis-outage fail-open policy; dedicated login/vault/SFTP throttles are separate.
+_api_rate_limit_policy_cache = None
 if getattr(settings, 'rate_limit_api_enabled', True):
-    from app.core.rate_limiter import RateLimitMiddleware, rate_limiter as _api_rate_limiter
+    from app.core.rate_limiter import (
+        ApiRateLimitPolicyCache,
+        RateLimitMiddleware,
+        RateLimitRule,
+        rate_limiter as _api_rate_limiter,
+    )
+    deployment = _api_rate_limit_deployment_defaults()
+    deployment_rules = {
+        category: RateLimitRule(
+            deployment[f"rate_limit_api_{category}"],
+            deployment[f"rate_limit_api_{category}_window"],
+        )
+        for category in _RATE_LIMIT_API_CATEGORIES
+    }
+    _api_rate_limit_policy_cache = ApiRateLimitPolicyCache(
+        deployment_rules,
+        _load_stored_api_rate_limit_overrides,
+        ttl_seconds=5,
+    )
     app.add_middleware(
         RateLimitMiddleware,
         rate_limiter=_api_rate_limiter,
         default_limit=settings.rate_limit_api_default,
         default_window=settings.rate_limit_api_default_window,
+        auth_limit=settings.rate_limit_api_auth,
+        auth_window=settings.rate_limit_api_auth_window,
+        upload_limit=settings.rate_limit_api_upload,
+        upload_window=settings.rate_limit_api_upload_window,
+        download_limit=settings.rate_limit_api_download,
+        download_window=settings.rate_limit_api_download_window,
+        policy_provider=_api_rate_limit_policy_cache.get,
         exclude_paths=["/health", "/static", "/favicon.ico", "/brand-assets",
                        "/docs", "/redoc", "/openapi.json"],
     )
@@ -403,14 +457,6 @@ app.include_router(info_router)
 from app.config.branding import HEX_COLOR_RE
 from app.config.effective import BRAND_SETTINGS_KEY, set_brand_overrides
 
-# First-run gate for the ENTIRE setup surface. The setup wizard is UNAUTHENTICATED (it has
-# to run before any admin exists), so it must become unreachable the moment an instance is
-# set up — otherwise an anonymous request could reconfigure a live production instance
-# (create/alter the admin, rewrite config). "Set up" = ANY admin user exists, which every
-# production deploy has from startup (./setup-secure.sh and the SaaS portal seed the admin
-# from env). Queried WITHOUT the is_active filter on purpose: a deactivated admin still
-# means the instance is set up and must NOT re-open the wizard. Setup is done by the
-# provisioning script / portal, so the wizard is a first-run-only fallback for a bare deploy.
 # Import and include ECC router (Elliptic Curve Cryptography)
 from app.api.ecc_router import router as ecc_router
 app.include_router(ecc_router, prefix="/ecc")
@@ -1867,6 +1913,36 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Settings payload must be an object")
 
+    for managed_key in ("rate_limit_api_enabled", "rate_limit_api_deployment_defaults"):
+        if managed_key in payload:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{managed_key} is managed by the deployment environment",
+            )
+
+    from app.core.rate_limiter import (
+        API_RATE_LIMIT_MAX_REQUESTS,
+        API_RATE_LIMIT_MAX_WINDOW_SECONDS,
+    )
+    for category in _RATE_LIMIT_API_CATEGORIES:
+        for key, maximum in (
+            (f"rate_limit_api_{category}", API_RATE_LIMIT_MAX_REQUESTS),
+            (f"rate_limit_api_{category}_window", API_RATE_LIMIT_MAX_WINDOW_SECONDS),
+        ):
+            if key not in payload:
+                continue
+            value = payload[key]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                or value > maximum
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{key} must be an integer from 0 to {maximum}",
+                )
+
     for bool_key in ("zero_knowledge_enabled", "force_zero_knowledge", "force_no_remember_vault_password",
                      "sharing_enabled"):
         if bool_key in payload and not isinstance(payload[bool_key], bool):
@@ -1972,6 +2048,12 @@ async def get_settings(
     data["zk_idle_lock_minutes"] = _zk_idle_lock_minutes(db)
     # Effective Sharing master switch (default OFF) so the Settings -> Sharing toggle reflects reality.
     data["sharing_enabled"] = _sharing_enabled(db)
+    # Stored zero means "use deployment default"; expose those defaults separately so the UI
+    # can explain the effective fallback without persisting it on an unrelated save.
+    for key in _RATE_LIMIT_API_SETTING_KEYS:
+        data.setdefault(key, 0)
+    data["rate_limit_api_enabled"] = bool(settings.rate_limit_api_enabled)
+    data["rate_limit_api_deployment_defaults"] = _api_rate_limit_deployment_defaults()
     return data
 
 
@@ -2005,10 +2087,15 @@ async def update_settings(
     # whitespace value drops that override -> back to the env default.
     brand_keys = _BRAND_FIELDS & set((payload or {}).keys())
     if brand_keys:
-        # shared writer (also used by the asset uploads + the setup wizard): non-empty sets, empty
+        # Shared writer (also used by asset uploads): non-empty sets, empty
         # clears -> env default. Values were validated by _validate_brand_overrides above.
         set_brand_overrides(db, updates={key: payload[key] for key in brand_keys})
     db.commit()
+    if (
+        _api_rate_limit_policy_cache is not None
+        and any(key in (payload or {}) for key in _RATE_LIMIT_API_SETTING_KEYS)
+    ):
+        _api_rate_limit_policy_cache.replace(merged)
     try:
         AuditLogger(db).log_action(
             action="settings_updated",
@@ -2134,10 +2221,10 @@ async def send_test_email(
 # ===========================================================================
 # Authenticated, disableable log-PULL endpoint (GET /logs) + admin token mgmt.
 # Two-layer gate: the env CEILING (settings.plan_log_pull, HARD, default off) AND a
-# per-component DB flag in SystemSetting('logs'). A dedicated bearer dependency (NOT
-# require_endpoint_permission, whose catalog-miss fails OPEN) validates a LogPullToken by
+# per-component DB flag in SystemSetting('logs'). A dedicated bearer dependency (rather
+# than a user endpoint-permission group) validates a LogPullToken by
 # peppered-HMAC constant-time compare. Every "off/unknown" path returns 404 so the feature is
-# undetectable when disabled, and the response is redacted. See docs/ro2-3-phase1-build-plan.md.
+# undetectable when disabled, and the response is redacted.
 # ===========================================================================
 LOGS_SETTINGS_KEY = "logs"
 _LOG_SINK_PATH = os.environ.get("LOG_PULL_SINK_PATH", "./logs/combined.log")
@@ -5487,7 +5574,7 @@ def _effective_vault_permission(vault, perms, user) -> str:
 
 # Confidentiality tiers we recognise. Only 'standard' (server-encrypted,
 # SFTP-capable) is functional today; 'zero_knowledge' (browser crypto, web-only)
-# is a later tier — see docs/vault-zero-trust-and-sftp-design.md §2.
+# is web-only because the server never receives the browser-held decryption keys.
 VAULT_TYPES = {"standard", "zero_knowledge"}
 
 
@@ -7461,7 +7548,9 @@ async def upload_file(
                 username=str(current_user.username),
                 operation_type="upload",
                 file_name=upload_file.filename,
-                total_size=0  # Unknown at start for streaming uploads
+                total_size=0,  # Unknown at start for streaming uploads
+                temp_credential_id=getattr(current_user, "_temp_cred_id", None),
+                vault_id=str(vault_id),
             )
             _op_ok = False  # set True only after the file is fully committed (drives complete_operation)
 
@@ -8724,167 +8813,214 @@ async def download_file(
     db: Session = Depends(get_db),
     x_vault_password: Optional[str] = Header(None)
 ):
-    """
-    Download a file from a vault.
-    Requires vault password if vault is password-protected (via X-Vault-Password header).
-    Requires file password if file is password-protected.
-    """
+    """Download a file while exposing a cancellable, principal-bound operation."""
+    from app.services.activity_monitor import ProgressTracker
+
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
-    
+    operation_id = None
+    tracker = None
+    tracker_started = False
+    stream_handed_off = False
+
     try:
         # Verify vault access and password. allow_share=True: a recipient with an active
         # whole-vault share claim may open + download from the vault (read-only). SFTP
         # downloads never pass this flag.
-        vault = vault_service.get_vault(vault_id, current_user, x_vault_password,
-                                        require_password=True, allow_share=True)
-        # A path-scoped temp credential may only download a file within its file/folder scope.
+        vault = vault_service.get_vault(
+            vault_id,
+            current_user,
+            x_vault_password,
+            require_password=True,
+            allow_share=True,
+        )
         require_file_scope(db, current_user, vault_id, file_id)
-        # A view-only share recipient may see the file but not download it (denied here).
         require_download_scope(db, current_user, vault_id, file_id)
 
-        # Create operation ID for tracking downloads
         operation_id = f"download_{uuid.uuid4()}"
         start_operation(operation_id)
-        
-        try:
-            # Get file info for size (before download for event broadcasting).
-            # The file MUST belong to the vault it's requested through, so the vault
-            # password/access gate above (checked against vault_id) actually covers
-            # THIS file's vault — otherwise a member of a password-protected vault B
-            # who lacks B's password could route through an own/unprotected vault A.
-            file_record = db.query(File).filter(
-                File.id == file_id, File.vault_id == vault_id
-            ).first()
-            if not file_record:
+
+        # The file must belong to the vault used for the access/password gate.
+        file_record = db.query(File).filter(
+            File.id == file_id, File.vault_id == vault_id
+        ).first()
+        if not file_record:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File not found",
+            )
+
+        # Atomically consume a capped share download before serving bytes.
+        if str(vault_id) in (getattr(current_user, '_share_vault_scope', None) or {}):
+            if not permission_service.burn_share_download(
+                current_user,
+                vault,
+                file_record,
+                folder_ancestry(db, vault_id, file_record.folder_id),
+            ):
                 raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="File not found"
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="This share has reached its download limit.",
                 )
 
-            # Per-recipient max_downloads: consume one download against the covering share claim(s)
-            # BEFORE serving the bytes (an atomic conditional burn, so concurrent GETs can't exceed
-            # the cap). Only for a share recipient (stamped a share scope on this vault by get_vault);
-            # a no-op for owners/members/temp creds and for unlimited shares.
-            if str(vault_id) in (getattr(current_user, '_share_vault_scope', None) or {}):
-                if not permission_service.burn_share_download(
-                        current_user, vault, file_record,
-                        folder_ancestry(db, vault_id, file_record.folder_id)):
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="This share has reached its download limit.")
-
-            # Download file. allow_share=True so a whole-vault share claimant (read-only)
-            # can download; SFTP downloads keep the default (False).
-            file_content, file_name, mime_type = vault_service.download_file(
-                file_id=file_id,
-                user=current_user,
-                file_password=file_password,
-                allow_share=True,
-            )
-
-            # Zero-knowledge: the name is the client's secret. For a SEALED ZK file it's already
-            # NULL; for a LEGACY (not-yet-migrated) ZK row the plaintext is still in the DB and
-            # download_file returns it — so unconditionally use a neutral label for any
-            # server-side surface (audit, monitoring broadcast, Content-Disposition). The
-            # browser applies the real, decrypted name client-side. Standard vaults are unchanged.
-            is_zk = _is_zk_vault(vault)
-            disp_name = '(encrypted file)' if is_zk else (file_name or 'download')
-            audit_name = None if is_zk else file_name
-
-            # Audit log
-            audit_logger.log_action(
-                action='file_download',
-                status='success',
-                user=current_user,
-                resource_type='file',
-                resource_id=str(file_id),
-                details={'vault_id': str(vault_id), 'file_name': audit_name},
-                ip_address=get_client_ip(request)
-            )
-
-            # If this download came via a share claim (the recipient was stamped a share scope on this
-            # vault by get_vault; owners/members are not), record a distinct share_downloaded event.
-            if str(vault_id) in (getattr(current_user, '_share_vault_scope', None) or {}):
-                try:
-                    audit_logger.log_action(
-                        action='share_downloaded', status='success', user=current_user,
-                        resource_type='file', resource_id=str(file_id),
-                        details={'vault_id': str(vault_id)}, ip_address=get_client_ip(request))
-                except Exception:
-                    db.rollback()
-
-            # Broadcast event to monitoring WebSocket clients
-            broadcast_event({
-                "event": {
-                    "type": "download",
-                    "title": "File downloaded",
-                    "description": f"{disp_name} ({file_record.size_bytes:,} bytes) downloaded from vault",
-                    "user": current_user.username,
-                    "ip": get_client_ip(request),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "operation_id": operation_id,
-                    "completed": True
-                },
-                "traffic": {
-                    "upload": 0,
-                    "download": file_record.size_bytes
-                }
-            })
-            
-            # Use StreamingResponse for better download handling
-            # Streams in chunks to avoid loading entire file in memory for large files
-            import asyncio
-            from fastapi.responses import StreamingResponse
-            
-            async def file_streamer():
-                """Stream file content in chunks."""
-                # Stream in reasonable chunks (64KB) for efficiency
-                chunk_size = 65536
-                offset = 0
-                total_size = len(file_content)
-                
-                while offset < total_size:
-                    chunk_end = min(offset + chunk_size, total_size)
-                    chunk = file_content[offset:chunk_end]
-                    yield chunk
-                    offset = chunk_end
-                    # Yield control to event loop
-                    await asyncio.sleep(0)
-            
-            return StreamingResponse(
-                file_streamer(),
-                media_type=mime_type or 'application/octet-stream',
-                headers={
-                    'Content-Disposition': _content_disposition(disp_name),
-                    'Content-Length': str(len(file_content)),
-                    'Cache-Control': 'no-cache',
-            }
+        file_content, file_name, mime_type = vault_service.download_file(
+            file_id=file_id,
+            user=current_user,
+            file_password=file_password,
+            allow_share=True,
         )
-        
-        finally:
-            # Always end operation tracking
-            end_operation(operation_id)
-        
+
+        # Never expose a zero-knowledge file name on a server-side surface.
+        is_zk = _is_zk_vault(vault)
+        disp_name = '(encrypted file)' if is_zk else (file_name or 'download')
+        audit_name = None if is_zk else file_name
+
+        tracker = ProgressTracker()
+        tracker_started = tracker.start_operation(
+            operation_id=operation_id,
+            user_id=str(current_user.id),
+            username=str(current_user.username),
+            operation_type="download",
+            file_name=disp_name,
+            total_size=len(file_content),
+            temp_credential_id=getattr(current_user, "_temp_cred_id", None),
+            vault_id=str(vault_id),
+        ) is not None
+
+        audit_logger.log_action(
+            action='file_download',
+            status='success',
+            user=current_user,
+            resource_type='file',
+            resource_id=str(file_id),
+            details={'vault_id': str(vault_id), 'file_name': audit_name},
+            ip_address=get_client_ip(request),
+        )
+
+        if str(vault_id) in (getattr(current_user, '_share_vault_scope', None) or {}):
+            try:
+                audit_logger.log_action(
+                    action='share_downloaded',
+                    status='success',
+                    user=current_user,
+                    resource_type='file',
+                    resource_id=str(file_id),
+                    details={'vault_id': str(vault_id)},
+                    ip_address=get_client_ip(request),
+                )
+            except Exception:
+                db.rollback()
+
+        request_ip = get_client_ip(request)
+        broadcast_event({
+            "event": {
+                "type": "download",
+                "title": "Download in progress",
+                "description": f"{disp_name} ({file_record.size_bytes:,} bytes)",
+                "user": current_user.username,
+                "ip": request_ip,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "operation_id": operation_id,
+                "completed": False,
+            }
+        })
+
+        import asyncio
+        from fastapi.responses import StreamingResponse
+
+        async def file_streamer():
+            """Stream chunks until completion, disconnect, or atomic cancellation."""
+            chunk_size = 65536
+            offset = 0
+            total_size = len(file_content)
+            cancellation_observed = False
+            terminal_success = False
+            try:
+                while offset < total_size:
+                    if tracker_started and tracker.is_cancelled(operation_id):
+                        cancellation_observed = True
+                        break
+                    chunk_end = min(offset + chunk_size, total_size)
+                    yield file_content[offset:chunk_end]
+                    offset = chunk_end
+                    await asyncio.sleep(0)
+                terminal_success = offset == total_size
+            finally:
+                transition = None
+                if tracker_started and not cancellation_observed:
+                    transition = tracker.complete_operation(
+                        operation_id,
+                        success=terminal_success,
+                    )
+
+                if transition is not None:
+                    broadcast_event({
+                        "event": {
+                            "type": "download",
+                            "title": (
+                                "File downloaded" if terminal_success else "Download interrupted"
+                            ),
+                            "description": (
+                                f"{disp_name} ({offset:,} of {total_size:,} bytes transferred)"
+                            ),
+                            "user": current_user.username,
+                            "ip": request_ip,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "operation_id": operation_id,
+                            "completed": terminal_success,
+                        },
+                        "traffic": {
+                            "upload": 0,
+                            "download": offset,
+                        },
+                    })
+                elif tracker_started and tracker.is_cancelled(operation_id):
+                    # The cancellation endpoint emitted the terminal cancellation event.
+                    # This worker event confirms that the transfer loop observed it.
+                    broadcast_event({
+                        "event": {
+                            "type": "download",
+                            "title": "Download cancelled",
+                            "description": f"{disp_name} stopped after {offset:,} bytes",
+                            "user": current_user.username,
+                            "ip": request_ip,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "operation_id": operation_id,
+                            "completed": True,
+                            "cancelled": True,
+                            "worker_stopped": True,
+                        }
+                    })
+                end_operation(operation_id)
+
+        stream_handed_off = True
+        return StreamingResponse(
+            file_streamer(),
+            media_type=mime_type or 'application/octet-stream',
+            headers={
+                'Content-Disposition': _content_disposition(disp_name),
+                'Content-Length': str(len(file_content)),
+                'Cache-Control': 'no-cache',
+                'X-Operation-ID': operation_id,
+            },
+        )
+
     except (PasswordRequiredError, InvalidPasswordError) as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(e)
+            detail=str(e),
         )
     except FileNotFoundError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
+            detail=str(e),
         )
     except HTTPException:
-        # Explicit HTTP errors (e.g. 404 file-not-found) must propagate as-is
-        # rather than be re-wrapped into a generic 500 below.
         raise
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
-        # Broadcast error event
         try:
             broadcast_event({
                 "event": {
@@ -8893,20 +9029,26 @@ async def download_file(
                     "description": f"Download error: {str(e)[:100]}",
                     "user": current_user.username if current_user else "unknown",
                     "ip": get_client_ip(request),
-                    "timestamp": datetime.now(timezone.utc).isoformat()
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             })
-        except:
-            pass  # Don't fail the error handler
+        except Exception:
+            pass
         import traceback
         print(f"[ERROR] Download failed - Exception type: {type(e).__name__}")
         print(f"[ERROR] Download failed - Exception message: {str(e)}")
         traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to download file: {str(e)}"
+            detail=f"Failed to download file: {str(e)}",
         )
-
+    finally:
+        # Before response handoff, this function owns cleanup. Afterwards the
+        # streaming generator owns the terminal transition and local active set.
+        if operation_id and not stream_handed_off:
+            if tracker_started:
+                tracker.complete_operation(operation_id, success=False)
+            end_operation(operation_id)
 
 @app.post("/vaults/{vault_id}/files/{file_id}/delete")
 @require_endpoint_permission("FILE_DELETE")
@@ -9453,6 +9595,7 @@ async def zk_seal_names(
 
 
 @app.get("/dashboard/stats", response_model=DashboardStats)
+@require_endpoint_permission("DASHBOARD_VIEW")
 async def get_dashboard_stats(
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
@@ -9653,6 +9796,7 @@ async def cancel_operation(
     if tracker.cancel_operation(
         operation_id,
         requester_id=str(current_user.id),
+        requester_temp_credential_id=getattr(current_user, "_temp_cred_id", None),
         # A temp credential is not a full admin: it may cancel only its own operations.
         is_admin=(current_user.role == RoleEnum.ADMIN and not getattr(current_user, "_is_temp_session", False)),
     ):
@@ -9858,39 +10002,36 @@ async def get_permission_groups(
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
-    """
-    Get all available functionality groups (admin only).
-    Returns comprehensive list of all endpoint groups that can be granted to users.
-    """
-    from app.core.api_catalog import API_CATALOG, RoleRequirement
-    
+    """Return the functionality groups an administrator can actually grant."""
+    from app.core.api_catalog import GRANTABLE_API_CATALOG
+
     groups = []
-    for group_name, group in API_CATALOG.items():
-        # Convert endpoints to dict format
+    for group in GRANTABLE_API_CATALOG.values():
         endpoints = [
             {
-                'method': ep.method,
-                'path': ep.path,
-                'description': ep.description,
-                'role_requirement': ep.role_requirement.value,
-                'requires_ownership': ep.requires_ownership,
-                'resource_type': ep.resource_type,
-                'ui_widgets': ep.ui_widgets
+                "method": endpoint.method,
+                "path": endpoint.path,
+                "description": endpoint.description,
+                "role_requirement": endpoint.role_requirement.value,
+                "requires_ownership": endpoint.requires_ownership,
+                "resource_type": endpoint.resource_type,
+                "ui_widgets": endpoint.ui_widgets,
             }
-            for ep in group.endpoints
+            for endpoint in group.endpoints
         ]
-        
         groups.append(EndpointPermissionGroupResponse(
             name=group.name,
             display_name=group.display_name,
             description=group.description,
             ui_section=group.ui_section,
-            default_for_roles=[role.value if hasattr(role, 'value') else str(role) for role in group.default_for_roles],
+            default_for_roles=[
+                role.value if hasattr(role, "value") else str(role)
+                for role in group.default_for_roles
+            ],
             endpoint_count=len(group.endpoints),
             endpoints=endpoints,
-            dependencies=group.dependencies
+            dependencies=group.dependencies,
         ))
-    
     return groups
 
 
@@ -9900,50 +10041,42 @@ async def get_user_permissions(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Get all permissions for a specific user.
-    Users can access their own permissions, admins can access any user's permissions.
-    For admin users, returns all permission groups as granted.
-    """
+    """Return grantable permissions for the current user or an admin-selected user."""
+    from app.core.api_catalog import GRANTABLE_API_CATALOG
     from app.core.endpoint_permissions import get_user_permissions as get_perms
-    from app.core.api_catalog import API_CATALOG
-    
-    # Authorization: users see only their own permissions; a real (interactive) admin can see anyone's.
-    # A temporary credential — even one owned by an admin — is treated as non-admin here, so it can
-    # only read its OWN permission set (consistent with require_interactive_admin).
-    _perms_is_admin = current_user.role == RoleEnum.ADMIN and not getattr(current_user, "_is_temp_session", False)
-    if not _perms_is_admin and current_user.id != user_id:
+
+    is_interactive_admin = (
+        current_user.role == RoleEnum.ADMIN
+        and not getattr(current_user, "_is_temp_session", False)
+    )
+    if not is_interactive_admin and current_user.id != user_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only view your own permissions"
+            detail="You can only view your own permissions",
         )
-    
-    # Get target user
+
     target_user = db.query(User).filter(User.id == user_id).first()
     if not target_user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"User {user_id} not found"
+            detail=f"User {user_id} not found",
         )
-    
-    # Get user's permissions from database
+
     permissions = get_perms(str(user_id), db)
-    
-    # Group by endpoint_group to get granted groups
-    granted_groups = list(set(perm['endpoint_group'] for perm in permissions))
-    
-    # If target user is admin, they have ALL permissions by role
+    granted_groups = sorted({
+        permission["endpoint_group"]
+        for permission in permissions
+    })
     if target_user.role == RoleEnum.ADMIN:
-        # Return all groups from API_CATALOG as granted for admins
-        granted_groups = list(API_CATALOG.keys())
-    
+        granted_groups = list(GRANTABLE_API_CATALOG)
+
     return UserPermissionsResponse(
         user_id=target_user.id,
         username=target_user.username,
         email=target_user.email,
         role=str(target_user.role),
         granted_groups=granted_groups,
-        permissions=permissions
+        permissions=permissions,
     )
 
 
@@ -9954,62 +10087,59 @@ async def grant_user_permission(
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
-    """
-    Grant a functionality group to a user (admin only).
-    """
+    """Atomically grant a functionality group and its dependencies."""
+    from app.core.api_catalog import GRANTABLE_API_CATALOG
     from app.core.endpoint_permissions import grant_endpoint_permission
-    from app.core.api_catalog import API_CATALOG
-    
-    # Validate user exists
+
     target_user = db.query(User).filter(User.id == user_id).first()
     if not target_user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"User {user_id} not found"
+            detail=f"User {user_id} not found",
         )
-    
-    # Validate group exists
-    if request.endpoint_group not in API_CATALOG:
+    if request.endpoint_group not in GRANTABLE_API_CATALOG:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid endpoint group: {request.endpoint_group}"
+            detail=f"Invalid endpoint group: {request.endpoint_group}",
         )
-    
+
     try:
-        # Grant permission
-        grant_endpoint_permission(
+        granted_groups = grant_endpoint_permission(
             user_id=str(user_id),
             endpoint_group=request.endpoint_group,
             db=db,
-            granted_by=str(current_user.id)
+            granted_by=str(current_user.id),
+            commit=False,
         )
-        
-        # Log the action
-        audit_logger = AuditLogger(db)
-        audit_logger.log_action(
-            action='GRANT_PERMISSION',
-            status='success',
+
+        AuditLogger(db).log_action(
+            action="GRANT_PERMISSION",
+            status="success",
             user=current_user,
-            resource_type='permission',
+            resource_type="permission",
             resource_id=str(user_id),
             details={
-                'endpoint_group': request.endpoint_group,
-                'target_user': target_user.username
-            }
+                "endpoint_group": request.endpoint_group,
+                "granted_groups": granted_groups,
+                "target_user": target_user.username,
+            },
         )
-        
-        group = API_CATALOG[request.endpoint_group]
+
+        group = GRANTABLE_API_CATALOG[request.endpoint_group]
         return {
-            'status': 'success',
-            'message': f'Granted {group.display_name} permissions to {target_user.username}',
-            'endpoint_group': request.endpoint_group,
-            'endpoint_count': len(group.endpoints)
+            "status": "success",
+            "message": f"Granted {group.display_name} permissions to {target_user.username}",
+            "endpoint_group": request.endpoint_group,
+            "endpoint_count": len(group.endpoints),
+            "granted_groups": granted_groups,
         }
-    
-    except Exception as e:
+    except Exception as exc:
+        db.rollback()
+        error_id = str(uuid.uuid4())
+        print(f"[ERROR] permission grant failed (ID: {error_id}): {exc}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error granting permission: {str(e)}"
+            detail=f"Permission update failed (reference: {error_id})",
         )
 
 
@@ -10020,63 +10150,64 @@ async def revoke_user_permission(
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
-    """
-    Revoke a functionality group from a user (admin only).
-    """
+    """Atomically revoke a group and every group that depends on it."""
+    from app.core.api_catalog import GRANTABLE_API_CATALOG
     from app.core.endpoint_permissions import revoke_endpoint_permission
-    from app.core.api_catalog import API_CATALOG
-    
-    # Validate user exists
+
     target_user = db.query(User).filter(User.id == user_id).first()
     if not target_user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"User {user_id} not found"
+            detail=f"User {user_id} not found",
         )
-    
-    # Validate group exists
-    if group_name not in API_CATALOG:
+    if group_name not in GRANTABLE_API_CATALOG:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid endpoint group: {group_name}"
-        )
-    
-    try:
-        # Revoke permission
-        revoke_endpoint_permission(
-            user_id=str(user_id),
-            endpoint_group=group_name,
-            db=db
-        )
-        
-        # Log the action
-        audit_logger = AuditLogger(db)
-        audit_logger.log_action(
-            action='REVOKE_PERMISSION',
-            status='success',
-            user=current_user,
-            resource_type='permission',
-            resource_id=str(user_id),
-            details={
-                'endpoint_group': group_name,
-                'target_user': target_user.username
-            }
-        )
-        
-        group = API_CATALOG[group_name]
-        return {
-            'status': 'success',
-            'message': f'Revoked {group.display_name} permissions from {target_user.username}',
-            'endpoint_group': group_name,
-            'endpoint_count': len(group.endpoints)
-        }
-    
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error revoking permission: {str(e)}"
+            detail=f"Invalid endpoint group: {group_name}",
         )
 
+    try:
+        revoked_groups = revoke_endpoint_permission(
+            user_id=str(user_id),
+            endpoint_group=group_name,
+            db=db,
+            commit=False,
+        )
+
+        AuditLogger(db).log_action(
+            action="REVOKE_PERMISSION",
+            status="success",
+            user=current_user,
+            resource_type="permission",
+            resource_id=str(user_id),
+            details={
+                "endpoint_group": group_name,
+                "revoked_groups": revoked_groups,
+                "target_user": target_user.username,
+            },
+        )
+
+        group = GRANTABLE_API_CATALOG[group_name]
+        return {
+            "status": "success",
+            "message": f"Revoked {group.display_name} permissions from {target_user.username}",
+            "endpoint_group": group_name,
+            "endpoint_count": len(group.endpoints),
+            "revoked_groups": revoked_groups,
+        }
+    except Exception as exc:
+        db.rollback()
+        error_id = str(uuid.uuid4())
+        print(f"[ERROR] permission revoke failed (ID: {error_id}): {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Permission update failed (reference: {error_id})",
+        )
+
+
+# All imported routers and monolithic routes have now applied their guards.
+# Refuse to construct an application whose grant UI and runtime gates diverge.
+validate_endpoint_permission_contract()
 
 # ============================================================================
 # STARTUP/SHUTDOWN & STATIC FILES
@@ -10164,8 +10295,8 @@ async def cleanup_expired_sessions():
 def _seed_admin_user():
     """
     Bootstrap an admin user from ADMIN_USERNAME/ADMIN_PASSWORD when no users
-    exist yet. This lets env-configured (Docker) deployments log in without
-    running the interactive setup wizard. No-op if an admin already exists or
+    exist yet. This lets env-configured deployments log in without manual database
+    bootstrap. No-op if an admin already exists or
     no admin password is configured.
     """
     try:
@@ -10322,7 +10453,7 @@ def _run_lightweight_migrations():
             # public key; team_key_version = the team-KEYPAIR epoch, SEPARATE from dek_version
             # (bumps only on a team-keypair rotation, not a routine DEK rotation). team_key (the
             # DEK->team-pubkey wrap map) + key_wrapping_mode already exist. Additive; default
-            # mode stays 'direct' so existing vaults are untouched. See docs/vault-zk-team-key-design.md.
+            # mode stays 'direct' so existing vaults retain their direct member wraps.
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS team_public_key TEXT",
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS team_key_version INTEGER NOT NULL DEFAULT 1",
             # Zero-knowledge filename/MIME encryption (client-side, vault DEK). ZK file/folder
@@ -10542,6 +10673,7 @@ def _add_name_uniqueness():
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
     # Startup
+    initialize_runtime()
     init_db()
     print("Database initialized")
     _run_lightweight_migrations()

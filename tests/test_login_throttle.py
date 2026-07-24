@@ -7,7 +7,7 @@ Two checks, both end-to-end over HTTP:
   throttle actually fires (it isn't answering 401 forever).
 
 * test_login_throttle_survives_redis_outage (opt-in: VAULT_REDIS_OUTAGE_TEST=1)
-  - with the Redis container stopped, the throttle must FAIL CLOSED to the
+  - with the Redis container paused, the throttle must FAIL CLOSED to the
   DB-backed fallback: repeated failed logins still reach 429 instead of
   unlimited 401s. This proves a Redis outage no longer silently disables
   throttling.
@@ -72,10 +72,10 @@ def test_login_throttle_enforced(base_url):
 @pytest.mark.skipif(
     os.environ.get("VAULT_REDIS_OUTAGE_TEST") not in ("1", "true", "yes"),
     reason="opt-in: set VAULT_REDIS_OUTAGE_TEST=1 to run the Redis-outage "
-           "fail-closed test (it stops/starts the Redis container via docker)",
+           "fail-closed test (it pauses/unpauses the Redis container via docker)",
 )
 def test_login_throttle_survives_redis_outage(base_url):
-    """With Redis DOWN the login throttle must FAIL CLOSED to the DB-backed
+    """With Redis UNRESPONSIVE the login throttle must FAIL CLOSED to the DB-backed
     fallback: repeated failed logins still reach 429 instead of unlimited 401s."""
     container = os.environ.get("VAULT_REDIS_CONTAINER", "vault-redis")
 
@@ -95,12 +95,12 @@ def test_login_throttle_survives_redis_outage(base_url):
         except Exception:  # noqa: BLE001
             return False
 
-    # The stop + its assert live INSIDE the try so the finally always runs once a
-    # stop has been attempted (a non-zero `docker stop` can still leave the
-    # container stopped — we must always attempt the restart).
+    # The pause + its assert live INSIDE the try so the finally always runs once a
+    # pause has been attempted (a non-zero command can still leave the container
+    # paused — we must always attempt the unpause).
     try:
-        stop = _docker("stop", container)
-        assert stop.returncode == 0, f"could not stop redis container: {stop.stderr}"
+        pause = _docker("pause", container)
+        assert pause.returncode == 0, f"could not pause redis container: {pause.stderr}"
         # Give the app a moment to start seeing Redis as unavailable.
         time.sleep(2)
         client = ApiClient(base_url)
@@ -109,7 +109,14 @@ def test_login_throttle_survives_redis_outage(base_url):
         codes = _hammer_until_429(client, username, max_attempts=max_attempts)
         if 429 not in codes and all(c == 401 for c in codes):
             # Same caveat as the always-on test: an absurdly high configured limit
-            # can't be hit in max_attempts. Skip rather than report a false failure.
+            # can't be hit in max_attempts on an arbitrary local deployment. The
+            # disposable same-commit job sets the shipped limit explicitly, so a
+            # clean run of 401s there proves the DB fallback failed open.
+            if os.environ.get("VAULT_SAME_COMMIT_CI", "").lower() in {"1", "true", "yes"}:
+                pytest.fail(
+                    "login throttle failed open during the Redis outage; "
+                    f"same-commit CI saw only 401 responses in {max_attempts} attempts"
+                )
             pytest.skip(
                 f"throttle did not engage within {max_attempts} attempts during the "
                 "outage; rate_limit_login_attempts is likely configured above that."
@@ -121,7 +128,7 @@ def test_login_throttle_survives_redis_outage(base_url):
     finally:
         # Always bring Redis back, even if the assertions above failed, so the
         # rest of the suite (and the live stack) keeps working.
-        _docker("start", container)
+        _docker("unpause", container)
         # First confirm the container answers, then that the APP re-established
         # its connection pool (not merely that HTTP responded).
         for _ in range(30):
@@ -137,21 +144,21 @@ def test_login_throttle_survives_redis_outage(base_url):
 @pytest.mark.skipif(
     os.environ.get("VAULT_REDIS_OUTAGE_TEST") not in ("1", "true", "yes"),
     reason="opt-in: set VAULT_REDIS_OUTAGE_TEST=1 to run the fast-fail-closed test "
-           "(it stops/starts the Redis container via docker)",
+           "(it pauses/unpauses the Redis container via docker)",
 )
 def test_login_fast_fail_closed_during_redis_outage(base_url):
-    """With Redis DOWN, logins must fail over to the DB throttle FAST. Before the fix every
+    """With Redis UNRESPONSIVE, logins must fail over to the DB throttle FAST. Before the fix every
     request blocked on the 5s Redis connect timeout, so logins crawled during an outage. With
-    the short connect timeout + the rate-limiter circuit breaker, the breaker trips after a few
-    failures and subsequent logins skip Redis entirely — so the TAIL attempts complete quickly."""
+    the short connect timeout + the rate-limiter circuit breaker, the breaker trips after the first
+    failure and subsequent logins skip Redis entirely — so the TAIL attempts complete quickly."""
     container = os.environ.get("VAULT_REDIS_CONTAINER", "vault-redis")
 
     def _docker(*args):
         return subprocess.run(["docker", *args], capture_output=True, text=True)
 
     try:
-        stop = _docker("stop", container)
-        assert stop.returncode == 0, f"could not stop redis container: {stop.stderr}"
+        pause = _docker("pause", container)
+        assert pause.returncode == 0, f"could not pause redis container: {pause.stderr}"
         time.sleep(2)  # let the app start seeing Redis as unavailable
 
         client = ApiClient(base_url)
@@ -162,7 +169,7 @@ def test_login_fast_fail_closed_during_redis_outage(base_url):
             client.post("/auth/login", json={"username": username, "password": "wrong-pw-xyz"})
             timings.append(time.time() - t0)
 
-        # The circuit breaker opens after a few consecutive Redis failures, so the LAST few
+        # The circuit breaker opens after the first Redis failure, so the LAST few
         # attempts must not pay any Redis stall — comfortably under the old 5s-per-request
         # floor and well within the breaker's cooldown window. (Generous bound to stay robust
         # on a busy CI host; the real expectation is ~sub-second once the breaker is open.)
@@ -171,7 +178,7 @@ def test_login_fast_fail_closed_during_redis_outage(base_url):
             f"logins slow during the Redis outage (circuit breaker not fast-failing): {timings}"
         )
     finally:
-        _docker("start", container)
+        _docker("unpause", container)
         for _ in range(30):
             try:
                 if requests.get(f"{base_url}/health", timeout=5).json().get("redis") == "connected":

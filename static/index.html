@@ -1158,6 +1158,49 @@
                                 </div>
                             </div>
                         </div>
+                        <div class="card mt-lg">
+                            <div class="card-header">
+                                <h3>General API Rate Limits</h3>
+                            </div>
+                            <div class="p-lg">
+                                <p id="setting-rate-limit-api-status" class="text-secondary mb-md"></p>
+                                <p class="text-secondary text-sm mb-md">These Redis-backed budgets are separate from the dedicated login, vault-unlock, and SFTP security throttles. Enter 0 or leave blank to use the deployment value.</p>
+                                <div class="grid grid-cols-2 gap-md">
+                                    <div class="form-group">
+                                        <label for="setting-rate-limit-api-default">Default requests</label>
+                                        <input type="number" id="setting-rate-limit-api-default" class="form-control" min="0" max="1000000">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-rate-limit-api-default-window">Default window (seconds)</label>
+                                        <input type="number" id="setting-rate-limit-api-default-window" class="form-control" min="0" max="86400">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-rate-limit-api-auth">Authentication requests</label>
+                                        <input type="number" id="setting-rate-limit-api-auth" class="form-control" min="0" max="1000000">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-rate-limit-api-auth-window">Authentication window (seconds)</label>
+                                        <input type="number" id="setting-rate-limit-api-auth-window" class="form-control" min="0" max="86400">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-rate-limit-api-upload">Upload requests</label>
+                                        <input type="number" id="setting-rate-limit-api-upload" class="form-control" min="0" max="1000000">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-rate-limit-api-upload-window">Upload window (seconds)</label>
+                                        <input type="number" id="setting-rate-limit-api-upload-window" class="form-control" min="0" max="86400">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-rate-limit-api-download">Download requests</label>
+                                        <input type="number" id="setting-rate-limit-api-download" class="form-control" min="0" max="1000000">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-rate-limit-api-download-window">Download window (seconds)</label>
+                                        <input type="number" id="setting-rate-limit-api-download-window" class="form-control" min="0" max="86400">
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Storage Settings Tab -->

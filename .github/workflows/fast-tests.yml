@@ -1,0 +1,63 @@
+name: Fast tests
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fast-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: Python 3.14 / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: tests/requirements-test.lock
+
+      - name: Install locked test dependencies
+        run: |
+          python -m pip install -r tests/requirements-test.lock
+          python -m pip check
+
+      - name: Parse the shell setup shim
+        shell: bash
+        run: bash -n setup-secure.sh
+
+      - name: Parse the PowerShell setup shim
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "setup-secure.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors) { throw ($errors | Out-String) }
+
+      - name: Compile the management tool
+        run: python -m py_compile dockvault.py
+
+      - name: Run the offline fast lane
+        run: python -m pytest -m "unit and not docker" --maxfail=1

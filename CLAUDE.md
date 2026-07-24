@@ -41,7 +41,9 @@ ships inside the built image (`Dockerfile` does `COPY . .`, filtered only by
 (skips cleanly if none is up). See `tests/README.md`. Quick start:
 
 ```
-cd tests && python -m venv .venv && .venv/Scripts/pip install -r requirements-test.txt
-.venv/Scripts/python -m pytest              # API tests (needs the vault running)
-.venv/Scripts/python -m pytest -m "not ui"  # skip browser tests
+python -m venv tests/.venv
+tests/.venv/Scripts/python -m pip install -r tests/requirements-test.lock
+tests/.venv/Scripts/python -m pip check
+tests/.venv/Scripts/python -m pytest              # API tests (needs the vault running)
+tests/.venv/Scripts/python -m pytest -m "not ui"  # skip browser tests
 ```

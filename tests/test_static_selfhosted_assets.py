@@ -13,18 +13,11 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "static"
 
-
-@pytest.fixture(scope="session", autouse=True)
-def _require_running_container():
-    """Override the suite-wide live-container guard for this module.
-
-    These are pure static-file checks — they need no running vault, so they must
-    run even when the container is down (exactly the moment a broken/tampered
-    vendored asset would otherwise slip through unnoticed)."""
-    return None
 
 
 # The customer-facing page actually served by app/api/api_server.py: GET / serves

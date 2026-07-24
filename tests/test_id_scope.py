@@ -7,6 +7,10 @@ framework needed -- the module is stdlib-only on purpose.
 import os
 import sys
 
+import pytest
+
+pytestmark = pytest.mark.unit
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core.id_scope import (  # noqa: E402

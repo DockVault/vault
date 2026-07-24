@@ -15,12 +15,10 @@ both covered here:
 The limit is BYTES, not characters — UTF-8 spends 2 on Greek/accented letters and up to 4 on
 emoji — so the byte/character distinction is asserted explicitly.
 
-Pure helpers: no running vault, no network. conftest.py's session-scoped autouse
-`_require_running_container` fixture would otherwise skip this whole file when no container is
-up, which matters more here than elsewhere: the running stack never calls verify_password (a
+Pure helpers: no running vault, no network. The module's ``unit`` marker bypasses the live-stack
+guard, which matters more here than elsewhere: the running stack never calls verify_password (a
 plain-env deployment sets no MASTER_PASSWORD_HASH, so check_legacy_mode() short-circuits), so
-this file is the ONLY coverage of the clamp. It overrides that fixture below so the tests run —
-and fail — regardless of whether a stack happens to be up.
+this file is the only coverage of the clamp and must run with the stack down.
 """
 import importlib.util
 import os
@@ -28,6 +26,8 @@ import sys
 
 import bcrypt
 import pytest
+
+pytestmark = pytest.mark.unit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -43,15 +43,6 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # (upper + lower + digit + symbol) so the prompt never falls through to input().
 GOOD_PASSWORD = "Correct-Horse-Batt9!!"
 
-
-@pytest.fixture(scope="session", autouse=True)
-def _require_running_container():
-    """Override conftest's container gate — see the module docstring.
-
-    A same-named fixture in a test module takes precedence over the conftest one, so these tests
-    execute with the stack down instead of reporting a green run in which nothing was checked.
-    """
-    return None
 
 
 _SETUP_MODULE = None

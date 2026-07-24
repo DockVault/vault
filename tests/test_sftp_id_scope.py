@@ -6,7 +6,6 @@ as non-existent (no listing, stat, download, upload, rename, delete, mkdir, or r
 """
 import contextlib
 import os
-import socket
 import uuid
 
 import pytest
@@ -19,18 +18,7 @@ SFTP_HOST = os.environ.get("VAULT_SFTP_HOST", "127.0.0.1")
 SFTP_PORT = int(os.environ.get("VAULT_SFTP_PORT", "2322"))
 
 
-def _sftp_reachable() -> bool:
-    try:
-        with socket.create_connection((SFTP_HOST, SFTP_PORT), timeout=5):
-            return True
-    except OSError:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _sftp_reachable(),
-    reason=f"SFTP server not reachable at {SFTP_HOST}:{SFTP_PORT}",
-)
+pytestmark = pytest.mark.sftp
 
 
 @contextlib.contextmanager

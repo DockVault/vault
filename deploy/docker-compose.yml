@@ -18,7 +18,7 @@ name: dockvault-vault
 
 services:
   vault-db:
-    image: postgres:15-alpine
+    image: postgres:15-alpine@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
     container_name: vault-db
     environment:
       POSTGRES_USER: sftp_user
@@ -51,7 +51,7 @@ services:
     restart: unless-stopped
 
   vault-redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     container_name: vault-redis
     environment:
       # Optional Redis auth. Empty (the default) => no password (unchanged behaviour). Set
@@ -105,9 +105,6 @@ services:
       # Hours a resumable chunked-upload session lives before its buffered chunks become
       # eligible for cleanup. Operators reclaim sooner via POST /api/maintenance/upload-sessions/cleanup.
       CHUNK_SESSION_TTL_HOURS: "24"
-      # read-only root fs: the first-run setup wizard writes its state file; point it at a
-      # writable path (tmpfs /app/run below) instead of the read-only app root.
-      SETUP_STATE_FILE: /app/run/setup_state.json
     command: ["python", "-m", "app.api.api_server"]
     # Loopback-only by default: this trial serves the full product (login form, bearer tokens,
     # server-side-decrypted files) over PLAINTEXT HTTP, so it must not be reachable off this host.
@@ -128,8 +125,7 @@ services:
       # non-root process can write here under the read-only root fs.
       - vault_brand:/app/brand
     # Hardening: non-root (Dockerfile USER) + no escalation + read-only root fs.
-    # storage/logs/keys/brand are volumes; /app/certs (unmounted), /app/run (setup-wizard
-    # state), /app/deployments (wizard-written .env/lock), + /tmp ride tmpfs.
+    # storage/logs/keys/brand are volumes; /app/certs (unmounted) and /tmp ride tmpfs.
     # mode=1777 so the non-root app (uid 10001) can write these even on a Linux
     # Docker engine that defaults compose tmpfs mounts to root-owned 0755
     # (Docker Desktop defaults to 1777, so this is a no-op there).
@@ -152,8 +148,6 @@ services:
     tmpfs:
       - /tmp:mode=1777
       - /app/certs:mode=1777
-      - /app/run:mode=1777
-      - /app/deployments:mode=1777
     # Resource ceilings so a heavy/compromised vault can't exhaust the shared host (co-tenant DoS
     # on the shared-worker SaaS topology). Generous dev/standalone defaults; the SaaS control plane
     # sizes these per plan tier at provision time. NOTE: the download path materialises the whole
@@ -180,7 +174,6 @@ services:
       SFTP_HOST: 0.0.0.0
       SFTP_PORT: "2222"
       ENVIRONMENT: development
-      SETUP_STATE_FILE: /app/run/setup_state.json  # read-only root fs: writable state path
     command: ["python", "-m", "app.sftp.sftp_server"]
     # This service runs SFTP, not the HTTP API. Check the port is bound via
     # /proc (port 2222 = hex 08AE) instead of opening a socket — a raw TCP
@@ -210,7 +203,7 @@ services:
       - vault_keys:/app/keys
     # Hardening: non-root (Dockerfile USER) + no escalation + read-only root fs.
     # storage/keys are volumes; this service doesn't mount the logs volume, so
-    # /app/logs (+ /app/certs, /app/run + /app/deployments wizard state, /tmp) ride tmpfs.
+    # /app/logs, /app/certs, and /tmp ride tmpfs.
     # mode=1777 so the non-root app can write on a Linux engine (see vault-api).
     security_opt:
       - no-new-privileges:true
@@ -229,8 +222,6 @@ services:
       - /tmp:mode=1777
       - /app/logs:mode=1777
       - /app/certs:mode=1777
-      - /app/run:mode=1777
-      - /app/deployments:mode=1777
     # SFTP also streams large files; keep headroom above max_file_size_mb (see vault-api note).
     mem_limit: 2g
     pids_limit: 512

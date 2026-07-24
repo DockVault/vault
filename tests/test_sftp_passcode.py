@@ -8,7 +8,6 @@ service (skips if unreachable — e.g. an API-only stack).
 """
 import contextlib
 import os
-import socket
 import subprocess
 
 import pytest
@@ -23,15 +22,7 @@ SFTP_PORT = int(os.environ.get("VAULT_SFTP_PORT", "2322"))
 _PW = "Sup3r-Secret-PW-9!"
 
 
-def _reachable():
-    try:
-        with socket.create_connection((SFTP_HOST, SFTP_PORT), timeout=5):
-            return True
-    except OSError:
-        return False
-
-
-pytestmark = pytest.mark.skipif(not _reachable(), reason=f"SFTP not reachable at {SFTP_HOST}:{SFTP_PORT}")
+pytestmark = pytest.mark.sftp
 
 
 def _psql(sql):

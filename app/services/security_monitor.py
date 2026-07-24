@@ -223,6 +223,14 @@ class SecurityMonitor:
         in Redis, incremented once here per event with a window TTL. If Redis is unavailable we fall
         back to the in-memory deque count (degrading to at-most-this-request rather than raising and
         breaking the calling auth/delete path)."""
+        # Auth and general API throttling share a process-wide Redis circuit breaker.
+        # Once either has observed an outage, do not repeat the same potentially slow
+        # DNS/connect attempt from monitoring on the same request.
+        from app.core.rate_limiter import redis_circuit_open
+        if redis_circuit_open():
+            self._signal_detection_degraded()
+            return self._count_recent_events(fallback_deque, window_seconds)
+
         try:
             count = self.redis.incrby(redis_key, amount)
             # Set the TTL only when THIS increment created the key (its value equals the amount we
@@ -432,7 +440,8 @@ class SecurityMonitor:
         username: Optional[str] = None,
         user_id: Optional[str] = None,
         ip_address: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None
+        details: Optional[Dict[str, Any]] = None,
+        broadcast: bool = True,
     ):
         """
         Raise a security alert.
@@ -445,6 +454,7 @@ class SecurityMonitor:
             user_id: User ID involved (optional)
             ip_address: IP address involved (optional)
             details: Additional details dictionary
+            broadcast: Publish the alert to Redis for live dashboards
         """
         # Dedup / cooldown: within the cooldown window, collapse a repeat of the SAME
         # (event_type, username, ip_address) into the existing alert -- bump a repeat counter instead
@@ -510,7 +520,8 @@ class SecurityMonitor:
         # TODO: Send webhook notification if configured
         
         # Broadcast to monitoring dashboard via Redis pub/sub
-        self._broadcast_alert(alert)
+        if broadcast:
+            self._broadcast_alert(alert)
         return alert
 
     def _signal_detection_degraded(self) -> None:
@@ -534,6 +545,9 @@ class SecurityMonitor:
                          "brute-force / bulk-operation thresholds cannot be evaluated. Preventive "
                          "controls (account lockout, rate-limit DB fallback) still apply."),
                 details={'reason': 'redis_counter_unavailable'},
+                # Redis is already known down; do not make a second blocking Redis call
+                # while recording the durable degradation alert.
+                broadcast=False,
             )
             # Advance the throttle only AFTER a successful emit, so a transient DB failure during the
             # outage retries on the next fallback request rather than suppressing the operator's

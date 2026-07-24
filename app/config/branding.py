@@ -160,8 +160,8 @@ class BrandingConfig(BaseSettings):
     
     # Defaults point at the real bundled DockVault assets (static/assets/*.png). The UI shell
     # consumes these via /branding, so a default MUST resolve to a file that exists
-    # — the old /static/logo.svg / /static/favicon.ico paths had no backing file. The
-    # an admin upload path (POST /settings/brand/asset/{slot}) that overrides these at
+    # — earlier defaults had no backing files. An admin upload endpoint
+    # (POST /settings/brand/asset/{slot}) overrides these at
     # runtime (served from /brand-assets/); these defaults are the DockVault logo/favicon.
     logo_url: str = Field(
         default="/static/assets/logo.png",

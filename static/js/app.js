@@ -2123,7 +2123,8 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
 })();
 
 // Open the modal that lets the user choose the credential's validity/expiry
-function showGenerateTempCreds() {
+let _tcModalLoadSeq = 0;
+async function showGenerateTempCreds() {
     const modal = document.getElementById('generate-temp-creds-modal');
     if (!modal) {
         // Fallback: modal markup missing, generate with server defaults
@@ -2143,10 +2144,28 @@ function showGenerateTempCreds() {
 
     initTempScopeBuilder();      // wire the scope-builder controls once
     resetTempScopeBuilder();     // reset to defaults
-    _tcLoadPasscodePolicy();     // fetch the effective temp-passcode policy (shapes the controls)
-    populateTempScopeVaults();   // fill the selectable vault list
-
+    const submitBtn = modal.querySelector('button[type="submit"]');
+    const loadSeq = ++_tcModalLoadSeq;
+    if (submitBtn) {
+        submitBtn.disabled = true;
+        delete submitBtn.dataset.tempScopeReady;
+    }
+    _tcVaultObjs = {};           // never let a prior modal session influence this mint
     modal.classList.add('active');
+
+    const [policyLoaded, vaultsLoaded] = await Promise.all([
+        _tcLoadPasscodePolicy(),
+        populateTempScopeVaults(),
+    ]);
+    if (loadSeq !== _tcModalLoadSeq || !modal.classList.contains('active')) return;
+    if (policyLoaded && vaultsLoaded) {
+        if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.dataset.tempScopeReady = 'true';
+        }
+    } else {
+        _tcShowError('Could not load the current vault policy. Close and try again before generating credentials.');
+    }
 }
 
 // Effective temp-passcode policy (from GET /temp-passcode-policy) — shapes the mint controls:
@@ -2155,12 +2174,16 @@ let _tcPasscodePolicy = null;
 async function _tcLoadPasscodePolicy() {
     _tcPasscodePolicy = null;  // clear the prior session's policy so the section stays hidden until the fresh fetch lands
     _tcSyncPasscodeUI();
+    let loaded = false;
     try {
         _tcPasscodePolicy = await apiRequest('/temp-passcode-policy', { silent: true });
+        loaded = !!_tcPasscodePolicy && typeof _tcPasscodePolicy === 'object';
+        if (!loaded) _tcPasscodePolicy = null;
     } catch (_) {
         _tcPasscodePolicy = null;  // fail closed: no policy => passcode controls stay hidden
     }
     _tcSyncPasscodeUI();
+    return loaded;
 }
 
 let _tempScopeWired = false;
@@ -2267,15 +2290,16 @@ function resetTempScopeBuilder() {
 
 async function populateTempScopeVaults() {
     const list = document.getElementById('tc-vault-list');
-    if (!list) return;
+    _tcVaultObjs = {};
+    if (!list) return false;
     list.innerHTML = '<div class="text-tertiary text-sm p-sm">Loading vaults…</div>';
     try {
         const vaults = await apiRequest('/vaults', { silent: true });
-        _tcVaultObjs = {};
-        if (Array.isArray(vaults)) vaults.forEach(v => { _tcVaultObjs[v.id] = v; });
-        if (!Array.isArray(vaults) || !vaults.length) {
+        if (!Array.isArray(vaults)) throw new Error('Invalid vault response');
+        vaults.forEach(v => { _tcVaultObjs[v.id] = v; });
+        if (!vaults.length) {
             list.innerHTML = '<div class="text-tertiary text-sm p-sm">No vaults available to grant.</div>';
-            return;
+            return true;
         }
         // A password-protected vault can only be granted over SFTP if the issuer proves
         // its password here (the credential then carries that proof — SFTP has no per-vault
@@ -2288,8 +2312,11 @@ async function populateTempScopeVaults() {
             <input type="password" class="tc-vault-pw form-control" data-vault="${escapeHtml(v.id)}" placeholder="Vault password — required to grant access to this password-protected vault" autocomplete="new-password" style="margin:2px 0 10px 26px;max-width:340px;">` : ''}`).join('');
         _tcDecoratePasscodeRows(vaults);   // append per-vault passcode controls via DOM (no innerHTML)
         _tcSyncPasscodeUI();               // reflect the current passcode-toggle state onto the rows
+        return true;
     } catch (_) {
+        _tcVaultObjs = {};
         list.innerHTML = '<div class="text-tertiary text-sm p-sm">Could not load vaults.</div>';
+        return false;
     }
 }
 
@@ -3722,7 +3749,7 @@ function renderPermissionToggles(userId, userPerms) {
                         <input type="checkbox" class="perm-toggle" data-group="${g.name}" ${granted.has(g.name) ? 'checked' : ''} ${isAdminTarget ? 'disabled' : ''}>
                         <span class="perm-text">
                             <span class="perm-name">${escapeHtml(g.display_name)}</span>
-                            <span class="perm-desc">${escapeHtml(g.description || '')}${g.dependencies && g.dependencies.length ? ` · needs ${g.dependencies.join(', ')}` : ''}</span>
+                            <span class="perm-desc">${escapeHtml(g.description || '')}${g.dependencies && g.dependencies.length ? ` · also grants ${g.dependencies.map(dep => escapeHtml(dep)).join(', ')}` : ''}</span>
                         </span>
                     </label>`).join('')}
             </div>`).join('')}`;
@@ -3734,11 +3761,16 @@ function renderPermissionToggles(userId, userPerms) {
 
 async function togglePermission(userId, group, grant, cb) {
     try {
+        let result;
         if (grant) {
-            await apiRequest(`/permissions/users/${userId}/grant`, { method: 'POST', body: JSON.stringify({ endpoint_group: group }) });
+            result = await apiRequest(`/permissions/users/${userId}/grant`, { method: 'POST', body: JSON.stringify({ endpoint_group: group }) });
         } else {
-            await apiRequest(`/permissions/users/${userId}/revoke/${group}`, { method: 'DELETE' });
+            result = await apiRequest(`/permissions/users/${userId}/revoke/${group}`, { method: 'DELETE' });
         }
+        const changedGroups = new Set(grant ? result.granted_groups : result.revoked_groups);
+        document.querySelectorAll('.perm-toggle').forEach(toggle => {
+            if (changedGroups.has(toggle.dataset.group)) toggle.checked = grant;
+        });
     } catch (e) {
         showError('Failed to update permission: ' + e.message);
         if (cb) cb.checked = !grant; // revert the toggle on failure
@@ -4583,12 +4615,23 @@ async function initSettings() {
     wireBrandColorInputs();
     wireBrandAssetUploads();
 
-    // Load current settings
-    await loadSettings();
-    loadLogSettings();  // silent; no-op for non-admins
-    
-    // Attach event listeners
+    // Attach handlers before loading begins, but keep Save inert until every
+    // asynchronous settings dependency has finished populating the form.
+    const saveBtn = document.getElementById('save-all-settings-btn');
+    if (saveBtn) {
+        saveBtn.disabled = true;
+        delete saveBtn.dataset.settingsReady;
+    }
     attachSettingsListeners();
+    try {
+        await loadSettings();
+    } finally {
+        if (saveBtn) {
+            saveBtn.disabled = false;
+            saveBtn.dataset.settingsReady = 'true';
+        }
+    }
+    loadLogSettings();  // silent; no-op for non-admins
     
     // Load storage statistics
     loadStorageStats();
@@ -5234,6 +5277,29 @@ async function loadSettings() {
         document.getElementById('setting-session-timeout').value = (settings.session_timeout > 0) ? settings.session_timeout : '';
         document.getElementById('setting-max-login-attempts').value = (settings.max_login_attempts > 0) ? settings.max_login_attempts : '';
         document.getElementById('setting-lockout-duration').value = (settings.lockout_duration > 0) ? settings.lockout_duration : '';
+        const apiRateDefaults = settings.rate_limit_api_deployment_defaults || {};
+        const apiRateFields = [
+            ['rate_limit_api_default', 'setting-rate-limit-api-default'],
+            ['rate_limit_api_default_window', 'setting-rate-limit-api-default-window'],
+            ['rate_limit_api_auth', 'setting-rate-limit-api-auth'],
+            ['rate_limit_api_auth_window', 'setting-rate-limit-api-auth-window'],
+            ['rate_limit_api_upload', 'setting-rate-limit-api-upload'],
+            ['rate_limit_api_upload_window', 'setting-rate-limit-api-upload-window'],
+            ['rate_limit_api_download', 'setting-rate-limit-api-download'],
+            ['rate_limit_api_download_window', 'setting-rate-limit-api-download-window'],
+        ];
+        for (const [key, id] of apiRateFields) {
+            const el = document.getElementById(id);
+            if (!el) continue;
+            el.value = (settings[key] > 0) ? settings[key] : '';
+            if (apiRateDefaults[key] > 0) el.placeholder = `Deployment default: ${apiRateDefaults[key]}`;
+        }
+        const apiRateStatus = document.getElementById('setting-rate-limit-api-status');
+        if (apiRateStatus) {
+            apiRateStatus.textContent = settings.rate_limit_api_enabled
+                ? 'General API rate limiting is enabled by the deployment; saved changes apply live.'
+                : 'General API rate limiting is disabled by the deployment; saved values remain inactive until an operator enables it.';
+        }
         
         // Storage
         // Show the actual stored quota, or BLANK when unset/0 (which the backend treats as
@@ -5345,6 +5411,14 @@ async function saveAllSettings() {
             session_timeout: parseInt(document.getElementById('setting-session-timeout').value) || 0,
             max_login_attempts: parseInt(document.getElementById('setting-max-login-attempts').value) || 0,
             lockout_duration: parseInt(document.getElementById('setting-lockout-duration').value) || 0,
+            rate_limit_api_default: parseInt(document.getElementById('setting-rate-limit-api-default').value) || 0,
+            rate_limit_api_default_window: parseInt(document.getElementById('setting-rate-limit-api-default-window').value) || 0,
+            rate_limit_api_auth: parseInt(document.getElementById('setting-rate-limit-api-auth').value) || 0,
+            rate_limit_api_auth_window: parseInt(document.getElementById('setting-rate-limit-api-auth-window').value) || 0,
+            rate_limit_api_upload: parseInt(document.getElementById('setting-rate-limit-api-upload').value) || 0,
+            rate_limit_api_upload_window: parseInt(document.getElementById('setting-rate-limit-api-upload-window').value) || 0,
+            rate_limit_api_download: parseInt(document.getElementById('setting-rate-limit-api-download').value) || 0,
+            rate_limit_api_download_window: parseInt(document.getElementById('setting-rate-limit-api-download-window').value) || 0,
             
             // Storage
             // Blank -> 0 (unlimited); the backend enforces a positive value and ignores 0.
@@ -8798,14 +8872,14 @@ const uploadManager = {
             // failure), flag that it won't survive a reload while it's still in flight.
             const noResume = it.isZk && it.resumePersisted === false && it.resumeWarning
                 && it.status !== 'done' && it.status !== 'error' && it.status !== 'needs-file';
-            const sub = it.status === 'error' ? `<div class="up-error">${escapeHtml ? escapeHtml(it.error || 'Upload failed') : (it.error || 'Upload failed')}</div>`
+            const sub = it.status === 'error' ? `<div class="up-error">${escapeHtml(it.error || 'Upload failed')}</div>`
                 : it.status === 'needs-file' ? `<div class="up-sub">${it.isZk ? 'Encrypted data isn\'t on this device — cancel and upload again' : 'Paused — click Resume and re-select the file'}</div>`
                 : `<div class="up-sub">${statusLabel} · ${pct}% · ${size}${noResume ? ' · <span class="up-warn">not resumable</span>' : ''}</div>`;
 
             return `
               <div class="up-row" data-up-row="${it.id}">
                 <div class="up-main">
-                  <div class="up-name" title="${escapeHtml ? escapeHtml(it.fileName) : it.fileName}">${escapeHtml ? escapeHtml(it.fileName) : it.fileName}</div>
+                  <div class="up-name" title="${escapeHtml(it.fileName)}">${escapeHtml(it.fileName)}</div>
                   ${sub}
                   <div class="up-bar"><div class="${barClass}" style="width:${pct}%"></div></div>
                 </div>
@@ -9990,16 +10064,6 @@ function copyToClipboard(elementId) {
     });
 }
 
-// Utility: Escape HTML
-function escapeHtml(unsafe) {
-    if (!unsafe) return '';
-    return unsafe
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
-}
 
 // ============================================================================
 // VIEW CLEANUP & RESOURCE MANAGEMENT
@@ -10413,6 +10477,11 @@ document.addEventListener('DOMContentLoaded', () => {
         generateTempCredsForm.addEventListener('submit', (e) => {
             e.preventDefault();
             _tcHideError();  // clear any prior inline error at the start of each attempt
+            const submitBtn = generateTempCredsForm.querySelector('button[type="submit"]');
+            if (!submitBtn || submitBtn.dataset.tempScopeReady !== 'true') {
+                _tcShowError('Wait for the current vault policy to finish loading before generating credentials.');
+                return;
+            }
 
             const minutesInput = document.getElementById('temp-cred-validity-minutes');
             const endInput = document.getElementById('temp-cred-end-datetime');

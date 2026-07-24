@@ -6,7 +6,6 @@ unregistered/duplicate keys, password-auth toggle (key-only), sftp_enabled toggl
 key deletion revokes access, and non-admin self-service key management.
 """
 import os
-import socket
 import subprocess
 import contextlib
 
@@ -18,15 +17,7 @@ SFTP_HOST = os.environ.get("VAULT_SFTP_HOST", "127.0.0.1")
 SFTP_PORT = int(os.environ.get("VAULT_SFTP_PORT", "2322"))
 
 
-def _reachable() -> bool:
-    try:
-        with socket.create_connection((SFTP_HOST, SFTP_PORT), timeout=5):
-            return True
-    except OSError:
-        return False
-
-
-pytestmark = pytest.mark.skipif(not _reachable(), reason=f"SFTP not reachable at {SFTP_HOST}:{SFTP_PORT}")
+pytestmark = pytest.mark.sftp
 
 # A refused/failed SSH auth surfaces as one of these.
 _AUTH_ERR = (paramiko.SSHException, EOFError, OSError)

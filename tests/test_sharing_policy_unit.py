@@ -7,6 +7,10 @@ No app import beyond the pure module, no running vault — mirrors test_temp_pas
 import os
 import sys
 
+import pytest
+
+pytestmark = pytest.mark.unit
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import sharing_policy as sp  # noqa: E402

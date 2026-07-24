@@ -3,7 +3,7 @@ Custom SFTP server implementation using Paramiko.
 
 Implements secure SFTP with vault support and hierarchical access control.
 
-Design (Standard-vault SFTP, see docs/vault-zero-trust-and-sftp-design.md §1):
+Standard-vault SFTP security model:
   * The SFTP client IS the UI; we expose a *virtual* tree — the principal's
     accessible vaults as top-level folders, their folders/files inside
     (``/Finance-Vault/report.pdf``). There is no real on-disk directory the
@@ -47,6 +47,10 @@ from typing import Optional, Dict, List
 import uuid
 import redis
 import json
+
+if __name__ == "__main__":
+    from app.core.config import bootstrap_entrypoint
+    bootstrap_entrypoint("SFTP")
 
 from app.core.database import get_db_context
 from app.core.models import User, ActiveSession, Vault, Folder, File

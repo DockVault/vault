@@ -1,0 +1,91 @@
+name: Test preflight
+
+on:
+  workflow_call:
+    inputs:
+      expected_sha:
+        description: Commit that every release gate must test
+        required: false
+        type: string
+        default: ""
+    outputs:
+      test-count:
+        description: Strictly collected test count for downstream result accounting
+        value: ${{ jobs.preflight.outputs.test-count }}
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Strict collection and offline tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      test-count: ${{ steps.collection.outputs.test_count }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify requested commit
+        if: ${{ inputs.expected_sha != '' }}
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            tests/requirements-test.lock
+
+      - name: Install locked test dependencies
+        run: python -m pip install -r tests/requirements-test.lock
+
+      - name: Verify and audit the production lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp requirements.lock "$RUNNER_TEMP/requirements.lock.checked"
+          rm requirements.lock
+          CUSTOM_COMPILE_COMMAND="python -m piptools compile --generate-hashes --strip-extras --output-file requirements.lock requirements.txt" \
+            python -m piptools compile \
+              --generate-hashes \
+              --strip-extras \
+              --output-file requirements.lock \
+              requirements.txt
+          cmp requirements.lock "$RUNNER_TEMP/requirements.lock.checked"
+          python -m pip install --force-reinstall --require-hashes -r requirements.lock
+          python -m pip check
+          python -m pip_audit \
+            --require-hashes \
+            --disable-pip \
+            -r requirements.lock
+
+      - name: Collect the strict full suite
+        id: collection
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pytest --collect-only -q 2>&1 | tee pytest-collection.txt
+          python - <<'PY' > test-count.txt
+          import re
+          import sys
+          from pathlib import Path
+
+          output = Path("pytest-collection.txt").read_text(encoding="utf-8")
+          matches = re.findall(r"^(\d+) tests? collected in .+$", output, re.MULTILINE)
+          if len(matches) != 1 or int(matches[0]) == 0:
+              sys.exit("could not determine one non-zero strict collection count")
+          print(matches[0])
+          PY
+          echo "test_count=$(cat test-count.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Run the offline fast lane
+        run: python -m pytest -m "unit and not docker" --maxfail=1

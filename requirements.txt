@@ -1,5 +1,9 @@
-# Reconstructed from the service's imports (no requirements.txt existed).
-# Pins align with the orchestrator's proven pydantic-v2 stack where shared.
+# Human-edited direct production dependency input.
+# Regenerate the deployable lock with:
+#   python -m piptools compile --generate-hashes --strip-extras --output-file requirements.lock requirements.txt
+#
+# Docker and CI install requirements.lock with --require-hashes; do not install this input
+# directly in production. Pins align with the orchestrator's proven pydantic-v2 stack where shared.
 
 # Web framework + server
 # fastapi 0.115 / starlette >=0.40 close CVE-2024-47874 (unbounded multipart buffering -> OOM DoS on

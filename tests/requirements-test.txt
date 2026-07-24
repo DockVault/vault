@@ -1,18 +1,43 @@
-# Test dependencies for the DockVault vault-service integration suite.
-# These run on the HOST (not in the container) and exercise the live API/UI
-# at http://localhost:8200.
+# Cross-platform dependency input for the DockVault host-side pytest suites.
+# Host tests import application modules, so this file carries an explicit host-import subset at
+# production versions in addition to the test tools. Server-only and optional OS-keyring packages
+# stay in the Linux production lock; the Fast workflow installs this lock on both Linux and
+# Windows.
 #
-# Install:  python -m venv .venv && .venv\Scripts\pip install -r requirements-test.txt
+# Resolve:  pip-compile --strip-extras --output-file requirements-test.lock requirements-test.txt
+# Install:  python -m venv .venv
+#           .venv\Scripts\pip install -r requirements-test.lock
+#           .venv\Scripts\pip check
 # Browsers: .venv\Scripts\playwright install chromium
+#
+# Linux preflight and full-suite CI additionally install ../requirements.lock with
+# --require-hashes so the deployable environment and Uvicorn extras are verified too.
+
+# Application packages imported by host-side tests. Keep these exact versions synchronized with
+# requirements.txt; tests/test_supply_chain_contract.py enforces the subset and generated lock.
+fastapi==0.139.2
+starlette==1.3.1
+python-multipart==0.0.32
+pydantic==2.13.4
+pydantic-settings==2.14.2
+python-dotenv==1.2.2
+email-validator==2.3.0
+sqlalchemy==2.0.51
+psycopg2-binary==2.9.12
+redis==8.0.1
+paramiko==5.0.0
+cryptography==49.0.0
+argon2-cffi==25.1.0
+bcrypt==5.0.0
+PyJWT==2.13.0
+
+# Test runners, clients, and supply-chain tooling.
 pytest>=9.1.1,<10.0
 requests>=2.34.2
 playwright>=1.61.0
 pytest-playwright>=0.8.0
 websocket-client>=1.9.0
-paramiko>=3.4  # SFTP client for the web<->SFTP round-trip tests
-# Direct imports of test_master_password_limit.py and the modules it loads. They also arrive as
-# paramiko transitives, but declaring them keeps the versions under test from drifting with
-# paramiko's resolver — bcrypt in particular, whose >=5.0 behaviour that file asserts.
-bcrypt>=5.0
-cryptography>=44  # app/core/startup_security.py + scripts/setup_master_password.py
-python-dotenv>=1.2.2  # imported by scripts/setup_master_password.py, which test_master_password_limit.py loads
+
+# Preflight regenerates and audits the production lock with these pinned supply-chain tools.
+pip-tools==7.6.0
+pip-audit==2.10.1

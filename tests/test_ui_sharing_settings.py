@@ -26,6 +26,12 @@ def _open_sharing_settings(page: Page):
     expect(page.locator("#settings-section")).to_be_visible()
     page.click('.tab-btn[data-tab="sharing"]')
     expect(page.locator("#settings-tab-sharing")).to_be_visible()
+    # initSettings deliberately keeps Save disabled while /settings, /groups, and the other
+    # asynchronous form dependencies populate controls. Do not mutate a switch or open a picker
+    # until that boundary is complete, or the late load can overwrite the test's interaction.
+    save = page.locator("#save-all-settings-btn")
+    expect(save).to_have_attribute("data-settings-ready", "true")
+    expect(save).to_be_enabled()
 
 
 @pytest.fixture

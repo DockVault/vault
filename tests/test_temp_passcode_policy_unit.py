@@ -7,6 +7,10 @@ running vault — mirrors test_log_pull_helpers.py.
 import os
 import sys
 
+import pytest
+
+pytestmark = pytest.mark.unit
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import temp_passcode_policy as tpp  # noqa: E402

@@ -25,7 +25,9 @@
 version: 2
 updates:
   - package-ecosystem: "pip"
-    directory: "/"
+    directories:
+      - "/"
+      - "/tests"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
@@ -69,6 +71,14 @@ updates:
   # build the slim image has no compiler for.
   - package-ecosystem: "docker"
     directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Postgres and Redis are declared in both Compose variants under deploy/. Their immutable
+  # manifest-list digests preserve multi-architecture pulls while still requiring an explicit,
+  # reviewable update when the upstream tag moves.
+  - package-ecosystem: "docker-compose"
+    directory: "/deploy"
     schedule:
       interval: "weekly"
 

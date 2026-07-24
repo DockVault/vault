@@ -7,6 +7,8 @@ only its prefix), and disables it. Cleans up the minted token.
 import pytest
 from playwright.sync_api import Page, expect
 
+from conftest import skip_for_older_deployment
+
 
 def _endpoint_present(admin):
     return admin.get("/settings/logs").status_code == 200
@@ -34,7 +36,7 @@ def _open_log_tab(page: Page):
 
 def test_log_access_tab_generate_and_disable(page: Page, admin_creds, admin):
     if not _endpoint_present(admin):
-        pytest.skip("running vault image predates the log-pull endpoint")
+        skip_for_older_deployment("running vault image predates the log-pull endpoint")
     if not _ceiling_on(admin):
         pytest.skip("the mint UI is now gated on the log ceiling; needs a ceiling-on instance")
 
@@ -82,7 +84,7 @@ def test_log_access_tab_generate_and_disable(page: Page, admin_creds, admin):
 
 def test_flag_toggle_persists(page: Page, admin_creds, admin):
     if not _endpoint_present(admin):
-        pytest.skip("running vault image predates the log-pull endpoint")
+        skip_for_older_deployment("running vault image predates the log-pull endpoint")
     import time
     before = admin.get("/settings/logs").json().get("flags", {})
     try:
@@ -109,7 +111,7 @@ def test_flag_toggle_persists(page: Page, admin_creds, admin):
 
 def test_stealth_toggle_persists(page: Page, admin_creds, admin):
     if not _endpoint_present(admin):
-        pytest.skip("running vault image predates the log-pull endpoint")
+        skip_for_older_deployment("running vault image predates the log-pull endpoint")
     import time
     before = bool(admin.get("/settings/logs").json().get("stealth_404", False))
     try:
@@ -137,7 +139,7 @@ def test_settings_logs_reports_ceiling(admin):
     """Backend signal the UI gates on: GET /settings/logs exposes a boolean `ceiling` + the
     per-component flags. No policy change here — the endpoint stays default-off."""
     if not _endpoint_present(admin):
-        pytest.skip("running vault image predates the log-pull endpoint")
+        skip_for_older_deployment("running vault image predates the log-pull endpoint")
     body = admin.get("/settings/logs").json()
     assert isinstance(body.get("ceiling"), bool)
     assert isinstance(body.get("flags"), dict)
@@ -148,7 +150,7 @@ def test_log_gating_ceiling_off_disables_generator(page: Page, admin_creds, admi
     """Ceiling OFF: the UI must NOT hand out a token/curl for an endpoint that only 404s. The
     Generate button is disabled and an actionable note names the two env vars to set."""
     if not _endpoint_present(admin):
-        pytest.skip("running vault image predates the log-pull endpoint")
+        skip_for_older_deployment("running vault image predates the log-pull endpoint")
     if _ceiling_on(admin):
         pytest.skip("this instance has the log ceiling ON; needs a ceiling-off instance")
     _login(page, admin_creds["username"], admin_creds["password"])
@@ -167,7 +169,7 @@ def test_log_gating_ceiling_on_component_hint_and_reveal_warning(page: Page, adm
     admin to tick one; and minting a token scoped to a NOT-enabled component surfaces a distinct
     'not enabled … returns 404' warning next to the curl (the second common 404 cause)."""
     if not _endpoint_present(admin):
-        pytest.skip("running vault image predates the log-pull endpoint")
+        skip_for_older_deployment("running vault image predates the log-pull endpoint")
     if not _ceiling_on(admin):
         pytest.skip("this instance has the log ceiling OFF; needs a ceiling-on instance")
     before = admin.get("/settings/logs").json().get("flags", {})

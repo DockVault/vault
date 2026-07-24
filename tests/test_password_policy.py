@@ -2,6 +2,10 @@
 import importlib.util
 import pathlib
 
+import pytest
+
+pytestmark = pytest.mark.unit
+
 _p = pathlib.Path(__file__).resolve().parents[1] / "app" / "core" / "password_policy.py"
 _spec = importlib.util.spec_from_file_location("password_policy_under_test", _p)
 pp = importlib.util.module_from_spec(_spec)

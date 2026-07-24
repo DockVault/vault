@@ -10,7 +10,8 @@ Privacy / safety contract (all HARD requirements):
     known"; it NEVER raises, blocks a request, or shows an error to the user.
   * No telemetry — the request carries NO instance identifier, account data, or even the current
     version: just a plain unauthenticated GET with a generic User-Agent. The only thing GitHub
-    learns is the egress IP, inherent to any outbound HTTP (documented in README / SECURITY.md).
+    learns is the egress IP, inherent to any outbound HTTP (documented in README.md and
+    .github/SECURITY.md).
   * SUPPRESSED for a control-plane-managed deployment (``managed_deployment``), which upgrades via
     operator promote, not self-service — so the banner never shows a CTA the customer can't use.
 """

@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import jwt  # PyJWT (maintained); HS256-only. jwt.encode/decode signatures match the prior jose usage.
 
-from app.core.config import settings
+from app.core.config import initialize_runtime, runtime_is_initialized, settings
 
 
 # Argon2 password hasher (winner of Password Hashing Competition)
@@ -31,8 +31,16 @@ password_hasher = PasswordHasher(
     salt_len=16  # Length of salt in bytes
 )
 
-# Fernet encryption for files at rest
-fernet = Fernet(settings.encryption_key.encode())
+def _runtime_settings():
+    """Resolve validated settings when a helper operation is first requested."""
+    if not runtime_is_initialized():
+        initialize_runtime(interactive=False)
+    return settings
+
+
+def _fernet():
+    """Resolve file encryption only when a cryptographic operation is requested."""
+    return Fernet(_runtime_settings().encryption_key.encode())
 
 # --- AES-256-GCM chunked at-rest stream (format version 0x10) ---------------
 # The legacy at-rest format is a global-key Fernet chunk stream (encrypt_chunk /
@@ -55,12 +63,13 @@ fernet = Fernet(settings.encryption_key.encode())
 # header). Zero-knowledge vaults are unaffected (their blobs are stored verbatim);
 # their swap-resistance is the client's own AEAD + the server-stored checksum, not this
 # AAD (the server holds no key for a ZK vault).
-_GCM_STREAM_ROOT_KEY = HKDF(
-    algorithm=hashes.SHA256(),
-    length=32,
-    salt=b'dockvault-gcm-chunk-stream-key-v1',
-    info=b'at-rest-content',
-).derive(settings.encryption_key.encode())
+def _gcm_stream_root_key():
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b'dockvault-gcm-chunk-stream-key-v1',
+        info=b'at-rest-content',
+    ).derive(_runtime_settings().encryption_key.encode())
 
 # Detected by comparing the FULL magic (all of GCM_STREAM_MAGIC), not a fixed-length prefix.
 GCM_STREAM_MAGIC = b'DockVault'
@@ -90,7 +99,7 @@ def _gcm_stream_subkey(vault_id, file_id) -> bytes:
         length=32,
         salt=b'dockvault-gcm-chunk-subkey-v1',
         info=_uuid_bytes(vault_id) + _uuid_bytes(file_id),
-    ).derive(_GCM_STREAM_ROOT_KEY)
+    ).derive(_gcm_stream_root_key())
 
 
 class GcmChunkStreamCodec:
@@ -192,7 +201,7 @@ def decrypt_gcm_chunk_stream(file_handle, vault_id, file_id) -> bytes:
 # encrypted IN THE BROWSER under the per-vault DEK (which the server never holds). Such
 # blobs are stored verbatim in the SAME enc_name/enc_mime columns but carry the marker
 # prefix below so the server can tell them apart and never tries (and fails) to decrypt
-# them. See docs/vault-zk-name-encryption.md and static/js/ecc_crypto.js.
+# them. The wire format must remain aligned with static/js/ecc_crypto.js.
 #
 # ZK_NAME_PREFIX MUST match the prefix the browser writes (ecc_crypto.js encryptName):
 # enc_name/enc_mime for a ZK object = ZK_NAME_PREFIX + base64(iv||ciphertext+tag).
@@ -212,14 +221,18 @@ def is_zk_sealed_name(token) -> bool:
     return bool(token) and str(token).startswith(ZK_NAME_PREFIXES)
 
 
-_NAME_ENC_ROOT = HKDF(
-    algorithm=hashes.SHA256(), length=32,
-    salt=b'dockvault-name-enc-key-v1', info=b'filename-mime',
-).derive(settings.encryption_key.encode())
-_NAME_BI_ROOT = HKDF(
-    algorithm=hashes.SHA256(), length=32,
-    salt=b'dockvault-name-bi-key-v1', info=b'filename-blind-index',
-).derive(settings.encryption_key.encode())
+def _name_encryption_root():
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32,
+        salt=b'dockvault-name-enc-key-v1', info=b'filename-mime',
+    ).derive(_runtime_settings().encryption_key.encode())
+
+
+def _name_blind_index_root():
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32,
+        salt=b'dockvault-name-bi-key-v1', info=b'filename-blind-index',
+    ).derive(_runtime_settings().encryption_key.encode())
 
 
 def _name_object_key(vault_id, obj_id) -> bytes:
@@ -227,7 +240,7 @@ def _name_object_key(vault_id, obj_id) -> bytes:
         algorithm=hashes.SHA256(), length=32,
         salt=b'dockvault-name-obj-v1',
         info=_uuid_bytes(vault_id) + _uuid_bytes(obj_id),
-    ).derive(_NAME_ENC_ROOT)
+    ).derive(_name_encryption_root())
 
 
 def _name_field_aad(field: str, vault_id, obj_id) -> bytes:
@@ -258,7 +271,7 @@ def name_blind_index(vault_id, name: str) -> str:
     key = HKDF(
         algorithm=hashes.SHA256(), length=32,
         salt=b'dockvault-name-bi-vault-v1', info=_uuid_bytes(vault_id),
-    ).derive(_NAME_BI_ROOT)
+    ).derive(_name_blind_index_root())
     return hmac.new(key, name.encode('utf-8'), hashlib.sha256).hexdigest()
 
 
@@ -411,7 +424,7 @@ def encrypt_file_content(content: bytes) -> bytes:
         EncryptionError: If encryption fails
     """
     try:
-        return fernet.encrypt(content)
+        return _fernet().encrypt(content)
     except Exception as e:
         raise EncryptionError(f"Failed to encrypt content: {str(e)}")
 
@@ -431,7 +444,7 @@ def encrypt_chunk(chunk: bytes) -> bytes:
         EncryptionError: If encryption fails
     """
     try:
-        encrypted = fernet.encrypt(chunk)
+        encrypted = _fernet().encrypt(chunk)
         # Prepend chunk length for streaming decryption (4 bytes, big-endian)
         import struct
         length_header = struct.pack('>I', len(encrypted))
@@ -470,7 +483,7 @@ def decrypt_chunk_stream(file_handle):
                 raise EncryptionError("Incomplete chunk in encrypted file")
             
             # Decrypt and yield
-            decrypted = fernet.decrypt(encrypted_chunk)
+            decrypted = _fernet().decrypt(encrypted_chunk)
             yield decrypted
     except Exception as e:
         if "Incomplete chunk" in str(e):
@@ -492,7 +505,7 @@ def decrypt_file_content(encrypted_content: bytes) -> bytes:
         EncryptionError: If decryption fails
     """
     try:
-        return fernet.decrypt(encrypted_content)
+        return _fernet().decrypt(encrypted_content)
     except Exception as e:
         raise EncryptionError(f"Failed to decrypt content: {str(e)}")
 
@@ -508,7 +521,7 @@ def encrypt_string(plain_text: str) -> str:
         Encrypted string (base64 encoded)
     """
     try:
-        encrypted = fernet.encrypt(plain_text.encode())
+        encrypted = _fernet().encrypt(plain_text.encode())
         return encrypted.decode()
     except Exception as e:
         raise EncryptionError(f"Failed to encrypt string: {str(e)}")
@@ -525,7 +538,7 @@ def decrypt_string(encrypted_text: str) -> str:
         Decrypted plain text string
     """
     try:
-        decrypted = fernet.decrypt(encrypted_text.encode())
+        decrypted = _fernet().decrypt(encrypted_text.encode())
         return decrypted.decode()
     except Exception as e:
         raise EncryptionError(f"Failed to decrypt string: {str(e)}")
@@ -578,15 +591,15 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
         expire = datetime.now(timezone.utc) + expires_delta
     else:
         expire = datetime.now(timezone.utc) + timedelta(
-            minutes=settings.jwt_access_token_expire_minutes
+            minutes=_runtime_settings().jwt_access_token_expire_minutes
         )
     
     to_encode.update({"exp": expire, "iat": datetime.now(timezone.utc)})
     
     encoded_jwt = jwt.encode(
         to_encode,
-        settings.jwt_secret_key,
-        algorithm=settings.jwt_algorithm
+        _runtime_settings().jwt_secret_key,
+        algorithm=_runtime_settings().jwt_algorithm
     )
     
     return encoded_jwt
@@ -605,8 +618,8 @@ def verify_access_token(token: str) -> Optional[dict]:
     try:
         payload = jwt.decode(
             token,
-            settings.jwt_secret_key,
-            algorithms=[settings.jwt_algorithm]
+            _runtime_settings().jwt_secret_key,
+            algorithms=[_runtime_settings().jwt_algorithm]
         )
         return payload
     except jwt.PyJWTError:

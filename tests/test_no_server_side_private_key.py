@@ -10,6 +10,10 @@ wiring mistake could turn into a zero-knowledge-breaking server-side key path.
 import re
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.unit
+
 _APP_DIR = Path(__file__).resolve().parent.parent
 
 # Server-side private-key / plaintext-DEK helper names that must NOT appear in live server code.
