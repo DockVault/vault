@@ -8872,14 +8872,14 @@ const uploadManager = {
             // failure), flag that it won't survive a reload while it's still in flight.
             const noResume = it.isZk && it.resumePersisted === false && it.resumeWarning
                 && it.status !== 'done' && it.status !== 'error' && it.status !== 'needs-file';
-            const sub = it.status === 'error' ? `<div class="up-error">${escapeHtml ? escapeHtml(it.error || 'Upload failed') : (it.error || 'Upload failed')}</div>`
+            const sub = it.status === 'error' ? `<div class="up-error">${escapeHtml(it.error || 'Upload failed')}</div>`
                 : it.status === 'needs-file' ? `<div class="up-sub">${it.isZk ? 'Encrypted data isn\'t on this device — cancel and upload again' : 'Paused — click Resume and re-select the file'}</div>`
                 : `<div class="up-sub">${statusLabel} · ${pct}% · ${size}${noResume ? ' · <span class="up-warn">not resumable</span>' : ''}</div>`;
 
             return `
               <div class="up-row" data-up-row="${it.id}">
                 <div class="up-main">
-                  <div class="up-name" title="${escapeHtml ? escapeHtml(it.fileName) : it.fileName}">${escapeHtml ? escapeHtml(it.fileName) : it.fileName}</div>
+                  <div class="up-name" title="${escapeHtml(it.fileName)}">${escapeHtml(it.fileName)}</div>
                   ${sub}
                   <div class="up-bar"><div class="${barClass}" style="width:${pct}%"></div></div>
                 </div>
@@ -10064,16 +10064,6 @@ function copyToClipboard(elementId) {
     });
 }
 
-// Utility: Escape HTML
-function escapeHtml(unsafe) {
-    if (!unsafe) return '';
-    return unsafe
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
-}
 
 // ============================================================================
 // VIEW CLEANUP & RESOURCE MANAGEMENT
