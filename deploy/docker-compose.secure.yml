@@ -35,7 +35,7 @@ name: dockvault-vault
 
 services:
   vault-db:
-    image: postgres:15-alpine@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
+    image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
     container_name: vault-db
     environment:
       POSTGRES_USER: sftp_user
