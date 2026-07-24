@@ -850,7 +850,14 @@ def test_user_detail_endpoints_enforce_ownership():
 
 
 def _import_config(env_overrides):
-    return _in_container(env_overrides=env_overrides, args=["python", "-c", "from app.core import config"])
+    return _in_container(
+        env_overrides=env_overrides,
+        args=[
+            "python",
+            "-c",
+            "from app.core.config import bootstrap_entrypoint; bootstrap_entrypoint('test')",
+        ],
+    )
 
 
 def test_production_rejects_sample_admin_password():

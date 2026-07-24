@@ -1,18 +1,16 @@
-"""
-DockVault Startup Security Module
-------------------------------
-Handles master password validation and credential decryption on startup.
+"""Credential unlocking primitives used by explicit runtime bootstrap.
 
-This module must be initialized BEFORE any other modules that need credentials.
+Importing this module is inert: it never reads a dotenv, prompts, prints, exits,
+connects to a keychain, or writes. Entry points opt into those operations by calling
+``CredentialManager.unlock_or_raise`` through ``app.core.config``.
 """
 
-import os
-import sys
 import base64
 import getpass
-import bcrypt
-from pathlib import Path
+import os
 from typing import Optional
+
+import bcrypt
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -21,355 +19,254 @@ try:
     import keyring
     KEYRING_AVAILABLE = True
 except ImportError:
+    keyring = None
     KEYRING_AVAILABLE = False
-    print("⚠️  keyring not installed. Install with: pip install keyring")
-    print("⚠️  System keychain integration will be unavailable")
 
 
-# bcrypt hashes at most the first 72 BYTES of its input — a hard limit of the
-# algorithm, not of any one library. bcrypt < 5.0 truncated past that silently;
-# bcrypt >= 5.0 raises ValueError instead. We clamp on the way in so a hash
-# written under EITHER version still verifies: rejecting long input here would
-# permanently lock out a deployment whose master password was set while the old
-# truncating behaviour applied, with no way back in.
-#
-# The limit is BYTES, not characters — UTF-8 spends 2 bytes on a Greek or
-# accented letter and up to 4 on an emoji, so a 37-character Greek passphrase
-# already exceeds it. Setup-time input is capped at the same limit (see
-# scripts/setup_master_password.py) so a NEW password is never silently
-# weakened; the clamp here is only for compatibility with older hashes.
+class CredentialUnlockError(RuntimeError):
+    """Typed credential failure with a message safe for startup logs."""
+
+    def __init__(self, code: str, safe_message: str):
+        self.code = code
+        self.safe_message = safe_message
+        super().__init__(safe_message)
+
+
+# bcrypt hashes at most the first 72 BYTES of its input. Clamp verification input
+# for compatibility with hashes created by older bcrypt releases that truncated it.
 BCRYPT_MAX_PASSWORD_BYTES = 72
 
 
 def bcrypt_password_bytes(password: str) -> bytes:
-    """UTF-8 encode a password and clamp it to bcrypt's 72-byte input limit.
-
-    Slicing the encoded bytes (not the string) reproduces exactly what
-    bcrypt < 5.0 did internally, so existing hashes keep verifying. A trailing
-    multi-byte character may be cut mid-sequence — that is intended: bcrypt
-    takes an opaque byte string and never decodes it.
-    """
+    """UTF-8 encode a password and clamp it to bcrypt's 72-byte input limit."""
     return password.encode("utf-8")[:BCRYPT_MAX_PASSWORD_BYTES]
 
 
 class CredentialManager:
-    """
-    Manages encrypted credentials and master password authentication.
-    
-    Usage:
-        credential_manager = CredentialManager()
-        if credential_manager.unlock():
-            # Credentials are now available
-            encryption_key = credential_manager.get('ENCRYPTION_KEY')
-            db_url = credential_manager.get('DATABASE_URL')
-    """
-    
+    """Own plaintext or decrypted credentials for one initialized process."""
+
+    _CREDENTIAL_NAMES = (
+        "ENCRYPTION_KEY",
+        "DATABASE_URL",
+        "REDIS_PASSWORD",
+        "JWT_SECRET_KEY",
+        "ADMIN_PASSWORD",
+    )
+
     def __init__(self):
         self.credentials = {}
         self.is_unlocked = False
         self._fernet_cipher = None
-    
-    def derive_key_from_password(self, password: str, salt: str) -> bytes:
-        """Derive encryption key from password using PBKDF2.
 
-        600k iterations per current OWASP guidance for PBKDF2-HMAC-SHA256 (was 100k). This KDF only
-        guards the OPTIONAL encrypted-.env master-password mode (not the Docker/SaaS plaintext-env
-        path, not user login which uses argon2/bcrypt), so raising it costs one extra ~0.5s unlock at
-        startup for that mode and nothing for the common deployments."""
+    def derive_key_from_password(self, password: str, salt: str) -> bytes:
+        """Derive the optional encrypted-dotenv key with PBKDF2-HMAC-SHA256."""
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt.encode(),
-            iterations=600000
+            iterations=600000,
         )
         return base64.urlsafe_b64encode(kdf.derive(password.encode()))
-    
+
     def get_password_from_keychain(self) -> Optional[str]:
-        """Try to retrieve master password from system keychain"""
+        """Retrieve a saved password at runtime; keychain failures stay silent."""
         if not KEYRING_AVAILABLE:
             return None
-        
         try:
-            import keyring as kr
-            password = kr.get_password("DockVault", "master_password")
-            if password:
-                print("✅ Retrieved master password from system keychain")
-            return password
-        except Exception as e:
-            print(f"⚠️  Could not access keychain: {e}")
+            return keyring.get_password("DockVault", "master_password")
+        except Exception:
             return None
-    
+
     def save_password_to_keychain(self, password: str) -> bool:
-        """Save master password to system keychain"""
+        """Save a password when an explicit caller requests it."""
         if not KEYRING_AVAILABLE:
             return False
-        
         try:
-            import keyring as kr
-            kr.set_password("DockVault", "master_password", password)
-            print("✅ Saved master password to system keychain")
+            keyring.set_password("DockVault", "master_password", password)
             return True
-        except Exception as e:
-            print(f"⚠️  Could not save to keychain: {e}")
-            return False
-    
-    def prompt_for_password(self) -> str:
-        """Prompt user for master password"""
-        print("\n" + "="*60)
-        print("🔐 DockVault Master Password Required")
-        print("="*60)
-        print("Enter the master password to unlock encrypted credentials.")
-        print()
-        
-        password = getpass.getpass("Master password: ")
-        return password
-    
-    def verify_password(self, password: str) -> bool:
-        """Verify password against stored bcrypt hash"""
-        password_hash = os.getenv("MASTER_PASSWORD_HASH")
-        
-        if not password_hash:
+        except Exception:
             return False
 
+    def prompt_for_password(self) -> str:
+        """Prompt only from the explicit interactive startup path."""
         try:
-            return bcrypt.checkpw(bcrypt_password_bytes(password), password_hash.encode())
-        except Exception:
-            # Do not log hash bytes or exception detail — the master-password hash /
-            # its salt must never reach container stdout.
+            return getpass.getpass("DockVault master password: ")
+        except (EOFError, KeyboardInterrupt):
+            raise CredentialUnlockError(
+                "master-password-unavailable",
+                "The encrypted credential store could not obtain a master password.",
+            ) from None
+
+    def verify_password(self, password: str) -> bool:
+        """Verify a password without logging hash material or exception details."""
+        password_hash = os.getenv("MASTER_PASSWORD_HASH")
+        if not password_hash:
             return False
-    
+        try:
+            return bcrypt.checkpw(
+                bcrypt_password_bytes(password),
+                password_hash.encode(),
+            )
+        except Exception:
+            return False
+
     def check_legacy_mode(self) -> bool:
-        """Check if using legacy unencrypted .env"""
-        # If ENCRYPTION_KEY exists as plaintext, we're in legacy mode
-        encryption_key = os.getenv("ENCRYPTION_KEY")
-        encrypted_key = os.getenv("ENCRYPTED_ENCRYPTION_KEY")
-        master_password_hash = os.getenv("MASTER_PASSWORD_HASH")
-        
-        # Plain environment mode: no encryption, no master password
-        # This is typical for Docker/test/development environments
-        return bool(encryption_key and not encrypted_key and not master_password_hash)
-    
-    def load_legacy_credentials(self):
-        """Load credentials from legacy unencrypted .env"""
-        # Check if this is a Docker/test environment (no master password warning needed)
-        is_plain_env = not os.getenv("MASTER_PASSWORD_HASH")
-        
-        if is_plain_env:
-            print("\n" + "="*60)
-            print("ℹ️  Using plaintext environment variables")
-            print("="*60)
-            print()
-            print("Running in plain configuration mode (Docker/test/dev).")
-            print("All credentials loaded directly from environment.")
-            print()
-        else:
-            print("\n" + "="*60)
-            print("⚠️  WARNING: Using LEGACY UNENCRYPTED credentials!")
-            print("="*60)
-            print()
-            print("Your .env file contains plaintext secrets.")
-            print("This is a SECURITY RISK!")
-            print()
-            print("🔒 To enable encryption protection:")
-            print("   python scripts/setup_master_password.py")
-            print()
-            print("Continuing with plaintext credentials...")
-            print()
-        
-        self.credentials = {
-            'ENCRYPTION_KEY': os.getenv('ENCRYPTION_KEY'),
-            'DATABASE_URL': os.getenv('DATABASE_URL'),
-            'REDIS_PASSWORD': os.getenv('REDIS_PASSWORD'),
-            'JWT_SECRET_KEY': os.getenv('JWT_SECRET_KEY'),
-            'ADMIN_PASSWORD': os.getenv('ADMIN_PASSWORD')
-        }
-        
-        # Create Fernet cipher for file encryption
-        if self.credentials['ENCRYPTION_KEY']:
-            self._fernet_cipher = Fernet(self.credentials['ENCRYPTION_KEY'].encode())
-        
+        """Return whether credentials are supplied directly by the environment."""
+        return bool(
+            os.getenv("ENCRYPTION_KEY")
+            and not os.getenv("ENCRYPTED_ENCRYPTION_KEY")
+            and not os.getenv("MASTER_PASSWORD_HASH")
+        )
+
+    def load_legacy_credentials(self) -> None:
+        """Load plaintext process-environment credentials without output or I/O."""
+        values = {name: os.getenv(name) for name in self._CREDENTIAL_NAMES}
+        try:
+            cipher = Fernet((values["ENCRYPTION_KEY"] or "").encode())
+        except Exception:
+            raise CredentialUnlockError(
+                "encryption-key-invalid",
+                "The configured file-encryption key is invalid.",
+            ) from None
+        self.credentials = values
+        self._fernet_cipher = cipher
         self.is_unlocked = True
-    
+
     def decrypt_credential(self, encrypted_value: str, fernet: Fernet) -> str:
-        """Decrypt a single credential"""
+        """Decrypt one credential without exposing ciphertext or exception detail."""
         try:
             return fernet.decrypt(encrypted_value.encode()).decode()
-        except Exception as e:
-            raise ValueError(f"Failed to decrypt credential: {e}")
-    
-    def unlock(self, max_attempts: int = 25) -> bool:
-        """
-        Unlock encrypted credentials with master password.
-        
-        Args:
-            max_attempts: Maximum number of password attempts (default: 25)
-        
-        Returns:
-            True if successfully unlocked, False otherwise
-        """
-        
-        # Check if already unlocked
+        except Exception:
+            raise CredentialUnlockError(
+                "credential-decryption-failed",
+                "Encrypted credentials could not be decrypted.",
+            ) from None
+
+    def unlock_or_raise(
+        self,
+        max_attempts: int = 25,
+        *,
+        master_password: Optional[str] = None,
+        interactive: bool = True,
+    ) -> None:
+        """Unlock once or raise a typed, sanitized startup failure."""
         if self.is_unlocked:
-            return True
-        
-        # Check for legacy/plain mode FIRST
+            return
+
         if self.check_legacy_mode():
             self.load_legacy_credentials()
-            return True
-        
-        # Check for encrypted credentials
+            return
+
         if not os.getenv("ENCRYPTED_ENCRYPTION_KEY"):
-            print("\n" + "="*60)
-            print("❌ ERROR: No credentials found!")
-            print("="*60)
-            print()
-            print("Your .env file doesn't have credentials configured.")
-            print()
-            print("Available environment variables:")
-            print(f"  ENCRYPTION_KEY: {'SET' if os.getenv('ENCRYPTION_KEY') else 'NOT SET'}")
-            print(f"  ENCRYPTED_ENCRYPTION_KEY: {'SET' if os.getenv('ENCRYPTED_ENCRYPTION_KEY') else 'NOT SET'}")
-            print(f"  MASTER_PASSWORD_HASH: {'SET' if os.getenv('MASTER_PASSWORD_HASH') else 'NOT SET'}")
-            print()
-            print("To set up encrypted credentials:")
-            print("   python scripts/setup_master_password.py")
-            print()
-            return False
-        
-        # Try keychain first
-        password = self.get_password_from_keychain()
-        
-        # Attempt to unlock
-        for attempt in range(max_attempts):
-            # Prompt if no password from keychain
-            if not password:
+            raise CredentialUnlockError(
+                "required-secret-missing",
+                "No complete plaintext or encrypted credential set is configured.",
+            )
+        if not os.getenv("MASTER_PASSWORD_HASH"):
+            raise CredentialUnlockError(
+                "encrypted-credentials-incomplete",
+                "The encrypted credential set is incomplete.",
+            )
+
+        encrypted_values = {
+            name: os.getenv(f"ENCRYPTED_{name}") for name in self._CREDENTIAL_NAMES
+        }
+        salt = os.getenv("MASTER_KEY_SALT")
+        if not salt or any(not value for value in encrypted_values.values()):
+            raise CredentialUnlockError(
+                "encrypted-credentials-incomplete",
+                "The encrypted credential set is incomplete.",
+            )
+
+        explicit_password = master_password is not None
+        password = master_password if explicit_password else self.get_password_from_keychain()
+        attempts = max(1, int(max_attempts))
+        for attempt in range(attempts):
+            if password is None:
+                if not interactive:
+                    raise CredentialUnlockError(
+                        "master-password-unavailable",
+                        "The encrypted credential store requires a master password.",
+                    )
                 password = self.prompt_for_password()
-            
-            # Verify password
-            print(f"🔍 Verifying password (attempt {attempt + 1}/{max_attempts})...")
-            if not self.verify_password(password):
-                remaining = max_attempts - attempt - 1
-                print(f"❌ Invalid master password!")
-                
-                if remaining > 0:
-                    print(f"   {remaining} attempt(s) remaining\n")
-                    password = None  # Force re-prompt
-                    continue
-                else:
-                    print("🔒 Maximum attempts exceeded.")
-                    print("   Cannot start server without valid credentials.")
-                    return False
-            
-            print("✅ Password verified successfully!")
-            
-            # Password is correct - decrypt credentials
-            try:
-                salt = os.getenv("MASTER_KEY_SALT")
-                if not salt:
-                    print("❌ Missing MASTER_KEY_SALT in .env file")
-                    return False
-                
-                password_key = self.derive_key_from_password(password, salt)
-                fernet = Fernet(password_key)
-                
-                # Decrypt all credentials
-                encrypted_values = {
-                    'ENCRYPTION_KEY': os.getenv("ENCRYPTED_ENCRYPTION_KEY"),
-                    'DATABASE_URL': os.getenv("ENCRYPTED_DATABASE_URL"),
-                    'REDIS_PASSWORD': os.getenv("ENCRYPTED_REDIS_PASSWORD"),
-                    'JWT_SECRET_KEY': os.getenv("ENCRYPTED_JWT_SECRET_KEY"),
-                    'ADMIN_PASSWORD': os.getenv("ENCRYPTED_ADMIN_PASSWORD")
-                }
-                
-                # Check all encrypted values are present
-                missing = [k for k, v in encrypted_values.items() if not v]
-                if missing:
-                    print(f"❌ Missing encrypted values: {', '.join(missing)}")
-                    return False
-                
-                # Now we know all values are non-None, decrypt them
-                self.credentials = {}
-                for k, v in encrypted_values.items():
-                    if v:  # Type guard - should always be true due to check above
-                        self.credentials[k] = self.decrypt_credential(v, fernet)
-                
-                # Create Fernet cipher for file encryption
-                self._fernet_cipher = Fernet(self.credentials['ENCRYPTION_KEY'].encode())
-                
-                self.is_unlocked = True
-                
-                print("\n✅ Master password verified!")
-                print("✅ All credentials decrypted successfully")
-                
-                # Offer to save to keychain
-                if not self.get_password_from_keychain():
-                    print()
-                    save = input("💾 Save password to system keychain? (y/n): ").strip().lower()
-                    if save == 'y':
-                        self.save_password_to_keychain(password)
-                
-                print()
-                return True
-                
-            except Exception as e:
-                print(f"❌ Failed to decrypt credentials: {e}")
-                print("   This might indicate:")
-                print("     • Corrupted .env file")
-                print("     • Modified encrypted values")
-                print("     • Wrong password (despite hash match)")
-                return False
-        
-        return False
-    
+
+            if self.verify_password(password):
+                break
+
+            if explicit_password or not interactive or attempt == attempts - 1:
+                raise CredentialUnlockError(
+                    "master-password-invalid",
+                    "The encrypted credential store rejected the master password.",
+                )
+            password = None
+        else:  # defensive; the loop either breaks or raises
+            raise CredentialUnlockError(
+                "master-password-invalid",
+                "The encrypted credential store rejected the master password.",
+            )
+
+        try:
+            wrapping_key = self.derive_key_from_password(password, salt)
+            wrapping_fernet = Fernet(wrapping_key)
+            decrypted = {
+                name: self.decrypt_credential(value, wrapping_fernet)
+                for name, value in encrypted_values.items()
+            }
+            content_fernet = Fernet(decrypted["ENCRYPTION_KEY"].encode())
+        except CredentialUnlockError:
+            raise
+        except Exception:
+            raise CredentialUnlockError(
+                "credential-decryption-failed",
+                "Encrypted credentials could not be decrypted.",
+            ) from None
+
+        self.credentials = decrypted
+        self._fernet_cipher = content_fernet
+        self.is_unlocked = True
+
+    def unlock(
+        self,
+        max_attempts: int = 25,
+        *,
+        master_password: Optional[str] = None,
+        interactive: bool = True,
+    ) -> bool:
+        """Backward-compatible boolean wrapper around ``unlock_or_raise``."""
+        try:
+            self.unlock_or_raise(
+                max_attempts,
+                master_password=master_password,
+                interactive=interactive,
+            )
+            return True
+        except CredentialUnlockError:
+            return False
+
     def get(self, key: str) -> Optional[str]:
-        """
-        Get a decrypted credential value.
-        
-        Args:
-            key: Credential name (e.g., 'ENCRYPTION_KEY', 'DATABASE_URL')
-            
-        Returns:
-            Decrypted credential value, or None if not found/not unlocked
-        """
         if not self.is_unlocked:
-            raise RuntimeError("Credentials not unlocked! Call unlock() first.")
-        
+            raise RuntimeError("Credentials are not initialized")
         return self.credentials.get(key)
-    
+
     def get_fernet(self) -> Fernet:
-        """
-        Get Fernet cipher for file encryption/decryption.
-        
-        Returns:
-            Fernet cipher instance
-            
-        Raises:
-            RuntimeError: If credentials not unlocked
-        """
-        if not self.is_unlocked:
-            raise RuntimeError("Credentials not unlocked! Call unlock() first.")
-        
-        if not self._fernet_cipher:
-            raise RuntimeError("Fernet cipher not initialized!")
-        
+        if not self.is_unlocked or not self._fernet_cipher:
+            raise RuntimeError("Credentials are not initialized")
         return self._fernet_cipher
-    
+
     def is_legacy_mode(self) -> bool:
-        """Check if running in legacy unencrypted mode"""
         return not os.getenv("ENCRYPTED_ENCRYPTION_KEY")
 
 
-# Global instance
 credential_manager = CredentialManager()
 
 
 def require_unlock():
-    """Decorator to ensure credentials are unlocked before function runs"""
+    """Decorator that guards functions requiring initialized credentials."""
     def decorator(func):
         def wrapper(*args, **kwargs):
             if not credential_manager.is_unlocked:
                 raise RuntimeError(
-                    f"Cannot call {func.__name__}: credentials not unlocked! "
-                    "Call credential_manager.unlock() first."
+                    f"Cannot call {func.__name__}: credentials are not initialized"
                 )
             return func(*args, **kwargs)
         return wrapper

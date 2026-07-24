@@ -48,6 +48,10 @@ import uuid
 import redis
 import json
 
+if __name__ == "__main__":
+    from app.core.config import bootstrap_entrypoint
+    bootstrap_entrypoint("SFTP")
+
 from app.core.database import get_db_context
 from app.core.models import User, ActiveSession, Vault, Folder, File
 from app.services.auth_service import AuthService

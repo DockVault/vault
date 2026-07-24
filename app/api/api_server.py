@@ -27,6 +27,11 @@ import shutil
 import traceback
 from pathlib import Path
 
+# Importing this module is itself the API launch contract (including ASGI import-string
+# launchers), so runtime settings must be installed before the app or middleware captures them.
+from app.core.config import bootstrap_entrypoint
+bootstrap_entrypoint("API")
+
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
 from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim
 from app.core import sharing_policy
@@ -45,7 +50,7 @@ from sqlalchemy.exc import IntegrityError
 from app.services.audit_logger import AuditLogger
 from app.services import log_pull  # pure helpers for the authenticated log-pull endpoint
 from app.core.security import create_access_token, verify_access_token
-from app.core.config import settings
+from app.core.config import initialize_runtime, settings
 from app.core.endpoint_permissions import require_endpoint_permission
 from app.core.temp_scope import require_vault_cap
 from app.api.user_management_api import router as user_management_router
@@ -10542,6 +10547,7 @@ def _add_name_uniqueness():
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
     # Startup
+    initialize_runtime()
     init_db()
     print("Database initialized")
     _run_lightweight_migrations()
