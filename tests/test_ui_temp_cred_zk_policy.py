@@ -6,6 +6,7 @@ ALLOW (default): a ZK vault is selectable, but selecting it forces an acknowledg
 """
 import os
 import subprocess
+import time
 import uuid
 
 import pytest
@@ -106,13 +107,22 @@ def test_allow_all_vaults_mode_requires_acknowledgment(page: Page, admin, admin_
     admin.put("/settings", json={"temp_cred_allow_zk_vaults": True})
     vid = _zk_vault(admin)  # owned by admin -> in scope of an 'all' mint
     try:
+        def delay_vault_list(route):
+            time.sleep(0.75)
+            route.continue_()
+
+        page.route("**/vaults", delay_vault_list)
         _login(page, admin_creds["username"], admin_creds["password"])
         _open_temp_modal(page)
+        submit = page.locator('#generate-temp-creds-form button[type="submit"]')
+        expect(submit).to_be_disabled()
         page.check("#tc-scope-enable")
         page.check('input[name="tc-vault-mode"][value="all"]')
+        expect(submit).to_have_attribute("data-temp-scope-ready", "true", timeout=8000)
         page.click("#generate-temp-creds-form button[type=submit]")
         expect(page.locator("#tc-zk-ack-modal")).to_be_visible(timeout=8000)
         expect(page.locator("#temp-creds-modal")).to_have_count(0)  # not minted until acknowledged
     finally:
+        page.unroute("**/vaults")
         _psql(f"UPDATE vaults SET type='standard' WHERE id='{vid}';")
         admin.delete_vault(vid)

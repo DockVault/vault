@@ -2123,7 +2123,8 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
 })();
 
 // Open the modal that lets the user choose the credential's validity/expiry
-function showGenerateTempCreds() {
+let _tcModalLoadSeq = 0;
+async function showGenerateTempCreds() {
     const modal = document.getElementById('generate-temp-creds-modal');
     if (!modal) {
         // Fallback: modal markup missing, generate with server defaults
@@ -2143,10 +2144,28 @@ function showGenerateTempCreds() {
 
     initTempScopeBuilder();      // wire the scope-builder controls once
     resetTempScopeBuilder();     // reset to defaults
-    _tcLoadPasscodePolicy();     // fetch the effective temp-passcode policy (shapes the controls)
-    populateTempScopeVaults();   // fill the selectable vault list
-
+    const submitBtn = modal.querySelector('button[type="submit"]');
+    const loadSeq = ++_tcModalLoadSeq;
+    if (submitBtn) {
+        submitBtn.disabled = true;
+        delete submitBtn.dataset.tempScopeReady;
+    }
+    _tcVaultObjs = {};           // never let a prior modal session influence this mint
     modal.classList.add('active');
+
+    const [policyLoaded, vaultsLoaded] = await Promise.all([
+        _tcLoadPasscodePolicy(),
+        populateTempScopeVaults(),
+    ]);
+    if (loadSeq !== _tcModalLoadSeq || !modal.classList.contains('active')) return;
+    if (policyLoaded && vaultsLoaded) {
+        if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.dataset.tempScopeReady = 'true';
+        }
+    } else {
+        _tcShowError('Could not load the current vault policy. Close and try again before generating credentials.');
+    }
 }
 
 // Effective temp-passcode policy (from GET /temp-passcode-policy) — shapes the mint controls:
@@ -2155,12 +2174,16 @@ let _tcPasscodePolicy = null;
 async function _tcLoadPasscodePolicy() {
     _tcPasscodePolicy = null;  // clear the prior session's policy so the section stays hidden until the fresh fetch lands
     _tcSyncPasscodeUI();
+    let loaded = false;
     try {
         _tcPasscodePolicy = await apiRequest('/temp-passcode-policy', { silent: true });
+        loaded = !!_tcPasscodePolicy && typeof _tcPasscodePolicy === 'object';
+        if (!loaded) _tcPasscodePolicy = null;
     } catch (_) {
         _tcPasscodePolicy = null;  // fail closed: no policy => passcode controls stay hidden
     }
     _tcSyncPasscodeUI();
+    return loaded;
 }
 
 let _tempScopeWired = false;
@@ -2267,15 +2290,16 @@ function resetTempScopeBuilder() {
 
 async function populateTempScopeVaults() {
     const list = document.getElementById('tc-vault-list');
-    if (!list) return;
+    _tcVaultObjs = {};
+    if (!list) return false;
     list.innerHTML = '<div class="text-tertiary text-sm p-sm">Loading vaults…</div>';
     try {
         const vaults = await apiRequest('/vaults', { silent: true });
-        _tcVaultObjs = {};
-        if (Array.isArray(vaults)) vaults.forEach(v => { _tcVaultObjs[v.id] = v; });
-        if (!Array.isArray(vaults) || !vaults.length) {
+        if (!Array.isArray(vaults)) throw new Error('Invalid vault response');
+        vaults.forEach(v => { _tcVaultObjs[v.id] = v; });
+        if (!vaults.length) {
             list.innerHTML = '<div class="text-tertiary text-sm p-sm">No vaults available to grant.</div>';
-            return;
+            return true;
         }
         // A password-protected vault can only be granted over SFTP if the issuer proves
         // its password here (the credential then carries that proof — SFTP has no per-vault
@@ -2288,8 +2312,11 @@ async function populateTempScopeVaults() {
             <input type="password" class="tc-vault-pw form-control" data-vault="${escapeHtml(v.id)}" placeholder="Vault password — required to grant access to this password-protected vault" autocomplete="new-password" style="margin:2px 0 10px 26px;max-width:340px;">` : ''}`).join('');
         _tcDecoratePasscodeRows(vaults);   // append per-vault passcode controls via DOM (no innerHTML)
         _tcSyncPasscodeUI();               // reflect the current passcode-toggle state onto the rows
+        return true;
     } catch (_) {
+        _tcVaultObjs = {};
         list.innerHTML = '<div class="text-tertiary text-sm p-sm">Could not load vaults.</div>';
+        return false;
     }
 }
 
@@ -4583,12 +4610,23 @@ async function initSettings() {
     wireBrandColorInputs();
     wireBrandAssetUploads();
 
-    // Load current settings
-    await loadSettings();
-    loadLogSettings();  // silent; no-op for non-admins
-    
-    // Attach event listeners
+    // Attach handlers before loading begins, but keep Save inert until every
+    // asynchronous settings dependency has finished populating the form.
+    const saveBtn = document.getElementById('save-all-settings-btn');
+    if (saveBtn) {
+        saveBtn.disabled = true;
+        delete saveBtn.dataset.settingsReady;
+    }
     attachSettingsListeners();
+    try {
+        await loadSettings();
+    } finally {
+        if (saveBtn) {
+            saveBtn.disabled = false;
+            saveBtn.dataset.settingsReady = 'true';
+        }
+    }
+    loadLogSettings();  // silent; no-op for non-admins
     
     // Load storage statistics
     loadStorageStats();
@@ -10413,6 +10451,11 @@ document.addEventListener('DOMContentLoaded', () => {
         generateTempCredsForm.addEventListener('submit', (e) => {
             e.preventDefault();
             _tcHideError();  // clear any prior inline error at the start of each attempt
+            const submitBtn = generateTempCredsForm.querySelector('button[type="submit"]');
+            if (!submitBtn || submitBtn.dataset.tempScopeReady !== 'true') {
+                _tcShowError('Wait for the current vault policy to finish loading before generating credentials.');
+                return;
+            }
 
             const minutesInput = document.getElementById('temp-cred-validity-minutes');
             const endInput = document.getElementById('temp-cred-end-datetime');

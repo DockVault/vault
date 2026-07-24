@@ -518,7 +518,9 @@ def test_deploy_scripts_hardened():
     # Deploy-script hardening (owner-validated on-host; here we lock the source):
     smp = _read("scripts/setup_master_password.py")
     assert "iterations=600000" in smp, "PBKDF2 must use >=600k iterations (match the runtime decryptor)"
-    assert "'production'" in smp, "the ENVIRONMENT fallback must default to production, not development"
+    assert "load_dotenv" not in smp, "conversion must read only the explicitly selected source"
+    assert "os.getenv(" not in smp, "ambient environment values must not alter conversion"
+    assert "ENVIRONMENT=" not in smp, "conversion must not synthesize unrelated defaults"
     assert "0o600" in smp, "secret files must be written mode 0600"
     # setup-secure.* are retired shims -> dockvault.py; the secret/.env generation now lives there.
     dvtool = _read("dockvault.py")

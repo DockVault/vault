@@ -96,7 +96,6 @@ def test_temp_credential_end_datetime_overrides_minutes(logged_in: Page):
 
 def test_directory_search_scope_setting_persists_via_ui(logged_in: Page, admin):
     """The admin 'User Directory' policy select saves through the Settings UI to the backend."""
-    import time as _t
     page = logged_in
     admin.put("/settings", json={"directory_search_scope": "deployment"})  # deterministic start
     try:
@@ -105,15 +104,24 @@ def test_directory_search_scope_setting_persists_via_ui(logged_in: Page, admin):
         # Wait until loadSettings has populated the control (else its async fetch would reset our
         # selection after select_option and the save would send the stale value).
         expect(page.locator("#setting-directory-search-scope")).to_have_value("deployment")
+        expect(page.locator("#save-all-settings-btn")).to_have_attribute(
+            "data-settings-ready", "true", timeout=15000
+        )
         page.select_option("#setting-directory-search-scope", "same_department")
-        page.click("#save-all-settings-btn")
-        ok = False
-        for _ in range(24):
-            if admin.get("/settings").json().get("directory_search_scope") == "same_department":
-                ok = True
-                break
-            _t.sleep(0.25)
-        assert ok, "directory_search_scope did not persist via the settings UI"
+        with page.expect_response(
+            lambda response: response.url.rstrip("/").endswith("/settings")
+            and response.request.method == "PUT",
+            timeout=15000,
+        ) as response_info:
+            page.click("#save-all-settings-btn")
+        response = response_info.value
+        assert response.ok, (
+            f"PUT /settings failed: {response.status} {response.text()[:300]}"
+        )
+        assert (
+            admin.get("/settings").json().get("directory_search_scope")
+            == "same_department"
+        )
         # And the value round-trips back into the control on reload.
         page.reload()
         page.click('.sidebar-item[data-section="settings"]')
