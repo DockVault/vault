@@ -12,7 +12,16 @@ from pathlib import Path
 
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _REVISION_RE = re.compile(r"[0-9a-f]{40}\Z")
-_IMAGE_RE = re.compile(r"ghcr\.io/[a-z0-9._/-]+:v?[0-9]+\.[0-9]+\.[0-9]+\Z")
+# The published artifact is `<repo>:vX.Y.Z`. The optional architecture suffix covers the
+# per-platform images the release scans BEFORE publication: a multi-architecture release has one
+# image per platform to scan and one VEX per image, and a VEX statement only applies to a product
+# it names. Scanning `…:vX.Y.Z-amd64` against a VEX that names `…:vX.Y.Z` silently suppresses
+# nothing — every exception in the document goes unapplied and the scan fails on findings that
+# were already reviewed. The suffix is scan-time only; nothing publishes it, and the release VEX
+# asset is re-rendered against the canonical reference and the published digest.
+_IMAGE_RE = re.compile(
+    r"ghcr\.io/[a-z0-9._/-]+:v?[0-9]+\.[0-9]+\.[0-9]+(?:-(?:amd64|arm64))?\Z"
+)
 _TOKENS = {
     "__IMAGE_DIGEST__",
     "__IMAGE_REFERENCE__",
