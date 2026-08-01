@@ -13,7 +13,15 @@ The deployment serves HTTPS with the certificate setup generated, so this pins T
 the only trust anchor (certs/cert.pem by default) rather than switching verification off. A
 scenario that silently started serving a different certificate should fail here, not pass.
 
-Usage:  deployment_state.py <base-url> <admin-user> <admin-password> [cert-path]
+``--identity-only`` omits health from the printed line, for the one comparison where including
+it would be wrong: a profile transition. Health describes the TOPOLOGY a deployment is running
+under — combined serves SFTP from the web container, split from its own — so demanding a
+byte-identical health payload across a combined/split change asserts that the topology did not
+change, which is the opposite of what those scenarios do. Identity (vaults, users) is what has
+to survive; the caller asserts health separately, on its own terms. Health is still READ in this
+mode, so a deployment that cannot answer /health still fails here.
+
+Usage:  deployment_state.py [--identity-only] <base-url> <admin-user> <admin-password> [cert-path]
 Exits non-zero (with the reason on stderr) if the deployment cannot be read.
 """
 import json
@@ -47,11 +55,14 @@ def call(base, path, ctx, payload=None, token=None):
 
 
 def main(argv):
-    if not 4 <= len(argv) <= 5:
+    flags = [a for a in argv[1:] if a.startswith("--")]
+    positional = [a for a in argv if not a.startswith("--")]
+    identity_only = "--identity-only" in flags
+    if set(flags) - {"--identity-only"} or not 4 <= len(positional) <= 5:
         print(__doc__, file=sys.stderr)
         return 2
-    base, user, password = argv[1].rstrip("/"), argv[2], argv[3]
-    cert_path = argv[4] if len(argv) == 5 else DEFAULT_CERT
+    base, user, password = positional[1].rstrip("/"), positional[2], positional[3]
+    cert_path = positional[4] if len(positional) == 5 else DEFAULT_CERT
     if not os.path.exists(cert_path):
         print(f"no certificate to trust at {cert_path}; setup should have written one",
               file=sys.stderr)
@@ -66,7 +77,10 @@ def main(argv):
         print(f"could not read the deployment at {base}: {exc}", file=sys.stderr)
         return 1
     # sort_keys so two runs are byte-comparable with plain diff
-    print(json.dumps({"health": health, "vault_ids": vaults, "users": users}, sort_keys=True))
+    state = {"vault_ids": vaults, "users": users}
+    if not identity_only:
+        state["health"] = health
+    print(json.dumps(state, sort_keys=True))
     return 0
 
 

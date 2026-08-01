@@ -793,12 +793,19 @@ def test_update_check_admin_gated_and_default_off():
 def test_release_workflow_and_upgrade_docs():
     import re
     wf = _read(".github/workflows/release.yml")
-    # Builds locally, then pushes the scanned tags to GHCR, stamps the version, and triggers on a
-    # version tag. The release gate emits the canonical image name, so this workflow intentionally
-    # contains the registry host rather than a duplicated literal ghcr.io/<owner>/vault path.
+    # Builds every platform into a staging registry on the runner, scans it there, then copies the
+    # scanned index to GHCR under both tags. A multi-platform image cannot be loaded into the
+    # daemon under one tag, so staging is what preserves "scan before you authenticate"; the copy
+    # moves the exact manifests that were scanned rather than rebuilding them. The release gate
+    # emits the canonical image name, so this workflow intentionally contains the registry host
+    # rather than a duplicated literal ghcr.io/<owner>/vault path.
     assert "build-push-action" in wf, "release.yml must build the release image"
-    assert "registry: ghcr.io" in wf and 'docker push "${IMAGE}:${TAG}"' in wf, \
-        "release.yml must authenticate to GHCR and push the scanned release tag"
+    assert "platforms: ${{ env.PLATFORMS }}" in wf, "release.yml must build every platform"
+    assert "registry: ghcr.io" in wf, "release.yml must authenticate to GHCR"
+    assert "docker buildx imagetools create" in wf and '--tag "${IMAGE}:${TAG}"' in wf, \
+        "release.yml must publish the scanned index under the release tag"
+    assert 'test "$resolved_version" = "$staged_digest"' in wf, \
+        "what GHCR resolves must be verified equal to the digest that was scanned"
     assert "APP_VERSION=" in wf, "release.yml must stamp the version via the build-arg"
     assert "v*.*.*" in wf, "release.yml must trigger on a version tag"
     # Every external action is pinned to a full commit SHA (supply-chain hardening for a public

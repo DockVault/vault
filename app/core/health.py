@@ -16,24 +16,42 @@ import uuid
 from app.core.config import settings
 
 
+# Set by run_combined.py on the children it starts, and ONLY there: it is the one launcher that
+# serves the web and SFTP halves from a single container. Its absence means SFTP, if this
+# deployment runs it at all, is in another container — see check_sftp_status.
+SFTP_IN_CONTAINER_ENV = "VAULT_SFTP_IN_CONTAINER"
+
+
 def _truthy(value) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def check_sftp_status() -> str:
-    """``disabled`` | ``listening`` | ``unreachable``.
+    """``disabled`` | ``external`` | ``listening`` | ``unreachable``.
 
     SFTP is opt-in: a deployment runs web only unless ``RUN_SFTP`` is set, and the two halves
-    are separate processes in one container. The API process therefore cannot inspect the SFTP
-    process directly — it asks the only question that matters to a client, which is whether
-    something is accepting connections on the port.
+    are separate processes. The API process therefore cannot inspect the SFTP process directly
+    — it asks the only question that matters to a client, which is whether something is
+    accepting connections on the port.
 
     ``disabled`` is deliberately distinct from ``unreachable``: a vault that was never meant to
     serve SFTP is healthy, while one that was and is not, is broken. Collapsing the two would
     make every web-only deployment look degraded.
+
+    ``external`` exists because ``RUN_SFTP`` and the loopback probe answer different questions.
+    ``RUN_SFTP`` says the DEPLOYMENT serves SFTP; the probe says THIS CONTAINER does. In the
+    split profile those diverge: ``vault-api`` is started with an explicit api-only command and
+    SFTP lives in its own ``vault-sftp`` container, yet ``RUN_SFTP`` still arrives from the
+    shared ``.env``. Probing loopback there finds nothing and reports a subsystem this process
+    was never asked to run as broken — which made every split deployment permanently
+    ``degraded``. ``run_combined.py`` is the only launcher that serves both halves from one
+    container, so it marks the processes it starts; without that marker SFTP is somebody else's
+    container and this one declines to answer for it.
     """
     if not _truthy(os.environ.get("RUN_SFTP")):
         return "disabled"
+    if not _truthy(os.environ.get(SFTP_IN_CONTAINER_ENV)):
+        return "external"
     try:
         with socket.create_connection(("127.0.0.1", int(settings.sftp_port)), timeout=2):
             return "listening"

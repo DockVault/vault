@@ -71,12 +71,28 @@ jobs:
     needs: [validate, tests, setup]
     if: ${{ success() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: write
       packages: write
       id-token: write
       attestations: write
+
+    # A multi-architecture image cannot be `load`ed into the Docker daemon under one tag, so the
+    # release is staged in a throwaway registry on the runner itself. That keeps the ordering this
+    # job is built around — build, SBOM, scan, and only THEN authenticate to GHCR — while still
+    # producing a real manifest list. What finally reaches GHCR is a byte-for-byte copy of the
+    # staged index, not a rebuild: `imagetools create` moves the exact manifests that were scanned.
+    services:
+      staging-registry:
+        image: registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373 # 2
+        ports:
+          - 5000:5000
+
+    env:
+      STAGING_IMAGE: localhost:5000/dockvault/vault
+      PLATFORMS: linux/amd64,linux/arm64
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -110,37 +126,89 @@ jobs:
             --repository-owner "$REPOSITORY_OWNER" \
             --github-output "$GITHUB_OUTPUT"
 
+      - name: Set up QEMU for the emulated platform
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: arm64
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          # The builder runs in its own container, so it needs the runner's network to reach the
+          # staging registry, and permission to speak plain HTTP to it. The registry is a loopback
+          # service on this throwaway VM and holds the artifact for a few minutes; nothing leaves
+          # the runner over that connection.
+          driver-opts: network=host
+          buildkitd-config-inline: |
+            [registry."localhost:5000"]
+              http = true
 
-      - name: Build the tested image locally
+      - name: Build every platform into the staging registry
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          load: true
-          push: false
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          # Keep the index to exactly the platform manifests. Buildx's own provenance/SBOM
+          # attestations would add manifests that `imagetools create` then copies as part of the
+          # image, duplicating what the signed attestations below already record.
+          provenance: false
+          sbom: false
           build-args: |
             APP_VERSION=${{ steps.publish_gate.outputs.version }}
             OCI_SOURCE=https://github.com/${{ github.repository }}
             OCI_VERSION=${{ steps.publish_gate.outputs.version }}
             OCI_REVISION=${{ needs.validate.outputs.sha }}
-          tags: |
-            ${{ steps.publish_gate.outputs.image }}:${{ steps.publish_gate.outputs.tag }}
-            ${{ steps.publish_gate.outputs.image }}:latest
+          tags: ${{ env.STAGING_IMAGE }}:${{ steps.publish_gate.outputs.tag }}
 
-      - name: Generate the SPDX SBOM
+      - name: Load each platform for scanning
+        shell: bash
+        env:
+          TAG: ${{ steps.publish_gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Resolve each platform's own manifest digest out of the index and pull THAT.
+          # `docker pull --platform <p> <tag>` is not good enough: against an index, the containerd
+          # image store resolves the tag and reports the index, so both iterations land the same
+          # host-architecture image — and the arm64 scan would silently be a second amd64 scan.
+          # Pulling a platform manifest by digest is unambiguous on either image store.
+          for platform in amd64 arm64; do
+            digest="$(docker buildx imagetools inspect "${STAGING_IMAGE}:${TAG}" \
+              --format "{{range .Manifest.Manifests}}{{if eq .Platform.Architecture \"${platform}\"}}{{.Digest}}{{end}}{{end}}")"
+            test -n "$digest" || { echo "::error::the staged index has no ${platform} manifest"; exit 1; }
+            docker pull --quiet "${STAGING_IMAGE}@${digest}"
+            docker tag "${STAGING_IMAGE}@${digest}" "dockvault-scan:${platform}"
+            got="$(docker image inspect -f '{{.Architecture}}' "dockvault-scan:${platform}")"
+            test "$got" = "$platform" || { echo "::error::${platform} manifest carries ${got}"; exit 1; }
+          done
+          test "$(docker image inspect -f '{{.Id}}' dockvault-scan:amd64)" \
+             != "$(docker image inspect -f '{{.Id}}' dockvault-scan:arm64)"
+          docker image inspect -f '{{.Id}} {{.Architecture}}' dockvault-scan:amd64 dockvault-scan:arm64
+
+      - name: Generate the SPDX SBOM (amd64)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          image: ${{ steps.publish_gate.outputs.image }}:${{ steps.publish_gate.outputs.tag }}
+          image: dockvault-scan:amd64
           format: spdx-json
           syft-version: v1.44.0
-          output-file: dockvault-${{ steps.publish_gate.outputs.tag }}.spdx.json
-          artifact-name: dockvault-${{ steps.publish_gate.outputs.tag }}-sbom
+          output-file: dockvault-${{ steps.publish_gate.outputs.tag }}-amd64.spdx.json
+          artifact-name: dockvault-${{ steps.publish_gate.outputs.tag }}-sbom-amd64
           upload-artifact: true
           upload-release-assets: false
 
-      - name: Render the revision-bound scan VEX
+      - name: Generate the SPDX SBOM (arm64)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: dockvault-scan:arm64
+          format: spdx-json
+          syft-version: v1.44.0
+          output-file: dockvault-${{ steps.publish_gate.outputs.tag }}-arm64.spdx.json
+          artifact-name: dockvault-${{ steps.publish_gate.outputs.tag }}-sbom-arm64
+          upload-artifact: true
+          upload-release-assets: false
+
+      - name: Render the revision-bound scan VEX for each platform
         shell: bash
         env:
           IMAGE: ${{ steps.publish_gate.outputs.image }}
@@ -148,23 +216,33 @@ jobs:
           SOURCE_REVISION: ${{ needs.validate.outputs.sha }}
         run: |
           set -euo pipefail
-          image_reference="${IMAGE}:${TAG}"
-          local_digest="$(docker image inspect --format '{{.Id}}' "$image_reference")"
-          python3 .github/scripts/render_release_vex.py \
-            --template security/vex.openvex.json \
-            --output "dockvault-${TAG}.openvex.json" \
-            --image-digest "$local_digest" \
-            --image-reference "$image_reference" \
-            --source-revision "$SOURCE_REVISION"
+          for platform in amd64 arm64; do
+            local_digest="$(docker image inspect --format '{{.Id}}' "dockvault-scan:${platform}")"
+            python3 .github/scripts/render_release_vex.py \
+              --template security/vex.openvex.json \
+              --output "dockvault-${TAG}-${platform}.openvex.json" \
+              --image-digest "$local_digest" \
+              --image-reference "${IMAGE}:${TAG}" \
+              --source-revision "$SOURCE_REVISION"
+          done
 
-      - name: Scan the exact local image
+      - name: Scan the exact staged image (amd64)
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
-          image: ${{ steps.publish_gate.outputs.image }}:${{ steps.publish_gate.outputs.tag }}
+          image: dockvault-scan:amd64
           grype-version: v0.112.0
           fail-build: true
           severity-cutoff: high
-          vex: dockvault-${{ steps.publish_gate.outputs.tag }}.openvex.json
+          vex: dockvault-${{ steps.publish_gate.outputs.tag }}-amd64.openvex.json
+
+      - name: Scan the exact staged image (arm64)
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: dockvault-scan:arm64
+          grype-version: v0.112.0
+          fail-build: true
+          severity-cutoff: high
+          vex: dockvault-${{ steps.publish_gate.outputs.tag }}-arm64.openvex.json
 
       - name: Refresh release refs immediately before authentication
         env:
@@ -194,7 +272,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push the scanned image and resolve its digest
+      - name: Copy the scanned index to GHCR and resolve its digest
         id: push
         shell: bash
         env:
@@ -202,21 +280,23 @@ jobs:
           TAG: ${{ steps.publish_gate.outputs.tag }}
         run: |
           set -euo pipefail
-          version_log="$RUNNER_TEMP/dockvault-push-version.log"
-          latest_log="$RUNNER_TEMP/dockvault-push-latest.log"
-          docker push "${IMAGE}:${TAG}" 2>&1 | tee "$version_log"
-          version_digest="$(python3 .github/scripts/release_push_digest.py "$version_log")"
-          docker push "${IMAGE}:latest" 2>&1 | tee "$latest_log"
-          latest_digest="$(python3 .github/scripts/release_push_digest.py "$latest_log")"
-          test "$latest_digest" = "$version_digest"
+          # `imagetools create` copies the staged manifests as they are — the same index, the same
+          # per-platform digests, the ones the scans just cleared. It does not rebuild, so nothing
+          # unscanned can enter the published artifact.
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${TAG}" \
+            --tag "${IMAGE}:latest" \
+            "${STAGING_IMAGE}:${TAG}"
 
+          staged_digest="$(docker buildx imagetools inspect "${STAGING_IMAGE}:${TAG}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           resolved_version="$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           resolved_latest="$(docker buildx imagetools inspect "${IMAGE}:latest" --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          test "$resolved_version" = "$version_digest"
-          test "$resolved_latest" = "$version_digest"
-          echo "digest=${version_digest}" >> "$GITHUB_OUTPUT"
+          # What was published is what was staged and scanned, and both tags name it.
+          test "$resolved_version" = "$staged_digest"
+          test "$resolved_latest" = "$staged_digest"
+          echo "digest=${resolved_version}" >> "$GITHUB_OUTPUT"
 
-      - name: Verify published digest is anonymously pullable
+      - name: Verify every published platform is anonymously pullable
         shell: bash
         env:
           IMAGE: ${{ steps.publish_gate.outputs.image }}
@@ -226,7 +306,18 @@ jobs:
           anonymous_config="$(mktemp -d "$RUNNER_TEMP/docker-anon.XXXXXX")"
           trap 'rm -rf "$anonymous_config"' EXIT
           printf '%s\n' '{"auths":{}}' > "$anonymous_config/config.json"
-          DOCKER_CONFIG="$anonymous_config" docker pull "${IMAGE}@${DIGEST}"
+          # Every advertised platform, not just the runner's: an index that resolves for amd64 and
+          # 404s for arm64 would look published and be unusable for half the people who pull it.
+          # Each platform is resolved to its own manifest digest and pulled by that digest, so this
+          # proves the arm64 blobs are anonymously fetchable rather than re-fetching amd64 twice.
+          for platform in ${PLATFORMS//,/ }; do
+            arch="${platform#*/}"
+            manifest="$(DOCKER_CONFIG="$anonymous_config" docker buildx imagetools inspect "${IMAGE}@${DIGEST}" \
+              --format "{{range .Manifest.Manifests}}{{if eq .Platform.Architecture \"${arch}\"}}{{.Digest}}{{end}}{{end}}")"
+            test -n "$manifest" || { echo "::error::the published index does not advertise $platform"; exit 1; }
+            DOCKER_CONFIG="$anonymous_config" docker pull --quiet "${IMAGE}@${manifest}"
+            echo "anonymous pull OK: ${platform} ${manifest}"
+          done
 
       - name: Bind release VEX to the published registry digest
         env:
@@ -250,12 +341,24 @@ jobs:
           push-to-registry: true
           create-storage-record: false
 
-      - name: Attest the SBOM
+      # One SBOM per platform: the two images install the same pinned dependency set but different
+      # architecture-specific wheels and base-image packages, so a single SBOM would misdescribe
+      # whichever platform it was not generated from.
+      - name: Attest the SBOM (amd64)
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-name: ${{ steps.publish_gate.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
-          sbom-path: dockvault-${{ steps.publish_gate.outputs.tag }}.spdx.json
+          sbom-path: dockvault-${{ steps.publish_gate.outputs.tag }}-amd64.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest the SBOM (arm64)
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-name: ${{ steps.publish_gate.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: dockvault-${{ steps.publish_gate.outputs.tag }}-arm64.spdx.json
           push-to-registry: true
           create-storage-record: false
 
@@ -265,5 +368,6 @@ jobs:
           tag_name: ${{ steps.publish_gate.outputs.tag }}
           generate_release_notes: true
           files: |
-            dockvault-${{ steps.publish_gate.outputs.tag }}.spdx.json
+            dockvault-${{ steps.publish_gate.outputs.tag }}-amd64.spdx.json
+            dockvault-${{ steps.publish_gate.outputs.tag }}-arm64.spdx.json
             dockvault-${{ steps.publish_gate.outputs.tag }}.openvex.json

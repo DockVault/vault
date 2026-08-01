@@ -387,6 +387,11 @@ def build_env_lines(cfg):
     # volume names so existing deployments are byte-identical.
     if cfg.get("volume_prefix") and cfg["volume_prefix"] != DEFAULT_PROJECT:
         bare("VAULT_VOLUME_PREFIX", cfg["volume_prefix"])
+    # Only pin an image when the operator chose a PUBLISHED release. Left unset, the composes fall
+    # back to the local build tag, so a build-from-source deployment authors exactly the .env it
+    # always has.
+    if cfg.get("dockvault_image"):
+        bare("DOCKVAULT_IMAGE", cfg["dockvault_image"])
     if cfg.get("run_sftp"):
         bare("RUN_SFTP", "1")
     # Only write a port line when it differs from the compose default (443 web / 2322 sftp).
@@ -1175,6 +1180,31 @@ def untar_volume(volume, src_dir, archive_name, run=subprocess.run):
 # --- update (release list + upgrade/downgrade) -----------------------------------------------
 RELEASES_URL = "https://api.github.com/repos/DockVault/vault/releases"
 GHCR_IMAGE = "ghcr.io/dockvault/vault"
+# The tag a local `docker compose --build` produces, and the compose files' own fallback for an
+# unset DOCKVAULT_IMAGE. Naming it here lets the from-source paths point .env back at a local build
+# after a release image has been pulled over it.
+LOCAL_IMAGE = "dockvault-vault:latest"
+
+
+def release_image_ref(version):
+    """The published GHCR reference for a version. '0.9.0' and 'v0.9.0' both -> '<repo>:v0.9.0'.
+    Returns '' for a missing/unknown version, which callers read as "no release to pull"."""
+    tag = (version or "").strip()
+    if not tag or tag == "unknown":
+        return ""
+    return "%s:%s" % (GHCR_IMAGE, tag if tag.startswith("v") else "v" + tag)
+
+
+def uses_release_image(env):
+    """True when .env pins this deployment to a PUBLISHED image instead of a local build.
+
+    Anything under the GHCR repository got there by being pulled; the local build always wears
+    LOCAL_IMAGE. The distinction is load-bearing rather than cosmetic: `compose up --build` tags
+    its output with whatever DOCKVAULT_IMAGE says, so building over a pulled release silently
+    replaces the scanned, attested, published image with a local build wearing its version tag —
+    and the deployment then reports a version it is not running."""
+    image = (env.get("DOCKVAULT_IMAGE") or "").strip()
+    return image.startswith(GHCR_IMAGE + ":") or image.startswith(GHCR_IMAGE + "@")
 
 
 def parse_semver(v):
@@ -1391,10 +1421,13 @@ class DockVault:
     def setup(self, args=None):
         """Configure + start the standalone HTTPS vault: author (or reuse) .env, provision a TLS
         certificate (self-signed / Let's Encrypt / bring-your-own, with rootless-cert-perm handling),
-        then build + start the secure stack."""
+        then start the secure stack — pulling the published release image or building this
+        checkout, per the .env's DOCKVAULT_IMAGE (see _resolve_setup_image)."""
         pal = self.pal
         no_start = bool(args and getattr(args, "no_start", False))
-        steps = ["Settings", "Write .env", "Certificate"] + ([] if no_start else ["Build + start", "Health check"])
+        # "Start" rather than "Build + start": the deployment may be pulling a published release
+        # rather than building, and for a fresh install the choice is not made until Settings.
+        steps = ["Settings", "Write .env", "Certificate"] + ([] if no_start else ["Start", "Health check"])
         tracker = Steps(steps, pal)
 
         env_path = self._env_path()
@@ -1526,7 +1559,7 @@ class DockVault:
         if not port_free(web_port) and not self._port_is_ours(web_port):
             print(pal.paint("  WARNING: host port %d is already in use; the web container may fail to bind "
                             "it. Free it first (e.g. sudo ss -ltnp 'sport = :%d')." % (web_port, web_port), "yellow"))
-        tracker.advance(); tracker.show()               # -> Build + start
+        tracker.advance(); tracker.show()               # -> Start
         if not self._start_secure_stack():
             shown = self._tail_logs(self._web_service(profiles))
             self._fail("the stack did not start - %s." % ("the last log lines are above" if shown
@@ -1558,6 +1591,42 @@ class DockVault:
         if not names:                       # None = could not ask; [] = nothing docker knows of
             return False
         return all(name in self.OWN_CONTAINERS for name in names)
+
+    def _resolve_setup_image(self, args, interactive):
+        """Decide whether a FRESH install runs the published release image or builds this checkout.
+        Returns the DOCKVAULT_IMAGE value to author, or '' to leave it unset (the compose default,
+        i.e. a local build). Only ever consulted when authoring a new .env — a re-run keeps whatever
+        the existing .env already says.
+
+        The two modes default differently, deliberately. An interactive operator is installing the
+        product and should get the release CI built, scanned and attested — no build toolchain, no
+        wait. A --non-interactive run is automation reproducing a checkout (CI, a provisioning
+        script), where pulling a DIFFERENT artifact than the one checked out would make the run
+        meaningless; it builds unless explicitly asked for a release."""
+        pal = self.pal
+        choice = ((getattr(args, "image_source", None) if args else None) or "").strip().lower()
+        candidate = release_image_ref(read_version_file(self.root))
+        if interactive and not choice:
+            print(pal.paint("\n  Container image:", "cyan"))
+            print("    1) Published release - pull %s (no build toolchain needed; fastest)"
+                  % (candidate or "the matching GHCR release"))
+            print("    2) Build from source - build this checkout's Dockerfile")
+            choice = {"2": "build"}.get(ask("Choose 1/2", pal, "1").strip(), "release")
+        if (choice or "build") != "release":
+            return ""
+        if not candidate:
+            print(pal.paint("  No usable VERSION to match a published release; building from source "
+                            "instead.", "yellow"))
+            return ""
+        # A checkout ahead of the last release (plain `main`) names a tag that was never published,
+        # so the pull would fail AFTER .env was authored. Ask GitHub first and fall back quietly.
+        # An unreachable API returns [] — proceed, and let the pull report the real failure.
+        tags = fetch_release_tags()
+        if tags and candidate.rsplit(":", 1)[1] not in tags:
+            print(pal.paint("  %s is not published (this checkout is ahead of the latest release); "
+                            "building from source instead." % candidate, "yellow"))
+            return ""
+        return candidate
 
     def _collect_setup_config(self, args):
         """Resolve the full setup config (secrets + flags) from args (unattended) and/or interactive
@@ -1613,6 +1682,7 @@ class DockVault:
 
         return {
             "server_name": server,
+            "dockvault_image": self._resolve_setup_image(args, interactive),
             "encryption_key": gen_fernet_key(),
             "jwt_secret_key": gen_hex(32),
             "vault_db_password": gen_hex(16),
@@ -1715,7 +1785,32 @@ class DockVault:
         return subprocess.run(self._dc(*args), stdin=subprocess.DEVNULL, **kw)
 
     def _start_secure_stack(self):
+        """Start/recreate the deployment the current .env describes.
+
+        Builds the local Dockerfile UNLESS .env pins a published release image, in which case the
+        image is PULLED and the stack recreated without --build. Setup re-runs go through here, so
+        without the check the documented "re-run setup to upgrade" path would rebuild over a
+        release image an operator deliberately chose — the same clobber the Update menu's pull path
+        already avoids."""
+        if uses_release_image(self._load_env()):
+            return self._pull_release_image() and self._recreate_stack(build=False)
         return self._recreate_stack(build=True)
+
+    def _pull_release_image(self):
+        """Pull the release image .env pins. Reports the remedy itself, since a failure here is
+        almost always a tag that was never published rather than a broken deployment."""
+        image = (self._load_env().get("DOCKVAULT_IMAGE") or "").strip()
+        print(self.pal.paint("  Pulling %s (published release; no local build) ..." % image, "cyan"))
+        try:
+            r = self._run_dc("pull", capture=False, timeout=600)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(self.pal.paint("  docker compose pull failed: %s" % exc, "red"))
+            return False
+        if getattr(r, "returncode", 1) != 0:
+            print(self.pal.paint("  Could not pull %s - is that version published? Build this checkout "
+                                 "instead with:  python dockvault.py setup --image-source build" % image, "red"))
+            return False
+        return True
 
     def _recreate_stack(self, build):
         """Recreate the stack. build=True builds the local Dockerfile (setup / from-source update);
@@ -2488,6 +2583,12 @@ class DockVault:
                 self._fail("git checkout failed: %s" % exc)
             if r.returncode != 0:
                 self._fail("git checkout %s failed: %s" % (tag, (r.stderr or "").strip()[:200]))
+            # Point .env back at the local build tag. Coming from a pulled release, DOCKVAULT_IMAGE
+            # still names a GHCR reference — and `compose up --build` tags its output with whatever
+            # it finds there, so the build would be published-image-shaped: same name and version
+            # tag as the release, different contents.
+            if uses_release_image(self._load_env()):
+                self._set_env_key(self._env_path(), "DOCKVAULT_IMAGE", LOCAL_IMAGE)
         else:
             image = "%s:%s" % (GHCR_IMAGE, tag)
             self._set_env_key(self._env_path(), "DOCKVAULT_IMAGE", image)
@@ -2591,6 +2692,9 @@ def build_parser():
     sp.add_argument("--sftp-port", dest="sftp_port", type=int, help="host port for SFTP (default 2322)")
     sp.add_argument("--enable-sftp", dest="enable_sftp", action="store_true", help="also serve SFTP")
     sp.add_argument("--split", dest="split", action="store_true", help="two containers (vault-api + vault-sftp)")
+    sp.add_argument("--image-source", dest="image_source", choices=("release", "build"),
+                    help="release = pull the published GHCR image | build = build this checkout "
+                         "(default with --non-interactive; interactive setup asks)")
     sp.add_argument("--update-check", dest="update_check", action="store_true", help="enable the opt-in update check")
     sp.add_argument("--enable-log-pull", dest="enable_log_pull", action="store_true", help="enable the log-pull endpoint")
     sp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags/defaults, never prompt")

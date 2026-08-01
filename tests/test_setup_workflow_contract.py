@@ -66,18 +66,33 @@ def test_profile_transitions_preserve_state_volumes_sftp_and_inventory():
         "New volume set and paired-env repoint round trip",
     )
 
+    # A transition deliberately CHANGES the topology, and health describes the topology — combined
+    # serves SFTP from the web container, split from its own. So identity (vaults, users) is what
+    # must be byte-identical across the change, and health is asserted separately on its own terms.
+    # Comparing the whole payload conflated the two and demanded the shape not change either.
     assert "COMPOSE_PROFILES=split" in to_split
-    assert "state-planted.json" in to_split
+    assert "--identity-only" in to_split
+    assert "identity-planted.json" in to_split
+    assert "state-planted.json" not in to_split, "identity, not the topology-dependent payload"
     assert "volumes-before-profile-transition" in to_split
     assert " down " not in to_split
     assert "vault-api vault-db vault-redis vault-sftp" in to_split
     assert "SSH-*" in to_split
+    # The regression this guards: the api-only container used to probe its own loopback for an
+    # SFTP server living in another container and report the deployment degraded forever.
+    assert 'h["status"]=="healthy"' in to_split
     assert "COMPOSE_PROFILES=combined" in to_combined
-    assert "state-planted.json" in to_combined
+    assert "--identity-only" in to_combined
+    assert "identity-planted.json" in to_combined
+    assert "state-planted.json" not in to_combined, "identity, not the topology-dependent payload"
     assert "volumes-before-profile-transition" in to_combined
     assert " down " not in to_combined
     assert "vault vault-db vault-redis" in to_combined
     assert "SSH-*" in to_combined
+    # Coming back to combined, SFTP is in this container again, so "healthy" is not enough — it
+    # must report actually listening, which proves the check resumed probing rather than going
+    # quiet in both directions.
+    assert 'h["sftp"]=="listening"' in to_combined
     assert "down -v" not in to_split + to_combined
 
 

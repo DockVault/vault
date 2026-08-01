@@ -2,7 +2,8 @@ name: Setup matrix
 
 # Drives dockvault.py against real Docker, in the states a self-hosting operator actually reaches:
 # a first install, a re-run over existing data, a backup/restore round trip, a mismatched .env, a
-# split deployment. tests/test_dockvault_tool.py already covers the tool's REASONING thoroughly —
+# split deployment, and an install from the published image rather than a source build.
+# tests/test_dockvault_tool.py already covers the tool's REASONING thoroughly —
 # 124 tests — but every one of them injects a fake `run` hook, so nothing has ever checked that the
 # tool can actually stand a deployment up, or that re-running it leaves a user's data where it was.
 #
@@ -122,6 +123,11 @@ jobs:
             -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
             -d '{"name":"matrix-marker","description":"planted before the re-runs"}' -o /dev/null
           python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS" > /tmp/state-planted.json
+          # Identity alone, for the profile transitions: those deliberately CHANGE the topology,
+          # and health describes the topology (combined serves SFTP from the web container, split
+          # from its own). What must survive a transition is the data, not the shape.
+          python3 .github/scripts/deployment_state.py --identity-only "$BASE" "$ADMIN_USER" "$ADMIN_PASS" \
+            > /tmp/identity-planted.json
           grep -q matrix-marker <(curl -sS --cacert certs/cert.pem "$BASE/vaults" -H "Authorization: Bearer $token") \
             || { echo "::error::the marker vault was not created"; exit 1; }
           echo "planted: $(cat /tmp/state-planted.json)"
@@ -246,10 +252,17 @@ jobs:
             --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
             --admin-password "$ADMIN_PASS" \
             --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" --enable-sftp
-          python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS" \
-            > /tmp/state-profile-split.json
-          diff /tmp/state-planted.json /tmp/state-profile-split.json \
+          python3 .github/scripts/deployment_state.py --identity-only "$BASE" "$ADMIN_USER" "$ADMIN_PASS" \
+            > /tmp/identity-profile-split.json
+          diff /tmp/identity-planted.json /tmp/identity-profile-split.json \
             || { echo "::error::combined-to-split changed deployment state"; exit 1; }
+          # Health is asserted on its own terms rather than by byte-equality: the payload legitimately
+          # differs across the transition (SFTP moves to its own container), but the deployment must
+          # not report itself broken afterwards. It used to — the api-only container probed its own
+          # loopback for an SFTP server that lives elsewhere and called it unreachable.
+          python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS" \
+            | python3 -c 'import json,sys; h=json.load(sys.stdin)["health"]; print(h); sys.exit(0 if h["status"]=="healthy" else 1)' \
+            || { echo "::error::split deployment reports itself degraded"; exit 1; }
           docker volume ls --filter label=com.dockvault.managed=true --format '{{.Name}}' \
             | sort > /tmp/volumes-after-profile-split
           diff /tmp/volumes-before-profile-transition /tmp/volumes-after-profile-split \
@@ -280,10 +293,16 @@ jobs:
             --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
             --admin-password "$ADMIN_PASS" \
             --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" --enable-sftp
-          python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS" \
-            > /tmp/state-profile-combined.json
-          diff /tmp/state-planted.json /tmp/state-profile-combined.json \
+          python3 .github/scripts/deployment_state.py --identity-only "$BASE" "$ADMIN_USER" "$ADMIN_PASS" \
+            > /tmp/identity-profile-combined.json
+          diff /tmp/identity-planted.json /tmp/identity-profile-combined.json \
             || { echo "::error::split-to-combined changed deployment state"; exit 1; }
+          # Back in combined the SFTP server IS in this container again, so health must not merely
+          # be healthy - it must report SFTP actually listening, which is what proves the marker is
+          # set on the way back and the check did not simply stop looking.
+          python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS" \
+            | python3 -c 'import json,sys; h=json.load(sys.stdin)["health"]; print(h); sys.exit(0 if h["status"]=="healthy" and h["sftp"]=="listening" else 1)' \
+            || { echo "::error::combined deployment does not report SFTP listening"; exit 1; }
           docker volume ls --filter label=com.dockvault.managed=true --format '{{.Name}}' \
             | sort > /tmp/volumes-after-profile-combined
           diff /tmp/volumes-before-profile-transition /tmp/volumes-after-profile-combined \
@@ -445,6 +464,94 @@ jobs:
           diff /tmp/state-h-before.json /tmp/state-h-after.json \
             || { echo "::error::the deployment did not survive a refused re-run intact"; exit 1; }
           echo "H: refused without touching the live deployment"
+
+      - name: Scenario I — install from the published release image
+        # The path a self-hoster takes when they do not want to build: setup pulls the published
+        # image instead of compiling this checkout. Nothing else in this file covers it, and for a
+        # long time nothing in the tool did either — every install built from source, so the
+        # published image was reachable only by hand-editing .env.
+        #
+        # Runs LAST on purpose: it is the one scenario whose containers are NOT built from the code
+        # under test, so it must not be able to influence anything above it.
+        #
+        # VERSION is pinned to the newest PUBLISHED release for the duration. `main` sits ahead of
+        # the registry for most of its life, so keying off the checkout's own VERSION would make
+        # this scenario silently test the fallback instead — which the step after this one asserts
+        # deliberately.
+        shell: bash
+        run: |
+          set -euo pipefail
+          published="$(curl -sSf https://api.github.com/repos/DockVault/vault/releases \
+            | python3 -c 'import json,sys; print(next(r["tag_name"] for r in json.load(sys.stdin) if not r.get("draft")))')"
+          echo "newest published release: $published"
+          cp VERSION "$RUNNER_TEMP/VERSION.checkout"
+          printf '%s\n' "${published#v}" > VERSION
+
+          python3 dockvault.py reset --non-interactive --confirm
+          rm -f .env
+          python3 dockvault.py setup --non-interactive --image-source release \
+            --server-name localhost \
+            --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
+            --admin-password "$ADMIN_PASS" \
+            --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" --enable-sftp \
+            | tee /tmp/setup-release.log
+          python3 .github/scripts/mask_env_secrets.py .env
+          cp "$RUNNER_TEMP/VERSION.checkout" VERSION
+
+          expected="ghcr.io/dockvault/vault:${published}"
+          grep -q "^DOCKVAULT_IMAGE=${expected}$" .env \
+            || { echo "::error::setup did not pin the published image"; grep '^DOCKVAULT_IMAGE=' .env || true; exit 1; }
+          grep -qi "published release" /tmp/setup-release.log \
+            || { echo "::error::setup did not report that it was pulling a release"; exit 1; }
+
+          # It must have PULLED, not built. A local build would wear the very same reference, so
+          # the reference proves nothing on its own: only an image that came from the registry
+          # carries a repo digest.
+          expected_id="$(docker image inspect -f '{{.Id}}' "$expected")"
+          running_id="$(docker inspect -f '{{.Image}}' vault)"
+          [ "$running_id" = "$expected_id" ] \
+            || { echo "::error::the container is not running $expected"; exit 1; }
+          [ "$(docker image inspect -f '{{len .RepoDigests}}' "$expected")" -gt 0 ] \
+            || { echo "::error::$expected has no repo digest - it was built locally, not pulled"; exit 1; }
+          echo "running $expected ($(docker image inspect -f '{{index .RepoDigests 0}}' "$expected"))"
+
+          # And it has to actually serve.
+          for attempt in $(seq 1 20); do
+            if curl -sSf --cacert certs/cert.pem "$BASE/health" >/dev/null 2>&1; then
+              echo "I: published image installed and serving"; exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::the published image never answered /health"
+          docker compose -f docker-compose.secure.yml logs --no-color --tail=100
+          exit 1
+
+      - name: Scenario I2 — an unpublished version falls back to a source build
+        # The other half of the decision. A checkout whose VERSION was never released must not
+        # author a .env pinned to an image that cannot be pulled — that would strand the operator
+        # on a failure AFTER their configuration was written.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp VERSION "$RUNNER_TEMP/VERSION.checkout"
+          printf '99.0.0\n' > VERSION
+
+          python3 dockvault.py reset --non-interactive --confirm
+          rm -f .env
+          python3 dockvault.py setup --non-interactive --image-source release --no-start \
+            --server-name localhost \
+            --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
+            --admin-password "$ADMIN_PASS" \
+            --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" \
+            | tee /tmp/setup-unpublished.log
+          python3 .github/scripts/mask_env_secrets.py .env
+          cp "$RUNNER_TEMP/VERSION.checkout" VERSION
+
+          grep -qi "not published" /tmp/setup-unpublished.log \
+            || { echo "::error::setup did not report the unpublished version"; cat /tmp/setup-unpublished.log; exit 1; }
+          grep -q '^DOCKVAULT_IMAGE=' .env \
+            && { echo "::error::setup pinned an image that was never published"; exit 1; } || true
+          echo "I2: fell back to a source build without pinning an unpullable image"
 
       - name: Deployment logs
         if: failure()
