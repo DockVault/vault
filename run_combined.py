@@ -153,6 +153,20 @@ def _spawn(target: str, label: str) -> None:
     _PROCS.append((target, p))
 
 
+def mark_sftp_in_container() -> bool:
+    """Tell the children that SFTP, if this deployment runs it, runs in THIS container.
+
+    This launcher is the only one that serves both halves from one container, so it is the only
+    place the marker is true — the split profile starts ``app.api.api_server`` directly and its
+    SFTP server lives in a separate container. ``/health`` reads the marker before probing
+    loopback for SFTP; without it the api-only container probes itself, finds nothing, and
+    reports a subsystem it was never asked to run as broken. Returns whether it was set."""
+    if not _truthy(os.environ.get("RUN_SFTP")):
+        return False
+    os.environ["VAULT_SFTP_IN_CONTAINER"] = "1"
+    return True
+
+
 def _wait_api_ready(timeout: float = 60.0) -> bool:
     """Poll the API's /health until it answers, so the SFTP server starts only AFTER the
     API's lifespan has created/migrated the schema the SFTP path reads. Returns False on
@@ -218,6 +232,8 @@ def main() -> None:
     # and drop — safe — but starting the writer first captures early startup lines too).
     _init_sink()
     threading.Thread(target=_sink_writer_loop, daemon=True).start()
+    # Must run BEFORE the first spawn — _spawn snapshots os.environ per child.
+    mark_sftp_in_container()
     # Start the API first — its lifespan runs the schema create/migrations the SFTP
     # server relies on.
     _spawn("app.api.api_server", "web")

@@ -1441,9 +1441,11 @@ async def health_check():
     sftp = check_sftp_status()
     storage = check_storage_status()
 
-    # SFTP is opt-in, so `disabled` is a healthy state — only a vault that was meant to serve
-    # SFTP and is not counts against the summary. Storage that cannot be written to is degraded
-    # even while the API answers: uploads will fail, and nothing else would have said so.
+    # SFTP is opt-in, so `disabled` is a healthy state, and so is `external` (a split deployment
+    # serves SFTP from its own container, which this process cannot and should not answer for) —
+    # only a vault that was meant to serve SFTP from HERE and is not counts against the summary.
+    # Storage that cannot be written to is degraded even while the API answers: uploads will
+    # fail, and nothing else would have said so.
     degraded = (not db_ok) or (not redis_ok) or sftp == "unreachable" or storage != "writable"
 
     return {
