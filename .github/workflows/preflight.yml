@@ -50,10 +50,25 @@ jobs:
 
       - name: Verify and audit the production lock
         shell: bash
+        # Recompiles IN PLACE, deliberately. pip-compile keeps every pin the existing lock already
+        # carries as long as it still satisfies requirements.txt, so this asks the question the gate
+        # exists to answer — "does the committed lock resolve requirements.txt completely, with
+        # hashes, and nothing stale or missing?" — and a changed pin, a dropped dependency or a
+        # forgotten regeneration still fails the cmp.
+        #
+        # An earlier version deleted the lock first, forcing a max-resolve against the index. That
+        # made the gate assert something else entirely: that the lock was the NEWEST resolution
+        # available at the moment CI ran. Nothing in the repository can hold that true — every
+        # unpinned transitive (annotated-doc via fastapi, websockets via uvicorn) turns an upstream
+        # release into a red main and a red pull request, with no commit having changed. It broke
+        # exactly that way, and it blocked the dependency PRs that would have refreshed the lock.
+        #
+        # Freshness is covered where it belongs and can actually fail closed: pip-audit below fails
+        # the build on a vulnerable pin, Dependabot proposes the direct upgrades, and the advisory
+        # step after this one reports drift without blocking anyone.
         run: |
           set -euo pipefail
           cp requirements.lock "$RUNNER_TEMP/requirements.lock.checked"
-          rm requirements.lock
           CUSTOM_COMPILE_COMMAND="python -m piptools compile --generate-hashes --strip-extras --output-file requirements.lock requirements.txt" \
             python -m piptools compile \
               --generate-hashes \
@@ -67,6 +82,57 @@ jobs:
             --require-hashes \
             --disable-pip \
             -r requirements.lock
+
+      - name: Report available lock refreshes
+        shell: bash
+        # Advisory only — never fails the job. Resolves requirements.txt from scratch and names the
+        # pins a `pip-compile --upgrade` would move, so the freshness signal the strict gate used to
+        # give is still visible without letting an upstream release break unrelated work.
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d "$RUNNER_TEMP/lock-refresh.XXXXXX")"
+          cp requirements.txt "$workdir/requirements.txt"
+          if ! (cd "$workdir" && python -m piptools compile \
+                  --quiet --generate-hashes --strip-extras \
+                  --output-file requirements.lock requirements.txt >/dev/null 2>&1); then
+            echo "::notice::could not resolve the newest dependency set; skipping the refresh report"
+            exit 0
+          fi
+          python - "$workdir/requirements.lock" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          PIN = re.compile(r"^([A-Za-z0-9._-]+)==(\S+?)\s*\\?$")
+
+          def pins(path):
+              found = {}
+              for line in Path(path).read_text(encoding="utf-8").splitlines():
+                  match = PIN.match(line)
+                  if match:
+                      found[match.group(1).lower()] = match.group(2)
+              return found
+
+          committed = pins("requirements.lock")
+          newest = pins(sys.argv[1])
+          moved = sorted(
+              (name, committed[name], newest[name])
+              for name in committed.keys() & newest.keys()
+              if committed[name] != newest[name]
+          )
+          added = sorted(newest.keys() - committed.keys())
+          if not moved and not added:
+              print("::notice::the production lock is already the newest resolvable set")
+              raise SystemExit(0)
+          for name, have, available in moved:
+              print("::warning::%s is pinned at %s; %s is available" % (name, have, available))
+          for name in added:
+              print("::warning::a newer resolution would add %s" % name)
+          print(
+              "::notice::refresh with `python -m piptools compile --upgrade --generate-hashes "
+              "--strip-extras --output-file requirements.lock requirements.txt` when you want these"
+          )
+          PY
 
       - name: Collect the strict full suite
         id: collection

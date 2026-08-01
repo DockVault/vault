@@ -1595,6 +1595,143 @@ def test_update_pull_path_sets_image_and_recreates_without_build(tmp_path, monke
         "the pull path must recreate WITHOUT --build (else it clobbers the pulled image)"
 
 
+# --- image source: build this checkout vs pull a published release ---------------------------
+def test_release_image_ref_normalises_the_version():
+    assert dv.release_image_ref("0.9.0") == "ghcr.io/dockvault/vault:v0.9.0"
+    assert dv.release_image_ref("v0.9.0") == "ghcr.io/dockvault/vault:v0.9.0"
+    assert dv.release_image_ref("") == ""
+    assert dv.release_image_ref("unknown") == "", "an unreadable VERSION means 'no release to pull'"
+
+
+def test_uses_release_image_distinguishes_published_from_local():
+    assert dv.uses_release_image({"DOCKVAULT_IMAGE": "ghcr.io/dockvault/vault:v0.9.0"})
+    assert dv.uses_release_image({"DOCKVAULT_IMAGE": "ghcr.io/dockvault/vault@sha256:abc"})
+    assert not dv.uses_release_image({"DOCKVAULT_IMAGE": dv.LOCAL_IMAGE})
+    assert not dv.uses_release_image({}), "an unset image is the compose default: a local build"
+    # a look-alike registry must not be mistaken for the published repository
+    assert not dv.uses_release_image({"DOCKVAULT_IMAGE": "ghcr.io/dockvault/vault-fork:v0.9.0"})
+
+
+def test_non_interactive_setup_builds_this_checkout_by_default(tmp_path):
+    # Automation reproducing a checkout must build it, never silently run a different artifact.
+    (tmp_path / "VERSION").write_text("0.9.0\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    args = argparse.Namespace(non_interactive=True, image_source=None)
+    assert tool._resolve_setup_image(args, interactive=False) == ""
+
+
+def test_setup_image_source_release_pins_the_matching_release(tmp_path, monkeypatch):
+    (tmp_path / "VERSION").write_text("0.9.0\n", encoding="utf-8")
+    monkeypatch.setattr(dv, "fetch_release_tags", lambda *a, **k: ["v0.9.0", "v0.8.0"])
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    args = argparse.Namespace(non_interactive=True, image_source="release")
+    assert tool._resolve_setup_image(args, interactive=False) == "ghcr.io/dockvault/vault:v0.9.0"
+
+
+def test_setup_image_source_release_falls_back_when_unpublished(tmp_path, monkeypatch, capsys):
+    # A checkout ahead of the last release (plain `main`) names a tag that was never published.
+    # Authoring it would strand the operator on a pull that cannot succeed.
+    (tmp_path / "VERSION").write_text("0.9.1\n", encoding="utf-8")
+    monkeypatch.setattr(dv, "fetch_release_tags", lambda *a, **k: ["v0.9.0", "v0.8.0"])
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    args = argparse.Namespace(non_interactive=True, image_source="release")
+    assert tool._resolve_setup_image(args, interactive=False) == ""
+    assert "not published" in capsys.readouterr().out
+
+
+def test_setup_image_source_release_proceeds_when_github_is_unreachable(tmp_path, monkeypatch):
+    # fetch_release_tags fails closed to []. That means "could not check", not "not published" —
+    # so the explicit request stands and the pull reports any real failure.
+    (tmp_path / "VERSION").write_text("0.9.0\n", encoding="utf-8")
+    monkeypatch.setattr(dv, "fetch_release_tags", lambda *a, **k: [])
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    args = argparse.Namespace(non_interactive=True, image_source="release")
+    assert tool._resolve_setup_image(args, interactive=False) == "ghcr.io/dockvault/vault:v0.9.0"
+
+
+def test_interactive_setup_offers_the_release_and_accepts_the_default(tmp_path, monkeypatch):
+    (tmp_path / "VERSION").write_text("0.9.0\n", encoding="utf-8")
+    monkeypatch.setattr(dv, "fetch_release_tags", lambda *a, **k: ["v0.9.0"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "")        # bare Enter -> offered default
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    args = argparse.Namespace(non_interactive=False, image_source=None)
+    assert tool._resolve_setup_image(args, interactive=True) == "ghcr.io/dockvault/vault:v0.9.0"
+
+
+def test_interactive_setup_can_still_choose_a_source_build(tmp_path, monkeypatch):
+    (tmp_path / "VERSION").write_text("0.9.0\n", encoding="utf-8")
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "2")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    args = argparse.Namespace(non_interactive=False, image_source=None)
+    assert tool._resolve_setup_image(args, interactive=True) == ""
+
+
+def test_authored_env_pins_the_image_only_when_a_release_was_chosen():
+    cfg = _reusable_env_cfg()
+    assert "DOCKVAULT_IMAGE" not in dv.parse_env("\n".join(dv.build_env_lines(cfg))), \
+        "a build-from-source install must author the .env it always has"
+    cfg["dockvault_image"] = "ghcr.io/dockvault/vault:v0.9.0"
+    pinned = dv.parse_env("\n".join(dv.build_env_lines(cfg)))
+    assert pinned["DOCKVAULT_IMAGE"] == "ghcr.io/dockvault/vault:v0.9.0"
+
+
+def test_start_pulls_and_never_builds_over_a_release_image(tmp_path, monkeypatch):
+    # The gap this closes: `setup` is the documented idempotent upgrade path, so a re-run over a
+    # release-image deployment used to rebuild — replacing the published image with a local build
+    # wearing its version tag.
+    cfg = _reusable_env_cfg()
+    cfg["dockvault_image"] = "ghcr.io/dockvault/vault:v0.9.0"
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _Proc(0, ""))
+    assert tool._start_secure_stack() is True
+    assert any("pull" in c for c in calls), "a release-image deployment must pull"
+    ups = [c for c in calls if "up" in c]
+    assert ups and all("--build" not in c for c in ups), "and must never rebuild over the release"
+
+
+def test_start_builds_when_no_release_image_is_pinned(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _Proc(0, ""))
+    assert tool._start_secure_stack() is True
+    assert not any("pull" in c for c in calls), "a source deployment must not pull a release"
+    ups = [c for c in calls if "up" in c]
+    assert ups and any("--build" in c for c in ups), "it builds this checkout"
+
+
+def test_start_reports_the_remedy_when_the_release_cannot_be_pulled(tmp_path, monkeypatch, capsys):
+    cfg = _reusable_env_cfg()
+    cfg["dockvault_image"] = "ghcr.io/dockvault/vault:v9.9.9"
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run",
+                        lambda cmd, **k: calls.append(cmd) or _Proc(0 if "pull" not in cmd else 1, ""))
+    assert tool._start_secure_stack() is False
+    assert not [c for c in calls if "up" in c], "a failed pull must not go on to start anything"
+    assert "--image-source build" in capsys.readouterr().out
+
+
+def test_update_from_source_stops_pointing_at_the_release_it_replaces(tmp_path, monkeypatch):
+    # --source builds locally, and `up --build` tags its output with whatever DOCKVAULT_IMAGE says.
+    # Left on the pulled release's reference, the build would wear that release's name and version.
+    cfg = _reusable_env_cfg()
+    cfg["dockvault_image"] = "ghcr.io/dockvault/vault:v0.9.0"
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
+    (tmp_path / "VERSION").write_text("0.9.0\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: _Proc(0, ""))
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: True)
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    tool.update(argparse.Namespace(non_interactive=True, tag="v0.8.0", source=True, yes=True))
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert env["DOCKVAULT_IMAGE"] == dv.LOCAL_IMAGE
+
+
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs host openssl for a BYO pair")
 def test_setup_byo_cert_mode_installs_pair(tmp_path):
     cert, key = _mkpair(tmp_path / "src")

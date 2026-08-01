@@ -54,6 +54,19 @@ Setup is idempotent — re-run any time to rebuild; it **reuses your existing `.
 data. (The old `./setup-secure.sh` / `./setup-secure.ps1` scripts still work — they are now thin
 shims that launch `dockvault.py setup`.)
 
+Setup asks where the container image should come from:
+
+| Choice | What happens | When to pick it |
+| --- | --- | --- |
+| **Published release** (default) | Pulls `ghcr.io/dockvault/vault:<version>` — the image GitHub Actions built, scanned and signed for that tag | Normal installs. No build toolchain, no wait. |
+| **Build from source** | Builds this checkout's `Dockerfile` | You changed the code, or you want to verify the build yourself (the AGPL guarantees you can) |
+
+Unattended runs (`--non-interactive`) **build** unless you pass `--image-source release`, so a
+scripted install always deploys the code it checked out rather than a different published artifact.
+If the checkout's `VERSION` has no matching release yet — which is normal on `main` — setup says so
+and builds instead. The choice is recorded as `DOCKVAULT_IMAGE` in `.env`, and re-running setup
+honours it: a release-image deployment is re-pulled, never rebuilt over.
+
 Setup creates the first admin account from the `ADMIN_USERNAME` / `ADMIN_PASSWORD` it writes to
 `.env` (a blank password auto-generates a strong one, printed once). Then open
 `https://<your-domain>` and log in with those credentials — change the password from Settings after
@@ -70,6 +83,19 @@ cp .env.example .env      # then edit it: set ENCRYPTION_KEY, JWT_SECRET_KEY, VA
 # ...put your TLS cert + key at ./certs/cert.pem and ./certs/key.pem...
 docker compose -f docker-compose.secure.yml up -d --build
 ```
+
+To run a **published release** instead of building, point `DOCKVAULT_IMAGE` at its tag and pull —
+no `--build`:
+
+```bash
+# in .env:  DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.9.0
+docker compose -f docker-compose.secure.yml pull
+docker compose -f docker-compose.secure.yml up -d
+```
+
+> **Never add `--build` while `DOCKVAULT_IMAGE` names a release.** Compose tags a local build with
+> whatever that variable says, so the build would replace the published image under its own version
+> tag — and the deployment would then report a version it is not running.
 
 > **The TLS key must be readable by the container's app user (uid `10001`).** `/app/certs` is a
 > read-only bind mount of `./certs`, and the app runs unprivileged — a key that is mode `600` owned
@@ -183,25 +209,29 @@ marks the one you're on, and lets you pick a version to **upgrade or downgrade**
 health. Because the database has no down-migrations, it **warns before any version change** and
 recommends a Backup first (Backup & Restore menu). The manual steps below do the same thing by hand:
 
-**From source** (works today, no prebuilt image needed):
+**From a prebuilt image** — every tagged release is published to GHCR as
+`ghcr.io/dockvault/vault:<tag>` (plus `:latest`), for `linux/amd64` and `linux/arm64`. The package
+is public: no login, no GitHub account. Set `DOCKVAULT_IMAGE` in `.env` to the release tag, then
+pull + restart with no local build:
+
+```bash
+# in .env:  DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.9.0
+docker compose -f docker-compose.secure.yml pull
+docker compose -f docker-compose.secure.yml up -d
+```
+
+**From source:**
 
 ```bash
 git pull
 docker compose -f docker-compose.secure.yml up -d --build   # or `docker compose up -d --build` for the local trial
 ```
 
-**From a prebuilt image** (once a release is published to GHCR) — set `DOCKVAULT_IMAGE` in `.env` to
-the release tag, then pull + restart with no local build:
-
-```bash
-# in .env:  DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.6.0
-docker compose -f docker-compose.secure.yml pull
-docker compose -f docker-compose.secure.yml up -d
-```
-
-Either way, re-running `dockvault.py setup` also upgrades (it rebuilds, recreates the containers, and
-keeps your `.env` and data). The `build:` path stays in the compose files, so you can always build
-your own (modified) image — which the AGPL license requires you be able to do.
+Re-running `dockvault.py setup` also upgrades, keeping your `.env` and data. It follows whichever
+path `DOCKVAULT_IMAGE` describes — pulling a release-image deployment, rebuilding a source one — so
+it never replaces a published image with a local build. The `build:` path stays in the compose
+files, so you can always build your own (modified) image, which the AGPL license requires you be
+able to do.
 
 > **Database migrations:** the app creates any missing tables on boot but does **not** yet alter
 > existing columns automatically. A release that changes the schema will call out the migration step

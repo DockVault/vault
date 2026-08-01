@@ -128,33 +128,40 @@ def test_publication_is_serial_and_scan_auth_push_release_order_is_fail_closed()
         "Refresh release refs immediately before authentication"
     ) < publish.index("Revalidate immediately before authentication")
     assert publish.count("release_gate.py") == 2
-    assert publish.count("release_push_digest.py") == 2
-    assert 'test "$latest_digest" = "$version_digest"' in publish
-    assert 'test "$resolved_version" = "$version_digest"' in publish
-    assert 'test "$resolved_latest" = "$version_digest"' in publish
-    assert 'echo "digest=${version_digest}" >> "$GITHUB_OUTPUT"' in publish
+    # What reaches GHCR must be the staged index that was scanned, under both tags, and nothing
+    # else: the copy is verified against the staging digest rather than trusted.
+    assert 'test "$resolved_version" = "$staged_digest"' in publish
+    assert 'test "$resolved_latest" = "$staged_digest"' in publish
+    assert 'echo "digest=${resolved_version}" >> "$GITHUB_OUTPUT"' in publish
     assert "+refs/heads/main:refs/remotes/origin/main" in publish
     assert "+refs/tags/${EXPECTED_TAG}:refs/tags/${EXPECTED_TAG}" in publish
     order = [
         publish.index("Validate publication inputs before build"),
-        publish.index("Build the tested image locally"),
-        publish.index("Generate the SPDX SBOM"),
-        publish.index("Render the revision-bound scan VEX"),
-        publish.index("Scan the exact local image"),
+        publish.index("Build every platform into the staging registry"),
+        publish.index("Load each platform for scanning"),
+        publish.index("Generate the SPDX SBOM (amd64)"),
+        publish.index("Generate the SPDX SBOM (arm64)"),
+        publish.index("Render the revision-bound scan VEX for each platform"),
+        publish.index("Scan the exact staged image (amd64)"),
+        publish.index("Scan the exact staged image (arm64)"),
         publish.index("Refresh release refs immediately before authentication"),
         publish.index("Revalidate immediately before authentication"),
         publish.index("Log in to GHCR"),
-        publish.index("Push the scanned image and resolve its digest"),
-        publish.index("Verify published digest is anonymously pullable"),
+        publish.index("Copy the scanned index to GHCR and resolve its digest"),
+        publish.index("Verify every published platform is anonymously pullable"),
         publish.index("Bind release VEX to the published registry digest"),
         publish.index("Attest build provenance"),
-        publish.index("Attest the SBOM"),
+        publish.index("Attest the SBOM (amd64)"),
+        publish.index("Attest the SBOM (arm64)"),
         publish.index("Create GitHub Release"),
     ]
     assert order == sorted(order)
     assert 'anonymous_config="$(mktemp -d "$RUNNER_TEMP/docker-anon.XXXXXX")"' in publish
     assert "printf '%s\\n' '{\"auths\":{}}'" in publish
-    assert 'DOCKER_CONFIG="$anonymous_config" docker pull "${IMAGE}@${DIGEST}"' in publish
+    assert (
+        'DOCKER_CONFIG="$anonymous_config" docker pull --quiet "${IMAGE}@${manifest}"'
+        in publish
+    )
     assert "steps.publish_gate.outputs.version" in publish
     assert "steps.publish_gate.outputs.image" in publish
     assert "steps.publish_gate.outputs.tag" in publish
