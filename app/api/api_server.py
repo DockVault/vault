@@ -1425,14 +1425,33 @@ def set_update_settings_endpoint(payload: dict, request: Request,
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """Health check endpoint.
+
+    Reports each subsystem separately, because a vault can be half-broken: the API answering
+    while its database is gone is a different problem from the API being down, and the two need
+    different responses. `status` stays the one-word summary a container healthcheck reads.
+
+    Unauthenticated, so every value comes from a short fixed vocabulary — see
+    `app/core/health.py`. No paths, capacities or error text.
+    """
+    from app.core.health import check_sftp_status, check_storage_status
+
     db_ok = check_db_connection()
     redis_ok = check_redis_connection()
-    
+    sftp = check_sftp_status()
+    storage = check_storage_status()
+
+    # SFTP is opt-in, so `disabled` is a healthy state — only a vault that was meant to serve
+    # SFTP and is not counts against the summary. Storage that cannot be written to is degraded
+    # even while the API answers: uploads will fail, and nothing else would have said so.
+    degraded = (not db_ok) or (not redis_ok) or sftp == "unreachable" or storage != "writable"
+
     return {
-        "status": "healthy" if (db_ok and redis_ok) else "degraded",
+        "status": "degraded" if degraded else "healthy",
         "database": "connected" if db_ok else "disconnected",
-        "redis": "connected" if redis_ok else "disconnected"
+        "redis": "connected" if redis_ok else "disconnected",
+        "sftp": sftp,
+        "storage": storage,
     }
 
 
