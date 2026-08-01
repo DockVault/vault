@@ -297,9 +297,12 @@ def test_release_scans_before_auth_and_attests_one_push_bound_registry_digest():
     assert "PLATFORMS: linux/amd64,linux/arm64" in publish
     assert "platforms: ${{ env.PLATFORMS }}" in publish
     assert "tags: ${{ env.STAGING_IMAGE }}:${{ steps.publish_gate.outputs.tag }}" in publish
-    staged_push = publish.index("Build every platform into the staging registry")
-    assert publish.index("Log in to GHCR") > staged_push
-    assert "ghcr.io" not in publish[staged_push : publish.index("Log in to GHCR")]
+    # Nothing may WRITE to GHCR before the scans. The build's one and only push target is the
+    # staging registry, and the single step that writes to GHCR runs after authentication.
+    # A ghcr.io-shaped LOCAL TAG before then is not a publication — see the scan identity below.
+    assert publish.count("push: true") == 1
+    assert "docker push" not in publish
+    assert publish.index("docker buildx imagetools create") > publish.index("Log in to GHCR")
     # Buildx's own attestation manifests would ride along into the published index and duplicate
     # the signed attestations below.
     assert "provenance: false" in publish
@@ -311,8 +314,15 @@ def test_release_scans_before_auth_and_attests_one_push_bound_registry_digest():
     assert publish.count("severity-cutoff: high") == 2
     assert publish.count("fail-build: true") == 2
     assert "only-fixed" not in publish
+
+    # The scanned image must wear the RELEASE reference, and each per-platform VEX must name the
+    # same reference. A VEX statement applies only to a product it lists, so scanning under an
+    # unrelated local name suppresses NOTHING: every reviewed exception goes unapplied and the
+    # release fails on the CPython findings the VEX exists to account for. That is not
+    # hypothetical — it is how the first multi-architecture release failed.
+    scan_ref = "${{ steps.publish_gate.outputs.image }}:${{ steps.publish_gate.outputs.tag }}"
     for platform in ("amd64", "arm64"):
-        assert f"image: dockvault-scan:{platform}" in publish
+        assert f"image: {scan_ref}-{platform}" in publish
         assert (
             f"vex: dockvault-${{{{ steps.publish_gate.outputs.tag }}}}-{platform}.openvex.json"
             in publish
@@ -321,6 +331,9 @@ def test_release_scans_before_auth_and_attests_one_push_bound_registry_digest():
             f"sbom-path: dockvault-${{{{ steps.publish_gate.outputs.tag }}}}-{platform}.spdx.json"
             in publish
         )
+    assert '--image-reference "${IMAGE}:${TAG}-${platform}"' in publish
+    assert "dockvault-scan" not in publish, "a name the VEX does not list suppresses nothing"
+
     # Each platform must be pulled by ITS OWN manifest digest. `docker pull --platform <p> <tag>`
     # resolves the index under the containerd image store, so both iterations would land the host
     # architecture and the arm64 "scan" would be a second amd64 scan that always passes.
@@ -328,12 +341,12 @@ def test_release_scans_before_auth_and_attests_one_push_bound_registry_digest():
     assert "docker pull --quiet --platform" not in publish
     assert '{{if eq .Platform.Architecture \\"${platform}\\"}}{{.Digest}}{{end}}' in publish
     assert (
-        'got="$(docker image inspect -f \'{{.Architecture}}\' "dockvault-scan:${platform}")"'
+        'got="$(docker image inspect -f \'{{.Architecture}}\' "${IMAGE}:${TAG}-${platform}")"'
         in publish
     )
     # ...and the two must not collapse to one image id, or one scan would cover both.
     assert (
-        "test \"$(docker image inspect -f '{{.Id}}' dockvault-scan:amd64)\"" in publish
+        'test "$(docker image inspect -f \'{{.Id}}\' "${IMAGE}:${TAG}-amd64")"' in publish
     )
 
     assert publish.count("release_gate.py") == 2
@@ -467,6 +480,44 @@ def test_vex_renderer_binds_digest_version_and_revision(tmp_path):
             image_reference=image_reference,
             source_revision=revision,
         )
+
+
+def test_vex_names_the_per_platform_image_the_release_actually_scans(tmp_path):
+    # A multi-architecture release scans one image per platform, and a VEX statement applies only
+    # to a product it names. So the renderer has to accept the per-platform reference those images
+    # wear — otherwise the release either cannot render the document or renders one that names an
+    # image nobody scans, silently suppressing nothing and failing on reviewed findings.
+    output = tmp_path / "release.openvex.json"
+    digest = f"sha256:{'a' * 64}"
+    revision = "b" * 40
+
+    for platform in ("amd64", "arm64"):
+        reference = f"ghcr.io/dockvault/vault:v0.10.0-{platform}"
+        document = _RENDERER.render(
+            _ROOT / "security" / "vex.openvex.json",
+            output,
+            image_digest=digest,
+            image_reference=reference,
+            source_revision=revision,
+        )
+        for statement in document["statements"]:
+            assert reference in {product["@id"] for product in statement["products"]}
+
+    # The suffix is scan-time only and narrow: it must not become a hole for arbitrary tags.
+    for rejected in (
+        "ghcr.io/dockvault/vault:v0.10.0-rc1",
+        "ghcr.io/dockvault/vault:latest",
+        "ghcr.io/dockvault/vault:v0.10.0-amd64-extra",
+        "docker.io/dockvault/vault:v0.10.0",
+    ):
+        with pytest.raises(ValueError, match="image reference"):
+            _RENDERER.render(
+                _ROOT / "security" / "vex.openvex.json",
+                output,
+                image_digest=digest,
+                image_reference=rejected,
+                source_revision=revision,
+            )
 
 
 def test_dependabot_covers_every_dependency_location():

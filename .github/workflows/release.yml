@@ -165,6 +165,7 @@ jobs:
       - name: Load each platform for scanning
         shell: bash
         env:
+          IMAGE: ${{ steps.publish_gate.outputs.image }}
           TAG: ${{ steps.publish_gate.outputs.tag }}
         run: |
           set -euo pipefail
@@ -173,23 +174,29 @@ jobs:
           # image store resolves the tag and reports the index, so both iterations land the same
           # host-architecture image — and the arm64 scan would silently be a second amd64 scan.
           # Pulling a platform manifest by digest is unambiguous on either image store.
+          #
+          # The local tag is the RELEASE reference plus an architecture suffix, not a name of its
+          # own. A VEX statement only applies to a product it names, so an image scanned under an
+          # unrelated local name matches nothing in the document: every reviewed exception goes
+          # unapplied and the scan fails on findings that were already assessed. These tags are
+          # local — publication copies the staged index and never pushes them.
           for platform in amd64 arm64; do
             digest="$(docker buildx imagetools inspect "${STAGING_IMAGE}:${TAG}" \
               --format "{{range .Manifest.Manifests}}{{if eq .Platform.Architecture \"${platform}\"}}{{.Digest}}{{end}}{{end}}")"
             test -n "$digest" || { echo "::error::the staged index has no ${platform} manifest"; exit 1; }
             docker pull --quiet "${STAGING_IMAGE}@${digest}"
-            docker tag "${STAGING_IMAGE}@${digest}" "dockvault-scan:${platform}"
-            got="$(docker image inspect -f '{{.Architecture}}' "dockvault-scan:${platform}")"
+            docker tag "${STAGING_IMAGE}@${digest}" "${IMAGE}:${TAG}-${platform}"
+            got="$(docker image inspect -f '{{.Architecture}}' "${IMAGE}:${TAG}-${platform}")"
             test "$got" = "$platform" || { echo "::error::${platform} manifest carries ${got}"; exit 1; }
           done
-          test "$(docker image inspect -f '{{.Id}}' dockvault-scan:amd64)" \
-             != "$(docker image inspect -f '{{.Id}}' dockvault-scan:arm64)"
-          docker image inspect -f '{{.Id}} {{.Architecture}}' dockvault-scan:amd64 dockvault-scan:arm64
+          test "$(docker image inspect -f '{{.Id}}' "${IMAGE}:${TAG}-amd64")" \
+             != "$(docker image inspect -f '{{.Id}}' "${IMAGE}:${TAG}-arm64")"
+          docker image inspect -f '{{.Id}} {{.Architecture}}' "${IMAGE}:${TAG}-amd64" "${IMAGE}:${TAG}-arm64"
 
       - name: Generate the SPDX SBOM (amd64)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          image: dockvault-scan:amd64
+          image: ${{ steps.publish_gate.outputs.image }}:${{ steps.publish_gate.outputs.tag }}-amd64
           format: spdx-json
           syft-version: v1.44.0
           output-file: dockvault-${{ steps.publish_gate.outputs.tag }}-amd64.spdx.json
@@ -200,7 +207,7 @@ jobs:
       - name: Generate the SPDX SBOM (arm64)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          image: dockvault-scan:arm64
+          image: ${{ steps.publish_gate.outputs.image }}:${{ steps.publish_gate.outputs.tag }}-arm64
           format: spdx-json
           syft-version: v1.44.0
           output-file: dockvault-${{ steps.publish_gate.outputs.tag }}-arm64.spdx.json
@@ -216,20 +223,23 @@ jobs:
           SOURCE_REVISION: ${{ needs.validate.outputs.sha }}
         run: |
           set -euo pipefail
+          # Each document must NAME the image it will be applied to. A VEX statement applies only
+          # to a product it lists, so a mismatch here is silent: nothing is suppressed, and the
+          # scan fails on the reviewed CPython findings as though they were new.
           for platform in amd64 arm64; do
-            local_digest="$(docker image inspect --format '{{.Id}}' "dockvault-scan:${platform}")"
+            local_digest="$(docker image inspect --format '{{.Id}}' "${IMAGE}:${TAG}-${platform}")"
             python3 .github/scripts/render_release_vex.py \
               --template security/vex.openvex.json \
               --output "dockvault-${TAG}-${platform}.openvex.json" \
               --image-digest "$local_digest" \
-              --image-reference "${IMAGE}:${TAG}" \
+              --image-reference "${IMAGE}:${TAG}-${platform}" \
               --source-revision "$SOURCE_REVISION"
           done
 
       - name: Scan the exact staged image (amd64)
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
-          image: dockvault-scan:amd64
+          image: ${{ steps.publish_gate.outputs.image }}:${{ steps.publish_gate.outputs.tag }}-amd64
           grype-version: v0.112.0
           fail-build: true
           severity-cutoff: high
@@ -238,7 +248,7 @@ jobs:
       - name: Scan the exact staged image (arm64)
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
-          image: dockvault-scan:arm64
+          image: ${{ steps.publish_gate.outputs.image }}:${{ steps.publish_gate.outputs.tag }}-arm64
           grype-version: v0.112.0
           fail-build: true
           severity-cutoff: high
