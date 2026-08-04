@@ -34,7 +34,7 @@ PyJWT==2.13.0
 # Test runners, clients, and supply-chain tooling.
 pytest>=9.1.1,<10.0
 requests>=2.34.2
-playwright>=1.61.0
+playwright>=1.62.0
 pytest-playwright>=0.8.0
 websocket-client>=1.9.0
 
