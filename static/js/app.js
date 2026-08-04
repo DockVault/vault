@@ -2063,11 +2063,9 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
         let zkPendingDek = null;
         if (vaultType === 'zero_knowledge') {
             try {
-                await zkEnsureKeypair();
+                const publicKeyPem = await zkEnsurePublicKeyForCreate();
                 const lib = eccLib();
-                const mine = await apiRequest('/ecc/keys/public', { silent: true });
-                if (!mine || !mine.public_key) throw new Error('Your public key is unavailable.');
-                const myPub = await lib.importPublicKeyPEM(mine.public_key);
+                const myPub = await lib.importPublicKeyPEM(publicKeyPem);
                 const dek = await lib.generateVaultDEK();
                 payload.type = 'zero_knowledge';
                 const hcb = document.getElementById('vault-hierarchical');
@@ -7283,20 +7281,31 @@ async function zkRestoreFromRecoveryKey(kitText) {
     zkArmIdleLock();
 }
 
-// Ensure the user has an ECC keypair: create + register one (first time) or just
-// unlock the existing one. Leaves the private key unlocked in memory.
-async function zkEnsureKeypair() {
+// Return the server-authoritative public identity key needed to create a zero-knowledge vault.
+// An existing keypair is deliberately PUBLIC-ONLY here: vault creation mints a fresh DEK and
+// wraps it to this key, so fetching or unlocking the private identity envelope would add exposure
+// without granting any capability the operation needs. First registration remains interactive.
+async function zkEnsurePublicKeyForCreate() {
     const pub = await apiRequest('/ecc/keys/public', { silent: true });
-    if (pub && pub.has_keypair) { await zkEnsureUnlocked(); return; }
+    if (pub && pub.has_keypair) {
+        if (!pub.public_key) throw new Error('Your public key is unavailable.');
+        return pub.public_key;
+    }
     try {
         await zkRegisterNewKeypair();
     } catch (e) {
-        // Race: a keypair appeared (another tab/device) between the has_keypair
-        // check and our register, so the server refused to overwrite (409). Unlock
-        // the existing one instead of failing.
-        if (e && e.status === 409) { await zkEnsureUnlocked(); return; }
-        throw e;
+        // Race: another tab/device registered first after our initial lookup. The losing browser
+        // must discard its unregistered key and use the winner's public key; it must not fetch the
+        // winner's encrypted private envelope or ask for that unrelated passphrase.
+        if (!(e && e.status === 409)) throw e;
     }
+    // Refetch after either successful registration or a 409 race. Returning the locally generated
+    // PEM would be wrong in the race and would wrap the new vault to an unregistered, unusable key.
+    const registered = await apiRequest('/ecc/keys/public', { silent: true });
+    if (!registered || !registered.has_keypair || !registered.public_key) {
+        throw new Error('Your registered public key is unavailable.');
+    }
+    return registered.public_key;
 }
 
 // --- Standalone "set up my encryption key" (account-level, profile menu) ------

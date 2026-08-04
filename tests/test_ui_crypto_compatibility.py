@@ -12,11 +12,11 @@ from urllib.parse import urlsplit
 import uuid
 
 import pytest
-import requests
 from playwright.sync_api import Page, expect
 
 from conftest import ADMIN_PASS, ADMIN_USER, ApiClient, BASE_URL
 from crypto_reference_vectors import load_vector, p384_private_der, p384_private_pem
+from test_live_crypto_compatibility import _inspect_exact_candidate
 
 
 pytestmark = [pytest.mark.ui, pytest.mark.crypto_compatibility]
@@ -25,27 +25,14 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _VECTOR_DIR = Path(__file__).resolve().parent / "fixtures" / "crypto" / "v0.10.0"
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="module", autouse=True)
 def _live_container_health():
-    """Override the suite's local-development skip: compatibility requires a live candidate."""
-    try:
-        response = requests.get(f"{BASE_URL}/health", timeout=5)
-        response.raise_for_status()
-        health = response.json()
-    except Exception as exc:  # noqa: BLE001 - required infrastructure must fail, never skip
-        pytest.fail(
-            f"crypto compatibility candidate is not reachable at {BASE_URL}: {exc}"
-        )
-    if health.get("database") != "connected":
-        pytest.fail(
-            f"crypto compatibility candidate database is not connected: {health}"
-        )
-    return health
+    """Bind every browser compatibility gate to the exact labeled candidate image."""
+    return _inspect_exact_candidate()["health"]
 
 
-@pytest.fixture(scope="module")
-def admin():
-    """Use an explicit failure instead of conftest's optional local credential skip."""
+def _exact_admin_client() -> ApiClient:
+    """Authenticate required test infrastructure without optional-local-test skips."""
     if not ADMIN_PASS:
         pytest.fail(
             "crypto compatibility browser gates require VAULT_ADMIN_PASS "
@@ -59,6 +46,11 @@ def admin():
             f"crypto compatibility admin login failed for {ADMIN_USER!r}: {exc}"
         )
     return client
+
+
+@pytest.fixture(scope="module")
+def admin():
+    return _exact_admin_client()
 
 
 def _load_browser_vectors() -> dict:
@@ -174,6 +166,32 @@ def _cleanup_vault(owner, vault_id, errors) -> None:
         lambda: owner.get(f"/vaults/{vault_id}"),
         expected_status=404,
     )
+
+
+def _collect_vault_ids_for_cleanup(owner, vault_names, known_ids, errors) -> list:
+    """Rediscover exact randomized names so a post-create UI failure cannot leak vaults."""
+    collected = [vault_id for vault_id in known_ids if vault_id is not None]
+    if owner is None:
+        return list(dict.fromkeys(collected))
+
+    listed = _record_cleanup_call(
+        errors,
+        "rediscover created vaults for cleanup",
+        lambda: owner.get("/vaults"),
+    )
+    if listed is not None and listed.status_code == 200:
+        try:
+            wanted_names = set(vault_names)
+            for vault in listed.json():
+                if vault.get("name") in wanted_names and vault.get("id") is not None:
+                    collected.append(vault["id"])
+        except Exception as exc:  # noqa: BLE001 - later cleanup must still run
+            errors.append(
+                "rediscover created vaults for cleanup: invalid response "
+                f"({type(exc).__name__}: {exc})"
+            )
+
+    return list(dict.fromkeys(collected))
 
 
 def _cleanup_user(admin, user_id, errors) -> None:
@@ -418,17 +436,10 @@ def test_candidate_served_browser_reads_all_pinned_zero_knowledge_formats(browse
         context.close()
 
 
-@pytest.mark.characterization
-def test_create_only_temp_existing_key_fetches_private_blob_before_vault_create(
+def test_create_only_temp_existing_key_uses_public_key_without_private_unlock(
     browser, admin
 ):
-    """Freeze the release-baseline create-only request order without endorsing it as the target.
-
-    At the pinned release a create-only temporary session can create a zero-knowledge vault when
-    the account already owns an identity key.  The official client nevertheless fetches and
-    unlocks the encrypted private-key blob before wrapping a fresh DEK to the public account key.
-    A later least-privilege change is expected to flip this characterization to no private fetch.
-    """
+    """Create-only uses the registered public key and never requests the private envelope."""
     settings_before = None
     user = None
     owner = None
@@ -499,15 +510,15 @@ def test_create_only_temp_existing_key_fetches_private_blob_before_vault_create(
                 "/ecc/keys/register/challenge",
                 "/ecc/keys/register",
                 "/vaults",
-            }:
+            } and (path != "/vaults" or request.method == "POST"):
                 requests_seen.append((request.method, path))
 
         page.on("request", record_request)
+        assert page.evaluate("() => zkState.privateKey === null") is True
         page.click("#create-vault-form button[type=submit]")
-        expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=8_000)
-        page.fill("#confirm-modal-input", passphrase)
-        page.click("#confirm-modal-confirm-btn")
         expect(page.locator("#create-vault-modal")).to_be_hidden(timeout=20_000)
+        expect(page.locator("#confirm-modal")).to_be_hidden()
+        assert page.evaluate("() => zkState.privateKey === null") is True
 
         matches = [v for v in owner.get("/vaults").json() if v["name"] == vault_name]
         assert len(matches) == 1, (
@@ -515,20 +526,10 @@ def test_create_only_temp_existing_key_fetches_private_blob_before_vault_create(
         )
         vault_id = matches[0]["id"]
 
-        public_positions = [
-            index
-            for index, event in enumerate(requests_seen)
-            if event == ("GET", "/ecc/keys/public")
-        ]
-        private_position = requests_seen.index(("GET", "/ecc/keys/private"))
-        create_position = requests_seen.index(("POST", "/vaults"))
-        assert len(public_positions) >= 2, requests_seen
-        assert (
-            public_positions[0]
-            < private_position
-            < public_positions[-1]
-            < create_position
-        ), requests_seen
+        assert requests_seen == [
+            ("GET", "/ecc/keys/public"),
+            ("POST", "/vaults"),
+        ], requests_seen
         assert not any(
             path.startswith("/ecc/keys/register") for _, path in requests_seen
         ), requests_seen
@@ -536,8 +537,14 @@ def test_create_only_temp_existing_key_fetches_private_blob_before_vault_create(
         _cleanup_contexts(contexts, cleanup_errors)
         if temp_username is not None:
             _cleanup_temp_credential(owner, temp_username, cleanup_errors)
-        if vault_id is not None:
-            _cleanup_vault(owner, vault_id, cleanup_errors)
+        vault_ids = _collect_vault_ids_for_cleanup(
+            owner,
+            {vault_name},
+            [vault_id] if vault_id is not None else [],
+            cleanup_errors,
+        )
+        for discovered_vault_id in vault_ids:
+            _cleanup_vault(owner, discovered_vault_id, cleanup_errors)
         if user is not None:
             _cleanup_user(admin, user["id"], cleanup_errors)
         if settings_before is not None:
