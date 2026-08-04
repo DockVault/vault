@@ -1,0 +1,26 @@
+{
+  "schema": "dockvault-crypto-vector-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "release": "v0.10.0",
+  "commit": "1a1b8fa9e1e80ca78d9a4154cfdb391f3f3c53a8",
+  "fixture_id": "zk-team-private-wrap-ecdh-hkdf-aes-gcm",
+  "source_paths": [
+    "static/js/ecc_crypto.js"
+  ],
+  "inputs": {
+    "member_private_scalar_hex": "55",
+    "ephemeral_private_scalar_hex": "66",
+    "team_private_scalar_hex": "44",
+    "iv_hex": "808182838485868788898a8b"
+  },
+  "encoded_b64": "gIGCg4SFhoeIiYqLRSGx3wHUoH96JLVthZ/l9+4wmLOExH9IvQbHtokcd5oQ0HJ7gsPlmDMeNIOUqM8SOqZB1h1ysdvWSWpMNb82FFNDJpYnIekI2yrXhOGlqnbILGPhBpK7Qcc6mqCZz5DmVHXMKmuV+WF3ccMKiT07zmpZ/X7hfTBvwJT6OprQJm8+7Qy1XYryRQ3u3bM1UdTjOcxaiOfRPhmkobmFvP6wft9FtwT45YDpNIqQXVm1oV2sp3VNEQeYC46RnMupk9TlcxQ0iKGidQdT",
+  "expected": {
+    "wrapped_key_b64": "gIGCg4SFhoeIiYqLRSGx3wHUoH96JLVthZ/l9+4wmLOExH9IvQbHtokcd5oQ0HJ7gsPlmDMeNIOUqM8SOqZB1h1ysdvWSWpMNb82FFNDJpYnIekI2yrXhOGlqnbILGPhBpK7Qcc6mqCZz5DmVHXMKmuV+WF3ccMKiT07zmpZ/X7hfTBvwJT6OprQJm8+7Qy1XYryRQ3u3bM1UdTjOcxaiOfRPhmkobmFvP6wft9FtwT45YDpNIqQXVm1oV2sp3VNEQeYC46RnMupk9TlcxQ0iKGidQdT",
+    "ephemeral_public_key_b64": "BLARX/VRAMjxnrxEfZesn10hSk2bZbnJGLr8poasXt9cY+87Rvk6SukjaBnZiU10emBrJAPlB0yAPy/2YTrApU+qgFVW1p76aXFeRE02eLy/ObqB8nn9GI6AAQqKYCkmWQ==",
+    "team_private_key_derived_from_input_scalar": true,
+    "hkdf_info": "team-privkey-wrapping-v1",
+    "framing": "iv12||ciphertext||tag16",
+    "aad": null
+  }
+}

@@ -1,0 +1,406 @@
+"""Independent reference codecs for DockVault crypto compatibility public test vectors.
+
+This module deliberately does not import DockVault application code.  It is a
+small, explicit description of the persisted/wire formats that were readable at
+the v0.10.0 boundary.  Constants in the fixture set are public test material and
+must never be reused by a deployment.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import struct
+import uuid
+from pathlib import Path
+from typing import Any
+
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes, padding, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.keywrap import aes_key_unwrap, aes_key_wrap
+
+
+SCHEMA = "dockvault-crypto-vector-v1"
+RELEASE = "v0.10.0"
+COMMIT = "1a1b8fa9e1e80ca78d9a4154cfdb391f3f3c53a8"
+NOTICE = "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT"
+
+STANDARD_MAGIC = b"DockVault"
+STANDARD_VERSION = 0x10
+STANDARD_HEADER = STANDARD_MAGIC + bytes([STANDARD_VERSION, 0, 0])
+STANDARD_ROOT_SALT = b"dockvault-gcm-chunk-stream-key-v1"
+STANDARD_ROOT_INFO = b"at-rest-content"
+STANDARD_SUBKEY_SALT = b"dockvault-gcm-chunk-subkey-v1"
+STANDARD_AAD_DOMAIN = b"dockvault-chunk-aad-v1"
+DIRECT_WRAP_INFO = b"vault-key-wrapping"
+TEAM_PRIVATE_WRAP_INFO = b"team-privkey-wrapping-v1"
+ZK_NAME_BLIND_SALT = b"dv-zk-name-bi-v1"
+
+
+def b64e(value: bytes) -> str:
+    return base64.b64encode(value).decode("ascii")
+
+
+def b64d(value: str) -> bytes:
+    return base64.b64decode(value, validate=True)
+
+
+def load_vector(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    assert_vector_metadata(value)
+    return value
+
+
+def assert_vector_metadata(vector: dict[str, Any]) -> None:
+    if vector.get("schema") != SCHEMA:
+        raise ValueError("unexpected crypto compatibility vector schema")
+    if vector.get("release") != RELEASE or vector.get("commit") != COMMIT:
+        raise ValueError(
+            "vector is not pinned to the crypto compatibility release boundary"
+        )
+    if vector.get("test_only") is not True or vector.get("notice") != NOTICE:
+        raise ValueError("vector does not carry the required public-test warning")
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _hkdf(ikm: bytes, *, salt: bytes, info: bytes, length: int = 32) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=length, salt=salt, info=info).derive(
+        ikm
+    )
+
+
+def _p384_private(scalar_hex: str) -> ec.EllipticCurvePrivateKey:
+    scalar = int(scalar_hex, 16)
+    if scalar <= 0:
+        raise ValueError("P-384 private scalar must be positive")
+    return ec.derive_private_key(scalar, ec.SECP384R1())
+
+
+def p384_private_pem(scalar_hex: str) -> str:
+    return (
+        _p384_private(scalar_hex)
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode("ascii")
+        .rstrip("\n")
+    )
+
+
+def p384_private_der(scalar_hex: str) -> bytes:
+    return _p384_private(scalar_hex).private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+
+
+def p384_public_raw(scalar_hex: str) -> bytes:
+    return (
+        _p384_private(scalar_hex)
+        .public_key()
+        .public_bytes(
+            serialization.Encoding.X962,
+            serialization.PublicFormat.UncompressedPoint,
+        )
+    )
+
+
+def _standard_subkey(encryption_key: str, vault_id: str, file_id: str) -> bytes:
+    root = _hkdf(
+        encryption_key.encode("utf-8"), salt=STANDARD_ROOT_SALT, info=STANDARD_ROOT_INFO
+    )
+    return _hkdf(
+        root,
+        salt=STANDARD_SUBKEY_SALT,
+        info=uuid.UUID(vault_id).bytes + uuid.UUID(file_id).bytes,
+    )
+
+
+def _standard_aad(vault_id: str, file_id: str, index: int) -> bytes:
+    return (
+        STANDARD_AAD_DOMAIN
+        + uuid.UUID(vault_id).bytes
+        + uuid.UUID(file_id).bytes
+        + struct.pack(">Q", index)
+    )
+
+
+def encode_standard_0x10(vector: dict[str, Any]) -> bytes:
+    inputs = vector["inputs"]
+    aes = AESGCM(
+        _standard_subkey(
+            inputs["encryption_key"], inputs["vault_id"], inputs["file_id"]
+        )
+    )
+    output = bytearray(STANDARD_HEADER)
+    chunks = [b64d(value) for value in inputs["chunks_b64"]]
+    nonces = [bytes.fromhex(value) for value in inputs["nonces_hex"]]
+    if len(chunks) != len(nonces):
+        raise ValueError("one deterministic nonce is required per Standard chunk")
+    for index, (chunk, nonce) in enumerate(zip(chunks, nonces, strict=True)):
+        if len(nonce) != 12:
+            raise ValueError("Standard AES-GCM nonces are exactly 12 bytes")
+        ciphertext = aes.encrypt(
+            nonce, chunk, _standard_aad(inputs["vault_id"], inputs["file_id"], index)
+        )
+        record = nonce + ciphertext
+        output.extend(struct.pack(">I", len(record)))
+        output.extend(record)
+    return bytes(output)
+
+
+def decode_standard_0x10(
+    encoded: bytes, *, encryption_key: str, vault_id: str, file_id: str
+) -> bytes:
+    if not encoded.startswith(STANDARD_HEADER):
+        raise ValueError("invalid Standard 0x10 header")
+    aes = AESGCM(_standard_subkey(encryption_key, vault_id, file_id))
+    offset = len(STANDARD_HEADER)
+    plaintext = bytearray()
+    index = 0
+    while offset < len(encoded):
+        if len(encoded) - offset < 4:
+            raise ValueError("truncated Standard record length")
+        size = struct.unpack(">I", encoded[offset : offset + 4])[0]
+        offset += 4
+        if size < 28 or size > len(encoded) - offset:
+            raise ValueError("invalid Standard record size")
+        record = encoded[offset : offset + size]
+        offset += size
+        plaintext.extend(
+            aes.decrypt(
+                record[:12],
+                record[12:],
+                _standard_aad(vault_id, file_id, index),
+            )
+        )
+        index += 1
+    return bytes(plaintext)
+
+
+def _fernet_token(key_b64: str, plaintext: bytes, timestamp: int, iv: bytes) -> bytes:
+    key = base64.urlsafe_b64decode(key_b64.encode("ascii"))
+    if len(key) != 32 or len(iv) != 16:
+        raise ValueError("Fernet needs a 32-byte key and 16-byte IV")
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(plaintext) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(key[16:]), modes.CBC(iv)).encryptor()
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+    body = b"\x80" + struct.pack(">Q", timestamp) + iv + ciphertext
+    signature = hmac.new(key[:16], body, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(body + signature)
+
+
+def encode_fernet_chunk_stream(vector: dict[str, Any]) -> bytes:
+    inputs = vector["inputs"]
+    chunks = [b64d(value) for value in inputs["chunks_b64"]]
+    timestamps = inputs["timestamps"]
+    ivs = [bytes.fromhex(value) for value in inputs["ivs_hex"]]
+    if not (len(chunks) == len(timestamps) == len(ivs)):
+        raise ValueError("one timestamp and IV are required per Fernet chunk")
+    output = bytearray()
+    for chunk, timestamp, iv in zip(chunks, timestamps, ivs, strict=True):
+        token = _fernet_token(inputs["encryption_key"], chunk, int(timestamp), iv)
+        output.extend(struct.pack(">I", len(token)))
+        output.extend(token)
+    return bytes(output)
+
+
+def decode_fernet_chunk_stream(encoded: bytes, *, encryption_key: str) -> bytes:
+    offset = 0
+    output = bytearray()
+    fernet = Fernet(encryption_key.encode("ascii"))
+    while offset < len(encoded):
+        if len(encoded) - offset < 4:
+            raise ValueError("truncated Fernet record length")
+        size = struct.unpack(">I", encoded[offset : offset + 4])[0]
+        offset += 4
+        if size <= 0 or size > len(encoded) - offset:
+            raise ValueError("invalid Fernet record size")
+        output.extend(fernet.decrypt(encoded[offset : offset + size]))
+        offset += size
+    return bytes(output)
+
+
+def encode_zk_content(vector: dict[str, Any]) -> bytes:
+    inputs = vector["inputs"]
+    iv = bytes.fromhex(inputs["iv_hex"])
+    return iv + AESGCM(bytes.fromhex(inputs["dek_hex"])).encrypt(
+        iv, b64d(inputs["plaintext_b64"]), None
+    )
+
+
+def decode_zk_content(encoded: bytes, *, dek_hex: str) -> bytes:
+    if len(encoded) < 28:
+        raise ValueError("truncated zero-knowledge content")
+    return AESGCM(bytes.fromhex(dek_hex)).decrypt(encoded[:12], encoded[12:], None)
+
+
+def encode_private_envelope(vector: dict[str, Any]) -> dict[str, Any]:
+    inputs = vector["inputs"]
+    salt = bytes.fromhex(inputs["salt_hex"])
+    iv = bytes.fromhex(inputs["iv_hex"])
+    iterations = int(inputs["iterations"])
+    key = PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32, salt=salt, iterations=iterations
+    ).derive(inputs["password"].encode("utf-8"))
+    plaintext = p384_private_pem(inputs["identity_private_scalar_hex"]).encode("utf-8")
+    return {
+        "encrypted": b64e(iv + AESGCM(key).encrypt(iv, plaintext, None)),
+        "salt": b64e(salt),
+        "iterations": iterations,
+    }
+
+
+def decode_private_envelope(envelope: dict[str, Any], *, password: str) -> str:
+    salt = b64d(envelope["salt"])
+    iterations = int(envelope["iterations"])
+    key = PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32, salt=salt, iterations=iterations
+    ).derive(password.encode("utf-8"))
+    encoded = b64d(envelope["encrypted"])
+    return AESGCM(key).decrypt(encoded[:12], encoded[12:], None).decode("utf-8")
+
+
+def _ecdh(private_scalar_hex: str, peer_scalar_hex: str) -> bytes:
+    return _p384_private(private_scalar_hex).exchange(
+        ec.ECDH(), _p384_private(peer_scalar_hex).public_key()
+    )
+
+
+def encode_direct_dek_wrap(vector: dict[str, Any]) -> dict[str, str]:
+    inputs = vector["inputs"]
+    shared = _ecdh(
+        inputs["ephemeral_private_scalar_hex"], inputs["recipient_private_scalar_hex"]
+    )
+    wrapping_key = _hkdf(shared, salt=b"", info=DIRECT_WRAP_INFO)
+    return {
+        "wrapped_dek_b64": b64e(
+            aes_key_wrap(wrapping_key, bytes.fromhex(inputs["dek_hex"]))
+        ),
+        "ephemeral_public_key_b64": b64e(
+            p384_public_raw(inputs["ephemeral_private_scalar_hex"])
+        ),
+    }
+
+
+def decode_direct_dek_wrap(
+    wrapped_dek_b64: str,
+    *,
+    ephemeral_public_key_b64: str,
+    recipient_private_scalar_hex: str,
+) -> bytes:
+    peer = ec.EllipticCurvePublicKey.from_encoded_point(
+        ec.SECP384R1(), b64d(ephemeral_public_key_b64)
+    )
+    shared = _p384_private(recipient_private_scalar_hex).exchange(ec.ECDH(), peer)
+    wrapping_key = _hkdf(shared, salt=b"", info=DIRECT_WRAP_INFO)
+    return aes_key_unwrap(wrapping_key, b64d(wrapped_dek_b64))
+
+
+def encode_team_private_wrap(vector: dict[str, Any]) -> dict[str, str]:
+    inputs = vector["inputs"]
+    shared = _ecdh(
+        inputs["ephemeral_private_scalar_hex"], inputs["member_private_scalar_hex"]
+    )
+    wrapping_key = _hkdf(shared, salt=b"", info=TEAM_PRIVATE_WRAP_INFO)
+    iv = bytes.fromhex(inputs["iv_hex"])
+    wrapped = iv + AESGCM(wrapping_key).encrypt(
+        iv, p384_private_der(inputs["team_private_scalar_hex"]), None
+    )
+    return {
+        "wrapped_key_b64": b64e(wrapped),
+        "ephemeral_public_key_b64": b64e(
+            p384_public_raw(inputs["ephemeral_private_scalar_hex"])
+        ),
+    }
+
+
+def decode_team_private_wrap(
+    wrapped_key_b64: str,
+    *,
+    ephemeral_public_key_b64: str,
+    member_private_scalar_hex: str,
+) -> ec.EllipticCurvePrivateKey:
+    peer = ec.EllipticCurvePublicKey.from_encoded_point(
+        ec.SECP384R1(), b64d(ephemeral_public_key_b64)
+    )
+    shared = _p384_private(member_private_scalar_hex).exchange(ec.ECDH(), peer)
+    wrapping_key = _hkdf(shared, salt=b"", info=TEAM_PRIVATE_WRAP_INFO)
+    encoded = b64d(wrapped_key_b64)
+    der = AESGCM(wrapping_key).decrypt(encoded[:12], encoded[12:], None)
+    private_key = serialization.load_der_private_key(der, password=None)
+    if not isinstance(private_key, ec.EllipticCurvePrivateKey):
+        raise ValueError("wrapped team key is not an EC private key")
+    return private_key
+
+
+def _zk_name_aad(
+    version: str, vault_id: str, field: str, epoch: int, object_id: str | None
+) -> bytes:
+    if version == "zk1":
+        return f"dv-zk-name-v1|{vault_id}|{field}|{epoch}".encode("utf-8")
+    if version == "zk2" and object_id:
+        return f"dv-zk-name-v2|{vault_id}|{field}|{epoch}|{object_id}".encode("utf-8")
+    raise ValueError("zk2 names require an object id")
+
+
+def encode_zk_name(vector: dict[str, Any]) -> dict[str, str]:
+    inputs = vector["inputs"]
+    version = inputs["version"]
+    dek = bytes.fromhex(inputs["dek_hex"])
+    iv = bytes.fromhex(inputs["iv_hex"])
+    aad = _zk_name_aad(
+        version,
+        inputs["vault_id"],
+        inputs["field"],
+        int(inputs["epoch"]),
+        inputs.get("object_id"),
+    )
+    raw = iv + AESGCM(dek).encrypt(iv, inputs["plaintext"].encode("utf-8"), aad)
+    blind_key = _hkdf(
+        dek,
+        salt=ZK_NAME_BLIND_SALT,
+        info=f"{inputs['vault_id']}|{inputs['epoch']}".encode("utf-8"),
+    )
+    blind_index = hmac.new(
+        blind_key, inputs["plaintext"].encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return {"token": f"{version}:{b64e(raw)}", "blind_index": blind_index}
+
+
+def decode_zk_name(
+    token: str,
+    *,
+    dek_hex: str,
+    vault_id: str,
+    field: str,
+    epoch: int,
+    object_id: str | None = None,
+) -> str:
+    if token.startswith("zk2:"):
+        version, encoded = "zk2", token[4:]
+    elif token.startswith("zk1:"):
+        version, encoded = "zk1", token[4:]
+    else:
+        version, encoded = "zk1", token
+    raw = b64d(encoded)
+    if len(raw) < 28:
+        raise ValueError("truncated zero-knowledge name")
+    aad = _zk_name_aad(version, vault_id, field, int(epoch), object_id)
+    return (
+        AESGCM(bytes.fromhex(dek_hex)).decrypt(raw[:12], raw[12:], aad).decode("utf-8")
+    )

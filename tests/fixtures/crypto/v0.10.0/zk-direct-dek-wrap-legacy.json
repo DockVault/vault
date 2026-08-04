@@ -1,0 +1,23 @@
+{
+  "schema": "dockvault-crypto-vector-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "release": "v0.10.0",
+  "commit": "1a1b8fa9e1e80ca78d9a4154cfdb391f3f3c53a8",
+  "fixture_id": "zk-direct-dek-wrap-ecdh-hkdf-aes-kw",
+  "source_paths": [
+    "static/js/ecc_crypto.js"
+  ],
+  "inputs": {
+    "recipient_private_scalar_hex": "22",
+    "ephemeral_private_scalar_hex": "33",
+    "dek_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"
+  },
+  "encoded_b64": "KBqSgmnvAn/8n+xgpxbZffzNtiZ9+4au1MWp6A6pNh9lPZJdiVrZiQ==",
+  "expected": {
+    "wrapped_dek_b64": "KBqSgmnvAn/8n+xgpxbZffzNtiZ9+4au1MWp6A6pNh9lPZJdiVrZiQ==",
+    "ephemeral_public_key_b64": "BIvGBX2kb9r7qG0sniPC9bwLSioSR+jyzHEm7TtRCwNBphiozAjRuZL/4G+64AaPsP6hnyf2iBpg+/KiL9HxmF13f+dZWZSuDUL+0gKZzpcFVMbQhN1gd/VstZe44iws6Q==",
+    "hkdf_info": "vault-key-wrapping",
+    "ephemeral_point_format": "x962-uncompressed-p384"
+  }
+}

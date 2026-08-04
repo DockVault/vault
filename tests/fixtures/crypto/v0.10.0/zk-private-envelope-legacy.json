@@ -1,0 +1,29 @@
+{
+  "schema": "dockvault-crypto-vector-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "release": "v0.10.0",
+  "commit": "1a1b8fa9e1e80ca78d9a4154cfdb391f3f3c53a8",
+  "fixture_id": "zk-private-envelope-pbkdf2-aes-gcm",
+  "source_paths": [
+    "static/js/ecc_crypto.js"
+  ],
+  "inputs": {
+    "identity_private_scalar_hex": "11",
+    "password": "DOCKVAULT-PUBLIC-TEST-ONLY-PASSPHRASE",
+    "salt_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "iv_hex": "707172737475767778797a7b",
+    "iterations": 600000
+  },
+  "encoded_b64": "cHFyc3R1dnd4eXp73y3KN/MwajMIuNyjWbcVGco3R2bPFGsu+tLcoGxi1nW7ilpfOOMIRy5c8LnEWYHXsUvxqG/y65wQor/LWQa9cGOiJBUuYL4TpKpmFPGICZauQqulfWJtWRLJ+P45HR+r3wX+cXufhKycPkVLUoOb/b37XgzI8vsoGrjllshq7cIK487Egb40qiTX5fz8skTOMcZR5AJPk1Q889+T+IcCx40a06ofgGkmwFAg91Xtfi42wo9KmmkGkCFTABoJqiRjik8QEKjvuFUjlTuNkInUxVYSiYzdDg9F2MWX4SFbYjIT3GckSGmipES5Y7PhzTpRush6xbavMUkOKAT62FrMYQ2MXi1FGp/xeb7wPIh3K1gbYvrjfDzbC+2a9b5bITepXktMSnjcWXLJjRMoktBhaF2yiXmKky+KO/Gh0TUHXH34",
+  "expected": {
+    "envelope": {
+      "encrypted": "cHFyc3R1dnd4eXp73y3KN/MwajMIuNyjWbcVGco3R2bPFGsu+tLcoGxi1nW7ilpfOOMIRy5c8LnEWYHXsUvxqG/y65wQor/LWQa9cGOiJBUuYL4TpKpmFPGICZauQqulfWJtWRLJ+P45HR+r3wX+cXufhKycPkVLUoOb/b37XgzI8vsoGrjllshq7cIK487Egb40qiTX5fz8skTOMcZR5AJPk1Q889+T+IcCx40a06ofgGkmwFAg91Xtfi42wo9KmmkGkCFTABoJqiRjik8QEKjvuFUjlTuNkInUxVYSiYzdDg9F2MWX4SFbYjIT3GckSGmipES5Y7PhzTpRush6xbavMUkOKAT62FrMYQ2MXi1FGp/xeb7wPIh3K1gbYvrjfDzbC+2a9b5bITepXktMSnjcWXLJjRMoktBhaF2yiXmKky+KO/Gh0TUHXH34",
+      "salt": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "iterations": 600000
+    },
+    "private_key_derived_from_input_scalar": true,
+    "framing": "iv12||ciphertext||tag16",
+    "aad": null
+  }
+}
