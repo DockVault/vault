@@ -372,7 +372,7 @@ def test_release_scans_before_auth_and_attests_one_push_bound_registry_digest():
     for action, sha in (
         ("anchore/sbom-action", "e22c389904149dbc22b58101806040fa8d37a610"),
         ("anchore/scan-action", "e1165082ffb1fe366ebaf02d8526e7c4989ea9d2"),
-        ("actions/attest", "f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6"),
+        ("actions/attest", "1e69f48acb82d1966a394da916b4c1698aa569d6"),
         ("docker/setup-qemu-action", "96fe6ef7f33517b61c61be40b68a1882f3264fb8"),
     ):
         assert f"{action}@{sha}" in publish
