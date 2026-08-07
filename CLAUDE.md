@@ -30,6 +30,26 @@ ships inside the built image (`Dockerfile` does `COPY . .`, filtered only by
   co-author or generated-by trailer to commit messages or PR bodies.
 - `BRAND_*` env vars (see `app/config/branding.py`) are a public contract consumed
   by downstream provisioning — don't rename or remove them without a deprecation path.
+- **⛔ Do NOT bump Postgres past the 15 major** (`deploy/docker-compose.yml` +
+  `deploy/docker-compose.secure.yml`). This was tried on 2026-08-07 and broke CI's
+  real-Docker job: the 18+ images moved the data layout to a single mount at
+  `/var/lib/postgresql` (major-version subdirectory inside) instead of
+  `/var/lib/postgresql/data`, so the container refuses to start. Independently, every
+  existing `vault_pg_data` volume holds 15 data files that a newer server cannot read
+  without `pg_upgrade` — a tag-only bump ships a dead database to every self-hoster who
+  runs `dockvault.py update`. It is not a security fix either: 15-alpine's only findings
+  are 3 Mediums from one unfixable BusyBox CVE in the Alpine base, and 18-alpine carries
+  those *plus* two more. 15 is supported to Nov 2027. Dependabot now ignores postgres
+  semver-majors (`.github/dependabot.yml`). Lift this only as a deliberate migration that
+  moves the mount AND gives `dockvault.py` a real `pg_upgrade` path.
+  Redis majors are fine — its `/data` is tmpfs (ephemeral cache), so there is no migration.
+- **Changing a pinned action SHA or image digest? Update the contract tests in the same
+  change.** `tests/test_supply_chain_contract.py` hardcodes an allowlist of reviewed
+  action pins and the python/postgres/redis digests, and
+  `tests/test_setup_workflow_contract.py` pins the checkout SHA. CI runs
+  `pytest --maxfail=1`, so it reveals only ONE stale pin per run — grep for the old value
+  across `tests/` and fix them all at once. Verify locally before pushing with
+  `python -m pytest -m "unit and not docker" -q` (no `--maxfail`).
 - **Keep config, `.env.example`, and the management tool in sync.** When you add or change an
   env/config field in `app/core/config.py`, update `.env.example` **and** `dockvault.py` (the setup
   flow / any menu that writes it) in the SAME change — a new flag with no `.env.example` entry or
