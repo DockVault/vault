@@ -35,8 +35,8 @@ _PYTHON_DIGEST = (
     "sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92"
 )
 _POSTGRES_DIGEST = (
-    "postgres:18-alpine@"
-    "sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15"
+    "postgres:15-alpine@"
+    "sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f"
 )
 _REDIS_DIGEST = (
     "redis:8-alpine@"

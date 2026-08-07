@@ -77,10 +77,23 @@ updates:
   # Postgres and Redis are declared in both Compose variants under deploy/. Their immutable
   # manifest-list digests preserve multi-architecture pulls while still requiring an explicit,
   # reviewable update when the upstream tag moves.
+  #
+  # Postgres MAJORS are ignored deliberately. A postgres major is not a digest change here: the
+  # 18+ images moved the data directory (a single mount at /var/lib/postgresql, major-version
+  # subdirectory inside) so the compose mount stops working, and every existing vault_pg_data
+  # volume holds older data files the new server cannot read without a pg_upgrade. A bump that
+  # only edits the tag ships a dead database to every self-hoster who runs `dockvault.py update`
+  # — it was proposed once and did exactly that in CI. Lift this ignore as part of a migration
+  # that also moves the mount and gives dockvault.py a real upgrade path.
+  # Redis is NOT ignored: its /data is tmpfs here (ephemeral cache), so majors carry no migration.
   - package-ecosystem: "docker-compose"
     directory: "/deploy"
     schedule:
       interval: "weekly"
+    ignore:
+      - dependency-name: "postgres"
+        update-types:
+          - "version-update:semver-major"
 
   # Keeps the pinned action SHAs in release.yml and tests.yml from going stale. Those pins are a
   # supply-chain control: they stop a moved tag from silently changing what CI executes, but they
