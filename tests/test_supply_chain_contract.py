@@ -35,12 +35,12 @@ _PYTHON_DIGEST = (
     "sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92"
 )
 _POSTGRES_DIGEST = (
-    "postgres:15-alpine@"
-    "sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f"
+    "postgres:18-alpine@"
+    "sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15"
 )
 _REDIS_DIGEST = (
-    "redis:7-alpine@"
-    "sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
+    "redis:8-alpine@"
+    "sha256:978f0e01593e65eed801f2402944efcd936d43b5027e4908a7897baf88ed6241"
 )
 _CPYTHON_SNAPSHOT = "07efb08123ba9367a7107325adb9d5626dca1ca9"
 _BACKPORT_HASHES = {
