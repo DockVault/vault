@@ -468,7 +468,7 @@ class AuthService:
         # Resolve the least-privilege scope. None = legacy/unrestricted. When a
         # temp session delegates (parent_scope set), intersect so the child can
         # never exceed its parent.
-        from app.core.temp_scope import intersect_scope, VAULT_CAPS, expand_vault_caps
+        from app.core.temp_scope import intersect_scope, expand_vault_caps
         from app.core.id_scope import normalize_id_scope, intersect_id_scope
         from app.services.vault_service import id_ancestry
         is_delegated = parent_scope is not None
@@ -487,7 +487,132 @@ class AuthService:
         from app.core import temp_passcode_policy as _tpp
         from app.core.models import SystemSetting as _PolSS
         _pol_row = self.db.query(_PolSS).filter(_PolSS.key == 'global').first()
-        _tp_policy = _tpp.effective_policy((_pol_row.value or {}) if (_pol_row and _pol_row.value) else {})
+        _pol_raw = _pol_row.value if _pol_row is not None else {}
+        if not isinstance(_pol_raw, dict):
+            _pol_raw = {}
+        _tp_policy = _tpp.effective_policy(_pol_raw)
+
+        # Resolve each selected grant before any database mutation. Every later
+        # persistence decision consumes this canonical plan.
+        selected_access_plans = []
+        if effective_scope is not None and mode == 'selected':
+            parent_ids = {str(v) for v in (parent_vault_ids or [])}
+            if parent_vault_scope is not None and not isinstance(parent_vault_scope, dict):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="The parent credential has an invalid stored vault scope.",
+                )
+            parent_scope_map = parent_vault_scope or {}
+            parent_caps_map = parent_vault_caps if isinstance(parent_vault_caps, dict) else {}
+            for sv in (selected_vaults or []):
+                if not isinstance(sv, dict) or not sv.get('vault_id'):
+                    continue
+                try:
+                    vault_uuid = uuid.UUID(str(sv.get('vault_id')))
+                except (ValueError, AttributeError, TypeError):
+                    continue
+                vid = str(vault_uuid)
+                if is_delegated and parent_vault_mode == 'selected' and vid not in parent_ids:
+                    continue
+                vault = self.db.query(Vault).filter(Vault.id == vault_uuid).first()
+                if vault is None:
+                    continue
+                # Org policy may forbid a zero-knowledge vault in a temp credential's scope
+                # entirely (a scoped ZK cred still forces the holder to enter the account master
+                # passphrase). This is the SINGLE enforcement point for selected grants, so
+                # self-service and delegated-child mints both honor it before anything is
+                # persisted. The admin-for-user path (no scope) is guarded at its own endpoint,
+                # and the unrestricted/all-vaults path is guarded just below.
+                if (
+                    not _tp_policy['temp_cred_allow_zk_vaults']
+                    and getattr(vault, 'type', 'standard') == 'zero_knowledge'
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=("Zero-knowledge vaults can't be included in a temporary "
+                                f"credential by organization policy (vault '{vault.name}')."),
+                    )
+
+                raw_scope_ids = sv.get('scope_ids')
+                if raw_scope_ids is not None and not isinstance(raw_scope_ids, dict):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="scope_ids must be null or an object.",
+                    )
+                scope_ids = normalize_id_scope(raw_scope_ids)
+                caps = expand_vault_caps(sv.get('caps') or [])
+                if is_delegated:
+                    if parent_vault_mode == 'all':
+                        parent_caps = set((parent_scope or {}).get('vault_caps_default', []))
+                        parent_scope_ids = None
+                    else:
+                        parent_caps = set(parent_caps_map.get(vid, []))
+                        parent_scope_ids = parent_scope_map.get(vid)
+                        if parent_scope_ids is not None and not isinstance(parent_scope_ids, dict):
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="The parent credential has an invalid stored vault scope.",
+                            )
+                        parent_scope_ids = normalize_id_scope(parent_scope_ids)
+                    caps = [cap for cap in caps if cap in parent_caps]
+                    scope_ids = intersect_id_scope(
+                        parent_scope_ids,
+                        scope_ids,
+                        lambda cid, v=vault_uuid: id_ancestry(self.db, v, cid),
+                    )
+                selected_access_plans.append({
+                    'request': sv,
+                    'vault': vault,
+                    'vault_uuid': vault_uuid,
+                    'vault_id': vid,
+                    'caps': caps,
+                    'scope_ids': scope_ids,
+                })
+
+            # A wrapped ZK key unlocks the whole vault, so object-level grant maps
+            # are rejected even when they normalize to an empty or stale set.
+            # Scan before duplicate rejection so input order cannot change the result.
+            for plan in selected_access_plans:
+                if (
+                    getattr(plan['vault'], 'type', 'standard') == 'zero_knowledge'
+                    and plan['scope_ids'] is not None
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=("Zero-knowledge vault temporary access must use whole-vault "
+                                "scope; file and folder restrictions are not supported."),
+                    )
+            plan_ids = [plan['vault_id'] for plan in selected_access_plans]
+            if len(plan_ids) != len(set(plan_ids)):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="A vault may only be selected once per temporary credential.",
+                )
+
+        # A parent whose ZK object grant blocks account key release must not shed
+        # that negative boundary by delegating only its otherwise-valid ZK grants.
+        # Read the parent rows from the database; request-derived scope maps are not
+        # authoritative for this cutoff. Standard-only delegation remains available.
+        if created_by_temp_credential_id is not None:
+            from app.core.zk_temp_access import credential_has_zk_object_conflict
+
+            if credential_has_zk_object_conflict(
+                self.db, created_by_temp_credential_id
+            ):
+                child_can_reach_zk = (
+                    effective_scope is None
+                    or mode == 'all'
+                    or any(
+                        getattr(plan['vault'], 'type', 'standard') == 'zero_knowledge'
+                        for plan in selected_access_plans
+                    )
+                )
+                if child_can_reach_zk:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=("A delegated credential cannot include zero-knowledge "
+                                "vaults while its parent has object-scoped zero-knowledge access."),
+                    )
         # An UNRESTRICTED (effective_scope is None) or ALL-vaults credential does NOT pass through the
         # per-vault selected loop below, yet it reaches every vault the account can access — including
         # zero-knowledge. Enforce the deny here too, fail-closed, before anything is persisted, when the
@@ -509,20 +634,7 @@ class AuthService:
         # so a dashboard/temp-creds-only credential and a request full of unusable ids are both
         # judged correctly.
         if mode == 'selected' and effective_scope is not None and 'vaults' in effective_scope.get('pages', []):
-            _parent_ids = set(str(v) for v in (parent_vault_ids or []))
-            _resolvable = []
-            for _sv in (selected_vaults or []):
-                _vid = _sv.get('vault_id') if isinstance(_sv, dict) else None
-                if not _vid:
-                    continue
-                try:
-                    uuid.UUID(str(_vid))
-                except (ValueError, AttributeError):
-                    continue
-                if is_delegated and parent_vault_mode == 'selected' and str(_vid) not in _parent_ids:
-                    continue
-                _resolvable.append(str(_vid))
-            if not _resolvable:
+            if not selected_access_plans:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="This credential is scoped to vaults but no reachable vaults are "
@@ -539,40 +651,22 @@ class AuthService:
         # (a delegated child re-proves too — proof must always bind to the LIVE password,
         # never inherited stale).
         pw_fingerprints = {}  # str(vault_id) -> fingerprint of the proven password hash
-        if mode == 'selected' and selected_vaults:
-            for sv in selected_vaults:
-                vid = sv.get('vault_id') if isinstance(sv, dict) else None
-                if not vid:
-                    continue
-                try:
-                    vid = str(uuid.UUID(str(vid)))  # canonicalize so pw_fingerprints keys match the persist loop
-                except (ValueError, AttributeError, TypeError):
-                    continue
-                try:
-                    vault = self.db.query(Vault).filter(Vault.id == uuid.UUID(str(vid))).first()
-                except (ValueError, AttributeError):
-                    continue
-                if vault is None:
-                    continue
-                # Org policy may forbid a zero-knowledge vault in a temp credential's scope entirely (a
-                # scoped ZK cred still forces the holder to enter the account master passphrase). Fail
-                # closed HERE so self-service AND delegated-child mints both honor it, before anything is
-                # persisted. The admin-for-user path (no scope) is guarded separately at its endpoint.
-                if not _tp_policy['temp_cred_allow_zk_vaults'] and getattr(vault, 'type', 'standard') == 'zero_knowledge':
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=(f"Zero-knowledge vaults can't be included in a temporary credential by "
-                                f"organization policy (vault '{vault.name}')."))
+        if mode == 'selected' and selected_access_plans:
+            for plan in selected_access_plans:
+                # The resolve pass above already canonicalized the id (so these keys match the
+                # persist loop), resolved a non-null vault, and applied the organization's
+                # zero-knowledge policy. This loop only proves vault passwords.
+                vault = plan['vault']
                 if not vault.password_hash:
                     continue  # not password-protected — nothing to prove
-                supplied = sv.get('password') if isinstance(sv, dict) else None
+                supplied = plan['request'].get('password')
                 if not supplied or not verify_password(supplied, vault.password_hash):
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=(f"Vault '{vault.name}' is password-protected — its correct "
                                 "password is required to grant access via a temporary credential."),
                     )
-                pw_fingerprints[str(vid)] = vault_password_fingerprint(vault.password_hash)
+                pw_fingerprints[plan['vault_id']] = vault_password_fingerprint(vault.password_hash)
 
         # --- Temporary passcodes (standard, password-protected vaults only) -----------------------
         # A passcode is a SECOND server-side access gate that opens a vault in place of its real
@@ -584,9 +678,9 @@ class AuthService:
         # Gate on the SAME condition as the persist loop below (effective_scope is not None) so a
         # passcode is only computed/revealed when a grant row will actually be written to carry its
         # verifier — never reveal a passcode that isn't persisted.
-        if effective_scope is not None and mode == 'selected' and selected_vaults:
-            requested = [sv for sv in selected_vaults
-                         if isinstance(sv, dict) and sv.get('issue_passcode')]
+        if effective_scope is not None and mode == 'selected' and selected_access_plans:
+            requested = [plan for plan in selected_access_plans
+                         if plan['request'].get('issue_passcode')]
             if requested:
                 from app.core.password_policy import password_policy_errors
                 from app.core.security import generate_passcode
@@ -612,24 +706,16 @@ class AuthService:
                 # stored as N independent verifiers.
                 shared_plain = shared_kind = None
                 if passcode_same_for_all:
-                    _custom = next((sv.get('passcode') for sv in requested if sv.get('passcode')), None)
+                    _custom = next((plan['request'].get('passcode') for plan in requested
+                                    if plan['request'].get('passcode')), None)
                     if _custom:
                         shared_plain, shared_kind = _custom, 'custom'
                     else:
                         shared_plain, shared_kind = generate_passcode(policy['temp_passcode_min_length']), 'generated'
-                parent_ids_pc = set(str(v) for v in (parent_vault_ids or []))
-                for sv in requested:
-                    try:
-                        vid = str(uuid.UUID(str(sv.get('vault_id'))))
-                    except (ValueError, AttributeError, TypeError):
-                        continue
-                    if vid in passcode_plans:
-                        continue  # already issued a passcode for this vault (dedup a repeated id)
-                    if is_delegated and parent_vault_mode == 'selected' and vid not in parent_ids_pc:
-                        continue  # a child cannot passcode a vault it cannot reach
-                    vault = self.db.query(Vault).filter(Vault.id == uuid.UUID(vid)).first()
-                    if vault is None:
-                        continue
+                for plan in requested:
+                    sv = plan['request']
+                    vid = plan['vault_id']
+                    vault = plan['vault']
                     if getattr(vault, 'type', 'standard') == 'zero_knowledge':
                         raise HTTPException(
                             status_code=status.HTTP_400_BAD_REQUEST,
@@ -678,8 +764,8 @@ class AuthService:
                     }
                     passcode_reveal.append({"vault_id": vid, "passcode": plain, "kind": kind})
 
-        # Create temporary credential record
-        # Note: encrypted_password is NULL (security enhancement - one-way hashing only)
+        # Persist the credential and every selected grant in one database transaction.
+        # Redis is written only after the relational state is complete.
         temp_cred = TemporaryCredential(
             user_id=user_id,
             temp_username=temp_username,
@@ -694,54 +780,21 @@ class AuthService:
             vault_access_mode=mode,
             created_by_temp_credential_id=created_by_temp_credential_id,
         )
-
-        self.db.add(temp_cred)
-        self.db.commit()
-        self.db.refresh(temp_cred)
-
-        # Persist per-vault access rows for 'selected' mode. For a delegated child,
-        # constrain the selection + capabilities to what the parent itself held.
-        if effective_scope is not None and mode == 'selected' and selected_vaults:
-            from app.core.models import TempCredentialVaultAccess
-            parent_ids = set(str(v) for v in (parent_vault_ids or []))
-            for sv in selected_vaults:
-                vid = sv.get('vault_id') if isinstance(sv, dict) else None
-                if not vid:
-                    continue
-                try:
-                    vid = str(uuid.UUID(str(vid)))  # canonicalize so the parent-key lookups below are case-insensitive
-                except (ValueError, AttributeError, TypeError):
-                    continue
-                if is_delegated and parent_vault_mode == 'selected' and str(vid) not in parent_ids:
-                    continue  # child cannot reach a vault the parent could not
-                # Add implied prerequisite caps so the granted combination is usable, then (for a
-                # delegated child) clamp to what the parent held so expansion can't broaden scope.
-                caps = expand_vault_caps(sv.get('caps') or [])
-                # Optional ID-based per-file/folder restriction (None = whole vault). For a delegated
-                # child, clamp it to the parent's own so a child can never widen past it.
-                scope_ids = normalize_id_scope(sv.get('scope_ids') if isinstance(sv, dict) else None)
-                if is_delegated:
-                    if parent_vault_mode == 'all':
-                        parent_caps = set((parent_scope or {}).get('vault_caps_default', []))
-                        parent_scope_ids = None  # a whole-vault parent imposes no file/folder limit
-                    else:
-                        parent_caps = set((parent_vault_caps or {}).get(str(vid), []))
-                        parent_scope_ids = (parent_vault_scope or {}).get(str(vid))
-                    caps = [c for c in caps if c in parent_caps]
-                    _vid = uuid.UUID(str(vid))
-                    scope_ids = intersect_id_scope(
-                        parent_scope_ids, scope_ids,
-                        lambda cid: id_ancestry(self.db, _vid, cid))
-                _pp = passcode_plans.get(str(vid)) or {}
-                try:
+        from app.core.models import TempCredentialVaultAccess
+        try:
+            self.db.add(temp_cred)
+            self.db.flush()
+            if effective_scope is not None and mode == 'selected':
+                for plan in selected_access_plans:
+                    _pp = passcode_plans.get(plan['vault_id']) or {}
                     self.db.add(TempCredentialVaultAccess(
                         temp_credential_id=temp_cred.id,
-                        vault_id=uuid.UUID(str(vid)),
-                        vault_caps=caps,
-                        scope_ids=scope_ids,
+                        vault_id=plan['vault_uuid'],
+                        vault_caps=plan['caps'],
+                        scope_ids=plan['scope_ids'],
                         # Binds the SFTP proof to the password proven above (NULL for
                         # non-password vaults); re-checked against the live hash on access.
-                        vault_password_fingerprint=pw_fingerprints.get(str(vid)),
+                        vault_password_fingerprint=pw_fingerprints.get(plan['vault_id']),
                         # Optional passcode verifier (NULL = no passcode). Computed + policy-checked above.
                         passcode_hash=_pp.get('hash'),
                         passcode_kind=_pp.get('kind'),
@@ -749,9 +802,11 @@ class AuthService:
                         passcode_expires_at=_pp.get('expires_at'),
                         created_by=created_by_user_id,
                     ))
-                except (ValueError, AttributeError):
-                    continue
             self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        self.db.refresh(temp_cred)
         
         # Store in Redis for quick expiration checks
         redis_key = f"temp_cred:{temp_username}"

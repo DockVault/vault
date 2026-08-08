@@ -1930,7 +1930,7 @@
                                     <div class="scope-section" id="tc-vault-caps">
                                         <div class="scope-section-title">What can they do in those vaults?</div>
                                         <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.see_info" checked><span>See vault info</span></label>
-                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.see_files" checked><span>See files <small>&mdash; browse/list the whole vault. Leave OFF for a "known files only" credential (it can still download/act on a file it's told about, but can't enumerate).</small></span></label>
+                                        <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="vault.see_files" checked><span>See files <small>&mdash; browse/list the whole vault. Leave OFF for a "known files only" credential (it can still download/act on a file it's told about, but can't enumerate). Zero-knowledge vaults are the exception: they need this, or Change permissions, to release the vault key at all &mdash; without one of them nothing in them can be decrypted.</small></span></label>
                                         <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="file.download" checked><span>Download files</span></label>
                                         <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="file.upload"><span>Upload files</span></label>
                                         <label class="checkbox-row"><input type="checkbox" class="tc-cap" value="folder.create"><span>Create folders</span></label>
@@ -1949,9 +1949,9 @@
                                         <div class="scope-section-title">Restrict to files/folders</div>
                                         <label class="checkbox-row">
                                             <input type="checkbox" id="tc-restrict-enable" disabled>
-                                            <span>Restrict to specific files/folders <small>&mdash; select exactly ONE vault above, then pick the files/folders this credential may use. It can act only on those (plus the folders needed to reach them) and can neither see nor touch anything else in the vault.</small></span>
+                                            <span>Restrict to specific files/folders <small>&mdash; select exactly ONE <strong>standard</strong> vault above, then pick the files/folders this credential may use. It can act only on those (plus the folders needed to reach them) and can neither see nor touch anything else in the vault. Zero-knowledge vaults can only be granted with whole-vault scope.</small></span>
                                         </label>
-                                        <div id="tc-restrict-hint" class="text-tertiary text-sm" style="margin:.2rem 0 0 26px;">Select a single vault above to enable.</div>
+                                        <div id="tc-restrict-hint" class="text-tertiary text-sm" style="margin:.2rem 0 0 26px;">Select a single Standard vault above to enable.</div>
                                         <div id="tc-restrict-panel" hidden style="margin:.4rem 0 0 26px;">
                                             <div id="tc-restrict-crumbs" class="tc-restrict-crumbs"></div>
                                             <div id="tc-restrict-list" class="tc-restrict-list member-pick-list"></div>
@@ -2501,7 +2501,7 @@
     <script src="/static/js/theme.js?v=20260703a"></script>
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/ecc_crypto.js?v=20260617a"></script>
-    <script src="/static/js/app.js?v=20260617a"></script>
+    <script src="/static/js/app.js?v=20260804a"></script>
 </body>
 </html>
 

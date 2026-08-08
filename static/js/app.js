@@ -2445,13 +2445,15 @@ function _tcConfirmZkAck(onProceed) {
 }
 
 // --- File/folder restriction picker (produces selected_vaults[].scope_ids) ------------------
-// A restriction targets exactly ONE selected vault (file/folder sharing is inherently single-vault);
-// with 0 or 2+ vaults selected, or "all my vaults", it is disabled and the credential is whole-vault.
+// A restriction targets exactly ONE selected Standard vault (file/folder sharing is inherently
+// single-vault). Zero-knowledge grants are whole-vault only; with 0 or 2+ vaults selected, or
+// "all my vaults", this picker is disabled and the credential is whole-vault.
 const _tcRestrict = { vaultId: null, files: new Set(), folders: new Set(), crumbs: [{ id: null, name: 'Root' }] };
-let _tcVaultObjs = {};  // id -> vault object (from the picker fetch), so the picker can decrypt ZK names
+let _tcVaultObjs = {};  // id -> vault object from the picker fetch (including its confidentiality type)
 let _tcRestrictSeq = 0; // monotonic load token: only the latest _tcRestrictLoad may paint (last-click-wins)
 
 function _tcRestrictReset() {
+    ++_tcRestrictSeq;  // invalidate any listing request still in flight from an earlier selection/modal
     _tcRestrict.vaultId = null;
     _tcRestrict.files.clear();
     _tcRestrict.folders.clear();
@@ -2459,7 +2461,11 @@ function _tcRestrictReset() {
     const en = document.getElementById('tc-restrict-enable');
     if (en) { en.checked = false; en.disabled = true; }
     const panel = document.getElementById('tc-restrict-panel'); if (panel) panel.hidden = true;
-    const hint = document.getElementById('tc-restrict-hint'); if (hint) hint.style.display = '';
+    const hint = document.getElementById('tc-restrict-hint');
+    if (hint) {
+        hint.style.display = '';
+        hint.textContent = 'Select a single Standard vault above to enable.';
+    }
     _tcRestrictRenderSummary();
 }
 
@@ -2469,10 +2475,12 @@ function _tcRestrictSyncAvailability() {
     if (!en) return;
     const picks = Array.from(document.querySelectorAll('.tc-vault-pick:checked'));
     const isSelected = document.querySelector('input[name="tc-vault-mode"]:checked')?.value === 'selected';
-    if (isSelected && picks.length === 1) {
+    const vid = isSelected && picks.length === 1 ? picks[0].value : null;
+    const vault = vid ? _tcVaultObjs[vid] : null;
+    const isSingleStandard = !!vault && vault.type === 'standard';
+    if (isSingleStandard) {
         en.disabled = false;
         if (hint) hint.style.display = 'none';
-        const vid = picks[0].value;
         if (_tcRestrict.vaultId !== vid) {
             // The single selected vault changed — drop any prior selection (ids are per-vault).
             _tcRestrict.vaultId = vid;
@@ -2482,13 +2490,20 @@ function _tcRestrictSyncAvailability() {
             if (en.checked) _tcRestrictLoad(null);
         }
     } else {
+        ++_tcRestrictSeq;  // a superseded load must not repaint after this state has been cleared
         en.disabled = true;
         en.checked = false;
         _tcRestrict.vaultId = null;
         _tcRestrict.files.clear();
         _tcRestrict.folders.clear();
+        _tcRestrict.crumbs = [{ id: null, name: 'Root' }];
         const panel = document.getElementById('tc-restrict-panel'); if (panel) panel.hidden = true;
-        if (hint) hint.style.display = '';
+        if (hint) {
+            hint.style.display = '';
+            hint.textContent = isSelected && vault && vault.type === 'zero_knowledge'
+                ? 'Zero-knowledge vaults can only be granted with whole-vault scope.'
+                : 'Select a single Standard vault above to enable.';
+        }
     }
     _tcRestrictRenderSummary();
 }
@@ -2497,7 +2512,15 @@ async function _tcRestrictLoad(folderId) {
     const panel = document.getElementById('tc-restrict-panel');
     const list = document.getElementById('tc-restrict-list');
     if (!panel || !list || !_tcRestrict.vaultId) return;
-    // Last-click-wins: a slower earlier load (esp. behind a ZK unlock prompt) must not paint over a
+    const vaultId = _tcRestrict.vaultId;
+    const vault = _tcVaultObjs[vaultId];
+    // Defense in depth: stale/programmatic state must never make this picker fetch or unlock a ZK
+    // listing. The server remains authoritative, but the browser should not attempt the operation.
+    if (!vault || vault.type !== 'standard') {
+        _tcRestrictSyncAvailability();
+        return;
+    }
+    // Last-click-wins: a slower earlier load must not paint over a
     // newer navigation, which would show one folder's contents under another's breadcrumb.
     const seq = ++_tcRestrictSeq;
     panel.hidden = false;
@@ -2505,21 +2528,13 @@ async function _tcRestrictLoad(folderId) {
     let items = [];
     try {
         const q = folderId ? `?folder_id=${encodeURIComponent(folderId)}` : '';
-        const res = await apiRequest(`/vaults/${encodeURIComponent(_tcRestrict.vaultId)}/files${q}`, { silent: true });
+        const res = await apiRequest(`/vaults/${encodeURIComponent(vaultId)}/files${q}`, { silent: true });
         items = (res && res.items) || [];
     } catch (_) {
         if (seq === _tcRestrictSeq) list.innerHTML = '<div class="text-tertiary text-sm p-sm">Could not load files.</div>';
         return;
     }
     if (seq !== _tcRestrictSeq) return;  // superseded by a newer navigation
-    // Zero-knowledge vaults return encrypted names; decrypt them client-side (same flow as the
-    // main file view) so the picker shows real names. IDs are always cleartext, so selection works
-    // either way — a cancelled unlock just leaves "🔒 Encrypted name" labels.
-    const vobj = _tcVaultObjs[_tcRestrict.vaultId];
-    if (vobj && vobj.type === 'zero_knowledge') {
-        try { await zkDecryptListingNames(items, vobj); } catch (_) { /* names stay encrypted; ids still work */ }
-        if (seq !== _tcRestrictSeq) return;  // the unlock prompt is async — re-check after it
-    }
     _tcRestrictRenderCrumbs();
     const rows = [];
     for (const f of items.filter(i => i.type === 'folder')) {
@@ -2609,14 +2624,17 @@ function collectTempScope() {
                 }
                 return item;
             });
-        // A single-vault file/folder restriction attaches scope_ids to that vault's entry. Only when
+        // A single-Standard-vault file/folder restriction attaches scope_ids to that vault's entry. Only when
         // at least one file/folder is chosen — an empty {files:[],folders:[]} means deny-all on the
         // server, so "restrict enabled but nothing picked" is treated as whole-vault (scope omitted).
         const restrictEnable = document.getElementById('tc-restrict-enable');
+        const restrictEntry = selected_vaults.length === 1 ? selected_vaults[0] : null;
+        const restrictVault = restrictEntry ? _tcVaultObjs[restrictEntry.vault_id] : null;
         if (restrictEnable && restrictEnable.checked && _tcRestrict.vaultId
+            && restrictEntry && restrictEntry.vault_id === _tcRestrict.vaultId
+            && restrictVault && restrictVault.type === 'standard'
             && (_tcRestrict.files.size + _tcRestrict.folders.size) > 0) {
-            const entry = selected_vaults.find(sv => sv.vault_id === _tcRestrict.vaultId);
-            if (entry) entry.scope_ids = {
+            restrictEntry.scope_ids = {
                 files: Array.from(_tcRestrict.files),
                 folders: Array.from(_tcRestrict.folders),
             };

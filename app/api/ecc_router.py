@@ -24,6 +24,12 @@ from app.core.endpoint_permissions import require_endpoint_permission
 from app.core.temp_scope import (
     require_vault_cap, enforce_vault, is_scoped, has_scoped_vault_cap, effective_vault_caps,
 )
+from app.core.zk_temp_access import (
+    TEAMPRIV_ALGO,
+    TEMP_ZK_KEY_ACCESS_DENIED,
+    may_release_private_envelope,
+    may_release_vault_key,
+)
 from cryptography.hazmat.primitives import serialization
 from datetime import datetime, timezone, timedelta
 
@@ -611,6 +617,10 @@ async def get_private_key(
     on the client (PBKDF2 + AES-GCM), so the server only ever stores and returns
     ciphertext it cannot read. Returns has_keypair=False when none exists (no 404,
     so the client can branch cleanly)."""
+    if not may_release_private_envelope(db, current_user):
+        raise HTTPException(
+            status_code=403, detail=TEMP_ZK_KEY_ACCESS_DENIED
+        )
     keypair = db.query(UserKeyPair).filter(UserKeyPair.user_id == current_user.id).first()
     if not keypair or not keypair.encrypted_private_key:
         return {"has_keypair": False, "encrypted_private_key": None}
@@ -671,7 +681,6 @@ async def update_private_key(
 
 # Tag distinguishing a wrapped TEAM PRIVATE key (hierarchical) from a wrapped DEK (direct) in
 # the shared vault_member_keys table. EVERY hierarchical query MUST filter on it.
-TEAMPRIV_ALGO = 'ECDH-P384-AES-GCM-TEAMPRIV'
 DIRECT_DEK_ALGO = 'ECDH-P384-AES-KW'
 
 
@@ -750,6 +759,10 @@ async def get_vault_keys(
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
     if not vault:
         raise HTTPException(status_code=404, detail="Vault not found")
+    if not may_release_vault_key(db, current_user, vault):
+        raise HTTPException(
+            status_code=403, detail=TEMP_ZK_KEY_ACCESS_DENIED
+        )
 
     # Confine a scoped temp credential to its granted vaults — the SAME gate the standard
     # read path applies (app/services/vault_service.py get_vault -> enforce_vault). Without it a cred scoped
