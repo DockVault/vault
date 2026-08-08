@@ -15,14 +15,20 @@ import os
 import json
 import uuid
 from app.core.database import get_db
-from app.core.models import User, Vault, UserKeyPair, VaultMemberKey, ZKShareInvite, ECCRegistrationChallenge, vault_members, RoleEnum
-from app.services import ecc_pop
+from app.core.models import User, Vault, UserKeyPair, VaultMemberKey, ZKShareInvite, ECCRegistrationChallenge, ECCKeyUpdateChallenge, vault_members, RoleEnum
+from app.services import ecc_pop, ecc_update_pop
 from app.services.ecc_crypto_service import ECCCryptoService
 from app.services.audit_logger import AuditLogger
 from app.core.rate_limiter import rate_limiter as _rate_limiter
 from app.core.endpoint_permissions import require_endpoint_permission
 from app.core.temp_scope import (
     require_vault_cap, enforce_vault, is_scoped, has_scoped_vault_cap, effective_vault_caps,
+)
+from app.core.zk_temp_access import (
+    TEAMPRIV_ALGO,
+    TEMP_ZK_KEY_ACCESS_DENIED,
+    may_release_private_envelope,
+    may_release_vault_key,
 )
 from cryptography.hazmat.primitives import serialization
 from datetime import datetime, timezone, timedelta
@@ -227,7 +233,8 @@ def _reconcile_orphan_member_keys(db: Session, vault: Vault) -> bool:
 
 
 def _audit_zk(db: Session, actor: User, action: str, *, resource_id,
-              resource_type: str = "vault", details: Optional[dict] = None) -> None:
+              resource_type: str = "vault", details: Optional[dict] = None,
+              status: str = "success") -> None:
     """Best-effort audit row for a /ecc ZK-crypto mutation.
 
     Called AFTER the mutation has committed (AuditLogger.log_action commits its own row), so a
@@ -238,7 +245,7 @@ def _audit_zk(db: Session, actor: User, action: str, *, resource_id,
     try:
         AuditLogger(db).log_action(
             action=action,
-            status="success",
+            status=status,
             user=actor,
             resource_type=resource_type,
             resource_id=str(resource_id),
@@ -257,6 +264,13 @@ _ECC_RATELIMIT = {
     "public_key": (100, 60),   # resolving recipients' keys while sharing to a team
     "mutate": (400, 60),       # grant / revoke / rekey / retire
     "decompress": (200, 60),   # point-format conversion during key ops (bounded compute)
+    # Replacing the private-key envelope. Separate buckets from "register" so exhausting one
+    # cannot lock out the other, and deliberately generous against legitimate use (a passphrase
+    # change or a recovery restore is rare) while tight against guessing: combined with one-time
+    # consumption, an attacker gets at most 10 proof attempts per 15 minutes, each needing a fresh
+    # issuance, against a 256-bit MAC.
+    "key_update_challenge": (10, 900),
+    "key_update": (10, 900),
 }
 
 
@@ -390,6 +404,13 @@ async def decompress_point(
 
 _POP_CHALLENGE_TTL_SECONDS = 300  # a registration challenge is single-use + short-lived
 
+# The private-key envelope is stored verbatim and never parsed, so the only bound the server
+# applies to it is a size cap. Defined here because BOTH of the field's writers -- first
+# registration below and replacement further down -- must use the same one: a cap on one writer
+# only is not a cap. Measured in UTF-8 BYTES, matching the serialized cap in the envelope design
+# and the way the client measures, so the two cannot disagree about the same blob.
+_MAX_ENVELOPE_BYTES = 16384
+
 
 @router.post("/keys/register/challenge")
 async def register_challenge(
@@ -488,6 +509,18 @@ async def register_public_key(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="An encryption key is already set up for this account.",
             )
+
+        # Size cap, checked FIRST so an oversized body is refused before any proof work or write.
+        # This is the field's other writer, so it applies the same bound as replacement, from the
+        # same constant; without it an account with no keypair could register an arbitrarily large
+        # blob that every later read returns verbatim.
+        if request.encrypted_private_key is not None:
+            try:
+                _reg_bytes = len(request.encrypted_private_key.encode("utf-8"))
+            except UnicodeEncodeError:
+                raise HTTPException(status_code=400, detail="encrypted_private_key is malformed")
+            if _reg_bytes > _MAX_ENVELOPE_BYTES:
+                raise HTTPException(status_code=400, detail="encrypted_private_key is too large")
 
         # Proof-of-possession: the caller must prove they hold the PRIVATE key matching this
         # public key (ECDH key-confirmation, via POST /keys/register/challenge), so a
@@ -611,10 +644,21 @@ async def get_private_key(
     on the client (PBKDF2 + AES-GCM), so the server only ever stores and returns
     ciphertext it cannot read. Returns has_keypair=False when none exists (no 404,
     so the client can branch cleanly)."""
+    if not may_release_private_envelope(db, current_user):
+        raise HTTPException(
+            status_code=403, detail=TEMP_ZK_KEY_ACCESS_DENIED
+        )
     keypair = db.query(UserKeyPair).filter(UserKeyPair.user_id == current_user.id).first()
     if not keypair or not keypair.encrypted_private_key:
         return {"has_keypair": False, "encrypted_private_key": None}
     return {"has_keypair": True, "encrypted_private_key": keypair.encrypted_private_key}
+
+
+class KeyUpdatePoP(BaseModel):
+    """Proof that the caller holds the CURRENTLY REGISTERED private key, bound to this exact
+    replacement. See docs/design/vault-private-key-update-pop-v1.md."""
+    challenge_id: str = Field(..., description="from POST /ecc/keys/private/challenge")
+    mac: str = Field(..., description="base64 HMAC over the update transcript")
 
 
 class PrivateKeyUpdateRequest(BaseModel):
@@ -622,6 +666,65 @@ class PrivateKeyUpdateRequest(BaseModel):
     the server cannot read it). The PUBLIC key is unchanged, so this is a passphrase change,
     not a key rotation."""
     encrypted_private_key: str = Field(..., description="password-encrypted private-key blob")
+    pop: Optional[KeyUpdatePoP] = Field(None, description="required proof of possession")
+
+
+# One indistinguishable failure for every reason a proof can fail. Telling a caller WHICH part of
+# the attempt was wrong helps only an attacker; a legitimate client's correct response to any of
+# them is identical -- request a fresh challenge and retry.
+_UPDATE_POP_FAILED = (
+    "Proof of possession failed. Request a new challenge and try again."
+)
+
+
+
+@router.post("/keys/private/challenge")
+async def key_update_challenge(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Issue a one-time challenge for REPLACING the stored private-key envelope.
+
+    Interactive sessions only, and only for an account that already has a keypair -- with no
+    keypair there is nothing to replace and nothing to prove against.
+
+    Issuance takes a row lock on the owning user so exactly one challenge is live per user even
+    under concurrent requests. Without the lock two issuances can interleave their delete and
+    insert and leave two live challenges, multiplying an attacker's attempts per round-trip.
+    """
+    # Refuse BEFORE charging the budget. A temporary session is the OWNER's User row tagged as
+    # temporary, and the limiter keys on the user id -- so charging a refused request would let a
+    # leaked temp credential hold the owner out of this route indefinitely. That is an
+    # availability attack on precisely what proof-bound replacement exists to protect, and a
+    # refused caller can never consume a challenge or attempt a proof, so excluding it costs the
+    # budget nothing.
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(
+            status_code=403,
+            detail="A temporary credential cannot change the account encryption passphrase.",
+        )
+    _ecc_rate_limit(current_user, "key_update_challenge")
+    keypair = db.query(UserKeyPair).filter(UserKeyPair.user_id == current_user.id).first()
+    if not keypair or not keypair.public_key:
+        raise HTTPException(status_code=404, detail="No encryption key is set up for this account.")
+
+    # Serialize issuance on the owning user row.
+    db.query(User).filter(User.id == current_user.id).with_for_update().first()
+    priv_pem, pub_pem, nonce_b64 = ecc_update_pop.generate_challenge()
+    db.query(ECCKeyUpdateChallenge).filter(
+        ECCKeyUpdateChallenge.user_id == current_user.id
+    ).delete(synchronize_session=False)
+    ch = ECCKeyUpdateChallenge(
+        user_id=current_user.id, server_private_key=priv_pem, nonce=nonce_b64
+    )
+    db.add(ch)
+    db.commit()
+    db.refresh(ch)
+    return {
+        "challenge_id": str(ch.id),
+        "server_ephemeral_public_key": pub_pem,
+        "nonce": nonce_b64,
+    }
 
 
 @router.put("/keys/private")
@@ -637,21 +740,88 @@ async def update_private_key(
     that public key), so NO per-vault re-wrap is needed — the user simply unlocks with the new
     passphrase from now on. Zero-knowledge is preserved: the server only ever stores the opaque
     ciphertext it cannot read. This is distinct from a key ROTATION (a new public key would
-    orphan every wrapped DEK); we deliberately keep the public key fixed. Rate-limited on the
-    same per-user bucket as registration.
+    orphan every wrapped DEK); we deliberately keep the public key fixed. Rate-limited on its own
+    per-user bucket, separate from registration so exhausting one cannot lock out the other.
 
     Requires an INTERACTIVE session: a temporary credential authenticates AS the account owner,
     and this overwrites the owner's private-key blob verbatim (no current-passphrase proof server
     side), so a delegated/temp cred must not be able to corrupt it and irreversibly lock the owner
     out of every zero-knowledge vault. Changing the account passphrase is an owner operation."""
-    _ecc_rate_limit(current_user, "register")
+    # Refuse before charging the budget -- see the note on the challenge route: a temp session
+    # shares the owner's rate-limit bucket, so a charged refusal is an owner lockout.
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="A temporary credential cannot change the account encryption passphrase.")
+    _ecc_rate_limit(current_user, "key_update")
+
+    # STEP 1 - validate the request WITHOUT parsing the envelope. A malformed request is refused
+    # here and does NOT consume a challenge, so an honest client cannot destroy its own in-flight
+    # challenge with a bad request. The server never learns the envelope's format: the transcript
+    # already binds the stored bytes to the proof, and a format-aware server would reject every
+    # replacement today's client makes, since the versioned writer ships disabled.
     if not request.encrypted_private_key:
         raise HTTPException(status_code=400, detail="encrypted_private_key is required")
+    try:
+        envelope_bytes = len(request.encrypted_private_key.encode("utf-8"))
+    except UnicodeEncodeError:
+        # JSON admits a lone surrogate, which is not encodable. That is a malformed request, not
+        # a server fault. NB the bound stays on UTF-8 BYTES: narrowing it to ASCII would refuse
+        # legitimate callers and would drift from the client-side check.
+        raise HTTPException(status_code=400, detail="encrypted_private_key is malformed")
+    if envelope_bytes > _MAX_ENVELOPE_BYTES:
+        raise HTTPException(status_code=400, detail="encrypted_private_key is too large")
+    # An account with no keypair has nothing to replace and nothing to prove against, and it
+    # learns that from GET /ecc/keys/public anyway, so answering honestly reveals nothing. This
+    # check precedes the proof check so the "no keypair" case keeps its own distinct status.
     keypair = db.query(UserKeyPair).filter(UserKeyPair.user_id == current_user.id).first()
     if not keypair:
         raise HTTPException(status_code=404, detail="No encryption key is set up for this account.")
+
+    # A malformed request is reported distinctly from a failed proof. That is not in tension with
+    # the indistinguishability rule below: a caller who sent the wrong SHAPE can act on it, learns
+    # nothing about the challenge or the key, and is refused before anything is consumed. Telling
+    # them "proof failed, get a new challenge" instead sends them round a loop that cannot help,
+    # burning one issuance and one verification from two rate-limited budgets per attempt.
+    pop = request.pop
+    if pop is None or not pop.challenge_id or not pop.mac:
+        raise HTTPException(status_code=400, detail="pop.challenge_id and pop.mac are required")
+    try:
+        cid = uuid.UUID(str(pop.challenge_id))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="pop.challenge_id is not a valid challenge id")
+
+    # STEP 2 - claim and CONSUME the challenge before verifying. Consumption must not depend on
+    # the result: if a failed proof left the challenge alive an attacker could brute-force MACs
+    # against one issuance. One-time means a wrong answer costs a fresh, rate-limited issuance.
+    ch = db.query(ECCKeyUpdateChallenge).filter(
+        ECCKeyUpdateChallenge.id == cid,
+        ECCKeyUpdateChallenge.user_id == current_user.id,
+    ).with_for_update().first()
+    if ch is None:
+        _audit_zk(db, current_user, "zk_key_update_pop_failed",
+                  resource_id=current_user.id, resource_type="user",
+                  details={"reason": "no_live_challenge"}, status="failure")
+        raise HTTPException(status_code=400, detail=_UPDATE_POP_FAILED)
+    created_at, server_priv, nonce = ch.created_at, ch.server_private_key, ch.nonce
+    db.delete(ch)
+    db.commit()
+
+    # STEP 3 - expiry, then the proof. Failures are audited with a short reason code and never the
+    # attempted MAC, nonce or envelope bytes: both routes are authenticated and rate-limited, and
+    # the limiter fails OPEN on a backing-store outage, so this record is what keeps an attempt
+    # burst visible in exactly the window where the limit is not.
+    expired = created_at is None or (
+        datetime.utcnow() - created_at
+    ) > timedelta(seconds=ecc_update_pop.CHALLENGE_TTL_SECONDS)
+    ok = (not expired) and ecc_update_pop.verify_pop(
+        server_priv, keypair.public_key, str(cid), nonce,
+        str(current_user.id), request.encrypted_private_key, pop.mac,
+    )
+    if not ok:
+        _audit_zk(db, current_user, "zk_key_update_pop_failed",
+                  resource_id=current_user.id, resource_type="user",
+                  details={"reason": "expired" if expired else "bad_proof"}, status="failure")
+        raise HTTPException(status_code=400, detail=_UPDATE_POP_FAILED)
+
     keypair.encrypted_private_key = request.encrypted_private_key
     keypair.updated_at = datetime.now(timezone.utc)
     db.commit()
@@ -671,7 +841,6 @@ async def update_private_key(
 
 # Tag distinguishing a wrapped TEAM PRIVATE key (hierarchical) from a wrapped DEK (direct) in
 # the shared vault_member_keys table. EVERY hierarchical query MUST filter on it.
-TEAMPRIV_ALGO = 'ECDH-P384-AES-GCM-TEAMPRIV'
 DIRECT_DEK_ALGO = 'ECDH-P384-AES-KW'
 
 
@@ -750,6 +919,10 @@ async def get_vault_keys(
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
     if not vault:
         raise HTTPException(status_code=404, detail="Vault not found")
+    if not may_release_vault_key(db, current_user, vault):
+        raise HTTPException(
+            status_code=403, detail=TEMP_ZK_KEY_ACCESS_DENIED
+        )
 
     # Confine a scoped temp credential to its granted vaults — the SAME gate the standard
     # read path applies (app/services/vault_service.py get_vault -> enforce_vault). Without it a cred scoped

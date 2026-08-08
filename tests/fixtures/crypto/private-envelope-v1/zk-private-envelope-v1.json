@@ -1,0 +1,32 @@
+{
+  "schema": "dockvault-crypto-vector-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "format": "account private-key envelope v1",
+  "spec": "docs/design/vault-private-key-envelope-v1.md",
+  "fixture_id": "zk-private-envelope-v1",
+  "source_paths": [
+    "static/js/ecc_crypto.js"
+  ],
+  "inputs": {
+    "identity_private_scalar_hex": "11",
+    "password": "DOCKVAULT-PUBLIC-TEST-ONLY-PASSPHRASE",
+    "salt_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "iv_hex": "707172737475767778797a7b",
+    "iterations": 600000
+  },
+  "expected": {
+    "envelope": {
+      "v": 1,
+      "kdf": "PBKDF2-SHA256",
+      "iter": 600000,
+      "cipher": "AES-256-GCM",
+      "salt": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "iv": "cHFyc3R1dnd4eXp7",
+      "ct": "3y3KN/MwajMIuNyjWbcVGco3R2bPFGsu+tLcoGxi1nW7ilpfOOMIRy5c8LnEWYHXsUvxqG/y65wQor/LWQa9cGOiJBUuYL4TpKpmFPGICZauQqulfWJtWRLJ+P45HR+r3wX+cXufhKycPkVLUoOb/b37XgzI8vsoGrjllshq7cIK487Egb40qiTX5fz8skTOMcZR5AJPk1Q889+T+IcCx40a06ofgGkmwFAg91Xtfi42wo9KmmkGkCFTABoJqiRjik8QEKjvuFUjlTuNkInUxVYSiYzdDg9F2MWX4SFbYjIT3GckSGmipES5Y7PhzTpRush6xbavMUkOKAT62FrMYQ2MXi1FGp/xeb7wPIh3K1gbYvrjfDzbC+2a9b5bITepXktMSnjcWXLJjRMoktBhaF1zbN4EAAdOY56SogBs+fp0"
+    },
+    "aad_utf8": "dockvault-private-key-envelope-v1|PBKDF2-SHA256|600000|AES-256-GCM|AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    "framing": "separate iv12 field; ct = ciphertext||tag16",
+    "private_key_derived_from_input_scalar": true
+  }
+}

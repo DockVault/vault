@@ -2063,11 +2063,9 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
         let zkPendingDek = null;
         if (vaultType === 'zero_knowledge') {
             try {
-                await zkEnsureKeypair();
+                const publicKeyPem = await zkEnsurePublicKeyForCreate();
                 const lib = eccLib();
-                const mine = await apiRequest('/ecc/keys/public', { silent: true });
-                if (!mine || !mine.public_key) throw new Error('Your public key is unavailable.');
-                const myPub = await lib.importPublicKeyPEM(mine.public_key);
+                const myPub = await lib.importPublicKeyPEM(publicKeyPem);
                 const dek = await lib.generateVaultDEK();
                 payload.type = 'zero_knowledge';
                 const hcb = document.getElementById('vault-hierarchical');
@@ -2447,13 +2445,15 @@ function _tcConfirmZkAck(onProceed) {
 }
 
 // --- File/folder restriction picker (produces selected_vaults[].scope_ids) ------------------
-// A restriction targets exactly ONE selected vault (file/folder sharing is inherently single-vault);
-// with 0 or 2+ vaults selected, or "all my vaults", it is disabled and the credential is whole-vault.
+// A restriction targets exactly ONE selected Standard vault (file/folder sharing is inherently
+// single-vault). Zero-knowledge grants are whole-vault only; with 0 or 2+ vaults selected, or
+// "all my vaults", this picker is disabled and the credential is whole-vault.
 const _tcRestrict = { vaultId: null, files: new Set(), folders: new Set(), crumbs: [{ id: null, name: 'Root' }] };
-let _tcVaultObjs = {};  // id -> vault object (from the picker fetch), so the picker can decrypt ZK names
+let _tcVaultObjs = {};  // id -> vault object from the picker fetch (including its confidentiality type)
 let _tcRestrictSeq = 0; // monotonic load token: only the latest _tcRestrictLoad may paint (last-click-wins)
 
 function _tcRestrictReset() {
+    ++_tcRestrictSeq;  // invalidate any listing request still in flight from an earlier selection/modal
     _tcRestrict.vaultId = null;
     _tcRestrict.files.clear();
     _tcRestrict.folders.clear();
@@ -2461,7 +2461,11 @@ function _tcRestrictReset() {
     const en = document.getElementById('tc-restrict-enable');
     if (en) { en.checked = false; en.disabled = true; }
     const panel = document.getElementById('tc-restrict-panel'); if (panel) panel.hidden = true;
-    const hint = document.getElementById('tc-restrict-hint'); if (hint) hint.style.display = '';
+    const hint = document.getElementById('tc-restrict-hint');
+    if (hint) {
+        hint.style.display = '';
+        hint.textContent = 'Select a single Standard vault above to enable.';
+    }
     _tcRestrictRenderSummary();
 }
 
@@ -2471,10 +2475,12 @@ function _tcRestrictSyncAvailability() {
     if (!en) return;
     const picks = Array.from(document.querySelectorAll('.tc-vault-pick:checked'));
     const isSelected = document.querySelector('input[name="tc-vault-mode"]:checked')?.value === 'selected';
-    if (isSelected && picks.length === 1) {
+    const vid = isSelected && picks.length === 1 ? picks[0].value : null;
+    const vault = vid ? _tcVaultObjs[vid] : null;
+    const isSingleStandard = !!vault && vault.type === 'standard';
+    if (isSingleStandard) {
         en.disabled = false;
         if (hint) hint.style.display = 'none';
-        const vid = picks[0].value;
         if (_tcRestrict.vaultId !== vid) {
             // The single selected vault changed — drop any prior selection (ids are per-vault).
             _tcRestrict.vaultId = vid;
@@ -2484,13 +2490,20 @@ function _tcRestrictSyncAvailability() {
             if (en.checked) _tcRestrictLoad(null);
         }
     } else {
+        ++_tcRestrictSeq;  // a superseded load must not repaint after this state has been cleared
         en.disabled = true;
         en.checked = false;
         _tcRestrict.vaultId = null;
         _tcRestrict.files.clear();
         _tcRestrict.folders.clear();
+        _tcRestrict.crumbs = [{ id: null, name: 'Root' }];
         const panel = document.getElementById('tc-restrict-panel'); if (panel) panel.hidden = true;
-        if (hint) hint.style.display = '';
+        if (hint) {
+            hint.style.display = '';
+            hint.textContent = isSelected && vault && vault.type === 'zero_knowledge'
+                ? 'Zero-knowledge vaults can only be granted with whole-vault scope.'
+                : 'Select a single Standard vault above to enable.';
+        }
     }
     _tcRestrictRenderSummary();
 }
@@ -2499,7 +2512,15 @@ async function _tcRestrictLoad(folderId) {
     const panel = document.getElementById('tc-restrict-panel');
     const list = document.getElementById('tc-restrict-list');
     if (!panel || !list || !_tcRestrict.vaultId) return;
-    // Last-click-wins: a slower earlier load (esp. behind a ZK unlock prompt) must not paint over a
+    const vaultId = _tcRestrict.vaultId;
+    const vault = _tcVaultObjs[vaultId];
+    // Defense in depth: stale/programmatic state must never make this picker fetch or unlock a ZK
+    // listing. The server remains authoritative, but the browser should not attempt the operation.
+    if (!vault || vault.type !== 'standard') {
+        _tcRestrictSyncAvailability();
+        return;
+    }
+    // Last-click-wins: a slower earlier load must not paint over a
     // newer navigation, which would show one folder's contents under another's breadcrumb.
     const seq = ++_tcRestrictSeq;
     panel.hidden = false;
@@ -2507,21 +2528,13 @@ async function _tcRestrictLoad(folderId) {
     let items = [];
     try {
         const q = folderId ? `?folder_id=${encodeURIComponent(folderId)}` : '';
-        const res = await apiRequest(`/vaults/${encodeURIComponent(_tcRestrict.vaultId)}/files${q}`, { silent: true });
+        const res = await apiRequest(`/vaults/${encodeURIComponent(vaultId)}/files${q}`, { silent: true });
         items = (res && res.items) || [];
     } catch (_) {
         if (seq === _tcRestrictSeq) list.innerHTML = '<div class="text-tertiary text-sm p-sm">Could not load files.</div>';
         return;
     }
     if (seq !== _tcRestrictSeq) return;  // superseded by a newer navigation
-    // Zero-knowledge vaults return encrypted names; decrypt them client-side (same flow as the
-    // main file view) so the picker shows real names. IDs are always cleartext, so selection works
-    // either way — a cancelled unlock just leaves "🔒 Encrypted name" labels.
-    const vobj = _tcVaultObjs[_tcRestrict.vaultId];
-    if (vobj && vobj.type === 'zero_knowledge') {
-        try { await zkDecryptListingNames(items, vobj); } catch (_) { /* names stay encrypted; ids still work */ }
-        if (seq !== _tcRestrictSeq) return;  // the unlock prompt is async — re-check after it
-    }
     _tcRestrictRenderCrumbs();
     const rows = [];
     for (const f of items.filter(i => i.type === 'folder')) {
@@ -2611,14 +2624,17 @@ function collectTempScope() {
                 }
                 return item;
             });
-        // A single-vault file/folder restriction attaches scope_ids to that vault's entry. Only when
+        // A single-Standard-vault file/folder restriction attaches scope_ids to that vault's entry. Only when
         // at least one file/folder is chosen — an empty {files:[],folders:[]} means deny-all on the
         // server, so "restrict enabled but nothing picked" is treated as whole-vault (scope omitted).
         const restrictEnable = document.getElementById('tc-restrict-enable');
+        const restrictEntry = selected_vaults.length === 1 ? selected_vaults[0] : null;
+        const restrictVault = restrictEntry ? _tcVaultObjs[restrictEntry.vault_id] : null;
         if (restrictEnable && restrictEnable.checked && _tcRestrict.vaultId
+            && restrictEntry && restrictEntry.vault_id === _tcRestrict.vaultId
+            && restrictVault && restrictVault.type === 'standard'
             && (_tcRestrict.files.size + _tcRestrict.folders.size) > 0) {
-            const entry = selected_vaults.find(sv => sv.vault_id === _tcRestrict.vaultId);
-            if (entry) entry.scope_ids = {
+            restrictEntry.scope_ids = {
                 files: Array.from(_tcRestrict.files),
                 folders: Array.from(_tcRestrict.folders),
             };
@@ -7060,6 +7076,61 @@ function setZkIdleLockMinutes(n) {
 
 function isZkVault(v) { return !!v && v.type === 'zero_knowledge'; }
 
+// Replace the stored private-key envelope, proving we hold the CURRENTLY REGISTERED key.
+//
+// Without this proof any session for the account could overwrite the envelope and permanently
+// destroy access to every vault: registration refuses a second keypair, and removing the first
+// would orphan every wrapped key. See docs/design/vault-private-key-update-pop-v1.md.
+//
+// `privateKey` must be the key just recovered on this path - which is by definition the
+// registered one, because both callers verify it against the registered public key first.
+async function zkPutPrivateEnvelope(envelope, privateKey, registeredPublicKeyPem, userId,
+                                    newPassphrase, expectedPem) {
+    const body = JSON.stringify(envelope);
+    // Read the re-wrapped envelope back and confirm it really recovers the same key BEFORE
+    // replacing the only copy, and before spending one of the few challenges the rate budget
+    // allows. The server cannot do this check - it cannot read the envelope - so a client bug
+    // that produced an undecryptable blob would otherwise look exactly like a correct one, and
+    // would be discovered at the next unlock, when it is too late.
+    let readBack = null;
+    try {
+        readBack = await eccLib().decryptPrivateEnvelope(body, newPassphrase);
+    } catch (e) {
+        console.error('Re-wrapped key failed its own read-back:', e);
+    }
+    if (readBack !== expectedPem) {
+        throw new Error('Internal error preparing the new encryption key — nothing was changed.');
+    }
+    const challenge = await apiRequest('/ecc/keys/private/challenge', { method: 'POST' });
+    const mac = await eccLib().computeKeyUpdatePoP(
+        challenge.server_ephemeral_public_key, challenge.nonce, challenge.challenge_id,
+        userId, registeredPublicKeyPem, body, privateKey
+    );
+    await apiRequest('/ecc/keys/private', {
+        method: 'PUT',
+        body: JSON.stringify({
+            encrypted_private_key: body,
+            pop: { challenge_id: challenge.challenge_id, mac },
+        }),
+    });
+}
+
+// The single writer for every private-key envelope this app produces: first registration,
+// passphrase change, recovery-kit export and recovery restore.
+//
+// It emits the versioned v1 shape only when the deployment has switched the writer on, and the
+// legacy shape otherwise. Readers accept both either way, which is what lets readers roll out
+// everywhere before any writer produces bytes an older client cannot read. Enabling v1 is
+// FORWARD-ONLY for a deployment: once a v1 envelope exists, rolling the image back to a reader
+// that predates it makes that envelope unreadable, and registration refuses a second keypair so
+// there is no self-service recovery. See docs/design/vault-private-key-envelope-v1.md §8.1.
+async function zkWrapPrivateKey(pem, passphrase) {
+    const lib = eccLib();
+    return lib.PRIV_ENVELOPE_WRITE_V1
+        ? await lib.encryptPrivateKeyV1(pem, passphrase)
+        : await lib.encryptPrivateKey(pem, passphrase);
+}
+
 // Unlock the user's ECC private key into memory (prompts for the passphrase once
 // per session). Returns the CryptoKey.
 async function zkEnsureUnlocked() {
@@ -7068,12 +7139,16 @@ async function zkEnsureUnlocked() {
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) {
         throw new Error('No encryption key is set up for your account.');
     }
-    let bundle;
-    try { bundle = JSON.parse(priv.encrypted_private_key); }
-    catch (_) { throw new Error('Stored encryption key is in an unexpected format.'); }
-    if (!bundle || !bundle.encrypted || !bundle.salt) {
+    // Validate shape and bounds BEFORE asking for a passphrase, so a corrupt or hostile blob
+    // fails immediately rather than after the user has typed one. Accepts legacy and v1 alike.
+    try {
+        eccLib().parsePrivateEnvelope(priv.encrypted_private_key);
+    } catch (_) {
         throw new Error('Stored encryption key is incomplete or corrupt — re-register your key.');
     }
+    // The registered public key, for the consistency check below. Fetched before the prompt so a
+    // server that cannot supply it fails the unlock early rather than after the passphrase.
+    const pub = await apiRequest('/ecc/keys/public', { silent: true });
     const pass = await showPrompt(
         'Enter your encryption passphrase to unlock zero-knowledge vaults.',
         'Unlock encryption key', { password: true }
@@ -7081,12 +7156,25 @@ async function zkEnsureUnlocked() {
     if (pass === null) throw new Error('Unlock cancelled.');
     let pem;
     try {
-        pem = await eccLib().decryptPrivateKey(bundle.encrypted, pass, bundle.salt, bundle.iterations);
+        pem = await eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, pass);
     } catch (e) {
         // AES-GCM auth failure is indistinguishable from a wrong key, but log the
         // real cause so genuine corruption / unavailable-WebCrypto isn't masked.
         console.error('Private-key unlock failed:', e);
         throw new Error('Incorrect passphrase (or the stored key is corrupt).');
+    }
+    // Decrypting proves the passphrase; it does not prove this is the ACCOUNT's key. Compare the
+    // recovered key with the registered public key as canonical raw points, and FAIL CLOSED when
+    // the comparison cannot be made — treating "cannot check" as "passed" would make this
+    // optional in exactly the circumstances an attacker controls. Nothing is cached until it does.
+    const consistent = await eccLib().privateKeyMatchesRegisteredPublicKey(
+        pem, pub && pub.public_key
+    );
+    if (!consistent) {
+        throw new Error(
+            'The stored encryption key does not match this account’s registered public key. ' +
+            'This is not a passphrase problem — nothing has been unlocked.'
+        );
     }
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);  // non-extractable runtime key
     zkArmIdleLock();  // start the inactivity auto-lock countdown now a key is in memory
@@ -7126,7 +7214,7 @@ async function zkRegisterNewKeypair() {
     const kp = await lib.generateKeypair();
     const publicPem = await lib.exportPublicKeyPEM(kp.publicKey);
     const privatePem = await lib.exportPrivateKeyPEM(kp.privateKey);
-    const enc = await lib.encryptPrivateKey(privatePem, pass);  // {encrypted, salt, iterations}
+    const enc = await zkWrapPrivateKey(privatePem, pass);  // legacy shape, or v1 when enabled
     // Proof-of-possession: prove we hold this key's private half (ECDH key-confirmation) so the
     // server won't accept a substituted/unheld public key.
     const challenge = await apiRequest('/ecc/keys/register/challenge', { method: 'POST' });
@@ -7139,8 +7227,6 @@ async function zkRegisterNewKeypair() {
             // Pack salt+iterations into the opaque blob so a later session can
             // decrypt it; the server stores this verbatim and cannot read it.
             encrypted_private_key: JSON.stringify(enc),
-            key_salt: enc.salt,
-            key_iterations: enc.iterations,
             pop: { challenge_id: challenge.challenge_id, mac },
         }),
     });
@@ -7160,20 +7246,25 @@ async function zkChangePassphrase() {
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) {
         throw new Error('No encryption key is set up for your account.');
     }
-    let bundle;
-    try { bundle = JSON.parse(priv.encrypted_private_key); }
-    catch (_) { throw new Error('Stored encryption key is in an unexpected format.'); }
-    if (!bundle || !bundle.encrypted || !bundle.salt) {
+    try {
+        eccLib().parsePrivateEnvelope(priv.encrypted_private_key);
+    } catch (_) {
         throw new Error('Stored encryption key is incomplete or corrupt.');
     }
     const current = await showPrompt('Enter your CURRENT encryption passphrase.', 'Change passphrase', { password: true });
     if (current === null) throw new Error('Cancelled.');
     let pem;
     try {
-        pem = await eccLib().decryptPrivateKey(bundle.encrypted, current, bundle.salt, bundle.iterations);
+        pem = await eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, current);
     } catch (e) {
         console.error('Passphrase-change unlock failed:', e);
         throw new Error('Incorrect current passphrase (or the stored key is corrupt).');
+    }
+    // Re-wrapping replaces the account's only copy, so confirm this really is the account's key
+    // before writing over it. Fails closed.
+    const pubForChange = await apiRequest('/ecc/keys/public', { silent: true });
+    if (!await eccLib().privateKeyMatchesRegisteredPublicKey(pem, pubForChange && pubForChange.public_key)) {
+        throw new Error('The stored key does not match this account’s registered public key; passphrase not changed.');
     }
     const next = await showPrompt('Enter a NEW passphrase. It protects your key and CANNOT be recovered if lost.', 'New passphrase', { password: true });
     if (next === null) throw new Error('Cancelled.');
@@ -7182,11 +7273,12 @@ async function zkChangePassphrase() {
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== next) throw new Error('Passphrases do not match.');
 
-    const enc = await eccLib().encryptPrivateKey(pem, next);  // {encrypted, salt, iterations}
-    await apiRequest('/ecc/keys/private', {
-        method: 'PUT',
-        body: JSON.stringify({ encrypted_private_key: JSON.stringify(enc) }),
-    });
+    const enc = await zkWrapPrivateKey(pem, next);  // legacy shape, or v1 when enabled
+    // Re-wrapping replaces the account's only copy, so prove possession of the registered key.
+    // `pem` was already checked against that key above, so it can answer the challenge.
+    const provingKey = await eccLib().importPrivateKeyPEM(pem, false);
+    await zkPutPrivateEnvelope(enc, provingKey, pubForChange.public_key,
+                               pubForChange.user_id, next, pem);
     // Keep a NON-extractable runtime copy so the session stays unlocked with the same key.
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
     zkArmIdleLock();
@@ -7200,15 +7292,24 @@ async function zkChangePassphrase() {
 async function zkExportRecoveryKey() {
     const priv = await apiRequest('/ecc/keys/private', { silent: true });
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) throw new Error('No encryption key is set up for your account.');
-    let bundle;
-    try { bundle = JSON.parse(priv.encrypted_private_key); }
-    catch (_) { throw new Error('Stored encryption key is in an unexpected format.'); }
-    if (!bundle || !bundle.encrypted || !bundle.salt) throw new Error('Stored encryption key is incomplete or corrupt.');
+    try {
+        eccLib().parsePrivateEnvelope(priv.encrypted_private_key);
+    } catch (_) {
+        throw new Error('Stored encryption key is incomplete or corrupt.');
+    }
     const current = await showPrompt('Enter your CURRENT encryption passphrase to export a recovery key.', 'Export recovery key', { password: true });
     if (current === null) throw new Error('Cancelled.');
     let pem;
-    try { pem = await eccLib().decryptPrivateKey(bundle.encrypted, current, bundle.salt, bundle.iterations); }
+    try { pem = await eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, current); }
     catch (e) { console.error('Recovery export unlock failed:', e); throw new Error('Incorrect current passphrase (or the stored key is corrupt).'); }
+    // Not required by the consistency rule, which scopes the check to paths that CACHE a key or
+    // replace the stored one. Done anyway because a kit minted from a key that does not match the
+    // account is useless, and catching it here turns an unrecoverable surprise at restore into a
+    // recoverable error at export.
+    const pubForExport = await apiRequest('/ecc/keys/public', { silent: true });
+    if (!await eccLib().privateKeyMatchesRegisteredPublicKey(pem, pubForExport && pubForExport.public_key)) {
+        throw new Error('The stored key does not match this account’s registered public key; no recovery key was written.');
+    }
     const rec = await showPrompt('Choose a RECOVERY passphrase. Store it somewhere safe and SEPARATE from your normal passphrase — it protects the recovery key you are about to download.', 'Recovery passphrase', { password: true });
     if (rec === null) throw new Error('Cancelled.');
     if (!rec || rec.length < 8) throw new Error('Recovery passphrase must be at least 8 characters.');
@@ -7216,14 +7317,20 @@ async function zkExportRecoveryKey() {
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== rec) throw new Error('Passphrases do not match.');
 
-    const enc = await eccLib().encryptPrivateKey(pem, rec);  // {encrypted, salt, iterations}
-    const pub = await apiRequest('/ecc/keys/public', { silent: true });
+    const enc = await zkWrapPrivateKey(pem, rec);  // legacy shape, or v1 when enabled
+    // Reuse the response fetched above rather than asking again. The read is not free (it stamps
+    // last_used and commits), and reusing it guarantees the kit records the very public key the
+    // private key was just checked against, rather than a second read that could disagree with
+    // the one the check passed on.
     const kit = {
         type: 'dockvault-zk-recovery-key',
         version: 1,
-        user_id: (typeof currentUser !== 'undefined' && currentUser && currentUser.id) || null,
-        fingerprint: (pub && pub.fingerprint) || null,
-        public_key: (pub && pub.public_key) || null,   // to verify the kit matches this account on restore
+        // Server-sourced, for the same reason the proof transcripts are: currentUser is hydrated
+        // from localStorage, whose loader tolerates corrupt data, and a kit stamped with the wrong
+        // account is precisely the unrecoverable surprise the check above exists to prevent.
+        user_id: (pubForExport && pubForExport.user_id) || null,
+        fingerprint: (pubForExport && pubForExport.fingerprint) || null,
+        public_key: (pubForExport && pubForExport.public_key) || null,  // verified on restore
         recovery: enc,
     };
     const blob = new Blob([JSON.stringify(kit, null, 2)], { type: 'application/json' });
@@ -7242,12 +7349,12 @@ async function zkExportRecoveryKey() {
 // re-wrap it under a NEW main passphrase, and store it (PUT /ecc/keys/private). Used when the main
 // passphrase was lost. Throws Error('Cancelled.') on back-out.
 async function zkRestoreFromRecoveryKey(kitText) {
+    // This file is the only fully attacker-supplied envelope the app reads, so the wrapper AND
+    // the envelope inside it are bounded here — before the passphrase prompt and before any key
+    // derivation. See docs/design/vault-private-key-envelope-v1.md §1.1.
     let kit;
-    try { kit = JSON.parse(kitText); }
-    catch (_) { throw new Error('That file is not a valid recovery key.'); }
-    if (!kit || kit.type !== 'dockvault-zk-recovery-key' || !kit.recovery || !kit.recovery.encrypted) {
-        throw new Error('That file is not a DockVault recovery key.');
-    }
+    try { kit = eccLib().parseRecoveryKitFile(kitText).kit; }
+    catch (_) { throw new Error('That file is not a valid DockVault recovery key.'); }
     const pub = await apiRequest('/ecc/keys/public', { silent: true });
     if (!pub || !pub.has_keypair || !pub.public_key) throw new Error('This account has no encryption key to restore.');
     // Fast pre-check on the kit's ASSERTED public key (untrusted metadata — a nicety so an
@@ -7258,16 +7365,21 @@ async function zkRestoreFromRecoveryKey(kitText) {
     const rec = await showPrompt('Enter the RECOVERY passphrase for this recovery key.', 'Restore access', { password: true });
     if (rec === null) throw new Error('Cancelled.');
     let pem;
-    try { pem = await eccLib().decryptPrivateKey(kit.recovery.encrypted, rec, kit.recovery.salt, kit.recovery.iterations); }
+    try { pem = await eccLib().decryptPrivateEnvelope(kit.recovery, rec); }
     catch (e) { console.error('Recovery restore decrypt failed:', e); throw new Error('Incorrect recovery passphrase (or the recovery key is corrupt).'); }
     // SECURITY: verify the DECRYPTED private key actually matches this account's registered public
     // key. The kit's asserted public_key is untrusted metadata (a corrupt/forged/null-public_key
     // kit could carry a different private key), so derive the public key FROM the private key and
     // compare — adopting a mismatched key would silently orphan every wrapped DEK (permanent lockout).
-    let derivedPub;
-    try { derivedPub = await eccLib().derivePublicKeyPEMFromPrivatePEM(pem); }
+    // Corruptness first, so a structurally invalid key reports as corrupt rather than as a
+    // mismatch — they send the user to different remedies.
+    try { await eccLib().derivePublicKeyPEMFromPrivatePEM(pem); }
     catch (e) { console.error('Recovery key derive failed:', e); throw new Error('The recovery key is corrupt or not a valid key.'); }
-    if (derivedPub.trim() !== pub.public_key.trim()) {
+    // Compare as canonical raw points, not as PEM text. A string comparison reports a mismatch
+    // between two encodings of the SAME key — line endings, wrap width, a trailing newline — and
+    // this is the one path reached only after the main passphrase is already lost, so a false
+    // mismatch here has no way back.
+    if (!await eccLib().privateKeyMatchesRegisteredPublicKey(pem, pub.public_key)) {
         throw new Error("This recovery key does not match your account's encryption key and cannot be restored.");
     }
     const next = await showPrompt('Set a NEW encryption passphrase. It replaces your forgotten one and CANNOT be recovered if lost.', 'New passphrase', { password: true });
@@ -7277,26 +7389,41 @@ async function zkRestoreFromRecoveryKey(kitText) {
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== next) throw new Error('Passphrases do not match.');
 
-    const enc = await eccLib().encryptPrivateKey(pem, next);
-    await apiRequest('/ecc/keys/private', { method: 'PUT', body: JSON.stringify({ encrypted_private_key: JSON.stringify(enc) }) });
+    const enc = await zkWrapPrivateKey(pem, next);
+    // Recovery works precisely because a valid kit reconstructs the SAME key: the key recovered
+    // above is the registered one (verified against it), so it can answer the challenge.
+    const recoveredKey = await eccLib().importPrivateKeyPEM(pem, false);
+    await zkPutPrivateEnvelope(enc, recoveredKey, pub.public_key,
+                               pub.user_id, next, pem);
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
     zkArmIdleLock();
 }
 
-// Ensure the user has an ECC keypair: create + register one (first time) or just
-// unlock the existing one. Leaves the private key unlocked in memory.
-async function zkEnsureKeypair() {
+// Return the server-authoritative public identity key needed to create a zero-knowledge vault.
+// An existing keypair is deliberately PUBLIC-ONLY here: vault creation mints a fresh DEK and
+// wraps it to this key, so fetching or unlocking the private identity envelope would add exposure
+// without granting any capability the operation needs. First registration remains interactive.
+async function zkEnsurePublicKeyForCreate() {
     const pub = await apiRequest('/ecc/keys/public', { silent: true });
-    if (pub && pub.has_keypair) { await zkEnsureUnlocked(); return; }
+    if (pub && pub.has_keypair) {
+        if (!pub.public_key) throw new Error('Your public key is unavailable.');
+        return pub.public_key;
+    }
     try {
         await zkRegisterNewKeypair();
     } catch (e) {
-        // Race: a keypair appeared (another tab/device) between the has_keypair
-        // check and our register, so the server refused to overwrite (409). Unlock
-        // the existing one instead of failing.
-        if (e && e.status === 409) { await zkEnsureUnlocked(); return; }
-        throw e;
+        // Race: another tab/device registered first after our initial lookup. The losing browser
+        // must discard its unregistered key and use the winner's public key; it must not fetch the
+        // winner's encrypted private envelope or ask for that unrelated passphrase.
+        if (!(e && e.status === 409)) throw e;
     }
+    // Refetch after either successful registration or a 409 race. Returning the locally generated
+    // PEM would be wrong in the race and would wrap the new vault to an unregistered, unusable key.
+    const registered = await apiRequest('/ecc/keys/public', { silent: true });
+    if (!registered || !registered.has_keypair || !registered.public_key) {
+        throw new Error('Your registered public key is unavailable.');
+    }
+    return registered.public_key;
 }
 
 // --- Standalone "set up my encryption key" (account-level, profile menu) ------

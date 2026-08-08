@@ -1,0 +1,17 @@
+{
+  "schema": "dockvault-crypto-manifest-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "release": "v0.10.0",
+  "commit": "1a1b8fa9e1e80ca78d9a4154cfdb391f3f3c53a8",
+  "vectors": [
+    {"path": "standard-0x10.json", "sha256": "0d3e377111226a83c425c138cb294c7093a73ba12849ff93c24177d6b73186bf"},
+    {"path": "standard-fernet-chunk-stream.json", "sha256": "b789dcd203996f2720746aaf5e490b8993ed6ae01ac0e656aae017004157b515"},
+    {"path": "zk-content-unversioned.json", "sha256": "96ec1468bf7966dd5b6dcffdfb8666f7b45b51865ed0c29311e438fe120f1864"},
+    {"path": "zk-direct-dek-wrap-legacy.json", "sha256": "a45520e7b8af9c77fcffdeb429732f4469e989515af2e319991e16d954b932b1"},
+    {"path": "zk-name-zk1.json", "sha256": "850e1586df45376532baaa0411f3bfa9d05436e950ecf60f43b0d7f0c73c0218"},
+    {"path": "zk-name-zk2.json", "sha256": "6188e1df8c18031d10d19bb64fd8c588b309cf4deb523a52d4c70f597a5b2d14"},
+    {"path": "zk-private-envelope-legacy.json", "sha256": "294c4b76f21b8153fa8d729cce5f06367b7268e16a9eb3e9fbf78be7263f9428"},
+    {"path": "zk-team-private-wrap-v1.json", "sha256": "d04f4d88f6b0cae514f43ba176c4949753325d472d9b8b4561b7b07bb2e2ed48"}
+  ]
+}

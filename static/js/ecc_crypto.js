@@ -37,6 +37,31 @@ class ECCCryptoLibrary {
         // Key wrapping
         this.HKDF_INFO = new TextEncoder().encode('vault-key-wrapping');
 
+        // --- Versioned private-key envelope. The v1 grammar, its bounds and its authenticated
+        // transcript are frozen by docs/design/vault-private-key-envelope-v1.md. Change that
+        // document first; these constants only mirror it.
+        this.PRIV_ENVELOPE_VERSION = 1;
+        this.PRIV_ENVELOPE_KDF = 'PBKDF2-SHA256';
+        this.PRIV_ENVELOPE_CIPHER = 'AES-256-GCM';
+        this.PRIV_ENVELOPE_AAD_LABEL = 'dockvault-private-key-envelope-v1';
+        // Denial-of-service ceiling, applied to BOTH formats because any envelope may arrive from
+        // an untrusted file. There is deliberately NO policy floor: a read-side floor protects
+        // nothing (a forged envelope cannot authenticate at any work factor) while rejecting a
+        // genuine one is unrecoverable — registration refuses a second keypair, and removing the
+        // first would orphan every vault wrap.
+        this.PRIV_ENVELOPE_MAX_ITER = 10000000;
+        this.PRIV_ENVELOPE_MAX_SERIALIZED = 16384;
+        this.PRIV_ENVELOPE_MAX_CT = 8192;
+        this.PRIV_ENVELOPE_MIN_CT = 17;   // one plaintext byte plus the 16-byte tag
+        this.RECOVERY_KIT_TYPE = 'dockvault-zk-recovery-key';
+        this.RECOVERY_KIT_MAX_FILE = 65536;
+        this.RECOVERY_KIT_MAX_FIELD = 4096;
+        // The v1 WRITER is off by default; readers accept v1 regardless, which is what makes a
+        // readers-first rollout possible. Enabling the writer is a forward-only decision for a
+        // deployment: once a v1 envelope exists, an image whose reader predates v1 cannot read it
+        // and there is no self-service recovery.
+        this.PRIV_ENVELOPE_WRITE_V1 = false;
+
         // Verbose per-operation logging — off in production (flip to debug).
         this.DEBUG = false;
         if (this.DEBUG) console.log('🔐 ECC Crypto Library initialized (P-384)');
@@ -289,6 +314,329 @@ class ECCCryptoLibrary {
     }
     
     // =========================================================================
+    // VERSIONED PRIVATE-KEY ENVELOPE (v1)
+    //
+    // Specified by docs/design/vault-private-key-envelope-v1.md. Two shapes are readable:
+    //   legacy  {encrypted: b64(iv12||ct||tag16), salt: b64(32), iterations?}   - no AAD
+    //   v1      {v,kdf,iter,cipher,salt,iv,ct}                                  - AAD-bound
+    // encryptPrivateKey()/decryptPrivateKey() above are the LEGACY pair and are deliberately
+    // left untouched: a pinned writer vector asserts they still emit exactly the published bytes.
+    // =========================================================================
+
+    /**
+     * UTF-8 byte length of a string.
+     *
+     * Both designs specify their size caps in BYTES, and the server measures bytes. A plain
+     * `.length` counts UTF-16 code units, which is up to three times smaller for a character in
+     * the U+0800-U+FFFF range -- so a code-unit check silently admits payloads well past the
+     * documented bound, and the client and server would disagree about the same blob.
+     * @private
+     */
+    _utf8Len(value) {
+        return new TextEncoder().encode(String(value)).byteLength;
+    }
+
+    /**
+     * Decode canonical standard base64, or throw. Rejects the URL-safe alphabet, whitespace,
+     * bad padding, and any string that decodes but is not the canonical encoding of its own
+     * bytes. Optionally pins the decoded length.
+     * @private
+     */
+    _b64Strict(value, field, expectedBytes = null) {
+        if (typeof value !== 'string') throw new Error(`envelope ${field}: not a string`);
+        if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value) || value.length % 4 !== 0) {
+            throw new Error(`envelope ${field}: not canonical base64`);
+        }
+        let bytes;
+        try {
+            bytes = new Uint8Array(this._base64ToArrayBuffer(value));
+        } catch (e) {
+            throw new Error(`envelope ${field}: not decodable`);
+        }
+        // Re-encoding catches non-canonical trailing bits, which the charset test cannot.
+        if (this._arrayBufferToBase64(bytes) !== value) {
+            throw new Error(`envelope ${field}: not canonical base64`);
+        }
+        if (expectedBytes !== null && bytes.length !== expectedBytes) {
+            throw new Error(`envelope ${field}: expected ${expectedBytes} bytes`);
+        }
+        return bytes;
+    }
+
+    /**
+     * The v1 AES-GCM additional authenticated data.
+     *
+     * This provides VERSION AND FORMAT domain separation - it stops a v1 ciphertext being
+     * repackaged into the legacy shape, which derives the same key from the same salt and
+     * iterations but authenticates nothing. It does NOT add substitution resistance for the
+     * salt or the work factor: both are PBKDF2 inputs, so tampering with either already yields
+     * a different key and a failing tag. The cheap-rejection property comes from the validation
+     * below, never from this.
+     * @private
+     */
+    _privEnvelopeAAD(iter, saltB64) {
+        return new TextEncoder().encode(
+            `${this.PRIV_ENVELOPE_AAD_LABEL}|${this.PRIV_ENVELOPE_KDF}|${iter}|` +
+            `${this.PRIV_ENVELOPE_CIPHER}|${saltB64}`
+        );
+    }
+
+    /** A JSON integer, not merely a number that happens to be whole. @private */
+    _isInt(n) {
+        return typeof n === 'number' && Number.isInteger(n);
+    }
+
+    /**
+     * Parse and fully validate an envelope, WITHOUT deriving anything. Every check here is
+     * cheap, so a malformed or hostile envelope costs nothing - which is the point, since a
+     * recovery kit's fields come from a file the user selected.
+     *
+     * @param {object|string} raw - the envelope object, or the JSON string holding it
+     * @returns {{format: 'v1'|'legacy', iter: number, salt: Uint8Array, iv: Uint8Array,
+     *            ct: Uint8Array, aad: Uint8Array|null}}
+     */
+    parsePrivateEnvelope(raw) {
+        let obj = raw;
+        if (typeof raw === 'string') {
+            // Bound before parsing: this cap applies to BOTH shapes, being a denial-of-service
+            // bound of the same kind as the iteration ceiling. A genuine legacy envelope is
+            // ~534 bytes, so it cannot reject a real one.
+            if (this._utf8Len(raw) > this.PRIV_ENVELOPE_MAX_SERIALIZED) {
+                throw new Error('envelope: too large');
+            }
+            try { obj = JSON.parse(raw); } catch (e) { throw new Error('envelope: not JSON'); }
+        }
+        if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
+            throw new Error('envelope: not an object');
+        }
+        if (typeof raw !== 'string' &&
+            this._utf8Len(JSON.stringify(obj)) > this.PRIV_ENVELOPE_MAX_SERIALIZED) {
+            throw new Error('envelope: too large');
+        }
+
+        if (Object.prototype.hasOwnProperty.call(obj, 'v')) return this._parseV1(obj);
+        if (Object.prototype.hasOwnProperty.call(obj, 'encrypted') &&
+            Object.prototype.hasOwnProperty.call(obj, 'salt')) {
+            return this._parseLegacy(obj);
+        }
+        throw new Error('envelope: unrecognized shape');
+    }
+
+    /** @private */
+    _parseV1(obj) {
+        const allowed = ['v', 'kdf', 'iter', 'cipher', 'salt', 'iv', 'ct'];
+        const keys = Object.keys(obj);
+        if (keys.length !== allowed.length || !allowed.every(k => keys.includes(k))) {
+            throw new Error('envelope: v1 field set mismatch');
+        }
+        if (obj.v !== this.PRIV_ENVELOPE_VERSION) throw new Error('envelope: unknown version');
+        if (obj.kdf !== this.PRIV_ENVELOPE_KDF) throw new Error('envelope: unknown kdf');
+        if (obj.cipher !== this.PRIV_ENVELOPE_CIPHER) throw new Error('envelope: unknown cipher');
+        if (!this._isInt(obj.iter) || obj.iter < 1 || obj.iter > this.PRIV_ENVELOPE_MAX_ITER) {
+            throw new Error('envelope: work factor out of range');
+        }
+        const salt = this._b64Strict(obj.salt, 'salt', this.PBKDF2_SALT_LENGTH);
+        const iv = this._b64Strict(obj.iv, 'iv', this.AES_IV_LENGTH);
+        const ct = this._b64Strict(obj.ct, 'ct');
+        if (ct.length < this.PRIV_ENVELOPE_MIN_CT || ct.length > this.PRIV_ENVELOPE_MAX_CT) {
+            throw new Error('envelope: ciphertext length out of range');
+        }
+        return {
+            format: 'v1', iter: obj.iter, salt, iv, ct,
+            aad: this._privEnvelopeAAD(obj.iter, obj.salt),
+        };
+    }
+
+    /**
+     * Legacy parsing stays exactly as permissive as the original reader, with two additions -
+     * the iteration ceiling and the serialized size cap, both denial-of-service bounds that any
+     * untrusted file can trip. Encoding strictness and length rules are v1-only ON PURPOSE:
+     * tightening a deployed format can only reject envelopes that work today.
+     * @private
+     */
+    _parseLegacy(obj) {
+        let iter = obj.iterations;
+        if (iter === undefined || iter === null || iter === '') {
+            iter = this.PBKDF2_ITERATIONS;
+        }
+        iter = Number(iter);
+        // A non-numeric value keeps its historical lenient treatment: fall back rather than
+        // reject. It simply derives the wrong key and fails authentication.
+        if (!Number.isFinite(iter) || iter < 1) iter = this.PBKDF2_ITERATIONS;
+        if (iter > this.PRIV_ENVELOPE_MAX_ITER) throw new Error('envelope: work factor too large');
+
+        const combined = new Uint8Array(this._base64ToArrayBuffer(obj.encrypted));
+        const salt = new Uint8Array(this._base64ToArrayBuffer(obj.salt));
+        return {
+            format: 'legacy', iter,
+            salt,
+            iv: combined.slice(0, this.AES_IV_LENGTH),
+            ct: combined.slice(this.AES_IV_LENGTH),
+            aad: null,
+        };
+    }
+
+    /**
+     * Write a v1 envelope. A fresh salt and IV are drawn per write and are never carried
+     * forward from a previous envelope - the re-wrap paths hold the old values, and reusing an
+     * IV under a derived key over this highly structured PEM plaintext would leak it.
+     *
+     * @param {string} privateKeyPEM
+     * @param {string} password
+     * @returns {Promise<object>} the v1 envelope object
+     */
+    async encryptPrivateKeyV1(privateKeyPEM, password) {
+        const salt = window.crypto.getRandomValues(new Uint8Array(this.PBKDF2_SALT_LENGTH));
+        const iv = window.crypto.getRandomValues(new Uint8Array(this.AES_IV_LENGTH));
+        const saltB64 = this._arrayBufferToBase64(salt);
+        const iter = this.PBKDF2_ITERATIONS;
+
+        const key = await this._deriveKeyFromPassword(password, salt, iter);
+        const ct = await window.crypto.subtle.encrypt(
+            {
+                name: this.AES_ALGORITHM,
+                iv,
+                tagLength: this.AES_TAG_LENGTH,
+                additionalData: this._privEnvelopeAAD(iter, saltB64),
+            },
+            key,
+            new TextEncoder().encode(privateKeyPEM)
+        );
+
+        return {
+            v: this.PRIV_ENVELOPE_VERSION,
+            kdf: this.PRIV_ENVELOPE_KDF,
+            iter,
+            cipher: this.PRIV_ENVELOPE_CIPHER,
+            salt: saltB64,
+            iv: this._arrayBufferToBase64(iv),
+            ct: this._arrayBufferToBase64(new Uint8Array(ct)),
+        };
+    }
+
+    /**
+     * Read either envelope shape. This is the single reader every unlock path should use.
+     *
+     * @param {object|string} envelope
+     * @param {string} password
+     * @returns {Promise<string>} the PKCS#8 PEM private key
+     */
+    async decryptPrivateEnvelope(envelope, password) {
+        const p = this.parsePrivateEnvelope(envelope);
+        const key = await this._deriveKeyFromPassword(password, p.salt, p.iter);
+        const params = { name: this.AES_ALGORITHM, iv: p.iv, tagLength: this.AES_TAG_LENGTH };
+        if (p.aad) params.additionalData = p.aad;
+        let plain;
+        try {
+            plain = await window.crypto.subtle.decrypt(params, key, p.ct);
+        } catch (e) {
+            // Wrong passphrase and tampered ciphertext are one outcome and are reported
+            // identically. The platform exception is not propagated: it is not ours to vouch for.
+            throw new Error('envelope: authentication failed');
+        }
+        return new TextDecoder().decode(plain);
+    }
+
+    /**
+     * Parse a recovery-kit FILE and return the envelope it carries. The kit is a wrapper around
+     * an envelope, not an envelope, and on restore every one of its fields comes from a file the
+     * user selected - so the wrapper needs bounds of its own.
+     *
+     * @param {string} text - the raw file contents
+     * @returns {{kit: object, envelope: object}}
+     */
+    parseRecoveryKitFile(text) {
+        if (typeof text !== 'string') throw new Error('recovery kit: not text');
+        if (this._utf8Len(text) > this.RECOVERY_KIT_MAX_FILE) throw new Error('recovery kit: too large');
+        let kit;
+        try { kit = JSON.parse(text); } catch (e) { throw new Error('recovery kit: not JSON'); }
+        if (kit === null || typeof kit !== 'object' || Array.isArray(kit)) {
+            throw new Error('recovery kit: not an object');
+        }
+        if (kit.type !== this.RECOVERY_KIT_TYPE) throw new Error('recovery kit: wrong type');
+        if (kit.version !== 1) throw new Error('recovery kit: unknown version');
+        for (const f of ['user_id', 'fingerprint', 'public_key']) {
+            const v = kit[f];
+            if (v === null || v === undefined) continue;
+            if (typeof v !== 'string' || this._utf8Len(v) > this.RECOVERY_KIT_MAX_FIELD) {
+                throw new Error(`recovery kit: ${f} invalid`);
+            }
+        }
+        if (kit.recovery === null || typeof kit.recovery !== 'object') {
+            throw new Error('recovery kit: missing envelope');
+        }
+        // Unknown wrapper members are ignored on purpose, so a future field does not break an
+        // older reader. That is the opposite of the envelope itself, where an extra member is a
+        // structural error.
+        this.parsePrivateEnvelope(kit.recovery);
+        return { kit, envelope: kit.recovery };
+    }
+
+    /**
+     * The raw uncompressed P-384 point (97 bytes: 0x04 || X || Y) of a public key.
+     * Exporting to a point is what makes a comparison canonical - it normalises away PEM line
+     * wrapping, whitespace, trailing newlines, base64 padding and SPKI header encoding, none of
+     * which are key material.
+     * @private
+     */
+    async _rawPointFromPublicPEM(pem) {
+        const key = await this.importPublicKeyPEM(pem);
+        return new Uint8Array(await window.crypto.subtle.exportKey('raw', key));
+    }
+
+    /**
+     * The raw uncompressed public point belonging to a private key. WebCrypto cannot derive a
+     * public key from a private one directly, so this goes via JWK: export, drop the private
+     * component, re-import the remainder as a public key. The extractable import is used only
+     * here and the handle is discarded.
+     * @private
+     */
+    async _rawPointFromPrivatePEM(pem) {
+        const priv = await this.importPrivateKeyPEM(pem, true);
+        const jwk = await window.crypto.subtle.exportKey('jwk', priv);
+        delete jwk.d;
+        jwk.key_ops = [];
+        delete jwk.ext;
+        const pub = await window.crypto.subtle.importKey(
+            'jwk', jwk, { name: 'ECDH', namedCurve: this.CURVE }, true, []
+        );
+        return new Uint8Array(await window.crypto.subtle.exportKey('raw', pub));
+    }
+
+    /**
+     * Does this private key belong to this registered public key?
+     *
+     * Decrypting proves the passphrase was right; it does not prove the recovered key is the
+     * ACCOUNT's key. An ordinary comparison is correct here - both operands are public, so there
+     * is no secret for a timing difference to leak.
+     *
+     * FAILS CLOSED: if the registered key is absent or unusable the check cannot be performed and
+     * this returns false. Treating "cannot check" as "check passed" would make the whole thing
+     * optional in exactly the circumstances an attacker controls.
+     *
+     * The limit, honestly: this proves consistency with the public key the SERVER RETURNED. It
+     * does not defend against a server substituting both halves at once.
+     *
+     * @returns {Promise<boolean>}
+     */
+    async privateKeyMatchesRegisteredPublicKey(privateKeyPEM, registeredPublicKeyPEM) {
+        if (typeof registeredPublicKeyPEM !== 'string' || !registeredPublicKeyPEM.trim()) {
+            return false;
+        }
+        let derived, registered;
+        try {
+            derived = await this._rawPointFromPrivatePEM(privateKeyPEM);
+            registered = await this._rawPointFromPublicPEM(registeredPublicKeyPEM);
+        } catch (e) {
+            return false;
+        }
+        if (derived.length !== registered.length || derived.length === 0) return false;
+        let diff = 0;
+        for (let i = 0; i < derived.length; i++) diff |= derived[i] ^ registered[i];
+        return diff === 0;
+    }
+
+    // =========================================================================
     // VAULT DEK WRAPPING/UNWRAPPING (ECDH + AES-KW simulation)
     // =========================================================================
     
@@ -390,6 +738,76 @@ class ECCCryptoLibrary {
         msg.set(pubBytes, nonce.byteLength);
         const mac = await window.crypto.subtle.sign('HMAC', macKey, msg);
         return this._arrayBufferToBase64(mac);
+    }
+
+    /**
+     * Proof of possession for REPLACING the stored private-key envelope.
+     *
+     * Specified by docs/design/vault-private-key-update-pop-v1.md. Deliberately shares the shape
+     * of computeRegistrationPoP above but NOT its domain: a different HKDF salt and info, so a
+     * proof for one protocol can never validate for the other.
+     *
+     * The transcript binds the exact replacement bytes, so a captured proof cannot authorise a
+     * different replacement. Digests contribute 32 RAW bytes, the nonce is base64-DECODED, and
+     * both ids are lowercase canonical UUIDs — pinned so this and the server cannot drift.
+     *
+     * @param {string} serverEphemeralPublicKeyPem  from the challenge
+     * @param {string} nonceBase64                  from the challenge
+     * @param {string} challengeId                  from the challenge
+     * @param {string} userId                       this account's UUID
+     * @param {string} registeredPublicKeyPem       the account's REGISTERED public key
+     * @param {string} envelopeJson                 the exact UTF-8 string about to be uploaded
+     * @param {CryptoKey} userPrivateKey            the recovered private key (ECDH, deriveBits)
+     * @returns {Promise<string>} base64 MAC
+     */
+    async computeKeyUpdatePoP(
+        serverEphemeralPublicKeyPem, nonceBase64, challengeId, userId,
+        registeredPublicKeyPem, envelopeJson, userPrivateKey
+    ) {
+        const serverPub = await this.importPublicKeyPEM(serverEphemeralPublicKeyPem);
+        const shared = await window.crypto.subtle.deriveBits(
+            { name: 'ECDH', public: serverPub }, userPrivateKey, 384);
+        const hkdfKey = await window.crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+        const macKeyBits = await window.crypto.subtle.deriveBits(
+            {
+                name: 'HKDF', hash: 'SHA-256',
+                salt: new TextEncoder().encode('dv-ecc-update-pop-v1'),
+                info: new TextEncoder().encode('private-key-update-pop'),
+            },
+            hkdfKey, 256);
+        const macKey = await window.crypto.subtle.importKey(
+            'raw', macKeyBits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+
+        // The registered key as its canonical uncompressed point (97 bytes), NOT its PEM, so a
+        // cosmetically re-encoded stored key cannot invalidate a genuine proof.
+        const registered = await this.importPublicKeyPEM(registeredPublicKeyPem);
+        const point = new Uint8Array(await window.crypto.subtle.exportKey('raw', registered));
+
+        const enc = new TextEncoder();
+        const sha256 = async bytes =>
+            new Uint8Array(await window.crypto.subtle.digest('SHA-256', bytes));
+
+        const parts = [
+            enc.encode('dockvault-private-key-update-pop-v1'),
+            enc.encode(String(challengeId).toLowerCase()),
+            new Uint8Array(this._base64ToArrayBuffer(nonceBase64)),
+            enc.encode(String(userId).toLowerCase()),
+            await sha256(point),
+            await sha256(enc.encode(envelopeJson)),
+        ];
+        // 0x00-separated, so the concatenation is unambiguous.
+        const total = parts.reduce((n, p) => n + p.byteLength, 0) + (parts.length - 1);
+        const joined = new Uint8Array(total);
+        let at = 0;
+        parts.forEach((p, i) => {
+            if (i > 0) joined[at++] = 0x00;
+            joined.set(p, at);
+            at += p.byteLength;
+        });
+
+        const transcript = await sha256(joined);
+        return this._arrayBufferToBase64(
+            await window.crypto.subtle.sign('HMAC', macKey, transcript));
     }
 
     // =========================================================================

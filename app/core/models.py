@@ -1184,6 +1184,31 @@ class ECCRegistrationChallenge(Base):
     )
 
 
+class ECCKeyUpdateChallenge(Base):
+    """A one-time proof-of-possession challenge for REPLACING the stored private-key envelope.
+
+    Deliberately a SEPARATE table from ECCRegistrationChallenge rather than one table with a
+    purpose column: a discriminator makes cross-use one query-filter bug away, whereas two tables
+    make a registration challenge simply unreachable from the update verifier. The key-derivation
+    domain differs too, so even a misrouted row could not yield a valid MAC.
+
+    Holds the server's EPHEMERAL private key and nonce so the update endpoint can verify the
+    client's proof. Never a user key, never a DEK: transient, single-use and short-lived.
+    See app/services/ecc_update_pop.py and docs/design/vault-private-key-update-pop-v1.md.
+    """
+    __tablename__ = 'ecc_key_update_challenges'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    server_private_key = Column(Text, nullable=False)  # server ephemeral PKCS8 PEM (transient)
+    nonce = Column(Text, nullable=False)               # base64
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_ecc_update_challenge_user', 'user_id'),
+    )
+
+
 class VaultMemberKey(Base):
     """
     Stores per-member wrapped vault Data Encryption Keys (DEKs).

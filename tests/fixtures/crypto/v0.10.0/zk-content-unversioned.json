@@ -1,0 +1,22 @@
+{
+  "schema": "dockvault-crypto-vector-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "release": "v0.10.0",
+  "commit": "1a1b8fa9e1e80ca78d9a4154cfdb391f3f3c53a8",
+  "fixture_id": "zk-content-unversioned-aes-gcm",
+  "source_paths": [
+    "static/js/ecc_crypto.js"
+  ],
+  "inputs": {
+    "dek_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "plaintext_b64": "Y3J5cHRvIGNvbXBhdGliaWxpdHkgemsgY29udGVudAD/Cg==",
+    "iv_hex": "606162636465666768696a6b"
+  },
+  "encoded_b64": "YGFiY2RlZmdoaWprgebU24e/WzaWKRfdYSMREB5u73thdzPpaMjXHOq/xz2fodxCIU9o8IHxUYtHrixkUis=",
+  "expected": {
+    "plaintext_b64": "Y3J5cHRvIGNvbXBhdGliaWxpdHkgemsgY29udGVudAD/Cg==",
+    "framing": "iv12||ciphertext||tag16",
+    "aad": null
+  }
+}

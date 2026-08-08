@@ -1,0 +1,34 @@
+{
+  "schema": "dockvault-crypto-vector-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "release": "v0.10.0",
+  "commit": "1a1b8fa9e1e80ca78d9a4154cfdb391f3f3c53a8",
+  "fixture_id": "standard-fernet-legacy-multichunk",
+  "source_paths": [
+    "app/core/security.py"
+  ],
+  "inputs": {
+    "encryption_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    "chunks_b64": [
+      "bGVnYWN5LW9uZQo=",
+      "",
+      "bGVnYWN5Lc6U"
+    ],
+    "timestamps": [
+      1700000000,
+      1700000001,
+      1700000002
+    ],
+    "ivs_hex": [
+      "303132333435363738393a3b3c3d3e3f",
+      "404142434445464748494a4b4c4d4e4f",
+      "505152535455565758595a5b5c5d5e5f"
+    ]
+  },
+  "encoded_b64": "AAAAZGdBQUFBQUJsVV9FQU1ERXlNelExTmpjNE9UbzdQRDAtUDlqUW8yaEtxRGxSam1PdWoySU9ieDlxMFBIVndwMGxsX3VINUNYMGRVanVmVXQ4Rll4WHRSbl9CUlAzNWJsSzRRPT0AAABkZ0FBQUFBQmxVX0VCUUVGQ1EwUkZSa2RJU1VwTFRFMU9UN0xrRmRiNUdxbHlraXlfUWNpQm5UcVdpTGpqNGtTVF93VTN3RzFiNC0zX041X0xHMVpsOS02akVFdFpYSHg0bkE9PQAAAGRnQUFBQUFCbFVfRUNVRkZTVTFSVlZsZFlXVnBiWEYxZVgzQjFFX1cteWpsN2IzM0JoWGQ4RDNMVUxwaWxrbG5aUk8wUFU1eUVfdnEtYVBzdGE4VEMxZ2dHQTZEejZYSVdOUT09",
+  "expected": {
+    "plaintext_b64": "bGVnYWN5LW9uZQpsZWdhY3ktzpQ=",
+    "chunk_count": 3
+  }
+}

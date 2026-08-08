@@ -711,7 +711,12 @@ async def create_temp_credential_for_user(
     from app.core.models import SystemSetting
     from app.services.auth_service import user_reaches_active_zk_vault
     _pol_row = db.query(SystemSetting).filter(SystemSetting.key == "global").first()
-    if (not temp_passcode_policy.allow_zk_vaults((_pol_row.value or {}) if (_pol_row and _pol_row.value) else {})
+    # A malformed settings blob is read as an empty one rather than crashing the mint, matching
+    # the other two "global" policy reads on this path. The documented default still applies.
+    _pol_raw = _pol_row.value if _pol_row is not None else {}
+    if not isinstance(_pol_raw, dict):
+        _pol_raw = {}
+    if (not temp_passcode_policy.allow_zk_vaults(_pol_raw)
             and user_reaches_active_zk_vault(db, user_id)):
         raise HTTPException(
             status_code=400,

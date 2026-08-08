@@ -1,0 +1,12 @@
+{
+  "schema": "dockvault-crypto-manifest-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "format": "private-key update proof of possession v1",
+  "vectors": [
+    {
+      "path": "zk-key-update-pop-v1.json",
+      "sha256": "5645ab33cc57edc69a4852301270d62fb7a03e77f906906491333fe63caf423d"
+    }
+  ]
+}

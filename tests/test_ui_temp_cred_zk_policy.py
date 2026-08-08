@@ -53,6 +53,12 @@ def _zk_vault(admin):
     return v["id"]
 
 
+def _folder(admin, vault_id):
+    response = admin.post(f"/vaults/{vault_id}/folders", json={"name": _u("scope")})
+    response.raise_for_status()
+    return response.json()["folder"]
+
+
 def test_deny_greys_zk_vault_with_policy_note(page: Page, admin, admin_creds, restore_zk_policy):
     admin.put("/settings", json={"temp_cred_allow_zk_vaults": False})
     vid = _zk_vault(admin)
@@ -69,6 +75,168 @@ def test_deny_greys_zk_vault_with_policy_note(page: Page, admin, admin_creds, re
     finally:
         _psql(f"UPDATE vaults SET type='standard' WHERE id='{vid}';")
         admin.delete_vault(vid)
+
+
+def test_zk_selection_clears_and_omits_object_scope_while_standard_scope_remains(
+    page: Page, admin, admin_creds, restore_zk_policy
+):
+    admin.put("/settings", json={"temp_cred_allow_zk_vaults": True})
+    standard = admin.create_vault(name=_u("stdui"))
+    folder = _folder(admin, standard["id"])
+    zk_id = _zk_vault(admin)
+    try:
+        _login(page, admin_creds["username"], admin_creds["password"])
+        _open_temp_modal(page)
+        page.check("#tc-scope-enable")
+
+        standard_pick = page.locator(f'.tc-vault-pick[value="{standard["id"]}"]')
+        zk_pick = page.locator(f'.tc-vault-pick[value="{zk_id}"]')
+        expect(standard_pick).to_be_visible(timeout=8000)
+        expect(zk_pick).to_be_enabled()
+        standard_pick.check()
+
+        restrict = page.locator("#tc-restrict-enable")
+        expect(restrict).to_be_enabled()
+        with page.expect_request(
+            f"**/vaults/{standard['id']}/files*"
+        ) as standard_request_info:
+            restrict.check()
+        assert standard_request_info.value.method == "GET"
+        folder_pick = page.locator(
+            f'.tc-restrict-include[data-id="{folder["id"]}"][data-kind="folder"]'
+        )
+        expect(folder_pick).to_be_visible(timeout=8000)
+        folder_pick.check()
+
+        standard_scope = page.evaluate("collectTempScope()")
+        standard_entry = next(
+            entry
+            for entry in standard_scope["selected_vaults"]
+            if entry["vault_id"] == standard["id"]
+        )
+        assert standard_entry["scope_ids"] == {"files": [], "folders": [folder["id"]]}
+
+        # Switch in one DOM event so the availability check observes a single ZK selection,
+        # rather than relying on the already-safe zero/two-selection intermediate states.
+        page.evaluate(
+            """([standardId, zkId]) => {
+                const picks = Array.from(document.querySelectorAll('.tc-vault-pick'));
+                const standardPick = picks.find(pick => pick.value === standardId);
+                const zkPick = picks.find(pick => pick.value === zkId);
+                standardPick.checked = false;
+                zkPick.checked = true;
+                zkPick.dispatchEvent(new Event('change', { bubbles: true }));
+            }""",
+            [standard["id"], zk_id],
+        )
+
+        expect(standard_pick).not_to_be_checked()
+        expect(zk_pick).to_be_checked()
+        expect(restrict).to_be_disabled()
+        expect(restrict).not_to_be_checked()
+        expect(page.locator("#tc-restrict-panel")).to_be_hidden()
+        expect(page.locator("#tc-restrict-hint")).to_contain_text("whole-vault")
+        cleared = page.evaluate(
+            """() => ({
+                vaultId: _tcRestrict.vaultId,
+                files: Array.from(_tcRestrict.files),
+                folders: Array.from(_tcRestrict.folders),
+                crumbs: _tcRestrict.crumbs,
+            })"""
+        )
+        assert cleared == {
+            "vaultId": None,
+            "files": [],
+            "folders": [],
+            "crumbs": [{"id": None, "name": "Root"}],
+        }
+
+        # Even if stale/programmatic state points the object picker back at a ZK vault, its loader
+        # must clear that state before touching either the listing endpoint or the unlock path.
+        zk_file_requests = []
+
+        def record_zk_file_request(request):
+            if f"/vaults/{zk_id}/files" in request.url:
+                zk_file_requests.append(request.url)
+
+        page.on("request", record_zk_file_request)
+        try:
+            guarded_load = page.evaluate(
+                """async ({ vaultId, folderId }) => {
+                    const originalDecrypt = window.zkDecryptListingNames;
+                    let decryptCalls = 0;
+                    window.zkDecryptListingNames = async (...args) => {
+                        decryptCalls += 1;
+                        return args[0];
+                    };
+                    try {
+                        const enable = document.getElementById('tc-restrict-enable');
+                        enable.disabled = false;
+                        enable.checked = true;
+                        _tcRestrict.vaultId = vaultId;
+                        _tcRestrict.folders.add(folderId);
+                        await _tcRestrictLoad(null);
+                        return {
+                            decryptCalls,
+                            disabled: enable.disabled,
+                            checked: enable.checked,
+                            vaultId: _tcRestrict.vaultId,
+                            folders: Array.from(_tcRestrict.folders),
+                        };
+                    } finally {
+                        window.zkDecryptListingNames = originalDecrypt;
+                    }
+                }""",
+                {"vaultId": zk_id, "folderId": folder["id"]},
+            )
+        finally:
+            page.remove_listener("request", record_zk_file_request)
+
+        assert zk_file_requests == []
+        assert guarded_load == {
+            "decryptCalls": 0,
+            "disabled": True,
+            "checked": False,
+            "vaultId": None,
+            "folders": [],
+        }
+
+        # Model stale/programmatic UI state and assert the request serializer still refuses to
+        # attach object IDs to a ZK grant. Fulfil locally so this payload check creates no credential.
+        page.evaluate(
+            """({ vaultId, folderId }) => {
+                const enable = document.getElementById('tc-restrict-enable');
+                enable.disabled = false;
+                enable.checked = true;
+                _tcRestrict.vaultId = vaultId;
+                _tcRestrict.folders.add(folderId);
+            }""",
+            {"vaultId": zk_id, "folderId": folder["id"]},
+        )
+        page.route(
+            "**/auth/temp-credentials",
+            lambda route: route.fulfill(
+                status=400,
+                content_type="application/json",
+                body='{"detail":"request captured by UI test"}',
+            ),
+        )
+        try:
+            page.click("#generate-temp-creds-form button[type=submit]")
+            expect(page.locator("#tc-zk-ack-modal")).to_be_visible(timeout=8000)
+            with page.expect_request("**/auth/temp-credentials") as request_info:
+                page.click("#tc-zk-ack-proceed")
+            body = request_info.value.post_data_json
+            zk_entry = next(
+                entry for entry in body["selected_vaults"] if entry["vault_id"] == zk_id
+            )
+            assert "scope_ids" not in zk_entry, body
+        finally:
+            page.unroute("**/auth/temp-credentials")
+    finally:
+        _psql(f"UPDATE vaults SET type='standard' WHERE id='{zk_id}';")
+        admin.delete_vault(zk_id)
+        admin.delete_vault(standard["id"])
 
 
 def test_allow_requires_acknowledgment_before_mint(page: Page, admin, admin_creds, restore_zk_policy):
