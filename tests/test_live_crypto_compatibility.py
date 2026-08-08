@@ -36,6 +36,45 @@ def _required_env(name: str) -> str:
     return value
 
 
+# Everything a caller must state to bind this suite's evidence to one exact candidate.
+_ROUND_DECLARATION_VARS = (
+    "CRYPTO_COMPAT_API_CONTAINER",
+    "CRYPTO_COMPAT_COMPOSE_PROJECT",
+    "CRYPTO_COMPAT_EXPECTED_IMAGE_ID",
+    "CRYPTO_COMPAT_EXPECTED_PORT",
+    "CRYPTO_COMPAT_EXPECTED_TREE",
+    "CRYPTO_COMPAT_ROUND_ID",
+)
+
+
+def _require_declared_round() -> None:
+    """Skip when NO round is declared; never let a PARTIAL declaration through.
+
+    These checks prove that the instance under test is one exact container, built from
+    one exact image and source tree. That is only meaningful inside a release-candidate
+    round which states what it claims to be. An ordinary suite run -- CI against a
+    generic stack, or a developer's own instance -- claims nothing, and must skip rather
+    than fail on a declaration it was never meant to make.
+
+    The asymmetry is deliberate. Skipping on a COMPLETE absence is safe, but treating a
+    missing variable as "skip" in general would turn provenance into something a failing
+    round could opt out of by unsetting one name. So a partial declaration stays a hard
+    error: state all of it, or none of it.
+    """
+    present = {n for n in _ROUND_DECLARATION_VARS if os.environ.get(n, "").strip()}
+    if not present:
+        pytest.skip(
+            "no candidate round is declared; set the crypto compatibility round "
+            "variables to bind this evidence to an exact container, image and tree"
+        )
+    missing = [n for n in _ROUND_DECLARATION_VARS if n not in present]
+    if missing:
+        pytest.fail(
+            "a candidate round is only partially declared, so a provenance check cannot "
+            "be trusted or skipped. Absent: " + ", ".join(sorted(missing))
+        )
+
+
 def _docker(*args: str, stdin: str | None = None, timeout: int = 30) -> str:
     try:
         completed = subprocess.run(
@@ -120,6 +159,7 @@ def _expected_http_endpoint() -> tuple[str, str, int]:
 
 def _inspect_exact_candidate() -> dict:
     """Bind the live URL to one exact container, image, source tree, and runtime source set."""
+    _require_declared_round()
     container = _required_env("CRYPTO_COMPAT_API_CONTAINER")
     expected_tree = _required_env("CRYPTO_COMPAT_EXPECTED_TREE")
     expected_image_id = _required_env("CRYPTO_COMPAT_EXPECTED_IMAGE_ID")
