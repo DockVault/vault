@@ -415,7 +415,15 @@ class ECCCryptoLibrary {
             
             return privateKeyPEM;
         } catch (error) {
-            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.AUTH_FAILED, 'decryptPrivateKey');
+            // Same rule as the versioned reader: only an authentication failure earns
+            // AUTH_FAILED. This body encloses key derivation as well as the decrypt, so a
+            // fallback of AUTH_FAILED would blame the passphrase for a derivation failure.
+            throw _coerceCryptoError(
+                error,
+                error && error.name === 'OperationError'
+                    ? CRYPTO_ERROR_CODES.AUTH_FAILED
+                    : CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+                'decryptPrivateKey');
         }
     }
     
@@ -1508,8 +1516,11 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     // Legacy reader, reached only by the compatibility fixtures -- the app parses first, so a
     // malformed blob yields ENVELOPE_INVALID there rather than arriving here. Anything wired to
     // call this directly should parse first for the same reason.
-    decryptPrivateKey: CRYPTO_ERROR_CODES.AUTH_FAILED,
-    decryptPrivateEnvelope: CRYPTO_ERROR_CODES.AUTH_FAILED,
+    decryptPrivateKey: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    // NOT AUTH_FAILED. Key derivation runs before the decrypt, and a fallback of AUTH_FAILED
+    // would report a derivation failure as a wrong passphrase -- the mislabel this contract
+    // exists to remove. Authentication failure is raised where it is observed, not defaulted to.
+    decryptPrivateEnvelope: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
 
     // Envelope grammar, no key involved.
     parsePrivateEnvelope: CRYPTO_ERROR_CODES.ENVELOPE_INVALID,
@@ -1555,7 +1566,10 @@ for (const [_name, _code] of Object.entries(_OPERATION_DEFAULT_CODE)) {
         // Defensive: a method pulled off the instance and called unbound would leave `self`
         // undefined, and a boundary whose whole job is "no failure escapes uncoded" must not
         // become the thing that throws. Diagnose when we can; always return the coded failure.
-        if (self && typeof self._diag === 'function') self._diag(_name, out);
+        // Prefer the label the error already carries: a parse failure knows it was
+        // `envelope.v1.kdf`, and the envelope contract promises that rule identity survives as a
+        // diagnostic. Falling back to the method name would discard it at the last step.
+        if (self && typeof self._diag === 'function') self._diag(out.operation || _name, out);
         return out;
     };
 

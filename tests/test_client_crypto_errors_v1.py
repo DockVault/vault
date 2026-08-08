@@ -502,3 +502,66 @@ def test_the_listing_swallow_all_still_reports_an_unusable_platform() -> None:
     fn = fn[: fn.index("\n// ")]
     assert "CRYPTO_UNAVAILABLE" in fn
     assert "🔒 Encrypted name" in fn, "anchored on the wrong function"
+
+
+def test_authentication_is_raised_where_observed_never_defaulted_to() -> None:
+    """Key derivation runs BEFORE the decrypt, so a boundary that fell back to AUTH_FAILED would
+    report a derivation failure as a wrong passphrase.
+
+    That is the same mislabel the whole contract exists to remove, arriving by a different route:
+    narrowing the inner catch is not enough while the boundary hands the code out as a default.
+    """
+    out = _node("""
+  const kp = await lib.generateKeypair();
+  const blob = JSON.stringify(
+      await lib.encryptPrivateKey(await lib.exportPrivateKeyPEM(kp.privateKey), 'pw'));
+  const CryptoLib = require(%s);
+
+  const derivationBroken = new CryptoLib();
+  derivationBroken._deriveKeyFromPassword = async () => { throw new TypeError('derive failed'); };
+
+  const legacyDerivationBroken = new CryptoLib();
+  legacyDerivationBroken._deriveKeyFromPassword = async () => { throw new TypeError('derive failed'); };
+
+  out(JSON.stringify({
+    derivation_v1:     await codeOf(() => derivationBroken.decryptPrivateEnvelope(blob, 'pw')),
+    derivation_legacy: await codeOf(() => legacyDerivationBroken.decryptPrivateKey(
+                          JSON.parse(blob).encrypted, 'pw', JSON.parse(blob).salt, 600000)),
+    real_wrong_pass:   await codeOf(() => lib.decryptPrivateEnvelope(blob, 'WRONG')),
+  }));
+""" % json.dumps(str(CRYPTO_JS)))
+    assert out["derivation_v1"] != "AUTH_FAILED", "a derivation failure blamed the passphrase"
+    assert out["derivation_v1"] == "CRYPTO_OPERATION_FAILED"
+    assert out["derivation_legacy"] != "AUTH_FAILED"
+    # The control: the case that genuinely IS authentication still says so.
+    assert out["real_wrong_pass"] == "AUTH_FAILED"
+
+
+def test_the_console_keeps_the_finer_operation_label() -> None:
+    """The envelope contract promises rule identity survives as a diagnostic. The boundary logged
+    its own method name, which threw that away at the last step -- `envelope.v1.kdf` became
+    `parsePrivateEnvelope`, and the one thing the debug line was for was gone."""
+    out = _node("""
+  await codeOf(() => lib.parsePrivateEnvelope(%s));
+  out(JSON.stringify({ lines: CONSOLE }));
+""" % json.dumps(_v1(kdf="scrypt")))
+    joined = " ".join(out["lines"])
+    assert "envelope.v1.kdf" in joined, joined
+    assert "ENVELOPE_UNSUPPORTED" in joined, joined
+
+
+def test_no_user_facing_message_on_a_crypto_path_renders_the_raw_message() -> None:
+    """`message` is shaped `CryptoError(CODE@op)` on purpose. A toast that concatenates it shows
+    the user contract internals dressed as advice -- which is worse than the sentence it replaced,
+    because at least that one was a sentence."""
+    app = APP_JS.read_text(encoding="utf-8")
+    blocks = re.split(r"\n(?=(?:async )?function )", app)
+    offenders = []
+    for block in blocks:
+        if "eccLib()" not in block:
+            continue
+        name = re.match(r"(?:async )?function (\w+)", block)
+        for line in block.splitlines():
+            if re.search(r"showError\([^)]*\+\s*(e|err|error)\.message", line):
+                offenders.append(f"{name.group(1) if name else '?'}: {line.strip()}")
+    assert not offenders, f"renders a crypto error's message to the user: {offenders}"

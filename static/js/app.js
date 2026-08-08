@@ -2111,7 +2111,9 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
         document.getElementById('create-vault-form').reset();
         loadVaults();
     } catch (error) {
-        showError('Failed to create vault: ' + error.message);
+        showError(isCodedCryptoError(error)
+            ? safeMessageForCode(error.code, 'unlock')
+            : 'Failed to create vault: ' + error.message);
     }
 });
 
@@ -9447,7 +9449,9 @@ async function createFolder() {
     } catch (error) {
         // Operation and code only, for the same reason as the rename path above.
         console.error('createFolder failed', (error && error.code) || 'UNCODED');
-        showError('Failed to create folder: ' + error.message);
+        showError(isCodedCryptoError(error)
+            ? safeMessageForCode(error.code, 'unlock')
+            : 'Failed to create folder: ' + error.message);
     }
 }
 

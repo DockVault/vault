@@ -122,10 +122,17 @@ class CryptoError extends Error {
 }
 ```
 
-- `code` — one of §3, taken from a frozen exported constant set, never a bare string literal at a
-  call site. A typo in a literal becomes an unrecognised code and silently takes the §5 fallback; a
-  constant makes it a reference error. A test enumerates the codes used in application code against
-  the exported set.
+- `code` — one of §3, taken from the frozen exported constant set **wherever an error is
+  raised**. A typo there becomes an unrecognised code that silently takes the §5 fallback; a
+  constant makes it a reference error instead.
+
+  The wording seam in the interface is a deliberate **exception**: it compares string literals.
+  Reading the set off the library would mean reaching for a global that a classic script does not
+  publish on `window`, and getting that wrong fails silently in the worst way — every failure
+  quietly taking the default branch. It would also stop working in the one case that matters most,
+  when the library itself is what failed to load. A test enumerates the literals the interface uses
+  against the exported set, which catches a typo without making the lookup a point of failure. Do
+  not "fix" one of these to match the other; they are different trade-offs on purpose.
 - `operation` — a short stable label for *where* it happened. Diagnostics only; never branch on it.
   Public operations use their method name, which is the most useful thing a reader of a console
   line can be given; finer-grained failures inside a parse use a dotted path such as
