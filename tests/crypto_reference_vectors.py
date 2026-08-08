@@ -69,6 +69,22 @@ def assert_vector_metadata(vector: dict[str, Any]) -> None:
         raise ValueError("vector does not carry the required public-test warning")
 
 
+def load_unreleased_vector(path: Path) -> dict[str, Any]:
+    """Load a vector for a format that no release has shipped yet.
+
+    ``load_vector`` additionally pins the vector to a released commit, which a format introduced
+    on a branch cannot satisfy. The public-test-material guards still apply and are the point of
+    going through a loader at all: a fixture read with a bare ``json.loads`` silently escapes
+    them, and these files must never carry production-derived material.
+    """
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if value.get("schema") != SCHEMA:
+        raise ValueError("unexpected crypto compatibility vector schema")
+    if value.get("test_only") is not True or value.get("notice") != NOTICE:
+        raise ValueError("vector does not carry the required public-test warning")
+    return value
+
+
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -263,6 +279,65 @@ def encode_private_envelope(vector: dict[str, Any]) -> dict[str, Any]:
         "salt": b64e(salt),
         "iterations": iterations,
     }
+
+
+PRIV_ENVELOPE_V1_LABEL = "dockvault-private-key-envelope-v1"
+PRIV_ENVELOPE_V1_KDF = "PBKDF2-SHA256"
+PRIV_ENVELOPE_V1_CIPHER = "AES-256-GCM"
+
+
+def private_envelope_v1_aad(iterations: int, salt_b64: str) -> bytes:
+    """The v1 authenticated transcript.
+
+    Written independently of the browser implementation on purpose. The AAD is a byte-exactness
+    surface: any drift between the two -- a stray delimiter, a differently rendered integer, salt
+    bytes instead of the salt string -- would make affected envelopes permanently unreadable. Two
+    implementations agreeing is the only thing that catches that.
+    """
+    return (
+        f"{PRIV_ENVELOPE_V1_LABEL}|{PRIV_ENVELOPE_V1_KDF}|{iterations}|"
+        f"{PRIV_ENVELOPE_V1_CIPHER}|{salt_b64}"
+    ).encode("utf-8")
+
+
+def encode_private_envelope_v1(vector: dict[str, Any]) -> dict[str, Any]:
+    inputs = vector["inputs"]
+    salt = bytes.fromhex(inputs["salt_hex"])
+    iv = bytes.fromhex(inputs["iv_hex"])
+    iterations = int(inputs["iterations"])
+    salt_b64 = b64e(salt)
+    key = PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32, salt=salt, iterations=iterations
+    ).derive(inputs["password"].encode("utf-8"))
+    plaintext = p384_private_pem(inputs["identity_private_scalar_hex"]).encode("utf-8")
+    return {
+        "v": 1,
+        "kdf": PRIV_ENVELOPE_V1_KDF,
+        "iter": iterations,
+        "cipher": PRIV_ENVELOPE_V1_CIPHER,
+        "salt": salt_b64,
+        "iv": b64e(iv),
+        "ct": b64e(
+            AESGCM(key).encrypt(iv, plaintext, private_envelope_v1_aad(iterations, salt_b64))
+        ),
+    }
+
+
+def decode_private_envelope_v1(envelope: dict[str, Any], *, password: str) -> str:
+    salt_b64 = envelope["salt"]
+    iterations = int(envelope["iter"])
+    key = PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32, salt=b64d(salt_b64), iterations=iterations
+    ).derive(password.encode("utf-8"))
+    return (
+        AESGCM(key)
+        .decrypt(
+            b64d(envelope["iv"]),
+            b64d(envelope["ct"]),
+            private_envelope_v1_aad(iterations, salt_b64),
+        )
+        .decode("utf-8")
+    )
 
 
 def decode_private_envelope(envelope: dict[str, Any], *, password: str) -> str:

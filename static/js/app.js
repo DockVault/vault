@@ -7076,6 +7076,22 @@ function setZkIdleLockMinutes(n) {
 
 function isZkVault(v) { return !!v && v.type === 'zero_knowledge'; }
 
+// The single writer for every private-key envelope this app produces: first registration,
+// passphrase change, recovery-kit export and recovery restore.
+//
+// It emits the versioned v1 shape only when the deployment has switched the writer on, and the
+// legacy shape otherwise. Readers accept both either way, which is what lets readers roll out
+// everywhere before any writer produces bytes an older client cannot read. Enabling v1 is
+// FORWARD-ONLY for a deployment: once a v1 envelope exists, rolling the image back to a reader
+// that predates it makes that envelope unreadable, and registration refuses a second keypair so
+// there is no self-service recovery. See docs/design/vault-private-key-envelope-v1.md §8.1.
+async function zkWrapPrivateKey(pem, passphrase) {
+    const lib = eccLib();
+    return lib.PRIV_ENVELOPE_WRITE_V1
+        ? await lib.encryptPrivateKeyV1(pem, passphrase)
+        : await lib.encryptPrivateKey(pem, passphrase);
+}
+
 // Unlock the user's ECC private key into memory (prompts for the passphrase once
 // per session). Returns the CryptoKey.
 async function zkEnsureUnlocked() {
@@ -7084,12 +7100,16 @@ async function zkEnsureUnlocked() {
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) {
         throw new Error('No encryption key is set up for your account.');
     }
-    let bundle;
-    try { bundle = JSON.parse(priv.encrypted_private_key); }
-    catch (_) { throw new Error('Stored encryption key is in an unexpected format.'); }
-    if (!bundle || !bundle.encrypted || !bundle.salt) {
+    // Validate shape and bounds BEFORE asking for a passphrase, so a corrupt or hostile blob
+    // fails immediately rather than after the user has typed one. Accepts legacy and v1 alike.
+    try {
+        eccLib().parsePrivateEnvelope(priv.encrypted_private_key);
+    } catch (_) {
         throw new Error('Stored encryption key is incomplete or corrupt — re-register your key.');
     }
+    // The registered public key, for the consistency check below. Fetched before the prompt so a
+    // server that cannot supply it fails the unlock early rather than after the passphrase.
+    const pub = await apiRequest('/ecc/keys/public', { silent: true });
     const pass = await showPrompt(
         'Enter your encryption passphrase to unlock zero-knowledge vaults.',
         'Unlock encryption key', { password: true }
@@ -7097,12 +7117,25 @@ async function zkEnsureUnlocked() {
     if (pass === null) throw new Error('Unlock cancelled.');
     let pem;
     try {
-        pem = await eccLib().decryptPrivateKey(bundle.encrypted, pass, bundle.salt, bundle.iterations);
+        pem = await eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, pass);
     } catch (e) {
         // AES-GCM auth failure is indistinguishable from a wrong key, but log the
         // real cause so genuine corruption / unavailable-WebCrypto isn't masked.
         console.error('Private-key unlock failed:', e);
         throw new Error('Incorrect passphrase (or the stored key is corrupt).');
+    }
+    // Decrypting proves the passphrase; it does not prove this is the ACCOUNT's key. Compare the
+    // recovered key with the registered public key as canonical raw points, and FAIL CLOSED when
+    // the comparison cannot be made — treating "cannot check" as "passed" would make this
+    // optional in exactly the circumstances an attacker controls. Nothing is cached until it does.
+    const consistent = await eccLib().privateKeyMatchesRegisteredPublicKey(
+        pem, pub && pub.public_key
+    );
+    if (!consistent) {
+        throw new Error(
+            'The stored encryption key does not match this account’s registered public key. ' +
+            'This is not a passphrase problem — nothing has been unlocked.'
+        );
     }
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);  // non-extractable runtime key
     zkArmIdleLock();  // start the inactivity auto-lock countdown now a key is in memory
@@ -7142,7 +7175,7 @@ async function zkRegisterNewKeypair() {
     const kp = await lib.generateKeypair();
     const publicPem = await lib.exportPublicKeyPEM(kp.publicKey);
     const privatePem = await lib.exportPrivateKeyPEM(kp.privateKey);
-    const enc = await lib.encryptPrivateKey(privatePem, pass);  // {encrypted, salt, iterations}
+    const enc = await zkWrapPrivateKey(privatePem, pass);  // legacy shape, or v1 when enabled
     // Proof-of-possession: prove we hold this key's private half (ECDH key-confirmation) so the
     // server won't accept a substituted/unheld public key.
     const challenge = await apiRequest('/ecc/keys/register/challenge', { method: 'POST' });
@@ -7176,20 +7209,25 @@ async function zkChangePassphrase() {
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) {
         throw new Error('No encryption key is set up for your account.');
     }
-    let bundle;
-    try { bundle = JSON.parse(priv.encrypted_private_key); }
-    catch (_) { throw new Error('Stored encryption key is in an unexpected format.'); }
-    if (!bundle || !bundle.encrypted || !bundle.salt) {
+    try {
+        eccLib().parsePrivateEnvelope(priv.encrypted_private_key);
+    } catch (_) {
         throw new Error('Stored encryption key is incomplete or corrupt.');
     }
     const current = await showPrompt('Enter your CURRENT encryption passphrase.', 'Change passphrase', { password: true });
     if (current === null) throw new Error('Cancelled.');
     let pem;
     try {
-        pem = await eccLib().decryptPrivateKey(bundle.encrypted, current, bundle.salt, bundle.iterations);
+        pem = await eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, current);
     } catch (e) {
         console.error('Passphrase-change unlock failed:', e);
         throw new Error('Incorrect current passphrase (or the stored key is corrupt).');
+    }
+    // Re-wrapping replaces the account's only copy, so confirm this really is the account's key
+    // before writing over it. Fails closed.
+    const pubForChange = await apiRequest('/ecc/keys/public', { silent: true });
+    if (!await eccLib().privateKeyMatchesRegisteredPublicKey(pem, pubForChange && pubForChange.public_key)) {
+        throw new Error('The stored key does not match this account’s registered public key; passphrase not changed.');
     }
     const next = await showPrompt('Enter a NEW passphrase. It protects your key and CANNOT be recovered if lost.', 'New passphrase', { password: true });
     if (next === null) throw new Error('Cancelled.');
@@ -7198,7 +7236,7 @@ async function zkChangePassphrase() {
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== next) throw new Error('Passphrases do not match.');
 
-    const enc = await eccLib().encryptPrivateKey(pem, next);  // {encrypted, salt, iterations}
+    const enc = await zkWrapPrivateKey(pem, next);  // legacy shape, or v1 when enabled
     await apiRequest('/ecc/keys/private', {
         method: 'PUT',
         body: JSON.stringify({ encrypted_private_key: JSON.stringify(enc) }),
@@ -7216,14 +7254,15 @@ async function zkChangePassphrase() {
 async function zkExportRecoveryKey() {
     const priv = await apiRequest('/ecc/keys/private', { silent: true });
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) throw new Error('No encryption key is set up for your account.');
-    let bundle;
-    try { bundle = JSON.parse(priv.encrypted_private_key); }
-    catch (_) { throw new Error('Stored encryption key is in an unexpected format.'); }
-    if (!bundle || !bundle.encrypted || !bundle.salt) throw new Error('Stored encryption key is incomplete or corrupt.');
+    try {
+        eccLib().parsePrivateEnvelope(priv.encrypted_private_key);
+    } catch (_) {
+        throw new Error('Stored encryption key is incomplete or corrupt.');
+    }
     const current = await showPrompt('Enter your CURRENT encryption passphrase to export a recovery key.', 'Export recovery key', { password: true });
     if (current === null) throw new Error('Cancelled.');
     let pem;
-    try { pem = await eccLib().decryptPrivateKey(bundle.encrypted, current, bundle.salt, bundle.iterations); }
+    try { pem = await eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, current); }
     catch (e) { console.error('Recovery export unlock failed:', e); throw new Error('Incorrect current passphrase (or the stored key is corrupt).'); }
     const rec = await showPrompt('Choose a RECOVERY passphrase. Store it somewhere safe and SEPARATE from your normal passphrase — it protects the recovery key you are about to download.', 'Recovery passphrase', { password: true });
     if (rec === null) throw new Error('Cancelled.');
@@ -7232,7 +7271,7 @@ async function zkExportRecoveryKey() {
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== rec) throw new Error('Passphrases do not match.');
 
-    const enc = await eccLib().encryptPrivateKey(pem, rec);  // {encrypted, salt, iterations}
+    const enc = await zkWrapPrivateKey(pem, rec);  // legacy shape, or v1 when enabled
     const pub = await apiRequest('/ecc/keys/public', { silent: true });
     const kit = {
         type: 'dockvault-zk-recovery-key',
@@ -7258,12 +7297,12 @@ async function zkExportRecoveryKey() {
 // re-wrap it under a NEW main passphrase, and store it (PUT /ecc/keys/private). Used when the main
 // passphrase was lost. Throws Error('Cancelled.') on back-out.
 async function zkRestoreFromRecoveryKey(kitText) {
+    // This file is the only fully attacker-supplied envelope the app reads, so the wrapper AND
+    // the envelope inside it are bounded here — before the passphrase prompt and before any key
+    // derivation. See docs/design/vault-private-key-envelope-v1.md §1.1.
     let kit;
-    try { kit = JSON.parse(kitText); }
-    catch (_) { throw new Error('That file is not a valid recovery key.'); }
-    if (!kit || kit.type !== 'dockvault-zk-recovery-key' || !kit.recovery || !kit.recovery.encrypted) {
-        throw new Error('That file is not a DockVault recovery key.');
-    }
+    try { kit = eccLib().parseRecoveryKitFile(kitText).kit; }
+    catch (_) { throw new Error('That file is not a valid DockVault recovery key.'); }
     const pub = await apiRequest('/ecc/keys/public', { silent: true });
     if (!pub || !pub.has_keypair || !pub.public_key) throw new Error('This account has no encryption key to restore.');
     // Fast pre-check on the kit's ASSERTED public key (untrusted metadata — a nicety so an
@@ -7274,16 +7313,21 @@ async function zkRestoreFromRecoveryKey(kitText) {
     const rec = await showPrompt('Enter the RECOVERY passphrase for this recovery key.', 'Restore access', { password: true });
     if (rec === null) throw new Error('Cancelled.');
     let pem;
-    try { pem = await eccLib().decryptPrivateKey(kit.recovery.encrypted, rec, kit.recovery.salt, kit.recovery.iterations); }
+    try { pem = await eccLib().decryptPrivateEnvelope(kit.recovery, rec); }
     catch (e) { console.error('Recovery restore decrypt failed:', e); throw new Error('Incorrect recovery passphrase (or the recovery key is corrupt).'); }
     // SECURITY: verify the DECRYPTED private key actually matches this account's registered public
     // key. The kit's asserted public_key is untrusted metadata (a corrupt/forged/null-public_key
     // kit could carry a different private key), so derive the public key FROM the private key and
     // compare — adopting a mismatched key would silently orphan every wrapped DEK (permanent lockout).
-    let derivedPub;
-    try { derivedPub = await eccLib().derivePublicKeyPEMFromPrivatePEM(pem); }
+    // Corruptness first, so a structurally invalid key reports as corrupt rather than as a
+    // mismatch — they send the user to different remedies.
+    try { await eccLib().derivePublicKeyPEMFromPrivatePEM(pem); }
     catch (e) { console.error('Recovery key derive failed:', e); throw new Error('The recovery key is corrupt or not a valid key.'); }
-    if (derivedPub.trim() !== pub.public_key.trim()) {
+    // Compare as canonical raw points, not as PEM text. A string comparison reports a mismatch
+    // between two encodings of the SAME key — line endings, wrap width, a trailing newline — and
+    // this is the one path reached only after the main passphrase is already lost, so a false
+    // mismatch here has no way back.
+    if (!await eccLib().privateKeyMatchesRegisteredPublicKey(pem, pub.public_key)) {
         throw new Error("This recovery key does not match your account's encryption key and cannot be restored.");
     }
     const next = await showPrompt('Set a NEW encryption passphrase. It replaces your forgotten one and CANNOT be recovered if lost.', 'New passphrase', { password: true });
@@ -7293,7 +7337,7 @@ async function zkRestoreFromRecoveryKey(kitText) {
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== next) throw new Error('Passphrases do not match.');
 
-    const enc = await eccLib().encryptPrivateKey(pem, next);
+    const enc = await zkWrapPrivateKey(pem, next);
     await apiRequest('/ecc/keys/private', { method: 'PUT', body: JSON.stringify({ encrypted_private_key: JSON.stringify(enc) }) });
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
     zkArmIdleLock();

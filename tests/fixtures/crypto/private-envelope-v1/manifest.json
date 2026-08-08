@@ -1,0 +1,12 @@
+{
+  "schema": "dockvault-crypto-manifest-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "format": "account private-key envelope v1",
+  "vectors": [
+    {
+      "path": "zk-private-envelope-v1.json",
+      "sha256": "516378344983c16d5bd6ef9c663c8eaf71b3b6c6894b324649d2517b1eeaec88"
+    }
+  ]
+}
