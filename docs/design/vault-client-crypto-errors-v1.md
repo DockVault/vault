@@ -127,9 +127,11 @@ class CryptoError extends Error {
   constant makes it a reference error. A test enumerates the codes used in application code against
   the exported set.
 - `operation` — a short stable label for *where* it happened. Diagnostics only; never branch on it.
-  Labels must not be bare method names: an existing test asserts that certain method names do not
-  appear outside their defining function, and a label reusing one would fail it for an unrelated
-  reason.
+  Public operations use their method name, which is the most useful thing a reader of a console
+  line can be given; finer-grained failures inside a parse use a dotted path such as
+  `envelope.v1.kdf`, so rule identity survives as a diagnostic even though the code channel is
+  coarser. Any interpolated segment must come from a fixed vocabulary, never from input — a label
+  is printed to the console, and a caller-controlled one would be log injection.
 - `cause` — the original platform exception, when there was one. Retained on the object, rendered
   only in debug mode.
 - `message` — **`CryptoError(<CODE>@<operation>)`**, deliberately shaped so it cannot be mistaken

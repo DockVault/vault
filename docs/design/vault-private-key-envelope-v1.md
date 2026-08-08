@@ -345,12 +345,24 @@ Two entries need their reasoning stated, because both look like oversights and a
 Everything not listed as applying to legacy is **v1 only**. Legacy parsing is otherwise exactly as
 permissive as it is today, per §5.
 
-Errors identify **which rule** failed, never the value that failed it, and no message, thrown value
-or console output composed by this code includes envelope bytes, ciphertext, salt, IV, passphrase or
-PEM text. The honest limit: platform exceptions from the underlying crypto and JSON implementations
-are not authored here, so the contract is that this code does not *add* material to an error and
-does not pass a raw platform exception through to the user interface — not that no underlying
-runtime can ever produce a diagnostic of its own.
+No message, thrown value or console output composed by this code includes envelope bytes,
+ciphertext, salt, IV, passphrase or PEM text.
+
+Rule identity survives as a **diagnostic**, not as something a caller branches on. Every rule in
+the table above raises one of three codes from
+[`vault-client-crypto-errors-v1.md`](vault-client-crypto-errors-v1.md) — invalid envelope,
+unsupported envelope, or rejected work factor — and the specific rule appears in the failure's
+operation label, which is debug output. The two documents agree on this deliberately: no caller
+can act on rule identity. Learning that the initialisation vector was the wrong length rather than
+the salt changes nothing a user or a call site would do. Learning that the envelope is
+*unsupported* rather than *damaged* changes everything, and that distinction is carried by the
+code.
+
+The honest limit: platform exceptions from the underlying crypto and JSON implementations are not
+authored here, so the contract is that this code does not *add* material to an error and does not
+pass a raw platform exception through to the user interface — not that no underlying runtime can
+ever produce a diagnostic of its own. Such an exception is retained as the failure's cause and is
+rendered only in debug mode.
 
 Wrong passphrase and corrupt ciphertext are both authentication failures and are reported
 identically. A key-consistency mismatch (§6) is a distinct, third outcome and is reported as such:

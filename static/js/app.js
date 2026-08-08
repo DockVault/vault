@@ -2089,7 +2089,9 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                 }
                 zkPendingDek = dek;
             } catch (err) {
-                showError('Encryption key setup failed: ' + err.message);
+                showError(isCodedCryptoError(err)
+                    ? safeMessageForCode(err.code, 'unlock')
+                    : 'Encryption key setup failed.');
                 return;
             }
         }
@@ -7096,7 +7098,9 @@ async function zkPutPrivateEnvelope(envelope, privateKey, registeredPublicKeyPem
     try {
         readBack = await eccLib().decryptPrivateEnvelope(body, newPassphrase);
     } catch (e) {
-        console.error('Re-wrapped key failed its own read-back:', e);
+        // Operation and code only: the error now retains the platform exception as its cause, and
+        // developer tools expand that.
+        console.error('crypto rewrapReadBack', (e && e.code) || 'UNCODED');
     }
     if (readBack !== expectedPem) {
         throw new Error('Internal error preparing the new encryption key — nothing was changed.');
@@ -7113,6 +7117,94 @@ async function zkPutPrivateEnvelope(envelope, privateKey, registeredPublicKeyPem
             pop: { challenge_id: challenge.challenge_id, mac },
         }),
     });
+}
+
+// Turn a crypto failure code into the sentence a user should read, for the flow they are in.
+//
+// This is the only place that decides wording. Individual catch blocks branch on `.code` and
+// delegate here; they never compose their own message and they never render `error.message` --
+// that string is deliberately not a sentence, so if it reaches a user it reads as a bug.
+//
+// `flow` exists because the same code means different things depending on what the user just
+// did: an authentication failure during a passphrase change is about the CURRENT passphrase,
+// the identical code during a recovery restore is about the RECOVERY passphrase. The code says
+// what happened; the flow knows which secret was typed.
+//
+// See docs/design/vault-client-crypto-errors-v1.md.
+// A recovered key that is not this account's. Distinct from an unusable one: the remedy is a
+// different key, not a repaired one. Worded per flow because what the user just did determines
+// what was NOT done as a result.
+const ZK_MISMATCH_SENTENCE = {
+    unlock: 'The stored encryption key does not match this account\u2019s registered public key.',
+    change: 'The stored key does not match this account\u2019s registered public key; '
+          + 'passphrase not changed.',
+    export: 'The stored key does not match this account\u2019s registered public key; '
+          + 'no recovery key was written.',
+    restore: 'That recovery key belongs to a different account; nothing was changed.',
+};
+
+const ZK_AUTH_SENTENCE = {
+    unlock: 'Incorrect passphrase (or the stored key is corrupt).',
+    change: 'Incorrect current passphrase (or the stored key is corrupt).',
+    export: 'Incorrect current passphrase (or the stored key is corrupt).',
+    restore: 'Incorrect recovery passphrase (or the recovery key is corrupt).',
+};
+
+// The codes are compared as literals rather than read off the library, deliberately. A classic
+// script's top-level `class` is a global LEXICAL binding, not a property of `window` -- which is
+// why every other reference to it here goes through a `typeof` guard -- so a
+// `window.ECCCryptoLibrary` lookup would be undefined and would quietly send every failure to the
+// default branch. A test pins these literals against the library's exported set, which catches a
+// typo without making the lookup itself a point of failure. It also keeps this function working
+// when the library is the thing that failed to load.
+function safeMessageForCode(code, flow) {
+    switch (code) {
+        case 'CRYPTO_UNAVAILABLE':
+            return 'This browser cannot perform encryption here. Use a current browser over a '
+                 + 'secure (https) connection.';
+        case 'AUTH_FAILED':
+            return ZK_AUTH_SENTENCE[flow] || ZK_AUTH_SENTENCE.unlock;
+        case 'CONTENT_AUTH_FAILED':
+            // Reached only after the passphrase already succeeded, so this must never suggest
+            // the passphrase is at fault.
+            return 'This item could not be decrypted — it appears damaged. Your passphrase is '
+                 + 'not the problem.';
+        case 'ENVELOPE_UNSUPPORTED':
+            // The envelope is FINE and the passphrase is FINE; this build is behind. Emphatically
+            // not an invitation to re-register: the server refuses that while a key exists, and
+            // it would orphan every vault key if it did not.
+            return 'Your encryption key was saved by a newer version of DockVault and cannot be '
+                 + 'read here. Update this deployment. Do not re-register your key.';
+        case 'RECOVERY_KIT_UNSUPPORTED':
+            return 'This recovery key file was written by a newer version of DockVault. Update '
+                 + 'this deployment to use it.';
+        case 'RECOVERY_KIT_INVALID':
+            return 'That file is not a valid DockVault recovery key.';
+        case 'ENVELOPE_INVALID':
+            return 'Your stored encryption key is damaged and cannot be read. Restore it from a '
+                 + 'recovery key file.';
+        case 'WORK_FACTOR_REJECTED':
+            return 'Your stored encryption key declares an unreasonable amount of work to open '
+                 + 'and was refused.';
+        case 'KEY_MISMATCH':
+            return ZK_MISMATCH_SENTENCE[flow] || ZK_MISMATCH_SENTENCE.unlock;
+        case 'KEY_UNUSABLE':
+            return 'That key could not be read — it appears damaged or is not a supported key.';
+        case 'WRAP_FAILED':
+            return 'This vault\u2019s key could not be opened for your account. Ask an owner to '
+                 + 'share the vault with you again.';
+        default:
+            // Includes INVALID_INPUT, CRYPTO_OPERATION_FAILED, an unrecognised code, and no code
+            // at all. Never guess a more specific cause, and never fall through to a passphrase
+            // prompt: guessing is how an unreadable envelope became "wrong passphrase".
+            return 'The encryption operation could not be completed.';
+    }
+}
+
+// True when an error carries a code from the crypto contract. Checked as an own property rather
+// than with instanceof, which does not survive the classic-script / require split.
+function isCodedCryptoError(e) {
+    return !!(e && e.isCryptoError === true && e.code);
 }
 
 // The single writer for every private-key envelope this app produces: first registration,
@@ -7143,8 +7235,11 @@ async function zkEnsureUnlocked() {
     // fails immediately rather than after the user has typed one. Accepts legacy and v1 alike.
     try {
         eccLib().parsePrivateEnvelope(priv.encrypted_private_key);
-    } catch (_) {
-        throw new Error('Stored encryption key is incomplete or corrupt — re-register your key.');
+    } catch (e) {
+        // Distinguishing damaged from merely-newer matters here more than anywhere: the advice
+        // differs, and the advice this used to give -- re-register -- is refused by the server
+        // and would orphan every wrapped vault key if it were not.
+        throw new Error(safeMessageForCode(e && e.code, 'unlock'));
     }
     // The registered public key, for the consistency check below. Fetched before the prompt so a
     // server that cannot supply it fails the unlock early rather than after the passphrase.
@@ -7158,10 +7253,10 @@ async function zkEnsureUnlocked() {
     try {
         pem = await eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, pass);
     } catch (e) {
-        // AES-GCM auth failure is indistinguishable from a wrong key, but log the
-        // real cause so genuine corruption / unavailable-WebCrypto isn't masked.
-        console.error('Private-key unlock failed:', e);
-        throw new Error('Incorrect passphrase (or the stored key is corrupt).');
+        // A wrong passphrase and tampered ciphertext are one outcome to AES-GCM. Everything
+        // else -- an unsupported envelope, an unusable key, no WebCrypto at all -- is NOT, and
+        // reporting it as a bad passphrase sends the user to re-type a passphrase that is right.
+        throw new Error(safeMessageForCode(e && e.code, 'unlock'));
     }
     // Decrypting proves the passphrase; it does not prove this is the ACCOUNT's key. Compare the
     // recovered key with the registered public key as canonical raw points, and FAIL CLOSED when
@@ -7248,8 +7343,8 @@ async function zkChangePassphrase() {
     }
     try {
         eccLib().parsePrivateEnvelope(priv.encrypted_private_key);
-    } catch (_) {
-        throw new Error('Stored encryption key is incomplete or corrupt.');
+    } catch (e) {
+        throw new Error(safeMessageForCode(e && e.code, 'change'));
     }
     const current = await showPrompt('Enter your CURRENT encryption passphrase.', 'Change passphrase', { password: true });
     if (current === null) throw new Error('Cancelled.');
@@ -7257,14 +7352,13 @@ async function zkChangePassphrase() {
     try {
         pem = await eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, current);
     } catch (e) {
-        console.error('Passphrase-change unlock failed:', e);
-        throw new Error('Incorrect current passphrase (or the stored key is corrupt).');
+        throw new Error(safeMessageForCode(e && e.code, 'change'));
     }
     // Re-wrapping replaces the account's only copy, so confirm this really is the account's key
     // before writing over it. Fails closed.
     const pubForChange = await apiRequest('/ecc/keys/public', { silent: true });
     if (!await eccLib().privateKeyMatchesRegisteredPublicKey(pem, pubForChange && pubForChange.public_key)) {
-        throw new Error('The stored key does not match this account’s registered public key; passphrase not changed.');
+        throw new Error(safeMessageForCode('KEY_MISMATCH', 'change'));
     }
     const next = await showPrompt('Enter a NEW passphrase. It protects your key and CANNOT be recovered if lost.', 'New passphrase', { password: true });
     if (next === null) throw new Error('Cancelled.');
@@ -7294,21 +7388,21 @@ async function zkExportRecoveryKey() {
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) throw new Error('No encryption key is set up for your account.');
     try {
         eccLib().parsePrivateEnvelope(priv.encrypted_private_key);
-    } catch (_) {
-        throw new Error('Stored encryption key is incomplete or corrupt.');
+    } catch (e) {
+        throw new Error(safeMessageForCode(e && e.code, 'export'));
     }
     const current = await showPrompt('Enter your CURRENT encryption passphrase to export a recovery key.', 'Export recovery key', { password: true });
     if (current === null) throw new Error('Cancelled.');
     let pem;
     try { pem = await eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, current); }
-    catch (e) { console.error('Recovery export unlock failed:', e); throw new Error('Incorrect current passphrase (or the stored key is corrupt).'); }
+    catch (e) { throw new Error(safeMessageForCode(e && e.code, 'export')); }
     // Not required by the consistency rule, which scopes the check to paths that CACHE a key or
     // replace the stored one. Done anyway because a kit minted from a key that does not match the
     // account is useless, and catching it here turns an unrecoverable surprise at restore into a
     // recoverable error at export.
     const pubForExport = await apiRequest('/ecc/keys/public', { silent: true });
     if (!await eccLib().privateKeyMatchesRegisteredPublicKey(pem, pubForExport && pubForExport.public_key)) {
-        throw new Error('The stored key does not match this account’s registered public key; no recovery key was written.');
+        throw new Error(safeMessageForCode('KEY_MISMATCH', 'export'));
     }
     const rec = await showPrompt('Choose a RECOVERY passphrase. Store it somewhere safe and SEPARATE from your normal passphrase — it protects the recovery key you are about to download.', 'Recovery passphrase', { password: true });
     if (rec === null) throw new Error('Cancelled.');
@@ -7354,7 +7448,12 @@ async function zkRestoreFromRecoveryKey(kitText) {
     // derivation. See docs/design/vault-private-key-envelope-v1.md §1.1.
     let kit;
     try { kit = eccLib().parseRecoveryKitFile(kitText).kit; }
-    catch (_) { throw new Error('That file is not a valid DockVault recovery key.'); }
+    catch (e) {
+        // Which artifact is wrong matters here more than anywhere else in the app. A kit written
+        // by a NEWER build is perfectly good and the remedy is to update this deployment; calling
+        // it invalid invites the user to discard the only copy of their key.
+        throw new Error(safeMessageForCode(e && e.code, 'restore'));
+    }
     const pub = await apiRequest('/ecc/keys/public', { silent: true });
     if (!pub || !pub.has_keypair || !pub.public_key) throw new Error('This account has no encryption key to restore.');
     // Fast pre-check on the kit's ASSERTED public key (untrusted metadata — a nicety so an
@@ -7366,7 +7465,7 @@ async function zkRestoreFromRecoveryKey(kitText) {
     if (rec === null) throw new Error('Cancelled.');
     let pem;
     try { pem = await eccLib().decryptPrivateEnvelope(kit.recovery, rec); }
-    catch (e) { console.error('Recovery restore decrypt failed:', e); throw new Error('Incorrect recovery passphrase (or the recovery key is corrupt).'); }
+    catch (e) { throw new Error(safeMessageForCode(e && e.code, 'restore')); }
     // SECURITY: verify the DECRYPTED private key actually matches this account's registered public
     // key. The kit's asserted public_key is untrusted metadata (a corrupt/forged/null-public_key
     // kit could carry a different private key), so derive the public key FROM the private key and
@@ -7374,7 +7473,7 @@ async function zkRestoreFromRecoveryKey(kitText) {
     // Corruptness first, so a structurally invalid key reports as corrupt rather than as a
     // mismatch — they send the user to different remedies.
     try { await eccLib().derivePublicKeyPEMFromPrivatePEM(pem); }
-    catch (e) { console.error('Recovery key derive failed:', e); throw new Error('The recovery key is corrupt or not a valid key.'); }
+    catch (_) { throw new Error('The recovery key is corrupt or not a valid key.'); }
     // Compare as canonical raw points, not as PEM text. A string comparison reports a mismatch
     // between two encodings of the SAME key — line endings, wrap width, a trailing newline — and
     // this is the one path reached only after the main passphrase is already lost, so a false
@@ -7525,7 +7624,9 @@ async function setupEncryptionKey() {
             // refused to overwrite. Treat as success, not an error.
             showInfo('Your encryption key is already set up.');
         } else if (!/cancelled/i.test(msg)) {
-            showError(msg || 'Failed to set up encryption key');
+            showError(isCodedCryptoError(e)
+                ? safeMessageForCode(e.code, 'unlock')
+                : (msg || 'Failed to set up encryption key'));
         }
     } finally {
         if (setupBtn) setupBtn.disabled = false;
@@ -7541,7 +7642,11 @@ async function changeEncryptionPassphrase() {
         showSuccess('Encryption passphrase changed. Use your new passphrase from now on.');
     } catch (e) {
         const msg = (e && e.message) || '';
-        if (!/cancelled/i.test(msg)) showError(msg || 'Failed to change passphrase');
+        if (!/cancelled/i.test(msg)) {
+            showError(isCodedCryptoError(e)
+                ? safeMessageForCode(e.code, 'change')
+                : (msg || 'Failed to change passphrase'));
+        }
     } finally {
         if (btn) btn.disabled = false;
         await refreshEncryptionKeyStatus();
@@ -7556,7 +7661,11 @@ async function exportRecoveryKey() {
         showSuccess('Recovery key downloaded. Store it somewhere safe and separate from your passphrase.');
     } catch (e) {
         const msg = (e && e.message) || '';
-        if (!/cancelled/i.test(msg)) showError(msg || 'Failed to export recovery key');
+        if (!/cancelled/i.test(msg)) {
+            showError(isCodedCryptoError(e)
+                ? safeMessageForCode(e.code, 'export')
+                : (msg || 'Failed to export recovery key'));
+        }
     } finally {
         if (btn) btn.disabled = false;
     }
@@ -7570,7 +7679,11 @@ async function restoreFromRecoveryKeyFile(file) {
         showSuccess('Access restored. Use your new passphrase from now on.');
     } catch (e) {
         const msg = (e && e.message) || '';
-        if (!/cancelled/i.test(msg)) showError(msg || 'Failed to restore from recovery key');
+        if (!/cancelled/i.test(msg)) {
+            showError(isCodedCryptoError(e)
+                ? safeMessageForCode(e.code, 'restore')
+                : (msg || 'Failed to restore from recovery key'));
+        }
     } finally {
         await refreshEncryptionKeyStatus();
     }
@@ -7664,6 +7777,12 @@ function zkNameEpoch(item) {
 // therefore the binding — is always available, and never undefined (encryptName requires it).
 function zkNewObjId() {
     if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+    if (!window.crypto || typeof window.crypto.getRandomValues !== 'function') {
+        // The same availability failure the library reports, reported the same way, rather than
+        // a TypeError from the next line.
+        throw new (eccLib().constructor.CryptoError)(
+            eccLib().constructor.CODES.CRYPTO_UNAVAILABLE, 'zkNewObjId');
+    }
     const b = new Uint8Array(16);
     window.crypto.getRandomValues(b);
     b[6] = (b[6] & 0x0f) | 0x40;  // version 4
@@ -7689,9 +7808,17 @@ async function zkDecryptListingNames(items, vault) {
         for (const it of items) {
             if (it.enc_name) { it.name = '🔒 Encrypted name'; it.zkLocked = true; }
         }
-        if (!/cancel/i.test(e.message || '')) showError(e.message);
+        if (isCodedCryptoError(e)) {
+            showError(safeMessageForCode(e.code, 'unlock'));
+        } else if (!/cancel/i.test(e.message || '')) {
+            showError(e.message);
+        }
         return;
     }
+    // A per-row failure below is swallowed into a placeholder on purpose -- one damaged name
+    // must not take down a listing. An unusable platform is different in kind: it fails EVERY
+    // row, and swallowing it leaves a directory of padlocks and no explanation. Report it once.
+    let unavailable = false;
     for (const it of items) {
         if (!it.enc_name) continue;  // legacy plaintext row (it.name already set) — leave it
         const epoch = zkNameEpoch(it);
@@ -7706,8 +7833,10 @@ async function zkDecryptListingNames(items, vault) {
         } catch (e) {
             it.name = '🔒 Encrypted name';
             it.zkLocked = true;  // can't decrypt this epoch — block preview/rename/download
+            if (e && e.code === 'CRYPTO_UNAVAILABLE') unavailable = true;
         }
     }
+    if (unavailable) showError(safeMessageForCode('CRYPTO_UNAVAILABLE', 'unlock'));
 }
 
 // Lazily migrate EXISTING zero-knowledge rows whose name is still plaintext server-side:
@@ -7949,7 +8078,12 @@ async function downloadFile(fileId, fileName) {
         let blob = await response.blob();
         if (isZkVault(state.currentVault)) {
             try { blob = await zkMaybeDecryptBlob(blob, state.currentVault, zkFileKeyVersion(fileId)); }
-            catch (e) { showError('Failed to decrypt file: ' + e.message); return; }
+            catch (e) {
+                showError(isCodedCryptoError(e)
+                    ? safeMessageForCode(e.code, 'unlock')
+                    : 'Failed to decrypt file.');
+                return;
+            }
         }
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -8023,7 +8157,16 @@ async function openFilePreview(fileId, fileName, mime) {
             bodyEl.replaceChildren(wrap);
         }
     } catch (e) {
-        bodyEl.innerHTML = `<div class="alert alert-error">Failed to preview: ${escapeHtml(e.message)}</div>`;
+        // Built as DOM rather than assigned as markup, and the text is chosen from the contract's
+        // fixed set rather than taken from the failure -- a crypto error's message is not a
+        // sentence, and rendering one here would read to the user as advice.
+        console.error('preview failed', (e && e.code) || 'UNCODED');
+        const alert = document.createElement('div');
+        alert.className = 'alert alert-error';
+        alert.textContent = isCodedCryptoError(e)
+            ? safeMessageForCode(e.code, 'unlock')
+            : 'This file could not be previewed.';
+        bodyEl.replaceChildren(alert);
     }
 }
 
@@ -8076,7 +8219,9 @@ async function renameVaultItem(itemId, currentName, type) {
                 };
                 if (type === 'folder') body.name_key_version = epoch;
             } catch (e) {
-                showError('Zero-knowledge encryption failed: ' + e.message);
+                showError(isCodedCryptoError(e)
+                    ? safeMessageForCode(e.code, 'unlock')
+                    : 'Zero-knowledge encryption failed.');
                 return;
             }
         } else {
@@ -8094,7 +8239,9 @@ async function renameVaultItem(itemId, currentName, type) {
         // Reload files
         await loadVaultFiles();
     } catch (error) {
-        console.error('Rename failed:', error);
+        // Operation and code only: this catch is downstream of crypto calls, and a coded
+        // failure retains the platform exception as its cause.
+        console.error('rename failed', (error && error.code) || 'UNCODED');
         showError('Failed to rename item');
     }
 }
@@ -9181,7 +9328,9 @@ async function uploadFiles(files) {
                     entry.encMime = mime ? await lib.encryptName(mime, dek, vid, 'mime', keyVersion, clientFileId) : null;
                 }
             } catch (e) {
-                showError('Zero-knowledge encryption failed: ' + e.message);
+                showError(isCodedCryptoError(e)
+                    ? safeMessageForCode(e.code, 'unlock')
+                    : 'Zero-knowledge encryption failed.');
                 return;
             }
         }
@@ -9276,7 +9425,9 @@ async function createFolder() {
                 body.name_bi = await lib.nameBlindIndex(folderName, dek, vid, epoch);
                 body.name_key_version = epoch;
             } catch (e) {
-                showError('Zero-knowledge encryption failed: ' + e.message);
+                showError(isCodedCryptoError(e)
+                    ? safeMessageForCode(e.code, 'unlock')
+                    : 'Zero-knowledge encryption failed.');
                 return;
             }
         } else {
@@ -9294,7 +9445,8 @@ async function createFolder() {
         // Reload files
         await loadVaultFiles();
     } catch (error) {
-        console.error('Create folder failed:', error);
+        // Operation and code only, for the same reason as the rename path above.
+        console.error('createFolder failed', (error && error.code) || 'UNCODED');
         showError('Failed to create folder: ' + error.message);
     }
 }

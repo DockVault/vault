@@ -16,6 +16,72 @@
  * @date October 13, 2025
  */
 
+/**
+ * Stable failure codes. Frozen by docs/design/vault-client-crypto-errors-v1.md -- change that
+ * document first. Callers branch on these; they never branch on a message string, because a
+ * message is prose and prose gets reworded.
+ *
+ * Two failures share a code only when no user could act differently on them. That is why a
+ * wrong passphrase and tampered ciphertext share AUTH_FAILED -- AES-GCM fails identically for
+ * both, so the distinction does not exist to report -- while authenticating vault-key-encrypted
+ * CONTENT is separate, because by then the passphrase has already succeeded and the user typed
+ * nothing.
+ */
+const CRYPTO_ERROR_CODES = Object.freeze({
+    CRYPTO_UNAVAILABLE: 'CRYPTO_UNAVAILABLE',
+    ENVELOPE_INVALID: 'ENVELOPE_INVALID',
+    ENVELOPE_UNSUPPORTED: 'ENVELOPE_UNSUPPORTED',
+    WORK_FACTOR_REJECTED: 'WORK_FACTOR_REJECTED',
+    AUTH_FAILED: 'AUTH_FAILED',
+    CONTENT_AUTH_FAILED: 'CONTENT_AUTH_FAILED',
+    KEY_UNUSABLE: 'KEY_UNUSABLE',
+    KEY_MISMATCH: 'KEY_MISMATCH',
+    WRAP_FAILED: 'WRAP_FAILED',
+    RECOVERY_KIT_INVALID: 'RECOVERY_KIT_INVALID',
+    RECOVERY_KIT_UNSUPPORTED: 'RECOVERY_KIT_UNSUPPORTED',
+    INVALID_INPUT: 'INVALID_INPUT',
+    CRYPTO_OPERATION_FAILED: 'CRYPTO_OPERATION_FAILED',
+});
+
+/**
+ * A failure with a code a caller can branch on.
+ *
+ * `message` is deliberately NOT a sentence. If one of these ever reaches a user it must read as
+ * a bug, not as plausible advice -- the whole point of the contract is that wording is chosen by
+ * the flow that knows the context, never by the layer that detected the failure.
+ *
+ * `cause` keeps the original platform exception for diagnostics. It is retained on the object and
+ * rendered only under the module's debug flag; see the diagnostics section of the design.
+ */
+class CryptoError extends Error {
+    constructor(code, operation, cause) {
+        super(`CryptoError(${code}@${operation})`);
+        this.name = 'CryptoError';
+        this.code = code;
+        this.operation = operation;
+        if (cause !== undefined) this.cause = cause;
+        // Callers test this, not `instanceof`: the module is a classic script in the browser and
+        // a CommonJS require in the test harnesses, and a prototype identity does not survive
+        // both. A plain own property does.
+        this.isCryptoError = true;
+    }
+}
+
+/**
+ * Pass a coded failure through unchanged; give anything else the caller's default code.
+ *
+ * Transport failures pass through too, and that is not a convenience: a crypto code must never be
+ * derived from a server response. The decompression endpoint is authenticated and rate limited,
+ * and a method with its own catch would otherwise convert its 401/403/429 into a crypto failure
+ * before the operation boundary could apply the exclusion. Every catch in this module funnels
+ * through here, so this is the one place the rule can be stated once.
+ */
+function _coerceCryptoError(err, code, operation) {
+    if (err && err.isCryptoError === true) return err;
+    if (err && err.isTransportError === true) return err;
+    return new CryptoError(code, operation, err);
+}
+
 class ECCCryptoLibrary {
     constructor() {
         // ECC curve parameters (P-384 / SECP384R1)
@@ -62,9 +128,63 @@ class ECCCryptoLibrary {
         // and there is no self-service recovery.
         this.PRIV_ENVELOPE_WRITE_V1 = false;
 
-        // Verbose per-operation logging — off in production (flip to debug).
+        // Raw platform exceptions are diagnostics, not user-facing detail. Off in production;
+        // a source constant rather than anything a deployment can flip at runtime, so turning
+        // verbose diagnostics on is a reviewable change. A test pins this false.
         this.DEBUG = false;
-        if (this.DEBUG) console.log('🔐 ECC Crypto Library initialized (P-384)');
+    }
+
+    /**
+     * The WebCrypto entry point every operation goes through.
+     *
+     * Checking once, here, is what makes CRYPTO_UNAVAILABLE a real code rather than an aspiration:
+     * without it an insecure origin or an old browser surfaces as a TypeError on `undefined` from
+     * whichever line happened to touch it first, and an availability problem gets reported as
+     * whatever that operation's failure normally means -- for the decrypt paths, as a wrong
+     * passphrase.
+     * @private
+     */
+    _subtle() {
+        const c = (typeof window !== 'undefined' && window.crypto) || null;
+        if (!c || !c.subtle) {
+            throw new CryptoError(CRYPTO_ERROR_CODES.CRYPTO_UNAVAILABLE, 'subtle');
+        }
+        return c.subtle;
+    }
+
+    /**
+     * Random bytes, through the same availability gate.
+     * @private
+     */
+    _randomBytes(n) {
+        const c = (typeof window !== 'undefined' && window.crypto) || null;
+        if (!c || typeof c.getRandomValues !== 'function') {
+            throw new CryptoError(CRYPTO_ERROR_CODES.CRYPTO_UNAVAILABLE, 'getRandomValues');
+        }
+        return c.getRandomValues(new Uint8Array(n));
+    }
+
+    /** Raise a coded failure. @private */
+    _fail(code, operation, cause) {
+        throw new CryptoError(code, operation, cause);
+    }
+
+    /**
+     * The only place this module writes a failure to the console, called only from the
+     * operation boundary -- so the code it prints is the code the caller actually received.
+     *
+     * Production output is the operation and the code and nothing else: no platform exception,
+     * no envelope bytes, no key material, no passphrase, no ciphertext, no account identifier.
+     * The cause is printed only under the debug flag.
+     * @private
+     */
+    _diag(operation, err) {
+        const code = (err && err.code) || (err && err.isTransportError ? 'TRANSPORT' : 'UNCODED');
+        if (this.DEBUG) {
+            console.error(`crypto ${operation} ${code}`, err);
+        } else {
+            console.error(`crypto ${operation} ${code}`);
+        }
     }
     
     // =========================================================================
@@ -78,7 +198,7 @@ class ECCCryptoLibrary {
      */
     async generateKeypair() {
         try {
-            const keypair = await window.crypto.subtle.generateKey(
+            const keypair = await this._subtle().generateKey(
                 {
                     name: 'ECDH',
                     namedCurve: this.CURVE
@@ -87,11 +207,9 @@ class ECCCryptoLibrary {
                 this.KEY_USAGES_PRIVATE
             );
             
-            console.log('✅ Generated ECC P-384 keypair');
             return keypair;
         } catch (error) {
-            console.error('❌ Keypair generation failed:', error);
-            throw new Error(`Failed to generate keypair: ${error.message}`);
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, 'generateKeypair');
         }
     }
     
@@ -103,15 +221,13 @@ class ECCCryptoLibrary {
      */
     async exportPublicKeyPEM(publicKey) {
         try {
-            const exported = await window.crypto.subtle.exportKey('spki', publicKey);
+            const exported = await this._subtle().exportKey('spki', publicKey);
             const base64 = this._arrayBufferToBase64(exported);
             const pem = this._formatPEM(base64, 'PUBLIC KEY');
             
-            console.log('✅ Exported public key to PEM');
             return pem;
         } catch (error) {
-            console.error('❌ Public key export failed:', error);
-            throw new Error(`Failed to export public key: ${error.message}`);
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, 'exportPublicKeyPEM');
         }
     }
     
@@ -123,15 +239,13 @@ class ECCCryptoLibrary {
      */
     async exportPrivateKeyPEM(privateKey) {
         try {
-            const exported = await window.crypto.subtle.exportKey('pkcs8', privateKey);
+            const exported = await this._subtle().exportKey('pkcs8', privateKey);
             const base64 = this._arrayBufferToBase64(exported);
             const pem = this._formatPEM(base64, 'PRIVATE KEY');
             
-            console.log('⚠️  Exported UNENCRYPTED private key to PEM');
             return pem;
         } catch (error) {
-            console.error('❌ Private key export failed:', error);
-            throw new Error(`Failed to export private key: ${error.message}`);
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, 'exportPrivateKeyPEM');
         }
     }
     
@@ -146,7 +260,7 @@ class ECCCryptoLibrary {
             const base64 = this._extractPEMContent(pem);
             const der = this._base64ToArrayBuffer(base64);
             
-            const publicKey = await window.crypto.subtle.importKey(
+            const publicKey = await this._subtle().importKey(
                 'spki',
                 der,
                 {
@@ -157,11 +271,9 @@ class ECCCryptoLibrary {
                 []
             );
             
-            console.log('✅ Imported public key from PEM');
             return publicKey;
         } catch (error) {
-            console.error('❌ Public key import failed:', error);
-            throw new Error(`Failed to import public key: ${error.message}`);
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.KEY_UNUSABLE, 'importPublicKeyPEM');
         }
     }
     
@@ -178,7 +290,7 @@ class ECCCryptoLibrary {
 
             // For runtime use (ECDH deriveBits/deriveKey) the key need not be
             // extractable; callers pass extractable=false to shrink the XSS target.
-            const privateKey = await window.crypto.subtle.importKey(
+            const privateKey = await this._subtle().importKey(
                 'pkcs8',
                 der,
                 {
@@ -189,11 +301,9 @@ class ECCCryptoLibrary {
                 this.KEY_USAGES_PRIVATE
             );
 
-            if (this.DEBUG) console.log('✅ Imported private key from PEM');
             return privateKey;
         } catch (error) {
-            console.error('❌ Private key import failed:', error);
-            throw new Error(`Failed to import private key: ${error.message}`);
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.KEY_UNUSABLE, 'importPrivateKeyPEM');
         }
     }
 
@@ -209,10 +319,10 @@ class ECCCryptoLibrary {
         const base64 = this._extractPEMContent(privateKeyPEM);
         const der = this._base64ToArrayBuffer(base64);
         // Import EXTRACTABLE so the public point (x/y) can be read out of the JWK.
-        const priv = await window.crypto.subtle.importKey(
+        const priv = await this._subtle().importKey(
             'pkcs8', der, { name: 'ECDH', namedCurve: this.CURVE }, true, this.KEY_USAGES_PRIVATE);
-        const jwk = await window.crypto.subtle.exportKey('jwk', priv);
-        const pub = await window.crypto.subtle.importKey(
+        const jwk = await this._subtle().exportKey('jwk', priv);
+        const pub = await this._subtle().importKey(
             'jwk', { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y },
             { name: 'ECDH', namedCurve: this.CURVE }, true, []);
         return await this.exportPublicKeyPEM(pub);
@@ -233,17 +343,17 @@ class ECCCryptoLibrary {
     async encryptPrivateKey(privateKeyPEM, password) {
         try {
             // Generate random salt
-            const salt = window.crypto.getRandomValues(new Uint8Array(this.PBKDF2_SALT_LENGTH));
+            const salt = this._randomBytes((this.PBKDF2_SALT_LENGTH));
             
             // Derive AES key from password
             const passwordKey = await this._deriveKeyFromPassword(password, salt);
             
             // Generate IV
-            const iv = window.crypto.getRandomValues(new Uint8Array(this.AES_IV_LENGTH));
+            const iv = this._randomBytes((this.AES_IV_LENGTH));
             
             // Encrypt private key PEM
             const privateKeyBytes = new TextEncoder().encode(privateKeyPEM);
-            const encrypted = await window.crypto.subtle.encrypt(
+            const encrypted = await this._subtle().encrypt(
                 {
                     name: this.AES_ALGORITHM,
                     iv: iv,
@@ -258,7 +368,6 @@ class ECCCryptoLibrary {
             combined.set(iv, 0);
             combined.set(new Uint8Array(encrypted), iv.length);
             
-            console.log('✅ Encrypted private key with password');
             
             return {
                 encrypted: this._arrayBufferToBase64(combined),
@@ -266,8 +375,7 @@ class ECCCryptoLibrary {
                 iterations: this.PBKDF2_ITERATIONS
             };
         } catch (error) {
-            console.error('❌ Private key encryption failed:', error);
-            throw new Error(`Failed to encrypt private key: ${error.message}`);
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, 'encryptPrivateKey');
         }
     }
     
@@ -293,7 +401,7 @@ class ECCCryptoLibrary {
             const ciphertext = combined.slice(this.AES_IV_LENGTH);
             
             // Decrypt
-            const decrypted = await window.crypto.subtle.decrypt(
+            const decrypted = await this._subtle().decrypt(
                 {
                     name: this.AES_ALGORITHM,
                     iv: iv,
@@ -305,11 +413,9 @@ class ECCCryptoLibrary {
             
             const privateKeyPEM = new TextDecoder().decode(decrypted);
             
-            console.log('✅ Decrypted private key with password');
             return privateKeyPEM;
         } catch (error) {
-            console.error('❌ Private key decryption failed:', error);
-            throw new Error(`Failed to decrypt private key: ${error.message}`);
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.AUTH_FAILED, 'decryptPrivateKey');
         }
     }
     
@@ -343,22 +449,23 @@ class ECCCryptoLibrary {
      * @private
      */
     _b64Strict(value, field, expectedBytes = null) {
-        if (typeof value !== 'string') throw new Error(`envelope ${field}: not a string`);
+        if (typeof value !== 'string')
+            this._fail(CRYPTO_ERROR_CODES.ENVELOPE_INVALID, `envelope.${field}.type`);
         if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value) || value.length % 4 !== 0) {
-            throw new Error(`envelope ${field}: not canonical base64`);
+            this._fail(CRYPTO_ERROR_CODES.ENVELOPE_INVALID, `envelope.${field}.charset`);
         }
         let bytes;
         try {
             bytes = new Uint8Array(this._base64ToArrayBuffer(value));
         } catch (e) {
-            throw new Error(`envelope ${field}: not decodable`);
+            this._fail(CRYPTO_ERROR_CODES.ENVELOPE_INVALID, `envelope.${field}.decode`, e);
         }
         // Re-encoding catches non-canonical trailing bits, which the charset test cannot.
         if (this._arrayBufferToBase64(bytes) !== value) {
-            throw new Error(`envelope ${field}: not canonical base64`);
+            this._fail(CRYPTO_ERROR_CODES.ENVELOPE_INVALID, `envelope.${field}.canonical`);
         }
         if (expectedBytes !== null && bytes.length !== expectedBytes) {
-            throw new Error(`envelope ${field}: expected ${expectedBytes} bytes`);
+            this._fail(CRYPTO_ERROR_CODES.ENVELOPE_INVALID, `envelope.${field}.length`);
         }
         return bytes;
     }
@@ -402,16 +509,17 @@ class ECCCryptoLibrary {
             // bound of the same kind as the iteration ceiling. A genuine legacy envelope is
             // ~534 bytes, so it cannot reject a real one.
             if (this._utf8Len(raw) > this.PRIV_ENVELOPE_MAX_SERIALIZED) {
-                throw new Error('envelope: too large');
+                this._fail(CRYPTO_ERROR_CODES.ENVELOPE_INVALID, 'envelope.size');
             }
-            try { obj = JSON.parse(raw); } catch (e) { throw new Error('envelope: not JSON'); }
+            try { obj = JSON.parse(raw); }
+            catch (e) { this._fail(CRYPTO_ERROR_CODES.ENVELOPE_INVALID, 'envelope.json', e); }
         }
         if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
-            throw new Error('envelope: not an object');
+            this._fail(CRYPTO_ERROR_CODES.ENVELOPE_INVALID, 'envelope.shape');
         }
         if (typeof raw !== 'string' &&
             this._utf8Len(JSON.stringify(obj)) > this.PRIV_ENVELOPE_MAX_SERIALIZED) {
-            throw new Error('envelope: too large');
+            this._fail(CRYPTO_ERROR_CODES.ENVELOPE_INVALID, 'envelope.size');
         }
 
         if (Object.prototype.hasOwnProperty.call(obj, 'v')) return this._parseV1(obj);
@@ -419,7 +527,7 @@ class ECCCryptoLibrary {
             Object.prototype.hasOwnProperty.call(obj, 'salt')) {
             return this._parseLegacy(obj);
         }
-        throw new Error('envelope: unrecognized shape');
+        this._fail(CRYPTO_ERROR_CODES.ENVELOPE_INVALID, 'envelope.discriminator');
     }
 
     /** @private */
@@ -427,19 +535,23 @@ class ECCCryptoLibrary {
         const allowed = ['v', 'kdf', 'iter', 'cipher', 'salt', 'iv', 'ct'];
         const keys = Object.keys(obj);
         if (keys.length !== allowed.length || !allowed.every(k => keys.includes(k))) {
-            throw new Error('envelope: v1 field set mismatch');
+            this._fail(CRYPTO_ERROR_CODES.ENVELOPE_INVALID, 'envelope.v1.fieldset');
         }
-        if (obj.v !== this.PRIV_ENVELOPE_VERSION) throw new Error('envelope: unknown version');
-        if (obj.kdf !== this.PRIV_ENVELOPE_KDF) throw new Error('envelope: unknown kdf');
-        if (obj.cipher !== this.PRIV_ENVELOPE_CIPHER) throw new Error('envelope: unknown cipher');
-        if (!this._isInt(obj.iter) || obj.iter < 1 || obj.iter > this.PRIV_ENVELOPE_MAX_ITER) {
-            throw new Error('envelope: work factor out of range');
-        }
+        if (obj.v !== this.PRIV_ENVELOPE_VERSION)
+            this._fail(CRYPTO_ERROR_CODES.ENVELOPE_UNSUPPORTED, 'envelope.v1.version');
+        if (obj.kdf !== this.PRIV_ENVELOPE_KDF)
+            this._fail(CRYPTO_ERROR_CODES.ENVELOPE_UNSUPPORTED, 'envelope.v1.kdf');
+        if (obj.cipher !== this.PRIV_ENVELOPE_CIPHER)
+            this._fail(CRYPTO_ERROR_CODES.ENVELOPE_UNSUPPORTED, 'envelope.v1.cipher');
+        if (!this._isInt(obj.iter) || obj.iter < 1)
+            this._fail(CRYPTO_ERROR_CODES.ENVELOPE_INVALID, 'envelope.v1.iter.shape');
+        if (obj.iter > this.PRIV_ENVELOPE_MAX_ITER)
+            this._fail(CRYPTO_ERROR_CODES.WORK_FACTOR_REJECTED, 'envelope.v1.iter.ceiling');
         const salt = this._b64Strict(obj.salt, 'salt', this.PBKDF2_SALT_LENGTH);
         const iv = this._b64Strict(obj.iv, 'iv', this.AES_IV_LENGTH);
         const ct = this._b64Strict(obj.ct, 'ct');
         if (ct.length < this.PRIV_ENVELOPE_MIN_CT || ct.length > this.PRIV_ENVELOPE_MAX_CT) {
-            throw new Error('envelope: ciphertext length out of range');
+            this._fail(CRYPTO_ERROR_CODES.ENVELOPE_INVALID, 'envelope.v1.ct.length');
         }
         return {
             format: 'v1', iter: obj.iter, salt, iv, ct,
@@ -463,7 +575,8 @@ class ECCCryptoLibrary {
         // A non-numeric value keeps its historical lenient treatment: fall back rather than
         // reject. It simply derives the wrong key and fails authentication.
         if (!Number.isFinite(iter) || iter < 1) iter = this.PBKDF2_ITERATIONS;
-        if (iter > this.PRIV_ENVELOPE_MAX_ITER) throw new Error('envelope: work factor too large');
+        if (iter > this.PRIV_ENVELOPE_MAX_ITER)
+            this._fail(CRYPTO_ERROR_CODES.WORK_FACTOR_REJECTED, 'envelope.legacy.iterations');
 
         const combined = new Uint8Array(this._base64ToArrayBuffer(obj.encrypted));
         const salt = new Uint8Array(this._base64ToArrayBuffer(obj.salt));
@@ -486,13 +599,13 @@ class ECCCryptoLibrary {
      * @returns {Promise<object>} the v1 envelope object
      */
     async encryptPrivateKeyV1(privateKeyPEM, password) {
-        const salt = window.crypto.getRandomValues(new Uint8Array(this.PBKDF2_SALT_LENGTH));
-        const iv = window.crypto.getRandomValues(new Uint8Array(this.AES_IV_LENGTH));
+        const salt = this._randomBytes((this.PBKDF2_SALT_LENGTH));
+        const iv = this._randomBytes((this.AES_IV_LENGTH));
         const saltB64 = this._arrayBufferToBase64(salt);
         const iter = this.PBKDF2_ITERATIONS;
 
         const key = await this._deriveKeyFromPassword(password, salt, iter);
-        const ct = await window.crypto.subtle.encrypt(
+        const ct = await this._subtle().encrypt(
             {
                 name: this.AES_ALGORITHM,
                 iv,
@@ -526,13 +639,31 @@ class ECCCryptoLibrary {
         const key = await this._deriveKeyFromPassword(password, p.salt, p.iter);
         const params = { name: this.AES_ALGORITHM, iv: p.iv, tagLength: this.AES_TAG_LENGTH };
         if (p.aad) params.additionalData = p.aad;
+        // Resolved BEFORE the try, so an unavailable platform cannot be caught below and reported
+        // as a bad passphrase.
+        const subtle = this._subtle();
         let plain;
         try {
-            plain = await window.crypto.subtle.decrypt(params, key, p.ct);
+            plain = await subtle.decrypt(params, key, p.ct);
         } catch (e) {
             // Wrong passphrase and tampered ciphertext are one outcome and are reported
-            // identically. The platform exception is not propagated: it is not ours to vouch for.
-            throw new Error('envelope: authentication failed');
+            // identically. Everything else is NOT: this is the single path whose wording blames
+            // the user's passphrase, so it must not absorb a failure that means something else.
+            //
+            // A coded failure keeps its own code. Of the rest, only an authentication failure --
+            // which Web Crypto reports as OperationError -- earns AUTH_FAILED; an unsupported
+            // algorithm or malformed input falls to the generic code and the generic sentence.
+            // The trade is deliberate: a platform that names an authentication failure something
+            // else would degrade to a vaguer message, which is recoverable, rather than tell a
+            // user their correct passphrase is wrong, which is not. The wrong-passphrase and
+            // tampered-ciphertext tests hold this honest on every platform a round runs.
+            if (e && e.isCryptoError === true) throw e;
+            if (e && e.isTransportError === true) throw e;
+            this._fail(
+                e && e.name === 'OperationError'
+                    ? CRYPTO_ERROR_CODES.AUTH_FAILED
+                    : CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+                'decryptPrivateEnvelope', e);
         }
         return new TextDecoder().decode(plain);
     }
@@ -546,24 +677,29 @@ class ECCCryptoLibrary {
      * @returns {{kit: object, envelope: object}}
      */
     parseRecoveryKitFile(text) {
-        if (typeof text !== 'string') throw new Error('recovery kit: not text');
-        if (this._utf8Len(text) > this.RECOVERY_KIT_MAX_FILE) throw new Error('recovery kit: too large');
+        if (typeof text !== 'string')
+            this._fail(CRYPTO_ERROR_CODES.RECOVERY_KIT_INVALID, 'kit.type');
+        if (this._utf8Len(text) > this.RECOVERY_KIT_MAX_FILE)
+            this._fail(CRYPTO_ERROR_CODES.RECOVERY_KIT_INVALID, 'kit.size');
         let kit;
-        try { kit = JSON.parse(text); } catch (e) { throw new Error('recovery kit: not JSON'); }
+        try { kit = JSON.parse(text); }
+        catch (e) { this._fail(CRYPTO_ERROR_CODES.RECOVERY_KIT_INVALID, 'kit.json', e); }
         if (kit === null || typeof kit !== 'object' || Array.isArray(kit)) {
-            throw new Error('recovery kit: not an object');
+            this._fail(CRYPTO_ERROR_CODES.RECOVERY_KIT_INVALID, 'kit.shape');
         }
-        if (kit.type !== this.RECOVERY_KIT_TYPE) throw new Error('recovery kit: wrong type');
-        if (kit.version !== 1) throw new Error('recovery kit: unknown version');
+        if (kit.type !== this.RECOVERY_KIT_TYPE)
+            this._fail(CRYPTO_ERROR_CODES.RECOVERY_KIT_INVALID, 'kit.marker');
+        if (kit.version !== 1)
+            this._fail(CRYPTO_ERROR_CODES.RECOVERY_KIT_UNSUPPORTED, 'kit.version');
         for (const f of ['user_id', 'fingerprint', 'public_key']) {
             const v = kit[f];
             if (v === null || v === undefined) continue;
             if (typeof v !== 'string' || this._utf8Len(v) > this.RECOVERY_KIT_MAX_FIELD) {
-                throw new Error(`recovery kit: ${f} invalid`);
+                this._fail(CRYPTO_ERROR_CODES.RECOVERY_KIT_INVALID, `kit.field.${f}`);
             }
         }
         if (kit.recovery === null || typeof kit.recovery !== 'object') {
-            throw new Error('recovery kit: missing envelope');
+            this._fail(CRYPTO_ERROR_CODES.RECOVERY_KIT_INVALID, 'kit.envelope.missing');
         }
         // Unknown wrapper members are ignored on purpose, so a future field does not break an
         // older reader. That is the opposite of the envelope itself, where an extra member is a
@@ -581,7 +717,7 @@ class ECCCryptoLibrary {
      */
     async _rawPointFromPublicPEM(pem) {
         const key = await this.importPublicKeyPEM(pem);
-        return new Uint8Array(await window.crypto.subtle.exportKey('raw', key));
+        return new Uint8Array(await this._subtle().exportKey('raw', key));
     }
 
     /**
@@ -593,14 +729,14 @@ class ECCCryptoLibrary {
      */
     async _rawPointFromPrivatePEM(pem) {
         const priv = await this.importPrivateKeyPEM(pem, true);
-        const jwk = await window.crypto.subtle.exportKey('jwk', priv);
+        const jwk = await this._subtle().exportKey('jwk', priv);
         delete jwk.d;
         jwk.key_ops = [];
         delete jwk.ext;
-        const pub = await window.crypto.subtle.importKey(
+        const pub = await this._subtle().importKey(
             'jwk', jwk, { name: 'ECDH', namedCurve: this.CURVE }, true, []
         );
-        return new Uint8Array(await window.crypto.subtle.exportKey('raw', pub));
+        return new Uint8Array(await this._subtle().exportKey('raw', pub));
     }
 
     /**
@@ -656,7 +792,7 @@ class ECCCryptoLibrary {
             const ephemeralPublicKey = await this._importRawPublicKey(ephemeralPublicKeyBytes);
 
             // ECDH -> shared secret -> HKDF wrapping key -> AES-KW unwrap.
-            const sharedSecret = await window.crypto.subtle.deriveBits(
+            const sharedSecret = await this._subtle().deriveBits(
                 { name: 'ECDH', public: ephemeralPublicKey },
                 userPrivateKey,
                 384 // P-384 produces a 384-bit shared secret
@@ -665,11 +801,9 @@ class ECCCryptoLibrary {
             const wrappedDEKBytes = this._base64ToArrayBuffer(wrappedDEKBase64);
             const vaultDEK = await this._unwrapKeyWithAESKW(wrappedDEKBytes, wrappingKey);
 
-            if (this.DEBUG) console.log('✅ Unwrapped vault DEK successfully');
             return vaultDEK;
         } catch (error) {
-            console.error('❌ Vault DEK unwrapping failed:', error);
-            throw new Error(`Failed to unwrap vault DEK: ${error.message}`);
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'unwrapVaultDEK');
         }
     }
 
@@ -685,19 +819,19 @@ class ECCCryptoLibrary {
      * @returns {Promise<{wrappedDEK: string, ephemeralPublicKey: string}>} base64
      */
     async wrapVaultDEK(vaultDEK, recipientPublicKey) {
-        const ephemeral = await window.crypto.subtle.generateKey(
+        const ephemeral = await this._subtle().generateKey(
             { name: 'ECDH', namedCurve: this.CURVE },
             true,                 // extractable: we export the ephemeral PUBLIC key
             ['deriveBits']
         );
-        const sharedSecret = await window.crypto.subtle.deriveBits(
+        const sharedSecret = await this._subtle().deriveBits(
             { name: 'ECDH', public: recipientPublicKey },
             ephemeral.privateKey,
             384
         );
         const wrappingKey = await this._deriveWrappingKey(sharedSecret);
-        const wrapped = await window.crypto.subtle.wrapKey('raw', vaultDEK, wrappingKey, { name: 'AES-KW' });
-        const ephRaw = await window.crypto.subtle.exportKey('raw', ephemeral.publicKey); // uncompressed
+        const wrapped = await this._subtle().wrapKey('raw', vaultDEK, wrappingKey, { name: 'AES-KW' });
+        const ephRaw = await this._subtle().exportKey('raw', ephemeral.publicKey); // uncompressed
         return {
             wrappedDEK: this._arrayBufferToBase64(wrapped),
             ephemeralPublicKey: this._arrayBufferToBase64(ephRaw),
@@ -719,24 +853,24 @@ class ECCCryptoLibrary {
      */
     async computeRegistrationPoP(serverEphemeralPublicKeyPem, nonceBase64, publicKeyPem, userPrivateKey) {
         const serverPub = await this.importPublicKeyPEM(serverEphemeralPublicKeyPem);
-        const shared = await window.crypto.subtle.deriveBits(
+        const shared = await this._subtle().deriveBits(
             { name: 'ECDH', public: serverPub }, userPrivateKey, 384);
-        const hkdfKey = await window.crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
-        const macKeyBits = await window.crypto.subtle.deriveBits(
+        const hkdfKey = await this._subtle().importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+        const macKeyBits = await this._subtle().deriveBits(
             {
                 name: 'HKDF', hash: 'SHA-256',
                 salt: new TextEncoder().encode('dv-ecc-pop-v1'),
                 info: new TextEncoder().encode('registration-pop'),
             },
             hkdfKey, 256);
-        const macKey = await window.crypto.subtle.importKey(
+        const macKey = await this._subtle().importKey(
             'raw', macKeyBits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
         const nonce = new Uint8Array(this._base64ToArrayBuffer(nonceBase64));
         const pubBytes = new TextEncoder().encode(publicKeyPem);
         const msg = new Uint8Array(nonce.byteLength + pubBytes.byteLength);
         msg.set(nonce, 0);
         msg.set(pubBytes, nonce.byteLength);
-        const mac = await window.crypto.subtle.sign('HMAC', macKey, msg);
+        const mac = await this._subtle().sign('HMAC', macKey, msg);
         return this._arrayBufferToBase64(mac);
     }
 
@@ -765,27 +899,27 @@ class ECCCryptoLibrary {
         registeredPublicKeyPem, envelopeJson, userPrivateKey
     ) {
         const serverPub = await this.importPublicKeyPEM(serverEphemeralPublicKeyPem);
-        const shared = await window.crypto.subtle.deriveBits(
+        const shared = await this._subtle().deriveBits(
             { name: 'ECDH', public: serverPub }, userPrivateKey, 384);
-        const hkdfKey = await window.crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
-        const macKeyBits = await window.crypto.subtle.deriveBits(
+        const hkdfKey = await this._subtle().importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+        const macKeyBits = await this._subtle().deriveBits(
             {
                 name: 'HKDF', hash: 'SHA-256',
                 salt: new TextEncoder().encode('dv-ecc-update-pop-v1'),
                 info: new TextEncoder().encode('private-key-update-pop'),
             },
             hkdfKey, 256);
-        const macKey = await window.crypto.subtle.importKey(
+        const macKey = await this._subtle().importKey(
             'raw', macKeyBits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
 
         // The registered key as its canonical uncompressed point (97 bytes), NOT its PEM, so a
         // cosmetically re-encoded stored key cannot invalidate a genuine proof.
         const registered = await this.importPublicKeyPEM(registeredPublicKeyPem);
-        const point = new Uint8Array(await window.crypto.subtle.exportKey('raw', registered));
+        const point = new Uint8Array(await this._subtle().exportKey('raw', registered));
 
         const enc = new TextEncoder();
         const sha256 = async bytes =>
-            new Uint8Array(await window.crypto.subtle.digest('SHA-256', bytes));
+            new Uint8Array(await this._subtle().digest('SHA-256', bytes));
 
         const parts = [
             enc.encode('dockvault-private-key-update-pop-v1'),
@@ -807,7 +941,7 @@ class ECCCryptoLibrary {
 
         const transcript = await sha256(joined);
         return this._arrayBufferToBase64(
-            await window.crypto.subtle.sign('HMAC', macKey, transcript));
+            await this._subtle().sign('HMAC', macKey, transcript));
     }
 
     // =========================================================================
@@ -821,10 +955,10 @@ class ECCCryptoLibrary {
     /** Derive an AES-GCM wrapping key for the team-private-key path (distinct info from the
      * DEK path's AES-KW key). @private */
     async _deriveTeamPrivWrappingKey(sharedSecretBits) {
-        const sharedSecretKey = await window.crypto.subtle.importKey(
+        const sharedSecretKey = await this._subtle().importKey(
             'raw', sharedSecretBits, 'HKDF', false, ['deriveKey']
         );
-        return await window.crypto.subtle.deriveKey(
+        return await this._subtle().deriveKey(
             { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(),
               info: new TextEncoder().encode('team-privkey-wrapping-v1') },
             sharedSecretKey,
@@ -845,22 +979,22 @@ class ECCCryptoLibrary {
      * @returns {Promise<{wrappedKey: string, ephemeralPublicKey: string}>} base64 (wrappedKey = iv||ct)
      */
     async wrapPrivateKeyToPublic(teamPrivateKey, recipientPublicKey) {
-        const ephemeral = await window.crypto.subtle.generateKey(
+        const ephemeral = await this._subtle().generateKey(
             { name: 'ECDH', namedCurve: this.CURVE }, true, ['deriveBits']
         );
-        const sharedSecret = await window.crypto.subtle.deriveBits(
+        const sharedSecret = await this._subtle().deriveBits(
             { name: 'ECDH', public: recipientPublicKey }, ephemeral.privateKey, 384
         );
         const wrappingKey = await this._deriveTeamPrivWrappingKey(sharedSecret);
-        const pkcs8 = await window.crypto.subtle.exportKey('pkcs8', teamPrivateKey);
-        const iv = window.crypto.getRandomValues(new Uint8Array(this.AES_IV_LENGTH));
-        const ct = await window.crypto.subtle.encrypt(
+        const pkcs8 = await this._subtle().exportKey('pkcs8', teamPrivateKey);
+        const iv = this._randomBytes((this.AES_IV_LENGTH));
+        const ct = await this._subtle().encrypt(
             { name: this.AES_ALGORITHM, iv, tagLength: this.AES_TAG_LENGTH }, wrappingKey, pkcs8
         );
         const combined = new Uint8Array(iv.length + ct.byteLength);
         combined.set(iv, 0);
         combined.set(new Uint8Array(ct), iv.length);
-        const ephRaw = await window.crypto.subtle.exportKey('raw', ephemeral.publicKey); // uncompressed
+        const ephRaw = await this._subtle().exportKey('raw', ephemeral.publicKey); // uncompressed
         return {
             wrappedKey: this._arrayBufferToBase64(combined.buffer),
             ephemeralPublicKey: this._arrayBufferToBase64(ephRaw),
@@ -880,20 +1014,20 @@ class ECCCryptoLibrary {
         const ephemeralPublicKey = await this._importRawPublicKey(
             this._base64ToArrayBuffer(ephemeralPublicKeyBase64)
         );
-        const sharedSecret = await window.crypto.subtle.deriveBits(
+        const sharedSecret = await this._subtle().deriveBits(
             { name: 'ECDH', public: ephemeralPublicKey }, memberPrivateKey, 384
         );
         const wrappingKey = await this._deriveTeamPrivWrappingKey(sharedSecret);
         const raw = new Uint8Array(this._base64ToArrayBuffer(wrappedKeyBase64));
         const iv = raw.slice(0, this.AES_IV_LENGTH);
         const ct = raw.slice(this.AES_IV_LENGTH);
-        const pkcs8 = await window.crypto.subtle.decrypt(
+        const pkcs8 = await this._subtle().decrypt(
             { name: this.AES_ALGORITHM, iv, tagLength: this.AES_TAG_LENGTH }, wrappingKey, ct
         );
         // Least privilege: the team private key is only ever used to ECDH-unwrap the vault DEK
         // (deriveBits), never deriveKey — so import it with deriveBits only, not the identity
         // keypair's broader KEY_USAGES_PRIVATE.
-        return await window.crypto.subtle.importKey(
+        return await this._subtle().importKey(
             'pkcs8', pkcs8, { name: 'ECDH', namedCurve: this.CURVE }, extractable, ['deriveBits']
         );
     }
@@ -911,9 +1045,9 @@ class ECCCryptoLibrary {
      */
     async encryptFile(fileContent, vaultDEK) {
         try {
-            const iv = window.crypto.getRandomValues(new Uint8Array(this.AES_IV_LENGTH));
+            const iv = this._randomBytes((this.AES_IV_LENGTH));
             
-            const encrypted = await window.crypto.subtle.encrypt(
+            const encrypted = await this._subtle().encrypt(
                 {
                     name: this.AES_ALGORITHM,
                     iv: iv,
@@ -928,11 +1062,9 @@ class ECCCryptoLibrary {
             combined.set(iv, 0);
             combined.set(new Uint8Array(encrypted), iv.length);
             
-            console.log('✅ Encrypted file successfully');
             return combined.buffer;
         } catch (error) {
-            console.error('❌ File encryption failed:', error);
-            throw new Error(`Failed to encrypt file: ${error.message}`);
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, 'encryptFile');
         }
     }
     
@@ -949,7 +1081,7 @@ class ECCCryptoLibrary {
             const iv = data.slice(0, this.AES_IV_LENGTH);
             const ciphertext = data.slice(this.AES_IV_LENGTH);
             
-            const decrypted = await window.crypto.subtle.decrypt(
+            const decrypted = await this._subtle().decrypt(
                 {
                     name: this.AES_ALGORITHM,
                     iv: iv,
@@ -959,11 +1091,9 @@ class ECCCryptoLibrary {
                 ciphertext
             );
             
-            console.log('✅ Decrypted file successfully');
             return decrypted;
         } catch (error) {
-            console.error('❌ File decryption failed:', error);
-            throw new Error(`Failed to decrypt file: ${error.message}`);
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED, 'decryptFile');
         }
     }
     
@@ -1012,11 +1142,11 @@ class ECCCryptoLibrary {
         // Every new sealed name MUST bind its object id (v2) so a blob can't be transposed to a
         // different row. Refuse to emit an unbound (v1) blob — a missing id is a caller bug.
         if (objId === undefined || objId === null || objId === '') {
-            throw new Error('encryptName requires objId (the file/folder id) to bind the sealed name');
+            this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, 'encryptName.objId');
         }
         const aad = this._zkNameAadV2(vaultId, field, epoch, objId);
-        const iv = window.crypto.getRandomValues(new Uint8Array(this.AES_IV_LENGTH));
-        const ct = await window.crypto.subtle.encrypt(
+        const iv = this._randomBytes((this.AES_IV_LENGTH));
+        const ct = await this._subtle().encrypt(
             { name: this.AES_ALGORITHM, iv, tagLength: this.AES_TAG_LENGTH, additionalData: aad },
             vaultDEK,
             new TextEncoder().encode(String(plaintext)),
@@ -1044,7 +1174,7 @@ class ECCCryptoLibrary {
         const data = new Uint8Array(this._base64ToArrayBuffer(b64));
         const iv = data.slice(0, this.AES_IV_LENGTH);
         const ct = data.slice(this.AES_IV_LENGTH);
-        const pt = await window.crypto.subtle.decrypt(
+        const pt = await this._subtle().decrypt(
             { name: this.AES_ALGORITHM, iv, tagLength: this.AES_TAG_LENGTH, additionalData: aad },
             vaultDEK,
             ct,
@@ -1060,17 +1190,17 @@ class ECCCryptoLibrary {
      * @returns {Promise<string>} hex
      */
     async nameBlindIndex(name, vaultDEK, vaultId, epoch) {
-        const raw = await window.crypto.subtle.exportKey('raw', vaultDEK);
-        const hkdf = await window.crypto.subtle.importKey('raw', raw, 'HKDF', false, ['deriveBits']);
-        const biKeyBits = await window.crypto.subtle.deriveBits(
+        const raw = await this._subtle().exportKey('raw', vaultDEK);
+        const hkdf = await this._subtle().importKey('raw', raw, 'HKDF', false, ['deriveBits']);
+        const biKeyBits = await this._subtle().deriveBits(
             { name: 'HKDF', hash: 'SHA-256',
               salt: new TextEncoder().encode('dv-zk-name-bi-v1'),
               info: new TextEncoder().encode(`${vaultId}|${epoch}`) },
             hkdf, 256,
         );
-        const hmacKey = await window.crypto.subtle.importKey(
+        const hmacKey = await this._subtle().importKey(
             'raw', biKeyBits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-        const sig = await window.crypto.subtle.sign('HMAC', hmacKey, new TextEncoder().encode(String(name)));
+        const sig = await this._subtle().sign('HMAC', hmacKey, new TextEncoder().encode(String(name)));
         return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
@@ -1086,15 +1216,14 @@ class ECCCryptoLibrary {
      */
     async calculateFingerprint(publicKey) {
         try {
-            const exported = await window.crypto.subtle.exportKey('raw', publicKey);
-            const hash = await window.crypto.subtle.digest('SHA-256', exported);
+            const exported = await this._subtle().exportKey('raw', publicKey);
+            const hash = await this._subtle().digest('SHA-256', exported);
             const hex = Array.from(new Uint8Array(hash))
                 .map(b => b.toString(16).padStart(2, '0'))
                 .join('');
             return hex.substring(0, 16);
         } catch (error) {
-            console.error('❌ Fingerprint calculation failed:', error);
-            throw new Error(`Failed to calculate fingerprint: ${error.message}`);
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, 'calculateFingerprint');
         }
     }
     
@@ -1105,7 +1234,7 @@ class ECCCryptoLibrary {
      */
     async generateVaultDEK() {
         try {
-            const dek = await window.crypto.subtle.generateKey(
+            const dek = await this._subtle().generateKey(
                 {
                     name: this.AES_ALGORITHM,
                     length: this.AES_KEY_LENGTH
@@ -1114,11 +1243,9 @@ class ECCCryptoLibrary {
                 ['encrypt', 'decrypt']
             );
             
-            console.log('✅ Generated vault DEK');
             return dek;
         } catch (error) {
-            console.error('❌ DEK generation failed:', error);
-            throw new Error(`Failed to generate vault DEK: ${error.message}`);
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, 'generateVaultDEK');
         }
     }
     
@@ -1133,7 +1260,7 @@ class ECCCryptoLibrary {
     async _deriveKeyFromPassword(password, salt, iterations = null) {
         const iters = iterations || this.PBKDF2_ITERATIONS;
         
-        const passwordKey = await window.crypto.subtle.importKey(
+        const passwordKey = await this._subtle().importKey(
             'raw',
             new TextEncoder().encode(password),
             'PBKDF2',
@@ -1141,7 +1268,7 @@ class ECCCryptoLibrary {
             ['deriveKey']
         );
         
-        return await window.crypto.subtle.deriveKey(
+        return await this._subtle().deriveKey(
             {
                 name: 'PBKDF2',
                 salt: salt,
@@ -1163,7 +1290,7 @@ class ECCCryptoLibrary {
      * @private
      */
     async _deriveWrappingKey(sharedSecretBits) {
-        const sharedSecretKey = await window.crypto.subtle.importKey(
+        const sharedSecretKey = await this._subtle().importKey(
             'raw',
             sharedSecretBits,
             'HKDF',
@@ -1171,7 +1298,7 @@ class ECCCryptoLibrary {
             ['deriveKey']
         );
         // Derive an AES-KW wrapping key (RFC 3394) so it matches server aes_key_wrap
-        return await window.crypto.subtle.deriveKey(
+        return await this._subtle().deriveKey(
             {
                 name: 'HKDF',
                 hash: 'SHA-256',
@@ -1194,7 +1321,6 @@ class ECCCryptoLibrary {
      */
     async _unwrapKeyWithAESKW(wrappedKeyBytes, wrappingKey) {
         try {
-            console.log('  - attempting AES-KW unwrap; wrappedKeyBytes length:', (wrappedKeyBytes && wrappedKeyBytes.byteLength) || (wrappedKeyBytes && wrappedKeyBytes.length));
 
             // Ensure we have an ArrayBuffer
             let wrappedBuf;
@@ -1208,7 +1334,7 @@ class ECCCryptoLibrary {
             }
 
             // Use SubtleCrypto.unwrapKey to unwrap RFC 3394 (AES-KW) wrapped key
-            const unwrappedKey = await window.crypto.subtle.unwrapKey(
+            const unwrappedKey = await this._subtle().unwrapKey(
                 'raw', // format of the unwrapped key material
                 wrappedBuf, // wrapped key bytes (RFC3394)
                 wrappingKey, // the AES-KW CryptoKey derived via HKDF
@@ -1218,11 +1344,9 @@ class ECCCryptoLibrary {
                 ['encrypt', 'decrypt'] // usages
             );
 
-            console.log('  - AES-KW unwrap succeeded; obtained DEK CryptoKey');
             return unwrappedKey;
         } catch (err) {
-            console.error('❌ AES-KW unwrap failed:', err);
-            throw err;
+            throw _coerceCryptoError(err, CRYPTO_ERROR_CODES.WRAP_FAILED, 'unwrapKeyWithAESKW');
         }
     }
     
@@ -1236,7 +1360,6 @@ class ECCCryptoLibrary {
         
         // Check if it's compressed (49 bytes for P-384)
         if (bytes.length === 49 && (bytes[0] === 0x02 || bytes[0] === 0x03)) {
-            console.log('🔄 Converting compressed point to uncompressed...');
             // For P-384, we need to decompress the point
             // This is complex, so we'll import as SPKI (PEM) instead
             // Create a minimal SPKI structure for the compressed point
@@ -1244,7 +1367,7 @@ class ECCCryptoLibrary {
             rawKeyBytes = uncompressedBytes;
         }
         
-        return await window.crypto.subtle.importKey(
+        return await this._subtle().importKey(
             'raw',
             rawKeyBytes,
             {
@@ -1267,7 +1390,6 @@ class ECCCryptoLibrary {
         // Since Web Crypto doesn't natively support compressed points,
         // we'll need to ask the server to convert it
         
-        console.log('🔧 Requesting server to decompress point...');
         
         try {
             // Convert to base64 for transmission
@@ -1286,17 +1408,25 @@ class ECCCryptoLibrary {
             });
             
             if (!response.ok) {
-                throw new Error(`Server decompression failed: ${response.statusText}`);
+                // Deliberately NOT a CryptoError: see the transport exclusion in
+                // docs/design/vault-client-crypto-errors-v1.md. A rate-limit or authorization
+                // response must not be reportable through the crypto code channel.
+                const transport = new Error('point decompression request failed');
+                transport.isTransportError = true;
+                transport.status = response.status;
+                throw transport;
             }
             
             const result = await response.json();
             const uncompressed = this._base64ToArrayBuffer(result.uncompressed_point);
             
-            console.log('✅ Server decompressed point:', uncompressed.byteLength, 'bytes');
             return uncompressed;
         } catch (error) {
-            console.error('❌ Point decompression failed:', error);
-            throw new Error(`Failed to decompress P-384 point: ${error.message}`);
+            if (error && error.isTransportError) throw error;
+            const transport = new Error('point decompression failed');
+            transport.isTransportError = true;
+            transport.cause = error;
+            throw transport;
         }
     }
     
@@ -1351,6 +1481,117 @@ class ECCCryptoLibrary {
             .replace(/\s/g, '');
     }
 }
+
+/**
+ * Default code for each public operation, applied at its boundary.
+ *
+ * A method that already raised a CryptoError keeps it; anything else -- a DOMException from
+ * WebCrypto, a TypeError from a malformed argument -- is converted here. This exists because most
+ * of the methods below have no try block of their own: they reject with whatever the platform
+ * threw, and a caller branching on `.code` would see `undefined`.
+ *
+ * Read the value as the answer to "if this operation fails for a reason nothing more specific
+ * caught, what should the user be told?"
+ */
+const _OPERATION_DEFAULT_CODE = Object.freeze({
+    // Key material in, key material out. A failure here means the bytes are not a usable key.
+    importPublicKeyPEM: CRYPTO_ERROR_CODES.KEY_UNUSABLE,
+    importPrivateKeyPEM: CRYPTO_ERROR_CODES.KEY_UNUSABLE,
+    derivePublicKeyPEMFromPrivatePEM: CRYPTO_ERROR_CODES.KEY_UNUSABLE,
+    // Listed for completeness: this one catches everything internally and returns a boolean,
+    // so the boundary is a no-op today. It stays so the table remains a full statement of the
+    // public surface rather than a list of whichever methods happened to need it.
+    privateKeyMatchesRegisteredPublicKey: CRYPTO_ERROR_CODES.KEY_UNUSABLE,
+
+    // Passphrase-derived. An authentication failure here is a wrong passphrase or tampering, and
+    // the two are indistinguishable to AES-GCM.
+    // Legacy reader, reached only by the compatibility fixtures -- the app parses first, so a
+    // malformed blob yields ENVELOPE_INVALID there rather than arriving here. Anything wired to
+    // call this directly should parse first for the same reason.
+    decryptPrivateKey: CRYPTO_ERROR_CODES.AUTH_FAILED,
+    decryptPrivateEnvelope: CRYPTO_ERROR_CODES.AUTH_FAILED,
+
+    // Envelope grammar, no key involved.
+    parsePrivateEnvelope: CRYPTO_ERROR_CODES.ENVELOPE_INVALID,
+    parseRecoveryKitFile: CRYPTO_ERROR_CODES.RECOVERY_KIT_INVALID,
+
+    // Data-key wrapping.
+    unwrapVaultDEK: CRYPTO_ERROR_CODES.WRAP_FAILED,
+    wrapVaultDEK: CRYPTO_ERROR_CODES.WRAP_FAILED,
+    wrapPrivateKeyToPublic: CRYPTO_ERROR_CODES.WRAP_FAILED,
+    unwrapPrivateKeyFromWrapped: CRYPTO_ERROR_CODES.WRAP_FAILED,
+
+    // Vault-key-encrypted content. The user supplied no secret to reach here, so a failure is
+    // never a passphrase problem and must never be reported as one.
+    decryptFile: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
+    decryptName: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
+
+    // Everything else: a primitive rejected for a reason that is not authentication, not policy
+    // and not input.
+    generateKeypair: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    exportPublicKeyPEM: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    exportPrivateKeyPEM: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    encryptPrivateKey: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    encryptPrivateKeyV1: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    computeRegistrationPoP: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    computeKeyUpdatePoP: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    encryptFile: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    encryptName: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    nameBlindIndex: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    calculateFingerprint: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    generateVaultDEK: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+});
+
+for (const [_name, _code] of Object.entries(_OPERATION_DEFAULT_CODE)) {
+    const _inner = ECCCryptoLibrary.prototype[_name];
+    if (typeof _inner !== 'function') {
+        throw new Error(`crypto boundary names a method that does not exist: ${_name}`);
+    }
+    // Convert whatever was thrown; shared by both wrappers below.
+    const _handle = function (self, err) {
+        const out = (err && err.isTransportError)
+            ? err                                    // keeps its own identity; see the exclusion
+            : _coerceCryptoError(err, _code, _name);
+        // Defensive: a method pulled off the instance and called unbound would leave `self`
+        // undefined, and a boundary whose whole job is "no failure escapes uncoded" must not
+        // become the thing that throws. Diagnose when we can; always return the coded failure.
+        if (self && typeof self._diag === 'function') self._diag(_name, out);
+        return out;
+    };
+
+    // A SYNCHRONOUS method must stay synchronous. Two of these -- envelope and recovery-kit
+    // parsing -- are called for their throw, inside a plain try/catch, with the result used on
+    // the next line. An async wrapper would hand back a pending promise instead: the catch would
+    // never fire, so the corrupt-envelope guard would pass everything, and the caller reading a
+    // field off the result would get undefined. Detect and preserve.
+    const _isAsync = _inner.constructor && _inner.constructor.name === 'AsyncFunction';
+
+    Object.defineProperty(ECCCryptoLibrary.prototype, _name, {
+        configurable: true,
+        writable: true,
+        value: _isAsync
+            ? async function (...args) {
+                try {
+                    return await _inner.apply(this, args);
+                } catch (err) {
+                    throw _handle(this, err);
+                }
+            }
+            : function (...args) {
+                try {
+                    return _inner.apply(this, args);
+                } catch (err) {
+                    throw _handle(this, err);
+                }
+            },
+    });
+}
+
+// The code set and the error type travel with the class, so a `require` of this module and the
+// classic-script global expose one shape. The default export is unchanged on purpose: seven test
+// harnesses do `module.exports`-style construction against it.
+ECCCryptoLibrary.CryptoError = CryptoError;
+ECCCryptoLibrary.CODES = CRYPTO_ERROR_CODES;
 
 // Export for use in other modules
 if (typeof module !== 'undefined' && module.exports) {
