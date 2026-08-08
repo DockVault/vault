@@ -727,6 +727,76 @@ class ECCCryptoLibrary {
         return this._arrayBufferToBase64(mac);
     }
 
+    /**
+     * Proof of possession for REPLACING the stored private-key envelope.
+     *
+     * Specified by docs/design/vault-private-key-update-pop-v1.md. Deliberately shares the shape
+     * of computeRegistrationPoP above but NOT its domain: a different HKDF salt and info, so a
+     * proof for one protocol can never validate for the other.
+     *
+     * The transcript binds the exact replacement bytes, so a captured proof cannot authorise a
+     * different replacement. Digests contribute 32 RAW bytes, the nonce is base64-DECODED, and
+     * both ids are lowercase canonical UUIDs — pinned so this and the server cannot drift.
+     *
+     * @param {string} serverEphemeralPublicKeyPem  from the challenge
+     * @param {string} nonceBase64                  from the challenge
+     * @param {string} challengeId                  from the challenge
+     * @param {string} userId                       this account's UUID
+     * @param {string} registeredPublicKeyPem       the account's REGISTERED public key
+     * @param {string} envelopeJson                 the exact UTF-8 string about to be uploaded
+     * @param {CryptoKey} userPrivateKey            the recovered private key (ECDH, deriveBits)
+     * @returns {Promise<string>} base64 MAC
+     */
+    async computeKeyUpdatePoP(
+        serverEphemeralPublicKeyPem, nonceBase64, challengeId, userId,
+        registeredPublicKeyPem, envelopeJson, userPrivateKey
+    ) {
+        const serverPub = await this.importPublicKeyPEM(serverEphemeralPublicKeyPem);
+        const shared = await window.crypto.subtle.deriveBits(
+            { name: 'ECDH', public: serverPub }, userPrivateKey, 384);
+        const hkdfKey = await window.crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+        const macKeyBits = await window.crypto.subtle.deriveBits(
+            {
+                name: 'HKDF', hash: 'SHA-256',
+                salt: new TextEncoder().encode('dv-ecc-update-pop-v1'),
+                info: new TextEncoder().encode('private-key-update-pop'),
+            },
+            hkdfKey, 256);
+        const macKey = await window.crypto.subtle.importKey(
+            'raw', macKeyBits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+
+        // The registered key as its canonical uncompressed point (97 bytes), NOT its PEM, so a
+        // cosmetically re-encoded stored key cannot invalidate a genuine proof.
+        const registered = await this.importPublicKeyPEM(registeredPublicKeyPem);
+        const point = new Uint8Array(await window.crypto.subtle.exportKey('raw', registered));
+
+        const enc = new TextEncoder();
+        const sha256 = async bytes =>
+            new Uint8Array(await window.crypto.subtle.digest('SHA-256', bytes));
+
+        const parts = [
+            enc.encode('dockvault-private-key-update-pop-v1'),
+            enc.encode(String(challengeId).toLowerCase()),
+            new Uint8Array(this._base64ToArrayBuffer(nonceBase64)),
+            enc.encode(String(userId).toLowerCase()),
+            await sha256(point),
+            await sha256(enc.encode(envelopeJson)),
+        ];
+        // 0x00-separated, so the concatenation is unambiguous.
+        const total = parts.reduce((n, p) => n + p.byteLength, 0) + (parts.length - 1);
+        const joined = new Uint8Array(total);
+        let at = 0;
+        parts.forEach((p, i) => {
+            if (i > 0) joined[at++] = 0x00;
+            joined.set(p, at);
+            at += p.byteLength;
+        });
+
+        const transcript = await sha256(joined);
+        return this._arrayBufferToBase64(
+            await window.crypto.subtle.sign('HMAC', macKey, transcript));
+    }
+
     // =========================================================================
     // HIERARCHICAL MODE — wrap/unwrap a TEAM PRIVATE KEY to/from a member pubkey
     // =========================================================================

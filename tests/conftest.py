@@ -83,6 +83,37 @@ def compute_registration_pop(client, priv, public_key_pem: str) -> dict:
     return {"challenge_id": ch["challenge_id"], "mac": mac}
 
 
+def compute_key_update_pop(client, priv, public_key_pem: str, user_id: str, envelope: str) -> dict:
+    """Client-side proof for REPLACING the private-key envelope -- a faithful Python mirror of
+    app/services/ecc_update_pop.py and ecc_crypto.js.computeKeyUpdatePoP.
+
+    Fetches an update challenge, derives the MAC key under the UPDATE domain (deliberately
+    different salt and info from registration, so the two protocols cannot be cross-used), and
+    MACs the transcript that binds the exact replacement bytes. `priv` must be the key matching
+    the account's REGISTERED public key. Returns {challenge_id, mac} for PUT /ecc/keys/private.
+    """
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import serialization, hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    ch = client.post("/ecc/keys/private/challenge").json()
+    server_pub = serialization.load_pem_public_key(ch["server_ephemeral_public_key"].encode())
+    shared = priv.exchange(ec.ECDH(), server_pub)
+    mac_key = HKDF(algorithm=hashes.SHA256(), length=32,
+                   salt=b"dv-ecc-update-pop-v1", info=b"private-key-update-pop").derive(shared)
+    point = serialization.load_pem_public_key(public_key_pem.encode()).public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+    transcript = _hashlib.sha256(b"\x00".join([
+        b"dockvault-private-key-update-pop-v1",
+        str(ch["challenge_id"]).lower().encode(),
+        _base64.b64decode(ch["nonce"]),
+        str(user_id).lower().encode(),
+        _hashlib.sha256(point).digest(),
+        _hashlib.sha256(envelope.encode("utf-8")).digest(),
+    ])).digest()
+    mac = _base64.b64encode(_hmac.new(mac_key, transcript, _hashlib.sha256).digest()).decode()
+    return {"challenge_id": ch["challenge_id"], "mac": mac}
+
+
 def ensure_ecc_keypair(client) -> None:
     """Ensure the logged-in user has a registered ECC keypair (idempotent).
 

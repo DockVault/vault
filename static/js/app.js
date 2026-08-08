@@ -7085,6 +7085,45 @@ function isZkVault(v) { return !!v && v.type === 'zero_knowledge'; }
 // FORWARD-ONLY for a deployment: once a v1 envelope exists, rolling the image back to a reader
 // that predates it makes that envelope unreadable, and registration refuses a second keypair so
 // there is no self-service recovery. See docs/design/vault-private-key-envelope-v1.md §8.1.
+// Replace the stored private-key envelope, proving we hold the CURRENTLY REGISTERED key.
+//
+// Without this proof any session for the account could overwrite the envelope and permanently
+// destroy access to every vault: registration refuses a second keypair, and removing the first
+// would orphan every wrapped key. See docs/design/vault-private-key-update-pop-v1.md.
+//
+// `privateKey` must be the key just recovered on this path - which is by definition the
+// registered one, because both callers verify it against the registered public key first.
+async function zkPutPrivateEnvelope(envelope, privateKey, registeredPublicKeyPem, userId,
+                                    newPassphrase, expectedPem) {
+    const body = JSON.stringify(envelope);
+    // Read the re-wrapped envelope back and confirm it really recovers the same key BEFORE
+    // replacing the only copy, and before spending one of the few challenges the rate budget
+    // allows. The server cannot do this check - it cannot read the envelope - so a client bug
+    // that produced an undecryptable blob would otherwise look exactly like a correct one, and
+    // would be discovered at the next unlock, when it is too late.
+    let readBack = null;
+    try {
+        readBack = await eccLib().decryptPrivateEnvelope(body, newPassphrase);
+    } catch (e) {
+        console.error('Re-wrapped key failed its own read-back:', e);
+    }
+    if (readBack !== expectedPem) {
+        throw new Error('Internal error preparing the new encryption key — nothing was changed.');
+    }
+    const challenge = await apiRequest('/ecc/keys/private/challenge', { method: 'POST' });
+    const mac = await eccLib().computeKeyUpdatePoP(
+        challenge.server_ephemeral_public_key, challenge.nonce, challenge.challenge_id,
+        userId, registeredPublicKeyPem, body, privateKey
+    );
+    await apiRequest('/ecc/keys/private', {
+        method: 'PUT',
+        body: JSON.stringify({
+            encrypted_private_key: body,
+            pop: { challenge_id: challenge.challenge_id, mac },
+        }),
+    });
+}
+
 async function zkWrapPrivateKey(pem, passphrase) {
     const lib = eccLib();
     return lib.PRIV_ENVELOPE_WRITE_V1
@@ -7237,10 +7276,11 @@ async function zkChangePassphrase() {
     if (confirm !== next) throw new Error('Passphrases do not match.');
 
     const enc = await zkWrapPrivateKey(pem, next);  // legacy shape, or v1 when enabled
-    await apiRequest('/ecc/keys/private', {
-        method: 'PUT',
-        body: JSON.stringify({ encrypted_private_key: JSON.stringify(enc) }),
-    });
+    // Re-wrapping replaces the account's only copy, so prove possession of the registered key.
+    // `pem` was already checked against that key above, so it can answer the challenge.
+    const provingKey = await eccLib().importPrivateKeyPEM(pem, false);
+    await zkPutPrivateEnvelope(enc, provingKey, pubForChange.public_key,
+                               (currentUser && currentUser.id), next, pem);
     // Keep a NON-extractable runtime copy so the session stays unlocked with the same key.
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
     zkArmIdleLock();
@@ -7338,7 +7378,11 @@ async function zkRestoreFromRecoveryKey(kitText) {
     if (confirm !== next) throw new Error('Passphrases do not match.');
 
     const enc = await zkWrapPrivateKey(pem, next);
-    await apiRequest('/ecc/keys/private', { method: 'PUT', body: JSON.stringify({ encrypted_private_key: JSON.stringify(enc) }) });
+    // Recovery works precisely because a valid kit reconstructs the SAME key: the key recovered
+    // above is the registered one (verified against it), so it can answer the challenge.
+    const recoveredKey = await eccLib().importPrivateKeyPEM(pem, false);
+    await zkPutPrivateEnvelope(enc, recoveredKey, pub.public_key,
+                               (currentUser && currentUser.id), next, pem);
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
     zkArmIdleLock();
 }

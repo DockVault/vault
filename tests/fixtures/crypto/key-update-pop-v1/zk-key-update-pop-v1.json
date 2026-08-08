@@ -1,0 +1,30 @@
+{
+  "schema": "dockvault-crypto-vector-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "format": "private-key update proof of possession v1",
+  "spec": "docs/design/vault-private-key-update-pop-v1.md",
+  "fixture_id": "zk-key-update-pop-v1",
+  "source_paths": [
+    "app/services/ecc_update_pop.py",
+    "static/js/ecc_crypto.js"
+  ],
+  "inputs": {
+    "server_ephemeral_private_scalar_hex": "2a",
+    "account_private_scalar_hex": "11",
+    "server_ephemeral_public_key_pem": "-----BEGIN PUBLIC KEY-----\nMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE4DXosz764Jh/a5lFKShb5KnVUJPSucFV\nwIbis8AlqMHIYAl7tSmyaLf/lXGVGKwKl+xCdlDWAO5ss0zVLKCTm2exVJ+kLrK1\na8EpeRZ6CQB1UQ3/vDlaS24EvsOj7Erp\n-----END PUBLIC KEY-----\n",
+    "account_public_key_pem": "-----BEGIN PUBLIC KEY-----\nMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEQJmVIgi0iJYApeu8sT4aMmkr77BzO0Hm\n3MYU5C5YBfgXASqZGvH0hsrzqa3Z/8wDXs+Ud3gzBZg5R0WUr2A1mBY60/gAitDN\nm3l9J38jiLME2k0vqpaA7PplDvXiOwmg\n-----END PUBLIC KEY-----\n",
+    "account_private_key_pem": "-----BEGIN PRIVATE KEY-----\nMIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDAAAAAAAAAAAAAAAAAA\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABGhZANiAARAmZUiCLSI\nlgCl67yxPhoyaSvvsHM7QebcxhTkLlgF+BcBKpka8fSGyvOprdn/zANez5R3eDMF\nmDlHRZSvYDWYFjrT+ACK0M2beX0nfyOIswTaTS+qloDs+mUO9eI7CaA=\n-----END PRIVATE KEY-----\n",
+    "challenge_id": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+    "user_id": "9b2c1d5e-7a34-4c81-9f2b-1a2b3c4d5e6f",
+    "nonce_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    "replacement_envelope_utf8": "{\"encrypted\": \"DOCKVAULT-PUBLIC-TEST-ONLY\", \"salt\": \"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\", \"iterations\": 600000}"
+  },
+  "expected": {
+    "transcript_sha256_hex": "1b585c340ff7498551abe2aad12931ebb730af61f2148fd35b45b8168ecd327e",
+    "mac_b64": "BUwn03LQu43FR1UCocDpVuyAgqP/3WwK6ARoDGGfMQY=",
+    "hkdf_salt": "dv-ecc-update-pop-v1",
+    "hkdf_info": "private-key-update-pop",
+    "protocol_label": "dockvault-private-key-update-pop-v1"
+  }
+}

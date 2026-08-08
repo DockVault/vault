@@ -1,11 +1,11 @@
 """Temporary-credential / zero-knowledge key-boundary compatibility matrix.
 
-The ordinary tests pin security invariants that hold today, including the whole-vault
-temporary key-access boundary. The single remaining ``characterization`` test records a
-permissive baseline that proof-bound private-envelope replacement is expected to reverse;
-it stays marked until that lands. A temporary credential never receives a zero-knowledge
-passphrase: the server can return only the opaque private-key envelope that the owner
-previously encrypted in the browser.
+These tests pin security invariants that hold today: the whole-vault temporary key-access
+boundary, and proof-bound replacement of the private-key envelope. No ``characterization``
+tests remain -- the last one recorded that an ordinary bearer could replace the envelope
+without proof, and it has been flipped now that the replacement path requires one. A temporary
+credential never receives a zero-knowledge passphrase: the server can return only the opaque
+private-key envelope that the owner previously encrypted in the browser.
 """
 
 from contextlib import contextmanager
@@ -739,22 +739,26 @@ def test_no_key_ordinary_and_temp_reads_and_temp_identity_write_denials(
         )
 
 
-@pytest.mark.characterization
-def test_ordinary_recovery_rewrap_preserves_identity_without_fresh_proof(
+def test_ordinary_bearer_cannot_replace_the_envelope_without_proving_possession(
     admin, temp_user_client
 ):
-    """Current weakness: an ordinary bearer replaces the envelope without fresh proof.
+    """An unproven replacement is refused, and the account is left exactly as it was.
 
-    Rewrapping preserves the registered public identity and its vault wraps. The
-    original envelope is restored with an independent read-back in ``finally``;
-    vault cleanup is attempted even if either restoration check fails.
+    This test previously documented the OPPOSITE as a known weakness: any ordinary session for
+    the account could overwrite the stored envelope. Nothing leaked -- the server cannot read
+    either blob -- but the owner lost access to every vault, permanently, because registration
+    refuses a second keypair and removing the first would orphan every wrapped key. The
+    expectation is flipped here now that replacement requires proof of possession.
+
+    Legitimate replacement still works and is covered by the passphrase-change and recovery
+    suites; what is pinned here is the refusal and, just as importantly, that a refused attempt
+    changes nothing.
     """
     owner = temp_user_client
     original = _opaque_envelope("ordinary_original")
     identity = _register_identity(owner, original)
     replacement = _opaque_envelope("ordinary_unproven")
     vault_ids = []
-    replacement_applied = False
 
     with _settings(admin, zero_knowledge_enabled=True):
         try:
@@ -763,17 +767,28 @@ def test_ordinary_recovery_rewrap_preserves_identity_without_fresh_proof(
             before_keys = owner.get(f"/ecc/vaults/{vault['id']}/keys")
             assert before_keys.status_code == 200, before_keys.text
 
-            changed = owner.put(
+            # No proof at all.
+            unproven = owner.put(
                 "/ecc/keys/private",
                 json={"encrypted_private_key": replacement},
             )
-            assert changed.status_code == 200, changed.text
-            replacement_applied = True
-            assert (
-                owner.get("/ecc/keys/private").json()["encrypted_private_key"]
-                == replacement
-            )
+            assert unproven.status_code == 400, unproven.text
 
+            # A well-formed but bogus proof, and a proof naming a challenge that never existed.
+            for pop in (
+                {"challenge_id": str(uuid.uuid4()), "mac": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
+                {"challenge_id": "not-a-uuid", "mac": "AAAA"},
+            ):
+                bogus = owner.put(
+                    "/ecc/keys/private",
+                    json={"encrypted_private_key": replacement, "pop": pop},
+                )
+                assert bogus.status_code == 400, bogus.text
+
+            # Nothing moved: the envelope, the registered identity and the vault wrap are intact.
+            assert (
+                owner.get("/ecc/keys/private").json()["encrypted_private_key"] == original
+            )
             after_identity = owner.get("/ecc/keys/public").json()
             assert after_identity["user_id"] == identity["user_id"]
             assert after_identity["public_key"] == identity["public_key"]
@@ -783,8 +798,6 @@ def test_ordinary_recovery_rewrap_preserves_identity_without_fresh_proof(
             assert after_keys.json()["wrapped_dek"] == before_keys.json()["wrapped_dek"]
         finally:
             cleanup_errors = []
-            if replacement_applied:
-                _restore_private_envelope(owner, original, cleanup_errors)
             _cleanup_owned_vaults(owner, vault_ids, cleanup_errors)
             _raise_cleanup_errors(cleanup_errors)
 

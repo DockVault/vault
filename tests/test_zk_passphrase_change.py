@@ -26,7 +26,7 @@ def _register(client, blob: str):
         "public_key": pub_pem, "encrypted_private_key": blob,
         "pop": compute_registration_pop(client, priv, pub_pem),
     }).raise_for_status()
-    return pub_pem
+    return pub_pem, priv
 
 
 def test_passphrase_change_swaps_blob_keeps_public_key(admin, temp_user, temp_user_client):
@@ -34,7 +34,7 @@ def test_passphrase_change_swaps_blob_keeps_public_key(admin, temp_user, temp_us
     user owns remains accessible (its wrapped DEK is bound to the unchanged public key)."""
     c = temp_user_client
     blob1 = json.dumps({"encrypted": "blob-one", "salt": "s1", "iterations": 600000})
-    _register(c, blob1)
+    pub_pem, priv = _register(c, blob1)
     fp1 = c.get("/ecc/keys/public").json()["fingerprint"]
     assert c.get("/ecc/keys/private").json()["encrypted_private_key"] == blob1
     with _ZkOn(admin):
@@ -44,8 +44,21 @@ def test_passphrase_change_swaps_blob_keeps_public_key(admin, temp_user, temp_us
         assert c.get(f"/ecc/vaults/{vid}/keys").json()["has_access"] is True
         # Change the passphrase (PUT a re-wrapped blob).
         blob2 = json.dumps({"encrypted": "blob-two", "salt": "s2", "iterations": 600000})
-        r = c.put("/ecc/keys/private", json={"encrypted_private_key": blob2})
+        # Replacement now requires proof that the caller holds the REGISTERED key, bound to
+        # these exact bytes. Without it the account's only copy could be overwritten by any
+        # session, which is unrecoverable.
+        from conftest import compute_key_update_pop
+        pop = compute_key_update_pop(c, priv, pub_pem, c.user["id"], blob2)
+        r = c.put("/ecc/keys/private", json={"encrypted_private_key": blob2, "pop": pop})
         assert r.status_code == 200, r.text
+        # An unproven replacement is refused, and the proof is single-use: the same one cannot
+        # be replayed, nor reused to install different bytes.
+        blob3 = json.dumps({"encrypted": "blob-three", "salt": "s3", "iterations": 600000})
+        assert c.put("/ecc/keys/private",
+                     json={"encrypted_private_key": blob3}).status_code == 400
+        assert c.put("/ecc/keys/private",
+                     json={"encrypted_private_key": blob3, "pop": pop}).status_code == 400
+        assert c.get("/ecc/keys/private").json()["encrypted_private_key"] == blob2
         # The new blob is served, and the PUBLIC key (fingerprint) is UNCHANGED — the
         # load-bearing property that keeps every wrapped DEK valid without a re-wrap. (has_access
         # is a membership-row lookup, untouched by this endpoint; it's a sanity check, not an
