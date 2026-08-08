@@ -30,10 +30,33 @@ The same format is produced in two different places, and this matters more than 
    the user keeps.
 
 They share a writer today. The difference is trust: the stored envelope arrives from the server,
-whereas **the recovery kit arrives from a file the user selects at restore time**. That makes the
-kit the only envelope whose fields are fully attacker-supplied, and it is therefore the primary
-reason the bounds in §4 and §7 exist. Any statement in this document about parsing, bounds or
-rejection applies to both unless it says otherwise.
+whereas **the recovery kit arrives from a file the user selects at restore time**. Both are
+untrusted input — a database-level attacker controls the stored envelope's fields just as fully —
+but the kit is the one an ordinary user can be socially engineered into supplying, and it is the
+reason the bounds in §4 and §7 are load-bearing rather than theoretical. Any statement about
+parsing, bounds or rejection applies to both unless it says otherwise.
+
+**The kit is not a bare envelope.** It is a JSON file that *contains* one:
+
+```json
+{ "type": "dockvault-zk-recovery-key", "version": 1,
+  "user_id": "...", "fingerprint": "...", "public_key": "<PEM>",
+  "recovery": { <envelope> } }
+```
+
+The envelope lives at `.recovery` and must satisfy §4 (v1) or §5 (legacy) exactly as a stored
+envelope does. The wrapper is a separate structure with its own obligations, because its members
+are equally attacker-supplied:
+
+- The file as read from disk must be rejected above **65,536 bytes before it is parsed at all**.
+  A genuine kit is well under 2 KB; the margin is for future wrapper fields, not for an attacker.
+- `type` must equal `"dockvault-zk-recovery-key"` and `version` must equal `1`.
+- `user_id`, `fingerprint` and `public_key` are strings with a maximum length of 4,096 each.
+  `public_key` is compared against the account's registered key; it is never a source of trust and
+  never substitutes for the §6 consistency check.
+- Unknown wrapper members are ignored rather than rejected, so a future field does not break an
+  older reader. This differs deliberately from the envelope itself, where an unexpected member is a
+  structural error.
 
 ## 2. Why version 1 exists
 
@@ -47,9 +70,11 @@ It works, and every deployed account uses it. Four properties are missing:
 
 1. **It is not self-identifying.** No version, no named KDF, no named cipher. A reader must infer
    all three from field names, and a second format cannot be introduced unambiguously.
-2. **There is no format domain separation.** Nothing distinguishes a stored envelope from a
-   recovery kit, or this format from a future one that reuses the same passphrase, salt and
-   iteration count with different plaintext framing.
+2. **There is no format domain separation.** Nothing distinguishes this format from the legacy
+   shape, or from a future one that reuses the same passphrase, salt and iteration count with
+   different plaintext framing. (Separating the *stored envelope* from the *recovery kit* is
+   deliberately **not** in scope — see §4.2 — because they wrap the same key under different
+   passphrases and a swap already fails to decrypt.)
 3. **The work factor is unbounded.** A reader attempts whatever integer it is given. For the
    recovery kit, that integer comes from an untrusted file: a value of 2,000,000,000 hangs the tab.
 4. **Nothing is validated before use.** Field types, base64 validity and salt/IV/ciphertext lengths
@@ -214,11 +239,15 @@ Readers accept **both** formats. Dispatch is by shape, in this order:
    to 600,000 when absent. No AAD.
 4. Otherwise → reject.
 
-**Legacy parsing stays exactly as permissive as it is today**, with one addition: the `iter`
-ceiling of §3.1, which is the denial-of-service bound and applies to any envelope from an untrusted
-file. Canonical-base64 strictness and the v1 field-set rules apply to **v1 only**. Tightening
-decoding on a format that is already deployed can only reject envelopes that currently work; there
-is nothing to gain and a user's vault access to lose.
+**Legacy parsing stays exactly as permissive as it is today**, with two additions, both
+denial-of-service bounds that apply to any envelope because any envelope may arrive from an
+untrusted file: the `iter` ceiling of §3.1, and the 16,384-byte serialized cap. Neither can reject
+a genuine legacy envelope — real ones carry 600,000 iterations and serialize to 534 bytes.
+
+Everything else — canonical-base64 strictness, the v1 field set, and the salt, IV and ciphertext
+length rules — applies to **v1 only**. §7 states the scoping rule by rule. Tightening decoding on a
+format that is already deployed can only reject envelopes that currently work; there is nothing to
+gain and a user's vault access to lose.
 
 **Legacy remains writable for initial registration during the compatibility window.** Stale browser
 tabs still produce it, and refusing it would break first-key registration for a client that is
@@ -243,7 +272,11 @@ After decrypting and before caching anything, the client:
    re-importing the remainder as a public key;
 3. exports both that key and the account's registered public key as **raw uncompressed P-384
    points** — 97 bytes, `0x04 ‖ X(48) ‖ Y(48)`;
-4. compares those byte strings in constant time.
+4. compares those byte strings.
+
+An ordinary comparison is correct here. Both operands are public keys, so there is no secret for a
+timing difference to leak, and a constant-time guarantee is not reliably achievable in JavaScript
+anyway. Demanding one would be cargo-cult precision that an implementer cannot honour.
 
 Exporting to a raw point is what makes the comparison canonical: it normalises away PEM line
 wrapping, whitespace, trailing newlines, base64 padding and SPKI header encoding, none of which are
@@ -278,10 +311,37 @@ malformed input is rejected at negligible cost. They also happen before the user
 passphrase where the flow allows it, so a corrupt recovery kit fails immediately rather than after
 a prompt.
 
-Rejected: non-object, array or null; missing, extra or wrong-typed members; a non-integer or
-out-of-range `iter`; an unknown `v`, `kdf` or `cipher`; non-canonical or invalid base64 (v1); a salt
-that is not exactly 32 bytes; an IV that is not exactly 12; a `ct` shorter than 17 or longer than
-8,192 bytes; a serialized envelope over 16,384 bytes; and any authentication failure.
+**Every rule below is scoped to a format. An unscoped checklist is precisely how legacy gets
+tightened by accident, and tightening legacy can only reject envelopes that work today.**
+
+| Rule | v1 | Legacy |
+|---|---|---|
+| Not a JSON object, or an array, or `null` | reject | reject |
+| Serialized envelope over 16,384 bytes | reject | reject |
+| Work factor above the §3.1 ceiling | reject | reject |
+| Work factor not a positive integer | reject | **accept** — see below |
+| Missing, extra or wrong-typed member | reject | not applied |
+| Unknown `v`, `kdf` or `cipher` | reject | n/a |
+| Non-canonical or invalid base64 | reject | not applied |
+| Salt not exactly 32 decoded bytes | reject | not applied |
+| IV not exactly 12 decoded bytes | reject | n/a — legacy has no `iv` member |
+| `ct` outside 17 … 8,192 decoded bytes | reject | not applied |
+| Authentication failure | reject | reject |
+
+Two entries need their reasoning stated, because both look like oversights and are not:
+
+- **The two size bounds apply to both shapes.** They are denial-of-service bounds of the same kind
+  as the ceiling, and §3.1's argument — that any envelope may arrive from an untrusted file —
+  applies to a hostile kit in the legacy shape just as much as a v1 one. They are also provably
+  safe to extend: a genuine legacy envelope serializes to 534 bytes, so a 16,384-byte cap
+  has around thirty times the headroom and cannot reject a real one.
+- **Legacy keeps today's lenient handling of a non-integer `iterations`.** Today's reader coerces
+  it and falls back to 600,000 when it is absent or unusable. Rejecting instead would be a new
+  failure mode on already-deployed data, for no gain — the ceiling already bounds the expensive
+  direction, and a nonsense value simply derives the wrong key and fails authentication.
+
+Everything not listed as applying to legacy is **v1 only**. Legacy parsing is otherwise exactly as
+permissive as it is today, per §5.
 
 Errors identify **which rule** failed, never the value that failed it, and no message, thrown value
 or console output composed by this code includes envelope bytes, ciphertext, salt, IV, passphrase or
