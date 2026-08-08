@@ -157,19 +157,37 @@ def zk_grant_has_key_authority(db, user, vault, caps=None, *, legacy=False) -> b
     )
 
 
-def _reachable_zk_vaults(db, user):
+def _reachable_zk_vaults(db, user, credential=None):
+    """Active zero-knowledge vaults this account can reach.
+
+    When a credential is supplied, vaults created AFTER it are excluded. That bound is the whole
+    point: eligibility for the account-wide private-key envelope must reflect what the OWNER
+    granted, never what the holder went on to create.
+
+    Without it a credential carrying zero-knowledge CREATE authority plus whole-account vault
+    access can manufacture its own eligibility -- denied the envelope while the account owns no
+    such vault, it creates one (which inserts its own wrapped key at the current epoch) and asks
+    again, now qualifying. Refusing creation instead is not an option: a scoped credential is
+    legitimately allowed to create these vaults, and a test pins that.
+
+    A credential with no creation timestamp is treated as qualifying for nothing, because this
+    gate releases an offline-attackable copy of the account identity and an unknown age cannot be
+    reasoned about.
+    """
     member_vaults = select(vault_members.c.vault_id).where(
         vault_members.c.user_id == user.id
     )
-    return (
-        db.query(Vault)
-        .filter(
-            Vault.type == "zero_knowledge",
-            Vault.is_active == True,  # noqa: E712
-            or_(Vault.owner_id == user.id, Vault.id.in_(member_vaults)),
-        )
-        .all()
+    query = db.query(Vault).filter(
+        Vault.type == "zero_knowledge",
+        Vault.is_active == True,  # noqa: E712
+        or_(Vault.owner_id == user.id, Vault.id.in_(member_vaults)),
     )
+    if credential is not None:
+        created = getattr(credential, "created_at", None)
+        if created is None:
+            return []
+        query = query.filter(Vault.created_at < created)
+    return query.all()
 
 
 def _credential(db, user):
@@ -275,7 +293,7 @@ def may_release_private_envelope(db, user) -> bool:
     if credential.scope is None:
         return any(
             zk_grant_has_key_authority(db, user, vault, legacy=True)
-            for vault in _reachable_zk_vaults(db, user)
+            for vault in _reachable_zk_vaults(db, user, credential)
         )
     if not isinstance(credential.scope, dict):
         return False
@@ -287,7 +305,7 @@ def may_release_private_envelope(db, user) -> bool:
         caps = credential.scope.get("vault_caps_default", [])
         return any(
             zk_grant_has_key_authority(db, user, vault, caps)
-            for vault in _reachable_zk_vaults(db, user)
+            for vault in _reachable_zk_vaults(db, user, credential)
         )
     if mode != "selected":
         return False

@@ -76,7 +76,7 @@ def _install_dek_evidence_probe(page: Page) -> None:
     page.evaluate(
         """
         () => {
-            window.__vcb1aDekEvidence = [];
+            window.__zkCreateDekEvidence = [];
             const original = ECCCryptoLibrary.prototype.generateVaultDEK;
             ECCCryptoLibrary.prototype.generateVaultDEK = async function (...args) {
                 const dek = await original.apply(this, args);
@@ -84,7 +84,7 @@ def _install_dek_evidence_probe(page: Page) -> None:
                 const digest = await window.crypto.subtle.digest('SHA-256', raw);
                 const digestHex = Array.from(new Uint8Array(digest))
                     .map(byte => byte.toString(16).padStart(2, '0')).join('');
-                window.__vcb1aDekEvidence.push({
+                window.__zkCreateDekEvidence.push({
                     byteLength: raw.byteLength,
                     digest: digestHex,
                 });
@@ -96,7 +96,7 @@ def _install_dek_evidence_probe(page: Page) -> None:
 
 
 def _dek_evidence(page: Page) -> list[dict]:
-    return page.evaluate("() => window.__vcb1aDekEvidence.slice()")
+    return page.evaluate("() => window.__zkCreateDekEvidence.slice()")
 
 
 def _unwrap_descriptor_dek(descriptor: dict, identity_scalar: str) -> bytes:
@@ -182,10 +182,10 @@ def test_existing_identity_create_only_uses_fresh_deks_without_private_key(
     vault_ids = []
     contexts = {}
     cleanup_errors = []
-    passphrase = "vcb1a-existing-key-passphrase"
+    passphrase = "zk-create-existing-key-passphrase"
     vault_specs = [
-        (_unique("vcb1a_direct"), False),
-        (_unique("vcb1a_hierarchical"), True),
+        (_unique("zk_create_direct"), False),
+        (_unique("zk_create_hierarchical"), True),
     ]
 
     try:
@@ -320,8 +320,8 @@ def test_first_key_registration_race_refetches_public_key_without_private_unlock
     vault_id = None
     contexts = {}
     cleanup_errors = []
-    browser_passphrase = "vcb1a-race-loser-passphrase"
-    vault_name = _unique("vcb1a_registration_race")
+    browser_passphrase = "zk-create-race-loser-passphrase"
+    vault_name = _unique("zk_create_registration_race")
 
     try:
         current_settings = admin.get("/settings")

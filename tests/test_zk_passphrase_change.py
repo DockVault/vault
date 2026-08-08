@@ -12,7 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from conftest import create_zk_vault, ensure_ecc_keypair, ZK_WRAPPED_DEK_STUB, ZK_EPHEMERAL_STUB, ApiClient
+from conftest import (create_zk_vault, ensure_ecc_keypair, compute_key_update_pop,
+                      ZK_WRAPPED_DEK_STUB, ZK_EPHEMERAL_STUB, ApiClient)
 
 
 def _register(client, blob: str):
@@ -47,17 +48,36 @@ def test_passphrase_change_swaps_blob_keeps_public_key(admin, temp_user, temp_us
         # Replacement now requires proof that the caller holds the REGISTERED key, bound to
         # these exact bytes. Without it the account's only copy could be overwritten by any
         # session, which is unrecoverable.
-        from conftest import compute_key_update_pop
         pop = compute_key_update_pop(c, priv, pub_pem, c.user["id"], blob2)
         r = c.put("/ecc/keys/private", json={"encrypted_private_key": blob2, "pop": pop})
         assert r.status_code == 200, r.text
-        # An unproven replacement is refused, and the proof is single-use: the same one cannot
-        # be replayed, nor reused to install different bytes.
+        # That proof is spent. Replaying it VERBATIM -- same proof, same bytes, so nothing but
+        # consumption can reject it -- must not install the same blob a second time.
+        assert c.put("/ecc/keys/private",
+                     json={"encrypted_private_key": blob2, "pop": pop}).status_code == 400, (
+            "a proof was accepted twice, so a successful replacement does not consume its challenge"
+        )
+        # An unproven replacement is refused.
         blob3 = json.dumps({"encrypted": "blob-three", "salt": "s3", "iterations": 600000})
         assert c.put("/ecc/keys/private",
                      json={"encrypted_private_key": blob3}).status_code == 400
+
+        # The challenge is DURABLY consumed, which is a different property from transcript
+        # binding and needs the same bytes to isolate it. Mint a fresh proof, spend it on a
+        # WRONG mac, then re-send the genuine proof for the SAME blob: that can only fail if the
+        # challenge was really consumed by the failed attempt. Asserting with different bytes
+        # would pass on the transcript hash alone, even if a wrong proof rolled the delete back
+        # and left the challenge alive for mac grinding.
+        blob4 = json.dumps({"encrypted": "blob-four", "salt": "s4", "iterations": 600000})
+        pop4 = compute_key_update_pop(c, priv, pub_pem, c.user["id"], blob4)
+        bad = dict(pop4, mac="A" * len(pop4["mac"]))
         assert c.put("/ecc/keys/private",
-                     json={"encrypted_private_key": blob3, "pop": pop}).status_code == 400
+                     json={"encrypted_private_key": blob4, "pop": bad}).status_code == 400
+        assert c.put("/ecc/keys/private",
+                     json={"encrypted_private_key": blob4, "pop": pop4}).status_code == 400, (
+            "a genuine proof still worked after a failed attempt on the same challenge, so the "
+            "challenge was not durably consumed and macs can be ground against one issuance"
+        )
         assert c.get("/ecc/keys/private").json()["encrypted_private_key"] == blob2
         # The new blob is served, and the PUBLIC key (fingerprint) is UNCHANGED — the
         # load-bearing property that keeps every wrapped DEK valid without a re-wrap. (has_access
@@ -139,3 +159,35 @@ def test_passphrase_rewrap_crypto_roundtrip():
     assert out["unlockedOld"] is True, "old passphrase did not unlock the original key"
     assert out["unlockedNew"] is True, "new passphrase did not decrypt to the same key"
     assert out["oldFails"] is True, "old passphrase still decrypted the re-wrapped blob"
+
+
+def test_the_replacement_path_is_blind_to_the_envelope_shape(admin, temp_user_client):
+    """A legacy-shaped and a versioned-shaped replacement each succeed against the same server.
+
+    The design calls this out explicitly, and it is load-bearing rather than incidental: it is
+    what keeps enabling the versioned writer a CLIENT-only decision instead of a coordinated
+    client-and-server release. The server stores the bytes the proof covers and never parses
+    them, so both shapes are just strings to it.
+
+    Without this, a field validator or a `startswith('{"encrypted"')` sanity check could be added
+    to the route, satisfy the source-level grep that guards this today, and still break every
+    versioned replacement -- surfacing only on the day an operator flips the writer on.
+    """
+    c = temp_user_client
+    legacy_blob = json.dumps({"encrypted": "shape-legacy", "salt": "s1", "iterations": 600000})
+    pub_pem, priv = _register(c, legacy_blob)
+    # No cleanup: temp_user is function-scoped and the account is deleted on teardown, so whatever
+    # shape this leaves behind reaches nothing.
+    for label, blob in (
+        ("legacy", json.dumps({
+            "encrypted": "shape-legacy-2", "salt": "s2", "iterations": 600000})),
+        ("versioned", json.dumps({
+            "v": 1, "kdf": "PBKDF2-SHA256", "iter": 600000, "cipher": "AES-256-GCM",
+            "salt": "c2FsdA==", "iv": "aXY=", "ct": "Y3Q="})),
+    ):
+        pop = compute_key_update_pop(c, priv, pub_pem, c.user["id"], blob)
+        r = c.put("/ecc/keys/private",
+                  json={"encrypted_private_key": blob, "pop": pop})
+        assert r.status_code == 200, f"{label}: {r.text}"
+        # Stored verbatim, byte for byte -- the server neither parsed nor normalised it.
+        assert c.get("/ecc/keys/private").json()["encrypted_private_key"] == blob, label

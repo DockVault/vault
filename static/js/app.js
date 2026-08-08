@@ -7076,15 +7076,6 @@ function setZkIdleLockMinutes(n) {
 
 function isZkVault(v) { return !!v && v.type === 'zero_knowledge'; }
 
-// The single writer for every private-key envelope this app produces: first registration,
-// passphrase change, recovery-kit export and recovery restore.
-//
-// It emits the versioned v1 shape only when the deployment has switched the writer on, and the
-// legacy shape otherwise. Readers accept both either way, which is what lets readers roll out
-// everywhere before any writer produces bytes an older client cannot read. Enabling v1 is
-// FORWARD-ONLY for a deployment: once a v1 envelope exists, rolling the image back to a reader
-// that predates it makes that envelope unreadable, and registration refuses a second keypair so
-// there is no self-service recovery. See docs/design/vault-private-key-envelope-v1.md §8.1.
 // Replace the stored private-key envelope, proving we hold the CURRENTLY REGISTERED key.
 //
 // Without this proof any session for the account could overwrite the envelope and permanently
@@ -7124,6 +7115,15 @@ async function zkPutPrivateEnvelope(envelope, privateKey, registeredPublicKeyPem
     });
 }
 
+// The single writer for every private-key envelope this app produces: first registration,
+// passphrase change, recovery-kit export and recovery restore.
+//
+// It emits the versioned v1 shape only when the deployment has switched the writer on, and the
+// legacy shape otherwise. Readers accept both either way, which is what lets readers roll out
+// everywhere before any writer produces bytes an older client cannot read. Enabling v1 is
+// FORWARD-ONLY for a deployment: once a v1 envelope exists, rolling the image back to a reader
+// that predates it makes that envelope unreadable, and registration refuses a second keypair so
+// there is no self-service recovery. See docs/design/vault-private-key-envelope-v1.md §8.1.
 async function zkWrapPrivateKey(pem, passphrase) {
     const lib = eccLib();
     return lib.PRIV_ENVELOPE_WRITE_V1
@@ -7227,8 +7227,6 @@ async function zkRegisterNewKeypair() {
             // Pack salt+iterations into the opaque blob so a later session can
             // decrypt it; the server stores this verbatim and cannot read it.
             encrypted_private_key: JSON.stringify(enc),
-            key_salt: enc.salt,
-            key_iterations: enc.iterations,
             pop: { challenge_id: challenge.challenge_id, mac },
         }),
     });
@@ -7280,7 +7278,7 @@ async function zkChangePassphrase() {
     // `pem` was already checked against that key above, so it can answer the challenge.
     const provingKey = await eccLib().importPrivateKeyPEM(pem, false);
     await zkPutPrivateEnvelope(enc, provingKey, pubForChange.public_key,
-                               (currentUser && currentUser.id), next, pem);
+                               pubForChange.user_id, next, pem);
     // Keep a NON-extractable runtime copy so the session stays unlocked with the same key.
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
     zkArmIdleLock();
@@ -7304,6 +7302,14 @@ async function zkExportRecoveryKey() {
     let pem;
     try { pem = await eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, current); }
     catch (e) { console.error('Recovery export unlock failed:', e); throw new Error('Incorrect current passphrase (or the stored key is corrupt).'); }
+    // Not required by the consistency rule, which scopes the check to paths that CACHE a key or
+    // replace the stored one. Done anyway because a kit minted from a key that does not match the
+    // account is useless, and catching it here turns an unrecoverable surprise at restore into a
+    // recoverable error at export.
+    const pubForExport = await apiRequest('/ecc/keys/public', { silent: true });
+    if (!await eccLib().privateKeyMatchesRegisteredPublicKey(pem, pubForExport && pubForExport.public_key)) {
+        throw new Error('The stored key does not match this account’s registered public key; no recovery key was written.');
+    }
     const rec = await showPrompt('Choose a RECOVERY passphrase. Store it somewhere safe and SEPARATE from your normal passphrase — it protects the recovery key you are about to download.', 'Recovery passphrase', { password: true });
     if (rec === null) throw new Error('Cancelled.');
     if (!rec || rec.length < 8) throw new Error('Recovery passphrase must be at least 8 characters.');
@@ -7312,13 +7318,19 @@ async function zkExportRecoveryKey() {
     if (confirm !== rec) throw new Error('Passphrases do not match.');
 
     const enc = await zkWrapPrivateKey(pem, rec);  // legacy shape, or v1 when enabled
-    const pub = await apiRequest('/ecc/keys/public', { silent: true });
+    // Reuse the response fetched above rather than asking again. The read is not free (it stamps
+    // last_used and commits), and reusing it guarantees the kit records the very public key the
+    // private key was just checked against, rather than a second read that could disagree with
+    // the one the check passed on.
     const kit = {
         type: 'dockvault-zk-recovery-key',
         version: 1,
-        user_id: (typeof currentUser !== 'undefined' && currentUser && currentUser.id) || null,
-        fingerprint: (pub && pub.fingerprint) || null,
-        public_key: (pub && pub.public_key) || null,   // to verify the kit matches this account on restore
+        // Server-sourced, for the same reason the proof transcripts are: currentUser is hydrated
+        // from localStorage, whose loader tolerates corrupt data, and a kit stamped with the wrong
+        // account is precisely the unrecoverable surprise the check above exists to prevent.
+        user_id: (pubForExport && pubForExport.user_id) || null,
+        fingerprint: (pubForExport && pubForExport.fingerprint) || null,
+        public_key: (pubForExport && pubForExport.public_key) || null,  // verified on restore
         recovery: enc,
     };
     const blob = new Blob([JSON.stringify(kit, null, 2)], { type: 'application/json' });
@@ -7382,7 +7394,7 @@ async function zkRestoreFromRecoveryKey(kitText) {
     // above is the registered one (verified against it), so it can answer the challenge.
     const recoveredKey = await eccLib().importPrivateKeyPEM(pem, false);
     await zkPutPrivateEnvelope(enc, recoveredKey, pub.public_key,
-                               (currentUser && currentUser.id), next, pem);
+                               pub.user_id, next, pem);
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
     zkArmIdleLock();
 }

@@ -48,8 +48,9 @@ The envelope lives at `.recovery` and must satisfy §4 (v1) or §5 (legacy) exac
 envelope does. The wrapper is a separate structure with its own obligations, because its members
 are equally attacker-supplied:
 
-- The file as read from disk must be rejected above **65,536 bytes before it is parsed at all**.
-  A genuine kit is well under 2 KB; the margin is for future wrapper fields, not for an attacker.
+- The file as read from disk must be rejected above **65,536 bytes before it is parsed at all**,
+  measured as UTF-8 bytes. A genuine kit is well under 2 KB; the margin is for future wrapper
+  fields, not for an attacker.
 - `type` must equal `"dockvault-zk-recovery-key"` and `version` must equal `1`.
 - `user_id`, `fingerprint` and `public_key` are strings with a maximum length of 4,096 each.
   `public_key` is compared against the account's registered key; it is never a source of trust and
@@ -168,7 +169,8 @@ A v1 envelope is a JSON **object** with exactly these seven members and no other
   at most 8,192.
 - **Canonical base64**: standard alphabet, correct padding, no whitespace, no URL-safe variant. A
   string that decodes but is not the canonical encoding of its own bytes is rejected.
-- Serialized envelope at most 16,384 bytes.
+- Serialized envelope at most 16,384 bytes. **Bytes, not characters** — client and server both
+  measure the UTF-8 encoding, so neither can accept a blob the other rejects.
 
 ### 4.1 Writer obligations
 
@@ -367,8 +369,13 @@ it is not a passphrase problem, and telling the user it is would send them to th
 ### 8.1 Rollout, and the rollback trap
 
 **A v1 envelope cannot be read by a client that predates this document.** That is inherent to
-introducing a format, and it is why the writer ships behind a gate that is off by default and is
-enabled as a separate, recorded decision rather than by merging code.
+introducing a format, and it is why the writer ships behind a gate that is off by default, so that
+merging the code does not enable the format.
+
+The gate is a constant in the client crypto module, carrying the warning below at the point where
+it is flipped, and a test pins it to `false`. Turning it on is therefore a deliberate, reviewable
+source change rather than a runtime toggle — which is the property that matters here. If it later
+becomes an operator-facing setting, the warning has to travel with it.
 
 For a self-hosted product the realistic lockout is not a stale tab — it is **an operator rolling the
 image back**. Once any client has written a v1 envelope, downgrading the deployment to an image

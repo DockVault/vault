@@ -332,37 +332,6 @@ def _cleanup_owned_vaults(owner, vault_ids, errors=None) -> None:
         raise AssertionError("cleanup failures:\n" + "\n".join(errors))
 
 
-def _restore_private_envelope(owner, envelope: str, errors) -> None:
-    """Attempt restoration and its independent read-back before later cleanup proceeds."""
-    try:
-        restored = owner.put(
-            "/ecc/keys/private",
-            json={"encrypted_private_key": envelope},
-        )
-        _record_cleanup_response(errors, "restore private-key envelope", restored)
-    except Exception as exc:  # noqa: BLE001 - the read-back and vault cleanup must still run
-        errors.append(
-            f"restore private-key envelope: raised {type(exc).__name__}: {exc}"
-        )
-
-    try:
-        read_back = owner.get("/ecc/keys/private")
-        _record_cleanup_response(
-            errors, "read restored private-key envelope", read_back
-        )
-        if read_back.status_code == 200:
-            actual = read_back.json().get("encrypted_private_key")
-            if actual != envelope:
-                errors.append(
-                    "read restored private-key envelope: ciphertext did not match "
-                    "the original envelope"
-                )
-    except Exception as exc:  # noqa: BLE001 - vault cleanup must still run
-        errors.append(
-            f"read restored private-key envelope: raised {type(exc).__name__}: {exc}"
-        )
-
-
 def _raise_cleanup_errors(errors) -> None:
     if errors:
         raise AssertionError("cleanup failures:\n" + "\n".join(errors))
@@ -2777,5 +2746,75 @@ def test_hierarchical_key_release_tracks_live_current_teampriv_state(
                     expected_status=200,
                     case="reactivated current TEAMPRIV",
                 )
+        finally:
+            _cleanup_owned_vaults(owner, vault_ids)
+
+
+def test_a_credential_cannot_manufacture_its_own_envelope_eligibility(
+    admin, temp_user_client
+):
+    """Creating a zero-knowledge vault must not turn a denied credential into an eligible one.
+
+    Whole-account mode decides eligibility from a live query over reachable zero-knowledge
+    vaults. Nothing refuses a temporary session on the creation path -- deliberately, since a
+    scoped credential is allowed to create these vaults -- and creation inserts the creator's own
+    wrapped key at the current epoch, which is exactly what the key check looks for. So a
+    credential denied the account envelope because the account owns no such vault could create
+    one and ask again.
+
+    Eligibility must reflect what the OWNER granted, not what the holder went on to create, so
+    vaults newer than the credential do not count. The envelope is an offline-attackable copy of
+    the account identity; a self-service route to it is the thing this gate exists to prevent.
+    """
+    owner = temp_user_client
+    envelope = _opaque_envelope("self_escalation")
+    _register_identity(owner, envelope)
+    vault_ids = []
+
+    with _settings(admin, zero_knowledge_enabled=True, temp_cred_allow_zk_vaults=True):
+        try:
+            caps = ["vault.see_info", "vault.see_files"]
+            with _minted_temp(
+                owner,
+                mode="all",
+                global_caps=["vault.create.zero_knowledge"],
+                default_caps=caps,
+            ) as (temp, _):
+                # The account owns no zero-knowledge vault, so there is nothing to consume a key
+                # for and the envelope is withheld.
+                before = temp.get("/ecc/keys/private")
+                assert before.status_code == 403, before.text
+
+                # The credential creates one itself. This is allowed and must stay allowed.
+                #
+                # The client-wrapped key is not decoration here, it is the entire premise: the
+                # server refuses a zero-knowledge vault without one, and supplying it is what
+                # inserts the creator's own VaultMemberKey at the current epoch. Omit it and the
+                # account still holds no live key for any zero-knowledge vault, so the closing 403
+                # would hold with the bound under test reverted and this test would prove nothing.
+                created = temp.post("/vaults", json={
+                    "name": unique("zk_self_escalation"),
+                    "type": "zero_knowledge",
+                    "description": "created by the temporary credential",
+                    "wrapped_dek": ZK_WRAPPED_DEK_STUB,
+                    "ephemeral_public_key": ZK_EPHEMERAL_STUB,
+                })
+                assert created.status_code in (200, 201), created.text
+                vault_ids.append(created.json()["id"])
+
+                # Non-vacuity guard: the vault really did land carrying a live wrapped key for
+                # this holder — the exact state that previously unlocked the envelope.
+                _assert_wrapped_dek(
+                    temp, created.json()["id"], ZK_WRAPPED_DEK_STUB, "self-created ZK vault",
+                )
+
+                # ...and is still refused. Before the bound this returned 200 and handed over the
+                # account-wide envelope.
+                after = temp.get("/ecc/keys/private")
+                assert after.status_code == 403, (
+                    "a credential made itself eligible for the account private-key envelope by "
+                    "creating a zero-knowledge vault"
+                )
+                assert after.json() == {"detail": TEMP_ZK_KEY_ACCESS_DENIED}
         finally:
             _cleanup_owned_vaults(owner, vault_ids)

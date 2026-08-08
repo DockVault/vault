@@ -324,6 +324,19 @@ class ECCCryptoLibrary {
     // =========================================================================
 
     /**
+     * UTF-8 byte length of a string.
+     *
+     * Both designs specify their size caps in BYTES, and the server measures bytes. A plain
+     * `.length` counts UTF-16 code units, which is up to three times smaller for a character in
+     * the U+0800-U+FFFF range -- so a code-unit check silently admits payloads well past the
+     * documented bound, and the client and server would disagree about the same blob.
+     * @private
+     */
+    _utf8Len(value) {
+        return new TextEncoder().encode(String(value)).byteLength;
+    }
+
+    /**
      * Decode canonical standard base64, or throw. Rejects the URL-safe alphabet, whitespace,
      * bad padding, and any string that decodes but is not the canonical encoding of its own
      * bytes. Optionally pins the decoded length.
@@ -388,7 +401,7 @@ class ECCCryptoLibrary {
             // Bound before parsing: this cap applies to BOTH shapes, being a denial-of-service
             // bound of the same kind as the iteration ceiling. A genuine legacy envelope is
             // ~534 bytes, so it cannot reject a real one.
-            if (raw.length > this.PRIV_ENVELOPE_MAX_SERIALIZED) {
+            if (this._utf8Len(raw) > this.PRIV_ENVELOPE_MAX_SERIALIZED) {
                 throw new Error('envelope: too large');
             }
             try { obj = JSON.parse(raw); } catch (e) { throw new Error('envelope: not JSON'); }
@@ -397,7 +410,7 @@ class ECCCryptoLibrary {
             throw new Error('envelope: not an object');
         }
         if (typeof raw !== 'string' &&
-            JSON.stringify(obj).length > this.PRIV_ENVELOPE_MAX_SERIALIZED) {
+            this._utf8Len(JSON.stringify(obj)) > this.PRIV_ENVELOPE_MAX_SERIALIZED) {
             throw new Error('envelope: too large');
         }
 
@@ -534,7 +547,7 @@ class ECCCryptoLibrary {
      */
     parseRecoveryKitFile(text) {
         if (typeof text !== 'string') throw new Error('recovery kit: not text');
-        if (text.length > this.RECOVERY_KIT_MAX_FILE) throw new Error('recovery kit: too large');
+        if (this._utf8Len(text) > this.RECOVERY_KIT_MAX_FILE) throw new Error('recovery kit: too large');
         let kit;
         try { kit = JSON.parse(text); } catch (e) { throw new Error('recovery kit: not JSON'); }
         if (kit === null || typeof kit !== 'object' || Array.isArray(kit)) {
@@ -545,7 +558,7 @@ class ECCCryptoLibrary {
         for (const f of ['user_id', 'fingerprint', 'public_key']) {
             const v = kit[f];
             if (v === null || v === undefined) continue;
-            if (typeof v !== 'string' || v.length > this.RECOVERY_KIT_MAX_FIELD) {
+            if (typeof v !== 'string' || this._utf8Len(v) > this.RECOVERY_KIT_MAX_FIELD) {
                 throw new Error(`recovery kit: ${f} invalid`);
             }
         }

@@ -404,6 +404,13 @@ async def decompress_point(
 
 _POP_CHALLENGE_TTL_SECONDS = 300  # a registration challenge is single-use + short-lived
 
+# The private-key envelope is stored verbatim and never parsed, so the only bound the server
+# applies to it is a size cap. Defined here because BOTH of the field's writers -- first
+# registration below and replacement further down -- must use the same one: a cap on one writer
+# only is not a cap. Measured in UTF-8 BYTES, matching the serialized cap in the envelope design
+# and the way the client measures, so the two cannot disagree about the same blob.
+_MAX_ENVELOPE_BYTES = 16384
+
 
 @router.post("/keys/register/challenge")
 async def register_challenge(
@@ -502,6 +509,18 @@ async def register_public_key(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="An encryption key is already set up for this account.",
             )
+
+        # Size cap, checked FIRST so an oversized body is refused before any proof work or write.
+        # This is the field's other writer, so it applies the same bound as replacement, from the
+        # same constant; without it an account with no keypair could register an arbitrarily large
+        # blob that every later read returns verbatim.
+        if request.encrypted_private_key is not None:
+            try:
+                _reg_bytes = len(request.encrypted_private_key.encode("utf-8"))
+            except UnicodeEncodeError:
+                raise HTTPException(status_code=400, detail="encrypted_private_key is malformed")
+            if _reg_bytes > _MAX_ENVELOPE_BYTES:
+                raise HTTPException(status_code=400, detail="encrypted_private_key is too large")
 
         # Proof-of-possession: the caller must prove they hold the PRIVATE key matching this
         # public key (ECDH key-confirmation, via POST /keys/register/challenge), so a
@@ -657,10 +676,6 @@ _UPDATE_POP_FAILED = (
     "Proof of possession failed. Request a new challenge and try again."
 )
 
-# The replacement blob is stored verbatim and never parsed, so the only bound the server applies
-# is a size cap. It matches the serialized cap in the envelope design and is measured in UTF-8
-# BYTES, not characters, so it cannot drift from the client-side check.
-_MAX_ENVELOPE_BYTES = 16384
 
 
 @router.post("/keys/private/challenge")
@@ -725,8 +740,8 @@ async def update_private_key(
     that public key), so NO per-vault re-wrap is needed — the user simply unlocks with the new
     passphrase from now on. Zero-knowledge is preserved: the server only ever stores the opaque
     ciphertext it cannot read. This is distinct from a key ROTATION (a new public key would
-    orphan every wrapped DEK); we deliberately keep the public key fixed. Rate-limited on the
-    same per-user bucket as registration.
+    orphan every wrapped DEK); we deliberately keep the public key fixed. Rate-limited on its own
+    per-user bucket, separate from registration so exhausting one cannot lock out the other.
 
     Requires an INTERACTIVE session: a temporary credential authenticates AS the account owner,
     and this overwrites the owner's private-key blob verbatim (no current-passphrase proof server
@@ -761,13 +776,18 @@ async def update_private_key(
     if not keypair:
         raise HTTPException(status_code=404, detail="No encryption key is set up for this account.")
 
+    # A malformed request is reported distinctly from a failed proof. That is not in tension with
+    # the indistinguishability rule below: a caller who sent the wrong SHAPE can act on it, learns
+    # nothing about the challenge or the key, and is refused before anything is consumed. Telling
+    # them "proof failed, get a new challenge" instead sends them round a loop that cannot help,
+    # burning one issuance and one verification from two rate-limited budgets per attempt.
     pop = request.pop
     if pop is None or not pop.challenge_id or not pop.mac:
-        raise HTTPException(status_code=400, detail=_UPDATE_POP_FAILED)
+        raise HTTPException(status_code=400, detail="pop.challenge_id and pop.mac are required")
     try:
         cid = uuid.UUID(str(pop.challenge_id))
     except (ValueError, AttributeError, TypeError):
-        raise HTTPException(status_code=400, detail=_UPDATE_POP_FAILED)
+        raise HTTPException(status_code=400, detail="pop.challenge_id is not a valid challenge id")
 
     # STEP 2 - claim and CONSUME the challenge before verifying. Consumption must not depend on
     # the result: if a failed proof left the challenge alive an attacker could brute-force MACs

@@ -172,8 +172,9 @@ The order is deliberate and is the security-relevant part of this design:
    writer ships disabled, so today's client submits the legacy shape — a server that enforced the
    v1 grammar would reject every replacement the shipping client makes.
 
-   The size cap is on **UTF-8 bytes**, not characters, so it cannot drift from the client-side
-   check as soon as a non-ASCII byte appears.
+   The size cap is on **UTF-8 bytes**, not characters. The client measures the same way, so the
+   two cannot disagree about the same blob — a check counting UTF-16 code units would be up to
+   three times looser for text outside the Basic Latin range.
 
    A request failing these checks is rejected here and **does not consume a challenge**.
 
@@ -207,6 +208,13 @@ These are deliberately generous relative to legitimate use — a passphrase chan
 restore is a once-in-a-long-while action — and tight relative to guessing. Combined with one-time
 consumption, an attacker gets at most ten MAC attempts per quarter hour, each requiring a fresh
 issuance, against a 256-bit MAC.
+
+**With one honest caveat: the limiter fails open.** When its backing store is unavailable it
+allows the request rather than refusing it, so during such an outage the budget above does not
+apply. That is a deliberate availability trade made elsewhere in the product, not something this
+protocol overrides — and it is the second reason §9 audits failed proofs, since an attempt burst
+is otherwise invisible in exactly that window. Against a 256-bit MAC the practical exposure is
+negligible; the point is that the bound is conditional and should not be quoted as absolute.
 
 ## 8. Errors
 

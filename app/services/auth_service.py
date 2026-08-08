@@ -626,13 +626,27 @@ class AuthService:
                 detail=("Zero-knowledge vaults can't be included in a temporary credential by "
                         "organization policy. Mint a credential scoped to specific standard vaults instead."))
 
-        # A 'selected'-mode credential scoped to the vaults page but with no vaults that will
-        # actually resolve to an access grant can reach nothing — reject rather than silently mint
-        # a dead credential. Keyed on the 'vaults' page (the only signal that governs selected-mode
-        # reachability — vault_caps_default is unused in 'selected' mode) and on the vaults that
-        # will really persist (a valid id, and for a delegated child one the parent itself holds),
-        # so a dashboard/temp-creds-only credential and a request full of unusable ids are both
-        # judged correctly.
+        # A SCOPED 'selected'-mode credential scoped to the vaults page but with no vaults that
+        # will actually resolve to an access grant can reach nothing — reject rather than silently
+        # mint a dead credential. Keyed on the 'vaults' page (the only signal that governs
+        # selected-mode reachability — vault_caps_default is unused in 'selected' mode) and on the
+        # vaults that will really persist (a valid id, and for a delegated child one the parent
+        # itself holds), so a dashboard/temp-creds-only credential and a request full of unusable
+        # ids are both judged correctly.
+        #
+        # The `effective_scope is not None` term is load-bearing twice over. Mechanically it keeps
+        # `.get('pages', [])` off a None. Semantically: a legacy request (no scope, no delegating
+        # parent) mints an UNRESTRICTED credential and skips the per-vault resolve entirely, so any
+        # selected_vaults it carried are ignored — such a credential is not dead, it is the
+        # opposite, and this check would be the wrong shape for it.
+        #
+        # That combination is still a poor request to honour quietly: the caller sent a restriction
+        # list and received a credential reaching everything the account does, zero-knowledge
+        # vaults included. Note the zero-knowledge deny above does NOT cover this by default —
+        # allow_zk_vaults() returns True unless an organization has explicitly stored False — so
+        # under the shipped policy nothing narrows that credential. Rejecting the combination would
+        # be a behaviour change on a legacy API shape and is deliberately not made here; it is
+        # recorded as a known sharp edge rather than fixed in passing.
         if mode == 'selected' and effective_scope is not None and 'vaults' in effective_scope.get('pages', []):
             if not selected_access_plans:
                 raise HTTPException(
