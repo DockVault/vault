@@ -34,9 +34,11 @@ def test_favorite_requires_read_access(admin, temp_user, temp_user_client):
         admin.delete_vault(v["id"])
 
 
-def test_rotate_key_works_on_standard_vault(admin):
+def test_rotate_key_is_refused_on_standard_vault(admin):
+    # It used to answer 200 "rotated successfully" while re-keying nothing the content is
+    # actually encrypted with. See tests/test_standard_rotation_honesty.py.
     v = admin.create_vault()
     try:
-        assert admin.post(f"/vaults/{v['id']}/rotate-key").status_code == 200
+        assert admin.post(f"/vaults/{v['id']}/rotate-key").status_code == 501
     finally:
         admin.delete_vault(v["id"])

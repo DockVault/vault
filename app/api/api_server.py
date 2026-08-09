@@ -7006,25 +7006,26 @@ async def rotate_vault_encryption_key(
     db: Session = Depends(get_db)
 ):
     """
-    Rotate a vault's encryption key to a new version.
-    
-    This operation:
-    1. Archives the current key to VaultKeyHistory
-    2. Generates a new random 32-byte encryption key
-    3. Encrypts it with the master key
-    4. Increments the vault's key_version
-    
-    After rotation:
-    - New file uploads use the new key version
-    - Old files remain readable using historical keys
-    - No re-encryption of existing files is required
-    
-    Only vault owner can rotate keys.
+    Refuse to rotate a Standard vault's encryption key, and say why.
+
+    This endpoint used to archive the stored key, generate a new one, bump `key_version` and
+    answer "Encryption key rotated successfully — new file uploads will use the new key."
+
+    None of that was true of the content. A Standard vault's file bytes are encrypted under a key
+    derived from the DEPLOYMENT secret — HKDF over `settings.encryption_key`, salted per file with
+    the vault and file ids — and no read path consults `encrypted_vault_key` or `key_version` at
+    all. Rotating them changed a key nothing uses, then reported a completed security operation.
+
+    That is the worst possible failure mode for this particular endpoint. An operator reaches for
+    it precisely when they believe a key is compromised; a success message tells them the content
+    is now protected under a new key, and they stop. The honest answer is that this server cannot
+    re-key Standard content today, so it says so, and changes nothing.
+
+    Zero-knowledge vaults are unaffected: their content key never reaches the server, and their
+    rekey endpoint is a different mechanism that genuinely works.
     """
     try:
         from app.core.models import Vault
-        from app.core.vault_key_utils import rotate_vault_key
-        from app.core.config import settings
         
         # Get vault
         vault = db.query(Vault).filter(Vault.id == vault_id).first()
@@ -7051,29 +7052,31 @@ async def rotate_vault_encryption_key(
                 detail="Key rotation does not apply to zero-knowledge vaults; their keys are managed client-side (use the zero-knowledge rekey endpoint).",
             )
 
-        # A password-protected Standard vault wraps its DEK under a password-derived KEK + salt.
-        # rotate_vault_key can only re-wrap under the MASTER key (it has no password parameter), which
-        # would write method='master_key' / key_salt=NULL while leaving password_hash set — an internally
-        # inconsistent row. Re-wrap-with-password isn't supported here, so reject rather than corrupt the
-        # row. (File content is keyed off the deployment secret, not this wrapped DEK, so no access change.)
-        if getattr(vault, "password_hash", None):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Key rotation is not supported for password-protected vaults (the password-wrapped key cannot be re-wrapped here).",
-            )
-
-        # Perform key rotation
-        master_key = settings.encryption_key.encode()
-        old_version = vault.key_version
-        new_version = rotate_vault_key(vault, master_key, db)
-        
-        return {
-            "message": "Encryption key rotated successfully",
-            "vault_id": str(vault_id),
-            "old_key_version": old_version,
-            "new_key_version": new_version,
-            "note": "New file uploads will use the new key. Old files remain readable with historical keys."
-        }
+        # ONE refusal for every Standard vault, whatever its password state or key vintage.
+        #
+        # Rotating here would archive the stored key, mint a replacement and bump key_version --
+        # all of it invisible to the content, which is encrypted under a key derived from the
+        # deployment secret and never consults these columns. The old response claimed otherwise.
+        #
+        # It is deliberately a REFUSAL rather than a quieter success or a no-op 200: a caller
+        # asking to rotate a key needs to learn that the key did not rotate. Nothing external
+        # depends on the old response -- no frontend, tool or documented flow calls this route;
+        # only this repository's own tests did.
+        #
+        # This does not touch the database. The reads above are reads.
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=(
+                "Key rotation is not implemented for standard vaults. File contents are "
+                "encrypted with a key derived from this deployment's encryption secret, not "
+                "from the vault key, so rotating the vault key would not re-encrypt anything. "
+                "Nothing was changed. To re-key stored content you must first download it, "
+                "then upload it to a deployment created with a new encryption secret: rotating "
+                "this deployment's secret in place makes every existing file permanently "
+                "undecryptable, including anything not yet downloaded. Zero-knowledge vaults are "
+                "the supported way to rotate content keys, because those keys are client-side."
+            ),
+        )
         
     except HTTPException:
         raise

@@ -568,7 +568,7 @@ class Vault(Base):
     # + re-wrapped for the remaining members IN THE BROWSER, old files keep their
     # original DEK epoch (read-old/write-new), and the revoked member never receives
     # the new epoch. DISTINCT from key_version above, which is the STANDARD-vault
-    # Fernet rotation counter (vault_key_utils + VaultKeyHistory + /vaults/{id}/rotate-key);
+    # Stamped at creation and never incremented: the rotate-key route refuses, and no content codec reads this;
     # conflating the two would regress Standard vaults. Always 1 for never-rotated /
     # non-ZK vaults.
     dek_version = Column(Integer, nullable=False, default=1, server_default='1')
