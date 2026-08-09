@@ -7936,11 +7936,25 @@ async function zkShareVaultToUser(vaultId, userId) {
         return;
     }
     // DIRECT: wrap the DEK straight to the recipient.
-    const dek = await zkGetVaultDek(vaultId);  // unwrap with my key (may prompt once)
+    // Pin the DEK to the epoch we already read above. Called with no epoch this refetches
+    // /keys independently, so the key could come back at a DIFFERENT epoch than the one we
+    // are about to declare -- and declaring an epoch the blob does not match is precisely
+    // the failure this change exists to stop.
+    const dek = await zkGetVaultDek(vaultId, keys && keys.key_version);  // may prompt once
     const { wrappedDEK, ephemeralPublicKey } = await eccLib().wrapVaultDEK(dek, recipientPub);
+    // Tell the server which epoch this blob wraps. Without it the server stamps whatever the
+    // vault's epoch is when the request lands, so a rotation arriving in between labels our
+    // old-DEK blob as the new epoch AND overwrites the correct row the rotation just wrote --
+    // leaving the recipient unable to read anything written after it, with no error anywhere.
+    // `keys.key_version` is the epoch the DEK above was actually fetched at.
     await apiRequest(`/ecc/vaults/${vaultId}/members`, {
         method: 'POST',
-        body: JSON.stringify({ user_id: userId, wrapped_dek: wrappedDEK, ephemeral_public_key: ephemeralPublicKey }),
+        body: JSON.stringify({
+            user_id: userId,
+            wrapped_dek: wrappedDEK,
+            ephemeral_public_key: ephemeralPublicKey,
+            dek_version: keys && keys.key_version != null ? keys.key_version : undefined,
+        }),
     });
 }
 
