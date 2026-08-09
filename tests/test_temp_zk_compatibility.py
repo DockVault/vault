@@ -281,8 +281,9 @@ def _set_current_teampriv_active(vault_id, user_id, active: bool) -> None:
         f"AND vmk.vault_id = '{safe_vault_id}' "
         f"AND vmk.user_id = '{safe_user_id}' "
         "AND vmk.key_version = v.team_key_version "
-        "AND vmk.wrapping_algorithm = "
-        "'ECDH-P384-AES-GCM-TEAMPRIV';"
+        # Both generations. Matching one label would let a relabelled row slip the UPDATE.
+        "AND vmk.wrapping_algorithm IN "
+        "('ECDH-P384-AES-GCM-TEAMPRIV', 'ECDH-P384-AES-GCM-TEAMPRIV-V2');"
     )
     assert result == "UPDATE 1", result
 
@@ -2720,8 +2721,13 @@ def test_hierarchical_key_release_tracks_live_current_teampriv_state(
                         f"WHERE vmk.vault_id = '{safe_vault_id}' "
                         f"AND vmk.user_id = '{safe_user_id}' "
                         "AND vmk.key_version = v.team_key_version "
-                        "AND vmk.wrapping_algorithm = "
-                        "'ECDH-P384-AES-GCM-TEAMPRIV' "
+                        # Both generations: against a row carrying only the newer label
+                        # this count would be zero because the LABEL did not match, not
+                        # because the row is inactive, and the assertion below would
+                        # silently stop testing anything.
+                        "AND vmk.wrapping_algorithm IN "
+                        "('ECDH-P384-AES-GCM-TEAMPRIV', "
+                        "'ECDH-P384-AES-GCM-TEAMPRIV-V2') "
                         "AND vmk.is_active IS TRUE;"
                     )
                     assert active_current == "0"
