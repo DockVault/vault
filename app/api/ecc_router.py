@@ -109,6 +109,14 @@ class VaultKeysResponse(BaseModel):
     # (which ignores these fields) keeps working against a never-rotated vault.
     key_version: Optional[int] = None
     current_dek_version: int = 1
+    # The account this row was selected for, echoed so a reader binding the recipient into a
+    # transcript has an authenticated source for it rather than reconstructing it from local
+    # state whose population order it would have to reason about.
+    #
+    # Nothing consumes this yet, deliberately: the transcript that needs it belongs to a
+    # format whose reader ships before its writer, and an authenticated field has to be
+    # available on the server for a while before a client may depend on it.
+    recipient_user_id: Optional[str] = None
     # Hierarchical mode only: the team PUBLIC key, the caller's wrap of the team PRIVATE key
     # (to unwrap with their identity key), its ephemeral, and the team-keypair epoch the DEK
     # above was wrapped under. The client unwraps team_priv (@ team_key_version) then the DEK.
@@ -972,6 +980,7 @@ async def get_vault_keys(
             return _no_access()
         return VaultKeysResponse(
             vault_id=vault_id, mode='hierarchical', has_access=True,
+            recipient_user_id=str(current_user.id),
             wrapped_dek=entry.get('wrapped_dek'),
             ephemeral_public_key=entry.get('ephemeral_public_key'),
             key_version=want, current_dek_version=current,
@@ -997,6 +1006,7 @@ async def get_vault_keys(
         vault_id=vault_id,
         mode=mode,
         has_access=True,
+        recipient_user_id=str(current_user.id),
         wrapped_dek=member_key.wrapped_dek,  # Use the property alias
         ephemeral_public_key=member_key.ephemeral_public_key,
         key_version=member_key.key_version,
@@ -1034,6 +1044,14 @@ async def get_user_public_key(
 
 class GrantMemberKeyRequest(BaseModel):
     user_id: str
+    # DIRECT vaults only -- rejected on the hierarchical path, whose rows are keyed by the
+    # separate team epoch. The DEK epoch the supplied `wrapped_dek` was built against. A wrap is only meaningful
+    # paired with its epoch, and the client is the only party that knows which one it used --
+    # the server can read the vault's CURRENT epoch, which is a different question whenever a
+    # rotation lands in between. Optional so a client that predates this field keeps working
+    # (it gets the old, racy behaviour); supplied, it is verified under the row lock and a
+    # mismatch is a 409, mirroring `from_version` on the rekey path.
+    dek_version: Optional[int] = None
     # DIRECT mode: the DEK wrapped to the recipient's public key.
     wrapped_dek: Optional[str] = None          # base64
     ephemeral_public_key: Optional[str] = None  # base64, ephemeral ECDH public key for the unwrap
@@ -1096,6 +1114,12 @@ async def grant_member_key(
                 status_code=400,
                 detail="This vault uses hierarchical wrapping; supply wrapped_team_privkey + team_ephemeral_public_key.",
             )
+        if request.dek_version is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=("dek_version does not apply to a hierarchical vault; its member rows "
+                        "are keyed by the team epoch. Omit it."),
+            )
         epoch = getattr(vault, 'team_key_version', 1) or 1
         blob, eph, algo = request.wrapped_team_privkey, request.team_ephemeral_public_key, TEAMPRIV_ALGO
     else:
@@ -1104,7 +1128,28 @@ async def grant_member_key(
                 status_code=400,
                 detail="This vault uses direct wrapping; supply wrapped_dek + ephemeral_public_key.",
             )
-        epoch = getattr(vault, 'dek_version', 1) or 1
+        # Re-read the vault under a row lock before deciding the epoch, so a rotation cannot
+        # commit between the read and the upsert. populate_existing() is load-bearing: this
+        # session already holds the row from the entry read, and without it the identity map
+        # hands back the stale instance -- the lock would be taken and the value compared
+        # would still predate it.
+        #
+        # The lock alone is not sufficient anyway: it stops the value moving during the write,
+        # not the client's blob being older than the value we read. The declared epoch below
+        # is the actual fix; the lock is what makes checking it meaningful.
+        locked = (db.query(Vault).populate_existing()
+                  .filter(Vault.id == vault_id).with_for_update().first())
+        if locked is None:
+            # Hard-deleted between the entry read and here. Saying 404 is honest; defaulting
+            # the epoch to 1 would answer a 409 naming an epoch that no longer exists.
+            raise HTTPException(status_code=404, detail="Vault not found")
+        epoch = getattr(locked, 'dek_version', 1) or 1
+        if request.dek_version is not None and request.dek_version != epoch:
+            raise HTTPException(
+                status_code=409,
+                detail=(f"Vault was re-keyed concurrently (current epoch {epoch}); "
+                        "refetch the vault key and re-share."),
+            )
         blob, eph, algo = request.wrapped_dek, request.ephemeral_public_key, DIRECT_DEK_ALGO
 
     existing = db.query(VaultMemberKey).filter(
