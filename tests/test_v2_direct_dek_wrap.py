@@ -312,19 +312,24 @@ def test_two_wraps_of_the_same_key_differ():
 # The call sites
 # =================================================================================================
 
-def test_the_create_path_stays_on_the_legacy_writer():
-    """Not an oversight: at vault creation the vault id does not exist yet.
+def test_the_create_path_chooses_the_id_before_it_locks_the_key():
+    """Creating a vault used to be the one path that could not stamp its lock.
 
-    The wrap is built into the request body and the server mints the id when it lands, so a
-    transcript binding that id cannot be produced there. Pinned so nobody removes the asymmetry by
-    binding a placeholder, which would mint wraps that never open.
+    The key is locked and sent in the same request that creates the vault, and the server used to
+    invent the id when that request landed -- so at the moment of locking there was nothing to
+    stamp. The browser now picks the id first and sends it, which is the only ordering that lets
+    the stamp exist at all.
+
+    Order is the whole property, so it is what this pins: a rearrangement that locked the key
+    before choosing the id would still look correct and would bind `undefined`.
     """
     source = APP_JS.read_text(encoding="utf-8")
     create = source.split("payload.type = 'zero_knowledge'", 1)[1].split("zkPendingDek = dek", 1)[0]
-    assert "wrapVaultDEKV2" not in create
-    # A short phrase rather than a sentence: the reason must stay documented at the call site,
-    # without a reword breaking the build.
-    assert "does not exist yet" in create
+    assert "payload.id = zkNewObjId();" in create, "the browser no longer chooses the vault id"
+    assert "vaultId: payload.id" in create, "the lock is not stamped with the chosen id"
+    assert create.index("payload.id = zkNewObjId();") < create.index("vaultId: payload.id"), (
+        "the id must be chosen BEFORE the key is locked; the other order binds nothing"
+    )
 
 
 def test_both_gated_write_sites_pass_a_complete_transcript():
@@ -336,9 +341,9 @@ def test_both_gated_write_sites_pass_a_complete_transcript():
     source = APP_JS.read_text(encoding="utf-8")
     calls = [ln.strip() for ln in source.splitlines()
              if "recipientUserId:" in ln and "dekEpoch:" in ln]
-    assert len(calls) == 3, (
-        "expected three transcript sites -- the direct read, the share write and the rekey "
-        f"write -- but found {len(calls)}:\n  " + "\n  ".join(calls))
+    assert len(calls) == 4, (
+        "expected four transcript sites -- the direct read, and the create, share and rekey "
+        f"writes -- but found {len(calls)}:\n  " + "\n  ".join(calls))
     for call in calls:
         assert "vaultId" in call, f"transcript site missing the vault: {call}"
     # And exactly one place decides the format, so a fourth write site inherits the decision.

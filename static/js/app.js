@@ -2066,6 +2066,7 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                 const publicKeyPem = await zkEnsurePublicKeyForCreate();
                 const lib = eccLib();
                 const myPub = await lib.importPublicKeyPEM(publicKeyPem);
+                const myUserId = zkIdentity.userId;
                 const dek = await lib.generateVaultDEK();
                 payload.type = 'zero_knowledge';
                 const hcb = document.getElementById('vault-hierarchical');
@@ -2083,13 +2084,18 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                     payload.wrapped_team_privkey = privWrap.wrappedKey;
                     payload.team_privkey_ephemeral_public_key = privWrap.ephemeralPublicKey;
                 } else {
-                    // Legacy writer, even when the v2 gate is on. A v2 transcript binds the
-                    // vault id, and at this point the vault does not exist yet -- the wrap is
-                    // built into the request body and the server mints the id when it lands.
-                    // Binding a value we do not have is not something to work around here; the
-                    // first rekey re-wraps every member, owner included, so a vault created
-                    // this way converts to v2 wholesale the first time it rotates.
-                    const { wrappedDEK, ephemeralPublicKey } = await lib.wrapVaultDEK(dek, myPub);
+                    // Choose the vault's id here, before locking, and send it with the
+                    // request. The newer lock stamps the key with the vault it belongs to,
+                    // and the key travels in this same request -- so waiting for the server
+                    // to assign an id would be too late to stamp anything with it.
+                    //
+                    // Choosing it costs nothing: a vault id is not a secret and grants no
+                    // access, which comes from membership and the crypto. The only risk is
+                    // two vaults sharing an id, and the server refuses that with a 409.
+                    payload.id = zkNewObjId();
+                    const { wrappedDEK, ephemeralPublicKey } = await zkWrapDekForRecipient(
+                        dek, myPub,
+                        { vaultId: payload.id, recipientUserId: myUserId, dekEpoch: 1 });
                     payload.wrapped_dek = wrappedDEK;
                     payload.ephemeral_public_key = ephemeralPublicKey;
                 }
@@ -7525,11 +7531,15 @@ async function zkRestoreFromRecoveryKey(kitText) {
 // An existing keypair is deliberately PUBLIC-ONLY here: vault creation mints a fresh DEK and
 // wraps it to this key, so fetching or unlocking the private identity envelope would add exposure
 // without granting any capability the operation needs. First registration remains interactive.
+// Returns { pem, userId }. The account id comes back from the same response as the key, and
+// the caller needs it: a version-2 lock stamps the account it was made for, and the only other
+// source is local session state, which this app deliberately does not trust for this (see the
+// recovery-kit writer, which refuses it for the same reason).
 async function zkEnsurePublicKeyForCreate() {
     const pub = await apiRequest('/ecc/keys/public', { silent: true });
     if (pub && pub.has_keypair) {
         if (!pub.public_key) throw new Error('Your public key is unavailable.');
-        return pub.public_key;
+        return { pem: pub.public_key, userId: pub.user_id };
     }
     try {
         await zkRegisterNewKeypair();
@@ -7545,7 +7555,7 @@ async function zkEnsurePublicKeyForCreate() {
     if (!registered || !registered.has_keypair || !registered.public_key) {
         throw new Error('Your registered public key is unavailable.');
     }
-    return registered.public_key;
+    return { pem: registered.public_key, userId: registered.user_id };
 }
 
 // --- Standalone "set up my encryption key" (account-level, profile menu) ------

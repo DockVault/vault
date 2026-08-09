@@ -852,6 +852,11 @@ class TempCredentialResponse(BaseModel):
 
 class VaultCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
+    # Optionally the id to create this vault under. A zero-knowledge client needs the id
+    # before it locks the vault key -- the newer lock format stamps the key with its vault,
+    # and the key travels in this same request, so waiting for the server to assign one is
+    # too late. Absent, the server assigns it as before.
+    id: Optional[uuid.UUID] = None
     description: Optional[str] = None
     password: Optional[str] = None
     expire_files_after_days: Optional[int] = Field(None, gt=0)
@@ -5856,7 +5861,14 @@ async def create_vault(
                             detail=f"Vault size must be between 1 byte and {_INT64_MAX / _GIB:.0f} GB")
     _enforce_vault_size(db, current_user, requested_size)
 
+    # Reject a taken id here, before anything is built, so the caller gets 409 rather than a
+    # constraint violation. This check -- not the fact that the client proposed the id -- is
+    # what keeps two vaults from sharing one.
+    if vault_create.id is not None and db.query(Vault.id).filter(Vault.id == vault_create.id).first():
+        raise HTTPException(status_code=409, detail="That vault id is already in use.")
+
     vault = vault_service.create_vault(
+        vault_id=vault_create.id,
         name=vault_create.name,
         owner=current_user,
         description=vault_create.description,

@@ -36,11 +36,20 @@ def test_create_only_public_key_helper_never_unlocks_private_identity_key():
     )
 
     assert helper.count("apiRequest('/ecc/keys/public'") == 2
-    assert "return pub.public_key" in helper
     assert "await zkRegisterNewKeypair()" in helper
     assert "e.status === 409" in helper
-    assert "return registered.public_key" in helper
 
+    # Both return paths hand back the PUBLIC key and the account id that arrived with it. The
+    # helper used to return the key alone; the account id now travels with it because a version-2
+    # lock stamps the account it was made for, and the only other source is local session state,
+    # which this app does not trust for that. What matters to this contract is unchanged: the
+    # values come from the PUBLIC endpoint's response and nothing else.
+    assert "pem: pub.public_key" in helper
+    assert "pem: registered.public_key" in helper
+    assert "userId: pub.user_id" in helper
+    assert "userId: registered.user_id" in helper
+
+    # The actual boundary, untouched: this helper must never reach for the private identity key.
     assert "zkEnsureUnlocked" not in helper
     assert "/ecc/keys/private" not in helper
     assert "zkState.privateKey" not in helper
