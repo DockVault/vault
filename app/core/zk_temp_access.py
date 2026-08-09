@@ -23,7 +23,11 @@ from app.core.models import (
 from app.core.temp_passcode_policy import effective_policy
 
 
-TEAMPRIV_ALGO = "ECDH-P384-AES-GCM-TEAMPRIV"
+# Re-exported from the module that owns the vocabulary, so the label is declared once.
+from app.core.key_wrap_algorithms import (  # noqa: F401  (re-export)
+    TEAMPRIV_ALGO,
+    TEAMPRIV_ALGOS,
+)
 QUALIFYING_ZK_CAPS = {"vault.see_files", "vault.change_permissions"}
 TEMP_ZK_KEY_ACCESS_DENIED = (
     "Temporary credential is not eligible for zero-knowledge key access"
@@ -93,7 +97,7 @@ def _has_current_key(db, vault, user_id) -> bool:
                 VaultMemberKey.vault_id == vault.id,
                 VaultMemberKey.user_id == user_id,
                 VaultMemberKey.key_version == team_epoch,
-                VaultMemberKey.wrapping_algorithm == TEAMPRIV_ALGO,
+                VaultMemberKey.wrapping_algorithm.in_(TEAMPRIV_ALGOS),
                 VaultMemberKey.is_active == True,  # noqa: E712
             )
             .first()

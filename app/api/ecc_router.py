@@ -24,8 +24,18 @@ from app.core.endpoint_permissions import require_endpoint_permission
 from app.core.temp_scope import (
     require_vault_cap, enforce_vault, is_scoped, has_scoped_vault_cap, effective_vault_caps,
 )
+# The vault_member_keys table holds two different kinds of row -- a wrapped team PRIVATE key
+# (hierarchical) and a wrapped DEK (direct) -- and wrapping_algorithm is the only thing that
+# tells them apart. Every query that touches one kind MUST filter on it, by membership rather
+# than equality, so a next-generation label is not silently invisible.
+from app.core.key_wrap_algorithms import (
+    DIRECT_DEK_ALGO,
+    DIRECT_DEK_ALGOS,
+    classify as _classify_algo,
+)
 from app.core.zk_temp_access import (
     TEAMPRIV_ALGO,
+    TEAMPRIV_ALGOS,
     TEMP_ZK_KEY_ACCESS_DENIED,
     may_release_private_envelope,
     may_release_vault_key,
@@ -839,11 +849,6 @@ async def update_private_key(
 # Vault creation must go through POST /vaults so all three gates apply.
 
 
-# Tag distinguishing a wrapped TEAM PRIVATE key (hierarchical) from a wrapped DEK (direct) in
-# the shared vault_member_keys table. EVERY hierarchical query MUST filter on it.
-DIRECT_DEK_ALGO = 'ECDH-P384-AES-KW'
-
-
 def _is_hierarchical(vault: Vault) -> bool:
     return getattr(vault, 'key_wrapping_mode', 'direct') == 'hierarchical'
 
@@ -875,7 +880,7 @@ def _team_rotation_owed(db: Session, vault: Vault) -> bool:
     return db.query(VaultMemberKey).filter(
         VaultMemberKey.vault_id == vault.id,
         VaultMemberKey.key_version == cur,
-        VaultMemberKey.wrapping_algorithm == TEAMPRIV_ALGO,
+        VaultMemberKey.wrapping_algorithm.in_(TEAMPRIV_ALGOS),
         VaultMemberKey.is_active == False,  # noqa: E712
     ).first() is not None
 
@@ -960,7 +965,7 @@ async def get_vault_keys(
             VaultMemberKey.vault_id == vault_id,
             VaultMemberKey.user_id == current_user.id,
             VaultMemberKey.key_version == team_epoch,
-            VaultMemberKey.wrapping_algorithm == TEAMPRIV_ALGO,
+            VaultMemberKey.wrapping_algorithm.in_(TEAMPRIV_ALGOS),
             VaultMemberKey.is_active == True,  # noqa: E712
         ).first()
         if not teampriv:
@@ -1376,7 +1381,7 @@ async def list_member_keys(
         rows = db.query(VaultMemberKey.user_id).filter(
             VaultMemberKey.vault_id == vault_id,
             VaultMemberKey.key_version == team_epoch,
-            VaultMemberKey.wrapping_algorithm == TEAMPRIV_ALGO,
+            VaultMemberKey.wrapping_algorithm.in_(TEAMPRIV_ALGOS),
             VaultMemberKey.is_active == True,  # noqa: E712
         ).distinct().all()
         # Intersect with current authz — the SAME filter rekey_vault applies — so the client's
@@ -1506,7 +1511,7 @@ async def rekey_vault(
         revoking_team_member = bool(request.revoke_user_id) and db.query(VaultMemberKey).filter(
             VaultMemberKey.vault_id == vault_id,
             VaultMemberKey.user_id == request.revoke_user_id,
-            VaultMemberKey.wrapping_algorithm == TEAMPRIV_ALGO,
+            VaultMemberKey.wrapping_algorithm.in_(TEAMPRIV_ALGOS),
             VaultMemberKey.is_active == True,  # noqa: E712
         ).first() is not None
         rotating_team_key = bool(request.team_public_key) and request.team_public_key != getattr(locked, 'team_public_key', None)
@@ -1527,7 +1532,7 @@ async def rekey_vault(
             rows = db.query(VaultMemberKey.user_id).filter(
                 VaultMemberKey.vault_id == vault_id,
                 VaultMemberKey.key_version == cur_team_epoch,
-                VaultMemberKey.wrapping_algorithm == TEAMPRIV_ALGO,
+                VaultMemberKey.wrapping_algorithm.in_(TEAMPRIV_ALGOS),
                 VaultMemberKey.is_active == True,  # noqa: E712
             ).distinct().all()
             remaining = {str(r[0]) for r in rows if _is_member(db, locked, r[0])}
@@ -1666,6 +1671,25 @@ async def retire_dek_versions(
     # No files => nothing references any epoch; keep only the current epoch's rows.
     dek_floor = min_in_use if min_in_use is not None else (getattr(locked, 'dek_version', 1) or 1)
 
+    # Census, taken before anything is deleted: rows whose label belongs to neither vocabulary.
+    # The two modes then treat them in OPPOSITE directions -- hierarchical filters on the label
+    # so they survive, direct filters only on the epoch so they do not -- which is why the
+    # response reports how many were FOUND and how many of those were DELETED, rather than one
+    # number that would mean something different depending on the mode.
+    #
+    # The expected value is zero: every label this build writes, and the legacy default that
+    # predates them, is registered. A non-zero count means rows are present that this build
+    # cannot place on an epoch axis, so nothing it says about retiring stale wraps covers them.
+    def _unclassified_ids():
+        return {
+            row_id for row_id, algo in db.query(
+                VaultMemberKey.id, VaultMemberKey.wrapping_algorithm
+            ).filter(VaultMemberKey.vault_id == vault_id).all()
+            if _classify_algo(algo) is None
+        }
+
+    unclassified_before = _unclassified_ids()
+    unclassified = len(unclassified_before)
     if _is_hierarchical(locked):
         # TWO AXES. (1) Prune the team_key map of DEK epochs below the DEK floor. (2) Delete
         # TEAMPRIV rows below the TEAM floor = the lowest team epoch any SURVIVING team_key entry
@@ -1680,20 +1704,27 @@ async def retire_dek_versions(
         team_floor = min(team_versions) if team_versions else (getattr(locked, 'team_key_version', 1) or 1)
         stale = db.query(VaultMemberKey).filter(
             VaultMemberKey.vault_id == vault_id,
-            ((VaultMemberKey.wrapping_algorithm == TEAMPRIV_ALGO) & (VaultMemberKey.key_version < team_floor))
-            | ((VaultMemberKey.wrapping_algorithm == DIRECT_DEK_ALGO) & (VaultMemberKey.key_version < dek_floor)),
+            (VaultMemberKey.wrapping_algorithm.in_(TEAMPRIV_ALGOS) & (VaultMemberKey.key_version < team_floor))
+            | (VaultMemberKey.wrapping_algorithm.in_(DIRECT_DEK_ALGOS) & (VaultMemberKey.key_version < dek_floor)),
         ).all()
         deleted = len(stale)
         for mk in stale:
             db.delete(mk)
         db.commit()  # always persist the (possibly pruned) team_key map
+        unclassified_deleted = len(unclassified_before - _unclassified_ids())
         _audit_zk(db, current_user, "zk_versions_retired", resource_id=vault_id,
                   details={"retired_dek_below": dek_floor, "retired_team_below": team_floor,
-                           "rows_deleted": deleted, "mode": "hierarchical"})
+                           "rows_deleted": deleted, "mode": "hierarchical",
+                           "unclassified_rows": unclassified,
+                           "unclassified_rows_deleted": unclassified_deleted})
         return {"status": "ok", "vault_id": vault_id, "retired_dek_below": dek_floor,
-                "retired_team_below": team_floor, "rows_deleted": deleted}
+                "retired_team_below": team_floor, "rows_deleted": deleted,
+                "unclassified_rows": unclassified,
+                "unclassified_rows_deleted": unclassified_deleted}
 
-    # DIRECT mode: a single DEK axis (unchanged behavior).
+    # DIRECT mode: a single DEK axis (unchanged behavior). No algorithm filter here, so an
+    # unrecognised label is removed along with everything else below the floor -- defensible,
+    # since nothing references an epoch below it, and now reported rather than assumed.
     stale = db.query(VaultMemberKey).filter(
         VaultMemberKey.vault_id == vault_id,
         VaultMemberKey.key_version < dek_floor,
@@ -1703,6 +1734,11 @@ async def retire_dek_versions(
         db.delete(mk)
     if deleted:
         db.commit()
+    unclassified_deleted = len(unclassified_before - _unclassified_ids())
     _audit_zk(db, current_user, "zk_versions_retired", resource_id=vault_id,
-              details={"retired_below_version": dek_floor, "rows_deleted": deleted, "mode": "direct"})
-    return {"status": "ok", "vault_id": vault_id, "retired_below_version": dek_floor, "rows_deleted": deleted}
+              details={"retired_below_version": dek_floor, "rows_deleted": deleted, "mode": "direct",
+                       "unclassified_rows": unclassified,
+                       "unclassified_rows_deleted": unclassified_deleted})
+    return {"status": "ok", "vault_id": vault_id, "retired_below_version": dek_floor,
+            "rows_deleted": deleted, "unclassified_rows": unclassified,
+            "unclassified_rows_deleted": unclassified_deleted}

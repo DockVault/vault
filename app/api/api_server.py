@@ -35,6 +35,7 @@ bootstrap_entrypoint("API")
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
 from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim
 from app.core import sharing_policy
+from app.core.key_wrap_algorithms import DIRECT_DEK_ALGO, TEAMPRIV_ALGO
 from app.config.branding import branding
 # NOTE: auth_service and vault_service BOTH define a class named RateLimitExceededError
 # (unrelated: one subclasses AuthenticationError, the other FileServiceError). Import the
@@ -5911,7 +5912,7 @@ async def create_vault(
                 user_id=current_user.id,
                 wrapped_dek=vault_create.wrapped_team_privkey,
                 ephemeral_public_key=vault_create.team_privkey_ephemeral_public_key,
-                wrapping_algorithm='ECDH-P384-AES-GCM-TEAMPRIV',
+                wrapping_algorithm=TEAMPRIV_ALGO,
                 key_version=1,  # team epoch 1
                 granted_by=current_user.id,
                 granted_at=datetime.now(timezone.utc),
@@ -5931,7 +5932,7 @@ async def create_vault(
                 user_id=current_user.id,
                 wrapped_dek=vault_create.wrapped_dek,
                 ephemeral_public_key=vault_create.ephemeral_public_key,
-                wrapping_algorithm='ECDH-P384-AES-KW',
+                wrapping_algorithm=DIRECT_DEK_ALGO,
                 key_version=1,
                 granted_by=current_user.id,
                 granted_at=datetime.now(timezone.utc),
