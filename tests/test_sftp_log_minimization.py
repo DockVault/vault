@@ -117,16 +117,16 @@ def test_the_emitter_drops_unknown_fields_and_redacts_unsafe_values(monkeypatch)
     monkeypatch.setattr("builtins.print", lambda *a, **k: written.append(" ".join(map(str, a))))
 
     events.safe_event("probe.code", vault="11111111-2222-3333-4444-555555555555", bytes=1234)
-    assert written[-1] == "sftp probe.code bytes=1234 vault=11111111-2222-3333-4444-555555555555"
+    assert written[-1] == "event probe.code bytes=1234 vault=11111111-2222-3333-4444-555555555555"
 
     # A field nobody whitelisted is dropped, not printed.
     events.safe_event("probe.code", filename="secret-merger-terms.pdf")
-    assert written[-1] == "sftp probe.code", written[-1]
+    assert written[-1] == "event probe.code", written[-1]
 
     # `reason` is no longer whitelisted at all, so free text is DROPPED rather than merely
     # redacted -- the stronger outcome, and the reason the unused permissive names were removed.
     events.safe_event("probe.code", reason="/app/storage/.sftp_tmp/secret-merger-terms.pdf")
-    assert written[-1] == "sftp probe.code", written[-1]
+    assert written[-1] == "event probe.code", written[-1]
 
     # A whitelisted field carrying an unsafe VALUE is redacted rather than trusted. This is the
     # backstop behind the name whitelist, and it has to hold on its own: a filename like
@@ -144,18 +144,18 @@ def test_the_emitter_drops_unknown_fields_and_redacts_unsafe_values(monkeypatch)
     # has exactly the same shape as an event code, so no runtime check can tell them apart.
     # The real guarantee is that every code is a literal, which the static test below enforces.
     events.safe_event("forged\nsftp fake.event")
-    assert written[-1] == "sftp invalid-code", written[-1]
+    assert written[-1] == "event invalid-code", written[-1]
     events.safe_event("Has Spaces And Caps")
-    assert written[-1] == "sftp invalid-code", written[-1]
+    assert written[-1] == "event invalid-code", written[-1]
 
     # The exception class survives; its message never does.
     events.safe_event("probe.code", ValueError("connect to 10.0.0.5 failed for user bob"))
-    assert written[-1] == "sftp probe.code err=ValueError", written[-1]
+    assert written[-1] == "event probe.code err=ValueError", written[-1]
 
     # A peer arrives as paramiko's (host, port) tuple; str() on it would fail the shape check and
     # be redacted, which is safe but useless. The host survives, the ephemeral port does not.
     events.safe_event("probe.code", peer=("203.0.113.7", 51234))
-    assert written[-1] == "sftp probe.code peer=203.0.113.7", written[-1]
+    assert written[-1] == "event probe.code peer=203.0.113.7", written[-1]
 
 
 @pytest.mark.unit
@@ -198,20 +198,32 @@ def test_a_real_upload_leaves_no_filename_in_the_container_log(admin, temp_vault
         pytest.skip("reading the container's own log needs the docker CLI")
     from conftest import ADMIN_PASS, ADMIN_USER, BASE_URL
 
-    container = (os.environ.get("VAULT_SFTP_CONTAINER")
-                 or os.environ.get("VAULT_API_CONTAINER", "vault-sftp"))
+    # Read EVERY container that could hold the line, not one guessed from whichever variable
+    # happens to be set. Falling back to the API container in split mode reads a log the SFTP
+    # server never writes to -- where the sentinel is absent for reasons unrelated to this fix,
+    # so the test would pass while proving nothing. Combined deployments put both halves in one
+    # container; split puts them in two; checking both is correct for either.
+    candidates = [c for c in (os.environ.get("VAULT_SFTP_CONTAINER"),
+                              os.environ.get("VAULT_API_CONTAINER"),
+                              "vault-sftp") if c]
+    containers = list(dict.fromkeys(candidates))
     host = urlsplit(BASE_URL).hostname or "127.0.0.1"
     port = int(os.environ.get("VAULT_SFTP_PORT", "2322"))
     sentinel = f"acquisition-terms-{uuid.uuid4().hex[:8]}-CONFIDENTIAL.txt"
 
-    stamp = subprocess.run(
-        # Trailing Z, or the docker CLI parses this in the CLI HOST's timezone rather than UTC.
-        # West of UTC that puts the window in the future and the log comes back empty.
-        ["docker", "exec", container, "date", "-u", "+%Y-%m-%dT%H:%M:%SZ"],
-        capture_output=True, text=True, timeout=30,
-    )
-    assert stamp.returncode == 0, stamp.stderr
-    since = stamp.stdout.strip()
+    since = None
+    reachable = []
+    for name in containers:
+        stamp = subprocess.run(
+            # Trailing Z, or the docker CLI parses this in the CLI HOST's timezone rather than
+            # UTC. West of UTC that puts the window in the future and the log comes back empty.
+            ["docker", "exec", name, "date", "-u", "+%Y-%m-%dT%H:%M:%SZ"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if stamp.returncode == 0:
+            reachable.append(name)
+            since = since or stamp.stdout.strip()
+    assert reachable, f"none of these containers exist: {containers}"
 
     vault_name = temp_vault["name"]
     transport = paramiko.Transport((host, port))
@@ -229,11 +241,13 @@ def test_a_real_upload_leaves_no_filename_in_the_container_log(admin, temp_vault
     finally:
         transport.close()
 
-    logs = subprocess.run(
-        ["docker", "logs", "--since", since, container],
-        capture_output=True, text=True, timeout=60,
-    )
-    combined = logs.stdout + logs.stderr
+    combined = ""
+    for name in reachable:
+        logs = subprocess.run(
+            ["docker", "logs", "--since", since, name],
+            capture_output=True, text=True, timeout=60,
+        )
+        combined += logs.stdout + logs.stderr
     offending = [ln for ln in combined.splitlines() if sentinel in ln]
     assert not offending, (
         "the uploaded filename appears in the container log:\n" + "\n".join(offending)
@@ -241,7 +255,7 @@ def test_a_real_upload_leaves_no_filename_in_the_container_log(admin, temp_vault
 
     # Non-vacuity: the upload must actually have been logged, or its name being absent from an
     # empty log would prove nothing at all.
-    assert "sftp upload.stored" in combined, (
+    assert "event upload.stored" in combined, (
         "no upload event was logged, so the missing filename means nothing:\n" + combined[-2000:]
     )
 

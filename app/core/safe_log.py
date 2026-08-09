@@ -59,7 +59,11 @@ def safe_event(code: str, exc: BaseException | None = None, **fields) -> None:
     """
     if not _SAFE_CODE.fullmatch(str(code)):
         code = "invalid-code"
-    parts = ["sftp", str(code)]
+    # No service name here. This module now has callers in more than one process, and a
+    # hardcoded one was actively misleading: a vault deletion on the web path announced itself
+    # as SFTP. The code carries the domain, the container carries the process, and the combined
+    # launcher already tags each line with the half it came from.
+    parts = ["event", str(code)]
     for key in sorted(fields):
         if key not in _SAFE_FIELDS:
             continue
