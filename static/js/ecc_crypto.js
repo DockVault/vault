@@ -142,9 +142,18 @@ class ECCCryptoLibrary {
         this.V2_MAGIC = new Uint8Array([0x44, 0x56, 0x5A, 0x32]);  // "DVZ2"
         this.V2_VERSION = 0x02;
         this.V2_PURPOSE_DIRECT_DEK = 0x01;
+        this.V2_PURPOSE_TEAM_DEK = 0x02;
+        this.V2_PURPOSE_TEAM_PRIV = 0x03;
         this.V2_DIRECT_WRAP_BYTES = 68;
+        // A team private key is a PKCS8 blob, so unlike the two DEK wraps this payload has no
+        // fixed size. Bounded on both sides instead: below the floor it cannot be this format
+        // at all, and the ceiling is forty times a P-384 key with room to spare.
+        this.V2_TEAMPRIV_MIN_BYTES = 36;   // 8 header + 12 nonce + 16 tag, empty plaintext
+        this.V2_TEAMPRIV_MAX_BYTES = 8192;
         this.V2_HKDF_SALT = new TextEncoder().encode('dockvault-zk-envelope-v2-salt-01');
         this.V2_INFO_DEK_DIRECT = 'dockvault-zk-dek-direct-v2';
+        this.V2_INFO_DEK_TEAM = 'dockvault-zk-dek-team-v2';
+        this.V2_INFO_TEAMPRIV = 'dockvault-zk-teampriv-v2';
 
         // The v2 WRITER is off by default, same mechanism and same reasoning as the envelope
         // above -- but the blast radius is larger. That envelope is read only by the account
@@ -489,37 +498,16 @@ class ECCCryptoLibrary {
      */
     _v2DirectTranscript(vaultId, recipientUserId, dekEpoch) {
         const enc = new TextEncoder();
-        const uuid = (v) => {
-            const s = String(v == null ? '' : v).toLowerCase();
-            // 36 bytes exactly. A short or malformed id would silently shorten the transcript and
-            // mint a wrap nothing can ever read, so refuse rather than encode it.
-            if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(s)) {
-                this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'v2Transcript.uuid');
-            }
-            return enc.encode(s);
-        };
-        // The backing column is a signed 32-bit integer. Python raises on a negative here while
-        // DataView.setUint32 would happily write 0xFFFFFFFF, and that divergence is a wrap one
-        // runtime can read and the other cannot.
-        // Number(true) is 1 and Number('') is 0, so coerce only from the two types that can
-        // legitimately carry an epoch. A boolean quietly becoming epoch 1 would mint a wrap
-        // that authenticates against the wrong transcript and can never be opened.
-        const epoch = (typeof dekEpoch === 'number' || typeof dekEpoch === 'string')
-            ? Number(dekEpoch) : NaN;
-        if (!Number.isInteger(epoch) || epoch < 1 || epoch > 0x7FFFFFFF) {
-            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'v2Transcript.epoch');
-        }
-        const epochBytes = new Uint8Array(4);
-        new DataView(epochBytes.buffer).setUint32(0, epoch, false);
-
-        const header = new Uint8Array(8);
-        header.set(this.V2_MAGIC, 0);
-        header[4] = this.V2_VERSION;
-        header[5] = this.V2_PURPOSE_DIRECT_DEK;
-        // header[6..7] stay zero: reserved, and a reader rejects anything else.
-
-        const v = uuid(vaultId), r = uuid(recipientUserId), z = new Uint8Array([0]);
-        const context = this._concatBytes([v, z, r, z, epochBytes]);
+        // The same three encoders every construction uses. They were inline here once, when
+        // this was the only construction; two copies of a canonical encoding means a future
+        // tightening of one silently forks this wrap from the others.
+        const header = this._v2Header(this.V2_PURPOSE_DIRECT_DEK);
+        const z = new Uint8Array([0]);
+        const context = this._concatBytes([
+            this._v2Uuid(vaultId, 'v2Transcript.uuid'), z,
+            this._v2Uuid(recipientUserId, 'v2Transcript.uuid'), z,
+            this._v2Epoch(dekEpoch, 'v2Transcript.epoch'),
+        ]);
         return {
             header,
             info: this._concatBytes([enc.encode(this.V2_INFO_DEK_DIRECT), z, context]),
@@ -559,9 +547,10 @@ class ECCCryptoLibrary {
      *
      * A NEW method rather than a change to wrapVaultDEK, and that is not tidiness: the legacy
      * helper's own output is pinned byte-for-byte by the frozen DIRECT-wrap vector, and it is
-     * also the writer for hierarchical team-DEK wraps, whose grammar is still blocked. (Those
-     * team wraps have no pinned vector of their own -- the team fixture covers a different
-     * function -- so that second reason rests on the blocked grammar, not on a test.)
+     * also the writer that every hierarchical vault still holds wraps from, because the newer
+     * team writers are gated off. (Those team wraps have no pinned vector of their own -- the
+     * team fixture covers a different function -- so that second reason rests on the stored
+     * data, not on a test.)
      */
     async wrapVaultDEKV2(vaultDEK, recipientPublicKey, context) {
         const { vaultId, recipientUserId, dekEpoch } = context || {};
@@ -641,6 +630,243 @@ class ECCCryptoLibrary {
                                             true, ['encrypt', 'decrypt']);
         } catch (error) {
             throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'unwrapVaultDEK.v2');
+        }
+    }
+
+    /**
+     * Transcript for the team DEK wrap. The recipient is the vault's team keypair, which the key
+     * agreement already binds, so there is no per-user field here -- one wrap serves every member,
+     * which is the whole reason this mode exists.
+     *
+     * The epoch bound is the DEK epoch, not the team epoch. They are different columns on
+     * different axes and only one of them can be bound: the rotating client proposes the DEK epoch
+     * and the server verifies it under a lock, whereas the team epoch is assigned server-side and
+     * a writer cannot know the value its row will carry.
+     * @private
+     */
+    _v2TeamDekTranscript(vaultId, dekEpoch) {
+        const enc = new TextEncoder();
+        const header = this._v2Header(this.V2_PURPOSE_TEAM_DEK);
+        const context = this._concatBytes([
+            this._v2Uuid(vaultId, 'v2TeamDek.vault'), new Uint8Array([0]),
+            this._v2Epoch(dekEpoch, 'v2TeamDek.epoch'),
+        ]);
+        return {
+            header,
+            info: this._concatBytes([enc.encode(this.V2_INFO_DEK_TEAM), new Uint8Array([0]), context]),
+            aad: this._concatBytes([header, context]),
+        };
+    }
+
+    /**
+     * Transcript for the team PRIVATE key wrap. This one does bind a recipient: it is wrapped to a
+     * specific member, and both ends can name that member.
+     *
+     * No epoch. The team epoch is the only one that would mean anything here, and it is the one the
+     * server assigns.
+     * @private
+     */
+    _v2TeamPrivTranscript(vaultId, recipientUserId) {
+        const enc = new TextEncoder();
+        const header = this._v2Header(this.V2_PURPOSE_TEAM_PRIV);
+        const context = this._concatBytes([
+            this._v2Uuid(vaultId, 'v2TeamPriv.vault'), new Uint8Array([0]),
+            this._v2Uuid(recipientUserId, 'v2TeamPriv.recipient'),
+        ]);
+        return {
+            header,
+            info: this._concatBytes([enc.encode(this.V2_INFO_TEAMPRIV), new Uint8Array([0]), context]),
+            aad: this._concatBytes([header, context]),
+        };
+    }
+
+    /** @private */
+    _v2Header(purpose) {
+        const header = new Uint8Array(8);
+        header.set(this.V2_MAGIC, 0);
+        header[4] = this.V2_VERSION;
+        header[5] = purpose;
+        return header;  // bytes 6-7 stay zero; a reader rejects anything else
+    }
+
+    /** @private */
+    _v2Uuid(value, where) {
+        const s = String(value == null ? '' : value).toLowerCase();
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(s)) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, where);
+        }
+        return new TextEncoder().encode(s);
+    }
+
+    /** @private */
+    _v2Epoch(value, where) {
+        const epoch = (typeof value === 'number' || typeof value === 'string') ? Number(value) : NaN;
+        if (!Number.isInteger(epoch) || epoch < 1 || epoch > 0x7FFFFFFF) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, where);
+        }
+        const out = new Uint8Array(4);
+        new DataView(out.buffer).setUint32(0, epoch, false);
+        return out;
+    }
+
+    /**
+     * Wrap a vault DEK to the vault's TEAM public key, version 2.
+     *
+     * A new method, not a change to wrapVaultDEK. That helper writes the legacy form of both this
+     * and the direct wrap, and its bytes are pinned.
+     */
+    async wrapTeamDEKV2(vaultDEK, teamPublicKey, context) {
+        const { vaultId, dekEpoch } = context || {};
+        const t = this._v2TeamDekTranscript(vaultId, dekEpoch);
+        try {
+            const out = await this._v2SealToPublicKey(vaultDEK, teamPublicKey, t, true);
+            return out;
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'wrapTeamDEKV2');
+        }
+    }
+
+    /**
+     * Wrap the team PRIVATE key to one member's public key, version 2.
+     */
+    async wrapTeamPrivateKeyV2(teamPrivateKey, recipientPublicKey, context) {
+        const { vaultId, recipientUserId } = context || {};
+        const t = this._v2TeamPrivTranscript(vaultId, recipientUserId);
+        try {
+            const pkcs8 = await this._subtle().exportKey('pkcs8', teamPrivateKey);
+            const sealed = await this._v2SealBytes(new Uint8Array(pkcs8), recipientPublicKey, t);
+            if (sealed.bytes.length > this.V2_TEAMPRIV_MAX_BYTES) {
+                this._fail(CRYPTO_ERROR_CODES.WRAP_FAILED, 'wrapTeamPrivateKeyV2.length');
+            }
+            return {
+                wrappedKey: this._arrayBufferToBase64(sealed.bytes.buffer),
+                ephemeralPublicKey: sealed.ephemeralPublicKey,
+            };
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'wrapTeamPrivateKeyV2');
+        }
+    }
+
+    /**
+     * Shared sealing: fresh ephemeral, agree with the recipient, derive under the transcript's
+     * info, encrypt under its aad. Returns raw bytes plus the exported ephemeral point.
+     * @private
+     */
+    async _v2SealBytes(plaintext, recipientPublicKey, t) {
+        const ephemeral = await this._subtle().generateKey(
+            { name: 'ECDH', namedCurve: this.CURVE }, true, ['deriveBits']);
+        const shared = await this._subtle().deriveBits(
+            { name: 'ECDH', public: recipientPublicKey }, ephemeral.privateKey, 384);
+        const key = await this._deriveV2WrappingKey(shared, t.info);
+        const nonce = this._randomBytes(12);
+        const ct = await this._subtle().encrypt(
+            { name: 'AES-GCM', iv: nonce, additionalData: t.aad, tagLength: 128 }, key, plaintext);
+        const ephRaw = await this._subtle().exportKey('raw', ephemeral.publicKey);
+        return {
+            bytes: this._concatBytes([t.header, nonce, new Uint8Array(ct)]),
+            ephemeralPublicKey: this._arrayBufferToBase64(ephRaw),
+        };
+    }
+
+    /** @private */
+    async _v2SealToPublicKey(cryptoKey, recipientPublicKey, t, fixedLength) {
+        const raw = await this._subtle().exportKey('raw', cryptoKey);
+        const sealed = await this._v2SealBytes(new Uint8Array(raw), recipientPublicKey, t);
+        if (fixedLength && sealed.bytes.length !== this.V2_DIRECT_WRAP_BYTES) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_FAILED, 'v2Seal.length');
+        }
+        return {
+            wrappedDEK: this._arrayBufferToBase64(sealed.bytes.buffer),
+            ephemeralPublicKey: sealed.ephemeralPublicKey,
+        };
+    }
+
+    /**
+     * Open a version-2 payload. Structural faults are rejected before any key agreement, so a
+     * malformed input is never reported as an authentication failure.
+     * @private
+     */
+    async _v2Open(wrapBytes, ephemeralPublicKeyBase64, privateKey, t, where) {
+        if (wrapBytes[6] !== 0 || wrapBytes[7] !== 0) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, where + '.reserved');
+        }
+        const ephBytes = new Uint8Array(this._base64ToArrayBuffer(ephemeralPublicKeyBase64));
+        if (ephBytes.length !== 97 || ephBytes[0] !== 0x04) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, where + '.point');
+        }
+        let ephemeralPublicKey;
+        try {
+            ephemeralPublicKey = await this._importRawPublicKey(ephBytes.buffer);
+        } catch (error) {
+            // On the right curve or not is a shape question, not an authentication one.
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, where + '.curve');
+        }
+        const shared = await this._subtle().deriveBits(
+            { name: 'ECDH', public: ephemeralPublicKey }, privateKey, 384);
+        const key = await this._deriveV2WrappingKey(shared, t.info);
+        return this._subtle().decrypt(
+            { name: 'AES-GCM', iv: wrapBytes.slice(8, 20), additionalData: t.aad, tagLength: 128 },
+            key, wrapBytes.slice(20));
+    }
+
+    /**
+     * Read a version-2 team DEK wrap. Opened with the team PRIVATE key, not the member's own.
+     * @private
+     */
+    async _unwrapTeamDEKV2(wrapBytes, ephemeralPublicKeyBase64, teamPrivateKey, context) {
+        const { vaultId, dekEpoch } = context || {};
+        if (wrapBytes.length !== this.V2_DIRECT_WRAP_BYTES) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapTeamDEK.v2.length');
+        }
+        const t = this._v2TeamDekTranscript(vaultId, dekEpoch);
+        try {
+            const plain = await this._v2Open(wrapBytes, ephemeralPublicKeyBase64,
+                                             teamPrivateKey, t, 'unwrapTeamDEK.v2');
+            // The wrapping used to be a key-wrap primitive that could only ever yield 32 bytes.
+            // Authenticated encryption returns whatever it was given, so a writer bug or a hostile
+            // row could otherwise hand back a short "key" that imports happily at half strength.
+            if (plain.byteLength !== 32) {
+                this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapTeamDEK.v2.keylen');
+            }
+            return this._subtle().importKey('raw', plain, { name: 'AES-GCM', length: 256 },
+                                            true, ['encrypt', 'decrypt']);
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'unwrapTeamDEK.v2');
+        }
+    }
+
+    /**
+     * Read a version-2 team PRIVATE key wrap.
+     *
+     * This payload has no fixed length, so length cannot discriminate it from the legacy form the
+     * way it can for the two DEK wraps -- the whole header has to validate instead, and the size
+     * is merely bounded on both sides before anything is allocated.
+     * @private
+     */
+    async _unwrapTeamPrivateKeyV2(wrapBytes, ephemeralPublicKeyBase64, memberPrivateKey,
+                                  context, extractable) {
+        const { vaultId, recipientUserId } = context || {};
+        if (wrapBytes.length < this.V2_TEAMPRIV_MIN_BYTES
+            || wrapBytes.length > this.V2_TEAMPRIV_MAX_BYTES) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapTeamPriv.v2.length');
+        }
+        const t = this._v2TeamPrivTranscript(vaultId, recipientUserId);
+        try {
+            const pkcs8 = await this._v2Open(wrapBytes, ephemeralPublicKeyBase64,
+                                             memberPrivateKey, t, 'unwrapTeamPriv.v2');
+            // Least privilege: this key exists only to agree with an ephemeral and open the
+            // vault DEK, so key agreement is its only permitted use and it is non-extractable
+            // by default. Every cached copy is a default one.
+            //
+            // `extractable` is the caller's to ask for, and exactly one caller does: re-sharing
+            // a team key to a new member means exporting it to wrap for them, which cannot be
+            // done with a key that will not leave the browser. That copy is a local in one
+            // function and is never cached. Any new caller passing true needs the same
+            // justification, in writing, at its own call site.
+            return this._subtle().importKey(
+                'pkcs8', pkcs8, { name: 'ECDH', namedCurve: this.CURVE }, extractable, ['deriveBits']);
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'unwrapTeamPriv.v2');
         }
     }
 
@@ -1056,17 +1282,28 @@ class ECCCryptoLibrary {
             if (wrapBytes[4] !== this.V2_VERSION) {
                 this._fail(CRYPTO_ERROR_CODES.WRAP_UNSUPPORTED, 'unwrapVaultDEK.v2.version');
             }
-            if (wrapBytes[5] !== this.V2_PURPOSE_DIRECT_DEK) {
-                this._fail(CRYPTO_ERROR_CODES.WRAP_UNSUPPORTED, 'unwrapVaultDEK.v2.purpose');
-            }
             if (!context) {
                 // The transcript inputs are not optional for v2. Reaching here means a caller
                 // was not updated; say so structurally rather than letting it surface as an
                 // authentication failure, which reads as tampering.
                 this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapVaultDEK.v2.context');
             }
+            // Which purpose is acceptable is the CALLER's statement, not the payload's. A
+            // hierarchical read passes the team private key and expects a team-DEK wrap; a
+            // direct read passes the member's own key and expects a direct one. Reading the
+            // purpose off the wire to pick a transcript is exactly the steering the header's
+            // authentication denies -- so compare, never select.
+            const expected = context.teamMode
+                ? this.V2_PURPOSE_TEAM_DEK : this.V2_PURPOSE_DIRECT_DEK;
+            if (wrapBytes[5] !== expected) {
+                this._fail(CRYPTO_ERROR_CODES.WRAP_UNSUPPORTED, 'unwrapVaultDEK.v2.purpose');
+            }
             // Committed to v2 from here. A tag failure is NOT retried as legacy -- retrying is
             // what turns a tampering signal into a parser oracle.
+            if (context.teamMode) {
+                return this._unwrapTeamDEKV2(wrapBytes, ephemeralPublicKeyBase64,
+                                             userPrivateKey, context);
+            }
             return this._unwrapVaultDEKV2(wrapBytes, ephemeralPublicKeyBase64, userPrivateKey, context);
         }
         if (wrapBytes.length !== 40) {
@@ -1298,12 +1535,32 @@ class ECCCryptoLibrary {
      * @param {CryptoKey} memberPrivateKey - the member's identity ECDH private key
      * @returns {Promise<CryptoKey>} the team private key (non-extractable)
      */
-    async unwrapPrivateKeyFromWrapped(wrappedKeyBase64, ephemeralPublicKeyBase64, memberPrivateKey, extractable = false) {
-        const teamV2 = this._inspectV2Header(this._base64ToArrayBuffer(wrappedKeyBase64));
-        if (teamV2) {
-            this._fail(teamV2 === 'UNSUPPORTED'
-                ? CRYPTO_ERROR_CODES.WRAP_UNSUPPORTED
-                : CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapPrivateKeyFromWrapped.v2');
+    async unwrapPrivateKeyFromWrapped(wrappedKeyBase64, ephemeralPublicKeyBase64, memberPrivateKey, extractable = false, context = null) {
+        // Judge the size BEFORE materialising it. Base64 is four characters per three bytes,
+        // so the encoded length bounds the decoded one without decoding anything -- and a
+        // ceiling applied after the decode has already let a hostile server hand us as much
+        // memory as it liked.
+        if (typeof wrappedKeyBase64 === 'string'
+            && wrappedKeyBase64.length > 4 * Math.ceil(this.V2_TEAMPRIV_MAX_BYTES / 3)) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapPrivateKeyFromWrapped.size');
+        }
+        const wrapBytes = new Uint8Array(this._base64ToArrayBuffer(wrappedKeyBase64));
+        const teamV2 = this._inspectV2Header(wrapBytes);
+        if (teamV2 === 'INVALID') {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapPrivateKeyFromWrapped.v2');
+        }
+        if (teamV2 === 'UNSUPPORTED') {
+            if (wrapBytes[4] !== this.V2_VERSION
+                || wrapBytes[5] !== this.V2_PURPOSE_TEAM_PRIV) {
+                this._fail(CRYPTO_ERROR_CODES.WRAP_UNSUPPORTED,
+                           'unwrapPrivateKeyFromWrapped.v2.purpose');
+            }
+            if (!context) {
+                this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID,
+                           'unwrapPrivateKeyFromWrapped.v2.context');
+            }
+            return this._unwrapTeamPrivateKeyV2(wrapBytes, ephemeralPublicKeyBase64,
+                                                memberPrivateKey, context, extractable);
         }
         const ephemeralPublicKey = await this._importRawPublicKey(
             this._base64ToArrayBuffer(ephemeralPublicKeyBase64)
@@ -1824,6 +2081,8 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     unwrapVaultDEK: CRYPTO_ERROR_CODES.WRAP_FAILED,
     wrapVaultDEK: CRYPTO_ERROR_CODES.WRAP_FAILED,
     wrapVaultDEKV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
+    wrapTeamDEKV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
+    wrapTeamPrivateKeyV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
     wrapPrivateKeyToPublic: CRYPTO_ERROR_CODES.WRAP_FAILED,
     unwrapPrivateKeyFromWrapped: CRYPTO_ERROR_CODES.WRAP_FAILED,
 
