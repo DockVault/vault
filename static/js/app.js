@@ -8479,8 +8479,13 @@ const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB — matches the server default
 // resume by replaying the SAME bytes for the chunks still missing.
 //
 // Zero-knowledge is preserved: only ciphertext (opaque without the DEK) is held
-// at rest; the DEK and the plaintext are NEVER persisted, the server still only
-// ever receives ciphertext, and resuming needs no DEK at all. Records are
+// at rest, and it is held as a NEUTRAL blob. That last part is load-bearing and was
+// once wrong: the bytes were encrypted but wrapped in a File built from the plaintext
+// name and MIME, and a File keeps `name`, `type` and `lastModified` across the
+// structured clone into IndexedDB. So an interrupted upload of a sensitively-named
+// document left that name sitting on disk in the clear, beside the sealed copy of the
+// very same name. The DEK and the plaintext bytes were never persisted and still are
+// not; what leaked was the metadata. Records are
 // deleted on completion/cancel and pruned by TTL. Everything fails soft if
 // IndexedDB is unavailable (private mode, quota, old browser) — uploads still
 // work, they just can't resume across a reload.
@@ -8488,30 +8493,159 @@ const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB — matches the server default
 const zkUploadStore = (() => {
     const DB_NAME = 'dockvault-zk-uploads';
     const STORE = 'pending';
-    const VERSION = 1;
+    // v2 drops plaintext name/MIME and stores ciphertext as a neutral blob. The bump exists to
+    // run the migration below over records v1 already wrote; a reader that only ever saw v2
+    // would not need it.
+    const VERSION = 2;
+    const NEUTRAL_TYPE = 'application/octet-stream';
     let _dbPromise = null;
+    // Set when an upgrade could not run because another tab holds the old connection open. That
+    // tab is still using the v1 schema, so plaintext metadata stays on disk until it closes --
+    // which the operator has to be told, not left to guess.
+    let _upgradeBlocked = false;
+    // Set when the stored database is NEWER than this page's code -- another tab upgraded it.
+    let _versionTooOld = false;
+
+    /**
+     * Strip a File down to opaque bytes.
+     *
+     * `new Blob([file])` copies no data -- it references the same underlying bytes -- but the
+     * result is a plain Blob, so `name` and `lastModified` are gone and `type` is whatever we
+     * say it is. Passing a File straight into IndexedDB is what leaked the name.
+     */
+    function _neutralBlob(fileOrBlob) {
+        if (!fileOrBlob) return null;
+        return new Blob([fileOrBlob], { type: NEUTRAL_TYPE });
+    }
 
     function _open() {
         if (_dbPromise) return _dbPromise;
-        _dbPromise = new Promise((resolve) => {
+        // Reset per ATTEMPT, not only on success: leaving it set after a failed retry means the
+        // user keeps being told to close other tabs long after they have.
+        _upgradeBlocked = false;
+        _versionTooOld = false;
+        const myPromise = new Promise((resolve) => {
             let req;
             try {
                 if (typeof indexedDB === 'undefined' || !indexedDB) { resolve(null); return; }
                 req = indexedDB.open(DB_NAME, VERSION);
             } catch (_) { resolve(null); return; }
-            req.onupgradeneeded = () => {
+            req.onupgradeneeded = (ev) => {
                 const db = req.result;
                 if (!db.objectStoreNames.contains(STORE)) {
                     const os = db.createObjectStore(STORE, { keyPath: 'sessionId' });
                     os.createIndex('vaultId', 'vaultId', { unique: false });
                     os.createIndex('createdAt', 'createdAt', { unique: false });
+                    return;  // nothing written yet, so nothing to migrate
                 }
+                // Rewrite each existing record IN PLACE. Deleting and recreating would put the
+                // only copy of the ciphertext at risk for the width of the transaction, and this
+                // migration must never be able to cost someone their upload -- the plaintext name
+                // is the problem, the bytes are the thing being protected.
+                try {
+                    const os = req.transaction.objectStore(STORE);
+                    const cursorReq = os.openCursor();
+                    // Swallow a cursor-level failure rather than let it abort the upgrade.
+                    cursorReq.onerror = (e) => { e.preventDefault(); };
+                    cursorReq.onsuccess = (cev) => {
+                        const cur = cev.target.result;
+                        if (!cur) return;
+                        try {
+                            const rec = cur.value;
+                            const cleaned = _stripPlaintextMetadata(rec);
+                            if (cleaned) {
+                                const upd = cur.update(cleaned);
+                                // The realistic failure here is asynchronous -- a quota breach
+                                // while the rewritten blob is materialised, or an unreadable
+                                // backing file. Unhandled, that error propagates to the
+                                // versionchange transaction and ABORTS the whole upgrade, which
+                                // would leave the database on the old schema permanently and
+                                // disable the TTL sweep and the logout wipe with it. Contain it:
+                                // this record stays v1-shaped on disk and is stripped on read.
+                                upd.onerror = (e) => { e.preventDefault(); };
+                            }
+                        } catch (_) { /* same containment for a synchronous throw */ }
+                        cur.continue();
+                    };
+                } catch (_) { /* an unmigrated record is handled defensively on read */ }
             };
-            req.onsuccess = () => resolve(req.result);
-            req.onerror = () => resolve(null);
-            req.onblocked = () => resolve(null);
+            req.onsuccess = () => {
+                const db = req.result;
+                // This attempt may already have been abandoned: onblocked resolves null and drops
+                // the memo, but does NOT cancel the request, so it can still succeed later. A
+                // connection nobody references is never closed and is missed by the logout wipe.
+                if (_dbPromise !== myPromise) { try { db.close(); } catch (_) {} return; }
+                // Another tab asking to upgrade must not be blocked by this connection: hold it
+                // open and the other tab is stuck on v1, still writing plaintext metadata.
+                db.onversionchange = () => {
+                    try { db.close(); } catch (_) {}
+                    // Only forget the memo if it still points at THIS connection; a newer one may
+                    // already have replaced it.
+                    if (_dbPromise === myPromise) _dbPromise = null;
+                };
+                _upgradeBlocked = false;
+                resolve(db);
+            };
+            req.onerror = () => {
+                // A VersionError means ANOTHER tab already upgraded past us: this page is running
+                // older code against a newer database and cannot resume anything until it
+                // reloads. Distinguishing it matters because the alternative advice -- the quiet
+                // degrade -- would leave the user with silently non-resumable uploads.
+                // Only speak for this attempt. onblocked already resolves and abandons an
+                // attempt without cancelling its request, so a superseded one can still fail
+                // later -- and letting that late failure clear the memo or set a flag would
+                // disable storage for the rest of the page on behalf of a connection nobody is
+                // waiting for. Same guard as onsuccess and onversionchange.
+                const current = (_dbPromise === myPromise);
+                const err = req.error;
+                if (current && err && err.name === 'VersionError') _versionTooOld = true;
+                // Clear the memo the way onblocked does. Caching a failure for the lifetime of
+                // the page would also disable the TTL sweep and the logout wipe, because both
+                // short-circuit when the database is unavailable.
+                if (current) _dbPromise = null;
+                resolve(null);
+            };
+            req.onblocked = () => {
+                // An older tab is holding the previous schema open. Record it, and drop the
+                // memoised promise so the next call retries rather than caching the failure for
+                // the lifetime of the page -- but again, only for the current attempt.
+                if (_dbPromise === myPromise) {
+                    _upgradeBlocked = true;
+                    _dbPromise = null;
+                }
+                resolve(null);
+            };
         });
-        return _dbPromise;
+        // Assigned AFTER construction so the handlers above can compare against it: the executor
+        // runs synchronously, but its callbacks fire later, and each needs to know whether this
+        // attempt is still the current one.
+        _dbPromise = myPromise;
+        return myPromise;
+    }
+
+    /**
+     * Return a v2-shaped copy of a record, or null if it is already clean.
+     *
+     * Used by the migration and again when reading, because a record can reach a reader
+     * unmigrated: the upgrade may have been blocked by another tab, or its cursor pass may have
+     * skipped a row. Reading defensively means a stale row is never handed onward with its
+     * plaintext attached.
+     */
+    function _stripPlaintextMetadata(rec) {
+        if (!rec || typeof rec !== 'object') return null;
+        // A record that declares this schema or newer was written by code that already knew the
+        // rule. Trusting the marker keeps a FUTURE version's legitimately-typed blob from being
+        // rewritten by today's shape heuristic on every read.
+        if (typeof rec.schema === 'number' && rec.schema >= VERSION) return null;
+        const hasPlaintextFields = ('fileName' in rec) || ('mimeType' in rec);
+        const blobIsFile = typeof File !== 'undefined' && rec.blob instanceof File;
+        const blobHasType = rec.blob && rec.blob.type && rec.blob.type !== NEUTRAL_TYPE;
+        if (!hasPlaintextFields && !blobIsFile && !blobHasType) return null;
+        const out = { ...rec, schema: VERSION };
+        delete out.fileName;
+        delete out.mimeType;
+        if (rec.blob) out.blob = _neutralBlob(rec.blob);
+        return out;
     }
 
     // Resolve a single IDB request to its result (or undefined on error) without rejecting.
@@ -8581,13 +8715,33 @@ const zkUploadStore = (() => {
                 }
             });
         },
+        // True when an upgrade could not run because another tab holds the old schema open.
+        // Callers surface this: until that tab closes, plaintext metadata stays on disk.
+        upgradeBlocked() { return _upgradeBlocked; },
+
+        // Exposed so the writer cannot accidentally hand a File to put(). One definition of
+        // "neutral" for the whole path.
+        neutralBlob(fileOrBlob) { return _neutralBlob(fileOrBlob); },
+
+        // So the writer stamps the same number the migration compares against, rather than a
+        // literal that drifts at the next bump.
+        schemaVersion() { return VERSION; },
+
+        // True when this page is running older code against a database another tab has already
+        // upgraded. Nothing here can work until the page reloads.
+        versionTooOld() { return _versionTooOld; },
+
         async get(sessionId) {
             const db = await _open();
             if (!db) return null;
             try {
                 const tx = db.transaction(STORE, 'readonly');
                 const out = await _reqProm(() => tx.objectStore(STORE).get(sessionId));
-                return out || null;
+                if (!out) return null;
+                // A record can arrive unmigrated -- blocked upgrade, or a row the cursor missed.
+                // Strip on the way out so nothing downstream ever sees the plaintext, even if it
+                // is still on disk.
+                return _stripPlaintextMetadata(out) || out;
             } catch (_) { return null; }
         },
         async delete(sessionId) {
@@ -8604,7 +8758,13 @@ const zkUploadStore = (() => {
             if (!db) return [];
             try {
                 const tx = db.transaction(STORE, 'readonly');
-                const out = await _reqProm(() => tx.objectStore(STORE).index('vaultId').getAll(vaultId));
+                const rows = await _reqProm(() => tx.objectStore(STORE).index('vaultId').getAll(vaultId));
+                // Same defensive strip as get(): a row can still be v1-shaped on disk, and this
+                // is a public read method -- a future caller building a list from it must not be
+                // handed the plaintext.
+                const out = Array.isArray(rows)
+                    ? rows.map((r) => _stripPlaintextMetadata(r) || r)
+                    : rows;
                 return out || [];
             } catch (_) { return []; }
         },
@@ -8761,9 +8921,17 @@ const uploadManager = {
                     const id = this._newId();
                     this.items.set(id, {
                         id, file: rec.blob, vaultId, folderId: s.folder_id || null,
-                        // The server has no plaintext name for a ZK session — use the name
-                        // saved locally (s.file_name is null for ZK).
-                        fileName: rec.fileName || s.file_name || '(encrypted upload)',
+                        // Neither side has a plaintext name to offer: the server never had one
+                        // for a zero-knowledge session, and the local record deliberately no
+                        // longer keeps one. Decrypting the sealed name needs the vault DEK, and
+                        // prompting for a passphrase merely to label a tray row is a worse trade.
+                        //
+                        // But two interrupted uploads must not be indistinguishable: Cancel
+                        // deletes the server session AND the local ciphertext, which is the only
+                        // copy, so choosing the wrong row cannot be undone. The session's short
+                        // id discriminates without revealing anything.
+                        fileName: s.file_name
+                            || `(encrypted upload \u00b7 ${String(s.session_id).slice(0, 8)})`,
                         totalSize: s.total_size,
                         totalChunks: s.total_chunks, chunkSize: rec.chunkSize || CHUNK_SIZE,
                         sessionId: s.session_id, received: new Set(),
@@ -8860,14 +9028,18 @@ const uploadManager = {
             const res = await zkUploadStore.put({
                 sessionId: it.sessionId,
                 vaultId: it.vaultId,
-                fileName: it.fileName,
+                // No fileName and no mimeType. The sealed encName/encMime/nameBi below carry the
+                // same information for the only consumer that needs it -- a re-init after the
+                // server expires the session -- and they carry it encrypted.
                 totalSize: it.totalSize,
-                mimeType: it.file.type || null,
                 folderId: it.folderId,
                 keyVersion: it.zkKeyVersion != null ? it.zkKeyVersion : null,
                 totalChunks: it.totalChunks,
                 chunkSize: it.chunkSize,
-                blob: it.file,
+                // A neutral Blob, never the File. The bytes are the same ciphertext either
+                // way; the File wrapper is what carried the plaintext name and MIME onto disk.
+                blob: zkUploadStore.neutralBlob(it.file),
+                schema: zkUploadStore.schemaVersion(),
                 // The encrypted name/MIME + blind index, so a re-init after a server-side
                 // session expiry (410) re-declares the same name without the plaintext.
                 encName: it.encName || null,
@@ -8890,7 +9062,30 @@ const uploadManager = {
     _noteResumePersistence(it, res) {
         if (!res || res.ok) { it.resumePersisted = true; it.resumeWarning = null; return; }
         it.resumePersisted = false;
-        if (res.unavailable) { it.resumeWarning = null; return; }  // expected, quiet degrade
+        if (res.unavailable) {
+            // "Unavailable" has two very different causes. Private mode or an old browser is the
+            // documented quiet degrade. Another TAB holding the previous schema open is not: the
+            // upgrade that removes plaintext filenames from disk cannot run while it is there,
+            // so the user is the only one who can resolve it and has to be told.
+            if (zkUploadStore.versionTooOld()) {
+                it.resumeWarning = 'DockVault was updated in another tab. Reload this page: until '
+                    + 'you do, uploads here cannot be saved for resuming.';
+                try { showWarning(it.resumeWarning); } catch (_) { /* toast optional */ }
+                try { this.render(); } catch (_) { /* a render hiccup must not fail the upload */ }
+                return;
+            }
+            if (zkUploadStore.upgradeBlocked()) {
+                it.resumeWarning = 'Another DockVault tab is open and is holding browser storage '
+                    + 'on an older format. Close the other tabs and reload: until then this '
+                    + 'upload cannot be saved for resuming, and older saved uploads keep their '
+                    + 'file names in browser storage.';
+                try { showWarning(it.resumeWarning); } catch (_) { /* toast optional */ }
+                try { this.render(); } catch (_) { /* a render hiccup must not fail the upload */ }
+                return;
+            }
+            it.resumeWarning = null;
+            return;
+        }
         it.resumeWarning = res.quota
             ? "Not enough browser storage to save this upload for resuming — it will still finish uploading, but can't be resumed if you reload or close the tab."
             : "Couldn't save this upload for resuming in browser storage — it will still finish uploading, but can't be resumed after a reload.";
