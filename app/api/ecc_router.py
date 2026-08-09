@@ -1482,7 +1482,13 @@ async def rekey_vault(
 
     # Lock the vault row so concurrent rekeys / version-checked uploads serialize. From here
     # to the final commit there are NO intermediate commits, so the lock holds throughout.
-    locked = db.query(Vault).filter(Vault.id == vault_id).with_for_update().first()
+    #
+    # populate_existing() is load-bearing, not decoration. This session already holds the vault
+    # from the entry read above, and without it the identity map hands back that instance
+    # unrefreshed -- the row would be genuinely locked while `current` still carried the value
+    # read before the lock, so two concurrent rotations could both satisfy the check below.
+    locked = (db.query(Vault).populate_existing()
+              .filter(Vault.id == vault_id).with_for_update().first())
     current = getattr(locked, 'dek_version', 1) or 1
 
     # Optimistic-lock: the client must have rotated from the live epoch.
@@ -1691,7 +1697,10 @@ async def retire_dek_versions(
 
     # Lock the vault row so a concurrent rekey/upload can't move the epoch or add a file
     # under an epoch we're about to retire between our scan and the delete.
-    locked = db.query(Vault).filter(Vault.id == vault_id).with_for_update().first()
+    # populate_existing() for the same reason as the rotation path: the entry read already put
+    # this vault in the session, and a locked query alone would return it unrefreshed.
+    locked = (db.query(Vault).populate_existing()
+              .filter(Vault.id == vault_id).with_for_update().first())
 
     # Lowest DEK epoch still in use by any file's CONTENT or any ZK folder's NAME
     # (absent metadata => epoch 1).
