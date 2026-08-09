@@ -135,6 +135,36 @@ class ECCCryptoLibrary {
         // and there is no self-service recovery.
         this.PRIV_ENVELOPE_WRITE_V1 = false;
 
+        // --- version-2 envelope family -----------------------------------------------
+        // Header: magic(4) version(1) purpose(1) reserved(2). A v2 DEK wrap is exactly 68
+        // bytes -- 8 header + 12 nonce + 32 key + 16 tag -- against a legacy wrap's 40, and
+        // both are fixed, which is what lets a reader dispatch on length before parsing.
+        this.V2_MAGIC = new Uint8Array([0x44, 0x56, 0x5A, 0x32]);  // "DVZ2"
+        this.V2_VERSION = 0x02;
+        this.V2_PURPOSE_DIRECT_DEK = 0x01;
+        this.V2_DIRECT_WRAP_BYTES = 68;
+        this.V2_HKDF_SALT = new TextEncoder().encode('dockvault-zk-envelope-v2-salt-01');
+        this.V2_INFO_DEK_DIRECT = 'dockvault-zk-dek-direct-v2';
+
+        // The v2 WRITER is off by default, same mechanism and same reasoning as the envelope
+        // above -- but the blast radius is larger. That envelope is read only by the account
+        // that wrote it; a DEK wrap is minted by one member's browser and read by others. One
+        // user on a v2-writing build performing one rekey locks out every member still on an
+        // older bundle, and there is no server-side recovery. Readers accept v2 regardless,
+        // which is what makes shipping them first useful.
+        //
+        // BEFORE ENABLING THIS, an operator needs all of the following to be true:
+        //   * every browser that will read this deployment's vaults is serving a bundle whose
+        //     reader understands v2 -- the cache-buster in the page's script tags is how you
+        //     force that, and a tab left open since before the upgrade is the case that bites;
+        //   * the server writes the matching algorithm label. It does not yet: the canonical
+        //     write constant in app/core/key_wrap_algorithms.py is still the v1 label, so
+        //     turning this on alone would store v2 bytes under a name that says otherwise.
+        //     That is a second, independent one-line change and it belongs in the same commit.
+        // There is no way back: once a v2 wrap exists, a reader that predates it cannot open
+        // the vault and the server holds nothing it could re-wrap from.
+        this.ZK_WRAP_WRITE_V2 = false;
+
         // Raw platform exceptions are diagnostics, not user-facing detail. Off in production;
         // a source constant rather than anything a deployment can flip at runtime, so turning
         // verbose diagnostics on is a reviewable change. A test pins this false.
@@ -445,13 +475,186 @@ class ECCCryptoLibrary {
     // =========================================================================
 
     /**
+     * Build the version-2 direct-DEK header, HKDF info, and AAD from one place.
+     *
+     * They have to agree field-for-field, and the surest way to make that true is to have a
+     * single function that cannot produce one without the other.
+     *
+     * Encoding is fixed-width by rule: UUIDs as their 36-byte lowercase hyphenated ASCII form
+     * (never the raw 16-byte form -- a different grammar in this product uses that, and mixing
+     * them is a footgun), epochs as 4-byte big-endian. Injectivity comes from those fixed widths
+     * alone; the 0x00 separators are readability, not delimiters, since the integer encoding is
+     * full of zero bytes.
+     * @private
+     */
+    _v2DirectTranscript(vaultId, recipientUserId, dekEpoch) {
+        const enc = new TextEncoder();
+        const uuid = (v) => {
+            const s = String(v == null ? '' : v).toLowerCase();
+            // 36 bytes exactly. A short or malformed id would silently shorten the transcript and
+            // mint a wrap nothing can ever read, so refuse rather than encode it.
+            if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(s)) {
+                this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'v2Transcript.uuid');
+            }
+            return enc.encode(s);
+        };
+        // The backing column is a signed 32-bit integer. Python raises on a negative here while
+        // DataView.setUint32 would happily write 0xFFFFFFFF, and that divergence is a wrap one
+        // runtime can read and the other cannot.
+        // Number(true) is 1 and Number('') is 0, so coerce only from the two types that can
+        // legitimately carry an epoch. A boolean quietly becoming epoch 1 would mint a wrap
+        // that authenticates against the wrong transcript and can never be opened.
+        const epoch = (typeof dekEpoch === 'number' || typeof dekEpoch === 'string')
+            ? Number(dekEpoch) : NaN;
+        if (!Number.isInteger(epoch) || epoch < 1 || epoch > 0x7FFFFFFF) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'v2Transcript.epoch');
+        }
+        const epochBytes = new Uint8Array(4);
+        new DataView(epochBytes.buffer).setUint32(0, epoch, false);
+
+        const header = new Uint8Array(8);
+        header.set(this.V2_MAGIC, 0);
+        header[4] = this.V2_VERSION;
+        header[5] = this.V2_PURPOSE_DIRECT_DEK;
+        // header[6..7] stay zero: reserved, and a reader rejects anything else.
+
+        const v = uuid(vaultId), r = uuid(recipientUserId), z = new Uint8Array([0]);
+        const context = this._concatBytes([v, z, r, z, epochBytes]);
+        return {
+            header,
+            info: this._concatBytes([enc.encode(this.V2_INFO_DEK_DIRECT), z, context]),
+            aad: this._concatBytes([header, context]),
+        };
+    }
+
+    /** @private */
+    _concatBytes(parts) {
+        let n = 0;
+        for (const p of parts) n += p.length;
+        const out = new Uint8Array(n);
+        let o = 0;
+        for (const p of parts) { out.set(p, o); o += p.length; }
+        return out;
+    }
+
+    /**
+     * Derive the version-2 wrapping key. Distinct from _deriveWrappingKey in every input --
+     * different salt, different info, and an AES-GCM key rather than an AES-KW one -- so the two
+     * cannot be confused for each other even though both start from an ECDH shared secret.
+     * @private
+     */
+    async _deriveV2WrappingKey(sharedSecretBits, info) {
+        const base = await this._subtle().importKey('raw', sharedSecretBits, 'HKDF', false, ['deriveKey']);
+        return this._subtle().deriveKey(
+            { name: 'HKDF', hash: 'SHA-256', salt: this.V2_HKDF_SALT, info },
+            base,
+            { name: 'AES-GCM', length: 256 },
+            false,
+            ['encrypt', 'decrypt']
+        );
+    }
+
+    /**
+     * Wrap a vault DEK to a recipient in the version-2 format.
+     *
+     * A NEW method rather than a change to wrapVaultDEK, and that is not tidiness: the legacy
+     * helper's own output is pinned byte-for-byte by the frozen DIRECT-wrap vector, and it is
+     * also the writer for hierarchical team-DEK wraps, whose grammar is still blocked. (Those
+     * team wraps have no pinned vector of their own -- the team fixture covers a different
+     * function -- so that second reason rests on the blocked grammar, not on a test.)
+     */
+    async wrapVaultDEKV2(vaultDEK, recipientPublicKey, context) {
+        const { vaultId, recipientUserId, dekEpoch } = context || {};
+        const t = this._v2DirectTranscript(vaultId, recipientUserId, dekEpoch);
+        try {
+            const ephemeral = await this._subtle().generateKey(
+                { name: 'ECDH', namedCurve: this.CURVE }, true, ['deriveBits']);
+            const shared = await this._subtle().deriveBits(
+                { name: 'ECDH', public: recipientPublicKey }, ephemeral.privateKey, 384);
+            const key = await this._deriveV2WrappingKey(shared, t.info);
+            const raw = await this._subtle().exportKey('raw', vaultDEK);
+            const nonce = this._randomBytes(12);
+            const ct = await this._subtle().encrypt(
+                { name: 'AES-GCM', iv: nonce, additionalData: t.aad, tagLength: 128 }, key, raw);
+            const out = this._concatBytes([t.header, nonce, new Uint8Array(ct)]);
+            if (out.length !== this.V2_DIRECT_WRAP_BYTES) {
+                // Cannot happen with a 32-byte DEK; if it ever does, a wrap of the wrong length
+                // would be rejected by every reader, so fail here where the cause is visible.
+                this._fail(CRYPTO_ERROR_CODES.WRAP_FAILED, 'wrapVaultDEKV2.length');
+            }
+            const ephRaw = await this._subtle().exportKey('raw', ephemeral.publicKey);
+            return {
+                wrappedDEK: this._arrayBufferToBase64(out.buffer),
+                ephemeralPublicKey: this._arrayBufferToBase64(ephRaw),
+            };
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'wrapVaultDEKV2');
+        }
+    }
+
+    /**
+     * Read a version-2 direct DEK wrap. Structural problems are rejected before any decryption is
+     * attempted, so a malformed payload is never reported as a tampering signal.
+     * @private
+     */
+    async _unwrapVaultDEKV2(wrappedBytes, ephemeralPublicKeyBase64, userPrivateKey, context) {
+        const { vaultId, recipientUserId, dekEpoch } = context || {};
+        if (wrappedBytes.length !== this.V2_DIRECT_WRAP_BYTES) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapVaultDEK.v2.length');
+        }
+        if (wrappedBytes[6] !== 0 || wrappedBytes[7] !== 0) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapVaultDEK.v2.reserved');
+        }
+        const ephBytes = new Uint8Array(this._base64ToArrayBuffer(ephemeralPublicKeyBase64));
+        // An uncompressed P-384 point is 97 bytes starting 0x04. Checked here rather than in the
+        // shared import helper, which also serves the frozen team path and its compressed-point
+        // branch.
+        if (ephBytes.length !== 97 || ephBytes[0] !== 0x04) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapVaultDEK.v2.point');
+        }
+        const t = this._v2DirectTranscript(vaultId, recipientUserId, dekEpoch);
+        // Imported OUTSIDE the try: a point of the right length that is not on the curve is a
+        // malformed input, and letting it fall into the catch below would report it as an
+        // authentication failure -- telling an operator their grant was tampered with when it
+        // was merely the wrong shape.
+        let ephemeralPublicKey;
+        try {
+            ephemeralPublicKey = await this._importRawPublicKey(ephBytes.buffer);
+        } catch (error) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapVaultDEK.v2.curve');
+        }
+        try {
+            const shared = await this._subtle().deriveBits(
+                { name: 'ECDH', public: ephemeralPublicKey }, userPrivateKey, 384);
+            const key = await this._deriveV2WrappingKey(shared, t.info);
+            const nonce = wrappedBytes.slice(8, 20);
+            const body = wrappedBytes.slice(20);
+            const plain = await this._subtle().decrypt(
+                { name: 'AES-GCM', iv: nonce, additionalData: t.aad, tagLength: 128 }, key, body);
+            // AES-KW enforced a 32-byte result structurally; AES-GCM returns whatever it was
+            // given. Without this check a writer bug or a hostile database row could hand back a
+            // 16-byte "DEK" that importKey would accept as AES-128.
+            if (plain.byteLength !== 32) {
+                this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapVaultDEK.v2.keylen');
+            }
+            return this._subtle().importKey('raw', plain, { name: 'AES-GCM', length: 256 },
+                                            true, ['encrypt', 'decrypt']);
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'unwrapVaultDEK.v2');
+        }
+    }
+
+    /**
      * Report whether these bytes announce themselves as a version-2 envelope, and if so whether
      * this build could ever read them.
      *
      * Returns null for anything that is not a v2 payload, so a caller can fall through to its
      * existing legacy handling. Returns a code otherwise:
      *
-     *   UNSUPPORTED — a well-formed v2 header. The payload is fine and this build is behind.
+     *   UNSUPPORTED — a well-formed v2 header. This is a statement about the HEADER, not a
+     *                 verdict: one purpose (direct DEK) is now readable, and that caller
+     *                 checks the purpose itself. A caller that reads no v2 purpose can still
+     *                 treat it as "the payload is fine and this build is behind".
      *   INVALID     — the marker is present but the header is malformed, so it is not a payload
      *                 from the future, it is not a payload at all.
      *
@@ -832,12 +1035,44 @@ class ECCCryptoLibrary {
      * @param {CryptoKey} userPrivateKey - User's private key
      * @returns {Promise<CryptoKey>} Unwrapped vault DEK as AES-GCM key
      */
-    async unwrapVaultDEK(wrappedDEKBase64, ephemeralPublicKeyBase64, userPrivateKey) {
-        const wrapV2 = this._inspectV2Header(this._base64ToArrayBuffer(wrappedDEKBase64));
-        if (wrapV2) {
-            this._fail(wrapV2 === 'UNSUPPORTED'
-                ? CRYPTO_ERROR_CODES.WRAP_UNSUPPORTED
-                : CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapVaultDEK.v2');
+    async unwrapVaultDEK(wrappedDEKBase64, ephemeralPublicKeyBase64, userPrivateKey, context) {
+        const wrapBytes = new Uint8Array(this._base64ToArrayBuffer(wrappedDEKBase64));
+        // Dispatch on LENGTH first. Both formats are fixed size -- 68 for v2, 40 for the
+        // legacy RFC 3394 wrap of a 32-byte key -- and that is what keeps a legacy wrap whose
+        // random leading bytes happen to spell a v2 header from being committed to the wrong
+        // reader. Getting that wrong costs a member their access permanently, because no
+        // server-side re-wrap exists.
+        if (wrapBytes.length === this.V2_DIRECT_WRAP_BYTES) {
+            const wrapV2 = this._inspectV2Header(wrapBytes);
+            if (wrapV2 !== 'UNSUPPORTED') {
+                // Right length, but the header does not validate: malformed, not from the
+                // future, and not something to hand to the legacy reader either.
+                this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapVaultDEK.v2');
+            }
+            // The version on the WIRE, not the one we would reconstruct. The transcript is
+            // built from canonical bytes, so this field is the one part of the header the AAD
+            // does not actually pin -- without this check a wrap relabelled to any other
+            // version decrypts happily under the v2 grammar.
+            if (wrapBytes[4] !== this.V2_VERSION) {
+                this._fail(CRYPTO_ERROR_CODES.WRAP_UNSUPPORTED, 'unwrapVaultDEK.v2.version');
+            }
+            if (wrapBytes[5] !== this.V2_PURPOSE_DIRECT_DEK) {
+                this._fail(CRYPTO_ERROR_CODES.WRAP_UNSUPPORTED, 'unwrapVaultDEK.v2.purpose');
+            }
+            if (!context) {
+                // The transcript inputs are not optional for v2. Reaching here means a caller
+                // was not updated; say so structurally rather than letting it surface as an
+                // authentication failure, which reads as tampering.
+                this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapVaultDEK.v2.context');
+            }
+            // Committed to v2 from here. A tag failure is NOT retried as legacy -- retrying is
+            // what turns a tampering signal into a parser oracle.
+            return this._unwrapVaultDEKV2(wrapBytes, ephemeralPublicKeyBase64, userPrivateKey, context);
+        }
+        if (wrapBytes.length !== 40) {
+            // Neither format. Saying so is better than letting AES-KW fail on it and calling
+            // the result damaged.
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapVaultDEK.length');
         }
         try {
             // Import ephemeral public key (X.962 point format).
@@ -1588,6 +1823,7 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     // Data-key wrapping.
     unwrapVaultDEK: CRYPTO_ERROR_CODES.WRAP_FAILED,
     wrapVaultDEK: CRYPTO_ERROR_CODES.WRAP_FAILED,
+    wrapVaultDEKV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
     wrapPrivateKeyToPublic: CRYPTO_ERROR_CODES.WRAP_FAILED,
     unwrapPrivateKeyFromWrapped: CRYPTO_ERROR_CODES.WRAP_FAILED,
 
