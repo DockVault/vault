@@ -52,23 +52,50 @@ def _v2(purpose: int = 0x04, version: int = 0x02, reserved: bytes = b"\x00\x00",
 
 
 def test_a_v2_payload_is_reported_as_unsupported_not_damaged() -> None:
-    """The headline. 'Damaged' about an intact file is worse than no message at all."""
+    """The headline. 'Damaged' about an intact file is worse than no message at all.
+
+    The direct-DEK purpose (0x01) has since become readable, so it is no longer part of this
+    claim -- a build that can read a format should not be reporting it as unsupported, and
+    `test_v2_direct_dek_wrap.py` covers what it does instead. Everything still unreadable is
+    checked here, and the purposes are checked individually rather than as a group so that the
+    next one to become readable fails this test rather than quietly narrowing it.
+    """
     out = _node("""
   const b64 = %s;
   const bytes = Buffer.from(b64, 'base64');
   const dek = await lib.generateVaultDEK();
   out(JSON.stringify({
-    content: await codeOf(() => lib.decryptFile(bytes, dek)),
-    direct:  await codeOf(() => lib.unwrapVaultDEK(%s, 'AAAA', null)),
-    team:    await codeOf(() => lib.unwrapPrivateKeyFromWrapped(%s, 'AAAA', null)),
+    content:  await codeOf(() => lib.decryptFile(bytes, dek)),
+    teamDek:  await codeOf(() => lib.unwrapVaultDEK(%s, 'AAAA', null)),
+    teamPriv: await codeOf(() => lib.unwrapPrivateKeyFromWrapped(%s, 'AAAA', null)),
   }));
-""" % (json.dumps(_v2(0x04)), json.dumps(_v2(0x01)), json.dumps(_v2(0x03))))
+""" % (json.dumps(_v2(0x04)), json.dumps(_v2(0x02, body=bytes(60))), json.dumps(_v2(0x03))))
 
+    # The DEK-wrap reader dispatches on length before it looks at anything else, so the team-DEK
+    # payload has to be a full 68 bytes to reach the purpose check at all -- a short one is
+    # correctly rejected as malformed, which would be a different property than the one under test.
     assert out["content"] == "CONTENT_UNSUPPORTED", out
-    assert out["direct"] == "WRAP_UNSUPPORTED", out
-    assert out["team"] == "WRAP_UNSUPPORTED", out
+    assert out["teamDek"] == "WRAP_UNSUPPORTED", out
+    assert out["teamPriv"] == "WRAP_UNSUPPORTED", out
     # The point of the whole change: none of these is the damaged code.
     assert "CONTENT_AUTH_FAILED" not in out.values()
+
+
+def test_the_readable_purpose_no_longer_claims_to_be_unsupported() -> None:
+    """The other half of the same property, and the reason the test above was narrowed.
+
+    Saying "update this deployment" about a format this build reads perfectly well is the same
+    class of wrong answer as saying "damaged" about an intact one. A structural reject is the
+    honest response to a header with nothing behind it.
+    """
+    out = _node("""
+  out(JSON.stringify({
+    direct: await codeOf(() => lib.unwrapVaultDEK(%s, 'AAAA', null,
+      { vaultId: '11111111-2222-4333-8444-555555555555',
+        recipientUserId: '66666666-7777-4888-8999-aaaaaaaaaaaa', dekEpoch: 1 })),
+  }));
+""" % json.dumps(_v2(0x01)))
+    assert out["direct"] == "WRAP_INVALID", out
 
 
 def test_a_malformed_v2_header_is_structural_not_from_the_future() -> None:

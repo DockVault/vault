@@ -2083,6 +2083,12 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                     payload.wrapped_team_privkey = privWrap.wrappedKey;
                     payload.team_privkey_ephemeral_public_key = privWrap.ephemeralPublicKey;
                 } else {
+                    // Legacy writer, even when the v2 gate is on. A v2 transcript binds the
+                    // vault id, and at this point the vault does not exist yet -- the wrap is
+                    // built into the request body and the server mints the id when it lands.
+                    // Binding a value we do not have is not something to work around here; the
+                    // first rekey re-wraps every member, owner included, so a vault created
+                    // this way converts to v2 wholesale the first time it rotates.
                     const { wrappedDEK, ephemeralPublicKey } = await lib.wrapVaultDEK(dek, myPub);
                     payload.wrapped_dek = wrappedDEK;
                     payload.ephemeral_public_key = ephemeralPublicKey;
@@ -7739,7 +7745,15 @@ async function zkGetVaultDek(vaultId, keyVersion = null) {
         if (zkState.pinnedHier[vaultId]) {
             throw new Error('This zero-knowledge vault is hierarchical but the server returned a direct key — refusing (possible mode downgrade).');
         }
-        dek = await eccLib().unwrapVaultDEK(keys.wrapped_dek, keys.ephemeral_public_key, priv);
+        // v2 wraps bind the vault, the recipient and the epoch into their transcript. All
+        // three come from this response rather than from local state: `recipient_user_id` is
+        // the account the server says it selected the row for, which is a better source than
+        // `currentUser` -- that is hydrated from localStorage by a loader that tolerates
+        // corrupt data, and the recovery-kit writer already refuses it for the same reason.
+        // A legacy wrap ignores the context entirely, so passing it is always safe.
+        dek = await eccLib().unwrapVaultDEK(
+            keys.wrapped_dek, keys.ephemeral_public_key, priv,
+            { vaultId, recipientUserId: keys.recipient_user_id, dekEpoch: version });
     }
     perVault[version] = dek;
     return dek;
@@ -7902,6 +7916,19 @@ async function zkSealLegacyNames(vault, items) {
 // Share a zero-knowledge vault with another user: unwrap the DEK locally, re-wrap
 // it to THEIR public key in the browser, and store the wrapped copy. The server
 // never sees the DEK. Throws if the recipient hasn't set up an encryption key.
+// The ONE place that decides which DEK-wrap format to write.
+//
+// A single choke point rather than the gate being consulted at each call site: a third write
+// site added later inherits the decision instead of having to remember it, and forgetting is
+// not a visible bug -- it just quietly keeps writing the old format while everything else
+// moves on. The transcript is required either way, so a caller cannot supply half of it.
+async function zkWrapDekForRecipient(dek, recipientPub, transcript) {
+    const lib = eccLib();
+    return lib.ZK_WRAP_WRITE_V2
+        ? lib.wrapVaultDEKV2(dek, recipientPub, transcript)
+        : lib.wrapVaultDEK(dek, recipientPub);
+}
+
 async function zkShareVaultToUser(vaultId, userId) {
     const pk = await apiRequest(`/ecc/users/${userId}/public-key`, { silent: true });
     if (!pk || !pk.has_keypair || !pk.public_key) {
@@ -7941,19 +7968,24 @@ async function zkShareVaultToUser(vaultId, userId) {
     // are about to declare -- and declaring an epoch the blob does not match is precisely
     // the failure this change exists to stop.
     const dek = await zkGetVaultDek(vaultId, keys && keys.key_version);  // may prompt once
-    const { wrappedDEK, ephemeralPublicKey } = await eccLib().wrapVaultDEK(dek, recipientPub);
+    // ONE value, used in both places below. An earlier version computed the epoch twice with
+    // different fallbacks -- 1 for the wrap, absent for the declaration -- which is two different
+    // answers to the same question on adjacent lines, and the shape of a bug where the recipient
+    // ends up holding a key labelled as something it is not.
+    const shareEpoch = keys && keys.key_version != null ? keys.key_version : null;
+    const { wrappedDEK, ephemeralPublicKey } = await zkWrapDekForRecipient(
+        dek, recipientPub, { vaultId, recipientUserId: userId, dekEpoch: shareEpoch });
     // Tell the server which epoch this blob wraps. Without it the server stamps whatever the
     // vault's epoch is when the request lands, so a rotation arriving in between labels our
     // old-DEK blob as the new epoch AND overwrites the correct row the rotation just wrote --
     // leaving the recipient unable to read anything written after it, with no error anywhere.
-    // `keys.key_version` is the epoch the DEK above was actually fetched at.
     await apiRequest(`/ecc/vaults/${vaultId}/members`, {
         method: 'POST',
         body: JSON.stringify({
             user_id: userId,
             wrapped_dek: wrappedDEK,
             ephemeral_public_key: ephemeralPublicKey,
-            dek_version: keys && keys.key_version != null ? keys.key_version : undefined,
+            dek_version: shareEpoch != null ? shareEpoch : undefined,
         }),
     });
 }
@@ -8016,7 +8048,15 @@ async function zkRekeyForRevoke(vaultId, revokedUserId) {
                 throw new Error('A remaining member has no encryption key; cannot rotate. Resolve their key setup and retry.');
             }
             const recipientPub = await eccLib().importPublicKeyPEM(pk.public_key);
-            const { wrappedDEK, ephemeralPublicKey } = await eccLib().wrapVaultDEK(newDek, recipientPub);
+            // Every remaining member is re-wrapped here, so a rotation is where a vault
+            // converts wholesale to v2, the owner's own wrap included. That is what keeps the
+            // legacy wrap written at creation from mattering much -- but only for vaults that
+            // ever rotate: this path runs on member revocation, so a vault that never removes
+            // anyone keeps its original wrap indefinitely. Harmless, since the reader takes
+            // both, but it is a mixed state rather than a passing one.
+            const { wrappedDEK, ephemeralPublicKey } = await zkWrapDekForRecipient(
+                newDek, recipientPub,
+                { vaultId, recipientUserId: uid, dekEpoch: fromVersion + 1 });
             memberKeys.push({ user_id: uid, wrapped_dek: wrappedDEK, ephemeral_public_key: ephemeralPublicKey });
         }
 
