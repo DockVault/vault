@@ -7166,6 +7166,21 @@ function safeMessageForCode(code, flow) {
                  + 'secure (https) connection.';
         case 'AUTH_FAILED':
             return ZK_AUTH_SENTENCE[flow] || ZK_AUTH_SENTENCE.unlock;
+        case 'CONTENT_UNSUPPORTED':
+            // The file is intact. This build cannot read the format it was written in, and
+            // saying "damaged" would send someone looking for a backup they do not need.
+            return 'This item was saved by a newer version of DockVault and cannot be read here. '
+                 + 'Update this deployment. The item itself is fine.';
+        case 'CONTENT_INVALID':
+            // Structurally wrong rather than failing authentication: not a tampered file, and
+            // not a format from the future either.
+            return 'This item is not in a format DockVault recognises.';
+        case 'WRAP_UNSUPPORTED':
+            return 'Your access to this vault was granted by a newer version of DockVault and '
+                 + 'cannot be read here. Update this deployment.';
+        case 'WRAP_INVALID':
+            return 'Your access to this vault is recorded in a form DockVault does not '
+                 + 'recognise. Ask an owner to share the vault with you again.';
         case 'CONTENT_AUTH_FAILED':
             // Reached only after the passphrase already succeeded, so this must never suggest
             // the passphrase is at fault.

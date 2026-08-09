@@ -34,6 +34,13 @@ const CRYPTO_ERROR_CODES = Object.freeze({
     WORK_FACTOR_REJECTED: 'WORK_FACTOR_REJECTED',
     AUTH_FAILED: 'AUTH_FAILED',
     CONTENT_AUTH_FAILED: 'CONTENT_AUTH_FAILED',
+    // Content and wraps need the same unsupported-vs-damaged split the envelope already has.
+    // Without it, anything a newer build wrote is reported as damaged -- and "your file is
+    // damaged" sends someone hunting for a backup, when the file is fine and the build is old.
+    CONTENT_UNSUPPORTED: 'CONTENT_UNSUPPORTED',
+    CONTENT_INVALID: 'CONTENT_INVALID',
+    WRAP_UNSUPPORTED: 'WRAP_UNSUPPORTED',
+    WRAP_INVALID: 'WRAP_INVALID',
     KEY_UNUSABLE: 'KEY_UNUSABLE',
     KEY_MISMATCH: 'KEY_MISMATCH',
     WRAP_FAILED: 'WRAP_FAILED',
@@ -438,6 +445,38 @@ class ECCCryptoLibrary {
     // =========================================================================
 
     /**
+     * Report whether these bytes announce themselves as a version-2 envelope, and if so whether
+     * this build could ever read them.
+     *
+     * Returns null for anything that is not a v2 payload, so a caller can fall through to its
+     * existing legacy handling. Returns a code otherwise:
+     *
+     *   UNSUPPORTED — a well-formed v2 header. The payload is fine and this build is behind.
+     *   INVALID     — the marker is present but the header is malformed, so it is not a payload
+     *                 from the future, it is not a payload at all.
+     *
+     * The distinction matters because the two send a person somewhere different: one to the
+     * update notes, the other to a backup.
+     * @private
+     */
+    _inspectV2Header(bytes) {
+        const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+        if (b.length < 8) return null;
+        // "DVZ2"
+        if (b[0] !== 0x44 || b[1] !== 0x56 || b[2] !== 0x5A || b[3] !== 0x32) return null;
+        const version = b[4];
+        const purpose = b[5];
+        const reserved = (b[6] << 8) | b[7];
+        // Reserved bytes are a breaking-change channel, not an extension channel: a non-zero
+        // value means bytes this build cannot reason about, so it is malformed rather than new.
+        if (reserved !== 0) return 'INVALID';
+        if (purpose < 0x01 || purpose > 0x04) return 'INVALID';
+        // Any version, including a future one, is "we recognise this and cannot read it".
+        if (version < 0x02) return 'INVALID';
+        return 'UNSUPPORTED';
+    }
+
+    /**
      * UTF-8 byte length of a string.
      *
      * Both designs specify their size caps in BYTES, and the server measures bytes. A plain
@@ -794,6 +833,12 @@ class ECCCryptoLibrary {
      * @returns {Promise<CryptoKey>} Unwrapped vault DEK as AES-GCM key
      */
     async unwrapVaultDEK(wrappedDEKBase64, ephemeralPublicKeyBase64, userPrivateKey) {
+        const wrapV2 = this._inspectV2Header(this._base64ToArrayBuffer(wrappedDEKBase64));
+        if (wrapV2) {
+            this._fail(wrapV2 === 'UNSUPPORTED'
+                ? CRYPTO_ERROR_CODES.WRAP_UNSUPPORTED
+                : CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapVaultDEK.v2');
+        }
         try {
             // Import ephemeral public key (X.962 point format).
             const ephemeralPublicKeyBytes = this._base64ToArrayBuffer(ephemeralPublicKeyBase64);
@@ -1019,6 +1064,12 @@ class ECCCryptoLibrary {
      * @returns {Promise<CryptoKey>} the team private key (non-extractable)
      */
     async unwrapPrivateKeyFromWrapped(wrappedKeyBase64, ephemeralPublicKeyBase64, memberPrivateKey, extractable = false) {
+        const teamV2 = this._inspectV2Header(this._base64ToArrayBuffer(wrappedKeyBase64));
+        if (teamV2) {
+            this._fail(teamV2 === 'UNSUPPORTED'
+                ? CRYPTO_ERROR_CODES.WRAP_UNSUPPORTED
+                : CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapPrivateKeyFromWrapped.v2');
+        }
         const ephemeralPublicKey = await this._importRawPublicKey(
             this._base64ToArrayBuffer(ephemeralPublicKeyBase64)
         );
@@ -1084,6 +1135,14 @@ class ECCCryptoLibrary {
      * @returns {Promise<ArrayBuffer>} Decrypted file content
      */
     async decryptFile(encryptedContent, vaultDEK) {
+        // Before anything else: is this a format from a newer build? Saying "damaged" about an
+        // intact file is the failure this check exists to prevent.
+        const contentV2 = this._inspectV2Header(encryptedContent);
+        if (contentV2) {
+            this._fail(contentV2 === 'UNSUPPORTED'
+                ? CRYPTO_ERROR_CODES.CONTENT_UNSUPPORTED
+                : CRYPTO_ERROR_CODES.CONTENT_INVALID, 'decryptFile.v2');
+        }
         try {
             const data = new Uint8Array(encryptedContent);
             const iv = data.slice(0, this.AES_IV_LENGTH);

@@ -69,6 +69,10 @@ collide with prose.
 | `WORK_FACTOR_REJECTED` | Declared KDF work factor outside the accepted range. | Refuse; possibly hostile input. |
 | `AUTH_FAILED` | Authenticated decryption of a **passphrase-derived** key failed. | Re-enter the passphrase. |
 | `CONTENT_AUTH_FAILED` | Authenticated decryption of **vault-key-encrypted content** failed. | The item is damaged. **Not a passphrase problem.** |
+| `CONTENT_UNSUPPORTED` | Content in a format this build does not implement. | Update this deployment. **The item is fine.** |
+| `CONTENT_INVALID` | Content that is not structurally a format this build recognises. | Wrong or damaged input — but not a format from the future. |
+| `WRAP_UNSUPPORTED` | A key wrap in a format this build does not implement. | Update this deployment. **The grant is fine.** |
+| `WRAP_INVALID` | A key wrap that is not structurally recognisable. | Ask an owner to share the vault again. |
 | `KEY_UNUSABLE` | Key material could not be imported, parsed, or derived. | The key is malformed. |
 | `KEY_MISMATCH` | Key does not match the account it was compared against. | This key belongs to a different account. |
 | `WRAP_FAILED` | Wrapping or unwrapping a data key failed. | The vault-key grant is damaged. |
@@ -98,7 +102,32 @@ the user supplied no secret to must never be rendered as a passphrase failure. T
 kept apart because they send the user to different remedies, a distinction the recovery-restore
 path already makes deliberately in prose and which must survive into the code channel.
 
-The set is closed for v1. Adding a code is a change to this document first.
+### The amendment of 2026-08-09
+
+The set was closed, and this is the change to the document that the closure required.
+
+**What was wrong.** The unsupported-versus-damaged split existed, but only for the private-key
+envelope. Content had exactly one code, `CONTENT_AUTH_FAILED`, whose remedy is "the item is
+damaged". So content written by a **newer** build — intact, readable by that build, wrong only in
+that this one is behind — would have been reported to its owner as damaged. That is precisely the
+mislabel this contract was written to eliminate, reappearing on a surface the contract did not
+reach. The same gap existed for key wraps.
+
+**Why it was found before it could bite.** A later design needed to say "this build cannot read
+that" about content, discovered there was no way to, and could not proceed. The gap was latent
+until then only because nothing had yet written content in a format an older reader could meet.
+
+**What the four new codes change in practice.** Today's readers now *recognise* a versioned
+payload and say so. They cannot read one — that is later work — but recognition is what turns
+"your file is damaged" into "update this deployment", and it has to ship well ahead of anything
+that writes such a payload. A reader that recognises a format it cannot read is safe to deploy
+anywhere; a writer that produces one is not.
+
+The distinction between the `UNSUPPORTED` and `INVALID` members of each pair is not decorative:
+one sends a person to the update notes, the other to a backup. Conflating them would reintroduce
+the original defect in a subtler form.
+
+The set is closed again. Adding a code is a change to this document first.
 
 ### 3.1 Two exclusions
 
