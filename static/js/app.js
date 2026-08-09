@@ -8591,20 +8591,28 @@ const zkUploadStore = (() => {
                 // older code against a newer database and cannot resume anything until it
                 // reloads. Distinguishing it matters because the alternative advice -- the quiet
                 // degrade -- would leave the user with silently non-resumable uploads.
+                // Only speak for this attempt. onblocked already resolves and abandons an
+                // attempt without cancelling its request, so a superseded one can still fail
+                // later -- and letting that late failure clear the memo or set a flag would
+                // disable storage for the rest of the page on behalf of a connection nobody is
+                // waiting for. Same guard as onsuccess and onversionchange.
+                const current = (_dbPromise === myPromise);
                 const err = req.error;
-                if (err && err.name === 'VersionError') _versionTooOld = true;
+                if (current && err && err.name === 'VersionError') _versionTooOld = true;
                 // Clear the memo the way onblocked does. Caching a failure for the lifetime of
                 // the page would also disable the TTL sweep and the logout wipe, because both
                 // short-circuit when the database is unavailable.
-                _dbPromise = null;
+                if (current) _dbPromise = null;
                 resolve(null);
             };
             req.onblocked = () => {
-                // An older tab is holding the v1 connection. Record it, and drop the memoised
-                // promise so the next call retries rather than caching the failure for the
-                // lifetime of the page.
-                _upgradeBlocked = true;
-                _dbPromise = null;
+                // An older tab is holding the previous schema open. Record it, and drop the
+                // memoised promise so the next call retries rather than caching the failure for
+                // the lifetime of the page -- but again, only for the current attempt.
+                if (_dbPromise === myPromise) {
+                    _upgradeBlocked = true;
+                    _dbPromise = null;
+                }
                 resolve(null);
             };
         });
@@ -8913,11 +8921,6 @@ const uploadManager = {
                     const id = this._newId();
                     this.items.set(id, {
                         id, file: rec.blob, vaultId, folderId: s.folder_id || null,
-                        // Neither side has a plaintext name to offer: the server never had one
-                        // for a zero-knowledge session, and the local record deliberately no
-                        // longer keeps one. The sealed name is in the record, but decrypting it
-                        // needs the vault DEK, and prompting for a passphrase merely to label a
-                        // tray row would be a worse trade than a generic label.
                         // Neither side has a plaintext name to offer: the server never had one
                         // for a zero-knowledge session, and the local record deliberately no
                         // longer keeps one. Decrypting the sealed name needs the vault DEK, and

@@ -67,3 +67,60 @@ def test_a_failed_record_migration_cannot_kill_the_whole_upgrade() -> None:
     assert "_dbPromise = null" in err, (
         "a failed open stays memoised, which also disables the TTL sweep and the logout wipe"
     )
+
+
+def test_every_open_handler_speaks_only_for_its_own_attempt() -> None:
+    """`onblocked` resolves and abandons an attempt WITHOUT cancelling its request, so a
+    superseded attempt can still succeed or fail later.
+
+    Every handler therefore has to check whether it is still the current attempt before touching
+    shared state. The rule is easy to apply to some handlers and forget on others -- which is
+    exactly what happened: the success paths were guarded and the failure paths were not, so a
+    late error from an abandoned attempt could clear a newer connection's memo and disable
+    browser storage for the rest of the page.
+    """
+    app = APP_JS.read_text(encoding="utf-8")
+    opener = app[app.index("function _open()"):]
+    opener = opener[: opener.index("\n    function ")]
+
+    handlers = {}
+    for name in ("onsuccess", "onerror", "onblocked"):
+        marker = f"req.{name} = () => {{"
+        assert marker in opener, f"{name} handler moved; re-anchor this guard"
+        body = opener[opener.index(marker) + len(marker):]
+        # Each handler ends at the next `req.on...` or at the end of the opener.
+        ends = [body.index(f"req.{o} =") for o in ("onsuccess", "onerror", "onblocked")
+                if f"req.{o} =" in body]
+        handlers[name] = body[: min(ends)] if ends else body
+
+    mutations = ("_dbPromise = null", "_upgradeBlocked = true", "_versionTooOld = true")
+
+    def unguarded(body):
+        """Mutations left over once the ones a currency check protects are removed.
+
+        Checking merely that a handler MENTIONS the attempt is not enough: it still mentions it
+        while computing a flag it then ignores, which is how the half-applied version passed an
+        earlier draft of this very test.
+        """
+        out, depth = [], 0
+        for line in body.splitlines():
+            if "if (_dbPromise === myPromise) {" in line:
+                depth += 1
+                continue
+            if depth:
+                if "}" in line:
+                    depth -= 1
+                continue
+            # Any braceless single-statement guard, whatever else its condition also tests.
+            if "if (" in line and ("current" in line or "myPromise" in line):
+                continue
+            out.append(line)
+        return [ln.strip() for ln in out if any(m in ln for m in mutations)]
+
+    for name, body in handlers.items():
+        left = unguarded(body)
+        assert not left, (
+            f"req.{name} mutates shared open state without checking it is still the current "
+            f"attempt; a superseded request completing late would clobber a live connection: "
+            f"{left}"
+        )
