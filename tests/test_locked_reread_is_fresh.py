@@ -30,6 +30,7 @@ pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parents[1]
 ECC_ROUTER = ROOT / "app" / "api" / "ecc_router.py"
+APP_DIR = ROOT / "app"
 
 
 def test_a_locked_reread_of_a_loaded_row_is_stale_without_populate_existing():
@@ -91,17 +92,36 @@ def test_every_locked_vault_reread_refreshes():
 
     Written as a source rule because the behavioural one is unreachable: the staleness needs two
     reads of one row in ONE session, and every request has its own.
+
+    Scanned across the whole application tree rather than one module. An earlier version of this
+    rule looked only at the router, and a fourth site in a different file went on comparing a
+    pre-lock epoch while its three siblings were being fixed -- the rule was narrower than the
+    problem, which is the least useful kind of guard.
     """
-    source = ECC_ROUTER.read_text(encoding="utf-8")
-    # Collapse so a multi-line query still reads as one expression.
-    flat = re.sub(r"\s+", " ", source)
-    locked_vault_reads = re.findall(r"db\.query\(Vault\)[^;]{0,120}?with_for_update\(\)", flat)
-    assert locked_vault_reads, "no locked vault read found -- has this moved?"
-    missing = [q for q in locked_vault_reads if "populate_existing()" not in q]
-    assert not missing, (
+    offenders = []
+    for path in sorted(APP_DIR.rglob("*.py")):
+        if "__pycache__" in str(path):
+            continue
+        # Collapse so a multi-line query still reads as one expression.
+        flat = re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
+        for q in re.findall(r"db\.query\(Vault\)[^;]{0,160}?with_for_update\(\)", flat):
+            if "populate_existing()" not in q:
+                offenders.append(f"{path.relative_to(ROOT)}: {q}")
+    assert not offenders, (
         "a vault row is locked and then read without refreshing it, so the value compared came "
-        "from before the lock:\n  " + "\n  ".join(missing)
+        "from before the lock:\n  " + "\n  ".join(offenders)
     )
+
+
+def test_the_rule_above_actually_finds_the_locked_reads():
+    """Non-vacuity: a rule that matched nothing would pass silently and guard nothing."""
+    found = 0
+    for path in sorted(APP_DIR.rglob("*.py")):
+        if "__pycache__" in str(path):
+            continue
+        flat = re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
+        found += len(re.findall(r"db\.query\(Vault\)[^;]{0,160}?with_for_update\(\)", flat))
+    assert found >= 4, f"expected at least four locked vault reads, matched {found}"
 
 
 def test_the_optimistic_checks_still_read_from_the_locked_row():
