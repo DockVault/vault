@@ -15,6 +15,7 @@ from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 
 from app.core.models import User, Vault, Folder, File, VaultPermissionEnum
+from app.core.safe_log import safe_event
 from app.core.security import (
     encrypt_file_content, decrypt_file_content,
     calculate_file_checksum, verify_file_integrity,
@@ -820,7 +821,7 @@ class VaultService:
             try:
                 shutil.rmtree(vault_dir)
             except Exception as _e:
-                print(f"Warning: vault dir removal after delete failed (recoverable orphan dir): {_e}")
+                safe_event('vault.dir-removal.failed', _e)
     
     def create_folder(
         self,
@@ -1135,7 +1136,9 @@ class VaultService:
                 if p.exists():
                     self.encrypted_storage.secure_delete(p)
             except Exception as e:  # noqa: BLE001
-                print(f"⚠️ replace: could not remove old blob {rel}: {e}")
+                # The blob's relative path is a storage path; the exception carries the
+                # ABSOLUTE one on an OSError. Neither belongs in a log an operator pastes.
+                safe_event('blob.replace-cleanup.failed', e)
 
     def finalize_streaming_upload(self, file_info: dict, total_size: int, checksum: str,
                                   zk_key_version: Optional[int] = None,
@@ -1399,7 +1402,7 @@ class VaultService:
                 self.encrypted_storage.secure_delete(storage_path)
             except Exception as e:
                 # Fallback to manual overwrite if secure delete fails
-                print(f"Warning: EncryptedFileStorage.secure_delete() failed, using fallback: {e}")
+                safe_event('blob.secure-delete.failed-using-fallback', e)
                 try:
                     file_size = storage_path.stat().st_size
                     with open(storage_path, 'wb') as f:
@@ -1414,7 +1417,7 @@ class VaultService:
                         os.fsync(f.fileno())
                     storage_path.unlink()
                 except Exception as fallback_error:
-                    print(f"Warning: Fallback deletion also failed: {fallback_error}")
+                    safe_event('blob.fallback-delete.failed', fallback_error)
                     # Last resort: just delete (best-effort — the row is already gone)
                     try:
                         storage_path.unlink()
@@ -1606,14 +1609,14 @@ class VaultService:
                 self.db.delete(file)
                 stale_paths.append(_path)
             except Exception as e:
-                print(f"Error deleting expired file {file.id}: {e}")
+                safe_event('expired-file.delete.failed', e, file=file.id)
                 continue
 
         try:
             self.db.commit()
         except Exception as e:
             self.db.rollback()
-            print(f"Error committing expired-file cleanup (blobs kept): {e}")
+            safe_event('expired-file.cleanup-commit.failed', e)
             return
 
         # Rows are durably gone; now securely destroy the blobs (best-effort — an orphan blob is
@@ -1623,7 +1626,7 @@ class VaultService:
             try:
                 self.encrypted_storage.secure_delete(storage_path)
             except Exception as e:
-                print(f"Error securely removing expired blob {storage_path}: {e}")
+                safe_event('expired-blob.remove.failed', e)
     
     def _get_vault_path(self, vault_id: uuid.UUID) -> Path:
         """Get physical path for vault directory."""
