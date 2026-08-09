@@ -71,6 +71,7 @@ from app.services.vault_service import (
 from app.services.vault_service import FileNotFoundError as VaultFileNotFoundError
 from app.services.audit_logger import AuditLogger
 from app.core.config import settings
+from app.core.safe_log import safe_event
 from app.core.temp_scope import is_scoped, effective_vault_caps, scope_ids
 from app.core.security import name_blind_index
 from sqlalchemy import or_
@@ -183,7 +184,7 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
             self.writefile.write(data)
             return paramiko.SFTP_OK
         except Exception as e:  # noqa: BLE001
-            print(f"❌ SFTP write error: {e}")
+            safe_event('write.failed', e)
             return paramiko.SFTP_FAILURE
 
     def stat(self):
@@ -203,12 +204,12 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
             if self.overlimit:
                 # The upload exceeded the per-file max mid-stream: discard it (don't persist),
                 # leaving any existing same-name file intact. The temp buffer is removed below.
-                print(f"⚠️ SFTP upload discarded: exceeded max file size ({self.max_bytes}B)")
+                safe_event('upload.discarded.too-large', limit=self.max_bytes)
             elif self.finalizer is not None and self.writepath:
                 try:
                     self.finalizer(self.writepath)
                 except Exception as e:  # noqa: BLE001
-                    print(f"❌ SFTP upload finalize failed: {e}")
+                    safe_event('upload.finalize.failed', e)
             # Always clean up the plaintext temp buffer.
             try:
                 if self.writepath and os.path.exists(self.writepath):
@@ -329,7 +330,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                     ActiveSession.is_active == True  # noqa: E712
                 ).first()
                 if not session:
-                    print(f"⛔ Session {token[:8]}... has been terminated")
+                    safe_event('session.terminated', session=token[:8])
                     return False
                 # Enforce the session's HARD expiry on every op, not just at login. Regular
                 # account sessions carry a NULL expires_at (no hard bound → skipped); a
@@ -342,7 +343,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                     if _exp.tzinfo is None:
                         _exp = _exp.replace(tzinfo=timezone.utc)
                     if datetime.now(timezone.utc) > _exp:
-                        print(f"⛔ Session {token[:8]}... past its hard expiry")
+                        safe_event('session.expired', session=token[:8])
                         return False
                 # A deactivated temporary credential must not keep a live SFTP
                 # session alive (deactivate revokes access immediately, like the
@@ -354,7 +355,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                         TemporaryCredential.id == session.temp_credential_id
                     ).first()
                     if tc is None or not tc.is_active:
-                        print(f"⛔ Session {token[:8]}... temp credential deactivated")
+                        safe_event('session.credential-deactivated', session=token[:8])
                         return False
                     # The credential's VALIDITY WINDOW (deactivate_at) is tighter than the hard
                     # expiry enforced at the session level above; enforce it too so a
@@ -365,11 +366,11 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                         if _da.tzinfo is None:
                             _da = _da.replace(tzinfo=timezone.utc)
                         if datetime.now(timezone.utc) > _da:
-                            print(f"⛔ Session {token[:8]}... temp credential past its validity window")
+                            safe_event('session.credential-expired', session=token[:8])
                             return False
                 return True
         except Exception as e:  # noqa: BLE001
-            print(f"❌ Error checking session validity: {e}")
+            safe_event('session.check.failed', e)
             return False
 
     # -- path helpers -------------------------------------------------------
@@ -551,7 +552,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 try:
                     vaults = vault_service.list_vaults(user)
                 except Exception as e:  # noqa: BLE001
-                    print(f"❌ SFTP list_vaults failed: {e}")
+                    safe_event('list-vaults.failed', e)
                     return paramiko.SFTP_FAILURE
                 for vault in vaults:
                     # SFTP exposes only Standard vaults; zero-knowledge vaults have
@@ -747,7 +748,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             except VaultFileNotFoundError:
                 return paramiko.SFTP_NO_SUCH_FILE
             except Exception as e:  # noqa: BLE001
-                print(f"❌ SFTP download failed for {f.id}: {e}")
+                safe_event('download.failed', e, file=f.id)
                 return paramiko.SFTP_FAILURE
 
             self._audit(user, "file_download", str(f.id),
@@ -819,7 +820,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             os.close(fd)
             wf = open(tmp_path, "wb")
         except Exception as e:  # noqa: BLE001
-            print(f"❌ SFTP could not open upload buffer: {e}")
+            safe_event('upload.buffer-open.failed', e)
             return paramiko.SFTP_FAILURE
 
         handle = VaultSFTPHandle(flags=os.O_WRONLY)
@@ -851,8 +852,8 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 buffered_size = 0
             max_bytes = settings.max_file_size_mb * 1024 * 1024
             if max_bytes and buffered_size > max_bytes:
-                print(f"⚠️ SFTP upload rejected: {filename} ({buffered_size}B) exceeds "
-                      f"max {max_bytes}B — existing file left intact")
+                safe_event('upload.rejected.too-large',
+                            bytes=buffered_size, limit=max_bytes)
                 return
 
             with get_db_context() as db:
@@ -861,7 +862,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 # locked/deactivated or a session revoked mid-transfer must not
                 # land the write (TOCTOU between open() and close()).
                 if user is None or not interface._check_session_valid():
-                    print("⚠️ SFTP upload aborted: principal/session no longer valid")
+                    safe_event('upload.aborted.principal-invalid')
                     return
                 vault_service = VaultService(db, PermissionService(db))
                 # Re-authorize at persist time (fresh session): membership +
@@ -871,28 +872,27 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 # quota re-checks): a scoped credential whose scope was narrowed between open() and
                 # close() must not land a write into a now-out-of-scope folder.
                 if not interface._scope_ok_folder(db, user, vault_id, folder_id):
-                    print("⚠️ SFTP upload aborted: destination folder no longer in scope")
+                    safe_event('upload.aborted.folder-out-of-scope')
                     return
                 # Re-gate the per-vault password proof too: a password ADDED or rotated
                 # between open() and close() must not let an in-flight write land without
                 # current proof (TOCTOU) — same gate _resolve_vault applies at open().
                 if vault.password_hash is not None and not interface._vault_password_proven(user, vault):
-                    print("⚠️ SFTP upload aborted: vault password proof no longer valid")
+                    safe_event('upload.aborted.password-proof-invalid')
                     return
 
                 # Vault quota pre-check (mirror the web upload path) — again before
                 # we write or delete anything.
                 if vault.size_limit and (vault.total_size_bytes or 0) + buffered_size > vault.size_limit:
-                    print(f"⚠️ SFTP upload rejected: would exceed vault size limit — "
-                          f"existing file left intact")
+                    safe_event('upload.rejected.vault-limit',
+                                vault=vault.id, bytes=buffered_size, limit=vault.size_limit)
                     return
                 # Deployment-wide plan storage ceiling (aggregate across all vaults) —
                 # same gate the web upload path enforces, so SFTP can't bypass the plan.
                 from app.services.vault_service import would_exceed_deployment_storage
                 exceeds, _used, _cap = would_exceed_deployment_storage(db, buffered_size)
                 if exceeds:
-                    print("⚠️ SFTP upload rejected: would exceed the plan storage limit — "
-                          "existing file left intact")
+                    safe_event('upload.rejected.plan-limit', bytes=buffered_size)
                     return
 
                 mime_type, _ = mimetypes.guess_type(filename)
@@ -939,7 +939,8 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
 
                 interface._audit(user, "file_upload", str(new_file.id),
                                  {"vault_id": str(vault_id), "file_name": filename, "via": "sftp"})
-                print(f"✅ SFTP upload stored {filename} ({total_size} bytes) in vault {vault_id}")
+                safe_event('upload.stored',
+                            file=new_file.id, vault=vault_id, bytes=total_size)
 
         return _finalize
 
@@ -979,7 +980,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             except VaultFileNotFoundError:
                 return paramiko.SFTP_NO_SUCH_FILE
             except Exception as e:  # noqa: BLE001
-                print(f"❌ SFTP remove failed: {e}")
+                safe_event('remove.failed', e, file=fid, vault=vault.id)
                 return paramiko.SFTP_FAILURE
             self._audit(user, "file_delete", str(fid),
                         {"vault_id": str(vault.id), "via": "sftp"})
@@ -1056,7 +1057,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             except ValueError:
                 return paramiko.SFTP_FAILURE
             except Exception as e:  # noqa: BLE001
-                print(f"❌ SFTP rename failed: {e}")
+                safe_event('rename.failed', e, vault=vault.id)
                 return paramiko.SFTP_FAILURE
             return paramiko.SFTP_OK
 
@@ -1094,7 +1095,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             except PermissionDeniedError:
                 return paramiko.SFTP_PERMISSION_DENIED
             except Exception as e:  # noqa: BLE001
-                print(f"❌ SFTP mkdir failed: {e}")
+                safe_event('mkdir.failed', e, vault=vault.id)
                 return paramiko.SFTP_FAILURE
             # Audit by folder id, not the (now at-rest-encrypted) plaintext name.
             self._audit(user, "folder_create", str(getattr(new_folder, "id", "")),
@@ -1156,7 +1157,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                         # rmdir (defense-in-depth behind the vault-level DELETE gate above).
                         raise
                     except Exception as ex:  # noqa: BLE001
-                        print(f"⚠️ rmdir: failed to delete file {child.id}: {ex}")
+                        safe_event('rmdir.child-delete.failed', ex, file=child.id)
                 for sub in db.query(Folder).filter(Folder.parent_folder_id == fid).all():
                     n += _purge(sub.id)
                     db.delete(sub)
@@ -1180,7 +1181,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 return paramiko.SFTP_PERMISSION_DENIED
             except Exception as e:  # noqa: BLE001
                 db.rollback()
-                print(f"❌ SFTP rmdir failed: {e}")
+                safe_event('rmdir.failed', e, vault=vault.id)
                 return paramiko.SFTP_FAILURE
             self._audit(user, "folder_delete", str(folder_id),
                         {"vault_id": str(vault.id), "via": "sftp"})
@@ -1348,8 +1349,13 @@ class SFTPServer(paramiko.ServerInterface):
                         return paramiko.AUTH_SUCCESSFUL
 
                 except Exception as e:
+                    # The exception CLASS, not its text. This lands in the audit row's reason and
+                    # error_message, so a driver message carrying a query fragment or a value from
+                    # the row it choked on would persist in the database -- the same hazard the
+                    # operational log rule addresses, one table over. The class is what an
+                    # investigator can act on.
                     audit_logger.log_login_failure(
-                        username, self.client_address, str(e)
+                        username, self.client_address, type(e).__name__
                     )
                     return paramiko.AUTH_FAILED
 
@@ -1432,9 +1438,9 @@ class SFTPServer(paramiko.ServerInterface):
                         if k is not None:
                             k.last_used = _dt.now(_tz.utc)
                     AuditLogger(db).log_login_success(u, self.client_address, is_temporary=False)
-                print(f"🔑 SSH-key SFTP session created for {self.user_id}")
+                safe_event('session.key-auth.created', user=self.user_id)
             except Exception as e:  # noqa: BLE001
-                print(f"❌ Failed to create key-auth session: {e}")
+                safe_event('session.key-auth.failed', e)
                 return paramiko.OPEN_FAILED_CONNECT_FAILED
 
         return paramiko.OPEN_SUCCEEDED
@@ -1482,7 +1488,7 @@ def listen_for_terminations():
             pubsub = r.pubsub()
             pubsub.subscribe('session_terminations')
 
-            print("👂 Listening for session termination signals...")
+            safe_event('termination-listener.listening')
 
             while True:
                 # Bounded poll, never an unbounded listen(): returns None on an idle tick, so
@@ -1500,20 +1506,20 @@ def listen_for_terminations():
                             with transport_lock:
                                 transport = active_transports.get(session_token)
                                 if transport:
-                                    print(f"⚠️ Terminating session {session_token[:8]}...")
+                                    safe_event('session.terminating', session=session_token[:8])
                                     transport.close()
                                     active_transports.pop(session_token, None)
-                                    print(f"✅ Session {session_token[:8]}... terminated")
+                                    safe_event('session.terminated.ok', session=session_token[:8])
                                 else:
-                                    print(f"ℹ️ Session {session_token[:8]}... not found in active transports")
+                                    safe_event('session.terminate.not-found', session=session_token[:8])
                     except Exception as e:
-                        print(f"❌ Error processing termination signal: {e}")
+                        safe_event('termination-signal.failed', e)
 
         except Exception as e:
             # Connection lost / health-check failed (Redis restarted, or a half-open socket surfaced
             # by health_check_interval) — back off briefly, then reconnect + resubscribe so revocation
             # self-heals after the outage.
-            print(f"❌ Termination listener connection lost; reconnecting in 5s: {e}")
+            safe_event('termination-listener.reconnecting', e)
             time.sleep(5)
 
 
@@ -1536,9 +1542,10 @@ def _sweep_sftp_tmp():
             except OSError:
                 pass
         if removed:
-            print(f"🧹 Swept {removed} orphaned SFTP upload buffer(s) from {_SFTP_TMP_DIR}")
+            # The directory is a deployment path; the COUNT is the operational fact.
+            safe_event('tmp-sweep.completed', removed=removed)
     except Exception as e:  # noqa: BLE001 — best-effort housekeeping, never block startup
-        print(f"⚠️ SFTP tmp sweep failed: {e}")
+        safe_event('tmp-sweep.failed', e)
 
 
 def start_sftp_server():
@@ -1549,7 +1556,8 @@ def start_sftp_server():
     host_key_path = Path(settings.sftp_host_key_path)
 
     if not host_key_path.exists():
-        print(f"Generating new RSA host key at {host_key_path}")
+        # Where it is written is a host path and stays out of the log.
+        safe_event('host-key.generating')
         host_key_path.parent.mkdir(parents=True, exist_ok=True)
         key = paramiko.RSAKey.generate(2048)
         key.write_private_key_file(str(host_key_path))
@@ -1563,7 +1571,7 @@ def start_sftp_server():
     # Start Redis termination listener in background
     termination_thread = threading.Thread(target=listen_for_terminations, daemon=True)
     termination_thread.start()
-    print("✅ Session termination listener started")
+    safe_event('termination-listener.started')
 
     # Create server socket
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1571,7 +1579,7 @@ def start_sftp_server():
     server_socket.bind((settings.sftp_host, settings.sftp_port))
     server_socket.listen(10)
 
-    print(f"SFTP Server listening on {settings.sftp_host}:{settings.sftp_port}")
+    safe_event('server.listening', port=settings.sftp_port)
 
     # Graceful shutdown: SIGTERM (docker stop / run_combined forwarding it) and SIGINT both
     # close the listening socket so accept() unblocks and the loop exits cleanly, instead of
@@ -1580,7 +1588,7 @@ def start_sftp_server():
     _stop = threading.Event()
 
     def _shutdown(signum, _frame):
-        print(f"\nSFTP server received signal {signum}; shutting down...")
+        safe_event('server.signal', signal=signum)
         _stop.set()
         try:
             server_socket.close()
@@ -1593,7 +1601,7 @@ def start_sftp_server():
     while not _stop.is_set():
         try:
             client_socket, client_address = server_socket.accept()
-            print(f"Connection from {client_address}")
+            safe_event('connection.accepted', peer=client_address)
 
             # Handle client in a new thread
             client_thread = threading.Thread(
@@ -1604,7 +1612,7 @@ def start_sftp_server():
             client_thread.start()
 
         except KeyboardInterrupt:
-            print("\nShutting down SFTP server...")
+            safe_event('server.shutting-down')
             break
         except OSError:
             # accept() on a socket closed by the signal handler — exit if we're stopping.
@@ -1612,14 +1620,14 @@ def start_sftp_server():
                 break
             continue
         except Exception as e:
-            print(f"Error accepting connection: {e}")
+            safe_event('connection.accept.failed', e)
             continue
 
     try:
         server_socket.close()
     except Exception:  # noqa: BLE001
         pass
-    print("SFTP server stopped.")
+    safe_event('server.stopped')
 
 
 def handle_sftp_client(
@@ -1665,7 +1673,7 @@ def handle_sftp_client(
         channel = transport.accept(20)
 
         if channel is None:
-            print(f"Client {client_address} failed to open channel")
+            safe_event('channel.open.failed', peer=client_address)
             return
 
         # Register transport in global registry if authenticated (key-auth sessions
@@ -1673,21 +1681,21 @@ def handle_sftp_client(
         if server.session_token:
             with transport_lock:
                 active_transports[server.session_token] = transport
-            print(f"✅ Registered transport for session {server.session_token[:8]}...")
+            safe_event('transport.registered', session=server.session_token[:8])
 
         # Keep connection alive
         while transport.is_active():
             transport.accept(1)
 
     except Exception as e:
-        print(f"Error handling client {client_address}: {e}")
+        safe_event('client.handling.failed', e, peer=client_address)
 
     finally:
         # Unregister transport
         if transport and server and server.session_token:
             with transport_lock:
                 active_transports.pop(server.session_token, None)
-            print(f"🔌 Unregistered transport for session {server.session_token[:8]}...")
+            safe_event('transport.unregistered', session=server.session_token[:8])
 
         if transport:
             transport.close()
