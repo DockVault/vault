@@ -140,13 +140,12 @@ def test_vault_permissions_grant_list_revoke(admin, temp_vault, temp_user):
 
 
 # ---- key rotation ----------------------------------------------------------
-def test_rotate_key_and_history(admin, temp_vault):
+def test_rotate_key_is_refused_and_history_still_reads(admin, temp_vault):
+    # Rotation used to report success while re-keying nothing that content is actually encrypted
+    # with. It now refuses; see tests/test_standard_rotation_honesty.py for the full contract.
     vid = temp_vault["id"]
     r = admin.post(f"/vaults/{vid}/rotate-key")
-    assert r.status_code in (200, 500)  # 500 only if crypto backend unavailable
-    if r.status_code == 200:
-        body = r.json()
-        assert body["new_key_version"] >= body["old_key_version"]
+    assert r.status_code == 501, r.text
 
     r = admin.get(f"/vaults/{vid}/key-history")
     assert r.status_code == 200
@@ -154,13 +153,13 @@ def test_rotate_key_and_history(admin, temp_vault):
 
 
 def test_rotate_key_rejected_for_password_vault(admin, temp_vault_pw):
-    # A password-protected vault's DEK is password-wrapped; server-side rotate-key can't re-wrap it with
-    # the password, so it must be rejected rather than write an inconsistent master-key-wrapped row.
-    # (File content is keyed off the deployment secret, not the wrapped DEK, so access is unaffected.)
+    # Now the same refusal every standard vault gets. The old narrower rejection was about not
+    # being able to re-wrap a password-derived key; true, but incomplete -- rotation would not
+    # have re-keyed the content either way, and one answer beats two for the same refusal.
     vid = temp_vault_pw["id"]
     r = admin.post(f"/vaults/{vid}/rotate-key")
-    assert r.status_code == 400, r.text
-    assert "password-protected" in r.json()["detail"].lower()
+    assert r.status_code == 501, r.text
+    assert "nothing was changed" in r.json()["detail"].lower()
 
 
 def test_delete_vault(admin):
