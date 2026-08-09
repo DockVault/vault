@@ -49,7 +49,7 @@ a constraint that decided §7.4's shape.
 
 **Not a migration.** Existing envelopes are never rewritten. There is no server-side conversion,
 because the server cannot read any of this and a migration that could damage opaque bytes is a
-stop-condition for the phase.
+stop-condition for this work.
 
 ## 3. The constraint that shapes everything
 
@@ -176,6 +176,13 @@ committed to the v2 path.
   is rejected as *unsupported*, distinguishably from *damaged* — see §6.5, which is a hard
   precondition rather than an aspiration.
 - A **legacy reader must reject a v2 payload** rather than interpret the header as ciphertext.
+- **The expected purpose is chosen by the call site and compared against the wire byte. It is never
+  read off the wire to select a transcript.** This is what §6.1's assurance actually rests on: if a
+  reader derived its transcript from the purpose it found, rewriting that byte would steer a payload
+  into another reader, which is the attack the assurance denies. Both DEK wraps are 68 bytes, so
+  length cannot separate them — only the call site's expectation can. An implementation that
+  satisfied every other sentence here and still selected on the wire byte would lose the property
+  this document exists to establish.
 
 ### 6.4 The server's `wrapping_algorithm` column is load-bearing, and v2 must not break it
 
@@ -245,11 +252,21 @@ reason about boot ordering to satisfy this sentence.
 
 ```
 shared   = ECDH(ephemeral_priv, vault_team_pub)                           384 bits
-info     = "dockvault-zk-dek-team-v2" 0x00 vault_id
+info     = "dockvault-zk-dek-team-v2" 0x00 vault_id 0x00 dek_epoch
 key      = HKDF-SHA256(shared, salt §4.3, info)                           32 bytes
-aad      = header || vault_id
+aad      = header || vault_id 0x00 dek_epoch
 payload  = header || nonce(12) || AES-256-GCM(key, nonce, DEK, aad)       exactly 68 bytes
 ```
+
+**`dek_epoch` is `vaults.dek_version`** — the same field §7.1 binds, and NOT the team epoch. The
+distinction is the whole reason this construction was blocked once and is not blocked now, so it is
+worth being exact about: they are different columns on different axes, and a routine DEK rotation
+advances one while leaving the other alone.
+
+The team epoch is server-assigned and cannot be bound (§11). The DEK epoch can: the rotating client
+proposes it as `to_version`, the server verifies it against the live value under a row lock and
+returns 409 on a mismatch, and the wrap is then stored under exactly that key. At creation it is 1.
+An earlier draft of this section omitted it, having treated "the team epoch" as one thing.
 
 The reader MUST reject an unwrapped plaintext that is not exactly 32 bytes (§3), and dispatches on
 the same fixed 68-byte length as §7.1.
@@ -259,8 +276,8 @@ team keypair, which ECDH already binds — there is no per-user choice to record
 member, which is the whole point of the hierarchical mode: adding a member is O(1) because the DEK is
 never re-wrapped for them.
 
-**The team epoch is deliberately absent.** See §11. It is not available to the writer, and no amount
-of wanting it changes that.
+**The TEAM epoch is deliberately absent** — see §11 — and only that one. It is not available to the
+writer, and no amount of wanting it changes that.
 
 ### 7.3 Team private wrap — purpose `0x03`
 
@@ -277,24 +294,63 @@ length** and the §6.2 length rule does not apply to it. Discrimination is magic
 only, exactly as §6.2 describes for the non-fixed constructions, and the reader MUST therefore
 validate every header field before committing — there is no length to disagree with first.
 
-The reader MUST enforce a maximum payload length before allocating. A P-384 PKCS8 key is ~185 bytes;
-**8 KiB** is the ceiling, generous by a factor of forty and far below anything that troubles a
-browser.
+The reader MUST bound the payload on both sides before allocating. The floor is **36 bytes**
+(8 header + 12 nonce + 16 tag, i.e. an empty plaintext); anything shorter cannot be this
+construction. The ceiling is **8 KiB measured over the whole payload**, header included: a P-384
+PKCS8 key is about 185 bytes, so this is generous by a factor of forty and far below anything that
+troubles a browser.
+
+The recovered plaintext MUST parse as a P-384 private key, and MUST be imported **non-extractable,
+with key agreement as its only permitted use**. That is a property of the construction and not an
+implementation detail: the team private key exists to unwrap a DEK, and a reader that imported it
+extractably would let anything holding it export the key that every member's access depends on.
 
 `recipient_user_id` is bound here for the same reason as §7.1 and with the same honest caveat: ECDH
 already binds the recipient, so against a lying server this is self-DoS only.
 
 It is available at both ends, but "available" is doing some work in that sentence and an implementer
-should know where. Both writers hold the id directly — the share path takes it as a parameter, and
-the rotation loop iterates over member ids. The reader is the awkward one: the function that unwraps
-a team private key is handed only the vault, the epoch and the two blobs, so the id has to be
-threaded in from its caller, which does have it from the keys response. That is a small change and
-an easy one to skip, and skipping it does not fail loudly — an absent field becomes `undefined`, the
-transcript is built from it anyway, and the result is a wrap that authenticates against nothing the
-writer produced. A reader MUST therefore treat a missing recipient id as a structural error rather
-than encoding it, which is the same rule §4.1 already applies to a malformed epoch.
+should know exactly where.
+
+**Three writers, not two.** The share path takes the recipient as a parameter and the rotation loop
+iterates over member ids; both are straightforward. The third is vault creation, and it is the one
+that needs care — see §7.5.
+
+**Two readers, and they take different ids.** One is the function that unwraps a team private key
+for ordinary use: it is handed only the vault, the epoch and the two blobs, so the id must be
+threaded in from its caller, which has it from the keys response. The other is inline in the share
+path, three lines above the writer, and takes the SHARER's own id while the writer beside it takes
+the RECIPIENT's. Both are in scope there under similar names, and choosing wrongly produces a wrap
+that fails as an authentication error indistinguishable from tampering.
+
+Skipping the threading does not fail loudly either: an absent field becomes `undefined`, the
+transcript is built from it anyway, and the result authenticates against nothing the writer
+produced. A reader MUST therefore treat a missing or empty recipient id as a structural error rather
+than encoding it, which is the same rule §4.1 applies to a malformed epoch.
 
 **The team epoch and the team public key's fingerprint are both deliberately absent.** See §11.
+
+### 7.5 Creation, and the prerequisite these constructions carry
+
+Both team wraps are minted by the browser into the create request, before the vault exists — so at
+that moment there is no vault id to bind, exactly as was true for §7.1.
+
+**§7.1's escape hatch does not transfer, and that is the important part.** A direct vault created on
+the legacy writer converts wholesale at its first rotation, because a rotation re-wraps every
+member. A hierarchical vault does not: sharing writes only the new member's team-private wrap, and
+the stored team-DEK wrap is rewritten only when a member is REVOKED. So a hierarchical vault that
+never removes anyone would keep its creation-time wraps unbound forever, and §7.2 and §7.3 would
+never be reached on it at all.
+
+**Prerequisite.** The creating client must choose the vault id and send it, the same way the direct
+path now does. The server side of that already accepts a chosen id for any zero-knowledge vault,
+hierarchical included; only the client half is missing. Until it lands, these two constructions are
+specified but not reachable, and an implementer should treat that as the first task rather than
+discovering it afterwards.
+
+The recipient id has the same shape of problem at creation — the recipient is the creator, and the
+only local source for their account id is session state this design rejects elsewhere (§7.1). The
+same fix serves both: the keys endpoint already echoes the account id, and the create path can take
+it from the same response it takes the public key from.
 
 ### 7.2/7.3 — what these transcripts do not prevent
 
@@ -306,9 +362,17 @@ who can write the database can serve a member an older generation's team-private
 current one. The member's own key opens it — it was genuinely issued to them — and they end up
 holding a retired team key.
 
-That is a real gap and §11 explains why it is not closed here. It is worth measuring against what
-exists today: the shipped wraps bind *nothing at all*, not even the vault, so v2 strictly improves
-matters even without the epoch.
+That is a real gap and §11 explains why it is not closed here.
+
+Two honest qualifications. First, it composes with anything else left unbound: a revoked member
+whose removal forced a team rotation could, given a served retired generation, read content written
+after their removal — which is precisely what the server's rotation enforcement exists to prevent.
+Binding the DEK epoch (§7.2) closes one half of that; the team generation remains.
+
+Second, "better than today" is true per wrap and weaker per deployment. Legacy wraps stay readable
+indefinitely and this document sets no point at which a reader refuses them, so a hostile server can
+always offer the unbound format instead. Retiring legacy reads is a separate decision with its own
+data-loss risk, and it is not taken here.
 
 ### 7.4 Content chunk framing — purpose `0x04`
 
@@ -419,12 +483,13 @@ alluded to: a source constant, off by default, pinned false by a test, with a si
 writer, and operator documentation at the point of enabling.
 
 Order: amend the error contract (§6.5) → widen the server's algorithm filters (§6.4) → direct
-wraps → content → team wraps. The first two have landed and direct wraps are written; the
-ordering constraint that remains is only that readers precede writers within each construction.
+wraps → content → team wraps. The first two have landed. The direct writer exists but is gated
+off and the canonical algorithm label is still generation 1, so no v2 row has been written yet;
+content and team wraps follow in that order once it has.
 
 ## 11. Why the team wraps bind so little
 
-Both team transcripts failed the phase's stop-condition — *"stop if any transcript field is
+Both team transcripts failed the stop-condition this work adopted — *"stop if any transcript field is
 unavailable at both encryption and decryption time"* — in opposite directions.
 
 **The team key fingerprint is unavailable at decryption time.** `Vault.team_public_key` holds only
@@ -483,6 +548,7 @@ after a rotation.
 non-extractable with `deriveBits` only. The fingerprint argument is correct about everything except
 whether the value can be obtained, which is the one property that matters.
 
-Recorded because the phase says not to start the next subround to hide a disagreement — and because
+Recorded rather than quietly resolved, because burying a disagreement of this kind is how the
+losing argument gets rediscovered later — and because
 the disagreement is the strongest argument for having run two independent reviews rather than one.
 Neither reviewer alone found all nine blockers, and their overlap was two.
