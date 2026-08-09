@@ -6,7 +6,12 @@ before the lock does, and the server assigning it on arrival is too late.
 
 Letting the browser choose it gives away nothing. A vault id is not a secret and grants no access;
 access comes from membership rows and from the crypto. The one thing that could go wrong is two
-vaults sharing an id, and that is what these tests are about.
+LIVE vaults sharing an id, and that is what these tests are about.
+
+Live is the operative word: vaults are hard-deleted, so a retired id can be claimed again, and
+these checks only ever look at vaults that still exist. That is a deliberate choice -- every table
+holding access or key material cascades on the vault, so a reclaimed id inherits nothing -- but it
+is a choice, not a property, and it should not be discovered by someone reading these tests.
 
 Note what the browser tests cannot check. They drive the real page and create real vaults, but they
 read the id back out of the *response* -- so a server that quietly ignored the field would still
@@ -46,10 +51,10 @@ def test_the_vault_is_created_under_the_id_the_client_chose(admin):
     Everything else in this change rests on it. If the server assigned its own id instead, the
     lock -- stamped with the id the browser chose -- would belong to a vault that does not exist.
     """
+    chosen = uuid.uuid4()
     admin.put("/settings", json={"zero_knowledge_enabled": True})
     try:
         ensure_ecc_keypair(admin)
-        chosen = uuid.uuid4()
         r = admin.post("/vaults", json=_zk_payload(chosen))
         assert r.status_code in (200, 201), r.text
         assert r.json()["id"] == str(chosen), "the server did not honour the chosen id"
@@ -69,20 +74,27 @@ def test_an_id_already_in_use_is_refused(admin):
 
     That is the single property choosing your own id could cost, so it is the one worth pinning.
     """
+    chosen = uuid.uuid4()
+    strays = []
     admin.put("/settings", json={"zero_knowledge_enabled": True})
     try:
         ensure_ecc_keypair(admin)
-        chosen = uuid.uuid4()
         first = admin.post("/vaults", json=_zk_payload(chosen))
         assert first.status_code in (200, 201), first.text
 
         clash = admin.post("/vaults", json=_zk_payload(chosen))
+        # If the guard is gone this succeeds under a server-assigned id, so record it for
+        # teardown before asserting -- a failing test should not also leak a vault.
+        if clash.status_code in (200, 201):
+            strays.append(clash.json()["id"])
         assert clash.status_code == 409, (
             f"a second vault was allowed to take a live vault's id: {clash.status_code} {clash.text}"
         )
         assert "already in use" in clash.text
     finally:
         admin.put("/settings", json={"zero_knowledge_enabled": False})
+        for stray in strays:
+            admin.delete_vault(stray)
         admin.delete_vault(str(chosen))
 
 

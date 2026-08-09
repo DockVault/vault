@@ -2097,10 +2097,12 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                     // and two vaults can never share one, because the server refuses a taken
                     // id with a 409 and the primary key backs that up.
                     //
-                    // It is NOT true that a vault id is inert everywhere: for a Standard
-                    // vault it feeds at-rest key derivation and names a directory on disk.
-                    // Which is why the server accepts a chosen id only for a zero-knowledge
-                    // vault -- the one kind that needs it.
+                    // A vault id is not inert, though. For a Standard vault it feeds at-rest
+                    // key derivation -- which is why the server accepts a chosen id only for
+                    // a zero-knowledge vault, the one kind that needs it. It also names a
+                    // directory, and that IS true of every vault including this one; what
+                    // makes it safe is that the server types the field as a UUID, so what
+                    // reaches the filesystem is always a canonical form and never a path.
                     payload.id = zkNewObjId();
                     const { wrappedDEK, ephemeralPublicKey } = await zkWrapDekForRecipient(
                         dek, myPub,
@@ -2123,6 +2125,14 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
         });
         // Cache the just-generated DEK (epoch 1) so the first upload needn't round-trip to
         // unwrap. zkState.vaultDeks is keyed {vaultId: {epoch: dek}} — store under epoch 1.
+        if (zkPendingDek && payload.id && created && created.id !== payload.id) {
+            // The lock was stamped with the id we chose. If the vault came back under a
+            // different one, the stamp names a vault that does not exist -- and nothing would
+            // go wrong until a reload, by which time the key is gone and the vault cannot be
+            // opened by anyone. Refuse now, while the failure is still legible.
+            throw new Error('The server created this vault under a different id; its key '
+                          + 'would not be readable. Nothing was lost -- please try again.');
+        }
         if (zkPendingDek && created && created.id) {
             zkState.vaultDeks[created.id] = { 1: zkPendingDek };
             if (payload.key_wrapping_mode === 'hierarchical') zkState.pinnedHier[created.id] = true;
@@ -7548,8 +7558,10 @@ async function zkEnsurePublicKeyForCreate() {
     const pub = await apiRequest('/ecc/keys/public', { silent: true });
     if (pub && pub.has_keypair) {
         if (!pub.public_key) throw new Error('Your public key is unavailable.');
-        // Checked as strictly as the key. A missing id would become `undefined` in a lock's
-        // stamp, which is not a visible failure -- it is a lock that opens for nobody.
+        // Checked as strictly as the key. Not because an unchecked id would silently produce
+        // a bad lock -- the transcript builder rejects anything that is not a canonical uuid,
+        // so it would throw -- but because it would throw deep inside the crypto with a
+        // message about the wrong thing, when the real fault is a response missing a field.
         if (!pub.user_id) throw new Error('Your account identity is unavailable.');
         return { pem: pub.public_key, userId: pub.user_id };
     }
@@ -7567,6 +7579,9 @@ async function zkEnsurePublicKeyForCreate() {
     if (!registered || !registered.has_keypair || !registered.public_key) {
         throw new Error('Your registered public key is unavailable.');
     }
+    // Same check as the branch above. This is the first-registration path, so leaving it off
+    // here would have meant the guard covered everyone except a brand-new user.
+    if (!registered.user_id) throw new Error('Your account identity is unavailable.');
     return { pem: registered.public_key, userId: registered.user_id };
 }
 

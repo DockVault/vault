@@ -78,9 +78,9 @@ def test_create_submit_wraps_a_fresh_dek_to_the_server_public_key():
     assert create_flow.index(fresh_dek) < create_flow.index(create_request)
 
     # One more ordering, new with the client-chosen vault id: the id must be minted BEFORE the key
-    # is locked. The lock is stamped with it, so the other order stamps `undefined` -- which throws
-    # rather than producing a bad lock, but only once someone enables the version-2 writer, and
-    # nothing executes this file to find out.
+    # is locked. The lock is stamped with it, so the other order stamps `undefined`, which throws
+    # rather than producing a bad lock -- but only once someone enables the version-2 writer, so
+    # until then this assertion is the only thing holding the order.
     mint_id = "payload.id = zkNewObjId();"
     stamp = "vaultId: payload.id"
     assert mint_id in create_flow

@@ -5891,8 +5891,13 @@ async def create_vault(
     except (ValueError, IntegrityError) as exc:
         # Losing the race between the check above and this insert should look to a caller
         # exactly like losing the check -- a taken id -- and not like a server fault.
+        #
+        # Narrowly, though. Key setup raises ValueError too when a deployment has no
+        # encryption key, and answering that with "id already in use" would diagnose a
+        # misconfiguration as a client mistake and hide it from error monitoring.
         db.rollback()
-        if vault_create.id is not None:
+        taken = isinstance(exc, IntegrityError) or 'id already in use' in str(exc)
+        if vault_create.id is not None and taken:
             raise HTTPException(status_code=409,
                                 detail="That vault id is already in use.") from exc
         raise
