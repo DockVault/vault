@@ -5861,22 +5861,41 @@ async def create_vault(
                             detail=f"Vault size must be between 1 byte and {_INT64_MAX / _GIB:.0f} GB")
     _enforce_vault_size(db, current_user, requested_size)
 
-    # Reject a taken id here, before anything is built, so the caller gets 409 rather than a
-    # constraint violation. This check -- not the fact that the client proposed the id -- is
-    # what keeps two vaults from sharing one.
-    if vault_create.id is not None and db.query(Vault.id).filter(Vault.id == vault_create.id).first():
-        raise HTTPException(status_code=409, detail="That vault id is already in use.")
+    if vault_create.id is not None:
+        # Only a zero-knowledge vault has a reason to choose its own id: its key is locked
+        # before the vault exists, and the lock is stamped with the id. A Standard vault's id
+        # feeds at-rest key derivation and names a directory on disk, so there is no reason to
+        # let a caller pick it and every reason not to.
+        if vault_type != 'zero_knowledge':
+            raise HTTPException(
+                status_code=400,
+                detail="A vault id may only be supplied when creating a zero-knowledge vault.",
+            )
+        # Reject a taken id before anything is built. Note what actually guarantees uniqueness:
+        # the primary key. This check turns that constraint violation into a clear answer, and
+        # two simultaneous requests for one id still race past it -- hence the guard below.
+        if db.query(Vault.id).filter(Vault.id == vault_create.id).first():
+            raise HTTPException(status_code=409, detail="That vault id is already in use.")
 
-    vault = vault_service.create_vault(
-        vault_id=vault_create.id,
-        name=vault_create.name,
-        owner=current_user,
-        description=vault_create.description,
-        password=vault_create.password,
-        expire_files_after_days=vault_create.expire_files_after_days,
-        vault_type=vault_type,
-        size_limit=requested_size,
-    )
+    try:
+        vault = vault_service.create_vault(
+            vault_id=vault_create.id,
+            name=vault_create.name,
+            owner=current_user,
+            description=vault_create.description,
+            password=vault_create.password,
+            expire_files_after_days=vault_create.expire_files_after_days,
+            vault_type=vault_type,
+            size_limit=requested_size,
+        )
+    except (ValueError, IntegrityError) as exc:
+        # Losing the race between the check above and this insert should look to a caller
+        # exactly like losing the check -- a taken id -- and not like a server fault.
+        db.rollback()
+        if vault_create.id is not None:
+            raise HTTPException(status_code=409,
+                                detail="That vault id is already in use.") from exc
+        raise
 
     # Zero-knowledge vaults: the DEK is generated AND wrapped IN THE BROWSER to the
     # owner's own public key; the owner's wrapped copy is supplied here. The server

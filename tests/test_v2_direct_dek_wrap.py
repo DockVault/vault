@@ -7,13 +7,18 @@ vault, with nothing on the server able to re-wrap for them. So the reader ships 
 and enabling the writer is a deliberate, reviewable source change.
 
 The round-trips below therefore call the v2 writer DIRECTLY, bypassing the gate rather than
-flipping it. Be clear about what that leaves uncovered: the two call sites in `app.js` that
-consult the gate are exercised by nothing at all -- no test loads that file, they are only
-read as text. A wrong variable there ships silently and fires for whoever enables v2 first,
-which is not hypothetical: an earlier draft of the rekey site referenced a name that does not
-exist in its scope. The grep below catches a missing transcript FIELD and would not have
-caught that. Closing it properly needs the browser lane to drive a share with the gate on,
-which is worth doing before the gate is ever flipped.
+flipping it. Be precise about what that does and does not leave uncovered, because an earlier
+version of this note got it wrong in both directions.
+
+The create path IS executed: a browser test drives the real page and creates zero-knowledge
+vaults through it, so a name that does not resolve there fails loudly. What no test reaches is
+the transcript itself -- with the gate off it is built and then discarded, so a wrong value
+inside it is invisible everywhere. A wrong VARIABLE now fails; a wrong VALUE does not.
+
+That distinction matters because the failure it leaves open is the quiet one: a lock stamped
+with the wrong thing is not detectably wrong until someone tries to open it, by which time the
+key it was made from is gone. Driving the browser lane once with the gate on is what closes
+it, and it is worth doing before the gate is ever flipped.
 
 Everything here runs the REAL shipped `ecc_crypto.js` under Node's Web Crypto, so what is under
 test is the file the browser is served rather than a reimplementation of it.
@@ -326,6 +331,11 @@ def test_the_create_path_chooses_the_id_before_it_locks_the_key():
     source = APP_JS.read_text(encoding="utf-8")
     create = source.split("payload.type = 'zero_knowledge'", 1)[1].split("zkPendingDek = dek", 1)[0]
     assert "payload.id = zkNewObjId();" in create, "the browser no longer chooses the vault id"
+    # Through the choke point, not around it. A direct call to the v2 writer here would still
+    # work and would still pass every other test, while quietly reintroducing a second place
+    # that decides the wrap format.
+    assert "zkWrapDekForRecipient(" in create
+    assert "wrapVaultDEKV2(" not in create
     assert "vaultId: payload.id" in create, "the lock is not stamped with the chosen id"
     assert create.index("payload.id = zkNewObjId();") < create.index("vaultId: payload.id"), (
         "the id must be chosen BEFORE the key is locked; the other order binds nothing"

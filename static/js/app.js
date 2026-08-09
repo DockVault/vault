@@ -2063,10 +2063,13 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
         let zkPendingDek = null;
         if (vaultType === 'zero_knowledge') {
             try {
-                const publicKeyPem = await zkEnsurePublicKeyForCreate();
+                // Both halves come from the same response: the public key to wrap to, and the
+                // account id the server says that key belongs to. The id is needed because a
+                // version-2 lock stamps the account it was made for.
+                const identity = await zkEnsurePublicKeyForCreate();
                 const lib = eccLib();
-                const myPub = await lib.importPublicKeyPEM(publicKeyPem);
-                const myUserId = zkIdentity.userId;
+                const myPub = await lib.importPublicKeyPEM(identity.pem);
+                const myUserId = identity.userId;
                 const dek = await lib.generateVaultDEK();
                 payload.type = 'zero_knowledge';
                 const hcb = document.getElementById('vault-hierarchical');
@@ -2089,9 +2092,15 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                     // and the key travels in this same request -- so waiting for the server
                     // to assign an id would be too late to stamp anything with it.
                     //
-                    // Choosing it costs nothing: a vault id is not a secret and grants no
-                    // access, which comes from membership and the crypto. The only risk is
-                    // two vaults sharing an id, and the server refuses that with a 409.
+                    // Choosing it is safe here for two reasons worth separating. A vault id
+                    // grants no access -- that comes from membership rows and the crypto --
+                    // and two vaults can never share one, because the server refuses a taken
+                    // id with a 409 and the primary key backs that up.
+                    //
+                    // It is NOT true that a vault id is inert everywhere: for a Standard
+                    // vault it feeds at-rest key derivation and names a directory on disk.
+                    // Which is why the server accepts a chosen id only for a zero-knowledge
+                    // vault -- the one kind that needs it.
                     payload.id = zkNewObjId();
                     const { wrappedDEK, ephemeralPublicKey } = await zkWrapDekForRecipient(
                         dek, myPub,
@@ -7539,6 +7548,9 @@ async function zkEnsurePublicKeyForCreate() {
     const pub = await apiRequest('/ecc/keys/public', { silent: true });
     if (pub && pub.has_keypair) {
         if (!pub.public_key) throw new Error('Your public key is unavailable.');
+        // Checked as strictly as the key. A missing id would become `undefined` in a lock's
+        // stamp, which is not a visible failure -- it is a lock that opens for nobody.
+        if (!pub.user_id) throw new Error('Your account identity is unavailable.');
         return { pem: pub.public_key, userId: pub.user_id };
     }
     try {
