@@ -1,7 +1,8 @@
 # Zero-knowledge envelope family, version 2
 
-Status: **reviewed. The direct-wrap and content grammars are implementable. The team-wrap grammar
-is blocked on a protocol change outside this document — see §11.**
+Status: **reviewed. Every construction in this document is implementable.** The team wraps were
+blocked in the first revision; §11.1 records the decision that unblocked them, and what it
+deliberately leaves unsolved.
 
 Two independent reviews are folded in. They found largely different problems, and on one question
 they reached opposite conclusions. §12 records that disagreement and how it was settled, because
@@ -48,7 +49,7 @@ a constraint that decided §7.4's shape.
 
 **Not a migration.** Existing envelopes are never rewritten. There is no server-side conversion,
 because the server cannot read any of this and a migration that could damage opaque bytes is a
-stop-condition for the phase.
+stop-condition for this work.
 
 ## 3. The constraint that shapes everything
 
@@ -175,6 +176,13 @@ committed to the v2 path.
   is rejected as *unsupported*, distinguishably from *damaged* — see §6.5, which is a hard
   precondition rather than an aspiration.
 - A **legacy reader must reject a v2 payload** rather than interpret the header as ciphertext.
+- **The expected purpose is chosen by the call site and compared against the wire byte. It is never
+  read off the wire to select a transcript.** This is what §6.1's assurance actually rests on: if a
+  reader derived its transcript from the purpose it found, rewriting that byte would steer a payload
+  into another reader, which is the attack the assurance denies. Both DEK wraps are 68 bytes, so
+  length cannot separate them — only the call site's expectation can. An implementation that
+  satisfied every other sentence here and still selected on the wire byte would lose the property
+  this document exists to establish.
 
 ### 6.4 The server's `wrapping_algorithm` column is load-bearing, and v2 must not break it
 
@@ -240,14 +248,131 @@ here are `vault_id`, the epoch, and the purpose byte. The reader takes the id fr
 session; the API should echo the account id the row was selected for, so the reader does not have to
 reason about boot ordering to satisfy this sentence.
 
-### 7.2 and 7.3 Team wraps — BLOCKED, see §11
+### 7.2 Team DEK wrap — purpose `0x02`
 
-The team-DEK and team-private grammars are **not specified as implementable** in this revision. Both
-transcripts failed the phase's availability stop-condition, in opposite directions, and fixing them
-requires a change to the rekey protocol rather than to a byte layout. §11 states the problem and the
-options; the team-wrap work cannot start until it is resolved.
+```
+shared   = ECDH(ephemeral_priv, vault_team_pub)                           384 bits
+info     = "dockvault-zk-dek-team-v2" 0x00 vault_id 0x00 dek_epoch
+key      = HKDF-SHA256(shared, salt §4.3, info)                           32 bytes
+aad      = header || vault_id 0x00 dek_epoch
+payload  = header || nonce(12) || AES-256-GCM(key, nonce, DEK, aad)       exactly 68 bytes
+```
 
-The purpose bytes `0x02` and `0x03` are reserved for them and MUST NOT be reused.
+**`dek_epoch` is `vaults.dek_version`** — the same field §7.1 binds, and NOT the team epoch. The
+distinction is the whole reason this construction was blocked once and is not blocked now, so it is
+worth being exact about: they are different columns on different axes, and a routine DEK rotation
+advances one while leaving the other alone.
+
+The team epoch is server-assigned and cannot be bound (§11). The DEK epoch can: the rotating client
+proposes it as `to_version`, the server verifies it against the live value under a row lock and
+returns 409 on a mismatch, and the wrap is then stored under exactly that key. At creation it is 1.
+An earlier draft of this section omitted it, having treated "the team epoch" as one thing.
+
+The reader MUST reject an unwrapped plaintext that is not exactly 32 bytes (§3), and dispatches on
+the same fixed 68-byte length as §7.1.
+
+**There is no recipient field, and that is not an omission.** This wrap's recipient *is* the vault's
+team keypair, which ECDH already binds — there is no per-user choice to record. One wrap serves every
+member, which is the whole point of the hierarchical mode: adding a member is O(1) because the DEK is
+never re-wrapped for them.
+
+**The TEAM epoch is deliberately absent** — see §11 — and only that one. It is not available to the
+writer, and no amount of wanting it changes that.
+
+### 7.3 Team private wrap — purpose `0x03`
+
+```
+shared   = ECDH(ephemeral_priv, recipient_account_pub)                    384 bits
+info     = "dockvault-zk-teampriv-v2" 0x00 vault_id 0x00 recipient_user_id
+key      = HKDF-SHA256(shared, salt §4.3, info)                           32 bytes
+aad      = header || vault_id 0x00 recipient_user_id
+payload  = header || nonce(12) || AES-256-GCM(key, nonce, team_priv_pkcs8, aad)
+```
+
+The plaintext is a PKCS8 private key, so unlike the two DEK wraps this payload has **no fixed
+length** and the §6.2 length rule does not apply to it. Discrimination is magic-plus-full-header
+only, exactly as §6.2 describes for the non-fixed constructions, and the reader MUST therefore
+validate every header field before committing — there is no length to disagree with first.
+
+The reader MUST bound the payload on both sides before allocating. The floor is **36 bytes**
+(8 header + 12 nonce + 16 tag, i.e. an empty plaintext); anything shorter cannot be this
+construction. The ceiling is **8 KiB measured over the whole payload**, header included: a P-384
+PKCS8 key is about 185 bytes, so this is generous by a factor of forty and far below anything that
+troubles a browser.
+
+The recovered plaintext MUST parse as a P-384 private key, and MUST be imported **non-extractable,
+with key agreement as its only permitted use**. That is a property of the construction and not an
+implementation detail: the team private key exists to unwrap a DEK, and a reader that imported it
+extractably would let anything holding it export the key that every member's access depends on.
+
+`recipient_user_id` is bound here for the same reason as §7.1 and with the same honest caveat: ECDH
+already binds the recipient, so against a lying server this is self-DoS only.
+
+It is available at both ends, but "available" is doing some work in that sentence and an implementer
+should know exactly where.
+
+**Three writers, not two.** The share path takes the recipient as a parameter and the rotation loop
+iterates over member ids; both are straightforward. The third is vault creation, and it is the one
+that needs care — see §7.5.
+
+**Two readers, and they take different ids.** One is the function that unwraps a team private key
+for ordinary use: it is handed only the vault, the epoch and the two blobs, so the id must be
+threaded in from its caller, which has it from the keys response. The other is inline in the share
+path, three lines above the writer, and takes the SHARER's own id while the writer beside it takes
+the RECIPIENT's. Both are in scope there under similar names, and choosing wrongly produces a wrap
+that fails as an authentication error indistinguishable from tampering.
+
+Skipping the threading does not fail loudly either: an absent field becomes `undefined`, the
+transcript is built from it anyway, and the result authenticates against nothing the writer
+produced. A reader MUST therefore treat a missing or empty recipient id as a structural error rather
+than encoding it, which is the same rule §4.1 applies to a malformed epoch.
+
+**The team epoch and the team public key's fingerprint are both deliberately absent.** See §11.
+
+### 7.5 Creation, and the prerequisite these constructions carry
+
+Both team wraps are minted by the browser into the create request, before the vault exists — so at
+that moment there is no vault id to bind, exactly as was true for §7.1.
+
+**§7.1's escape hatch does not transfer, and that is the important part.** A direct vault created on
+the legacy writer converts wholesale at its first rotation, because a rotation re-wraps every
+member. A hierarchical vault does not: sharing writes only the new member's team-private wrap, and
+the stored team-DEK wrap is rewritten only when a member is REVOKED. So a hierarchical vault that
+never removes anyone would keep its creation-time wraps unbound forever, and §7.2 and §7.3 would
+never be reached on it at all.
+
+**Prerequisite.** The creating client must choose the vault id and send it, the same way the direct
+path now does. The server side of that already accepts a chosen id for any zero-knowledge vault,
+hierarchical included; only the client half is missing. Until it lands, these two constructions are
+specified but not reachable, and an implementer should treat that as the first task rather than
+discovering it afterwards.
+
+The recipient id has the same shape of problem at creation — the recipient is the creator, and the
+only local source for their account id is session state this design rejects elsewhere (§7.1). The
+same fix serves both: the keys endpoint already echoes the account id, and the create path can take
+it from the same response it takes the public key from.
+
+### 7.2/7.3 — what these transcripts do not prevent
+
+Stated plainly, because a bound field list invites the assumption that everything else is covered.
+Neither construction binds *which generation of the team keypair* it belongs to. A vault that has
+rotated its team keypair holds wraps from several generations, and nothing in the bytes distinguishes
+them; the server's `key_version` column does, and that column is not authenticated. So an adversary
+who can write the database can serve a member an older generation's team-private wrap in place of the
+current one. The member's own key opens it — it was genuinely issued to them — and they end up
+holding a retired team key.
+
+That is a real gap and §11 explains why it is not closed here.
+
+Two honest qualifications. First, it composes with anything else left unbound: a revoked member
+whose removal forced a team rotation could, given a served retired generation, read content written
+after their removal — which is precisely what the server's rotation enforcement exists to prevent.
+Binding the DEK epoch (§7.2) closes one half of that; the team generation remains.
+
+Second, "better than today" is true per wrap and weaker per deployment. Legacy wraps stay readable
+indefinitely and this document sets no point at which a reader refuses them, so a hostile server can
+always offer the unbound format instead. Retiring legacy reads is a separate decision with its own
+data-loss risk, and it is not taken here.
 
 ### 7.4 Content chunk framing — purpose `0x04`
 
@@ -358,11 +483,13 @@ alluded to: a source constant, off by default, pinned false by a test, with a si
 writer, and operator documentation at the point of enabling.
 
 Order: amend the error contract (§6.5) → widen the server's algorithm filters (§6.4) → direct
-wraps → content → team wraps, once §11 is resolved.
+wraps → content → team wraps. The first two have landed. The direct writer exists but is gated
+off and the canonical algorithm label is still generation 1, so no v2 row has been written yet;
+content and team wraps follow in that order once it has.
 
-## 11. Why the team wraps are blocked
+## 11. Why the team wraps bind so little
 
-Both team transcripts failed the phase's stop-condition — *"stop if any transcript field is
+Both team transcripts failed the stop-condition this work adopted — *"stop if any transcript field is
 unavailable at both encryption and decryption time"* — in opposite directions.
 
 **The team key fingerprint is unavailable at decryption time.** `Vault.team_public_key` holds only
@@ -377,7 +504,7 @@ the vault's current value, on rotation it increments. The client never proposes 
 turns member-add into a read-then-write race: the wrap binds T, a concurrent rotation lands the row
 at T+1, and the member is silently locked out of the vault.
 
-**Options, for the owner to choose:**
+**Options:**
 
 1. Bind neither. Team wraps get version, purpose and vault only — weaker than direct wraps, and the
    team-DEK/direct confusion is still fixed by the purpose byte, which was the main goal.
@@ -385,9 +512,30 @@ at T+1, and the member is silently locked out of the vault.
 3. Make the team epoch client-proposed with an optimistic-lock 409, mirroring the existing
    `from_version` mechanism on the DEK axis.
 
-Option 1 is implementable today and delivers most of the value. Options 2 and 3 are protocol changes
-that deserve their own round. This document does not choose, because the choice is a product
-decision about how much rotation machinery to add.
+### 11.1 The decision: bind neither
+
+**Option 1 was chosen** (2026-08-09). §7.2 and §7.3 are specified accordingly and are implementable
+without any protocol change.
+
+What that buys, and what it does not:
+
+- **Bought.** A team wrap can no longer be moved between vaults, and the purpose byte plus distinct
+  `info` labels make the three constructions mutually unreadable — a team-DEK wrap fed to the
+  team-private reader, or to the direct reader, fails rather than being misinterpreted. That
+  cross-construction confusion was the goal that justified this family of changes.
+- **Not bought.** Generation rollback within one vault, described at the end of §7.3. The database
+  column that distinguishes generations stays unauthenticated.
+
+**Options 2 and 3 are deferred, not rejected.** Either would close the rollback gap, and each is a
+protocol change deserving its own design: option 2 adds a stored history of retired team public keys
+and a migration; option 3 changes member-add into a client-proposed, optimistically-locked write,
+which is the same shape as the fix already applied to the direct DEK axis and is therefore the
+cheaper of the two if the gap is later judged worth closing.
+
+Recording the reasoning matters more than recording the choice. If someone later reads §7.2 and
+wonders why a construction that clearly *should* bind its epoch does not, the answer is not that
+nobody thought of it: it is that the writer cannot know the value the server will assign, and
+reading it first turns adding a member into a race that silently locks that member out.
 
 ## 12. Where the two reviewers disagreed
 
@@ -400,6 +548,7 @@ after a rotation.
 non-extractable with `deriveBits` only. The fingerprint argument is correct about everything except
 whether the value can be obtained, which is the one property that matters.
 
-Recorded because the phase says not to start the next subround to hide a disagreement — and because
+Recorded rather than quietly resolved, because burying a disagreement of this kind is how the
+losing argument gets rediscovered later — and because
 the disagreement is the strongest argument for having run two independent reviews rather than one.
 Neither reviewer alone found all nine blockers, and their overlap was two.
