@@ -8542,7 +8542,12 @@ async def complete_chunked_upload(
         # through finalize's commit so a concurrent rekey can't slip in between.
         zk_kv = None
         if getattr(vault, 'type', 'standard') == 'zero_knowledge':
-            locked_vault = db.query(Vault).filter(Vault.id == vault_id).with_for_update().first()
+            # populate_existing() is what makes the lock mean anything: this session already
+            # holds the vault from the checks above, and without it the epoch compared below
+            # would be the one read before the lock -- so the rotation this guard exists to
+            # catch would sail straight past it.
+            locked_vault = (db.query(Vault).populate_existing()
+                            .filter(Vault.id == vault_id).with_for_update().first())
             current_epoch = getattr(locked_vault, 'dek_version', 1) or 1
             declared = session.zk_key_version
             # Structured detail (code) so the client can distinguish this from a generic
@@ -9238,7 +9243,8 @@ async def rename_file(
             # Vault-row lock): without this a name (re)sealed at an old epoch could land in retire's
             # scan->delete window and lose its member key -> a permanently undecryptable name.
             # Same lock order as retire + upload-complete (Vault row first) -> no deadlock.
-            locked_vault = db.query(Vault).filter(Vault.id == vault_id).with_for_update().first()
+            locked_vault = (db.query(Vault).populate_existing()
+                            .filter(Vault.id == vault_id).with_for_update().first())
             _cur = getattr(locked_vault, 'dek_version', 1) or 1
             if rename_data.name_key_version is not None and int(rename_data.name_key_version) > _cur:
                 raise HTTPException(status_code=400, detail="Folder name epoch is ahead of the vault's current key epoch.")
@@ -9398,7 +9404,8 @@ async def create_folder(
             # Vault-row lock): without this a name sealed at an old epoch could land in retire's
             # scan->delete window and lose its member key -> a permanently undecryptable name.
             # Same lock order as retire + upload-complete (Vault row first) -> no deadlock.
-            locked_vault = db.query(Vault).filter(Vault.id == vault_id).with_for_update().first()
+            locked_vault = (db.query(Vault).populate_existing()
+                            .filter(Vault.id == vault_id).with_for_update().first())
             _cur = getattr(locked_vault, 'dek_version', 1) or 1
             if zk_name_kv is not None and zk_name_kv > _cur:
                 raise HTTPException(status_code=400, detail="Folder name epoch is ahead of the vault's current key epoch.")
@@ -9605,7 +9612,8 @@ async def zk_seal_names(
     # Vault-row lock): without it a name sealed at an old epoch could land in retire's scan->delete
     # window and lose its member key -> a permanently undecryptable name. Same lock order (Vault row
     # first) as retire / rename / upload-complete -> no deadlock. Held through the commit below.
-    locked_vault = db.query(Vault).filter(Vault.id == vault_id).with_for_update().first()
+    locked_vault = (db.query(Vault).populate_existing()
+                    .filter(Vault.id == vault_id).with_for_update().first())
     # Fall back to the already-validated vault object if the row vanished between fetch and lock
     # (concurrent delete) so the epoch read keeps its original non-None semantics.
     current_epoch = getattr(locked_vault or vault, 'dek_version', 1) or 1
