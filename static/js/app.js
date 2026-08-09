@@ -7968,21 +7968,24 @@ async function zkShareVaultToUser(vaultId, userId) {
     // are about to declare -- and declaring an epoch the blob does not match is precisely
     // the failure this change exists to stop.
     const dek = await zkGetVaultDek(vaultId, keys && keys.key_version);  // may prompt once
-    const shareEpoch = keys && keys.key_version != null ? keys.key_version : 1;
+    // ONE value, used in both places below. An earlier version computed the epoch twice with
+    // different fallbacks -- 1 for the wrap, absent for the declaration -- which is two different
+    // answers to the same question on adjacent lines, and the shape of a bug where the recipient
+    // ends up holding a key labelled as something it is not.
+    const shareEpoch = keys && keys.key_version != null ? keys.key_version : null;
     const { wrappedDEK, ephemeralPublicKey } = await zkWrapDekForRecipient(
         dek, recipientPub, { vaultId, recipientUserId: userId, dekEpoch: shareEpoch });
     // Tell the server which epoch this blob wraps. Without it the server stamps whatever the
     // vault's epoch is when the request lands, so a rotation arriving in between labels our
     // old-DEK blob as the new epoch AND overwrites the correct row the rotation just wrote --
     // leaving the recipient unable to read anything written after it, with no error anywhere.
-    // `keys.key_version` is the epoch the DEK above was actually fetched at.
     await apiRequest(`/ecc/vaults/${vaultId}/members`, {
         method: 'POST',
         body: JSON.stringify({
             user_id: userId,
             wrapped_dek: wrappedDEK,
             ephemeral_public_key: ephemeralPublicKey,
-            dek_version: keys && keys.key_version != null ? keys.key_version : undefined,
+            dek_version: shareEpoch != null ? shareEpoch : undefined,
         }),
     });
 }
