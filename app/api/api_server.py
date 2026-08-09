@@ -852,6 +852,11 @@ class TempCredentialResponse(BaseModel):
 
 class VaultCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
+    # Optionally the id to create this vault under. A zero-knowledge client needs the id
+    # before it locks the vault key -- the newer lock format stamps the key with its vault,
+    # and the key travels in this same request, so waiting for the server to assign one is
+    # too late. Absent, the server assigns it as before.
+    id: Optional[uuid.UUID] = None
     description: Optional[str] = None
     password: Optional[str] = None
     expire_files_after_days: Optional[int] = Field(None, gt=0)
@@ -5856,15 +5861,46 @@ async def create_vault(
                             detail=f"Vault size must be between 1 byte and {_INT64_MAX / _GIB:.0f} GB")
     _enforce_vault_size(db, current_user, requested_size)
 
-    vault = vault_service.create_vault(
-        name=vault_create.name,
-        owner=current_user,
-        description=vault_create.description,
-        password=vault_create.password,
-        expire_files_after_days=vault_create.expire_files_after_days,
-        vault_type=vault_type,
-        size_limit=requested_size,
-    )
+    if vault_create.id is not None:
+        # Only a zero-knowledge vault has a reason to choose its own id: its key is locked
+        # before the vault exists, and the lock is stamped with the id. A Standard vault's id
+        # feeds at-rest key derivation and names a directory on disk, so there is no reason to
+        # let a caller pick it and every reason not to.
+        if vault_type != 'zero_knowledge':
+            raise HTTPException(
+                status_code=400,
+                detail="A vault id may only be supplied when creating a zero-knowledge vault.",
+            )
+        # Reject a taken id before anything is built. Note what actually guarantees uniqueness:
+        # the primary key. This check turns that constraint violation into a clear answer, and
+        # two simultaneous requests for one id still race past it -- hence the guard below.
+        if db.query(Vault.id).filter(Vault.id == vault_create.id).first():
+            raise HTTPException(status_code=409, detail="That vault id is already in use.")
+
+    try:
+        vault = vault_service.create_vault(
+            vault_id=vault_create.id,
+            name=vault_create.name,
+            owner=current_user,
+            description=vault_create.description,
+            password=vault_create.password,
+            expire_files_after_days=vault_create.expire_files_after_days,
+            vault_type=vault_type,
+            size_limit=requested_size,
+        )
+    except (ValueError, IntegrityError) as exc:
+        # Losing the race between the check above and this insert should look to a caller
+        # exactly like losing the check -- a taken id -- and not like a server fault.
+        #
+        # Narrowly, though. Key setup raises ValueError too when a deployment has no
+        # encryption key, and answering that with "id already in use" would diagnose a
+        # misconfiguration as a client mistake and hide it from error monitoring.
+        db.rollback()
+        taken = isinstance(exc, IntegrityError) or 'id already in use' in str(exc)
+        if vault_create.id is not None and taken:
+            raise HTTPException(status_code=409,
+                                detail="That vault id is already in use.") from exc
+        raise
 
     # Zero-knowledge vaults: the DEK is generated AND wrapped IN THE BROWSER to the
     # owner's own public key; the owner's wrapped copy is supplied here. The server

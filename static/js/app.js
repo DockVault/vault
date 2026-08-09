@@ -2063,9 +2063,13 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
         let zkPendingDek = null;
         if (vaultType === 'zero_knowledge') {
             try {
-                const publicKeyPem = await zkEnsurePublicKeyForCreate();
+                // Both halves come from the same response: the public key to wrap to, and the
+                // account id the server says that key belongs to. The id is needed because a
+                // version-2 lock stamps the account it was made for.
+                const identity = await zkEnsurePublicKeyForCreate();
                 const lib = eccLib();
-                const myPub = await lib.importPublicKeyPEM(publicKeyPem);
+                const myPub = await lib.importPublicKeyPEM(identity.pem);
+                const myUserId = identity.userId;
                 const dek = await lib.generateVaultDEK();
                 payload.type = 'zero_knowledge';
                 const hcb = document.getElementById('vault-hierarchical');
@@ -2083,13 +2087,26 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                     payload.wrapped_team_privkey = privWrap.wrappedKey;
                     payload.team_privkey_ephemeral_public_key = privWrap.ephemeralPublicKey;
                 } else {
-                    // Legacy writer, even when the v2 gate is on. A v2 transcript binds the
-                    // vault id, and at this point the vault does not exist yet -- the wrap is
-                    // built into the request body and the server mints the id when it lands.
-                    // Binding a value we do not have is not something to work around here; the
-                    // first rekey re-wraps every member, owner included, so a vault created
-                    // this way converts to v2 wholesale the first time it rotates.
-                    const { wrappedDEK, ephemeralPublicKey } = await lib.wrapVaultDEK(dek, myPub);
+                    // Choose the vault's id here, before locking, and send it with the
+                    // request. The newer lock stamps the key with the vault it belongs to,
+                    // and the key travels in this same request -- so waiting for the server
+                    // to assign an id would be too late to stamp anything with it.
+                    //
+                    // Choosing it is safe here for two reasons worth separating. A vault id
+                    // grants no access -- that comes from membership rows and the crypto --
+                    // and two vaults can never share one, because the server refuses a taken
+                    // id with a 409 and the primary key backs that up.
+                    //
+                    // A vault id is not inert, though. For a Standard vault it feeds at-rest
+                    // key derivation -- which is why the server accepts a chosen id only for
+                    // a zero-knowledge vault, the one kind that needs it. It also names a
+                    // directory, and that IS true of every vault including this one; what
+                    // makes it safe is that the server types the field as a UUID, so what
+                    // reaches the filesystem is always a canonical form and never a path.
+                    payload.id = zkNewObjId();
+                    const { wrappedDEK, ephemeralPublicKey } = await zkWrapDekForRecipient(
+                        dek, myPub,
+                        { vaultId: payload.id, recipientUserId: myUserId, dekEpoch: 1 });
                     payload.wrapped_dek = wrappedDEK;
                     payload.ephemeral_public_key = ephemeralPublicKey;
                 }
@@ -2108,6 +2125,14 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
         });
         // Cache the just-generated DEK (epoch 1) so the first upload needn't round-trip to
         // unwrap. zkState.vaultDeks is keyed {vaultId: {epoch: dek}} — store under epoch 1.
+        if (zkPendingDek && payload.id && created && created.id !== payload.id) {
+            // The lock was stamped with the id we chose. If the vault came back under a
+            // different one, the stamp names a vault that does not exist -- and nothing would
+            // go wrong until a reload, by which time the key is gone and the vault cannot be
+            // opened by anyone. Refuse now, while the failure is still legible.
+            throw new Error('The server created this vault under a different id; its key '
+                          + 'would not be readable. Nothing was lost -- please try again.');
+        }
         if (zkPendingDek && created && created.id) {
             zkState.vaultDeks[created.id] = { 1: zkPendingDek };
             if (payload.key_wrapping_mode === 'hierarchical') zkState.pinnedHier[created.id] = true;
@@ -7525,11 +7550,20 @@ async function zkRestoreFromRecoveryKey(kitText) {
 // An existing keypair is deliberately PUBLIC-ONLY here: vault creation mints a fresh DEK and
 // wraps it to this key, so fetching or unlocking the private identity envelope would add exposure
 // without granting any capability the operation needs. First registration remains interactive.
+// Returns { pem, userId }. The account id comes back from the same response as the key, and
+// the caller needs it: a version-2 lock stamps the account it was made for, and the only other
+// source is local session state, which this app deliberately does not trust for this (see the
+// recovery-kit writer, which refuses it for the same reason).
 async function zkEnsurePublicKeyForCreate() {
     const pub = await apiRequest('/ecc/keys/public', { silent: true });
     if (pub && pub.has_keypair) {
         if (!pub.public_key) throw new Error('Your public key is unavailable.');
-        return pub.public_key;
+        // Checked as strictly as the key. Not because an unchecked id would silently produce
+        // a bad lock -- the transcript builder rejects anything that is not a canonical uuid,
+        // so it would throw -- but because it would throw deep inside the crypto with a
+        // message about the wrong thing, when the real fault is a response missing a field.
+        if (!pub.user_id) throw new Error('Your account identity is unavailable.');
+        return { pem: pub.public_key, userId: pub.user_id };
     }
     try {
         await zkRegisterNewKeypair();
@@ -7545,7 +7579,10 @@ async function zkEnsurePublicKeyForCreate() {
     if (!registered || !registered.has_keypair || !registered.public_key) {
         throw new Error('Your registered public key is unavailable.');
     }
-    return registered.public_key;
+    // Same check as the branch above. This is the first-registration path, so leaving it off
+    // here would have meant the guard covered everyone except a brand-new user.
+    if (!registered.user_id) throw new Error('Your account identity is unavailable.');
+    return { pem: registered.public_key, userId: registered.user_id };
 }
 
 // --- Standalone "set up my encryption key" (account-level, profile menu) ------

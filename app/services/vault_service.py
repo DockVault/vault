@@ -383,7 +383,8 @@ class VaultService:
         password: Optional[str] = None,
         expire_files_after_days: Optional[int] = None,
         vault_type: str = 'standard',
-        size_limit: Optional[int] = None
+        size_limit: Optional[int] = None,
+        vault_id: Optional[uuid.UUID] = None
     ) -> Vault:
         """
         Create a new vault.
@@ -394,6 +395,10 @@ class VaultService:
             description: Optional description
             password: Optional vault password
             expire_files_after_days: Optional file expiration policy
+            vault_id: Optionally the id to create the vault under, chosen by the caller.
+                A zero-knowledge client needs the id BEFORE it locks the vault key, because
+                the newer lock format stamps the key with the vault it belongs to and the
+                key is sent in this same request. Absent, the server assigns one as before.
             
         Returns:
             Created Vault object
@@ -416,7 +421,14 @@ class VaultService:
             master_key=master_key
         )
         
+        # Belt and braces against the endpoint's own check: the id must not already belong to
+        # a vault. Two vaults sharing an id would let a key locked for one be opened as the
+        # other, which is the single property choosing your own id could otherwise cost.
+        if vault_id is not None and self.db.query(Vault.id).filter(Vault.id == vault_id).first():
+            raise ValueError("vault id already in use")
+
         vault = Vault(
+            id=vault_id or uuid.uuid4(),
             name=name,
             description=description,
             owner_id=owner.id,

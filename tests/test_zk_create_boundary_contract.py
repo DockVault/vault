@@ -36,11 +36,20 @@ def test_create_only_public_key_helper_never_unlocks_private_identity_key():
     )
 
     assert helper.count("apiRequest('/ecc/keys/public'") == 2
-    assert "return pub.public_key" in helper
     assert "await zkRegisterNewKeypair()" in helper
     assert "e.status === 409" in helper
-    assert "return registered.public_key" in helper
 
+    # Both return paths hand back the PUBLIC key and the account id that arrived with it. The
+    # helper used to return the key alone; the account id now travels with it because a version-2
+    # lock stamps the account it was made for, and the only other source is local session state,
+    # which this app does not trust for that. What matters to this contract is unchanged: the
+    # values come from the PUBLIC endpoint's response and nothing else.
+    assert "pem: pub.public_key" in helper
+    assert "pem: registered.public_key" in helper
+    assert "userId: pub.user_id" in helper
+    assert "userId: registered.user_id" in helper
+
+    # The actual boundary, untouched: this helper must never reach for the private identity key.
     assert "zkEnsureUnlocked" not in helper
     assert "/ecc/keys/private" not in helper
     assert "zkState.privateKey" not in helper
@@ -52,8 +61,11 @@ def test_create_submit_wraps_a_fresh_dek_to_the_server_public_key():
         "// Keep the password + team-mode visibility",
     )
 
-    public_lookup = "const publicKeyPem = await zkEnsurePublicKeyForCreate();"
-    public_import = "const myPub = await lib.importPublicKeyPEM(publicKeyPem);"
+    # The helper now returns { pem, userId } rather than a bare string: a version-2 lock stamps
+    # the account it was made for, and the account id arrives in the same response as the key.
+    # Only the names change here -- every ordering and every negative below is as it was.
+    public_lookup = "const identity = await zkEnsurePublicKeyForCreate();"
+    public_import = "const myPub = await lib.importPublicKeyPEM(identity.pem);"
     fresh_dek = "const dek = await lib.generateVaultDEK();"
     create_request = "const created = await apiRequest('/vaults'"
 
@@ -64,6 +76,15 @@ def test_create_submit_wraps_a_fresh_dek_to_the_server_public_key():
     assert create_flow.index(public_lookup) < create_flow.index(public_import)
     assert create_flow.index(public_import) < create_flow.index(fresh_dek)
     assert create_flow.index(fresh_dek) < create_flow.index(create_request)
+
+    # One more ordering, new with the client-chosen vault id: the id must be minted BEFORE the key
+    # is locked. The lock is stamped with it, so the other order stamps `undefined`, which throws
+    # rather than producing a bad lock -- but only once someone enables the version-2 writer, so
+    # until then this assertion is the only thing holding the order.
+    mint_id = "payload.id = zkNewObjId();"
+    stamp = "vaultId: payload.id"
+    assert mint_id in create_flow
+    assert create_flow.index(mint_id) < create_flow.index(stamp)
 
     assert "zkEnsureKeypair" not in create_flow
     assert "zkEnsureUnlocked" not in create_flow
