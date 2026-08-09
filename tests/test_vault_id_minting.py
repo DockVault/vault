@@ -139,3 +139,74 @@ def test_a_client_that_sends_no_id_is_unaffected(admin):
     finally:
         admin.put("/settings", json={"zero_knowledge_enabled": False})
     admin.delete_vault(assigned)
+
+
+@pytest.mark.integration
+def test_a_team_vault_may_also_choose_its_id(admin):
+    """Team-wrapped vaults need this more than direct ones, not less.
+
+    A direct vault created before the newer lock format converts wholesale at its first rotation,
+    because a rotation re-wraps every member. A team vault does not: sharing writes only the new
+    member's wrap, and the stored team wrap is rewritten only when someone is REVOKED. So a team
+    vault that never removes anyone would keep unstamped wraps indefinitely, and the constructions
+    that depend on the id would never be reached on it at all.
+
+    The server's gate keys on the vault TYPE, and a team vault is a zero-knowledge vault -- so this
+    already works. Pinned because the gate could plausibly be tightened to the wrapping mode by
+    someone who had only the direct path in mind.
+    """
+    import base64
+
+    chosen = uuid.uuid4()
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    try:
+        ensure_ecc_keypair(admin)
+        r = admin.post("/vaults", json={
+            "name": unique("teamid"),
+            "type": "zero_knowledge",
+            "id": str(chosen),
+            "key_wrapping_mode": "hierarchical",
+            "team_public_key": "TEAMPUB-" + uuid.uuid4().hex,
+            "team_wrapped_dek": _stub("tdek"),
+            "team_dek_ephemeral_public_key": _stub("teph"),
+            "wrapped_team_privkey": _stub("tpriv"),
+            "team_privkey_ephemeral_public_key": _stub("tpeph"),
+        })
+        assert r.status_code in (200, 201), r.text
+        assert r.json()["id"] == str(chosen), "the server did not honour the chosen id"
+    finally:
+        admin.put("/settings", json={"zero_knowledge_enabled": False})
+
+    try:
+        keys = admin.get(f"/ecc/vaults/{chosen}/keys").json()
+        assert keys["mode"] == "hierarchical", keys
+        assert keys["has_access"] is True
+    finally:
+        admin.delete_vault(str(chosen))
+
+
+@pytest.mark.unit
+def test_the_browser_chooses_the_id_for_both_wrapping_modes():
+    """Order and reach, pinned together.
+
+    The id must be chosen before ANY key is locked, and it must be chosen for both modes. Putting
+    the mint inside one branch of the mode check is the mistake this guards -- it reads correctly,
+    it passes every other test, and it leaves the team constructions permanently out of reach on a
+    vault that never revokes anyone.
+    """
+    from pathlib import Path
+    app_js = (Path(__file__).resolve().parents[1] / "static" / "js" / "app.js").read_text(
+        encoding="utf-8")
+    create = app_js.split("payload.type = 'zero_knowledge'", 1)[1].split("zkPendingDek = dek", 1)[0]
+
+    assert create.count("payload.id = zkNewObjId();") == 1, (
+        "the vault id should be chosen exactly once, above the wrapping-mode branch"
+    )
+    # Above the branch, so both modes get it.
+    assert create.index("payload.id = zkNewObjId();") < create.index("vault-hierarchical"), (
+        "the id is chosen inside or after the mode check, so one mode does not get one"
+    )
+    # And still before anything is locked.
+    assert create.index("payload.id = zkNewObjId();") < create.index("wrapVaultDEK"), (
+        "a key is locked before the id exists; the stamp would bind nothing"
+    )

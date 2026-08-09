@@ -2072,6 +2072,29 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                 const myUserId = identity.userId;
                 const dek = await lib.generateVaultDEK();
                 payload.type = 'zero_knowledge';
+
+                // Choose the vault's id here, before anything is locked, and send it with the
+                // request. A version-2 lock stamps the key with the vault it belongs to, and the
+                // key travels in this same request -- so waiting for the server to assign an id
+                // would be too late to stamp anything with it.
+                //
+                // Both wrapping modes need this, and the team mode needs it more. A direct vault
+                // created on the older format converts wholesale at its first rotation, because a
+                // rotation re-wraps every member. A team vault does not: sharing writes only the
+                // new member's wrap, and the stored team wrap is rewritten only when someone is
+                // REVOKED. A team vault that never removes anyone would otherwise keep unstamped
+                // wraps forever.
+                //
+                // Choosing it is safe, for two reasons worth separating. A vault id grants no
+                // access -- that comes from membership rows and the crypto -- and two vaults can
+                // never share one, because the server refuses a taken id and the primary key backs
+                // that up. It is not inert, though: it feeds at-rest key derivation for a Standard
+                // vault, which is why the server accepts a chosen id only for a zero-knowledge one.
+                // It also names a directory, and that is true of every vault including this one;
+                // what makes it safe is that the server types the field as a UUID, so what reaches
+                // the filesystem is always canonical and never a path.
+                payload.id = zkNewObjId();
+
                 const hcb = document.getElementById('vault-hierarchical');
                 if (hcb && hcb.checked) {
                     // HIERARCHICAL: mint a per-vault TEAM keypair, wrap the DEK to the team PUBLIC
@@ -2087,23 +2110,6 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                     payload.wrapped_team_privkey = privWrap.wrappedKey;
                     payload.team_privkey_ephemeral_public_key = privWrap.ephemeralPublicKey;
                 } else {
-                    // Choose the vault's id here, before locking, and send it with the
-                    // request. The newer lock stamps the key with the vault it belongs to,
-                    // and the key travels in this same request -- so waiting for the server
-                    // to assign an id would be too late to stamp anything with it.
-                    //
-                    // Choosing it is safe here for two reasons worth separating. A vault id
-                    // grants no access -- that comes from membership rows and the crypto --
-                    // and two vaults can never share one, because the server refuses a taken
-                    // id with a 409 and the primary key backs that up.
-                    //
-                    // A vault id is not inert, though. For a Standard vault it feeds at-rest
-                    // key derivation -- which is why the server accepts a chosen id only for
-                    // a zero-knowledge vault, the one kind that needs it. It also names a
-                    // directory, and that IS true of every vault including this one; what
-                    // makes it safe is that the server types the field as a UUID, so what
-                    // reaches the filesystem is always a canonical form and never a path.
-                    payload.id = zkNewObjId();
                     const { wrappedDEK, ephemeralPublicKey } = await zkWrapDekForRecipient(
                         dek, myPub,
                         { vaultId: payload.id, recipientUserId: myUserId, dekEpoch: 1 });
