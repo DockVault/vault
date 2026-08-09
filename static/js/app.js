@@ -8939,6 +8939,20 @@ const uploadManager = {
     // Enqueue freshly-picked File objects for the current vault/folder.
     enqueueFiles(files) {
         if (!files || !files.length || !state.currentVault) return;
+        // This path builds a queue entry with no encryption flag and no object id. The upload
+        // would not actually get far -- the server refuses a zero-knowledge upload arriving
+        // without an encrypted name -- but the request that gets refused carries the file's
+        // PLAINTEXT NAME, to a server whose whole promise is that it never sees one.
+        //
+        // Nothing calls this today. Refusing here rather than deleting it keeps the sibling
+        // paths' shape intact while making the gap impossible to reintroduce by accident: a
+        // future caller gets a loud stop rather than a leak on a path that looks fine.
+        // Throws rather than returning: a future caller has to catch this to show it, the way
+        // the sibling upload paths throw inside `run()` and render the message into the tray.
+        if (isZkVault(state.currentVault)) {
+            throw new Error('This upload path does not encrypt and cannot be used for a '
+                          + 'zero-knowledge vault.');
+        }
         const vaultId = state.currentVault.id;
         const folderId = state.currentFolderId || null;
         for (const file of files) {
@@ -9121,11 +9135,27 @@ const uploadManager = {
                 chunk_size: it.chunkSize,
                 folder_id: it.folderId,
                 zk_key_version: it.zkKeyVersion != null ? it.zkKeyVersion : null,  // ZK only
+                // The id this file's encrypted material is bound to, declared up front. The
+                // name is already sealed against it and the content will be too, so an upload
+                // that finishes under a different id produces material nothing can open.
+                // Declared here rather than only at the end because the end cannot tell a
+                // client that lost its id from one that never had one.
+                file_id: it.isZk && it.clientFileId ? it.clientFileId : null,
             }),
         });
         if (!r.ok) {
             const e = await r.json().catch(() => ({}));
-            throw new Error(typeof e.detail === 'string' ? e.detail : 'Could not start upload');
+            // Read the sentence out of a structured refusal too. Only string details were
+            // being forwarded, so a structured one arrived as 'Could not start upload' -- a
+            // generic failure in place of the one explanation that says what to do.
+            //
+            // Deliberately NOT deleting the conflicting session, unlike the stale-key recovery
+            // below: there the buffered ciphertext is provably unsalvageable, whereas this
+            // session may be the same file still uploading from another device, and discarding
+            // it would silently throw that progress away.
+            const d = e.detail;
+            throw new Error(typeof d === 'string' ? d
+                : (d && d.message) || 'Could not start upload');
         }
         const data = await r.json();
         it.sessionId = data.session_id;
@@ -9270,8 +9300,14 @@ const uploadManager = {
             this.render();
             // ZK v2: send the client-generated file id the name was sealed under, so the server
             // uses it as the row id and the stored name binds the final row (anti-transposition).
-            // Standard uploads (and any legacy ZK item without a client id) stay bodyless — the
-            // server assigns the id.
+            // A zero-knowledge upload without an object id cannot be completed safely: its
+            // name is sealed against an id, and the server would assign a different one. That
+            // state is reachable -- a queued upload stored before this field existed comes
+            // back without it -- so stop rather than finish it into something unopenable.
+            if (it.isZk && !it.clientFileId) {
+                throw new Error('This upload was prepared by an older version and cannot be '
+                              + 'completed. Nothing was lost -- please add the file again.');
+            }
             const zkComplete = it.isZk && it.clientFileId;
             const c = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}/complete`, {
                 method: 'POST',

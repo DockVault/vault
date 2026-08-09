@@ -1305,6 +1305,16 @@ class ChunkedUploadSession(Base):
     # Destination folder (persisted so a resumed session targets the right place)
     folder_id = Column(UUID(as_uuid=True), nullable=True)
 
+    # The object id the client says it encrypted against, declared when the upload starts.
+    # Deliberately NOT the file_id column below: that one holds the finished File's id and
+    # has a foreign key to it, so it cannot carry an id whose row does not exist yet.
+    #
+    # Declared at the start because the end is too late to judge. At completion the server
+    # cannot distinguish a client that lost its id from an older one that never sent any, so
+    # it can refuse neither without breaking the other. Recorded here, the two are different
+    # sessions and only one of them is wrong.
+    client_object_id = Column(UUID(as_uuid=True), nullable=True)
+
     # Zero-knowledge upload only: the DEK epoch the client encrypted this file under
     # (declared at init). At finalize we reject (409) if it no longer matches the vault's
     # current dek_version — i.e. the vault was re-keyed mid-upload — so a stale-epoch file
@@ -1322,7 +1332,10 @@ class ChunkedUploadSession(Base):
     status = Column(String(20), default='active')  # active, completed, failed, expired
     error_message = Column(Text, nullable=True)
     
-    # Final file ID after completion
+    # Intended to hold the finished File's id, and nothing has ever written it -- the completion
+    # path returns the file rather than recording it here. Kept because its foreign key is the
+    # reason it cannot serve as the declared-id column above: it can only hold an id that
+    # already has a row.
     file_id = Column(UUID(as_uuid=True), ForeignKey('files.id', ondelete='SET NULL'), nullable=True)
     
     # Relationships

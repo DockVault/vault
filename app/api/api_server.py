@@ -8122,6 +8122,9 @@ class ChunkedUploadInit(BaseModel):
     # finalize, where it is re-checked against the vault's current epoch under a row lock
     # (a mid-upload rotation => 409) and stamped onto the File. Omitted for Standard vaults.
     zk_key_version: Optional[int] = None
+    # The object id the client will encrypt against. Optional, so a client that does not send
+    # one keeps the old behaviour; supplied, the completion must match it.
+    file_id: Optional[uuid.UUID] = None
     # Zero-knowledge only: the file name + MIME encrypted IN THE BROWSER under the vault
     # DEK (security ZK marker + base64) and the client-computed blind index for same-name
     # matching. Required for ZK uploads; rejected for Standard ones. The server stores them
@@ -8230,6 +8233,29 @@ async def init_chunked_upload(
         resume_q = resume_q.filter(ChunkedUploadSession.filename == body.file_name)
     session = resume_q.order_by(ChunkedUploadSession.created_at.desc()).first()
 
+    if session is not None and body.file_id != session.client_object_id:
+        # This session's buffered chunks, and its stored encrypted name, belong to the id it
+        # was opened with. Resuming under a different one would assemble a file out of two
+        # encryptions and commit it under an id its name is not sealed against -- an entry
+        # whose name can never be opened again.
+        #
+        # Both sides absent compares equal, so an unencrypted upload and an older client that
+        # never declares anything keep their existing behaviour untouched. Every disagreement
+        # is refused here, before a byte is re-sent, rather than at the end: silently keeping
+        # the session's own id meant the caller re-uploaded the whole file to be told no, and
+        # each attempt pushed the session's expiry out by another TTL.
+        #
+        # The session id travels with the refusal because it is the only handle on the thing
+        # the caller has to discard, and it is the caller's own session -- the resume query
+        # above is filtered to this user, and the list endpoint already returns strictly more
+        # about it.
+        raise HTTPException(status_code=409, detail={
+            "code": "object_id_mismatch",
+            "session_id": str(session.id),
+            "message": ("An upload of this file is already in progress under a different "
+                        "object id. Cancel it and start again."),
+        })
+
     if session is None:
         # bound concurrent open sessions per user so N half-open sessions can't buffer
         # N*total_size of transient disk that the plan storage quota never counts. Resuming an
@@ -8259,6 +8285,7 @@ async def init_chunked_upload(
             chunks_received=0,
             bytes_received=0,
             folder_id=folder_uuid,
+            client_object_id=body.file_id,
             created_at=now,
             last_chunk_at=now,
             expires_at=now + timedelta(hours=_chunk_session_ttl_hours()),
@@ -8433,6 +8460,8 @@ async def complete_chunked_upload(
         raise HTTPException(status_code=404, detail="Upload session not found")
     # A scoped credential may only finalize a session whose target folder is in scope.
     require_folder_scope(db, current_user, vault_id, session.folder_id)
+    # Unreachable: nothing writes `file_id` (see the column), and a session is deleted once it
+    # completes. Left in place rather than removed with an unrelated change.
     if session.status == 'completed' and session.file_id:
         return {'id': str(session.file_id), 'name': session.filename, 'already_completed': True}
     if session.status != 'active':
@@ -8494,6 +8523,23 @@ async def complete_chunked_upload(
             client_file_id = uuid.UUID(str(_cbody["file_id"]))
     except Exception:  # noqa: BLE001 — no/invalid body -> server assigns the id
         client_file_id = None
+    # A session that declared an id at the start must finish with that id. Silently substituting
+    # a different one is the failure this whole mechanism exists to prevent: the client encrypted
+    # against what it declared, so anything else produces material that will not open.
+    declared_object_id = session.client_object_id
+    if declared_object_id is not None:
+        if client_file_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail=("This upload declared an object id when it started and must supply the "
+                        "same one to finish. Encrypted material is bound to it."),
+            )
+        if client_file_id != declared_object_id:
+            raise HTTPException(
+                status_code=400,
+                detail=("The object id supplied does not match the one this upload declared when "
+                        "it started."),
+            )
     if client_file_id is not None and db.query(File.id).filter(File.id == client_file_id).first():
         raise HTTPException(status_code=409, detail="File id already in use")
 
@@ -10514,6 +10560,7 @@ def _run_lightweight_migrations():
             # client-declared epoch through to finalize for the upload-vs-rekey race check.
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS dek_version INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS zk_key_version INTEGER",
+            "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS client_object_id UUID",
             # Backfill any legacy NULL/0 per-vault size_limit to the 1 GB default: such a vault
             # reserves nothing in the account budget SUM yet is treated as UNLIMITED at every upload
             # guard (`if vault.size_limit`), so the reservation model would under-count it. Idempotent.
