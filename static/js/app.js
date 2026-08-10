@@ -2101,8 +2101,10 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                     // key, and wrap the team PRIVATE key to the owner. The server holds only public
                     // keys + opaque wraps; it never sees the DEK or the team private key.
                     const teamKp = await lib.generateKeypair();
-                    const dekWrap = await lib.wrapVaultDEK(dek, teamKp.publicKey);
-                    const privWrap = await lib.wrapPrivateKeyToPublic(teamKp.privateKey, myPub);
+                    const dekWrap = await zkWrapTeamDek(dek, teamKp.publicKey,
+                        { vaultId: payload.id, dekEpoch: 1 });
+                    const privWrap = await zkWrapTeamPrivateKey(teamKp.privateKey, myPub,
+                        { vaultId: payload.id, recipientUserId: myUserId });
                     payload.key_wrapping_mode = 'hierarchical';
                     payload.team_public_key = await lib.exportPublicKeyPEM(teamKp.publicKey);
                     payload.team_wrapped_dek = dekWrap.wrappedDEK;
@@ -7780,8 +7782,13 @@ async function zkGetVaultDek(vaultId, keyVersion = null) {
     if (keys.wrapped_team_privkey && keys.team_ephemeral_public_key) {
         zkState.pinnedHier[vaultId] = true;  // pin: this vault is hierarchical
         const teamPriv = await zkGetTeamPrivKey(
-            vaultId, keys.team_key_version, keys.wrapped_team_privkey, keys.team_ephemeral_public_key);
-        dek = await eccLib().unwrapVaultDEK(keys.wrapped_dek, keys.ephemeral_public_key, teamPriv);
+            vaultId, keys.team_key_version, keys.wrapped_team_privkey,
+            keys.team_ephemeral_public_key, keys.recipient_user_id);
+        // teamMode says which purpose this caller will accept. The payload's own byte never
+        // gets to choose; it is compared against this and rejected if it disagrees.
+        dek = await eccLib().unwrapVaultDEK(
+            keys.wrapped_dek, keys.ephemeral_public_key, teamPriv,
+            { vaultId, dekEpoch: version, teamMode: true });
     } else {
         // Downgrade defense: a vault we have seen as hierarchical must never be served a DIRECT
         // key. Refuse loudly rather than fall through (the direct unwrap would fail closed anyway).
@@ -7805,12 +7812,17 @@ async function zkGetVaultDek(vaultId, keyVersion = null) {
 // Unwrap (and cache) a hierarchical vault's TEAM PRIVATE key at a given team epoch. The wrapped
 // blob + its ephemeral come from the /keys response (no extra fetch). Cached per (vault, team
 // epoch); the runtime key is non-extractable. Cleared on logout via zkResetKeys.
-async function zkGetTeamPrivKey(vaultId, teamEpoch, wrappedTeamPrivkey, teamEphemeralPublicKey) {
+async function zkGetTeamPrivKey(vaultId, teamEpoch, wrappedTeamPrivkey, teamEphemeralPublicKey,
+                                recipientUserId) {
     const perVault = zkState.teamKeys[vaultId] || (zkState.teamKeys[vaultId] = {});
     if (teamEpoch != null && perVault[teamEpoch]) return perVault[teamEpoch];
     const priv = await zkEnsureUnlocked();
+    // The account this wrap was made for. It has to come from the caller: this function is
+    // handed the vault, the epoch and the two blobs, and an absent id would be encoded as
+    // nothing rather than refused -- a wrap that authenticates against nothing.
     const teamPriv = await eccLib().unwrapPrivateKeyFromWrapped(
-        wrappedTeamPrivkey, teamEphemeralPublicKey, priv, false);
+        wrappedTeamPrivkey, teamEphemeralPublicKey, priv, false,
+        { vaultId, recipientUserId });
     if (teamEpoch != null) perVault[teamEpoch] = teamPriv;
     return teamPriv;
 }
@@ -7956,9 +7968,22 @@ async function zkSealLegacyNames(vault, items) {
     } catch (_) { /* best effort; retried on the next vault open */ }
 }
 
-// Share a zero-knowledge vault with another user: unwrap the DEK locally, re-wrap
-// it to THEIR public key in the browser, and store the wrapped copy. The server
-// never sees the DEK. Throws if the recipient hasn't set up an encryption key.
+// The ONE place that decides which format to write for a DEK wrapped to a TEAM key.
+async function zkWrapTeamDek(dek, teamPub, transcript) {
+    const lib = eccLib();
+    return lib.ZK_WRAP_WRITE_V2
+        ? lib.wrapTeamDEKV2(dek, teamPub, transcript)
+        : lib.wrapVaultDEK(dek, teamPub);
+}
+
+// And for the team PRIVATE key wrapped to one member.
+async function zkWrapTeamPrivateKey(teamPriv, recipientPub, transcript) {
+    const lib = eccLib();
+    return lib.ZK_WRAP_WRITE_V2
+        ? lib.wrapTeamPrivateKeyV2(teamPriv, recipientPub, transcript)
+        : lib.wrapPrivateKeyToPublic(teamPriv, recipientPub);
+}
+
 // The ONE place that decides which DEK-wrap format to write.
 //
 // A single choke point rather than the gate being consulted at each call site: a third write
@@ -7972,6 +7997,9 @@ async function zkWrapDekForRecipient(dek, recipientPub, transcript) {
         : lib.wrapVaultDEK(dek, recipientPub);
 }
 
+// Share a zero-knowledge vault with another user: unwrap the DEK locally, re-wrap
+// it to THEIR public key in the browser, and store the wrapped copy. The server
+// never sees the DEK. Throws if the recipient hasn't set up an encryption key.
 async function zkShareVaultToUser(vaultId, userId) {
     const pk = await apiRequest(`/ecc/users/${userId}/public-key`, { silent: true });
     if (!pk || !pk.has_keypair || !pk.public_key) {
@@ -7996,9 +8024,14 @@ async function zkShareVaultToUser(vaultId, userId) {
         // touched, it stays wrapped to the team public key). Unwrap an EXTRACTABLE copy just to
         // re-wrap it; never cache the extractable form.
         const myPriv = await zkEnsureUnlocked();
+        // Two different accounts, three lines apart. The read opens a wrap made for ME, so it
+        // names my account; the write makes one for the person being shared with, so it names
+        // theirs. Swapping them fails as an authentication error that looks like tampering.
         const teamPriv = await eccLib().unwrapPrivateKeyFromWrapped(
-            keys.wrapped_team_privkey, keys.team_ephemeral_public_key, myPriv, true);
-        const { wrappedKey, ephemeralPublicKey } = await eccLib().wrapPrivateKeyToPublic(teamPriv, recipientPub);
+            keys.wrapped_team_privkey, keys.team_ephemeral_public_key, myPriv, true,
+            { vaultId, recipientUserId: keys.recipient_user_id });
+        const { wrappedKey, ephemeralPublicKey } = await zkWrapTeamPrivateKey(
+            teamPriv, recipientPub, { vaultId, recipientUserId: userId });
         await apiRequest(`/ecc/vaults/${vaultId}/members`, {
             method: 'POST',
             body: JSON.stringify({ user_id: userId, wrapped_team_privkey: wrappedKey, team_ephemeral_public_key: ephemeralPublicKey }),
@@ -8136,7 +8169,8 @@ async function zkRotateTeamForRevoke(vaultId, revokedUserId, info, fromVersion) 
     const remaining = (info.members || []).filter(uid => String(uid) !== String(revokedUserId));
     const teamKp = await ecc.generateKeypair();         // new team keypair (browser-only)
     const newDek = await ecc.generateVaultDEK();         // new DEK (browser-only)
-    const dekWrap = await ecc.wrapVaultDEK(newDek, teamKp.publicKey);  // DEK -> new team pubkey
+    const dekWrap = await zkWrapTeamDek(newDek, teamKp.publicKey,      // DEK -> new team pubkey
+        { vaultId, dekEpoch: fromVersion + 1 });
     const memberKeys = [];
     for (const uid of remaining) {
         const pk = await apiRequest(`/ecc/users/${uid}/public-key`, { silent: true });
@@ -8144,7 +8178,8 @@ async function zkRotateTeamForRevoke(vaultId, revokedUserId, info, fromVersion) 
             throw new Error('A remaining member has no encryption key; cannot rotate the team key.');
         }
         const recipientPub = await ecc.importPublicKeyPEM(pk.public_key);
-        const { wrappedKey, ephemeralPublicKey } = await ecc.wrapPrivateKeyToPublic(teamKp.privateKey, recipientPub);
+        const { wrappedKey, ephemeralPublicKey } = await zkWrapTeamPrivateKey(
+            teamKp.privateKey, recipientPub, { vaultId, recipientUserId: uid });
         memberKeys.push({ user_id: uid, wrapped_dek: wrappedKey, ephemeral_public_key: ephemeralPublicKey });
     }
     const teamPubPem = await ecc.exportPublicKeyPEM(teamKp.publicKey);

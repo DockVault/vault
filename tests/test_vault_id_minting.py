@@ -206,7 +206,10 @@ def test_the_browser_chooses_the_id_for_both_wrapping_modes():
     assert create.index("payload.id = zkNewObjId();") < create.index("vault-hierarchical"), (
         "the id is chosen inside or after the mode check, so one mode does not get one"
     )
-    # And still before anything is locked.
-    assert create.index("payload.id = zkNewObjId();") < create.index("wrapVaultDEK"), (
+    # And still before anything is locked. Both modes now reach their writer through a choke
+    # point, so anchor on whichever comes first rather than on a writer name that may move.
+    first_wrap = min(create.index(name) for name in
+                     ("zkWrapDekForRecipient(", "zkWrapTeamDek(") if name in create)
+    assert create.index("payload.id = zkNewObjId();") < first_wrap, (
         "a key is locked before the id exists; the stamp would bind nothing"
     )
