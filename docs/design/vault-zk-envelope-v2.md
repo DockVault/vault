@@ -42,10 +42,16 @@ anyone holding the DEK, with no authenticated statement of length, ordering or c
 **In:** the byte grammar for direct DEK wraps, team-private wraps, team-DEK wraps, and chunk-framed
 content; how a reader tells v2 from legacy; what a reader does with anything else.
 
-**Out:** transport, authorization, and `zk2:` object-bound names, which stay as they are. Streaming
-and memory behaviour are deliberately left to later work, which must emit and consume
-**byte-identical** v2 envelopes —
-a constraint that decided §7.4's shape.
+**Out:** authorization, and `zk2:` object-bound names, which stay as they are. Streaming and memory
+behaviour are deliberately left to later work, which must emit and consume **byte-identical** v2
+envelopes — a constraint that decided §7.4's shape.
+
+**Transport was originally out too, and §7.4 pulled part of it back in.** Content framing cannot be
+specified without it: the fields its key derivation binds are chosen when an upload session opens,
+and the party that decides whether a new upload resumes an existing one is the server, not the
+writer. So §7.4 imposes three requirements on the upload protocol — `object_id`, `dek_epoch` and
+`blob_id` declared at session open and compared on resume — and nothing beyond those three. Chunk
+sizes, retry behaviour, expiry and everything else about transport remain out of scope.
 
 **Not a migration.** Existing envelopes are never rewritten. There is no server-side conversion,
 because the server cannot read any of this and a migration that could damage opaque bytes is a
@@ -397,6 +403,47 @@ upload, so without it two attempts at the same object derive the *same* key with
 making chunks from two attempts freely interchangeable, both authenticating. A continued resume
 keeps its `blob_id`; a restarted upload gets a new one. Cost: 16 bytes per file.
 
+`blob_id` is **16 raw bytes** wherever it appears — in the `file_header`, in the `info`, and in the
+AAD. §4.1's "never raw 16-byte form" rule governs **UUIDs**, and `blob_id` is not one: it is opaque
+random bytes with no textual form, and the `file_header` is fixed-width. An implementer who reaches
+for the UUID encoder here produces a 48-byte header and a format nobody else can read.
+
+**A writer that mints a new `blob_id` MUST open a fresh upload session and MUST NOT inherit any
+previously received **transport** chunk set.** This is normative and it is the rule the whole
+construction rests on. "Transport chunk" here means an upload-session chunk as the server buffers
+and indexes it, which this document elsewhere distinguishes from a crypto chunk — the two need not
+be the same size, and this rule is about the former. The obvious "let the user re-pick the file and carry on" implementation violates it: it keeps
+`object_id` — which it must, because the name is sealed against it — mints a new `blob_id` because
+it is a new encryption, and then adopts the buffered transport indices the server reports. The result is a
+file whose header names one attempt's key and whose early chunks were encrypted under another's.
+Nothing on the write path notices, and the reader cannot repair it.
+
+Enforcing that at the writer alone is not enough, because the *server* decides whether a new upload
+resumes an existing session, and it matches on fields that are identical across two independent
+encryptions of the same plaintext. The server MUST therefore treat `blob_id` as an opaque
+per-attempt token: it is declared when the session opens, stored, and compared on any resume, and a
+mismatch is refused before a byte is accepted. The server never derives anything from the value and
+never needs to understand it.
+
+Store it as **16 opaque bytes** — a `BYTEA(16)` column, or fixed-width hex text. The warning above
+about the UUID encoder applies to the schema as much as to the header: the nearest precedent for a
+declared-at-init token is a `UUID` column, which round-trips as hyphenated text and reintroduces
+exactly the width the fixed header cannot carry.
+
+**Determining `final` is the reader's problem, and it is not a wire field.** `final` is an AAD
+input, so a reader must decide which interpretation to use *before* it can authenticate anything.
+It MUST derive that from the stored length using the closed form above — computing `total_chunks`
+up front and treating index `total_chunks - 1` as final. A reader always has `L`, so this is
+always available to it, whatever the writer did.
+
+A consumer reading a stream whose total length is genuinely not yet known — a proxy relaying a
+producer's output — instead holds **one chunk of lookahead**: buffer `28 + chunk_size` bytes, and
+treat a chunk as final exactly when no byte follows it. Note that a final chunk with `r =
+chunk_size` is full-width and is still final; length alone does not mark it.
+
+**Trial decryption under both interpretations is forbidden.** It is not a confidentiality hole, but it doubles the work on every final chunk and
+leaves a normative document with two acceptable behaviours where it needs one.
+
 **Totals appear only in the final chunk's AAD.** The first draft put them in every chunk for early
 truncation detection, which was the wrong trade: it forced the writer to know the length before
 chunk zero, which forecloses a future streaming producer, and it left the *reader* with no specified
@@ -404,6 +451,15 @@ source for two AAD inputs it needs before decrypting anything. Truncation is sti
 truncated stream simply ends with no chunk that carries totals, and the reader rejects it. An
 attacker cannot forge a final chunk at position `k` because the real final chunk's AAD binds
 `index = n-1`.
+
+**No plaintext may be released to a consumer until the chunk carrying `final = 1` has
+authenticated.** What this construction provides is prefix integrity plus an authenticated
+end-of-stream marker, which is *not* all-or-nothing integrity: every chunk of a truncated file
+authenticates, and only the absence of the terminator reveals the truncation. A reader that hands
+bytes onward as each chunk authenticates has therefore already delivered attacker-chosen-length
+output by the time it detects the problem. Today's whole-file reader satisfies this by accident,
+because it buffers; the streaming reader this grammar exists to enable does not, and must hold or
+mark its output until the terminator is in.
 
 **Framing rules, all normative:**
 
@@ -415,19 +471,88 @@ attacker cannot forge a final chunk at position `k` because the real final chunk
   file is one chunk, and `ceil(0/n)` is 0.
 - A zero-length final chunk is **forbidden except for the empty file**, so a file whose length is an
   exact multiple of `chunk_size` has exactly one valid encoding. Without this, deterministic vectors
-  are not deterministic.
-- A file of length ≤ 28 (header plus an empty chunk's overhead) is rejected; "no chunks" is always
-  an error, never an empty file.
+  are not deterministic. This binds the **reader** as well as the writer: a reader that encounters a
+  zero-length final chunk on a non-empty file MUST reject it rather than treat it as a harmless
+  terminator. Read as a writer-only constraint it would leave two encodings acceptable on the read
+  side, which is the ambiguity the rule exists to remove.
+- The smallest valid file is **56 bytes**: the 28-byte `file_header`, plus one empty chunk's
+  12-byte nonce and 16-byte tag. Anything shorter is rejected — "no chunks" is always an error,
+  never an empty file. (An earlier draft said 28, which is the header *alone*; that would admit a
+  30-byte input which cannot be valid under any reading.)
+- **Parsing a file of stored length `L` is closed-form**, given `chunk_size` from the header. Each
+  non-final chunk occupies `28 + chunk_size` stored bytes and the final one occupies `28 + r` with
+  `1 ≤ r ≤ chunk_size` (or `r = 0`, only for the empty file):
+
+  ```
+  total_chunks     = ceil((L - 28) / (28 + chunk_size))
+  total_plaintext  = L - 28 - 28 * total_chunks
+  ```
+
+  Both hold at the boundaries — the empty file (`L = 56`, one chunk, zero plaintext) and a length
+  that is an exact multiple of `chunk_size`. What makes them exact is that per-chunk overhead is
+  **strictly positive**, so `L` cannot be ambiguous between two chunk counts; the zero-length-final
+  rule earns its place in encoding determinism, not here.
+- **The closed form has a domain, and a reader MUST check it.** Between the valid lengths for `n`
+  chunks and for `n + 1` sits a 28-byte-wide gap that no valid file can occupy, and the formulae
+  answer confidently for those inputs — `L = 4153` at `chunk_size = 4096` yields `2, 4069`, whose
+  implied final chunk is one byte, shorter than a nonce and tag together. Derive the final chunk's
+  plaintext length and reject unless it is in range:
+
+  ```
+  r = total_plaintext - (total_chunks - 1) * chunk_size
+  valid iff (1 <= r <= chunk_size) or (r == 0 and total_chunks == 1)
+  ```
+
+  Check `L >= 56` first, or `L = 28` derives a self-consistent-looking `0, 0`.
+- **The totals are not on the wire, and there is nothing to cross-check them against.**
+  `total_chunks` and `total_plaintext` appear only in the final chunk's AAD, which is *supplied* by
+  the reader, never parsed from storage. A reader derives them from `L`, feeds them to the AAD, and
+  a disagreement with what the writer used surfaces as an **authentication failure on the final
+  chunk** — which MUST be fatal. An implementer who reads this expecting a stored field will not
+  find one.
 - Nonces are random per chunk, never index-derived: a resumed writer re-encrypting a chunk under the
   same derived key would otherwise reuse a nonce, which leaks the keystream and enables GCM
-  authentication-key recovery. ~2³² chunks is the collision bound for a 96-bit random nonce, and the
-  4 KiB floor puts that beyond 16 TiB in one object.
+  authentication-key recovery. **2³² invocations is the NIST SP 800-38D §8.3 cap for randomly
+  generated 96-bit nonces**, chosen so the probability of IV reuse stays under the 2⁻³² ceiling §8
+  mandates — it is not the point at which that probability is reached (at 2³² the figure is nearer
+  2⁻³³), and it is not the birthday point, which is near 2⁴⁸. The limit is the conservative one and is the one to size against; an implementer who
+  reads "the collision bound" and sizes something else off it is out by 2¹⁶. The count is **per
+  derived key** — SP 800-38D counts "all instances of the authenticated encryption function with
+  the given key" — so a resumed writer that re-encrypts chunks it already sent spends from the same
+  budget. Passes under a *different* `blob_id` derive a different key and start a fresh one. The 4 KiB floor puts 2³² chunks
+  beyond 16 TiB in one object.
 
-**`object_id` availability.** The client-minted file id is threaded end to end and is the id the
-server adopts. But the server currently **swallows a malformed completion body and assigns its own
-id instead** — for names that costs a name, for content it would cost the file. Making that
-fallback an error for zero-knowledge uploads is a **precondition for the content work**, not an implementation
-detail.
+**Encodings for this construction.** Integers are unsigned big-endian: `chunk_size` **4 bytes**,
+`index` 8, `total_chunks` 8, `total_plaintext` 8, and `dek_epoch` 4 per §4.1. `final` is one byte,
+`0x00` or `0x01` — a writer MUST emit no other value, and test vectors MUST NOT contain one. Note
+that `final`, `index` and the totals are AAD inputs and never appear on the wire, so "accepted" here
+constrains writers and vectors, not a parser. `vault_id` and `object_id` follow §4.1's 36-byte
+textual UUID form; `blob_id` does not, per the rule above.
+
+`chunk_size` is the first **4-byte non-epoch integer** in this family. §4.1 says "4 bytes for every
+epoch field, 8 bytes where stated" and did not anticipate one; this clause is the statement, and an
+implementer working from §4.1 alone would encode it as 8.
+
+**`object_id` and `dek_epoch` availability.** Both are bound into the key derivation and into every
+AAD, so a session that does not know them cannot produce readable bytes — and for content, unlike
+for a name, getting one wrong costs the whole file rather than its label.
+
+It is not sufficient that the completion fallback becomes an error. Both fields MUST be **required
+when the upload session opens**, for zero-knowledge uploads, and both MUST be compared on any
+resume. A server that accepts a session declaring neither still has to guess at commit time, and a
+server that accepts a *second* session declaring neither will hand the second attempt the first
+attempt's buffered chunks — the two are indistinguishable to a matcher that keys on the blind index,
+total size and chunk count, all of which are identical across two encryptions of the same plaintext.
+These are **preconditions for the content work**, not implementation details.
+
+They are **complementary to** the `blob_id` comparison above, not the same requirement one field
+over, and it is worth being exact about which one does what. `object_id` is deliberately *stable*
+across attempts at the same object — the name is sealed against it — so requiring and comparing it
+cannot distinguish two attempts: both declare the same value. **Only `blob_id` separates attempts.**
+What requiring `object_id` and `dek_epoch` at session open buys is different and also necessary: it
+removes the server's need to guess at commit time, and it closes the case where one party declares a
+field and the other does not, which at completion is indistinguishable from an older client that
+never declared anything at all.
 
 ## 8. What is deliberately not bound
 
@@ -459,8 +584,22 @@ version, purpose, reserved, nonce, tag, and for content the index, final flag an
 content: empty, one chunk, partial final chunk, reorder, duplicate, drop, truncate, append, and a
 cross-attempt splice attempt defeated by `blob_id`.
 
+**For content specifically, §7.4 creates seven further obligations**, each of which is a rule a
+reader can get wrong while still decrypting ordinary files correctly — which is what makes them
+worth enumerating rather than leaving to the prose that states them:
+
+- a zero-length final chunk on a non-empty file is rejected;
+- a stored length below 56, and a length in the 28-byte gap between two valid chunk counts, are
+  both rejected before any decryption is attempted;
+- no plaintext reaches a consumer before the chunk carrying `final = 1` has authenticated;
+- `final` is decided from the stored length, never by trial decryption under both interpretations;
+- a resume declaring a different `blob_id` is refused by the server before a byte is accepted;
+- `object_id` and `dek_epoch` are required when the upload session opens, not only at completion;
+- `final` is `0x00` or `0x01` in every emitted vector.
+
 **Missing baseline:** there is no pinned legacy fixture for the **team-DEK** wrap. §10 and §9 both
-presuppose one. It must be captured as a baseline fixture before anything changes.
+presuppose one. It was not captured before the team wraps shipped, so it is now a debt to settle
+rather than a gate that held.
 
 ## 10. Rollout
 
@@ -482,10 +621,21 @@ mechanism is the one the private-key envelope actually uses, which should be nam
 alluded to: a source constant, off by default, pinned false by a test, with a single choke-point
 writer, and operator documentation at the point of enabling.
 
-Order: amend the error contract (§6.5) → widen the server's algorithm filters (§6.4) → direct
-wraps → content → team wraps. The first two have landed. The direct writer exists but is gated
-off and the canonical algorithm label is still generation 1, so no v2 row has been written yet;
-content and team wraps follow in that order once it has.
+Order, as planned: amend the error contract (§6.5) → widen the server's algorithm filters (§6.4)
+→ direct wraps → content → team wraps.
+
+**What actually shipped took the team wraps before content, and content has not shipped at all** —
+recorded so a later reader does not infer from the list that it has. The error contract, the
+algorithm filters, the direct wrap and both team wraps are in. Every writer is gated off and the
+canonical algorithm label is still generation 1, so nothing in this tree can write a v2 row.
+
+One obligation went unmet on the way: §9 requires the team-DEK wrap's legacy form to be captured as
+a baseline fixture *before anything changes*, and the team wraps shipped without one. That is a
+team-wrap debt rather than a content gate, but it should not be discovered by inference later.
+
+Content is therefore the remaining construction, and it carries preconditions the wraps did not
+(§7.4): the object id, the DEK epoch and the per-attempt `blob_id` must each be declared when the
+upload session opens and compared on resume. Those land before any content byte is written.
 
 ## 11. Why the team wraps bind so little
 
