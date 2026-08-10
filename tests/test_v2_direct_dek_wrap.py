@@ -81,7 +81,7 @@ def test_the_v2_writer_is_off_in_source():
 
 
 def test_the_writer_is_a_new_method_not_a_change_to_the_shared_one():
-    """The legacy helper also writes hierarchical team-DEK wraps, whose grammar is still blocked.
+    """The legacy helper also writes the hierarchical team-DEK wraps every existing vault holds.
 
     Editing it would move bytes on a path this change must leave byte-identical, so the writer
     has to be separate. Pinned because the separation is invisible once the diff is old.
@@ -262,7 +262,7 @@ def test_a_payload_of_neither_length_is_malformed_rather_than_damaged():
 
 
 def test_the_other_v2_purposes_stay_unreadable():
-    """Team wraps are blocked and content is a different reader; both must still say "unsupported".
+    """This reader opens one purpose. The others have their own readers, and it must refuse them.
 
     An older build meeting a format it cannot read should send someone to the update notes, not to
     a backup -- and a build that can read ONE purpose must not start implying it can read four.
@@ -356,5 +356,7 @@ def test_both_gated_write_sites_pass_a_complete_transcript():
         f"writes -- but found {len(calls)}:\n  " + "\n  ".join(calls))
     for call in calls:
         assert "vaultId" in call, f"transcript site missing the vault: {call}"
-    # And exactly one place decides the format, so a fourth write site inherits the decision.
-    assert source.count("lib.ZK_WRAP_WRITE_V2") == 1
+    # One choke point per construction -- direct, team DEK, team private -- so a new write
+    # site inherits the decision rather than having to remember it. `test_v2_team_wraps`
+    # names them individually; this only pins that the count has not grown by accident.
+    assert source.count("lib.ZK_WRAP_WRITE_V2") == 3
