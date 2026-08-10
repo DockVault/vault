@@ -835,6 +835,10 @@ def test_zero_knowledge_upload_resumes_across_reload(page: Page, admin):
 
         # The resumed upload finishes and the file lands.
         f_item = None
+        # Read the rehydrated record BEFORE the resume completes and prunes it.
+        restored_blob_id = page.evaluate(
+            "async (sid) => { const r = await zkUploadStore.get(sid); return r && r.blobId; }", sid)
+
         for _ in range(60):
             items = owner.get(f"/vaults/{vid}/files").json()["items"]
             hit = [it for it in items if it["type"] == "file"]  # ZK name is server-opaque
@@ -843,6 +847,15 @@ def test_zero_knowledge_upload_resumes_across_reload(page: Page, admin):
                 break
             page.wait_for_timeout(500)
         assert f_item, "resumed ZK upload never completed after reload"
+
+        # The attempt token had to survive the same IndexedDB round trip as the object id, or the
+        # resume could not have happened at all -- the server refuses a resume that re-declares a
+        # different one, and refuses one that declares none. Checked against the tray item the
+        # rehydrated page built, which is the value that was actually re-sent.
+        assert setup["blobId"], "the setup never minted a token, so the check below is vacuous"
+        assert restored_blob_id == setup["blobId"], (
+            f"the attempt token did not survive the reload: {restored_blob_id!r} != "
+            f"{setup['blobId']!r} -- the resume would have been refused")
         fid = f_item["id"]
 
         # The resumed upload completed under the SAME client id the name was sealed with (v2),
@@ -865,6 +878,123 @@ def test_zero_knowledge_upload_resumes_across_reload(page: Page, admin):
         # On completion the saved ciphertext is dropped from IndexedDB (no dead blob left).
         left = page.evaluate("async (sid) => await zkUploadStore.get(sid)", sid)
         assert left is None, "completed ZK upload left its ciphertext in IndexedDB"
+
+    finally:
+        if vid:
+            owner.delete_vault(vid)
+        admin.delete_user(user["id"])
+        admin.put("/settings", json={"zero_knowledge_enabled": False})
+
+
+@pytest.mark.ui
+def test_a_blocked_encrypted_upload_offers_both_ways_out(page: Page, admin):
+    """A second encryption of the same file must produce a row the user can act on.
+
+    The first version of this shipped a recovery flow that never rendered: `run()`'s catch set the
+    status to 'error' unconditionally, overwriting the one this path sets, so the message told the
+    user to resume or discard while drawing neither control -- and the Resume that WAS drawn
+    re-ran the same refused request forever. Nothing tested it, which is how it got that far.
+
+    Both controls matter and they are not interchangeable. Discarding deletes the buffered
+    ciphertext, which for an encrypted upload is the only copy of those bytes.
+    """
+    from conftest import ApiClient
+
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    user = admin.create_user(role="admin")
+    owner = ApiClient()
+    owner.login(user["_username"], user["_password"])
+    vid = None
+    fname = _u("blocked") + ".txt"
+    try:
+        _login(page, user["_username"], user["_password"])
+        vid = _create_zk_vault_via_ui(page, owner, "zk-blocked-pass-1")
+        page.wait_for_selector(f'.open-vault-btn[data-vault-id="{vid}"]', timeout=10000)
+        page.click(f'.open-vault-btn[data-vault-id="{vid}"]')
+        expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
+        out = page.evaluate(
+            """async ({ vid, fname }) => {
+                const kv = await zkGetCurrentDekVersion(vid);
+                const dek = await zkGetVaultDek(vid, kv);
+
+                const nameBi = await eccLib().nameBlindIndex(fname, dek, vid, kv);
+                const cipher = new Uint8Array(await eccLib().encryptFile(
+                    new TextEncoder().encode('BLOCKED ' + fname).buffer, dek));
+
+                // An earlier attempt still IN FLIGHT -- session open, no chunks sent, not
+                // completed. A finished upload deletes its session, so there would be nothing
+                // left to conflict with and the second attempt would simply succeed.
+                const firstId = zkNewObjId();
+                const firstInit = await fetch(`${API_BASE}/vaults/${vid}/uploads`, {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + authToken,
+                               'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        total_size: cipher.byteLength, total_chunks: 1, chunk_size: 1 << 20,
+                        folder_id: null, zk_key_version: kv,
+                        enc_name: await eccLib().encryptName(fname, dek, vid, 'name', kv, firstId),
+                        enc_mime: await eccLib().encryptName('text/plain', dek, vid, 'mime', kv, firstId),
+                        name_bi: nameBi, file_id: firstId, blob_id: zkNewBlobId(),
+                    }),
+                });
+                const firstSession = (await firstInit.json()).session_id;
+
+                // Now the same file, encrypted again: a fresh object id and a fresh attempt token,
+                // exactly what re-adding it to the tray produces. Everything the server matches a
+                // resume on is identical, because it is all deterministic for the same file.
+                const clientFileId = zkNewObjId();
+                const blobId = zkNewBlobId();
+                const second = uploadManager._newId();
+                uploadManager.items.set(second, {
+                    id: second, file: new File([cipher], fname, { type: 'text/plain' }),
+                    vaultId: vid, folderId: null, fileName: fname,
+                    totalSize: cipher.byteLength, totalChunks: 1, chunkSize: 1 << 20,
+                    sessionId: null, received: new Set(),
+                    status: 'queued', error: null, paused: false, cancelled: false,
+                    zkKeyVersion: kv, isZk: true,
+                    encName: await eccLib().encryptName(fname, dek, vid, 'name', kv, clientFileId),
+                    encMime: await eccLib().encryptName('text/plain', dek, vid, 'mime', kv, clientFileId),
+                    nameBi, clientFileId, blobId,
+                });
+                await uploadManager.run(second);
+
+                const it = uploadManager.items.get(second);
+                const row = document.querySelector(`[data-up-row="${second}"]`);
+                const actions = row
+                    ? [...row.querySelectorAll('button[data-up-action]')]
+                          .map(b => b.getAttribute('data-up-action'))
+                    : [];
+                return {
+                    status: it.status,
+                    error: it.error,
+                    conflictSessionId: it.conflictSessionId,
+                    actions,
+                    text: row ? row.innerText : '',
+                    firstSession, firstInitOk: firstInit.status,
+                };
+            }""",
+            {"vid": vid, "fname": fname},
+        )
+
+        assert out["firstInitOk"] in (200, 201), out
+        assert out["conflictSessionId"] == out["firstSession"], (
+            "the blocked row points at the wrong session")
+        assert out["status"] == "conflict", (
+            f"a refused second encryption was not marked as blocked (status={out['status']}, "
+            f"error={out['error']}) -- the recovery controls only render for 'conflict'")
+        assert out["conflictSessionId"], "the blocked row does not know which session blocks it"
+        # Both ways out are present, and the non-destructive one is offered.
+        assert "conflict-resume" in out["actions"], (
+            f"no way to resume the earlier attempt: {out['actions']}")
+        assert "conflict-discard" in out["actions"], (
+            f"no way to discard the earlier attempt: {out['actions']}")
+        # The row explains both options. (The 'Blocked' status label belongs to the ordinary
+        # progress sub-line, which a blocked row replaces with this explanation.)
+        assert "Resume" in out["text"] and "discard" in out["text"].lower(), out["text"]
+        assert "cannot be undone" in out["text"], (
+            f"the row does not warn that discarding is irreversible: {out['text']!r}")
+        # And the copy must not point at cancelling, which deletes the only copy of the bytes.
+        assert "cancel" not in (out["error"] or "").lower(), out["error"]
     finally:
         if vid:
             owner.delete_vault(vid)
@@ -892,6 +1022,9 @@ def _zk_start_partial_upload(page: Page, vid: str, fname: str, marker: str,
             // exactly as the live uploader does; never send the plaintext. The id is persisted with
             // the ciphertext so a resume can complete under the same id the name was sealed under.
             const clientFileId = zkNewObjId();
+            // Which encryption attempt these bytes are from. Persisted with the ciphertext so a
+            // resume re-declares the same one -- the server refuses a resume that does not.
+            const blobId = zkNewBlobId();
             const encName = await eccLib().encryptName(fname, dek, vid, 'name', kv, clientFileId);
             const encMime = await eccLib().encryptName('text/plain', dek, vid, 'mime', kv, clientFileId);
             const nameBi = await eccLib().nameBlindIndex(fname, dek, vid, kv);
@@ -901,7 +1034,8 @@ def _zk_start_partial_upload(page: Page, vid: str, fname: str, marker: str,
                 body: JSON.stringify({ total_size: total,
                     total_chunks: totalChunks, chunk_size: chunkSize,
                     folder_id: null, zk_key_version: kv,
-                    enc_name: encName, enc_mime: encMime, name_bi: nameBi }),
+                    enc_name: encName, enc_mime: encMime, name_bi: nameBi,
+                    file_id: clientFileId, blob_id: blobId }),
             });
             const sid = (await initRes.json()).session_id;
             await fetch(`${API_BASE}/vaults/${vid}/uploads/${sid}/chunks/0`, {
@@ -912,10 +1046,10 @@ def _zk_start_partial_upload(page: Page, vid: str, fname: str, marker: str,
                 await zkUploadStore.put({ sessionId: sid, vaultId: vid, fileName: fname,
                     totalSize: total, mimeType: 'text/plain', folderId: null, keyVersion: kv,
                     totalChunks, chunkSize, blob: new Blob([cipher], { type: 'text/plain' }),
-                    encName, encMime, nameBi, clientFileId, createdAt: Date.now() });
+                    encName, encMime, nameBi, clientFileId, blobId, createdAt: Date.now() });
             }
             let bin = ''; for (const b of cipher) bin += String.fromCharCode(b);
-            return { sid, totalChunks, cipherB64: btoa(bin), clientFileId,
+            return { sid, totalChunks, cipherB64: btoa(bin), clientFileId, blobId,
                      plainText: new TextDecoder().decode(plain) };
         }""",
         {"vid": vid, "fname": fname, "marker": marker, "chunkSize": chunk_size, "persist": persist},
@@ -997,10 +1131,25 @@ def test_zero_knowledge_upload_init_persists_client_file_id(page: Page, admin):
                 const kv = await zkGetCurrentDekVersion(vid);
                 const dek = await zkGetVaultDek(vid, kv);
                 // Build the item exactly as the ZK seal loop + enqueueNamed do: a client-generated
-                // id, and a name/MIME SEALED bound to it (v2).
+                // id, a per-attempt token, and a name/MIME SEALED bound to the id (v2).
                 const clientFileId = zkNewObjId();
+                const blobId = zkNewBlobId();
                 const cipher = new Uint8Array(await eccLib().encryptFile(
                     new TextEncoder().encode('INIT-PERSIST ' + fname + ' ').buffer, dek));
+                // Watch the wire. Persisting the right value proves nothing on its own -- the
+                // record is written from the same object the request is built from, so a client
+                // that SENT something else would still persist correctly and pass.
+                let sentBlob = null, sentFileId = null;
+                const realFetch = window.fetch;
+                window.fetch = async (url, opts) => {
+                    if (String(url).endsWith('/uploads') && opts && opts.method === 'POST') {
+                        try {
+                            const b = JSON.parse(opts.body);
+                            sentBlob = b.blob_id; sentFileId = b.file_id;
+                        } catch (_) { /* not ours */ }
+                    }
+                    return realFetch(url, opts);
+                };
                 const it = {
                     id: uploadManager._newId(), file: new File([cipher], fname, { type: 'text/plain' }),
                     vaultId: vid, folderId: null, fileName: fname,
@@ -1011,26 +1160,40 @@ def test_zero_knowledge_upload_init_persists_client_file_id(page: Page, admin):
                     encName: await eccLib().encryptName(fname, dek, vid, 'name', kv, clientFileId),
                     encMime: await eccLib().encryptName('text/plain', dek, vid, 'mime', kv, clientFileId),
                     nameBi: await eccLib().nameBlindIndex(fname, dek, vid, kv),
-                    clientFileId,
+                    clientFileId, blobId,
                 };
                 // Drive the PRODUCTION persist path: _init starts the server session and writes the
                 // resume record to IndexedDB (the line a resume depends on).
                 await uploadManager._init(it);
                 const rec = await zkUploadStore.get(it.sessionId);
                 // Clean up: abandon the server session + drop the record (we never complete it).
+                window.fetch = realFetch;
                 try {
                     await fetch(`${API_BASE}/vaults/${vid}/uploads/${it.sessionId}`,
                         { method: 'DELETE', headers: { 'Authorization': 'Bearer ' + authToken } });
                 } catch (_) { /* best effort */ }
                 await zkUploadStore.delete(it.sessionId);
                 return { expected: clientFileId, persisted: rec && rec.clientFileId,
-                         encName: rec && rec.encName };
+                         encName: rec && rec.encName,
+                         expectedBlob: blobId, persistedBlob: rec && rec.blobId,
+                         sentBlob, sentFileId };
             }""",
             {"vid": vid, "fname": fname},
         )
         assert out["persisted"] == out["expected"], (
             "_init did not persist clientFileId to IndexedDB — a resumed UI upload would complete "
             "under a fresh id and the v2 name would be undecryptable")
+        # The attempt token, on the wire and in storage. The server refuses a resume that declares
+        # a different one, so a client that minted a fresh token per request, or persisted none,
+        # would strand every interrupted encrypted upload. Both of those passed before this.
+        assert out["expectedBlob"], "the item carried no attempt token, so the checks below are vacuous"
+        assert out["sentBlob"] == out["expectedBlob"], (
+            f"_init sent attempt token {out['sentBlob']!r}, not the item's {out['expectedBlob']!r} "
+            "— a resume would re-declare a value the session never saw and be refused")
+        assert out["sentFileId"] == out["expected"], (
+            f"_init sent object id {out['sentFileId']!r}, not the item's {out['expected']!r}")
+        assert out["persistedBlob"] == out["expectedBlob"], (
+            "_init did not persist the attempt token — a resumed upload could not re-declare it")
         assert (out["encName"] or "").startswith("zk2:"), "the persisted resume record holds a non-v2 name"
     finally:
         if vid:
@@ -1252,6 +1415,7 @@ def test_zero_knowledge_upload_quota_fallback_completes_and_warns(page: Page, ad
                 const plain = enc.encode(('QUOTA-FALLBACK ' + fname + ' ').repeat(25));
                 const cipher = new Uint8Array(await eccLib().encryptFile(plain.buffer, dek));
                 const clientFileId = zkNewObjId();
+                const blobId = zkNewBlobId();
                 const encName = await eccLib().encryptName(fname, dek, vid, 'name', kv, clientFileId);
                 const encMime = await eccLib().encryptName('text/plain', dek, vid, 'mime', kv, clientFileId);
                 const nameBi = await eccLib().nameBlindIndex(fname, dek, vid, kv);
@@ -1272,7 +1436,7 @@ def test_zero_knowledge_upload_quota_fallback_completes_and_warns(page: Page, ad
                     totalChunks: Math.ceil(cipher.byteLength / chunkSize), chunkSize,
                     sessionId: null, received: new Set(),
                     status: 'queued', error: null, paused: false, cancelled: false,
-                    zkKeyVersion: kv, isZk: true, encName, encMime, nameBi, clientFileId };
+                    zkKeyVersion: kv, isZk: true, encName, encMime, nameBi, clientFileId, blobId };
                 uploadManager.items.set(id, it);
                 try {
                     await uploadManager.run(id);   // resolves when the upload finishes/fails
@@ -1286,7 +1450,7 @@ def test_zero_knowledge_upload_quota_fallback_completes_and_warns(page: Page, ad
                 return { status: it.status, error: it.error, warned,
                          resumeWarning: it.resumeWarning, resumePersisted: it.resumePersisted,
                          putCalls, sid: it.sessionId, persistedRec: rec, cipherB64: btoa(bin),
-                         clientFileId };
+                         clientFileId, blobId };
             }""",
             {"vid": vid, "fname": fname},
         )

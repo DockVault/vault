@@ -220,25 +220,53 @@ def test_member_keys_lists_targets_without_blobs(admin, temp_user, temp_user_cli
 
 # --- upload-vs-rekey race -----------------------------------------------------
 
-def _zk_chunked_upload(client, vid, content: bytes, zk_key_version=None, expect_status=200):
+def _db(sql: str) -> str:
+    """Run SQL against the vault DB via docker exec; skip if docker/psql is unavailable."""
+    import os as _os
+    import subprocess
+    container = _os.environ.get("VAULT_DB_CONTAINER", "vault-db")
+    try:
+        proc = subprocess.run(
+            ["docker", "exec", container, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc", sql],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        pytest.skip(f"docker/psql unavailable: {exc}")
+    assert proc.returncode == 0, f"psql failed: {proc.stderr}"
+    return proc.stdout.strip()
+
+
+def _zk_chunked_upload(client, vid, content: bytes, zk_key_version=None, expect_status=200,
+                       expect_init_status=None):
     """Drive a single-chunk resumable upload, declaring the ZK DEK epoch. Returns the new
     file id on success; on a non-200 'complete' returns the Response for assertions. The name
-    is encrypted client-side (these tests don't decrypt it — they assert the content epoch)."""
+    is encrypted client-side (these tests don't decrypt it — they assert the content epoch).
+
+    An encrypted upload must declare its object id, epoch and attempt token at session open, so
+    this always sends the first and last. Pass `expect_init_status` to assert on the INIT response
+    instead of driving the upload — that is how the epoch-omitted case is exercised now."""
     import os
+    import uuid as _uuid
     dek = os.urandom(32)
     name_epoch = zk_key_version if zk_key_version is not None else 1
     name = unique("zk") + ".bin"
     init = {"total_size": len(content), "total_chunks": 1, "chunk_size": 5 * 1024 * 1024,
             "enc_name": zk_encrypt_name(name, dek, vid, "name", name_epoch),
-            "name_bi": zk_name_blind_index(name, dek, vid, name_epoch)}
+            "name_bi": zk_name_blind_index(name, dek, vid, name_epoch),
+            "file_id": str(_uuid.uuid4()),
+            "blob_id": _uuid.uuid4().hex}
     if zk_key_version is not None:
         init["zk_key_version"] = zk_key_version
     r = client.post(f"/vaults/{vid}/uploads", json=init)
+    if expect_init_status is not None:
+        assert r.status_code == expect_init_status, r.text
+        return r
     r.raise_for_status()
     sid = r.json()["session_id"]
     client.put(f"/vaults/{vid}/uploads/{sid}/chunks/0", data=content,
                headers={"Content-Type": "application/octet-stream"})
-    c = client.post(f"/vaults/{vid}/uploads/{sid}/complete")
+    c = client.post(f"/vaults/{vid}/uploads/{sid}/complete",
+                    json={"file_id": init["file_id"]})
     if expect_status == 200:
         assert c.status_code == 200, c.text
         return c.json()["id"]
@@ -468,10 +496,18 @@ def test_grant_member_key_requires_manager_not_just_a_key(admin, temp_user, temp
         admin.delete_vault(vid)
 
 
-def test_epochless_upload_after_rotation_is_rejected(admin):
-    """SECURITY (review should-fix): after a rotation, a legacy/epoch-less ZK upload (no
-    declared epoch) must be REJECTED (409) — accepting it would stamp the file at the new
-    epoch while it was encrypted under the old DEK, making it undecryptable."""
+def test_epochless_upload_is_refused_before_a_byte_is_sent(admin):
+    """An encrypted upload that does not say which key epoch it used is refused AT SESSION OPEN.
+
+    It used to be accepted, uploaded in full, and refused at completion — correct, but the caller
+    paid for the whole transfer to find out, and the server had everything it needed to say so at
+    the door. The refusal also moves from 409 to 400: nothing conflicts, the request is simply
+    incomplete.
+
+    The completion-time guard is NOT dead and is covered separately below. A session opened before
+    this requirement existed still carries a NULL epoch into completion, and that is the case it
+    exists for.
+    """
     ensure_ecc_keypair(admin)
     with _zk_enabled(admin):
         vid = create_zk_vault(admin)["id"]
@@ -480,11 +516,52 @@ def test_epochless_upload_after_rotation_is_rejected(admin):
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [_mk(admin.user["id"])],
         }).raise_for_status()
-        # No zk_key_version declared on a rekeyed (epoch 2) vault -> 409.
-        c = _zk_chunked_upload(admin, vid, b"epochless", zk_key_version=None, expect_status=409)
+        r = _zk_chunked_upload(admin, vid, b"epochless", zk_key_version=None,
+                               expect_init_status=400)
+        assert "zk_key_version" in r.text, r.text
+    finally:
+        admin.delete_vault(vid)
+
+
+def test_a_session_opened_without_an_epoch_is_still_refused_at_completion(admin):
+    """The rollout path, and the reason the completion guard stays.
+
+    A session opened before the epoch became mandatory carries a NULL epoch to completion, where
+    the vault may since have been rekeyed. Committing it would stamp the file at the CURRENT epoch
+    while its bytes were encrypted under the old DEK — unreadable, and readable by nobody the
+    rotation was meant to exclude either. Simulated by clearing the column, which is exactly the
+    state such a session is in.
+    """
+    import uuid as _uuid
+    ensure_ecc_keypair(admin)
+    with _zk_enabled(admin):
+        vid = create_zk_vault(admin)["id"]
+    try:
+        import os
+        dek = os.urandom(32)
+        name = unique("zk") + ".bin"
+        fid = str(_uuid.uuid4())
+        r = admin.post(f"/vaults/{vid}/uploads", json={
+            "total_size": 9, "total_chunks": 1, "chunk_size": 5 * 1024 * 1024,
+            "enc_name": zk_encrypt_name(name, dek, vid, "name", 1),
+            "name_bi": zk_name_blind_index(name, dek, vid, 1),
+            "zk_key_version": 1, "file_id": fid, "blob_id": _uuid.uuid4().hex,
+        })
+        r.raise_for_status()
+        sid = r.json()["session_id"]
+        admin.put(f"/vaults/{vid}/uploads/{sid}/chunks/0", data=b"epochless",
+                  headers={"Content-Type": "application/octet-stream"})
+
+        # Put the session into the state a pre-requirement client would have left it in.
+        _db(f"UPDATE chunked_upload_sessions SET zk_key_version = NULL WHERE id = '{sid}'")
+        admin.post(f"/ecc/vaults/{vid}/rekey", json={
+            "from_version": 1, "to_version": 2, "revoke_user_id": None,
+            "member_keys": [_mk(admin.user["id"])],
+        }).raise_for_status()
+
+        c = admin.post(f"/vaults/{vid}/uploads/{sid}/complete", json={"file_id": fid})
         assert c.status_code == 409, c.text
-        body = c.json()
-        assert isinstance(body.get("detail"), dict) and body["detail"].get("code") == "stale_zk_epoch", body
+        assert c.json()["detail"]["code"] == "stale_zk_epoch", c.text
     finally:
         admin.delete_vault(vid)
 

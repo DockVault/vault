@@ -33,6 +33,7 @@ def _init(admin, vault_id, **extra):
     return admin.post(f"/vaults/{vault_id}/uploads", json=body)
 
 
+_UNSET = object()   # "not specified" -- distinct from an explicit None, which means "omit it"
 _BI = uuid.uuid4().hex
 
 
@@ -56,8 +57,12 @@ def zk_vault(admin):
     admin.delete_vault(vid)
 
 
-def _zk_init(admin, vault_id, file_id, name_bi):
-    """An encrypted upload declares a blind index instead of a name; that is what pairs a resume."""
+def _zk_init(admin, vault_id, file_id, name_bi, blob_id=_UNSET, epoch=1):
+    """An encrypted upload declares a blind index instead of a name; that is what pairs a resume.
+
+    `file_id`, `blob_id` and the epoch are all sent by default because the server now requires all
+    three. Pass `None` for any of them to exercise the refusal.
+    """
     import base64
 
     body = {
@@ -65,10 +70,14 @@ def _zk_init(admin, vault_id, file_id, name_bi):
         "enc_name": "zk2:" + base64.b64encode(b"sealed-name").decode(),
         "enc_mime": "zk2:" + base64.b64encode(b"sealed-mime").decode(),
         "name_bi": name_bi,
-        "zk_key_version": 1,
     }
+    if epoch is not None:
+        body["zk_key_version"] = epoch
     if file_id is not None:
         body["file_id"] = str(file_id)
+    token = uuid.uuid4().hex if blob_id is _UNSET else blob_id
+    if token is not None:
+        body["blob_id"] = token
     return admin.post(f"/vaults/{vault_id}/uploads", json=body)
 
 
@@ -266,6 +275,7 @@ def test_an_encrypted_upload_is_protected_too(admin):
             "name_bi": uuid.uuid4().hex,
             "zk_key_version": 1,
             "file_id": str(declared),
+            "blob_id": uuid.uuid4().hex,
         })
         assert r.status_code in (200, 201), r.text
         sid = r.json()["session_id"]
@@ -324,60 +334,171 @@ def test_an_encrypted_resume_that_changes_the_object_id_is_refused(admin, zk_vau
     encrypted uploads passed all of them -- the same blind spot as the completion check had,
     reappearing in the code written to close it.
     """
-    first = uuid.uuid4()
-    r = _zk_init(admin, zk_vault, first, name_bi=_BI)
+    first, token = uuid.uuid4(), uuid.uuid4().hex
+    r = _zk_init(admin, zk_vault, first, name_bi=_BI, blob_id=token)
     assert r.status_code in (200, 201), r.text
     session_one = r.json()["session_id"]
 
-    again = _zk_init(admin, zk_vault, uuid.uuid4(), name_bi=_BI)
+    # The attempt token is held EQUAL on purpose. It is checked first, so letting it differ here
+    # would refuse the request for the other reason and this test would prove nothing about object
+    # ids. In practice a second encryption differs in both; this pins the inner guard.
+    again = _zk_init(admin, zk_vault, uuid.uuid4(), name_bi=_BI, blob_id=token)
     assert again.status_code == 409, (
         f"an encrypted resume adopted a different object id: {again.status_code} {again.text}"
     )
-    assert again.json()["detail"]["code"] == "object_id_mismatch"
+    assert again.json()["detail"]["code"] == "object_id_mismatch", again.text
 
-    same = _zk_init(admin, zk_vault, first, name_bi=_BI)
+    same = _zk_init(admin, zk_vault, first, name_bi=_BI, blob_id=token)
     assert same.status_code in (200, 201), same.text
     assert same.json()["session_id"] == session_one
 
 
 @pytest.mark.integration
-def test_a_declared_upload_may_not_adopt_a_session_that_declared_nothing(admin, zk_vault):
-    """The hole the first version of the resume rule left open, and the one it is named after.
+def test_an_encrypted_upload_must_declare_what_its_bytes_are_bound_to(admin, zk_vault):
+    """The hole, at its source.
 
-    That version only compared the two ids when BOTH sides had one, so a client that declares an id
-    could resume a session opened by a client that did not. The server keeps the ORIGINAL session's
-    sealed name and commits the row under the NEW id -- a stored name that will never open again.
-    Reproduced end to end against a running vault: the stored name decrypts under the first id and
-    fails under the second.
+    Comparing the declared values only separated two uploads when both of them declared. Neither
+    had to: the encrypted branch required an encrypted name and a blind index and asked for nothing
+    else, so two independent encryptions of the same file could each declare nothing, compare equal,
+    and share one session. The second then skipped the chunks the first had sent and the stored
+    object was a splice of the two -- committed with a 200, and unopenable forever.
 
-    Comparing the ids directly, present or absent, closes this and its mirror at once.
+    Reproduced against a running server before the fix. Now every field an encrypted upload binds
+    its material to is required when the session opens.
     """
-    bi = uuid.uuid4().hex
-
-    legacy = _zk_init(admin, zk_vault, None, name_bi=bi)
-    assert legacy.status_code in (200, 201), legacy.text
-
-    adopt = _zk_init(admin, zk_vault, uuid.uuid4(), name_bi=bi)
-    assert adopt.status_code == 409, (
-        f"a declared upload adopted an undeclared session's chunks and sealed name: "
-        f"{adopt.status_code} {adopt.text}"
-    )
+    for omitted, field in ((dict(file_id=None), "file_id"),
+                           (dict(blob_id=None), "blob_id"),
+                           (dict(epoch=None), "zk_key_version")):
+        kwargs = dict(file_id=uuid.uuid4(), name_bi=uuid.uuid4().hex)
+        kwargs.update(omitted)
+        r = _zk_init(admin, zk_vault, **kwargs)
+        assert r.status_code == 400, (
+            f"an encrypted upload opened a session without declaring {field}: "
+            f"{r.status_code} {r.text}"
+        )
+        assert field in r.text, r.text
 
 
 @pytest.mark.integration
-def test_an_undeclared_resume_of_a_declared_upload_is_refused_at_the_start(admin, zk_vault):
-    """The mirror, refused at the start rather than after the whole re-upload.
+def test_two_encryptions_of_one_file_cannot_share_a_session(admin, zk_vault):
+    """The case the object id cannot catch, and the reason there is a second token.
 
-    This direction was accepted and then failed at completion -- verbatim the cost the refusal was
-    written to remove, still being paid in the other direction.
+    A resumed upload keeps its object id -- it must, because the file's name is sealed against it
+    -- so two attempts at the same object can legitimately declare the same one. Only a value
+    minted per encryption separates them. Here both attempts declare the SAME object id, exactly as
+    a client that re-picked the same file would, and they are still kept apart.
     """
-    bi = uuid.uuid4().hex
+    obj, bi = uuid.uuid4(), uuid.uuid4().hex
 
-    declared = _zk_init(admin, zk_vault, uuid.uuid4(), name_bi=bi)
-    assert declared.status_code in (200, 201), declared.text
+    one = _zk_init(admin, zk_vault, obj, name_bi=bi, blob_id=uuid.uuid4().hex)
+    assert one.status_code in (200, 201), one.text
 
-    undeclared = _zk_init(admin, zk_vault, None, name_bi=bi)
-    assert undeclared.status_code == 409, (
-        f"an undeclared resume was accepted and would have been refused only at the end: "
-        f"{undeclared.status_code} {undeclared.text}"
+    two = _zk_init(admin, zk_vault, obj, name_bi=bi, blob_id=uuid.uuid4().hex)
+    assert two.status_code == 409, (
+        f"a second encryption inherited the first attempt's session: {two.status_code} {two.text}"
     )
+    assert two.json()["detail"]["code"] == "upload_attempt_mismatch", two.text
+    # The caller is given the handle it needs, and is NOT told to cancel: for an encrypted upload
+    # the buffered ciphertext is the only copy of those bytes.
+    detail = two.json()["detail"]
+    assert detail["session_id"] == one.json()["session_id"]
+    assert "cancel" not in detail["message"].lower(), detail["message"]
+
+
+@pytest.mark.integration
+def test_a_short_delivery_is_refused_instead_of_stored(admin, zk_vault):
+    """Every other size check on this path is a one-sided upper bound.
+
+    A session that declared more bytes than it delivered was assembled and committed without
+    complaint. Whole-file encryption made that loud on the first read; chunk framing would make it
+    quiet until the very end, because every chunk that did arrive authenticates and only the
+    missing terminator reveals the truncation. The server knows at commit time.
+    """
+    declared = uuid.uuid4()
+    r = _zk_init(admin, zk_vault, declared, name_bi=uuid.uuid4().hex)
+    assert r.status_code in (200, 201), r.text
+    sid = r.json()["session_id"]
+
+    # One chunk, short of the 11 bytes the session declared.
+    assert admin.put(f"/vaults/{zk_vault}/uploads/{sid}/chunks/0",
+                     data=b"short").status_code in (200, 201)
+
+    done = admin.post(f"/vaults/{zk_vault}/uploads/{sid}/complete",
+                      json={"file_id": str(declared)})
+    assert done.status_code == 409, (
+        f"a truncated upload was stored: {done.status_code} {done.text}"
+    )
+    assert done.json()["detail"]["code"] == "size_mismatch", done.text
+
+
+@pytest.mark.integration
+def test_a_short_delivery_is_refused_on_an_ordinary_vault_too(admin, std_vault):
+    """The same truncation, on the vault type the first version of this check excluded.
+
+    That version was scoped to encrypted vaults on the reasoning that a standard vault's codec
+    expands the data, so a declared-vs-assembled comparison would refuse every upload. It does not:
+    the size counted is the RAW input handed to the codec, before any header or expansion, so the
+    identity holds for both. Deleting the scope entirely passed every test in the suite, which is
+    how the wrong reasoning survived -- nothing here had ever declared more than it sent.
+    """
+    r = _init(admin, std_vault)
+    assert r.status_code in (200, 201), r.text
+    sid = r.json()["session_id"]
+
+    # Declares 11 bytes (see _init), sends 5.
+    assert admin.put(f"/vaults/{std_vault}/uploads/{sid}/chunks/0",
+                     data=b"short").status_code in (200, 201)
+
+    done = admin.post(f"/vaults/{std_vault}/uploads/{sid}/complete")
+    assert done.status_code == 409, (
+        f"a truncated standard upload was stored: {done.status_code} {done.text}"
+    )
+    assert done.json()["detail"]["code"] == "size_mismatch", done.text
+
+
+@pytest.mark.integration
+def test_an_ordinary_upload_may_not_carry_the_encrypted_upload_fields(admin, std_vault):
+    """Accepting them was not harmless.
+
+    A standard session opened while carrying an attempt token then refused every ordinary re-init
+    of that same file -- the plain client sends no token, so the comparison never matched again --
+    for the whole session lifetime. The encrypted branch already rejects the fields belonging to
+    the other kind of upload; this is the missing half of that symmetry.
+
+    `file_id` stays allowed: a plain upload may legitimately choose its own id.
+    """
+    for field, value in (("blob_id", uuid.uuid4().hex), ("zk_key_version", 1)):
+        r = _init(admin, std_vault, **{field: value})
+        assert r.status_code == 400, (
+            f"a standard upload was accepted carrying {field}: {r.status_code} {r.text}"
+        )
+        assert field in r.text, r.text
+
+    # The one that is allowed, so this test cannot pass by refusing everything.
+    ok = _init(admin, std_vault, file_id=str(uuid.uuid4()))
+    assert ok.status_code in (200, 201), ok.text
+
+
+@pytest.mark.integration
+def test_a_resume_after_a_rekey_is_refused(admin, zk_vault):
+    """The third arm of the comparison, which nothing exercised.
+
+    Deleting it outright left every test green. It catches an attempt encrypted after a rekey
+    meeting a session opened before one: same object, same token, different key. Committing that
+    would stamp the file at an epoch its bytes were not encrypted under.
+    """
+    obj, token, bi = uuid.uuid4(), uuid.uuid4().hex, uuid.uuid4().hex
+
+    one = _zk_init(admin, zk_vault, obj, name_bi=bi, blob_id=token, epoch=1)
+    assert one.status_code in (200, 201), one.text
+
+    two = _zk_init(admin, zk_vault, obj, name_bi=bi, blob_id=token, epoch=2)
+    assert two.status_code == 409, (
+        f"a resume declaring a different key epoch was accepted: {two.status_code} {two.text}"
+    )
+    assert two.json()["detail"]["code"] == "key_epoch_mismatch", two.text
+
+    # And the original epoch still resumes, so this refuses a conflict rather than everything.
+    same = _zk_init(admin, zk_vault, obj, name_bi=bi, blob_id=token, epoch=1)
+    assert same.status_code in (200, 201), same.text
+    assert same.json()["session_id"] == one.json()["session_id"]

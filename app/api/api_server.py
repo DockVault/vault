@@ -8122,9 +8122,14 @@ class ChunkedUploadInit(BaseModel):
     # finalize, where it is re-checked against the vault's current epoch under a row lock
     # (a mid-upload rotation => 409) and stamped onto the File. Omitted for Standard vaults.
     zk_key_version: Optional[int] = None
-    # The object id the client will encrypt against. Optional, so a client that does not send
-    # one keeps the old behaviour; supplied, the completion must match it.
+    # The object id the client will encrypt against. REQUIRED for a zero-knowledge upload (see
+    # the check below); optional here so a Standard upload, which binds nothing to it, is
+    # unaffected.
     file_id: Optional[uuid.UUID] = None
+    # Zero-knowledge only: 32 lowercase hex characters naming this ENCRYPTION ATTEMPT. Required
+    # for a zero-knowledge upload. The server never interprets the value -- it compares it, so
+    # that a second encryption of the same file cannot inherit the first's buffered chunks.
+    blob_id: Optional[str] = Field(None, pattern=r'^[0-9a-f]{32}$')
     # Zero-knowledge only: the file name + MIME encrypted IN THE BROWSER under the vault
     # DEK (security ZK marker + base64) and the client-computed blind index for same-name
     # matching. Required for ZK uploads; rejected for Standard ones. The server stores them
@@ -8186,6 +8191,16 @@ async def init_chunked_upload(
         # Standard (non-ZK) uploads carry a plaintext name — enforce the admin file-type allowlist.
         # ZK names are browser-encrypted (server-invisible), so ZK vaults are exempt.
         _enforce_file_type(body.file_name, _allowed_exts)
+        # And it must not carry the fields that only mean something for an encrypted upload,
+        # mirroring the guard above. Accepting them was not harmless: a Standard session
+        # opened with an attempt token then refused every ordinary re-init of that same file,
+        # for the whole session lifetime, because the plain client sends none. `file_id` is
+        # deliberately still allowed -- a plain upload may choose its own id.
+        if body.blob_id is not None or body.zk_key_version is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="An upload to a standard vault must not send blob_id or zk_key_version.",
+            )
 
     if body.total_size > _max_file_bytes:
         raise HTTPException(status_code=413, detail=f"File exceeds maximum size of {_max_file_bytes // (1024 * 1024)}MB")
@@ -8233,30 +8248,84 @@ async def init_chunked_upload(
         resume_q = resume_q.filter(ChunkedUploadSession.filename == body.file_name)
     session = resume_q.order_by(ChunkedUploadSession.created_at.desc()).first()
 
-    if session is not None and body.file_id != session.client_object_id:
-        # This session's buffered chunks, and its stored encrypted name, belong to the id it
-        # was opened with. Resuming under a different one would assemble a file out of two
-        # encryptions and commit it under an id its name is not sealed against -- an entry
-        # whose name can never be opened again.
-        #
-        # Both sides absent compares equal, so an unencrypted upload and an older client that
-        # never declares anything keep their existing behaviour untouched. Every disagreement
-        # is refused here, before a byte is re-sent, rather than at the end: silently keeping
-        # the session's own id meant the caller re-uploaded the whole file to be told no, and
-        # each attempt pushed the session's expiry out by another TTL.
-        #
-        # The session id travels with the refusal because it is the only handle on the thing
-        # the caller has to discard, and it is the caller's own session -- the resume query
-        # above is filtered to this user, and the list endpoint already returns strictly more
-        # about it.
-        raise HTTPException(status_code=409, detail={
-            "code": "object_id_mismatch",
-            "session_id": str(session.id),
-            "message": ("An upload of this file is already in progress under a different "
-                        "object id. Cancel it and start again."),
-        })
+    # This session's buffered chunks, and its stored encrypted name, belong to the object id,
+    # the key epoch and the encryption attempt it was opened with. Resuming under any different
+    # one would assemble a file out of two encryptions and commit it under bindings its own
+    # bytes do not match -- an entry that will never open again.
+    #
+    # Refused HERE rather than at the end. Silently keeping the session's own values meant the
+    # caller re-uploaded the whole file to be told no, and each attempt pushed the session's
+    # expiry out by another TTL.
+    #
+    # The three are not interchangeable and all three are needed:
+    #   - the attempt token is the only one that separates two encryptions of the SAME object,
+    #     because the object id is deliberately stable across a resume (the name is sealed
+    #     against it) and can legitimately be equal on both attempts;
+    #   - the object id catches a resume that adopted the wrong object entirely;
+    #   - the key epoch catches an attempt encrypted after a rekey meeting one from before it.
+    #
+    # The epoch needs no vault-type conditioning: a standard upload is refused above if it carries
+    # one at all, so both sides are always absent there and the comparison is a no-op. An earlier
+    # draft conditioned it on the vault type, which read as though it were load-bearing.
+    #
+    # Both sides absent still compares equal, which now only reaches Standard uploads: an
+    # encrypted one cannot open a session without declaring all three.
+    if session is not None:
+        for code, mine, theirs in (
+            ("upload_attempt_mismatch", body.blob_id, session.blob_id),
+            ("object_id_mismatch", body.file_id, session.client_object_id),
+            ("key_epoch_mismatch", body.zk_key_version, session.zk_key_version),
+        ):
+            if mine == theirs:
+                continue
+            # The session id travels with the refusal because it is the handle on the thing the
+            # caller has to act on, and it is the caller's own session -- the resume query above
+            # is filtered to this user, and the listing endpoint already returns more about it.
+            #
+            # The message does NOT say to cancel. For an encrypted upload the buffered
+            # ciphertext is the only copy -- the plaintext handle was released at encryption
+            # time -- so cancelling is the one irreversible option, and it was the only one the
+            # old wording offered.
+            raise HTTPException(status_code=409, detail={
+                "code": code,
+                "session_id": str(session.id),
+                "message": ("An earlier attempt at this file is still in progress. Resume "
+                            "that one, or discard it before starting again."),
+            })
 
     if session is None:
+        if is_zk:
+            # A zero-knowledge upload must say what its encrypted material is bound to, and it
+            # must say it HERE rather than at the end.
+            #
+            # At the end the server can only guess, and guessing costs the file: the name is
+            # sealed against the object id, and the coming content format derives its key from
+            # the object id, the epoch and the attempt (today's does not -- the token is an
+            # opaque label the server only ever compares). Worse, a session that declared
+            # nothing was
+            # indistinguishable from any OTHER session that declared nothing -- so a second,
+            # independent encryption of the same file matched the first one's session and
+            # inherited its buffered chunks. The stored object came out as one attempt's first
+            # chunk followed by another attempt's rest, committed with a 200 and no error.
+            #
+            # Required only when OPENING a session, deliberately. A session opened before these
+            # fields existed still has a browser holding its ciphertext as the only copy, and
+            # refusing its resume would strand exactly the bytes this rule exists to protect. Such
+            # a session declares nothing on both sides, compares equal above, and continues; it
+            # ages out with its own expiry, and nothing new can be created in that shape.
+            missing = [name for name, value in (
+                ('file_id', body.file_id),
+                ('zk_key_version', body.zk_key_version),
+                ('blob_id', body.blob_id),
+            ) if value is None]
+            if missing:
+                raise HTTPException(status_code=400, detail={
+                    "code": "upload_declaration_missing",
+                    "missing": missing,
+                    "message": ("This upload could not be started because the browser did not "
+                                "say which encryption produced it. Add the file again."),
+                })
+
         # bound concurrent open sessions per user so N half-open sessions can't buffer
         # N*total_size of transient disk that the plan storage quota never counts. Resuming an
         # existing session (above) is unaffected — only a NEW session is capped.
@@ -8286,6 +8355,9 @@ async def init_chunked_upload(
             bytes_received=0,
             folder_id=folder_uuid,
             client_object_id=body.file_id,
+            # Recorded only on a fresh session, like the epoch below; a resumed one keeps its
+            # original and the comparison above is what enforces that.
+            blob_id=body.blob_id,
             created_at=now,
             last_chunk_at=now,
             expires_at=now + timedelta(hours=_chunk_session_ttl_hours()),
@@ -8575,6 +8647,29 @@ async def complete_chunked_upload(
                         ctx.write_chunk(buf)
             final_checksum = ctx.get_checksum()
             final_size = ctx.get_total_size()
+
+        # A short delivery must not commit. Every other size check in this path is a one-sided
+        # upper bound, so a session that declared N bytes and delivered fewer was assembled and
+        # stored without complaint.
+        #
+        # Under whole-file encryption that surfaces loudly on the first read. Under chunk
+        # framing it surfaces LAST: every chunk that did arrive authenticates correctly, and
+        # only the missing end-of-stream marker reveals the truncation -- which is no help to a
+        # reader that has already handed those bytes onward. The server knows at commit time and
+        # can simply refuse.
+        #
+        # Every vault, not only encrypted ones. `final_size` counts the RAW bytes handed to
+        # the codec -- `write_chunk` adds `len(chunk)` before encrypting, and the accessor
+        # says so -- so a codec that prepends a header and expands each chunk does not move
+        # it. An earlier draft scoped this to encrypted vaults on the assumption that it did,
+        # which would have left a Standard upload able to declare 11 bytes, send 5, and store
+        # the truncation with a 200.
+        if final_size != session.total_size:
+            raise HTTPException(status_code=409, detail={
+                "code": "size_mismatch",
+                "message": ("This upload delivered " + str(final_size) + " bytes but declared "
+                            + str(session.total_size) + ". Nothing has been stored."),
+            })
 
         # Final size-limit guard now that the true plaintext size is known.
         if vault.size_limit and (vault.total_size_bytes or 0) + final_size > vault.size_limit:
@@ -10561,6 +10656,7 @@ def _run_lightweight_migrations():
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS dek_version INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS zk_key_version INTEGER",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS client_object_id UUID",
+            "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS blob_id VARCHAR(32)",
             # Backfill any legacy NULL/0 per-vault size_limit to the 1 GB default: such a vault
             # reserves nothing in the account budget SUM yet is treated as UNLIMITED at every upload
             # guard (`if vault.size_limit`), so the reservation model would under-count it. Idempotent.

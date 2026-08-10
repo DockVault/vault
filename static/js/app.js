@@ -7877,6 +7877,23 @@ function zkNewObjId() {
     return `${h[0]}${h[1]}${h[2]}${h[3]}-${h[4]}${h[5]}-${h[6]}${h[7]}-${h[8]}${h[9]}-${h[10]}${h[11]}${h[12]}${h[13]}${h[14]}${h[15]}`;
 }
 
+// 16 random bytes naming ONE encryption attempt, as 32 lowercase hex characters.
+//
+// Distinct from the object id above, and needed alongside it. The object id stays the same when an
+// interrupted upload resumes -- it has to, because the file's name is sealed against it -- so it
+// cannot tell two ATTEMPTS at the same file apart. This can. Two encryptions of one file are not
+// interchangeable, and a stored object built from a chunk of each will never decrypt.
+function zkNewBlobId() {
+    if (!window.crypto || typeof window.crypto.getRandomValues !== 'function') {
+        // The same availability failure the library reports, reported the same way.
+        throw new (eccLib().constructor.CryptoError)(
+            eccLib().constructor.CODES.CRYPTO_UNAVAILABLE, 'zkNewBlobId');
+    }
+    const b = new Uint8Array(16);
+    window.crypto.getRandomValues(b);
+    return [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
 // Decrypt the browser-encrypted names/MIME in a zero-knowledge listing IN PLACE, so the
 // rest of the UI keeps using item.name / item.mime_type unchanged. Rows still holding a
 // plaintext name (legacy, not yet sealed) are left as-is (and later sealed). A row whose
@@ -9011,7 +9028,8 @@ const uploadManager = {
         if (!entries || !entries.length || !state.currentVault) return;
         const vaultId = state.currentVault.id;
         const folderId = state.currentFolderId || null;
-        for (const { file, name, keyVersion, encName, encMime, nameBi, clientFileId } of entries) {
+        for (const { file, name, keyVersion, encName, encMime, nameBi, clientFileId, blobId }
+                of entries) {
             const id = this._newId();
             const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
             this.items.set(id, {
@@ -9028,6 +9046,10 @@ const uploadManager = {
                 // ZK v2: the client-generated file id the name was sealed under. Persisted to
                 // IndexedDB and re-sent at complete so the final row id matches the sealed id.
                 clientFileId: clientFileId || null,
+                // ZK v2: which encryption attempt these bytes came from. Persisted and re-declared
+                // on resume; a fresh encryption mints a new one and the server refuses to let it
+                // adopt this attempt's chunks.
+                blobId: blobId || null,
             });
             this.run(id);
         }
@@ -9103,6 +9125,7 @@ const uploadManager = {
                         encName: rec.encName || null, encMime: rec.encMime || null, nameBi: rec.nameBi || null,
                         // Restore the v2 obj-id binding so complete finishes under the sealed id.
                         clientFileId: rec.clientFileId || null,
+                        blobId: rec.blobId || null,
                         needsServerSync: true,  // re-sync received chunks from the server before replaying
                     });
                     toResume.push(id);  // auto-resume below: replay the remaining ciphertext chunks
@@ -9176,6 +9199,9 @@ const uploadManager = {
                 // Declared here rather than only at the end because the end cannot tell a
                 // client that lost its id from one that never had one.
                 file_id: it.isZk && it.clientFileId ? it.clientFileId : null,
+                // Which encryption attempt these bytes are from. The server compares it and refuses
+                // to hand this attempt the chunks of a different one.
+                blob_id: it.isZk && it.blobId ? it.blobId : null,
             }),
         });
         if (!r.ok) {
@@ -9183,12 +9209,26 @@ const uploadManager = {
             // Read the sentence out of a structured refusal too. Only string details were
             // being forwarded, so a structured one arrived as 'Could not start upload' -- a
             // generic failure in place of the one explanation that says what to do.
-            //
-            // Deliberately NOT deleting the conflicting session, unlike the stale-key recovery
-            // below: there the buffered ciphertext is provably unsalvageable, whereas this
-            // session may be the same file still uploading from another device, and discarding
-            // it would silently throw that progress away.
             const d = e.detail;
+            const conflict = d && typeof d === 'object' && d.session_id && (
+                d.code === 'upload_attempt_mismatch' || d.code === 'object_id_mismatch'
+                || d.code === 'key_epoch_mismatch');
+            if (conflict) {
+                // An earlier attempt at this file is still open. Point at it rather than at the
+                // one destructive option: for an encrypted upload the buffered ciphertext is the
+                // ONLY copy -- the plaintext handle was released when the bytes were encrypted --
+                // so discarding cannot be undone, and resuming is almost always what was wanted.
+                //
+                // Nothing is deleted here, unlike the stale-key recovery further down. There the
+                // buffered bytes are provably unsalvageable; here they are a real upload that may
+                // still be running in another tab, and throwing it away silently would be worse
+                // than the error it replaces.
+                it.conflictSessionId = d.session_id;
+                it.status = 'conflict';
+                it.error = (d.message || 'An earlier attempt at this file is still in progress.');
+                this.render();
+                throw new Error(it.error);
+            }
             throw new Error(typeof d === 'string' ? d
                 : (d && d.message) || 'Could not start upload');
         }
@@ -9225,6 +9265,10 @@ const uploadManager = {
                 // ZK v2: the id the name was sealed under. Without it, a resumed upload would
                 // complete under a fresh server id and the v2 name would be undecryptable.
                 clientFileId: it.clientFileId || null,
+                // And which attempt produced the blob above. A resume must re-declare it or the
+                // server will not let it continue -- correctly, since it could not prove these
+                // bytes belong to that session.
+                blobId: it.blobId || null,
                 createdAt: Date.now(),
             });
             this._noteResumePersistence(it, res);
@@ -9388,8 +9432,14 @@ const uploadManager = {
             setTimeout(() => { this.items.delete(id); this.render(); }, 4000);
         } catch (err) {
             if (it.cancelled) return;
-            it.status = 'error';
-            it.error = err.message || String(err);
+            // A blocked row has already set its own status and message, and it has two
+            // controls that a plain error row does not. Overwriting it here left the copy
+            // telling the user to resume or discard while rendering neither button, and the
+            // Resume that WAS drawn re-ran the same refused request forever.
+            if (it.status !== 'conflict') {
+                it.status = 'error';
+                it.error = err.message || String(err);
+            }
             this.render();
         }
     },
@@ -9484,6 +9534,42 @@ const uploadManager = {
         return Math.round(it.percent || 0);
     },
 
+    // Step aside and let the earlier attempt through. Nothing is deleted: if its ciphertext is
+    // on this device the refresh below surfaces it and it resumes on its own, and if it is not,
+    // the row it surfaces explains that instead of failing silently.
+    async conflictResume(id) {
+        const it = this.items.get(id);
+        if (!it) return;
+        // Park it rather than delete it. The persist to IndexedDB happens after the init that
+        // was refused, so this row holds the ONLY reference to the ciphertext it encrypted --
+        // dropping it would throw those bytes away while claiming to be the safe choice.
+        it.status = 'paused';
+        it.paused = true;
+        it.error = null;
+        it.conflictSessionId = null;
+        this.render();
+        try { await this.refreshResumable(); } catch (_) { /* the tray still shows the truth */ }
+    },
+
+    // The irreversible one, taken only because the user chose it. For an encrypted upload the
+    // buffered ciphertext is the only copy of those bytes, so this cannot be undone -- which is
+    // why it is a second button rather than the wording of an error message.
+    async conflictDiscard(id) {
+        const it = this.items.get(id);
+        if (!it || !it.conflictSessionId) return;
+        const sid = it.conflictSessionId;
+        try {
+            await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${sid}`,
+                { method: 'DELETE', headers: this._vaultHeaders() });
+        } catch (_) { /* if it did not go, the retry below is refused again and says so */ }
+        try { await zkUploadStore.delete(sid); } catch (_) { /* no local copy is fine */ }
+        it.conflictSessionId = null;
+        it.status = 'queued';
+        it.error = null;
+        this.render();
+        this.run(id);
+    },
+
     render() {
         let tray = document.getElementById('upload-tray');
         if (!tray) {
@@ -9501,7 +9587,7 @@ const uploadManager = {
             const statusLabel = {
                 queued: 'Queued', uploading: 'Uploading', pausing: 'Pausing…',
                 paused: 'Paused', completing: 'Finalising…', done: 'Done',
-                error: 'Failed', 'needs-file': 'Resumable',
+                error: 'Failed', 'needs-file': 'Resumable', conflict: 'Blocked',
             }[it.status] || it.status;
 
             let controls = '';
@@ -9516,6 +9602,13 @@ const uploadManager = {
                 // ciphertext can't be replayed here, so it offers only Cancel (+ the note below).
                 controls += `<button class="up-btn up-btn-text" data-up-action="resume" data-up-id="${it.id}">Resume…</button>`;
             }
+            if (it.status === 'conflict') {
+                // Two ways out, and the non-destructive one comes first. Discarding is the only
+                // irreversible option here -- for an encrypted upload the buffered ciphertext is
+                // the sole copy -- and it used to be the only one the message named.
+                controls += `<button class="up-btn up-btn-text" data-up-action="conflict-resume" data-up-id="${it.id}">Resume earlier</button>`;
+                controls += `<button class="up-btn up-btn-text" data-up-action="conflict-discard" data-up-id="${it.id}">Discard it</button>`;
+            }
             if (it.status !== 'done') {
                 controls += `<button class="up-btn" data-up-action="cancel" data-up-id="${it.id}" title="Cancel">${this._icon('x')}</button>`;
             }
@@ -9526,7 +9619,10 @@ const uploadManager = {
             // failure), flag that it won't survive a reload while it's still in flight.
             const noResume = it.isZk && it.resumePersisted === false && it.resumeWarning
                 && it.status !== 'done' && it.status !== 'error' && it.status !== 'needs-file';
-            const sub = it.status === 'error' ? `<div class="up-error">${escapeHtml(it.error || 'Upload failed')}</div>`
+            const sub = it.status === 'conflict' ? `<div class="up-error">${escapeHtml(
+                    'An earlier attempt at this file is still uploading. Resume it, or discard it '
+                    + 'to start over \u2014 discarding cannot be undone.')}</div>`
+                : it.status === 'error' ? `<div class="up-error">${escapeHtml(it.error || 'Upload failed')}</div>`
                 : it.status === 'needs-file' ? `<div class="up-sub">${it.isZk ? 'Encrypted data isn\'t on this device — cancel and upload again' : 'Paused — click Resume and re-select the file'}</div>`
                 : `<div class="up-sub">${statusLabel} · ${pct}% · ${size}${noResume ? ' · <span class="up-warn">not resumable</span>' : ''}</div>`;
 
@@ -9543,7 +9639,8 @@ const uploadManager = {
 
         // A failed item (e.g. a rejected 0-byte upload) is finished, not active — exclude 'error'
         // so it doesn't stick in the tray header as "N active" forever.
-        const active = items.filter(i => i.status !== 'done' && i.status !== 'needs-file' && i.status !== 'error').length;
+        const active = items.filter(i => i.status !== 'done' && i.status !== 'needs-file'
+            && i.status !== 'error' && i.status !== 'conflict').length;
         tray.innerHTML = `
           <div class="up-tray-head">
             <span>Uploads${active ? ` · ${active} active` : ''}</span>
@@ -9558,12 +9655,20 @@ const uploadManager = {
                 if (a === 'pause') this.pause(id);
                 else if (a === 'resume') this.resume(id);
                 else if (a === 'cancel') this.cancel(id);
+                else if (a === 'conflict-resume') this.conflictResume(id);
+                else if (a === 'conflict-discard') this.conflictDiscard(id);
             });
         });
         const clear = tray.querySelector('#up-tray-clear');
         if (clear) clear.addEventListener('click', () => {
             for (const [id, it] of this.items) {
-                if (it.status === 'done' || it.status === 'needs-file' || it.status === 'error') this.items.delete(id);
+                const finished = it.status === 'done' || it.status === 'needs-file'
+                    || it.status === 'error';
+                // Keep a row whose server session is still open, even when it looks finished.
+                // Dropping it hid an upload that still existed, and the next attempt at the same
+                // file was refused by a session the user could no longer see or act on.
+                const stillOnServer = it.status !== 'done' && (it.sessionId || it.conflictSessionId);
+                if (finished && !stillOnServer) this.items.delete(id);
             }
             this.render();
         });
@@ -9699,6 +9804,11 @@ async function uploadFiles(files) {
                     // server uses it as the row id — keeping the sealed id == the final row id.
                     const clientFileId = zkNewObjId();
                     entry.clientFileId = clientFileId;
+                    // Minted HERE, in the same iteration as the encryption below, so the token and
+                    // the bytes it names are produced together and cannot drift apart. A resumed
+                    // upload replays these same bytes and re-declares this same token; only a fresh
+                    // encryption gets a new one, which is exactly what the server refuses to merge.
+                    entry.blobId = zkNewBlobId();
                     const buf = await entry.file.arrayBuffer();
                     const enc = await lib.encryptFile(buf, dek);
                     entry.file = new File([enc], entry.name, { type: mime });
