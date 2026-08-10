@@ -418,12 +418,17 @@ def test_zk_chunked_upload_resumes_and_stores_ciphertext_verbatim(admin):
         import os as _os
         dek = _os.urandom(32)
         zkname = unique("zkbig") + ".bin"
+        import uuid as _uuid
+        obj_id = str(_uuid.uuid4())
         r = admin.post(f"/vaults/{vid}/uploads", json={
             "total_size": len(blob), "total_chunks": 2, "chunk_size": len(part0),
             "zk_key_version": 1,
             "enc_name": zk_encrypt_name(zkname, dek, vid, "name", 1),
             "enc_mime": zk_encrypt_name("application/octet-stream", dek, vid, "mime", 1),
             "name_bi": zk_name_blind_index(zkname, dek, vid, 1),
+            # An encrypted upload declares what its material is bound to, and which encryption
+            # attempt produced it, when the session opens.
+            "file_id": obj_id, "blob_id": _uuid.uuid4().hex,
         })
         assert r.status_code == 200, r.text
         sid = r.json()["session_id"]
@@ -435,7 +440,7 @@ def test_zk_chunked_upload_resumes_and_stores_ciphertext_verbatim(admin):
         assert detail["received_chunks"] == [0]
         assert admin.put(f"/vaults/{vid}/uploads/{sid}/chunks/1", data=part1, headers=_OCTET).status_code == 200
 
-        out = admin.post(f"/vaults/{vid}/uploads/{sid}/complete")
+        out = admin.post(f"/vaults/{vid}/uploads/{sid}/complete", json={"file_id": obj_id})
         assert out.status_code == 200, out.text
         fid = out.json()["id"]
 
@@ -901,17 +906,21 @@ def test_zk_name_crypto_parity_with_browser_lib():
 
 def _zk_pw_upload(client, vid, name, content, dek, pw, epoch=1):
     """zk_chunked_upload variant that carries the vault password header on every call."""
+    import uuid as _uuid
     PW = {"X-Vault-Password": pw}
+    obj_id = str(_uuid.uuid4())
     init = client.post(f"/vaults/{vid}/uploads", headers=PW, json={
         "total_size": len(content), "total_chunks": 1, "chunk_size": max(1, len(content)),
         "zk_key_version": epoch,
         "enc_name": zk_encrypt_name(name, dek, vid, "name", epoch),
         "name_bi": zk_name_blind_index(name, dek, vid, epoch),
+        "file_id": obj_id, "blob_id": _uuid.uuid4().hex,
     })
     init.raise_for_status()
     sid = init.json()["session_id"]
     client.put(f"/vaults/{vid}/uploads/{sid}/chunks/0", data=content,
                headers={**PW, "Content-Type": "application/octet-stream"}).raise_for_status()
-    done = client.post(f"/vaults/{vid}/uploads/{sid}/complete", headers=PW)
+    done = client.post(f"/vaults/{vid}/uploads/{sid}/complete", headers=PW,
+                       json={"file_id": obj_id})
     done.raise_for_status()
     return done.json()["id"]

@@ -215,16 +215,22 @@ def zk_chunked_upload(client, vault_id, name, content, dek, epoch=1, mime="text/
     client-side (never sent in the clear) and the content is sent as opaque bytes. Returns the
     completed file id. `dek` is the 32-byte vault DEK the caller uses for the name crypto.
 
-    If `file_id` is given, the name/MIME are sealed BOUND to that id (v2) and the id is supplied
-    at complete (a client-generated id); otherwise legacy v1 (the server assigns the id)."""
+    If `file_id` is given, the name/MIME are sealed BOUND to that id (v2); otherwise the seal is
+    legacy v1 and binds nothing. Either way an id is DECLARED, because an encrypted upload must now
+    say at session-open what its material is bound to -- v1 vs v2 is a property of the seal, not of
+    whether an id exists."""
     chunk_size = chunk_size or max(1, len(content))
     total_chunks = max(1, (len(content) + chunk_size - 1) // chunk_size)
+    declared_id = file_id or uuid.uuid4()
     init = client.post(f"/vaults/{vault_id}/uploads", json={
         "total_size": len(content), "total_chunks": total_chunks, "chunk_size": chunk_size,
         "zk_key_version": epoch, "folder_id": folder_id,
         "enc_name": zk_encrypt_name(name, dek, vault_id, "name", epoch, obj_id=file_id),
         "enc_mime": zk_encrypt_name(mime, dek, vault_id, "mime", epoch, obj_id=file_id) if mime else None,
         "name_bi": zk_name_blind_index(name, dek, vault_id, epoch),
+        "file_id": str(declared_id),
+        # A fresh token per call: two calls are two encryptions and must never share a session.
+        "blob_id": uuid.uuid4().hex,
     })
     init.raise_for_status()
     sid = init.json()["session_id"]
@@ -234,7 +240,7 @@ def zk_chunked_upload(client, vault_id, name, content, dek, epoch=1, mime="text/
                        headers={"Content-Type": "application/octet-stream"})
         r.raise_for_status()
     done = client.post(f"/vaults/{vault_id}/uploads/{sid}/complete",
-                       json={"file_id": str(file_id)} if file_id else None)
+                       json={"file_id": str(declared_id)})
     done.raise_for_status()
     return done.json()["id"]
 

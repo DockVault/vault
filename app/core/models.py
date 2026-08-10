@@ -1322,6 +1322,21 @@ class ChunkedUploadSession(Base):
     # for Standard vaults and legacy clients.
     zk_key_version = Column(Integer, nullable=True)
 
+    # Zero-knowledge upload only: 32 lowercase hex characters naming ONE ENCRYPTION ATTEMPT at
+    # this object -- 16 random bytes the client mints when it starts encrypting, declared when
+    # the session opens and compared on every resume.
+    #
+    # The object id above cannot do this job. It is deliberately STABLE across a resumed upload,
+    # because the file's name is sealed against it, so two attempts at the same object can
+    # legitimately carry the same one. Only a per-attempt value separates them -- and they have
+    # to be separated, because two encryptions of one file are not interchangeable: splicing a
+    # chunk of one onto a chunk of the other produces bytes that will never decrypt.
+    #
+    # Held as opaque text, never a UUID column. A UUID column round-trips as hyphenated ASCII,
+    # which is the wrong width for a value that also has to sit in a fixed-width binary header.
+    # The server never interprets it; it only ever compares it for equality.
+    blob_id = Column(String(32), nullable=True)
+
     # Session management
     created_at = Column(DateTime, default=datetime.utcnow)
     last_chunk_at = Column(DateTime, default=datetime.utcnow)
