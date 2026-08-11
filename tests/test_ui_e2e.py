@@ -6,6 +6,7 @@ temporary-credential validity flow, vault creation, user creation, and logout.
 Run only these:   pytest -m ui
 Watch the browser: pytest -m ui --headed
 """
+import json
 import uuid
 
 import pytest
@@ -1031,6 +1032,250 @@ def test_a_resume_with_no_recorded_digests_re_sends_everything(logged_in: Page, 
             f"with no digests to check against every chunk must be re-sent; stored {stored!r}")
     finally:
         admin.delete_vault(vid)
+
+
+@pytest.mark.ui
+def test_zk_content_v2_survives_a_real_upload_and_download(page: Page, admin):
+    """The writer, end to end, through the stack a user actually touches.
+
+    Everything else about this format is proven offline against fixtures, which says the bytes are
+    right and says nothing about whether they survive the trip. This uploads a real file into a
+    real zero-knowledge vault with the writer switched on, and reads it back through the same
+    decrypt seam a download uses.
+
+    Three things have to hold and only this test covers all three at once: the server stores the new
+    bytes untouched, the reader recognises them from the header without being told, and a file
+    written under the OLD format in the same vault still opens afterwards. That last one is the
+    whole reason readers ship before writers, and it is worth failing loudly if it stops being true.
+
+    The chunk size is dropped to the grammar's floor so a small payload still spans several chunks.
+    That is a writer-side choice by construction -- the size is recorded in each file's header and
+    the reader takes it from there -- so this exercises the multi-chunk path without moving
+    megabytes through a browser test.
+    """
+    from conftest import ApiClient
+
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    user = admin.create_user(role="admin")
+    owner = ApiClient()
+    owner.login(user["_username"], user["_password"])
+
+    vid = None
+    try:
+        _login(page, user["_username"], user["_password"])
+        vid = _create_zk_vault_via_ui(page, owner, "zk-content-v2-pass-1")
+        page.click('.sidebar-item[data-section="vaults"]')
+        page.wait_for_selector(f'.open-vault-btn[data-vault-id="{vid}"]', timeout=10000)
+        page.click(f'.open-vault-btn[data-vault-id="{vid}"]')
+        expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
+
+        def _wait_for_files(count):
+            for _ in range(40):
+                rows = owner.get(f"/vaults/{vid}/files").json()["items"]
+                if len(rows) >= count:
+                    return rows
+                page.wait_for_timeout(500)
+            raise AssertionError(f"only {len(rows)} file(s) landed, expected {count}")
+
+        legacy_name = _u("legacy") + ".txt"
+        legacy_body = b"written before the writer was switched on\n" * 40
+        page.set_input_files("#file-upload-input", files=[
+            {"name": legacy_name, "mimeType": "text/plain", "buffer": legacy_body}])
+        _wait_for_files(1)
+
+        # Switch the writer on for this page only. A source constant is the ship-time control; a
+        # test that edited the source would prove the format works and prove nothing about the gate.
+        page.evaluate("""() => {
+            const lib = eccLib();
+            lib.ZK_CONTENT_WRITE_V2 = true;
+            lib.V2_CONTENT_CHUNK_DEFAULT = lib.V2_CONTENT_CHUNK_MIN;
+        }""")
+
+        v2_name = _u("framed") + ".txt"
+        v2_body = b"chunk-framed content, written by the browser\n" * 260   # ~11 KB, 3 chunks
+        # Watch what the client DECLARES when it opens the session. The token sealed into the file
+        # and the token the server matches attempts on have to be the same value, and the library
+        # test can only prove the writer hands back what it sealed -- not that the wiring forwards
+        # that specific value rather than minting a second one. Nothing caught that before.
+        declared = []
+        page.on("request", lambda r: (
+            declared.append(r.post_data)
+            if r.method == "POST" and r.url.endswith("/uploads") else None))
+        page.set_input_files("#file-upload-input", files=[
+            {"name": v2_name, "mimeType": "text/plain", "buffer": v2_body}])
+        rows = _wait_for_files(2)
+
+        # Read every row back through the seam a download calls, and match on CONTENT. The names
+        # are sealed client-side, so which row is which is not something the server can be asked.
+        found = {}
+        for row in rows:
+            plain = page.evaluate(
+                """async ({ id, kv }) => {
+                    const base = `${API_BASE}/vaults/${state.currentVault.id}/files/${id}`;
+                    const r = await fetch(base + '/download',
+                        { headers: { 'Authorization': 'Bearer ' + authToken } });
+                    const out = await zkMaybeDecryptBlob(await r.blob(), state.currentVault, kv, id);
+                    return Array.from(new Uint8Array(await out.arrayBuffer()));
+                }""",
+                {"id": row["id"], "kv": page.evaluate("(id) => zkFileKeyVersion(id)", row["id"])})
+            found[bytes(plain)] = row["id"]
+
+        assert v2_body in found, (
+            "the chunk-framed file did not read back as what was sent")
+        assert legacy_body in found, (
+            "the file written before the switch stopped reading once the v2 writer ran")
+        v2_id = found[v2_body]
+
+        # What the server holds. It never had a key, so this is the writer's own output verbatim --
+        # and it must carry the new header, or the round trip above passed on the legacy format.
+        stored = owner.get(f"/vaults/{vid}/files/{v2_id}/download").content
+        assert stored[:6] == b"DVZ2\x02\x04", (
+            f"stored bytes do not start with a version-2 content header: {stored[:8]!r}")
+        assert v2_body[:60] not in stored, "plaintext reached the server"
+        chunk_size = int.from_bytes(stored[8:12], "big")
+        assert chunk_size == 4096, chunk_size
+        # Exact, not approximate: 28 bytes of file header, then every chunk pays 28 for its nonce
+        # and tag. A trailing empty chunk or a missing one both fail here.
+        chunks = max(1, -(-len(v2_body) // chunk_size))
+        assert len(stored) == 28 + chunks * 28 + len(v2_body), (
+            f"{len(stored)} stored bytes for {len(v2_body)} plaintext in {chunks} chunks")
+
+        legacy_stored = owner.get(f"/vaults/{vid}/files/{found[legacy_body]}/download").content
+        assert legacy_stored[:4] != b"DVZ2", "the pre-switch file was rewritten"
+
+        sealed = stored[12:28].hex()
+        v2_inits = [json.loads(b) for b in declared if b and "blob_id" in b]
+        assert v2_inits, f"no upload-init body was captured: {declared}"
+        assert any(i.get("blob_id") == sealed for i in v2_inits), (
+            f"the session declared {[i.get('blob_id') for i in v2_inits]} but the file header "
+            f"seals {sealed} -- the server would be matching attempts on a different token than "
+            "the one the bytes are bound to")
+    finally:
+        if vid:
+            owner.delete_vault(vid)
+        admin.delete_user(user["id"])
+        admin.put("/settings", json={"zero_knowledge_enabled": False})
+
+
+@pytest.mark.ui
+def test_zk_content_v2_written_after_a_rekey_binds_the_new_epoch(browser, admin):
+    """The one binding in this format with nothing behind it, until now.
+
+    The content key derives from the DEK epoch and every chunk authenticates it. A review mutation
+    replacing the epoch the upload path passes with a hardcoded ``1`` passed the entire suite --
+    including the other end-to-end test here, which creates a fresh vault where the current epoch
+    *is* 1, so the mutation is a no-op there. Nothing rotated a DEK and then wrote v2 content.
+
+    What that costs if it regresses: the upload is ACCEPTED, because the epoch the server checks is
+    declared separately by the client and is correct. The file is stamped at the new epoch, and on
+    download the reader passes that epoch and the content fails to authenticate. An intact file,
+    the right key, and a permanent "damaged" -- with no path in the UI that would ever retry at the
+    old epoch.
+
+    A real rotation is the only way to test it: the epoch cannot be faked, because the server
+    re-reads the vault under its own lock and refuses an upload declaring anything else. So this
+    revokes a real member, which is what bumps the epoch.
+    """
+    from conftest import ApiClient, BASE_URL
+
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    ua = admin.create_user(role="admin")
+    ub = admin.create_user(role="admin")
+    ca = ApiClient(); ca.login(ua["_username"], ua["_password"])
+    cb = ApiClient(); cb.login(ub["_username"], ub["_password"])
+
+    vid_a = vid_b = None
+    ctx_a = browser.new_context(base_url=BASE_URL)
+    ctx_b = browser.new_context(base_url=BASE_URL)
+    page_a = ctx_a.new_page()
+    page_b = ctx_b.new_page()
+    try:
+        _login(page_a, ua["_username"], ua["_password"])
+        vid_a = _create_zk_vault_via_ui(page_a, ca, "rotate-pass-A-123")
+        page_a.click('.sidebar-item[data-section="vaults"]')
+        page_a.wait_for_selector(f'.open-vault-btn[data-vault-id="{vid_a}"]', timeout=10000)
+        page_a.click(f'.open-vault-btn[data-vault-id="{vid_a}"]')
+        expect(page_a.locator("#vault-view-section")).to_be_visible(timeout=10000)
+
+        # B needs a keypair of their own before A can grant them the DEK.
+        _login(page_b, ub["_username"], ub["_password"])
+        vid_b = _create_zk_vault_via_ui(page_b, cb, "rotate-pass-B-123")
+        page_a.click('[data-vault-tab="permissions"]')
+        page_a.click("#add-permission-btn")
+        expect(page_a.locator("#vault-grant-modal")).to_be_visible(timeout=5000)
+        page_a.fill("#vault-grant-search", ub["_username"])
+        page_a.wait_for_selector(f'#vault-grant-list input[value="{ub["id"]}"]', timeout=8000)
+        page_a.check(f'#vault-grant-list input[value="{ub["id"]}"]')
+        page_a.click("#vault-grant-confirm")
+        expect(page_a.locator("#vault-grant-modal")).to_be_hidden(timeout=15000)
+        for _ in range(20):
+            if cb.get(f"/ecc/vaults/{vid_a}/keys").json().get("has_access"):
+                break
+            page_a.wait_for_timeout(300)
+
+        # Revoking B rotates the DEK forward. This is what makes the epoch something other than 1.
+        page_a.click(
+            f'button[data-action="revoke-permission"][data-user-id="{ub["id"]}"]')
+        expect(page_a.locator("#confirm-modal")).to_be_visible(timeout=5000)
+        page_a.click("#confirm-modal-confirm-btn")
+        rotated = False
+        for _ in range(40):
+            if ca.get(f"/ecc/vaults/{vid_a}/keys").json().get("current_dek_version") == 2:
+                rotated = True
+                break
+            page_a.wait_for_timeout(300)
+        assert rotated, "the revoke did not rotate the DEK, so this test would prove nothing"
+
+        page_a.click('[data-vault-tab="files"]')
+        page_a.evaluate("""() => {
+            const lib = eccLib();
+            lib.ZK_CONTENT_WRITE_V2 = true;
+            lib.V2_CONTENT_CHUNK_DEFAULT = lib.V2_CONTENT_CHUNK_MIN;
+        }""")
+        name = _u("epoch2") + ".txt"
+        body = b"written under the second epoch\n" * 200
+        page_a.set_input_files("#file-upload-input", files=[
+            {"name": name, "mimeType": "text/plain", "buffer": body}])
+
+        row = None
+        for _ in range(40):
+            hit = [it for it in ca.get(f"/vaults/{vid_a}/files").json()["items"]
+                   if it["type"] == "file" and it.get("key_version") == 2]
+            if hit:
+                row = hit[0]
+                break
+            page_a.wait_for_timeout(500)
+        assert row, "the epoch-2 upload never landed"
+
+        stored = ca.get(f"/vaults/{vid_a}/files/{row['id']}/download").content
+        assert stored[:6] == b"DVZ2\x02\x04", (
+            f"the gate was on but the file is not chunk-framed: {stored[:8]!r}")
+
+        plain = page_a.evaluate(
+            """async ({ id }) => {
+                const r = await fetch(
+                    `${API_BASE}/vaults/${state.currentVault.id}/files/${id}/download`,
+                    { headers: { 'Authorization': 'Bearer ' + authToken } });
+                const out = await zkMaybeDecryptBlob(await r.blob(), state.currentVault,
+                    zkFileKeyVersion(id), id);
+                return Array.from(new Uint8Array(await out.arrayBuffer()));
+            }""",
+            {"id": row["id"]})
+        assert bytes(plain) == body, (
+            "a file written after a rotation did not read back -- the content is bound to an "
+            "epoch other than the one the row was stamped with")
+    finally:
+        for client, v in ((ca, vid_a), (cb, vid_b)):
+            if v:
+                try:
+                    client.delete_vault(v)
+                except Exception:                      # noqa: BLE001 - teardown, best effort
+                    pass
+        admin.delete_user(ua["id"])
+        admin.delete_user(ub["id"])
+        admin.put("/settings", json={"zero_knowledge_enabled": False})
+        ctx_a.close()
+        ctx_b.close()
 
 
 def _zk_start_partial_upload(page: Page, vid: str, fname: str, marker: str,

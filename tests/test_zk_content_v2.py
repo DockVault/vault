@@ -13,8 +13,11 @@ self-consistent with itself. Reading one's output with the other is the only thi
 Specified by ``docs/design/vault-zk-envelope-v2.md`` §7.4. Where a test here and that document
 disagree, the document is the contract.
 
-The writer is not built yet. This is deliberate and is the document's own rule: readers ship before
-writers, so that a file written by a newer build is never met by an older one that cannot read it.
+This file covers the reader alone. The writer has its own, and the split is the document's own
+rule: readers ship before writers, so that a file written by a newer build is never met by an older
+one that cannot read it. Keeping the reader's tests free of anything the writer produces is what
+keeps that rule checkable — every vector here was written by an implementation that is not the one
+under test.
 """
 
 import base64
@@ -228,19 +231,31 @@ def test_the_reader_is_reachable_only_through_the_documented_seam():
     assert "_v2ContentTranscript(\n            ctx.vaultId" in body or "ctx.vaultId, ctx.objectId" in body
 
 
-def test_the_writer_has_not_shipped():
+def test_the_writer_did_not_ship_in_this_change():
     """Readers before writers, and this is the document's own rule.
 
     A file written by a newer build and met by an older one that cannot read it is unrecoverable
-    without the server's help, and the server holds nothing it could re-derive. The reader must be
-    in every bundle first. Enabling a writer is a separate, operator-gated change.
+    without the server's help, and the server holds nothing it could re-derive. The reader has to be
+    in every bundle first.
+
+    It was, and this test used to say so by asserting no writer existed at all. A writer has since
+    shipped, in a later change and behind its own default-off constant, so the assertion that still
+    means something is the gate rather than the absence -- and it is checked here as well as in the
+    writer's own file, because this is where someone comes to ask whether the ordering held.
     """
     src = CRYPTO_JS.read_text(encoding="utf-8")
-    assert "encryptFileV2" not in src, (
-        "a version-2 content writer has appeared -- it must not ship in the same change as the "
-        "reader, and never with its gate on")
+    assert "this.ZK_CONTENT_WRITE_V2 = false;" in src, (
+        "the version-2 content writer is not gated off at the source")
     app = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
-    assert "ZK_CONTENT_WRITE_V2" not in app and "ZK_CONTENT_WRITE_V2" not in src
+    # Exactly one place decides whether a file is written in the new format. A second would mean an
+    # upload path that ignores the gate, which is how a writer ships by accident.
+    assert app.count("lib.ZK_CONTENT_WRITE_V2") == 1, (
+        "the content writer has more than one choke point")
+    # And the gate is the WHOLE condition. A count alone is satisfied by `false && lib.GATE`, which
+    # a review mutation confirmed passes every offline test -- fail-safe, but it means the on-path
+    # would have no offline coverage at all and nobody would know.
+    assert "if (lib.ZK_CONTENT_WRITE_V2) {" in app, (
+        "the gate is no longer the sole condition on the writer branch")
 
     # And the existing wrap gate is untouched: its own tests count the choke points.
     assert "this.ZK_WRAP_WRITE_V2 = false;" in src

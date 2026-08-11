@@ -171,6 +171,15 @@ class ECCCryptoLibrary {
         // use, so an implementer may align the two without the grammar forbidding it.
         this.V2_CONTENT_CHUNK_MIN = 4096;
         this.V2_CONTENT_CHUNK_MAX = 8388608;
+        // What this build's writer picks when a caller does not say. Well inside both bounds, so
+        // the choice can be revised without touching the grammar: the size is written into every
+        // file's header and read back from there, and a reader never assumes this value.
+        //
+        // A megabyte costs 28 bytes of overhead per chunk -- three thousandths of a percent -- and
+        // is the largest window a bounded streaming writer would want to hold. Matching the 5 MB
+        // transport chunk instead would look tidier and buy nothing: the 28-byte file header
+        // shifts every boundary, so crypto chunks and transport chunks never line up anyway.
+        this.V2_CONTENT_CHUNK_DEFAULT = 1048576;
 
         // The v2 WRITER is off by default, same mechanism and same reasoning as the envelope
         // above -- but the blast radius is larger. That envelope is read only by the account
@@ -190,6 +199,35 @@ class ECCCryptoLibrary {
         // There is no way back: once a v2 wrap exists, a reader that predates it cannot open
         // the vault and the server holds nothing it could re-wrap from.
         this.ZK_WRAP_WRITE_V2 = false;
+
+        // The v2 CONTENT writer, off by default and for a different reason than the wrap above.
+        //
+        // A wrap is read by other members, so writing one early locks them out. Content is read
+        // by whoever can already open the vault, and every reader that can open a vault at all
+        // has understood this format since the reader shipped -- so the exposure is not other
+        // people, it is other TABS. A tab loaded before the reader shipped, left open, and used
+        // to download a file written by this flag reports the file as damaged.
+        //
+        // BEFORE ENABLING THIS, an operator needs all of the following to be true:
+        //   * the reader has been deployed long enough that no live tab predates it. That is the
+        //     whole of the condition: the bundle is served `no-store`, so there is no HTTP cache
+        //     to bust and any reload picks the reader up immediately. Bumping the version string
+        //     in the page's script tags does nothing for a tab that is ALREADY open, which is the
+        //     only case that matters here -- an earlier draft of this list said to bump it, which
+        //     would have let someone believe they had mitigated something;
+        //   * the deployment will not be rolled back to an image that predates the reader. It is
+        //     the same exposure as the stale tab and it arrives fleet-wide rather than one tab at
+        //     a time. Nothing is lost either way -- the bytes are intact and rolling forward reads
+        //     them -- but every v2 file reports as damaged until it is;
+        //   * a restore of a backup taken before the switch is still readable, which it is, since
+        //     readers keep the legacy path unchanged.
+        // What a pre-reader build DOES with a v2 file is throw, not misread: it takes the first
+        // twelve bytes as an IV and the rest as ciphertext, and AES-GCM refuses the tag. So the
+        // symptom is an intact file reported as damaged -- the mislabel the content error codes
+        // were added to eliminate -- rather than silent garbage.
+        // Unlike the wrap flag there IS a way back for anything not yet written: turning this off
+        // returns the writer to the legacy form, and files already written in v2 keep reading.
+        this.ZK_CONTENT_WRITE_V2 = false;
 
         // Raw platform exceptions are diagnostics, not user-facing detail. Off in production;
         // a source constant rather than anything a deployment can flip at runtime, so turning
@@ -796,6 +834,12 @@ class ECCCryptoLibrary {
 
         const enc = new TextEncoder();
         return {
+            // The COERCED, validated size -- not the caller's value. They are not always the same
+            // object: a caller can pass something whose `valueOf` answers differently each time it
+            // is read, and then the size validated and written into the header is not the size the
+            // framing loop uses. The result is a file whose header disagrees with its own body,
+            // which is precisely what validating up front is supposed to rule out.
+            chunkSize: size,
             fileHeader,
             info: this._concatBytes([enc.encode(this.V2_INFO_CONTENT), z, context, z, blob]),
             aadFor: (index, isFinal, totals) => {
@@ -825,7 +869,25 @@ class ECCCryptoLibrary {
      * @private
      */
     async _deriveV2ContentKey(dekCryptoKey, info) {
+        // HKDF takes input keying material of any length and any provenance, so without these two
+        // checks a 16-byte AES-128 key -- or a 32-byte HMAC key, or an AES-KW key -- seeds a
+        // perfectly valid AES-256 content key and the file round-trips with nothing to show for
+        // it. The legacy writer got this for free by handing the key straight to AES-GCM, which
+        // refuses both; deriving instead means checking. Both v2 unwrap paths already make the
+        // length half on the other side of the same key, for the same reason.
+        //
+        // The algorithm half has to come first and cannot be folded into the length check: an
+        // HMAC key exports 32 bytes just as happily, so length alone lets the wrong key through.
+        // Every DEK in this module is minted or imported as AES-GCM-256, so nothing legitimate is
+        // excluded.
+        const alg = (dekCryptoKey && dekCryptoKey.algorithm) || {};
+        if (alg.name !== this.AES_ALGORITHM) {
+            this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, 'content.dekAlgorithm');
+        }
         const raw = await this._subtle().exportKey('raw', dekCryptoKey);
+        if (raw.byteLength !== 32) {
+            this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, 'content.dekLength');
+        }
         return this._deriveV2WrappingKey(raw, info);
     }
 
@@ -1758,6 +1820,102 @@ class ECCCryptoLibrary {
      * @returns {Promise<ArrayBuffer>} Decrypted file content
      */
     /**
+     * Write a version-2 chunk-framed file.
+     *
+     * Buffered: the whole plaintext arrives as one buffer and the whole ciphertext is returned as
+     * one. That is a deliberate first step -- the grammar is what is being established here, and
+     * it is the same grammar a streaming writer will emit, chunk boundaries and all. Nothing about
+     * these bytes says which kind of writer produced them.
+     *
+     * The attempt token is minted HERE and handed back, never accepted from the caller. Two
+     * encryptions that share a token share a derived key, and share the associated data of every
+     * chunk except the last -- so chunk `i` of one file substitutes cleanly for chunk `i` of the
+     * other, and a shorter second attempt supplies the final chunk that turns the substitution
+     * into a silent truncation. No caller can hold that wrong. Deriving the token from the content
+     * instead -- the obvious move if cross-file deduplication ever looks attractive -- reintroduces
+     * it deliberately: identical plaintext would mean an identical token by design.
+     *
+     * @param {ArrayBuffer|Uint8Array} fileContent
+     * @param {CryptoKey} vaultDEK
+     * @param {{vaultId: string, objectId: string, dekEpoch: number}} context
+     * @param {{chunkSize?: number}} [options]
+     * @returns {Promise<{bytes: Uint8Array, blobId: string}>} the file, and the 32-hex-character
+     *   attempt token to declare when the upload session is opened
+     */
+    async encryptFileV2(fileContent, vaultDEK, context, options) {
+        const W = 'encryptFileV2';
+        try {
+            const opts = options || {};
+            const blobId = this._randomBytes(16);
+            const ctx = context || {};
+            // Bounds, the uuids and the epoch are all validated in here, before a single byte is
+            // encrypted -- so a bad transcript fails as bad input rather than as a file that
+            // encrypts happily and cannot be opened.
+            const t = this._v2ContentTranscript(
+                ctx.vaultId, ctx.objectId, ctx.dekEpoch,
+                opts.chunkSize === undefined ? this.V2_CONTENT_CHUNK_DEFAULT : opts.chunkSize,
+                blobId);
+            // Read back from the transcript, so the framing below and the header above are the
+            // same number by construction rather than by both reading the caller twice.
+            const chunkSize = t.chunkSize;
+            const key = await this._deriveV2ContentKey(vaultDEK, t.info);
+
+            // Accept what WebCrypto calls a BufferSource and refuse everything else. The
+            // one-liner this replaces -- `new Uint8Array(x)` for any non-Uint8Array -- does not
+            // throw on an unrecognised value, it yields a ZERO-LENGTH array, so a DataView (the
+            // natural type for a caller working in byte offsets, and the natural type for the
+            // streaming writer this grammar exists for) was encrypted as an empty file. It was
+            // silent, it authenticated, and the totals it bound were correct for the empty file
+            // it had become -- so no reader, no terminator and no length check could tell it from
+            // a file that really was empty. Truncating before the transcript is computed defeats
+            // every integrity property below it.
+            let plain;
+            if (fileContent instanceof Uint8Array) {
+                plain = fileContent;
+            } else if (fileContent instanceof ArrayBuffer) {
+                plain = new Uint8Array(fileContent);
+            } else if (ArrayBuffer.isView(fileContent)) {
+                // A view of any element width: take the bytes it spans, which is what WebCrypto
+                // itself would do, rather than one byte per element.
+                plain = new Uint8Array(
+                    fileContent.buffer, fileContent.byteOffset, fileContent.byteLength);
+            } else {
+                this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.fileContent');
+            }
+            const total = plain.length;
+            // An empty file is ONE empty chunk, not zero chunks: a reader has to find a chunk
+            // marked final, and a header on its own carries no such mark. The same `max` keeps an
+            // exact multiple of the chunk size from growing a trailing empty chunk, which the
+            // reader's domain check rejects outright.
+            const n = Math.max(1, Math.ceil(total / chunkSize));
+            const totals = { totalChunks: n, totalPlaintext: total };
+
+            const parts = [t.fileHeader];
+            for (let i = 0; i < n; i++) {
+                const isFinal = (i === n - 1);
+                const nonce = this._randomBytes(12);
+                const sealed = await this._subtle().encrypt(
+                    {
+                        name: this.AES_ALGORITHM,
+                        iv: nonce,
+                        additionalData: t.aadFor(i, isFinal, totals),
+                        tagLength: this.AES_TAG_LENGTH,
+                    },
+                    key,
+                    plain.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, total)),
+                );
+                parts.push(nonce, new Uint8Array(sealed));
+            }
+            return {
+                bytes: this._concatBytes(parts),
+                blobId: [...blobId].map(b => b.toString(16).padStart(2, '0')).join(''),
+            };
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, W);
+        }
+    }
+
+    /**
      * Read a version-2 chunk-framed file.
      *
      * The framing is parsed from the stored LENGTH, not from a count on the wire. Successive chunk
@@ -2333,6 +2491,7 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     // never a passphrase problem and must never be reported as one.
     decryptFile: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
     decryptFileV2: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
+    encryptFileV2: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     decryptName: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
 
     // Everything else: a primitive rejected for a reason that is not authentication, not policy
