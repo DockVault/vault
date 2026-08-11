@@ -55,9 +55,14 @@ class AuditLogger:
         Returns:
             Created AuditLog object
         """
+        temp_credential_id = None
         if user:
             user_id = user.id
             username = user.username
+            # Derived here rather than at each call site, so every surface gets it at once and
+            # a new one cannot forget. A temp session is the account object with this stamped
+            # on it, which is exactly why `username` alone is not attribution.
+            temp_credential_id = getattr(user, '_temp_cred_id', None)
 
         # At-rest privacy: file/folder names are encrypted in the files/folders tables,
         # so we must not persist their plaintext in the audit details JSON (that would
@@ -74,6 +79,7 @@ class AuditLogger:
         audit_log = AuditLog(
             user_id=user_id,
             username=username,
+            temp_credential_id=temp_credential_id,
             action=action,
             resource_type=resource_type,
             resource_id=resource_id,

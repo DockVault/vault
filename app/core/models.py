@@ -913,6 +913,11 @@ class AuditLog(Base):
     
     # What
     action = Column(String(100), nullable=False)
+    # Which temporary credential performed this, when one did. `username` is the ACCOUNT's,
+    # because a temp session is the account -- so without this column the audit trail cannot
+    # answer "what did the credential I handed that contractor actually do?", and anything it
+    # did wrong is recorded under the account owner's name.
+    temp_credential_id = Column(UUID(as_uuid=True), nullable=True)
     resource_type = Column(String(50), nullable=True)
     resource_id = Column(String(255), nullable=True)
     
@@ -1336,6 +1341,19 @@ class ChunkedUploadSession(Base):
     # which is the wrong width for a value that also has to sit in a fixed-width binary header.
     # The server never interprets it; it only ever compares it for equality.
     blob_id = Column(String(32), nullable=True)
+
+    # WHICH principal opened this session. NULL means a person signed in directly.
+    #
+    # `user_id` above cannot answer that question: a temporary credential acts AS the account
+    # that minted it and carries the same `user_id`, so a session was identified only by the
+    # account it belonged to. Any credential holding `file.upload` on the vault could
+    # therefore write into, read, or destroy an upload somebody else had started -- including
+    # replacing chunks of it, after which the owner's own completion succeeds and stores a
+    # file made partly of the credential's bytes.
+    #
+    # A credential must never match a NULL: an interactive session is not "any credential's",
+    # it is nobody's but the person's.
+    temp_credential_id = Column(UUID(as_uuid=True), nullable=True)
 
     # Session management
     created_at = Column(DateTime, default=datetime.utcnow)

@@ -146,15 +146,22 @@ def test_id_scope_chunked_upload_enforcement(admin):
 
         # cross-credential hijack: admin opens a session targeting OTHER; the scoped credential
         # (scope = D) must not touch it via any surface, nor see it listed.
+        #
+        # These answer 404, not 403, and that is the stronger answer rather than a weakened one.
+        # A session now belongs to the principal that opened it, so one belonging to somebody else
+        # is filtered out of the query and is indistinguishable from a session that never existed
+        # -- which is what a caller with no business knowing about it should be told. The folder
+        # scope check that used to produce the 403 is still there and still runs; it is simply no
+        # longer the first thing to refuse.
         r = init(admin, OTHER, "hijack.bin")
         assert r.status_code == 200
         sid = r.json()["session_id"]
-        assert c.get(f"/vaults/{vid}/uploads/{sid}").status_code == 403                 # inspect
-        assert c.put(f"/vaults/{vid}/uploads/{sid}/chunks/0", data=b"0123456789").status_code == 403  # write chunk
+        assert c.get(f"/vaults/{vid}/uploads/{sid}").status_code == 404                 # inspect
+        assert c.put(f"/vaults/{vid}/uploads/{sid}/chunks/0", data=b"0123456789").status_code == 404  # write chunk
         listed = {s["session_id"] for s in c.get(f"/vaults/{vid}/uploads").json()}
         assert sid not in listed                                                        # enumerate
         assert sid in {s["session_id"] for s in admin.get(f"/vaults/{vid}/uploads").json()}
-        assert c.delete(f"/vaults/{vid}/uploads/{sid}").status_code == 403              # cancel
+        assert c.delete(f"/vaults/{vid}/uploads/{sid}").status_code == 404              # cancel
         # the session survived the denied cancel (admin can still see it)
         assert sid in {s["session_id"] for s in admin.get(f"/vaults/{vid}/uploads").json()}
     finally:
