@@ -20,6 +20,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request as StarletteRequest
 from pydantic import BaseModel, EmailStr, Field, field_validator
+import sqlalchemy
 from sqlalchemy.orm import Session
 import io
 import os
@@ -1519,6 +1520,11 @@ def _audit_row_to_dict(r):
     return {
         "timestamp": r.timestamp.isoformat() if r.timestamp else None,
         "username": r.username,
+        # The ACCOUNT is always the username, because a temporary session is the account.
+        # This is the only field that says which credential acted, so an admin can answer
+        # "what did the one I issued to that contractor actually do?" -- and so a credential
+        # misbehaving is not recorded as the owner doing it.
+        "temp_credential_id": str(r.temp_credential_id) if r.temp_credential_id else None,
         "action": r.action,
         "status": r.status,
         "ip_address": r.ip_address,
@@ -1581,12 +1587,13 @@ async def export_audit_log(
     )
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["Timestamp", "Username", "Action", "Status", "IP Address",
-                     "Resource Type", "Resource ID", "Details"])
+    writer.writerow(["Timestamp", "Username", "Temp Credential", "Action", "Status",
+                     "IP Address", "Resource Type", "Resource ID", "Details"])
     for r in rows:
         writer.writerow([_csv_formula_safe(cell) for cell in (
             r.timestamp.isoformat() if r.timestamp else "",
             r.username or "",
+            str(r.temp_credential_id) if r.temp_credential_id else "",
             r.action or "",
             r.status or "",
             r.ip_address or "",
@@ -3334,6 +3341,23 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
     web session must keep working. Mutates session rows in `db` but does NOT commit."""
     from app.core.models import ActiveSession
     from app.core.database import redis_client
+
+    # Release any chunked upload the credential had open. Those sessions are bound to the
+    # principal that started them, so once the credential is gone nobody can finish them and
+    # nobody but a deployment administrator could clear them -- while they keep occupying the
+    # account's session budget until they expire. The buffered chunks are swept with the row.
+    #
+    # Marked cancelled rather than deleted, so the ordinary sweeper reclaims the bytes on its
+    # own schedule rather than this request doing filesystem work. The row leaves the active
+    # listing immediately and the sweep removes it shortly after; what survives for auditing
+    # is the audit row, not this one.
+    if temp_credential_id is not None:
+        for up in db.query(ChunkedUploadSession).filter(
+            ChunkedUploadSession.temp_credential_id == temp_credential_id,
+            ChunkedUploadSession.status == 'active',
+        ).all():
+            up.status = 'cancelled'
+
     q = db.query(ActiveSession).filter(ActiveSession.is_active == True)  # noqa: E712
     if user_id is not None:
         q = q.filter(ActiveSession.user_id == user_id)
@@ -3453,6 +3477,16 @@ async def terminate_temp_credential_sessions(
     _guard_temp_session_cred_mutation(current_user, temp_cred, 'invalidate')
 
     # Find and deactivate all active sessions for this credential
+    # A temporary credential is single-login: once its session is gone it cannot log back in,
+    # so terminating its sessions ends it as surely as deactivating it does. Release the
+    # uploads it left open, the same as the other two paths -- otherwise they stay active,
+    # finishable by nobody, and count against the account's session budget until they expire.
+    for _up in db.query(ChunkedUploadSession).filter(
+        ChunkedUploadSession.temp_credential_id == temp_cred.id,
+        ChunkedUploadSession.status == 'active',
+    ).all():
+        _up.status = 'cancelled'
+
     active_sessions = db.query(ActiveSession).filter(
         ActiveSession.temp_credential_id == temp_cred.id,
         ActiveSession.is_active == True
@@ -8080,6 +8114,62 @@ def _sweep_orphaned_upload_chunks(db: Session, idle_minutes: Optional[int] = Non
     }
 
 
+def _session_visible(current_user):
+    """Sessions this caller may SEE and CANCEL.
+
+    Wider than `_session_principal`, and only in the direction that is safe. A person signed in
+    directly may look at, and get rid of, any upload sitting on their own account -- including one
+    a temporary credential started. It is their storage, their quota and their session budget.
+
+    They still may not WRITE to or COMPLETE such a session; those keep the strict rule, because
+    that is where the tampering and the misattribution live.
+
+    Without this, binding a session to its opener hid a credential's uploads from the only party
+    entitled to clear them: a few credentials could fill the account's session budget, the owner
+    would see an empty list beside a 429, and nothing short of a deployment administrator could
+    resolve it. Revoking the credential made it permanent rather than better.
+    """
+    # Branching on the credential id alone was wrong: a temporary session that somehow lacks
+    # one would land in the owner branch and get see-and-cancel over the whole account --
+    # exactly the shape the strict predicate below refuses, made unreachable by returning
+    # first. Anything that is temporary in any way goes through the strict rule.
+    if (getattr(current_user, '_is_temp_session', False)
+            or getattr(current_user, '_temp_cred_id', None) is not None):
+        return _session_principal(current_user)
+    return ChunkedUploadSession.user_id == current_user.id
+
+
+def _session_principal(current_user):
+    """Restrict a chunked-upload session query to the principal that opened it.
+
+    `user_id` alone cannot do this. A temporary credential acts AS the account that minted it and
+    carries the same `user_id`, so every session surface -- write a chunk, list, inspect, complete,
+    cancel -- was reachable by any credential holding `file.upload` on the vault, for uploads it
+    had never started. A credential could overwrite chunks of somebody else's in-flight upload and
+    the owner's own completion would then succeed, storing a file made partly of the credential's
+    bytes, with a checksum computed over the tampered assembly. On a zero-knowledge vault that is
+    destruction rather than tampering: one replaced chunk fails the whole-file tag, and the browser
+    released the only plaintext copy when it encrypted.
+
+    Applied as a query filter rather than a post-fetch check, so a session belonging to another
+    principal is simply not found -- the same answer as one that does not exist, which is also the
+    right answer to give.
+
+    A credential must not match NULL: an interactive session belongs to the person, not to
+    "whoever is acting as them".
+    """
+    cred_id = getattr(current_user, '_temp_cred_id', None)
+    if cred_id is None:
+        # A temporary session with no credential id should be impossible -- authentication rejects
+        # it well before here -- but the whole point of this predicate is that the SHAPE of the
+        # caller decides what they reach, and defaulting a temp session to the owner's predicate
+        # would be this defect over again. Match nothing instead of guessing.
+        if getattr(current_user, '_is_temp_session', False):
+            return sqlalchemy.false()
+        return ChunkedUploadSession.temp_credential_id.is_(None)
+    return ChunkedUploadSession.temp_credential_id == cred_id
+
+
 def _received_chunk_indices(session_dir) -> set:
     """Authoritative set of chunk indices present on disk (survives restarts)."""
     if not session_dir.exists():
@@ -8104,6 +8194,11 @@ def _session_payload(session: ChunkedUploadSession, received: int) -> dict:
         'chunks_received': received,
         'folder_id': str(session.folder_id) if session.folder_id else None,
         'percent': round(received * 100 / total, 1) if total else 0,
+        # Which principal opened it. The owner may cancel any session on their account, and
+        # cancelling a zero-knowledge upload destroys the only copy of those bytes -- so a
+        # list they cannot tell apart is a list they cannot safely act on.
+        'temp_credential_id': (str(session.temp_credential_id)
+                               if session.temp_credential_id else None),
         'created_at': session.created_at.isoformat() if session.created_at else None,
         'last_chunk_at': session.last_chunk_at.isoformat() if session.last_chunk_at else None,
     }
@@ -8192,14 +8287,31 @@ async def init_chunked_upload(
         # ZK names are browser-encrypted (server-invisible), so ZK vaults are exempt.
         _enforce_file_type(body.file_name, _allowed_exts)
         # And it must not carry the fields that only mean something for an encrypted upload,
-        # mirroring the guard above. Accepting them was not harmless: a Standard session
-        # opened with an attempt token then refused every ordinary re-init of that same file,
-        # for the whole session lifetime, because the plain client sends none. `file_id` is
-        # deliberately still allowed -- a plain upload may choose its own id.
-        if body.blob_id is not None or body.zk_key_version is not None:
+        # mirroring the guard above. Accepting them is not harmless: a session opened while
+        # carrying one of them then refuses every ordinary re-init of that same file, for the whole
+        # session lifetime, because the plain client sends none.
+        #
+        # `file_id` is deliberately NOT in this list, and the reasoning is worth recording because
+        # it changed. A session opened carrying an id refuses every re-init of that file that
+        # declares none, for the whole session lifetime -- and the shipped client declares none for
+        # a standard upload, so the field looked like the same lockout this guard exists to
+        # prevent. What made that worth acting on was that a temporary credential could inflict it
+        # on the account owner. It no longer can: a session is now bound to the principal that
+        # opened it, so a credential's session is invisible to the owner and cannot collide with
+        # theirs. What remains is one principal colliding with itself, recoverable from the
+        # refusal, which names the session to discard.
+        #
+        # Against that, refusing it would remove a capability that exists on purpose: an API client
+        # may choose its own object id, and the completion honours it.
+        forbidden = [name for name, value in (
+            ('blob_id', body.blob_id),
+            ('zk_key_version', body.zk_key_version),
+        ) if value is not None]
+        if forbidden:
             raise HTTPException(
                 status_code=400,
-                detail="An upload to a standard vault must not send blob_id or zk_key_version.",
+                detail=("An upload to a standard vault must not send "
+                        + ", ".join(forbidden) + "."),
             )
 
     if body.total_size > _max_file_bytes:
@@ -8229,6 +8341,7 @@ async def init_chunked_upload(
     resume_q = db.query(ChunkedUploadSession).filter(
         ChunkedUploadSession.vault_id == vault_id,
         ChunkedUploadSession.user_id == current_user.id,
+        _session_principal(current_user),
         ChunkedUploadSession.total_size == body.total_size,
         ChunkedUploadSession.total_chunks == body.total_chunks,
         ChunkedUploadSession.status == 'active',
@@ -8331,6 +8444,7 @@ async def init_chunked_upload(
         # existing session (above) is unaffected — only a NEW session is capped.
         open_sessions = db.query(ChunkedUploadSession.id).filter(
             ChunkedUploadSession.user_id == current_user.id,
+            _session_principal(current_user),
             ChunkedUploadSession.status == 'active',
             ChunkedUploadSession.expires_at > now,
         ).count()
@@ -8338,6 +8452,27 @@ async def init_chunked_upload(
             raise HTTPException(
                 status_code=429,
                 detail="Too many concurrent uploads in progress; complete or cancel some before starting another.",
+            )
+        # The cap above now counts only the caller's OWN sessions, which is the fix: it used to
+        # count every session on the account, so a credential scoped to one vault could fill it and
+        # lock the owner out of uploading to every OTHER vault for the whole session lifetime --
+        # a scope escape, since the point of scoping is to bound the blast radius to the vaults
+        # granted.
+        #
+        # Per-principal counting alone would multiply the buffered-chunk disk by the number of
+        # live credentials, so the account keeps an overall ceiling too. Four credentials at
+        # their own limit reach it, which is ordinary use rather than abuse -- so reaching it
+        # must stay recoverable, and it is: the owner can list and cancel every session on
+        # the account, and revoking a credential releases the ones it opened.
+        account_sessions = db.query(ChunkedUploadSession.id).filter(
+            ChunkedUploadSession.user_id == current_user.id,
+            ChunkedUploadSession.status == 'active',
+            ChunkedUploadSession.expires_at > now,
+        ).count()
+        if account_sessions >= 100:
+            raise HTTPException(
+                status_code=429,
+                detail="This account has too many uploads in progress; complete or cancel some before starting another.",
             )
         session = ChunkedUploadSession(
             vault_id=vault_id,
@@ -8358,6 +8493,8 @@ async def init_chunked_upload(
             # Recorded only on a fresh session, like the epoch below; a resumed one keeps its
             # original and the comparison above is what enforces that.
             blob_id=body.blob_id,
+            # Whose session this is. NULL for a person signed in directly.
+            temp_credential_id=getattr(current_user, '_temp_cred_id', None),
             created_at=now,
             last_chunk_at=now,
             expires_at=now + timedelta(hours=_chunk_session_ttl_hours()),
@@ -8407,6 +8544,7 @@ async def upload_chunk(
         ChunkedUploadSession.id == session_id,
         ChunkedUploadSession.vault_id == vault_id,
         ChunkedUploadSession.user_id == current_user.id,
+        _session_principal(current_user),
     ).first()
     if session is None:
         raise HTTPException(status_code=404, detail="Upload session not found")
@@ -8527,6 +8665,7 @@ async def complete_chunked_upload(
         ChunkedUploadSession.id == session_id,
         ChunkedUploadSession.vault_id == vault_id,
         ChunkedUploadSession.user_id == current_user.id,
+        _session_principal(current_user),
     ).first()
     if session is None:
         raise HTTPException(status_code=404, detail="Upload session not found")
@@ -8830,6 +8969,7 @@ async def list_resumable_uploads(
     sessions = db.query(ChunkedUploadSession).filter(
         ChunkedUploadSession.vault_id == vault_id,
         ChunkedUploadSession.user_id == current_user.id,
+        _session_visible(current_user),
         ChunkedUploadSession.status == 'active',
         ChunkedUploadSession.expires_at > now,
     ).order_by(ChunkedUploadSession.created_at.desc()).all()
@@ -8868,6 +9008,7 @@ async def get_upload_session(
         ChunkedUploadSession.id == session_id,
         ChunkedUploadSession.vault_id == vault_id,
         ChunkedUploadSession.user_id == current_user.id,
+        _session_visible(current_user),
     ).first()
     if session is None:
         raise HTTPException(status_code=404, detail="Upload session not found")
@@ -8902,6 +9043,7 @@ async def cancel_chunked_upload(
         ChunkedUploadSession.id == session_id,
         ChunkedUploadSession.vault_id == vault_id,
         ChunkedUploadSession.user_id == current_user.id,
+        _session_visible(current_user),
     ).first()
     if session is None:
         raise HTTPException(status_code=404, detail="Upload session not found")
@@ -8910,9 +9052,27 @@ async def cancel_chunked_upload(
 
     shutil.rmtree(_upload_session_dir(vault_service, str(session.id)), ignore_errors=True)
     if session.status == 'active':
-        session.status = 'failed'
-        session.error_message = 'Cancelled by user'
+        # 'cancelled', matching what revoking a credential records. Two words for one outcome
+        # meant a query for cancelled uploads found half of them.
+        session.status = 'cancelled'
+        session.error_message = (
+            'Cancelled by the account owner' if session.temp_credential_id
+            and getattr(current_user, '_temp_cred_id', None) is None else 'Cancelled by user')
         db.commit()
+        # The one destructive cross-principal action here. On a zero-knowledge vault it
+        # destroys the only copy of the buffered bytes, so it does not go unrecorded in a
+        # change whose subject is attribution.
+        try:
+            AuditLogger(db).log_action(
+                action='upload_session_cancelled', status='success', user=current_user,
+                resource_type='vault', resource_id=str(vault_id),
+                details={'session_id': str(session.id),
+                         'opened_by_temp_credential_id': (
+                             str(session.temp_credential_id)
+                             if session.temp_credential_id else None)},
+            )
+        except Exception:  # noqa: BLE001 -- never fail the cancellation over its own record
+            pass
     return {'message': 'Upload cancelled', 'session_id': str(session.id)}
 
 
@@ -10657,6 +10817,8 @@ def _run_lightweight_migrations():
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS zk_key_version INTEGER",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS client_object_id UUID",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS blob_id VARCHAR(32)",
+            "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS temp_credential_id UUID",
+            "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS temp_credential_id UUID",
             # Backfill any legacy NULL/0 per-vault size_limit to the 1 GB default: such a vault
             # reserves nothing in the account budget SUM yet is treated as UNLIMITED at every upload
             # guard (`if vault.size_limit`), so the reservation model would under-count it. Idempotent.
