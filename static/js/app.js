@@ -8666,6 +8666,13 @@ function closeVault() {
 // ===========================================================================
 const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB — matches the server default
 
+// Hex SHA-256 of a buffer. Used to check a resumed upload's own chunks against what the
+// server stored, so a file edited since the interruption re-sends only what changed.
+async function sha256Hex(buf) {
+    const d = await crypto.subtle.digest('SHA-256', buf);
+    return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 // ===========================================================================
 // Zero-knowledge upload resume store (IndexedDB)
 // ---------------------------------------------------------------------------
@@ -9245,25 +9252,10 @@ const uploadManager = {
             // being forwarded, so a structured one arrived as 'Could not start upload' -- a
             // generic failure in place of the one explanation that says what to do.
             const d = e.detail;
-            const conflict = d && typeof d === 'object' && d.session_id && (
-                d.code === 'upload_attempt_mismatch' || d.code === 'object_id_mismatch'
-                || d.code === 'key_epoch_mismatch');
-            if (conflict) {
-                // An earlier attempt at this file is still open. Point at it rather than at the
-                // one destructive option: for an encrypted upload the buffered ciphertext is the
-                // ONLY copy -- the plaintext handle was released when the bytes were encrypted --
-                // so discarding cannot be undone, and resuming is almost always what was wanted.
-                //
-                // Nothing is deleted here, unlike the stale-key recovery further down. There the
-                // buffered bytes are provably unsalvageable; here they are a real upload that may
-                // still be running in another tab, and throwing it away silently would be worse
-                // than the error it replaces.
-                it.conflictSessionId = d.session_id;
-                it.status = 'conflict';
-                it.error = (d.message || 'An earlier attempt at this file is still in progress.');
-                this.render();
-                throw new Error(it.error);
-            }
+            // A refusal naming another session is no longer reachable from here: this client
+            // never asks to continue one, so an upload of a file already in flight simply opens
+            // its own session. The server still refuses a mismatched resume for callers that do
+            // name a session -- there is just no browser state to render for it.
             throw new Error(typeof d === 'string' ? d
                 : (d && d.message) || 'Could not start upload');
         }
@@ -9376,11 +9368,57 @@ const uploadManager = {
             } else if (it.needsServerSync) {
                 // Restored across a reload: re-sync which chunks the server already has
                 // so we only replay the missing ones.
+                let detail = null;
                 try {
                     const s = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`, { headers: this._vaultHeaders() });
-                    if (s.ok) { const sd = await s.json(); it.received = new Set(sd.received_chunks || []); }
+                    if (s.ok) { detail = await s.json(); it.received = new Set(detail.received_chunks || []); }
                 } catch (_) { /* fall back to re-sending all chunks (server is idempotent) */ }
                 it.needsServerSync = false;
+
+                // The server reports which indices it holds AND a digest of each. Skipping an
+                // index on the strength of its presence alone is what let an edited file join the
+                // previous attempt's chunks: same name, same length, so nothing else noticed and
+                // the stored file was part old and part new, with a 200.
+                //
+                // Only the chunks the server claims are re-read. Any that no longer match come out
+                // of the received set and go up with the rest, so an edit costs the chunks it
+                // touched rather than the whole file. Encrypted uploads are excluded: their local
+                // copy is ciphertext the server already has byte-for-byte, and a re-encryption is
+                // refused earlier as a different attempt.
+                if (detail && !it.isZk && it.file) {
+                    // Absent, not merely empty: an older server sends no digests at all, and
+                    // gating the whole check on the field being present meant trusting every
+                    // chunk in exactly that case. Treat it as nothing verifiable, which sends
+                    // them all again -- the same answer as a single missing digest, for the
+                    // same reason.
+                    const sums = detail.chunk_checksums || {};
+                    const stale = [];
+                    for (const idx of [...it.received]) {
+                        const want = sums[idx];
+                        if (!want) {
+                            // No digest recorded, so there is nothing to check this chunk
+                            // against -- send it again rather than trust it. `continue` here
+                            // left it in the received set, which SKIPS it: the whole defect
+                            // back, in every degraded state. Chunks stored before this
+                            // shipped have no digest at all, so the sessions most likely to
+                            // be mid-resume when it lands were exactly the unprotected ones.
+                            it.received.delete(idx);
+                            stale.push(idx);
+                            continue;
+                        }
+                        const start = idx * it.chunkSize;
+                        const part = it.file.slice(start,
+                            Math.min(start + it.chunkSize, it.file.size));
+                        if (await sha256Hex(await part.arrayBuffer()) !== want) {
+                            it.received.delete(idx);
+                            stale.push(idx);
+                        }
+                    }
+                    if (stale.length) {
+                        it.changedLocally = stale.length;
+                        this.render();
+                    }
+                }
             }
 
             for (let i = 0; i < it.totalChunks; i++) {
@@ -9467,14 +9505,8 @@ const uploadManager = {
             setTimeout(() => { this.items.delete(id); this.render(); }, 4000);
         } catch (err) {
             if (it.cancelled) return;
-            // A blocked row has already set its own status and message, and it has two
-            // controls that a plain error row does not. Overwriting it here left the copy
-            // telling the user to resume or discard while rendering neither button, and the
-            // Resume that WAS drawn re-ran the same refused request forever.
-            if (it.status !== 'conflict') {
-                it.status = 'error';
-                it.error = err.message || String(err);
-            }
+            it.status = 'error';
+            it.error = err.message || String(err);
             this.render();
         }
     },
@@ -9569,42 +9601,6 @@ const uploadManager = {
         return Math.round(it.percent || 0);
     },
 
-    // Step aside and let the earlier attempt through. Nothing is deleted: if its ciphertext is
-    // on this device the refresh below surfaces it and it resumes on its own, and if it is not,
-    // the row it surfaces explains that instead of failing silently.
-    async conflictResume(id) {
-        const it = this.items.get(id);
-        if (!it) return;
-        // Park it rather than delete it. The persist to IndexedDB happens after the init that
-        // was refused, so this row holds the ONLY reference to the ciphertext it encrypted --
-        // dropping it would throw those bytes away while claiming to be the safe choice.
-        it.status = 'paused';
-        it.paused = true;
-        it.error = null;
-        it.conflictSessionId = null;
-        this.render();
-        try { await this.refreshResumable(); } catch (_) { /* the tray still shows the truth */ }
-    },
-
-    // The irreversible one, taken only because the user chose it. For an encrypted upload the
-    // buffered ciphertext is the only copy of those bytes, so this cannot be undone -- which is
-    // why it is a second button rather than the wording of an error message.
-    async conflictDiscard(id) {
-        const it = this.items.get(id);
-        if (!it || !it.conflictSessionId) return;
-        const sid = it.conflictSessionId;
-        try {
-            await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${sid}`,
-                { method: 'DELETE', headers: this._vaultHeaders() });
-        } catch (_) { /* if it did not go, the retry below is refused again and says so */ }
-        try { await zkUploadStore.delete(sid); } catch (_) { /* no local copy is fine */ }
-        it.conflictSessionId = null;
-        it.status = 'queued';
-        it.error = null;
-        this.render();
-        this.run(id);
-    },
-
     render() {
         let tray = document.getElementById('upload-tray');
         if (!tray) {
@@ -9622,7 +9618,7 @@ const uploadManager = {
             const statusLabel = {
                 queued: 'Queued', uploading: 'Uploading', pausing: 'Pausing…',
                 paused: 'Paused', completing: 'Finalising…', done: 'Done',
-                error: 'Failed', 'needs-file': 'Resumable', conflict: 'Blocked',
+                error: 'Failed', 'needs-file': 'Resumable',
             }[it.status] || it.status;
 
             let controls = '';
@@ -9637,13 +9633,6 @@ const uploadManager = {
                 // ciphertext can't be replayed here, so it offers only Cancel (+ the note below).
                 controls += `<button class="up-btn up-btn-text" data-up-action="resume" data-up-id="${it.id}">Resume…</button>`;
             }
-            if (it.status === 'conflict') {
-                // Two ways out, and the non-destructive one comes first. Discarding is the only
-                // irreversible option here -- for an encrypted upload the buffered ciphertext is
-                // the sole copy -- and it used to be the only one the message named.
-                controls += `<button class="up-btn up-btn-text" data-up-action="conflict-resume" data-up-id="${it.id}">Resume earlier</button>`;
-                controls += `<button class="up-btn up-btn-text" data-up-action="conflict-discard" data-up-id="${it.id}">Discard it</button>`;
-            }
             if (it.status !== 'done') {
                 controls += `<button class="up-btn" data-up-action="cancel" data-up-id="${it.id}" title="Cancel">${this._icon('x')}</button>`;
             }
@@ -9654,12 +9643,15 @@ const uploadManager = {
             // failure), flag that it won't survive a reload while it's still in flight.
             const noResume = it.isZk && it.resumePersisted === false && it.resumeWarning
                 && it.status !== 'done' && it.status !== 'error' && it.status !== 'needs-file';
-            const sub = it.status === 'conflict' ? `<div class="up-error">${escapeHtml(
-                    'An earlier attempt at this file is still uploading. Resume it, or discard it '
-                    + 'to start over \u2014 discarding cannot be undone.')}</div>`
-                : it.status === 'error' ? `<div class="up-error">${escapeHtml(it.error || 'Upload failed')}</div>`
+            // A resumed upload that found some of its chunks no longer match says so. It is
+            // the only signal that the file changed since the interruption, and without it
+            // the re-upload looks like an ordinary slow resume.
+            const changed = it.changedLocally
+                ? ` · <span class="up-warn">file changed, re-sending ${it.changedLocally} part${it.changedLocally === 1 ? '' : 's'}</span>`
+                : '';
+            const sub = it.status === 'error' ? `<div class="up-error">${escapeHtml(it.error || 'Upload failed')}</div>`
                 : it.status === 'needs-file' ? `<div class="up-sub">${it.isZk ? 'Encrypted data isn\'t on this device — cancel and upload again' : 'Paused — click Resume and re-select the file'}</div>`
-                : `<div class="up-sub">${statusLabel} · ${pct}% · ${size}${noResume ? ' · <span class="up-warn">not resumable</span>' : ''}</div>`;
+                : `<div class="up-sub">${statusLabel} · ${pct}% · ${size}${changed}${noResume ? ' · <span class="up-warn">not resumable</span>' : ''}</div>`;
 
             return `
               <div class="up-row" data-up-row="${it.id}">
@@ -9675,7 +9667,7 @@ const uploadManager = {
         // A failed item (e.g. a rejected 0-byte upload) is finished, not active — exclude 'error'
         // so it doesn't stick in the tray header as "N active" forever.
         const active = items.filter(i => i.status !== 'done' && i.status !== 'needs-file'
-            && i.status !== 'error' && i.status !== 'conflict').length;
+            && i.status !== 'error').length;
         tray.innerHTML = `
           <div class="up-tray-head">
             <span>Uploads${active ? ` · ${active} active` : ''}</span>
@@ -9690,8 +9682,6 @@ const uploadManager = {
                 if (a === 'pause') this.pause(id);
                 else if (a === 'resume') this.resume(id);
                 else if (a === 'cancel') this.cancel(id);
-                else if (a === 'conflict-resume') this.conflictResume(id);
-                else if (a === 'conflict-discard') this.conflictDiscard(id);
             });
         });
         const clear = tray.querySelector('#up-tray-clear');
@@ -9702,7 +9692,7 @@ const uploadManager = {
                 // Keep a row whose server session is still open, even when it looks finished.
                 // Dropping it hid an upload that still existed, and the next attempt at the same
                 // file was refused by a session the user could no longer see or act on.
-                const stillOnServer = it.status !== 'done' && (it.sessionId || it.conflictSessionId);
+                const stillOnServer = it.status !== 'done' && it.sessionId;
                 if (finished && !stillOnServer) this.items.delete(id);
             }
             this.render();

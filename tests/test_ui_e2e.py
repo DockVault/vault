@@ -886,120 +886,151 @@ def test_zero_knowledge_upload_resumes_across_reload(page: Page, admin):
         admin.put("/settings", json={"zero_knowledge_enabled": False})
 
 
+# The blocked-upload test that stood here drove two encryptions of one file into a collision and
+# checked the row offered a way out of it. That collision no longer happens: resuming is asked for,
+# so a second upload of a file already in flight opens its own session instead of being handed the
+# first attempt's. The recovery flow it tested was removed with it, since nothing in this client can
+# reach the refusals it rendered -- the server still refuses a mismatched resume, but only for a
+# caller that names a session, which this one never does.
+
+
 @pytest.mark.ui
-def test_a_blocked_encrypted_upload_offers_both_ways_out(page: Page, admin):
-    """A second encryption of the same file must produce a row the user can act on.
+def test_a_resumed_upload_re_sends_the_parts_that_changed(logged_in: Page, admin):
+    """The client half of resume integrity, which nothing covered.
 
-    The first version of this shipped a recovery flow that never rendered: `run()`'s catch set the
-    status to 'error' unconditionally, overwriting the one this path sets, so the message told the
-    user to resume or discard while drawing neither control -- and the Resume that WAS drawn
-    re-ran the same refused request forever. Nothing tested it, which is how it got that far.
+    Every browser resume test here is for an encrypted vault, and the verification loop excludes
+    those deliberately -- their local copy is ciphertext the server already holds byte for byte. So
+    the loop protecting ORDINARY uploads had no test, and the first version of it skipped a chunk
+    whenever the server reported no digest for it, which is the original defect back in every
+    degraded state.
 
-    Both controls matter and they are not interchangeable. Discarding deletes the buffered
-    ciphertext, which for an encrypted upload is the only copy of those bytes.
+    Driven through the real uploadManager: interrupt after the chunks land, change the file
+    underneath it without changing its length, resume, and look at what was stored.
     """
-    from conftest import ApiClient
-
-    admin.put("/settings", json={"zero_knowledge_enabled": True})
-    user = admin.create_user(role="admin")
-    owner = ApiClient()
-    owner.login(user["_username"], user["_password"])
-    vid = None
-    fname = _u("blocked") + ".txt"
+    page = logged_in
+    vault = admin.create_vault(name=_u("resumeverify"))
+    vid = vault["id"]
     try:
-        _login(page, user["_username"], user["_password"])
-        vid = _create_zk_vault_via_ui(page, owner, "zk-blocked-pass-1")
+        page.click('.sidebar-item[data-section="vaults"]')
         page.wait_for_selector(f'.open-vault-btn[data-vault-id="{vid}"]', timeout=10000)
         page.click(f'.open-vault-btn[data-vault-id="{vid}"]')
         expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
-        out = page.evaluate(
-            """async ({ vid, fname }) => {
-                const kv = await zkGetCurrentDekVersion(vid);
-                const dek = await zkGetVaultDek(vid, kv);
 
-                const nameBi = await eccLib().nameBlindIndex(fname, dek, vid, kv);
-                const cipher = new Uint8Array(await eccLib().encryptFile(
-                    new TextEncoder().encode('BLOCKED ' + fname).buffer, dek));
-
-                // An earlier attempt still IN FLIGHT -- session open, no chunks sent, not
-                // completed. A finished upload deletes its session, so there would be nothing
-                // left to conflict with and the second attempt would simply succeed.
-                const firstId = zkNewObjId();
-                const firstInit = await fetch(`${API_BASE}/vaults/${vid}/uploads`, {
+        out = page.evaluate("""async ({ vid }) => {
+                const enc = new TextEncoder();
+                const auth = { 'Authorization': 'Bearer ' + authToken };
+                const init = await fetch(`${API_BASE}/vaults/${vid}/uploads`, {
                     method: 'POST',
-                    headers: { 'Authorization': 'Bearer ' + authToken,
-                               'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        total_size: cipher.byteLength, total_chunks: 1, chunk_size: 1 << 20,
-                        folder_id: null, zk_key_version: kv,
-                        enc_name: await eccLib().encryptName(fname, dek, vid, 'name', kv, firstId),
-                        enc_mime: await eccLib().encryptName('text/plain', dek, vid, 'mime', kv, firstId),
-                        name_bi: nameBi, file_id: firstId, blob_id: zkNewBlobId(),
-                    }),
+                    headers: { ...auth, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ file_name: 'edited.bin', total_size: 20,
+                                           total_chunks: 2, chunk_size: 10 }),
                 });
-                const firstSession = (await firstInit.json()).session_id;
+                const sid = (await init.json()).session_id;
+                await fetch(`${API_BASE}/vaults/${vid}/uploads/${sid}/chunks/0`,
+                    { method: 'PUT', headers: auth, body: enc.encode('AAAAAAAAAA') });
+                await fetch(`${API_BASE}/vaults/${vid}/uploads/${sid}/chunks/1`,
+                    { method: 'PUT', headers: auth, body: enc.encode('BBBBBBBBBB') });
 
-                // Now the same file, encrypted again: a fresh object id and a fresh attempt token,
-                // exactly what re-adding it to the tray produces. Everything the server matches a
-                // resume on is identical, because it is all deterministic for the same file.
-                const clientFileId = zkNewObjId();
-                const blobId = zkNewBlobId();
-                const second = uploadManager._newId();
-                uploadManager.items.set(second, {
-                    id: second, file: new File([cipher], fname, { type: 'text/plain' }),
-                    vaultId: vid, folderId: null, fileName: fname,
-                    totalSize: cipher.byteLength, totalChunks: 1, chunkSize: 1 << 20,
-                    sessionId: null, received: new Set(),
-                    status: 'queued', error: null, paused: false, cancelled: false,
-                    zkKeyVersion: kv, isZk: true,
-                    encName: await eccLib().encryptName(fname, dek, vid, 'name', kv, clientFileId),
-                    encMime: await eccLib().encryptName('text/plain', dek, vid, 'mime', kv, clientFileId),
-                    nameBi, clientFileId, blobId,
+                // Same length, second half different.
+                const changed = new File(
+                    [new Blob([enc.encode('AAAAAAAAAA'), enc.encode('ZZZZZZZZZZ')])],
+                    'edited.bin', { type: 'application/octet-stream' });
+
+                const id = uploadManager._newId();
+                uploadManager.items.set(id, {
+                    id, file: changed, vaultId: vid, folderId: null,
+                    fileName: 'edited.bin', totalSize: 20, totalChunks: 2, chunkSize: 10,
+                    sessionId: sid, received: new Set(), needsServerSync: true,
+                    status: 'queued', error: null, paused: false, cancelled: false, isZk: false,
                 });
-                await uploadManager.run(second);
+                await uploadManager.run(id);
+                const it = uploadManager.items.get(id);
+                return { status: it.status, error: it.error, changed: it.changedLocally || 0 };
+            }""", {"vid": vid})
+        assert out["status"] == "done", f"the resume did not finish: {out}"
+        assert out["changed"] == 1, (
+            f"exactly one chunk changed and the client should have said so, reported {out}")
 
-                const it = uploadManager.items.get(second);
-                const row = document.querySelector(`[data-up-row="${second}"]`);
-                const actions = row
-                    ? [...row.querySelectorAll('button[data-up-action]')]
-                          .map(b => b.getAttribute('data-up-action'))
-                    : [];
-                return {
-                    status: it.status,
-                    error: it.error,
-                    conflictSessionId: it.conflictSessionId,
-                    actions,
-                    text: row ? row.innerText : '',
-                    firstSession, firstInitOk: firstInit.status,
-                };
-            }""",
-            {"vid": vid, "fname": fname},
-        )
-
-        assert out["firstInitOk"] in (200, 201), out
-        assert out["conflictSessionId"] == out["firstSession"], (
-            "the blocked row points at the wrong session")
-        assert out["status"] == "conflict", (
-            f"a refused second encryption was not marked as blocked (status={out['status']}, "
-            f"error={out['error']}) -- the recovery controls only render for 'conflict'")
-        assert out["conflictSessionId"], "the blocked row does not know which session blocks it"
-        # Both ways out are present, and the non-destructive one is offered.
-        assert "conflict-resume" in out["actions"], (
-            f"no way to resume the earlier attempt: {out['actions']}")
-        assert "conflict-discard" in out["actions"], (
-            f"no way to discard the earlier attempt: {out['actions']}")
-        # The row explains both options. (The 'Blocked' status label belongs to the ordinary
-        # progress sub-line, which a blocked row replaces with this explanation.)
-        assert "Resume" in out["text"] and "discard" in out["text"].lower(), out["text"]
-        assert "cannot be undone" in out["text"], (
-            f"the row does not warn that discarding is irreversible: {out['text']!r}")
-        # And the copy must not point at cancelling, which deletes the only copy of the bytes.
-        assert "cancel" not in (out["error"] or "").lower(), out["error"]
+        listing = admin.get(f"/vaults/{vid}/files").json()["items"]
+        fid = next(f["id"] for f in listing if f.get("name") == "edited.bin")
+        stored = admin.get(f"/vaults/{vid}/files/{fid}/download").content
+        assert stored == b"AAAAAAAAAAZZZZZZZZZZ", (
+            f"a resumed upload of an edited file stored {stored!r} -- the changed half was not "
+            "re-sent, so the object is part old and part new")
     finally:
-        if vid:
-            owner.delete_vault(vid)
-        admin.delete_user(user["id"])
-        admin.put("/settings", json={"zero_knowledge_enabled": False})
+        admin.delete_vault(vid)
+
+
+@pytest.mark.ui
+def test_a_resume_with_no_recorded_digests_re_sends_everything(logged_in: Page, admin):
+    """The degraded case, which is the one that shipped broken.
+
+    A chunk the server holds no digest for cannot be checked, so it has to be sent again. The first
+    version skipped it -- and chunks written before this change have no digest at all, so the
+    sessions most likely to be mid-resume when it lands were precisely the unprotected ones.
+    """
+    page = logged_in
+    vault = admin.create_vault(name=_u("nodigest"))
+    vid = vault["id"]
+    try:
+        page.click('.sidebar-item[data-section="vaults"]')
+        page.wait_for_selector(f'.open-vault-btn[data-vault-id="{vid}"]', timeout=10000)
+        page.click(f'.open-vault-btn[data-vault-id="{vid}"]')
+        expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
+
+        out = page.evaluate("""async ({ vid }) => {
+                const enc = new TextEncoder();
+                const auth = { 'Authorization': 'Bearer ' + authToken };
+                const init = await fetch(`${API_BASE}/vaults/${vid}/uploads`, {
+                    method: 'POST',
+                    headers: { ...auth, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ file_name: 'legacy.bin', total_size: 20,
+                                           total_chunks: 2, chunk_size: 10 }),
+                });
+                const sid = (await init.json()).session_id;
+                await fetch(`${API_BASE}/vaults/${vid}/uploads/${sid}/chunks/0`,
+                    { method: 'PUT', headers: auth, body: enc.encode('AAAAAAAAAA') });
+                await fetch(`${API_BASE}/vaults/${vid}/uploads/${sid}/chunks/1`,
+                    { method: 'PUT', headers: auth, body: enc.encode('BBBBBBBBBB') });
+
+                // A session as an older build left it: chunks present, no digests. Stubbed on the
+                // wire, because that is exactly how that state looks to this client.
+                const realFetch = window.fetch;
+                window.fetch = async (url, opts) => {
+                    const r = await realFetch(url, opts);
+                    if (String(url).endsWith(`/uploads/${sid}`) && (!opts || !opts.method)) {
+                        const d = await r.clone().json();
+                        delete d.chunk_checksums;
+                        return new Response(JSON.stringify(d),
+                            { status: 200, headers: { 'Content-Type': 'application/json' } });
+                    }
+                    return r;
+                };
+
+                const changed = new File(
+                    [new Blob([enc.encode('XXXXXXXXXX'), enc.encode('ZZZZZZZZZZ')])],
+                    'legacy.bin', { type: 'application/octet-stream' });
+                const id = uploadManager._newId();
+                uploadManager.items.set(id, {
+                    id, file: changed, vaultId: vid, folderId: null,
+                    fileName: 'legacy.bin', totalSize: 20, totalChunks: 2, chunkSize: 10,
+                    sessionId: sid, received: new Set(), needsServerSync: true,
+                    status: 'queued', error: null, paused: false, cancelled: false, isZk: false,
+                });
+                await uploadManager.run(id);
+                window.fetch = realFetch;
+                const it = uploadManager.items.get(id);
+                return { status: it.status, error: it.error };
+            }""", {"vid": vid})
+        assert out["status"] == "done", f"the resume did not finish: {out}"
+
+        listing = admin.get(f"/vaults/{vid}/files").json()["items"]
+        fid = next(f["id"] for f in listing if f.get("name") == "legacy.bin")
+        stored = admin.get(f"/vaults/{vid}/files/{fid}/download").content
+        assert stored == b"XXXXXXXXXXZZZZZZZZZZ", (
+            f"with no digests to check against every chunk must be re-sent; stored {stored!r}")
+    finally:
+        admin.delete_vault(vid)
 
 
 def _zk_start_partial_upload(page: Page, vid: str, fname: str, marker: str,

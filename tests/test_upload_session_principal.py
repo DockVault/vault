@@ -42,10 +42,13 @@ def _mint(admin, vault_id, caps):
     return client
 
 
-def _init(client, vault_id, name, chunks=3, size=30):
-    return client.post(f"/vaults/{vault_id}/uploads", json={
-        "file_name": name, "total_size": size, "total_chunks": chunks, "chunk_size": 10,
-    })
+def _init(client, vault_id, name, chunks=3, size=30, resume=None):
+    """Resuming is asked for now -- without naming a session the server opens a new one, because it
+    cannot tell a continuation from a second upload of the same file."""
+    body = {"file_name": name, "total_size": size, "total_chunks": chunks, "chunk_size": 10}
+    if resume is not None:
+        body["resume_session_id"] = resume
+    return client.post(f"/vaults/{vault_id}/uploads", json=body)
 
 
 @pytest.fixture
@@ -109,7 +112,7 @@ def test_a_credential_can_still_run_its_own_upload(admin, vault):
     # Its own session is listed, inspectable and resumable by it.
     assert sid in [s["session_id"] for s in temp.get(f"/vaults/{vault}/uploads").json()]
     assert temp.get(f"/vaults/{vault}/uploads/{sid}").status_code == 200
-    again = _init(temp, vault, "credentials-own.bin", chunks=2, size=20)
+    again = _init(temp, vault, "credentials-own.bin", chunks=2, size=20, resume=sid)
     assert again.status_code in (200, 201) and again.json()["session_id"] == sid
 
     done = temp.post(f"/vaults/{vault}/uploads/{sid}/complete")
@@ -192,14 +195,22 @@ def test_a_credential_cannot_adopt_the_owners_session_by_resuming(admin, vault):
                      data=b"AAAAAAAAAA").status_code in (200, 201)
 
     temp = _mint(admin, vault, ["file.upload", "vault.see_files"])
+    # An ordinary second upload cannot adopt anything now: resuming is asked for, so this just
+    # opens the credential's own session. The collision is prevented rather than detected, which
+    # is the stronger outcome.
     theirs = _init(temp, vault, "same-name.bin", chunks=2, size=20)
     assert theirs.status_code in (200, 201), theirs.text
-    assert theirs.json()["session_id"] != my_sid, (
-        "a credential's init adopted the owner's in-flight session -- it is now holding a handle "
-        "to an upload it did not start, and knows how much of it has arrived")
-    assert theirs.json().get("received_chunks") in (None, [], [0]) or True
-    # And the owner's own re-init still finds the owner's session, not the credential's.
-    again = _init(admin, vault, "same-name.bin", chunks=2, size=20)
+    assert theirs.json()["session_id"] != my_sid
+    assert theirs.json()["received_chunks"] == [], (
+        "the credential was told it already holds chunks it never sent")
+
+    # And naming the owner's session outright is refused rather than found.
+    named = _init(temp, vault, "same-name.bin", chunks=2, size=20, resume=my_sid)
+    assert named.status_code == 409, (
+        f"a credential continued an upload the owner started: {named.status_code} {named.text}")
+
+    # The owner's own session is reachable by the owner, and untouched by all of it.
+    again = _init(admin, vault, "same-name.bin", chunks=2, size=20, resume=my_sid)
     assert again.json()["session_id"] == my_sid
 
 
