@@ -154,7 +154,21 @@ offset 5   1 byte    purpose   0x01 direct DEK | 0x02 team DEK | 0x03 team priva
 offset 6   2 bytes   reserved  0x0000, MUST be zero
 ```
 
-Covered by the AAD, so the purpose byte cannot be rewritten to steer a payload into another reader.
+The purpose is bound into the AAD — but as the value the READER EXPECTED, not as the byte that
+arrived. Every construction rebuilds the eight header bytes from its own purpose constant and
+authenticates that; the wire header is never copied into the AAD.
+
+That distinction matters, because "covered by the AAD" invites two wrong implementations. One
+copies the wire bytes into the AAD and produces a format nobody else can read. The other concludes
+that AAD coverage makes it safe to pick a reader from the wire byte — which is the exact attack
+this document denies, and which AAD coverage would not prevent, since a payload steered into
+another reader is authenticated under that reader's transcript.
+
+**The protection is that the reader is chosen by the call site and never by the wire** (§6.3), and
+the expected purpose in the AAD is what makes a mismatch fail rather than silently succeed. A
+reader may additionally compare the wire header against the one it rebuilt — content does, because
+it is a public entry point a streaming caller can reach without passing the dispatch in §6.2 — but
+that comparison is a second line, not the first.
 
 There is deliberately **no cipher-suite field**: every choice (P-384, HKDF-SHA256, AES-256-GCM,
 12-byte nonce, 128-bit tag) is implicit in `version`. A suite change is a version bump, not a
@@ -170,17 +184,35 @@ rejects any other length before parsing.
 For team-private wraps and content there is no such length rule, and discrimination is magic-only:
 a legacy payload whose random IV begins with `DVZ2` (p = 2⁻³²) would be dispatched to the v2 reader.
 To keep that from becoming unrecoverable loss, **"is v2" requires the whole header to validate** —
-magic, `version == 0x02`, a known `purpose`, `reserved == 0`, and for content a `chunk_size` in
-range and a total length consistent with the framing. Only a payload passing all of that is
-committed to the v2 path.
+magic, `version == 0x02`, a known `purpose`, `reserved == 0`. A payload passing all four is
+committed to the v2 path; one failing any of them is not v2 and is read as legacy.
+
+**The commit point is the header and nothing beyond it.** An earlier draft added "and for content a
+`chunk_size` in range and a total length consistent with the framing" to that list, which cannot be
+right: it would mean a payload failing those falls back to the legacy reader, and falling back
+after committing is precisely the retry §6.3 forbids — it turns a tampering signal into a parser
+oracle. `chunk_size` and framing are validated *after* the commit and are hard failures.
+
+The residual is a legacy payload whose random IV happens to begin `DVZ2`, then `0x02`, then a byte
+in `0x01..0x04`, then two zero bytes: about 2⁻⁶². That is the price of a magic-only discriminator
+and it is accepted here rather than paid for with a fall-back path.
 
 ### 6.3 Downgrade
 
 - A payload that **commits** to v2 by §6.2 and then fails its tag **fails closed**. It is not
   retried as legacy; retrying is what turns a tampering signal into a parser oracle.
-- A payload with the magic but a structural failure (unknown version or purpose, non-zero reserved)
-  is rejected as *unsupported*, distinguishably from *damaged* — see §6.5, which is a hard
-  precondition rather than an aspiration.
+- A payload with the magic but a structural failure is rejected distinguishably from *damaged* —
+  see §6.5, which is a hard precondition rather than an aspiration. Which of the two answers it
+  gets is not a free choice, and an earlier draft of this bullet gave the wrong one for two of the
+  three cases:
+  - **`version` above the one this build knows → *unsupported*.** It is a real format from a newer
+    build, and the honest sentence is "update this deployment", not "your file is damaged".
+  - **`version` below `0x02`, or a `purpose` outside the known range, or `reserved != 0` →
+    *malformed*.** None of these can be a future format. §6.1 makes the reserved bytes a
+    breaking-change channel with a strict-reject rule, so a non-zero value means bytes this build
+    cannot reason about — malformed, not new. Calling it *unsupported* would tell an operator to
+    upgrade in response to corruption, and would make the reserved channel behave like the
+    extension channel §6.1 says it deliberately is not.
 - A **legacy reader must reject a v2 payload** rather than interpret the header as ciphertext.
 - **The expected purpose is chosen by the call site and compared against the wire byte. It is never
   read off the wire to select a transcript.** This is what §6.1's assurance actually rests on: if a
