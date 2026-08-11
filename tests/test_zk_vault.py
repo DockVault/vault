@@ -68,10 +68,34 @@ def test_zk_opaque_roundtrip(admin):
             admin.delete_vault(v["id"])
 
 
+def _stored_relative_path(file_id):
+    """Where the server actually put the blob, read from the row rather than guessed.
+
+    This used to be built as `<vault>/files/<file_id>`, which stopped being true when the blob
+    filename was decoupled from the row id -- two uploads sharing a client-chosen id would
+    otherwise open the same path, and the loser's cleanup would delete the winner's bytes. The
+    path is recorded in `files.storage_path`, relative to the storage root, and every read and
+    delete in the application uses that column; so does this now.
+    """
+    container = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
+    sql = "SELECT storage_path FROM files WHERE id = '%s'" % file_id
+    out = subprocess.run(
+        ["docker", "exec", container, "sh", "-c",
+         'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "%s"' % sql],
+        capture_output=True, text=True,
+    )
+    return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
+
+
 def _stored_sha256(vault_id, file_id):
     """SHA-256 of the on-disk stored file inside the vault-api container, or None
     if it can't be read (docker unavailable / different layout)."""
-    path = f"/app/storage/{vault_id}/files/{file_id}"
+    relative = _stored_relative_path(file_id)
+    if relative is None:
+        if os.environ.get("VAULT_SAME_COMMIT_CI", "").lower() in {"1", "true", "yes"}:
+            pytest.fail(f"no storage_path recorded for file {file_id}")
+        return None
+    path = f"/app/storage/{relative}"
     out = subprocess.run(
         ["docker", "exec", _API_CONTAINER, "sha256sum", path],
         capture_output=True,
