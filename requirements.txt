@@ -9,7 +9,7 @@
 # fastapi 0.115 / starlette >=0.40 close CVE-2024-47874 (unbounded multipart buffering -> OOM DoS on
 # the upload endpoints). starlette is pinned explicitly for reproducibility (it arrives via fastapi).
 fastapi==0.141.1
-starlette==1.3.1
+starlette==1.5.1
 uvicorn[standard]==0.52.1
 # 0.0.18 closes CVE-2024-53981 (many-part malformed multipart -> CPU-exhaustion DoS) on top of the
 # earlier 0.0.7 Content-Type option-parsing ReDoS fix (CVE-2024-24762). Pairs with the fastapi/starlette
@@ -18,7 +18,7 @@ python-multipart==0.0.32
 
 # Config / validation
 pydantic==2.13.4
-pydantic-settings==2.14.2
+pydantic-settings==2.15.0
 python-dotenv==1.2.2
 email-validator==2.3.0
 
