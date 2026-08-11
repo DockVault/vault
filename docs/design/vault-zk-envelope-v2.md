@@ -435,6 +435,15 @@ upload, so without it two attempts at the same object derive the *same* key with
 making chunks from two attempts freely interchangeable, both authenticating. A continued resume
 keeps its `blob_id`; a restarted upload gets a new one. Cost: 16 bytes per file.
 
+One thing this framing newly exposes, recorded because the product claim is that the server
+learns nothing: the cleartext `file_header` tells the server which format and which chunk size
+wrote each object, where a legacy blob begins with a random IV and is indistinguishable from noise.
+That is a fingerprint of the writing build and its flag state, not of the user's data — the exact
+plaintext length was already derivable from the stored length under both framings, and the chunk
+boundaries are at fixed offsets rather than content-defined, so they carry no structural signal.
+It is inherent to having a version discriminator at all (§6.1), and worth knowing before anyone
+treats the stored bytes as opaque for traffic-analysis purposes.
+
 `blob_id` is **16 raw bytes** wherever it appears — in the `file_header`, in the `info`, and in the
 AAD. §4.1's "never raw 16-byte form" rule governs **UUIDs**, and `blob_id` is not one: it is opaque
 random bytes with no textual form, and the `file_header` is fixed-width. An implementer who reaches
@@ -497,7 +506,13 @@ mark its output until the terminator is in.
 
 - `chunk_size` is the plaintext chunk length, bounded **4096 .. 8388608** (8 MiB). The ceiling was
   raised from 4 MiB because the shipped transport chunk is 5 MiB and an implementer will align them.
-  A crypto chunk need not equal a transport chunk, but the grammar must not forbid it.
+  A crypto chunk need not equal a transport chunk, but the grammar must not forbid it. This build's
+  writer picks **1 MiB** and does not try to align them: the 28-byte file header and the 28 bytes
+  each chunk adds mean a crypto boundary and a transport boundary coincide only periodically and
+  never usefully, so alignment buys nothing to pay for. A megabyte keeps the overhead at three
+  thousandths of a percent while staying small enough for a bounded streaming writer to hold. That
+  is a writer-side choice, revisable without touching the grammar — the size is recorded in each
+  file's header and a reader takes it from there.
 - Every chunk except the last holds exactly `chunk_size` plaintext bytes.
 - `total_chunks == max(1, ceil(total_plaintext / chunk_size))`. The `max(1, …)` matters: an empty
   file is one chunk, and `ceil(0/n)` is 0.
@@ -656,18 +671,27 @@ writer, and operator documentation at the point of enabling.
 Order, as planned: amend the error contract (§6.5) → widen the server's algorithm filters (§6.4)
 → direct wraps → content → team wraps.
 
-**What actually shipped took the team wraps before content, and content has not shipped at all** —
-recorded so a later reader does not infer from the list that it has. The error contract, the
-algorithm filters, the direct wrap and both team wraps are in. Every writer is gated off and the
-canonical algorithm label is still generation 1, so nothing in this tree can write a v2 row.
+**What actually shipped took the team wraps before content.** The error contract, the algorithm
+filters, the direct wrap and both team wraps are in, and content is now in as well — the reader
+first, then the writer behind its own gate. Every writer is gated off and the canonical algorithm
+label is still generation 1, so nothing in this tree can write a v2 row without a source change.
+
+The content writer's gate is a second constant rather than a reuse of the wrap gate, because the
+two protect against different readers. A wrap is read by *other members*, so writing one early
+locks people out and there is no way back. Content is read by whoever can already open the vault,
+and every such reader has understood this format since the reader shipped — so the exposure is
+other TABS, not other people, and a file already written keeps reading if the gate goes back off.
+Sharing one constant would have forced the stricter of the two conditions onto both and, worse,
+made turning one on turn the other on with it.
 
 One obligation went unmet on the way: §9 requires the team-DEK wrap's legacy form to be captured as
 a baseline fixture *before anything changes*, and the team wraps shipped without one. That is a
 team-wrap debt rather than a content gate, but it should not be discovered by inference later.
 
-Content is therefore the remaining construction, and it carries preconditions the wraps did not
-(§7.4): the object id, the DEK epoch and the per-attempt `blob_id` must each be declared when the
-upload session opens and compared on resume. Those land before any content byte is written.
+Content carried preconditions the wraps did not (§7.4): the object id, the DEK epoch and the
+per-attempt `blob_id` must each be declared when the upload session opens and compared on resume.
+**Those landed first, each on its own, before either the content reader or the content writer** —
+which is why content could then ship in the two halves described above.
 
 ## 11. Why the team wraps bind so little
 

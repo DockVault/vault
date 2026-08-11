@@ -9833,9 +9833,22 @@ async function uploadFiles(files) {
                     // the bytes it names are produced together and cannot drift apart. A resumed
                     // upload replays these same bytes and re-declares this same token; only a fresh
                     // encryption gets a new one, which is exactly what the server refuses to merge.
-                    entry.blobId = zkNewBlobId();
                     const buf = await entry.file.arrayBuffer();
-                    const enc = await lib.encryptFile(buf, dek);
+                    let enc;
+                    if (lib.ZK_CONTENT_WRITE_V2) {
+                        // Chunk-framed content. The token comes back FROM the writer, which is why
+                        // the legacy branch below mints its own instead of both sharing one line:
+                        // under this branch the token is sealed into the file's header, and a
+                        // value minted out here could drift from the one the bytes actually carry.
+                        const written = await lib.encryptFileV2(buf, dek, {
+                            vaultId: vid, objectId: clientFileId, dekEpoch: keyVersion,
+                        });
+                        entry.blobId = written.blobId;
+                        enc = written.bytes;
+                    } else {
+                        entry.blobId = zkNewBlobId();
+                        enc = await lib.encryptFile(buf, dek);
+                    }
                     entry.file = new File([enc], entry.name, { type: mime });
                     entry.keyVersion = keyVersion;
                     entry.encName = await lib.encryptName(entry.name, dek, vid, 'name', keyVersion, clientFileId);
