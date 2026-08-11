@@ -8170,6 +8170,39 @@ def _session_principal(current_user):
     return ChunkedUploadSession.temp_credential_id == cred_id
 
 
+def _chunk_hash_path(session_dir, index: int):
+    """Where the digest of chunk `index` lives.
+
+    Beside the chunk rather than in the database, for two reasons. The received-chunk set is read
+    from disk precisely so it survives a restart, and a digest kept anywhere else could disagree
+    with the bytes it describes. And they are removed together: the session directory is deleted
+    wholesale on completion and by the sweeper, so a digest cannot outlive its chunk.
+
+    Named `hash_*` rather than `chunk_*.sha256` so it cannot be mistaken for a chunk by the glob
+    below -- that would depend on an integer parse failing, which is not a thing to rely on.
+    """
+    return session_dir / f"hash_{index:06d}"
+
+
+def _chunk_hashes(session_dir) -> dict:
+    """Digest per stored chunk, for a resuming client to check its local copy against.
+
+    A resumed upload sends only the indices the server says it is missing. If the file changed
+    since the interrupted attempt -- edited to the same length, so nothing else notices -- the
+    result is the old attempt's chunks joined to the new file's, stored with no error. These let
+    the client find out which of its own chunks no longer match and send those too.
+    """
+    if not session_dir.exists():
+        return {}
+    out = {}
+    for p in session_dir.glob("hash_*"):
+        try:
+            out[int(p.name.split("_", 1)[1])] = p.read_text(encoding="ascii").strip()
+        except (ValueError, IndexError, OSError):
+            continue
+    return out
+
+
 def _received_chunk_indices(session_dir) -> set:
     """Authoritative set of chunk indices present on disk (survives restarts)."""
     if not session_dir.exists():
@@ -8225,6 +8258,11 @@ class ChunkedUploadInit(BaseModel):
     # for a zero-knowledge upload. The server never interprets the value -- it compares it, so
     # that a second encryption of the same file cannot inherit the first's buffered chunks.
     blob_id: Optional[str] = Field(None, pattern=r'^[0-9a-f]{32}$')
+    # The session this upload means to continue. Absent means "start a new one", and that is
+    # the whole point: resuming used to be inferred from the request looking like one already
+    # in flight, which is not something a server can tell apart from a second upload of the
+    # same file.
+    resume_session_id: Optional[uuid.UUID] = None
     # Zero-knowledge only: the file name + MIME encrypted IN THE BROWSER under the vault
     # DEK (security ZK marker + base64) and the client-computed blind index for same-name
     # matching. Required for ZK uploads; rejected for Standard ones. The server stores them
@@ -8359,7 +8397,30 @@ async def init_chunked_upload(
         resume_q = resume_q.filter(ChunkedUploadSession.name_bi == body.name_bi)
     else:
         resume_q = resume_q.filter(ChunkedUploadSession.filename == body.file_name)
-    session = resume_q.order_by(ChunkedUploadSession.created_at.desc()).first()
+    # Resuming is something a client ASKS for. It used to be inferred: a new upload matching an
+    # existing session on vault, folder, name, size and chunk count was handed that session and
+    # its already-received chunks. Nothing in that set distinguishes a genuine resume from a
+    # second upload of the same file -- so editing a file without changing its length and
+    # uploading it again stored the OLD content, or a mixture, with no error and a 200.
+    #
+    # A different length was always safe, because the length is part of the match. This closes
+    # the one case where it is not doing that work.
+    #
+    # The cost of asking is a client that relied on the inference now re-uploads instead of
+    # continuing: slower, never wrong.
+    if body.resume_session_id is None:
+        session = None
+    else:
+        session = resume_q.filter(
+            ChunkedUploadSession.id == body.resume_session_id).first()
+        if session is None:
+            # Named a session that does not exist, belongs to another principal, has expired,
+            # or describes a different file. Refusing beats silently starting a new upload the
+            # caller did not ask for and will not know to look for.
+            raise HTTPException(status_code=409, detail={
+                "code": "resume_target_gone",
+                "message": ("That upload can no longer be continued. Start it again."),
+            })
 
     # This session's buffered chunks, and its stored encrypted name, belong to the object id,
     # the key epoch and the encryption attempt it was opened with. Resuming under any different
@@ -8519,6 +8580,9 @@ async def init_chunked_upload(
         'chunk_size': body.chunk_size,
         'total_chunks': session.total_chunks,
         'received_chunks': received,
+        # What the server holds for each of those indices, so the client can tell whether its
+        # local copy still matches before skipping them.
+        'chunk_checksums': _chunk_hashes(sdir),
         'expires_at': session.expires_at.isoformat() if session.expires_at else None,
     }
 
@@ -8610,6 +8674,15 @@ async def upload_chunk(
     with open(tmp_path, 'wb') as f:
         f.write(data)
     os.replace(tmp_path, chunk_path)
+    # Computed here, where the bytes are already in hand, and from what was actually written
+    # rather than from anything the client asserted. Best effort: a missing digest makes a
+    # resuming client re-send that chunk, which is slower and never wrong.
+    try:
+        import hashlib
+        _chunk_hash_path(sdir, chunk_index).write_text(
+            hashlib.sha256(data).hexdigest(), encoding='ascii')
+    except Exception:  # noqa: BLE001 -- a missing digest costs a re-send, never the upload
+        pass
 
     # Serialize the counter update per session (SELECT ... FOR UPDATE) and recompute the counters from
     # the AUTHORITATIVE on-disk chunk set, so concurrent PUTs — even a same-index re-send — converge to
@@ -9020,6 +9093,9 @@ async def get_upload_session(
     payload = _session_payload(session, len(received))
     payload['status'] = session.status
     payload['received_chunks'] = received
+    # The client checks its own copy of each received index against these before skipping it.
+    payload['chunk_checksums'] = _chunk_hashes(
+        _upload_session_dir(vault_service, str(session.id)))
     return payload
 
 

@@ -57,7 +57,7 @@ def zk_vault(admin):
     admin.delete_vault(vid)
 
 
-def _zk_init(admin, vault_id, file_id, name_bi, blob_id=_UNSET, epoch=1):
+def _zk_init(admin, vault_id, file_id, name_bi, blob_id=_UNSET, epoch=1, resume=None):
     """An encrypted upload declares a blind index instead of a name; that is what pairs a resume.
 
     `file_id`, `blob_id` and the epoch are all sent by default because the server now requires all
@@ -78,6 +78,11 @@ def _zk_init(admin, vault_id, file_id, name_bi, blob_id=_UNSET, epoch=1):
     token = uuid.uuid4().hex if blob_id is _UNSET else blob_id
     if token is not None:
         body["blob_id"] = token
+    if resume is not None:
+        # Resuming is asked for now: without naming a session the server opens a new one, because
+        # it cannot tell a continuation from a second upload of the same file. These guards live on
+        # the resume path, so reaching them at all means saying so.
+        body["resume_session_id"] = resume
     return admin.post(f"/vaults/{vault_id}/uploads", json=body)
 
 
@@ -310,14 +315,15 @@ def test_resuming_with_a_different_object_id_is_refused_at_the_start(admin, std_
     assert r.status_code in (200, 201), r.text
     session_one = r.json()["session_id"]
 
-    again = _init(admin, std_vault, file_id=str(uuid.uuid4()))
+    again = _init(admin, std_vault, file_id=str(uuid.uuid4()),
+                  resume_session_id=session_one)
     assert again.status_code == 409, (
         f"a resume under a different object id was accepted: {again.status_code} {again.text}"
     )
     assert "object_id_mismatch" in again.text, again.text
 
     # The original id still resumes the same session, so this refuses a conflict and not a retry.
-    same = _init(admin, std_vault, file_id=str(first))
+    same = _init(admin, std_vault, file_id=str(first), resume_session_id=session_one)
     assert same.status_code in (200, 201), same.text
     assert same.json()["session_id"] == session_one
 
@@ -342,13 +348,14 @@ def test_an_encrypted_resume_that_changes_the_object_id_is_refused(admin, zk_vau
     # The attempt token is held EQUAL on purpose. It is checked first, so letting it differ here
     # would refuse the request for the other reason and this test would prove nothing about object
     # ids. In practice a second encryption differs in both; this pins the inner guard.
-    again = _zk_init(admin, zk_vault, uuid.uuid4(), name_bi=_BI, blob_id=token)
+    again = _zk_init(admin, zk_vault, uuid.uuid4(), name_bi=_BI, blob_id=token,
+                     resume=session_one)
     assert again.status_code == 409, (
         f"an encrypted resume adopted a different object id: {again.status_code} {again.text}"
     )
     assert again.json()["detail"]["code"] == "object_id_mismatch", again.text
 
-    same = _zk_init(admin, zk_vault, first, name_bi=_BI, blob_id=token)
+    same = _zk_init(admin, zk_vault, first, name_bi=_BI, blob_id=token, resume=session_one)
     assert same.status_code in (200, 201), same.text
     assert same.json()["session_id"] == session_one
 
@@ -393,7 +400,8 @@ def test_two_encryptions_of_one_file_cannot_share_a_session(admin, zk_vault):
     one = _zk_init(admin, zk_vault, obj, name_bi=bi, blob_id=uuid.uuid4().hex)
     assert one.status_code in (200, 201), one.text
 
-    two = _zk_init(admin, zk_vault, obj, name_bi=bi, blob_id=uuid.uuid4().hex)
+    two = _zk_init(admin, zk_vault, obj, name_bi=bi, blob_id=uuid.uuid4().hex,
+                   resume=one.json()["session_id"])
     assert two.status_code == 409, (
         f"a second encryption inherited the first attempt's session: {two.status_code} {two.text}"
     )
@@ -492,13 +500,15 @@ def test_a_resume_after_a_rekey_is_refused(admin, zk_vault):
     one = _zk_init(admin, zk_vault, obj, name_bi=bi, blob_id=token, epoch=1)
     assert one.status_code in (200, 201), one.text
 
-    two = _zk_init(admin, zk_vault, obj, name_bi=bi, blob_id=token, epoch=2)
+    two = _zk_init(admin, zk_vault, obj, name_bi=bi, blob_id=token, epoch=2,
+                   resume=one.json()["session_id"])
     assert two.status_code == 409, (
         f"a resume declaring a different key epoch was accepted: {two.status_code} {two.text}"
     )
     assert two.json()["detail"]["code"] == "key_epoch_mismatch", two.text
 
     # And the original epoch still resumes, so this refuses a conflict rather than everything.
-    same = _zk_init(admin, zk_vault, obj, name_bi=bi, blob_id=token, epoch=1)
+    same = _zk_init(admin, zk_vault, obj, name_bi=bi, blob_id=token, epoch=1,
+                    resume=one.json()["session_id"])
     assert same.status_code in (200, 201), same.text
     assert same.json()["session_id"] == one.json()["session_id"]

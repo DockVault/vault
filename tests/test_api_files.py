@@ -135,8 +135,10 @@ def test_chunked_upload_resume_roundtrip(admin, temp_vault):
     # upload only the first chunk, then "pause"
     assert admin.put(f"/vaults/{vid}/uploads/{sid}/chunks/0", data=parts[0], headers=_OCTET).status_code == 200
 
-    # resume: re-init the same file returns the SAME session and what it has
+    # resume: naming the session returns it and what it has. Without the name the server
+    # correctly opens a NEW one -- it cannot tell a continuation from a second upload.
     r = admin.post(f"/vaults/{vid}/uploads", json={
+        "resume_session_id": sid,
         "file_name": name, "total_size": len(data),
         "total_chunks": len(parts), "chunk_size": chunk_size,
     })
