@@ -1,4 +1,4 @@
-FROM python:3.14-alpine@sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92
+FROM python:3.14-alpine@sha256:a1321512d6a287428c50dcdf2ab3857761127e03a23b1f648e9c1c0de59288f8
 
 WORKDIR /app
 
@@ -16,10 +16,13 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.lock \
     && pip check \
     && python -m pip uninstall --yes pip
 
-# Python 3.14.6 predates three reviewed 3.14-branch security fixes. Vendor the exact upstream
-# standard-library snapshot, verify it byte-for-byte before installation, and retain its PSF
-# license in the image. Grype still identifies the interpreter as 3.14.6, so release VEX records
-# these code-level backports against the immutable image digest.
+# Three reviewed 3.14-branch security fixes reached the base image in 3.14.7, so the two files
+# copied below are now byte-identical to the ones they replace -- verified against the pinned
+# digest, not assumed. The copy is kept rather than deleted because it is what makes the property
+# independent of the base: if a future base moves backwards, or a digest bump lands before the fix
+# it was assumed to carry, this still pins the reviewed bytes and the build fails loudly on a hash
+# mismatch instead of shipping quietly. Retiring it, and the VEX statements below, is a separate
+# decision that wants a release scan against 3.14.7 as evidence.
 COPY security/cpython-backports /tmp/cpython-backports
 RUN cd /tmp/cpython-backports \
     && echo "3c8d585a77d7d376aea66e5e11a4d53c2605100d4c05a71b5385ed54bc526f51  Lib/tarfile.py" | sha256sum -c - \

@@ -1,8 +1,13 @@
 # CPython 3.14 security backports
 
-The release image starts from the immutable Python 3.14.6 Alpine image, then replaces two standard
+The release image starts from an immutable Python 3.14 Alpine digest, then replaces two standard
 library files with their reviewed versions from CPython's `3.14` branch at commit
 `07efb08123ba9367a7107325adb9d5626dca1ca9`.
+
+As of the 3.14.7 base these two files are **byte-identical to the ones they replace** — the fixes
+below are upstream now, and the copy is a verified no-op. It is kept because the hash check ties
+the property to reviewed bytes rather than to a base-image version number, and a base that lacked
+them would fail the build instead of shipping.
 
 That snapshot contains the upstream 3.14 security backports for:
 
