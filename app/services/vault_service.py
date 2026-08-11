@@ -424,7 +424,13 @@ class VaultService:
         # Belt and braces against the endpoint's own check: the id must not already belong to
         # a vault. Two vaults sharing an id would let a key locked for one be opened as the
         # other, which is the single property choosing your own id could otherwise cost.
-        if vault_id is not None and self.db.query(Vault.id).filter(Vault.id == vault_id).first():
+        # A retired vault id is the most valuable one to refuse. The server never generates a
+        # zero-knowledge vault's key -- it stores a wrap the browser supplies -- so anyone still
+        # holding an old key could otherwise recreate the vault under its own id, re-supply that
+        # same wrap, and read whatever survived the delete.
+        if vault_id is not None and (
+                self.db.query(Vault.id).filter(Vault.id == vault_id).first()
+                or self._id_is_spent(vault_id)):
             raise ValueError("vault id already in use")
 
         vault = Vault(
@@ -913,7 +919,14 @@ class VaultService:
         # Folder ID: a CLIENT-supplied id (zero-knowledge v2 name binding — the browser seals
         # the name bound to this id) or a server-generated one; assigned now so the at-rest name
         # cipher key (per id) is available. The endpoint validates a client id is a fresh UUID.
-        if folder_id is not None and self.db.query(Folder.id).filter(Folder.id == folder_id).first():
+        # Folder ids matter more here than they look. Deleting a folder removes rows and
+        # nothing else -- the only `rmtree` on persistent storage is in `delete_vault` -- so
+        # `<vault>/folders/<folder_id>/` outlives the folder, and any blob whose secure-delete
+        # fell through its best-effort fallback is still inside it. Re-claim the folder id and the
+        # file id and the old bytes are back at their exact path.
+        if folder_id is not None and (
+                self.db.query(Folder.id).filter(Folder.id == folder_id).first()
+                or self._id_is_spent(folder_id)):
             raise ValueError("folder id already in use")
         folder = Folder(
             id=folder_id or uuid.uuid4(),
@@ -1053,10 +1066,30 @@ class VaultService:
         # File ID: a CLIENT-supplied id (zero-knowledge v2 name binding — the browser seals the
         # name bound to this id before the row exists) or a server-generated one. The endpoint
         # validates a client id is a fresh UUID; this is belt-and-suspenders against a collision.
-        if file_id is not None and self.db.query(File.id).filter(File.id == file_id).first():
+        # Defence in depth, and honestly so: today the only caller that passes a client-chosen
+        # file_id is the chunked-upload completion, which checks the same two things first and
+        # answers with a clean 409 rather than this ValueError. So removing the ledger half of
+        # THIS check currently fails no test -- it was mutated to confirm that. It stays because
+        # this is the one place every upload path goes through, so a future caller that starts
+        # accepting a client id is covered without anyone remembering to add it.
+        if file_id is not None and (
+                self.db.query(File.id).filter(File.id == file_id).first()
+                or self._id_is_spent(file_id)):
             raise ValueError("file id already in use")
         file_id = file_id or uuid.uuid4()
-        storage_path = self._get_file_storage_path(vault_id, file_id, folder_id)
+        # The blob's name on disk is NOT the row id, and that is the entire fix for one of the two
+        # defects here. While they were the same string, two completions carrying one client-chosen
+        # id opened the same path 'wb' and interleaved; the loser hit the primary-key violation and
+        # its cleanup deleted the blob at that path -- the WINNER'S committed bytes, leaving a live
+        # row with nothing behind it. With a name of its own, each writer owns its own file and a
+        # loser's cleanup can only reach its own.
+        #
+        # Nothing reconstructs this path from the id: `_get_file_storage_path` has exactly one
+        # caller (here), and every later read and delete goes through the `storage_path` column
+        # recorded below. So existing rows keep working untouched and there is no migration. It
+        # does NOT address re-claiming a retired id -- the transcript binds the row id, not the
+        # path -- which is what the check above and the ledger behind it are for.
+        storage_path = self._get_file_storage_path(vault_id, uuid.uuid4(), folder_id)
         storage_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Detect MIME type if not provided
@@ -1229,6 +1262,13 @@ class VaultService:
             file.enc_mime = zk_enc_mime
             file.name_bi = zk_name_bi
 
+        # Re-checked here, right before the insert. The check at claim time is separated from
+        # this point by the entire blob assembly, and the ledger is not a database constraint --
+        # only the primary key is, and it sees live rows only. Today a head-of-line block in the
+        # single worker happens to serialise these, which is luck rather than design: moving
+        # assembly off the event loop, or adding a worker, opens the window. One index probe.
+        if getattr(file, "id", None) is not None and self._id_is_spent(file.id):
+            raise ValueError("file id already in use")
         self.db.add(file)
 
         # Encrypt the filename/MIME at rest (Standard vaults) before persisting. No-op for ZK.
@@ -1648,6 +1688,19 @@ class VaultService:
         """Get physical path for folder directory."""
         return self._get_vault_path(vault_id) / "folders" / str(folder_id)
     
+    def _id_is_spent(self, object_id) -> bool:
+        """Has this id ever been taken out of circulation?
+
+        The check every client-choosable id needs, and the one thing all three of them used to
+        get wrong in the same way: they asked whether a row holds the id NOW. A deleted row holds
+        nothing, so every id a deleted object used to own was free again -- and deleting an object
+        does not reliably erase its bytes, so re-claiming one can put an old version back where a
+        reader will find it and authenticate it.
+        """
+        from app.core.models import RetiredObjectId
+        return self.db.query(RetiredObjectId.id).filter(
+            RetiredObjectId.id == object_id).first() is not None
+
     def _get_file_storage_path(
         self,
         vault_id: uuid.UUID,

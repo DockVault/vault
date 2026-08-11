@@ -34,7 +34,7 @@ from app.core.config import bootstrap_entrypoint
 bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
-from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim
+from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId
 from app.core import sharing_policy
 from app.core.key_wrap_algorithms import DIRECT_DEK_ALGO, TEAMPRIV_ALGO
 from app.config.branding import branding
@@ -5908,7 +5908,13 @@ async def create_vault(
         # Reject a taken id before anything is built. Note what actually guarantees uniqueness:
         # the primary key. This check turns that constraint violation into a clear answer, and
         # two simultaneous requests for one id still race past it -- hence the guard below.
-        if db.query(Vault.id).filter(Vault.id == vault_create.id).first():
+        # "In use" includes "was in use". A retired vault id is the most valuable one to refuse:
+        # the server never generates a zero-knowledge vault key, it stores a wrap the browser
+        # supplies, so an old key holder could otherwise recreate the vault under its own id,
+        # re-supply that same wrap, and read whatever survived the delete.
+        if (db.query(Vault.id).filter(Vault.id == vault_create.id).first()
+                or db.query(RetiredObjectId.id).filter(
+                    RetiredObjectId.id == vault_create.id).first()):
             raise HTTPException(status_code=409, detail="That vault id is already in use.")
 
     try:
@@ -8535,6 +8541,16 @@ async def init_chunked_upload(
                 status_code=429,
                 detail="This account has too many uploads in progress; complete or cancel some before starting another.",
             )
+        # Refuse a doomed id BEFORE a byte moves. The completion checks this too and must
+        # keep doing so -- an id can be retired while an upload is in flight -- but without a
+        # check here the client transfers the entire file, the server writes every chunk to disk,
+        # and only then does /complete answer 409. The comment on that check justified itself by
+        # avoiding exactly this, which was true of the assembly and not of the transfer.
+        if body.file_id is not None and (
+                db.query(File.id).filter(File.id == body.file_id).first()
+                or db.query(RetiredObjectId.id).filter(
+                    RetiredObjectId.id == body.file_id).first()):
+            raise HTTPException(status_code=409, detail="File id already in use")
         session = ChunkedUploadSession(
             vault_id=vault_id,
             user_id=current_user.id,
@@ -8824,7 +8840,13 @@ async def complete_chunked_upload(
                 detail=("The object id supplied does not match the one this upload declared when "
                         "it started."),
             )
-    if client_file_id is not None and db.query(File.id).filter(File.id == client_file_id).first():
+    # Not the enforcement boundary -- that is in the service, which every upload path goes
+    # through -- but leaving this one liveness-only would turn a clean 409 into a ValueError
+    # surfacing after the whole blob had been streamed and assembled.
+    if client_file_id is not None and (
+            db.query(File.id).filter(File.id == client_file_id).first()
+            or db.query(RetiredObjectId.id).filter(
+                RetiredObjectId.id == client_file_id).first()):
         raise HTTPException(status_code=409, detail="File id already in use")
 
     # After a clean `with stream_ctx` exit the assembled blob PERSISTS; the post-assembly checks
@@ -9764,7 +9786,12 @@ async def create_folder(
                     folder_client_id = uuid.UUID(str(folder_data.get('id')))
                 except (TypeError, ValueError):
                     raise HTTPException(status_code=400, detail="id must be a UUID")
-                if db.query(Folder.id).filter(Folder.id == folder_client_id).first():
+                # Live OR spent, matching the vault and file pre-checks. The service refuses
+                # a retired id regardless, so this only changes where the refusal happens -- but
+                # reaching the service means taking a row lock on the vault first.
+                if (db.query(Folder.id).filter(Folder.id == folder_client_id).first()
+                        or db.query(RetiredObjectId.id).filter(
+                            RetiredObjectId.id == folder_client_id).first()):
                     raise HTTPException(status_code=409, detail="Folder id already in use")
             # folder_data is a raw dict (untyped), so validate the client-supplied fields here
             # — a malformed value must be a clean 400, not a 500 (int()/DB DataError) below.
@@ -10792,7 +10819,61 @@ def _run_lightweight_migrations():
     try:
         from app.core.database import get_db_context
         from sqlalchemy import text
-        statements = [
+        # Retired object ids. `create_all` builds the TABLE on a fresh database but knows nothing
+        # about triggers, and an existing deployment has neither -- so both are declared here, and
+        # a startup self-test below refuses to serve if the triggers did not land. That check is
+        # not belt-and-braces: every statement in this list is wrapped in try/except and a failure
+        # only PRINTS, so without it a skipped step quietly returns the deployment to the
+        # liveness-only behaviour this replaces, while every id check keeps answering "not spent".
+        _retire_ddl = ["""
+            CREATE TABLE IF NOT EXISTS retired_object_ids (
+                id       UUID      PRIMARY KEY,
+                kind     INTEGER   NOT NULL,
+                vault_id UUID      NULL,
+                spent_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'utc')
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_retired_object_vault "
+            "ON retired_object_ids (vault_id)",
+            # For a database where create_all already built this table from an earlier model that
+            # carried only the Python-side default. Harmless when the default is already right.
+            "ALTER TABLE retired_object_ids ALTER COLUMN spent_at "
+            "SET DEFAULT (now() AT TIME ZONE 'utc')"]
+        # One function + one statement-level trigger per table holding a client-choosable id.
+        #
+        # Statement-level with a transition table, not row-level: a cascade deleting N rows then
+        # costs one INSERT rather than N. And AFTER DELETE fires for rows removed by an
+        # `ON DELETE CASCADE` foreign key, which is the whole reason this lives in the database --
+        # those deletions have no Python site to patch, now or in future.
+        for _tbl, _kind, _vault_expr in (("files", 1, "d.vault_id"),
+                                         ("folders", 2, "d.vault_id"),
+                                         ("vaults", 3, "NULL::uuid")):
+            _retire_ddl.append(f"""
+                CREATE OR REPLACE FUNCTION dv_retire_{_tbl}_ids() RETURNS trigger
+                LANGUAGE plpgsql AS $dv$
+                BEGIN
+                    INSERT INTO retired_object_ids (id, kind, vault_id)
+                    SELECT d.id, {_kind}, {_vault_expr} FROM deleted d
+                    ON CONFLICT (id) DO NOTHING;
+                    RETURN NULL;
+                END $dv$""")
+            # CREATE OR REPLACE, not DROP-then-CREATE. Those were two separately committed
+            # statements, so every single boot dropped the protection and re-added it ~20ms
+            # later -- and the SFTP server is a different container that keeps serving across an
+            # API restart, so a delete landing in that window retired nothing and freed the id
+            # permanently. If the CREATE had then failed, the window never closed.
+            _retire_ddl.append(f"""
+                CREATE OR REPLACE TRIGGER trg_{_tbl}_retire AFTER DELETE ON {_tbl}
+                REFERENCING OLD TABLE AS deleted FOR EACH STATEMENT
+                EXECUTE FUNCTION dv_retire_{_tbl}_ids()""")
+            # ENABLE ALWAYS, not the default ORIGIN. An ORIGIN trigger does not fire when
+            # `session_replication_role = 'replica'` -- which is what a logical-replication apply
+            # worker runs as, and what `pg_restore --disable-triggers` sets. A promoted replica or
+            # a restore would otherwise free every id it touched, silently, while the trigger row
+            # still existed for the check below to find.
+            _retire_ddl.append(
+                f"ALTER TABLE {_tbl} ENABLE ALWAYS TRIGGER trg_{_tbl}_retire")
+
+        statements = _retire_ddl + [
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS unlock_remember_minutes INTEGER",
             # Per-vault confidentiality tier; 'standard' = today's server-encrypted,
             # SFTP-capable vault (zero-knowledge slots in later, web-only).
@@ -10968,6 +11049,62 @@ def _run_lightweight_migrations():
                     print(f"⚠ Migration step skipped ({stmt}): {e}")
     except Exception as e:
         print(f"⚠ Lightweight migrations skipped: {e}")
+
+    # OUTSIDE that try, deliberately, and this is the whole point of the check.
+    #
+    # It used to be the last line inside it -- where the `except Exception: print(...)` above
+    # caught the RuntimeError it raises and carried on serving. The check that exists to stop a
+    # deployment without the triggers reported its own failure in the same "⚠ … skipped" format
+    # its docstring dismisses as nothing anyone reads. A fresh session, because the one above
+    # belongs to a context manager that has already closed.
+    from app.core.database import get_db_context as _ctx
+    with _ctx() as _db:
+        _verify_retired_object_id_triggers(_db)
+
+
+def _verify_retired_object_id_triggers(db) -> None:
+    """Refuse to run without the triggers that record retired object ids.
+
+    Every statement above is wrapped in try/except and reports a failure by PRINTING. That is the
+    right call for a column addition -- one that does not apply is usually one that already
+    exists. It is the wrong call here, because the failure is silent in the direction that matters:
+    with no trigger, ids are never recorded, every "has this id been spent" check keeps answering
+    no, and the deployment is back to the liveness-only guard with nothing in the logs anyone reads
+    to say so. A client could then re-claim the id of a deleted object and read a blob that
+    outlived its row.
+
+    So this is a hard stop rather than a warning. A deployment that cannot record retired ids must
+    not serve, because the property it would be advertising is not one it has.
+    """
+    from sqlalchemy import text as _text
+
+    expected = {"trg_files_retire": "files",
+                "trg_folders_retire": "folders",
+                "trg_vaults_retire": "vaults"}
+    try:
+        # Name alone is not enough, and both extra conditions were demonstrated to matter:
+        # a trigger of the same name on ANY table satisfied a name-only lookup, and
+        # `ALTER TABLE ... DISABLE TRIGGER` left the row in place so the check passed while
+        # nothing was recorded. Join the relation, and reject a disabled one.
+        rows = db.execute(_text(
+            "SELECT t.tgname, c.relname, t.tgenabled FROM pg_trigger t "
+            "JOIN pg_class c ON c.oid = t.tgrelid "
+            "WHERE t.tgname = ANY(:names) AND NOT t.tgisinternal"
+        ), {"names": sorted(expected)}).fetchall()
+    except Exception as e:  # noqa: BLE001 - a database that cannot answer is not a pass
+        raise RuntimeError(
+            "Could not verify the retired-object-id triggers, so the re-claim guard cannot be "
+            f"trusted: {e}"
+        ) from e
+    usable = {name for name, relation, enabled in rows
+              if relation == expected.get(name) and enabled != "D"}
+    missing = set(expected) - usable
+    if missing:
+        raise RuntimeError(
+            "Retired-object-id triggers are missing: " + ", ".join(sorted(missing)) + ". Object "
+            "ids of deleted files, folders or vaults would silently become re-claimable. Check "
+            "the migration output above for the step that was skipped."
+        )
 
 
 def _backfill_encrypted_names():

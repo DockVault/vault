@@ -1381,3 +1381,76 @@ class ChunkedUploadSession(Base):
         Index('idx_chunked_upload_user', 'user_id'),
         Index('idx_chunked_upload_status', 'status', 'expires_at'),
     )
+
+
+class RetiredObjectId(Base):
+    """Every object id that has been taken out of circulation, so it can never be re-claimed.
+
+    A client may choose the UUID of the object it is creating. That exists for a real reason: in a
+    zero-knowledge vault the browser seals the name, the MIME type and now the file content bound
+    to that id BEFORE any row exists, so the id has to be known client-side first. The guard on it
+    was a liveness check -- is a row holding this id right now -- and a deleted row leaves nothing
+    behind, so every id a deleted object used to hold was free again.
+
+    What that costs is rollback resistance. Deleting an object does not reliably erase its bytes:
+    `secure_delete` ends in a best-effort fallback chain, and a deleted FOLDER never has its
+    directory removed at all -- only `delete_vault` calls `rmtree`. So a blob can outlive its row,
+    and re-claiming the id it was stored under puts an old version back where a reader will find
+    it, authenticating correctly, because the transcript binds the id and not the generation.
+
+    Three properties of this table are load-bearing, and each is a decision rather than a detail:
+
+    **The primary key is the id alone.** Not `(vault_id, id)`. A vault-scoped key invites
+    vault-scoped cleanup, and freeing a deleted vault's ids is exactly the hole this closes: the
+    server never generates a zero-knowledge vault's key, it accepts a browser-supplied wrap, so
+    somebody who kept the old key can recreate a vault under the same id, re-supply the same
+    wrapped key, re-claim a file id and read the retained blob. `vault_id` is here for provenance
+    and nothing reads it in a decision.
+
+    **There is deliberately no foreign key.** An `ON DELETE CASCADE` back to `vaults` would erase
+    precisely the records this exists to keep, and it would look like tidiness in review. The
+    column is expected to go dangling; that is the point.
+
+    **Rows arrive from database triggers, not application code.** Object rows disappear through
+    many paths -- explicit deletes, same-name replacement, the expiry sweep, folder deletion, the
+    startup duplicate collapse, SFTP -- and, more importantly, through `ON DELETE CASCADE`
+    constraints that have no Python site to patch at all. One `AFTER DELETE` trigger per table
+    catches every one of them, including the ones nobody has written yet. They are `ENABLE ALWAYS`
+    so that a logical-replication apply worker or a `pg_restore --disable-triggers` cannot skip
+    them.
+
+    **What this does NOT cover, stated because the guarantee above reads as unconditional.** Ids
+    retired BEFORE this shipped are not in the ledger and cannot be put there -- their rows are
+    gone. Those are exactly the ids whose blobs may still be sitting at the old paths, so the
+    oldest deletions are the least protected. The same is true of a database restored from a
+    backup taken before this shipped, which is a realistic pairing: backups here are volume-level,
+    so an old database can arrive beside a storage volume that still holds the blobs.
+    """
+    __tablename__ = 'retired_object_ids'
+
+    # Kinds. Small integers rather than an enum: this table is written by SQL triggers, and a
+    # trigger that has to know an enum's type name is one migration-ordering problem away from
+    # failing silently.
+    KIND_FILE = 1
+    KIND_FOLDER = 2
+    KIND_VAULT = 3
+
+    id = Column(UUID(as_uuid=True), primary_key=True)
+    kind = Column(Integer, nullable=False)
+    # Provenance only, and intentionally not a foreign key -- see the class docstring. NULL for a
+    # retired vault, whose own id is the primary key.
+    vault_id = Column(UUID(as_uuid=True), nullable=True)
+    # server_default, not just default: these rows are inserted by a database trigger, which
+    # never runs Python. A column with only the SQLAlchemy-side default is NOT NULL with no
+    # database default, so every trigger insert fails and -- because the insert happens inside the
+    # DELETE -- takes the delete down with it. create_all builds this table from the model on a
+    # fresh database, so the model is where the default has to be.
+    spent_at = Column(DateTime, nullable=False,
+                      server_default=text("(now() AT TIME ZONE 'utc')"),
+                      default=datetime.utcnow)
+
+    __table_args__ = (
+        # Not on `id`: that is the primary key already. This one is for the operator question
+        # "what did this vault retire", which is the only non-lookup use.
+        Index('idx_retired_object_vault', 'vault_id'),
+    )
