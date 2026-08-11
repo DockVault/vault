@@ -1,0 +1,32 @@
+{
+  "schema": "dockvault-crypto-vector-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "format": "zero-knowledge chunk-framed content v2 (purpose 0x04)",
+  "fixture_id": "zk-content-v2-empty",
+  "why_this_shape": "An empty file is ONE chunk holding zero bytes, not zero chunks -- ceil(0/n) is 0 and the grammar's max(1, ...) is what stops a reader concluding there is nothing to read.",
+  "source_paths": [
+    "docs/design/vault-zk-envelope-v2.md",
+    "static/js/ecc_crypto.js"
+  ],
+  "inputs": {
+    "dek_hex": "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a",
+    "blob_id_hex": "5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b",
+    "chunk_size": 4096,
+    "vault_id": "11111111-1111-4111-8111-111111111111",
+    "object_id": "22222222-2222-4222-8222-222222222222",
+    "dek_epoch": 7,
+    "plaintext_b64": "",
+    "nonces_hex": [
+      "a0a0a0a0a0a0a0a0a0a0a0a0"
+    ]
+  },
+  "encoded_b64": "RFZaMgIEAAAAABAAW1tbW1tbW1tbW1tbW1tbW6CgoKCgoKCgoKCgoL0smca9SflC6t0Sx5xb1MY=",
+  "expected": {
+    "plaintext_b64": "",
+    "total_chunks": 1,
+    "total_plaintext": 0,
+    "stored_bytes": 56,
+    "framing": "header28(magic4||version||purpose||reserved2||chunk_size4||blob_id16)||(nonce12||ciphertext||tag16)*"
+  }
+}

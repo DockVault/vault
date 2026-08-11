@@ -155,6 +155,23 @@ class ECCCryptoLibrary {
         this.V2_INFO_DEK_TEAM = 'dockvault-zk-dek-team-v2';
         this.V2_INFO_TEAMPRIV = 'dockvault-zk-teampriv-v2';
 
+        // Content framing. Unlike the three wraps, a file is many independently authenticated
+        // chunks under one derived key, so it carries its own 28-byte header before the first
+        // of them: the 8 shared bytes, the chunk size, and 16 bytes naming the encryption
+        // attempt that produced it.
+        this.V2_PURPOSE_CONTENT = 0x04;
+        this.V2_INFO_CONTENT = 'dockvault-zk-content-v2';
+        this.V2_CONTENT_HEADER_BYTES = 28;      // 8 shared + 4 chunk size + 16 attempt token
+        this.V2_CONTENT_CHUNK_OVERHEAD = 28;    // 12-byte nonce + 16-byte tag, per chunk
+        // The smallest possible file is the header plus one empty chunk. Anything shorter is
+        // not a short file, it is not this format.
+        this.V2_CONTENT_MIN_BYTES = 56;
+        // The floor keeps the per-chunk overhead from dominating and puts the nonce-collision
+        // budget beyond any realistic object; the ceiling is the largest transport chunk in
+        // use, so an implementer may align the two without the grammar forbidding it.
+        this.V2_CONTENT_CHUNK_MIN = 4096;
+        this.V2_CONTENT_CHUNK_MAX = 8388608;
+
         // The v2 WRITER is off by default, same mechanism and same reasoning as the envelope
         // above -- but the blast radius is larger. That envelope is read only by the account
         // that wrote it; a DEK wrap is minted by one member's browser and read by others. One
@@ -690,19 +707,133 @@ class ECCCryptoLibrary {
     }
 
     /** @private */
-    _v2Uuid(value, where) {
+    _v2Uuid(value, where, code) {
         const s = String(value == null ? '' : value).toLowerCase();
         if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(s)) {
-            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, where);
+            // Wrap-shaped by default, because every caller until now was one. Content passes
+            // INVALID_INPUT instead: telling someone to ask an owner to re-share the vault is
+            // the right advice about a broken key wrap and the wrong advice about a file.
+            this._fail(code || CRYPTO_ERROR_CODES.WRAP_INVALID, where);
         }
         return new TextEncoder().encode(s);
     }
 
+    /**
+     * Eight bytes, big-endian, unsigned. Zero is valid -- an empty file has zero plaintext.
+     *
+     * Assembled from two 32-bit halves because this module has no 64-bit integer writer and no
+     * BigInt anywhere; `Number.MAX_SAFE_INTEGER` is the honest ceiling, and it is four orders of
+     * magnitude above any object this product will store.
+     * @private
+     */
+    _v2U64(value, where, code) {
+        const n = (typeof value === 'number' || typeof value === 'string') ? Number(value) : NaN;
+        if (!Number.isInteger(n) || n < 0 || n > Number.MAX_SAFE_INTEGER) {
+            this._fail(code || CRYPTO_ERROR_CODES.WRAP_INVALID, where);
+        }
+        const out = new Uint8Array(8);
+        const view = new DataView(out.buffer);
+        view.setUint32(0, Math.floor(n / 0x100000000), false);
+        view.setUint32(4, n >>> 0, false);
+        return out;
+    }
+
+    /** One byte, 0x00 or 0x01. No other value is ever emitted. @private */
+    _v2Flag(value) {
+        return new Uint8Array([value ? 0x01 : 0x00]);
+    }
+
+    /**
+     * The attempt token, passed through as 16 RAW bytes.
+     *
+     * Section 4.1's "UUIDs are never the raw 16-byte form" rule does not reach this: it is not a
+     * uuid, it has no textual form, and the header it sits in is fixed-width. Encoding it as text
+     * would produce a 48-byte header nothing else can read.
+     * @private
+     */
+    _v2BlobId(bytes, where) {
+        const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+        if (b.length !== 16) {
+            this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, where);
+        }
+        return b;
+    }
+
+    /**
+     * The content transcript: one 28-byte file header, one `info` for the key derivation, and a
+     * function producing the per-chunk AAD.
+     *
+     * The three wrap builders each return a single `aad`, because their payload is one sealed
+     * blob. Content cannot: every chunk binds its own index and whether it is the last, and the
+     * last one also binds the totals. What must not change is the reason those builders return
+     * both channels from one place -- `info` and `aad` are built from the SAME `context` bytes, so
+     * they cannot drift. `aadFor` closes over that same `context`, which is why it lives in here
+     * rather than as a free function taking the fields again.
+     * @private
+     */
+    _v2ContentTranscript(vaultId, objectId, dekEpoch, chunkSize, blobIdBytes) {
+        const W = 'content.transcript';
+        const BAD = CRYPTO_ERROR_CODES.INVALID_INPUT;
+        const size = Number(chunkSize);
+        if (!Number.isInteger(size)
+                || size < this.V2_CONTENT_CHUNK_MIN || size > this.V2_CONTENT_CHUNK_MAX) {
+            this._fail(BAD, W + '.chunkSize');
+        }
+        const blob = this._v2BlobId(blobIdBytes, W + '.blobId');
+
+        const sizeBytes = new Uint8Array(4);
+        new DataView(sizeBytes.buffer).setUint32(0, size, false);
+        const fileHeader = this._concatBytes([
+            this._v2Header(this.V2_PURPOSE_CONTENT), sizeBytes, blob,
+        ]);
+
+        const z = new Uint8Array([0]);
+        const context = this._concatBytes([
+            this._v2Uuid(vaultId, W + '.vaultId', BAD), z,
+            this._v2Uuid(objectId, W + '.objectId', BAD), z,
+            this._v2Epoch(dekEpoch, W + '.dekEpoch', BAD),
+        ]);
+
+        const enc = new TextEncoder();
+        return {
+            fileHeader,
+            info: this._concatBytes([enc.encode(this.V2_INFO_CONTENT), z, context, z, blob]),
+            aadFor: (index, isFinal, totals) => {
+                const parts = [
+                    fileHeader, context,
+                    this._v2U64(index, W + '.index', BAD),
+                    this._v2Flag(isFinal),
+                ];
+                if (isFinal) {
+                    // Only the last chunk carries them. Putting them in every chunk would force a
+                    // writer to know the length before it writes anything, which forecloses a
+                    // streaming producer; truncation is still caught, because a truncated stream
+                    // simply never reaches a chunk that claims to be the last.
+                    parts.push(this._v2U64(totals.totalChunks, W + '.totalChunks', BAD));
+                    parts.push(this._v2U64(totals.totalPlaintext, W + '.totalPlaintext', BAD));
+                }
+                return this._concatBytes(parts);
+            },
+        };
+    }
+
+    /**
+     * One content key per file, never per chunk.
+     *
+     * The DEK arrives as a non-extractable-by-habit CryptoKey, so it is exported to raw bytes to
+     * seed HKDF -- the same thing `nameBlindIndex` does, for the same reason.
+     * @private
+     */
+    async _deriveV2ContentKey(dekCryptoKey, info) {
+        const raw = await this._subtle().exportKey('raw', dekCryptoKey);
+        return this._deriveV2WrappingKey(raw, info);
+    }
+
     /** @private */
-    _v2Epoch(value, where) {
+    _v2Epoch(value, where, code) {
         const epoch = (typeof value === 'number' || typeof value === 'string') ? Number(value) : NaN;
         if (!Number.isInteger(epoch) || epoch < 1 || epoch > 0x7FFFFFFF) {
-            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, where);
+            this._fail(code || CRYPTO_ERROR_CODES.WRAP_INVALID, where);
         }
         const out = new Uint8Array(4);
         new DataView(out.buffer).setUint32(0, epoch, false);
@@ -1626,11 +1757,123 @@ class ECCCryptoLibrary {
      * @param {CryptoKey} vaultDEK - Vault Data Encryption Key
      * @returns {Promise<ArrayBuffer>} Decrypted file content
      */
-    async decryptFile(encryptedContent, vaultDEK) {
+    /**
+     * Read a version-2 chunk-framed file.
+     *
+     * The framing is parsed from the stored LENGTH, not from a count on the wire. Successive chunk
+     * counts occupy disjoint length windows separated by a 28-byte gap, and a zero-length final
+     * chunk is forbidden except for the empty file, so exactly one (count, length) pair can
+     * explain any valid input -- and a length in one of the gaps explains none, which is why the
+     * check at step 4 is not optional.
+     *
+     * Nothing is handed back until the chunk marked final has authenticated. Each chunk
+     * authenticates on its own, so a truncated file decrypts perfectly up to the cut; the only
+     * thing that reveals the cut is the absent terminator. Releasing bytes as they verify would
+     * mean handing over attacker-chosen-length output and detecting it afterwards.
+     */
+    async decryptFileV2(encryptedContent, vaultDEK, context) {
+        const W = 'decryptFileV2';
+        const bytes = encryptedContent instanceof Uint8Array
+            ? encryptedContent : new Uint8Array(encryptedContent || []);
+        const L = bytes.length;
+        if (L < this.V2_CONTENT_MIN_BYTES) {
+            this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.length');
+        }
+
+        const H = this.V2_CONTENT_HEADER_BYTES;
+        const O = this.V2_CONTENT_CHUNK_OVERHEAD;
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const chunkSize = view.getUint32(8, false);
+        if (chunkSize < this.V2_CONTENT_CHUNK_MIN || chunkSize > this.V2_CONTENT_CHUNK_MAX) {
+            this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.chunkSize');
+        }
+        const blobId = bytes.slice(12, 28);
+
+        const S = chunkSize + O;                 // a full chunk's stored size
+        const M = L - H;                         // everything after the header
+        const n = Math.max(1, Math.ceil(M / S));
+        const last = M - (n - 1) * S;            // the final chunk's stored size
+        // A valid final chunk holds between one and chunkSize plaintext bytes -- or zero, and then
+        // only when it is also the first. Every length in the gap between two chunk counts fails
+        // here rather than producing a confident wrong answer.
+        if (last < O || last > S || (last === O && n !== 1)) {
+            this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.framing');
+        }
+        const totalPlaintext = (n - 1) * chunkSize + (last - O);
+
+        const ctx = context || {};
+        const t = this._v2ContentTranscript(
+            ctx.vaultId, ctx.objectId, ctx.dekEpoch, chunkSize, blobId);
+        // The header this reader authenticates is REBUILT -- a constant purpose byte plus the
+        // chunk size and attempt token parsed out of the input -- so the AAD says nothing
+        // about the magic, the version, the purpose or the reserved bytes as they actually
+        // arrived. This comparison is the only thing that does.
+        //
+        // Called through `decryptFile` the seam has already checked those four, so removing
+        // this loop changes nothing and it reads as redundant. It is not: this method is
+        // public, a streaming reader is the caller this grammar exists for, and called
+        // directly with the loop gone a file relabelled to any version or purpose decrypts.
+        for (let i = 0; i < H; i++) {
+            if (bytes[i] !== t.fileHeader[i]) {
+                this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.header');
+            }
+        }
+
+        // Once per file. Deriving per chunk would be correct and ruinous.
+        const key = await this._deriveV2ContentKey(vaultDEK, t.info);
+
+        const out = new Uint8Array(totalPlaintext);
+        let written = 0;
+        for (let i = 0; i < n; i++) {
+            const start = H + i * S;
+            const end = (i === n - 1) ? L : start + S;
+            const isFinal = (i === n - 1);
+            let plain;
+            try {
+                plain = await this._subtle().decrypt(
+                    {
+                        name: this.AES_ALGORITHM,
+                        iv: bytes.slice(start, start + 12),
+                        additionalData: t.aadFor(i, isFinal,
+                            { totalChunks: n, totalPlaintext }),
+                    },
+                    key,
+                    bytes.slice(start + 12, end),
+                );
+            } catch (e) {
+                this._fail(CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED, W + '.chunk', e);
+            }
+            const p = new Uint8Array(plain);
+            // A chunk that authenticates but is the wrong length means the writer and this reader
+            // disagree about the framing, which the length arithmetic above should have caught.
+            if (p.length !== (isFinal ? last - O : chunkSize)) {
+                this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.chunkLength');
+            }
+            out.set(p, written);
+            written += p.length;
+        }
+        return out.buffer;
+    }
+
+    async decryptFile(encryptedContent, vaultDEK, context) {
         // Before anything else: is this a format from a newer build? Saying "damaged" about an
         // intact file is the failure this check exists to prevent.
         const contentV2 = this._inspectV2Header(encryptedContent);
         if (contentV2) {
+            const b = encryptedContent instanceof Uint8Array
+                ? encryptedContent : new Uint8Array(encryptedContent || []);
+            // The one recognised shape this build can now read. Everything else keeps the
+            // answer it had: a recognised header we cannot handle is 'saved by a newer
+            // version', which is true and actionable, and a malformed one is still damage.
+            //
+            // The purpose byte selects a reader here, and ONLY here. Inside that reader the
+            // transcript is built from what the caller expects, never from what the wire
+            // says -- a reader that picked its own transcript off the wire would satisfy
+            // every other rule in this family and lose the property it exists for.
+            if (contentV2 === 'UNSUPPORTED'
+                    && b[4] === this.V2_VERSION && b[5] === this.V2_PURPOSE_CONTENT) {
+                return this.decryptFileV2(b, vaultDEK, context);
+            }
             this._fail(contentV2 === 'UNSUPPORTED'
                 ? CRYPTO_ERROR_CODES.CONTENT_UNSUPPORTED
                 : CRYPTO_ERROR_CODES.CONTENT_INVALID, 'decryptFile.v2');
@@ -2089,6 +2332,7 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     // Vault-key-encrypted content. The user supplied no secret to reach here, so a failure is
     // never a passphrase problem and must never be reported as one.
     decryptFile: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
+    decryptFileV2: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
     decryptName: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
 
     // Everything else: a primitive rejected for a reason that is not authentication, not policy

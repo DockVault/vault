@@ -1,0 +1,32 @@
+{
+  "schema": "dockvault-crypto-vector-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "format": "zero-knowledge chunk-framed content v2 (purpose 0x04)",
+  "fixture_id": "zk-content-v2-one-partial-chunk",
+  "why_this_shape": "The ordinary small file: a single chunk shorter than chunk_size.",
+  "source_paths": [
+    "docs/design/vault-zk-envelope-v2.md",
+    "static/js/ecc_crypto.js"
+  ],
+  "inputs": {
+    "dek_hex": "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a",
+    "blob_id_hex": "5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b",
+    "chunk_size": 4096,
+    "vault_id": "11111111-1111-4111-8111-111111111111",
+    "object_id": "22222222-2222-4222-8222-222222222222",
+    "dek_epoch": 7,
+    "plaintext_b64": "DRQbIikwNz5FTFNaYWhvdn2Ei5KZoKeutbzDytHY3+bt9PsCCRAXHiUsMzpBSE9WXWRrcnmAh46VnKOqsbi/xs3U2+Lp8Pf+BQwTGiEoLzY9REtSWWBnbnV8g4qRmJ+mrbS7wg==",
+    "nonces_hex": [
+      "a0a0a0a0a0a0a0a0a0a0a0a0"
+    ]
+  },
+  "encoded_b64": "RFZaMgIEAAAAABAAW1tbW1tbW1tbW1tbW1tbW6CgoKCgoKCgoKCgoFKALaMZ3fI0OaW2N6i8OFvPkYaPrOYuHDJpLjC40kzYh8j4LJIO/alUImtINlklxz6vo8F+kBp61WhS2W22y3paUALZnET4IKjjwuGQXRScSjHukPD5bcCxSnxF4ym/q5U/6G7FLtEj8Aoz7BGKQcCw3+8d",
+  "expected": {
+    "plaintext_b64": "DRQbIikwNz5FTFNaYWhvdn2Ei5KZoKeutbzDytHY3+bt9PsCCRAXHiUsMzpBSE9WXWRrcnmAh46VnKOqsbi/xs3U2+Lp8Pf+BQwTGiEoLzY9REtSWWBnbnV8g4qRmJ+mrbS7wg==",
+    "total_chunks": 1,
+    "total_plaintext": 100,
+    "stored_bytes": 156,
+    "framing": "header28(magic4||version||purpose||reserved2||chunk_size4||blob_id16)||(nonce12||ciphertext||tag16)*"
+  }
+}

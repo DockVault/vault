@@ -51,30 +51,15 @@ def _v2(purpose: int = 0x04, version: int = 0x02, reserved: bytes = b"\x00\x00",
     return base64.b64encode(b"DVZ2" + bytes([version, purpose]) + reserved + body).decode()
 
 
-def test_a_v2_payload_is_reported_as_unsupported_not_damaged() -> None:
-    """The headline. 'Damaged' about an intact file is worse than no message at all.
-
-    Only content (0x04) is still unreadable. The direct DEK wrap became readable first and the two
-    team purposes followed, so each in turn left this claim -- a build that can read a format must
-    not report it as unsupported. `test_v2_direct_dek_wrap.py` and `test_v2_team_wraps.py` cover
-    what those three do instead, including that each still refuses the other two.
-
-    When content becomes readable this test has nothing left to assert and should be deleted rather
-    than weakened. That is the honest end state for it, and worth saying now so it is not quietly
-    hollowed out instead.
-    """
-    out = _node("""
-  const b64 = %s;
-  const bytes = Buffer.from(b64, 'base64');
-  const dek = await lib.generateVaultDEK();
-  out(JSON.stringify({
-    content: await codeOf(() => lib.decryptFile(bytes, dek)),
-  }));
-""" % json.dumps(_v2(0x04)))
-
-    assert out["content"] == "CONTENT_UNSUPPORTED", out
-    # The point of the whole change: none of these is the damaged code.
-    assert "CONTENT_AUTH_FAILED" not in out.values()
+# The test that used to stand here asserted that a version-2 payload is reported as unsupported
+# rather than damaged, narrowing each time a purpose became readable. Content (0x04) was the last
+# one it still had, and content is now readable -- so it had nothing left to assert. Its own
+# docstring called for deleting it rather than weakening it when this moment came, which is what
+# happened, and this note exists so the deletion does not read like a lost assertion.
+#
+# The property it protected is intact and covered elsewhere: a future VERSION still reads as
+# unsupported (below), a malformed header is still structural rather than from-the-future (below),
+# and the four readable purposes each still refuse the other three, in their own suites.
 
 
 def test_the_readable_purpose_no_longer_claims_to_be_unsupported() -> None:

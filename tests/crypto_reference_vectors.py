@@ -265,6 +265,118 @@ def decode_zk_content(encoded: bytes, *, dek_hex: str) -> bytes:
     return AESGCM(bytes.fromhex(dek_hex)).decrypt(encoded[:12], encoded[12:], None)
 
 
+V2_MAGIC = b"DVZ2"
+V2_VERSION = 0x02
+V2_PURPOSE_CONTENT = 0x04
+V2_SALT = b"dockvault-zk-envelope-v2-salt-01"
+V2_INFO_CONTENT = b"dockvault-zk-content-v2"
+V2_CONTENT_HEADER = 28
+V2_CHUNK_OVERHEAD = 28          # 12-byte nonce + 16-byte tag
+V2_CONTENT_MIN = V2_CONTENT_HEADER + V2_CHUNK_OVERHEAD
+V2_CHUNK_MIN = 4096
+V2_CHUNK_MAX = 8 * 1024 * 1024
+
+
+def _v2_content_context(vault_id: str, object_id: str, dek_epoch: int) -> bytes:
+    """Field order and widths are fixed per construction; separators are decoration, not
+    delimiters -- injectivity comes from the fixed widths."""
+    return (
+        str(uuid.UUID(vault_id)).lower().encode("ascii") + b"\x00"
+        + str(uuid.UUID(object_id)).lower().encode("ascii") + b"\x00"
+        + struct.pack(">I", dek_epoch)
+    )
+
+
+def _v2_content_aad(file_header: bytes, context: bytes, index: int, is_final: bool,
+                    total_chunks: int, total_plaintext: int) -> bytes:
+    aad = file_header + context + struct.pack(">Q", index) + (b"\x01" if is_final else b"\x00")
+    if is_final:
+        aad += struct.pack(">Q", total_chunks) + struct.pack(">Q", total_plaintext)
+    return aad
+
+
+def encode_zk_content_v2(vector: dict[str, Any]) -> bytes:
+    """Write the chunk-framed zero-knowledge content format (purpose 0x04).
+
+    Independent of the browser implementation on purpose: a single-byte disagreement between the
+    two is indistinguishable at runtime from a working system, so the only way to catch it is to
+    build the bytes twice from the specification and compare.
+    """
+    inputs = vector["inputs"]
+    dek = bytes.fromhex(inputs["dek_hex"])
+    blob_id = bytes.fromhex(inputs["blob_id_hex"])
+    if len(blob_id) != 16:
+        raise ValueError("blob_id must be 16 raw bytes")
+    chunk_size = int(inputs["chunk_size"])
+    if not V2_CHUNK_MIN <= chunk_size <= V2_CHUNK_MAX:
+        raise ValueError("chunk_size out of range")
+    plaintext = b64d(inputs["plaintext_b64"])
+    nonces = [bytes.fromhex(n) for n in inputs["nonces_hex"]]
+
+    file_header = (
+        V2_MAGIC + bytes([V2_VERSION, V2_PURPOSE_CONTENT, 0x00, 0x00])
+        + struct.pack(">I", chunk_size) + blob_id
+    )
+    context = _v2_content_context(inputs["vault_id"], inputs["object_id"],
+                                  int(inputs["dek_epoch"]))
+    key = _hkdf(dek, salt=V2_SALT, info=V2_INFO_CONTENT + b"\x00" + context + b"\x00" + blob_id)
+
+    total = len(plaintext)
+    # max(1, ...) matters: an empty file is one chunk, and ceil(0/n) is zero. An exact multiple of
+    # chunk_size gets no trailing empty chunk -- that is the one case a naive loop gets wrong, and
+    # it produces a blob every conforming reader rejects.
+    n = max(1, -(-total // chunk_size))
+    if len(nonces) != n:
+        raise ValueError(f"expected {n} nonces, got {len(nonces)}")
+
+    out = bytearray(file_header)
+    for i in range(n):
+        part = plaintext[i * chunk_size:(i + 1) * chunk_size]
+        aad = _v2_content_aad(file_header, context, i, i == n - 1, n, total)
+        out += nonces[i] + AESGCM(key).encrypt(nonces[i], part, aad)
+    return bytes(out)
+
+
+def decode_zk_content_v2(encoded: bytes, *, dek_hex: str, vault_id: str, object_id: str,
+                         dek_epoch: int) -> bytes:
+    """Read it back, deriving the framing from the stored length alone."""
+    if len(encoded) < V2_CONTENT_MIN:
+        raise ValueError("too short to be chunk-framed content")
+    if encoded[:4] != V2_MAGIC or encoded[4] != V2_VERSION or encoded[5] != V2_PURPOSE_CONTENT:
+        raise ValueError("not a version-2 content header")
+    if encoded[6] != 0 or encoded[7] != 0:
+        raise ValueError("reserved bytes are not zero")
+    chunk_size = struct.unpack(">I", encoded[8:12])[0]
+    if not V2_CHUNK_MIN <= chunk_size <= V2_CHUNK_MAX:
+        raise ValueError("chunk_size out of range")
+    blob_id = encoded[12:28]
+    file_header = encoded[:V2_CONTENT_HEADER]
+
+    stored = len(encoded) - V2_CONTENT_HEADER
+    span = chunk_size + V2_CHUNK_OVERHEAD
+    n = max(1, -(-stored // span))
+    last = stored - (n - 1) * span
+    # The domain check. Between the valid lengths for n chunks and for n+1 sits a 28-byte gap that
+    # no file can occupy, and without this the arithmetic answers confidently for those.
+    if last < V2_CHUNK_OVERHEAD or last > span or (last == V2_CHUNK_OVERHEAD and n != 1):
+        raise ValueError("length does not describe a valid chunk framing")
+    total = (n - 1) * chunk_size + (last - V2_CHUNK_OVERHEAD)
+
+    context = _v2_content_context(vault_id, object_id, dek_epoch)
+    key = _hkdf(bytes.fromhex(dek_hex), salt=V2_SALT,
+                info=V2_INFO_CONTENT + b"\x00" + context + b"\x00" + blob_id)
+
+    out = bytearray()
+    for i in range(n):
+        start = V2_CONTENT_HEADER + i * span
+        end = len(encoded) if i == n - 1 else start + span
+        aad = _v2_content_aad(file_header, context, i, i == n - 1, n, total)
+        out += AESGCM(key).decrypt(encoded[start:start + 12], encoded[start + 12:end], aad)
+    if len(out) != total:
+        raise ValueError("decrypted length does not match the framing")
+    return bytes(out)
+
+
 def encode_private_envelope(vector: dict[str, Any]) -> dict[str, Any]:
     inputs = vector["inputs"]
     salt = bytes.fromhex(inputs["salt_hex"])

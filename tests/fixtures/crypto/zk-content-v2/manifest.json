@@ -1,0 +1,24 @@
+{
+  "schema": "dockvault-crypto-manifest-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "format": "zero-knowledge chunk-framed content v2",
+  "vectors": [
+    {
+      "path": "zk-content-v2-empty.json",
+      "sha256": "2fe24ea05ac4575c3f71eebaa020211d08f162529b2ae6b0fc2716cb9ec59133"
+    },
+    {
+      "path": "zk-content-v2-one-partial-chunk.json",
+      "sha256": "62f463d0752e2579b16e188488343d80cd71d9b1a174095e229b2722aecd9ff5"
+    },
+    {
+      "path": "zk-content-v2-exact-multiple.json",
+      "sha256": "d58cec3e32b4f38c9bc19e09428d685f457f267a80e2a1d75166975b45b0d2bb"
+    },
+    {
+      "path": "zk-content-v2-multi-chunk-partial-tail.json",
+      "sha256": "64f582d0e89e649c2bc8eff3cc5e25560c97551348053dcf3ec549def6610eb4"
+    }
+  ]
+}

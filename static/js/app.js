@@ -7835,17 +7835,50 @@ async function zkGetCurrentDekVersion(vaultId) {
 
 // Decrypt a downloaded blob when the given vault is zero-knowledge; else pass through.
 // keyVersion is the file's DEK epoch (from the listing; null/absent => epoch 1).
-async function zkMaybeDecryptBlob(blob, vault, keyVersion = null) {
+//
+// The vault id, the file's own id and its epoch are passed through: a version-2 content file
+// derives its key from all three and authenticates them, so a reader cannot open one without
+// knowing which object it is reading. The older whole-file format ignores them.
+async function zkMaybeDecryptBlob(blob, vault, keyVersion = null, fileId = null) {
     if (!isZkVault(vault)) return blob;
-    const dek = await zkGetVaultDek(vault.id, keyVersion != null ? keyVersion : 1);
-    const plain = await eccLib().decryptFile(await blob.arrayBuffer(), dek);
+    // A caller that named a file but could not say which epoch it used does not know enough to
+    // decrypt it. Guessing 1 is what the lookup stopped doing, and coercing the null back into a 1
+    // here would put the guess straight back.
+    //
+    // But the usual reason for a miss is a stale listing, not a missing file -- a download begun
+    // before the six-second refresh, say. That is worth one reload before giving up, because the
+    // alternative is telling someone their intact file failed to decrypt.
+    if (fileId && keyVersion == null) {
+        try { await loadVaultFiles(); } catch (_) { /* the retry below reports it */ }
+        keyVersion = zkFileKeyVersion(fileId);
+    }
+    if (fileId && keyVersion == null) {
+        const e = new Error('zk.epoch.unknown');
+        // Carried separately from `message`: the catches show a fixed sentence for anything
+        // without a crypto code, and "failed to decrypt" is damage wording for a file that is
+        // perfectly intact and one refresh away.
+        e.userMessage = 'This file is no longer in the current listing, so the app cannot tell '
+                      + 'which key it was saved under. Reopen the folder and try again.';
+        throw e;
+    }
+    const epoch = keyVersion != null ? keyVersion : 1;
+    const dek = await zkGetVaultDek(vault.id, epoch);
+    const plain = await eccLib().decryptFile(await blob.arrayBuffer(), dek,
+        { vaultId: vault.id, objectId: fileId, dekEpoch: epoch });
     return new Blob([plain], { type: blob.type || 'application/octet-stream' });
 }
 
-// Look up a file's DEK epoch from the loaded listing (state.currentFiles). Absent => 1.
+// Look up a file's DEK epoch from the loaded listing (state.currentFiles).
+//
+// Returns null when the file is not in the loaded listing, and the caller must treat that as a
+// failure. This used to answer 1 for a miss, which was harmless while the epoch only chose which
+// key to unwrap -- a wrong guess failed loudly at the next step. It is now an input to the content
+// key derivation, so a confident wrong 1 would produce an authentication failure reported as a
+// damaged file.
 function zkFileKeyVersion(fileId) {
     const item = (state.currentFiles || []).find(i => i.id === fileId);
-    return item && item.key_version != null ? item.key_version : 1;
+    if (!item) return null;
+    return item.key_version != null ? item.key_version : 1;
 }
 
 // The DEK epoch a listing item's NAME is encrypted under. Files: their content epoch
@@ -8243,11 +8276,11 @@ async function downloadFile(fileId, fileName) {
         // Get blob (decrypting in-browser for zero-knowledge vaults) and save it.
         let blob = await response.blob();
         if (isZkVault(state.currentVault)) {
-            try { blob = await zkMaybeDecryptBlob(blob, state.currentVault, zkFileKeyVersion(fileId)); }
+            try { blob = await zkMaybeDecryptBlob(blob, state.currentVault,
+                zkFileKeyVersion(fileId), fileId); }
             catch (e) {
-                showError(isCodedCryptoError(e)
-                    ? safeMessageForCode(e.code, 'unlock')
-                    : 'Failed to decrypt file.');
+                showError(isCodedCryptoError(e) ? safeMessageForCode(e.code, 'unlock')
+                    : (e && e.userMessage) || 'Failed to decrypt file.');
                 return;
             }
         }
@@ -8290,7 +8323,10 @@ async function openFilePreview(fileId, fileName, mime) {
         if (!resp.ok) throw new Error('Could not load file (status ' + resp.status + ')');
         let blob = await resp.blob();
         // Zero-knowledge vault: decrypt the ciphertext in-browser before rendering.
-        if (isZkVault(state.currentVault)) blob = await zkMaybeDecryptBlob(blob, state.currentVault, zkFileKeyVersion(fileId));
+        if (isZkVault(state.currentVault)) {
+            blob = await zkMaybeDecryptBlob(blob, state.currentVault,
+                zkFileKeyVersion(fileId), fileId);
+        }
 
         if (_previewUrl) { URL.revokeObjectURL(_previewUrl); _previewUrl = null; }
         const type = (mime || blob.type || '').toLowerCase();
@@ -8329,9 +8365,8 @@ async function openFilePreview(fileId, fileName, mime) {
         console.error('preview failed', (e && e.code) || 'UNCODED');
         const alert = document.createElement('div');
         alert.className = 'alert alert-error';
-        alert.textContent = isCodedCryptoError(e)
-            ? safeMessageForCode(e.code, 'unlock')
-            : 'This file could not be previewed.';
+        alert.textContent = isCodedCryptoError(e) ? safeMessageForCode(e.code, 'unlock')
+            : (e && e.userMessage) || 'This file could not be previewed.';
         bodyEl.replaceChildren(alert);
     }
 }
