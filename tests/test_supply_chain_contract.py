@@ -32,7 +32,7 @@ _RENDERER_SPEC.loader.exec_module(_RENDERER)
 
 _PYTHON_DIGEST = (
     "python:3.14-alpine@"
-    "sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92"
+    "sha256:a1321512d6a287428c50dcdf2ab3857761127e03a23b1f648e9c1c0de59288f8"
 )
 _POSTGRES_DIGEST = (
     "postgres:15-alpine@"
@@ -414,11 +414,11 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
                     "pkg:oci/vault@__IMAGE_DIGEST__"
                     "?repository_url=ghcr.io/dockvault/vault"
                 ),
-                "subcomponents": [{"@id": "pkg:generic/python@3.14.6"}],
+                "subcomponents": [{"@id": "pkg:generic/python@3.14.7"}],
             },
             {
                 "@id": "__IMAGE_REFERENCE__",
-                "subcomponents": [{"@id": "pkg:generic/python@3.14.6"}],
+                "subcomponents": [{"@id": "pkg:generic/python@3.14.7"}],
             },
         ]
         assert _CPYTHON_SNAPSHOT in statement["impact_statement"]

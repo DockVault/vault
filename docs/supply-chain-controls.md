@@ -33,16 +33,22 @@ The release gate fails for every unexcepted vulnerability at `high` or `critical
 whether or not the feed advertises a fix. There is no blanket `only-fixed` bypass or global Grype
 ignore file.
 
-Python 3.14.6 predates three security fixes which are already merged on CPython's maintained
-`3.14` branch. The image replaces `Lib/tarfile.py` and `Lib/html/parser.py` with their exact
-versions from CPython commit `07efb08123ba9367a7107325adb9d5626dca1ca9`, which contains the
-3.14 backports for `CVE-2026-11940`, `CVE-2026-11972`, and `CVE-2026-15308`. The Docker build
-checks the vendored file and PSF-license hashes before copying them over the base standard
-library, and removes pip after the locked dependency installation. The file origins and expected
-hashes are recorded in `security/cpython-backports/README.md`.
+The image replaces `Lib/tarfile.py` and `Lib/html/parser.py` with their exact versions from
+CPython commit `07efb08123ba9367a7107325adb9d5626dca1ca9`, which contains the 3.14 backports for
+`CVE-2026-11940`, `CVE-2026-11972`, and `CVE-2026-15308`. The Docker build checks the vendored file
+and PSF-license hashes before copying them over the base standard library, and removes pip after
+the locked dependency installation. The file origins and expected hashes are recorded in
+`security/cpython-backports/README.md`.
 
-The reviewed OpenVEX template therefore uses `vulnerable_code_not_present` for exactly those three
-findings and the `pkg:generic/python@3.14.6` subcomponent. Before the local scan, the workflow
+**Since the base moved to 3.14.7 those two files are byte-identical to the ones they replace**, so
+the copy is a verified no-op rather than a substitution. It is retained deliberately: the hash
+check is what makes the property hold independently of whichever base digest is pinned, and it
+fails the build loudly rather than quietly if a future base does not carry the fixes. Retiring the
+vendored snapshot and the VEX statements below is a separate decision, and wants a release scan
+against 3.14.7 as its evidence rather than this reasoning.
+
+The reviewed OpenVEX template uses `vulnerable_code_not_present` for exactly those three
+findings and the `pkg:generic/python@3.14.7` subcomponent. Before the local scan, the workflow
 renders it for the tested source revision, the versioned image reference, and the local image
 content ID. After push, it overwrites the release asset with the exact registry manifest digest.
 Every statement contains both the immutable OCI digest PURL and versioned image reference; the

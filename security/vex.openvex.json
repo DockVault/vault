@@ -10,11 +10,11 @@
       "products": [
         {
           "@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
-          "subcomponents": [{"@id": "pkg:generic/python@3.14.6"}]
+          "subcomponents": [{"@id": "pkg:generic/python@3.14.7"}]
         },
         {
           "@id": "__IMAGE_REFERENCE__",
-          "subcomponents": [{"@id": "pkg:generic/python@3.14.6"}]
+          "subcomponents": [{"@id": "pkg:generic/python@3.14.7"}]
         }
       ],
       "status": "not_affected",
@@ -27,11 +27,11 @@
       "products": [
         {
           "@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
-          "subcomponents": [{"@id": "pkg:generic/python@3.14.6"}]
+          "subcomponents": [{"@id": "pkg:generic/python@3.14.7"}]
         },
         {
           "@id": "__IMAGE_REFERENCE__",
-          "subcomponents": [{"@id": "pkg:generic/python@3.14.6"}]
+          "subcomponents": [{"@id": "pkg:generic/python@3.14.7"}]
         }
       ],
       "status": "not_affected",
@@ -44,11 +44,11 @@
       "products": [
         {
           "@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
-          "subcomponents": [{"@id": "pkg:generic/python@3.14.6"}]
+          "subcomponents": [{"@id": "pkg:generic/python@3.14.7"}]
         },
         {
           "@id": "__IMAGE_REFERENCE__",
-          "subcomponents": [{"@id": "pkg:generic/python@3.14.6"}]
+          "subcomponents": [{"@id": "pkg:generic/python@3.14.7"}]
         }
       ],
       "status": "not_affected",
