@@ -230,7 +230,17 @@ def test_same_commit_redis_outage_cannot_skip_fail_open(monkeypatch):
 
 
 def test_same_commit_zk_storage_probe_failure_is_fatal(monkeypatch):
+    """Under same-commit CI the storage probe must FAIL, never skip -- by either route.
+
+    There are two ways it can fail to read the stored blob, and both used to be one. It now looks
+    the path up from `files.storage_path` before hashing it, because the blob's filename is no
+    longer the row id, so "cannot find where the file is" joined "cannot hash the file" as a
+    distinct failure. Both are checked here: this test previously matched one message, and the new
+    route reached a different one -- fatal, correctly, but not what the contract asserted.
+    """
     monkeypatch.setenv("VAULT_SAME_COMMIT_CI", "1")
+
+    # Route 1: the path lookup itself comes back empty.
     monkeypatch.setattr(
         zk_vault.subprocess,
         "run",
@@ -240,9 +250,22 @@ def test_same_commit_zk_storage_probe_failure_is_fatal(monkeypatch):
             stdout="",
         ),
     )
+    with pytest.raises(pytest.fail.Exception, match="no storage_path recorded"):
+        zk_vault._stored_sha256("vault-id", "file-id")
 
+    # Route 2: the path is known, and hashing it fails. The lookup succeeds, the hash does not.
+    calls = {"n": 0}
+
+    def _lookup_then_fail(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return SimpleNamespace(returncode=0, stdout="some-vault/files/abc", stderr="")
+        return SimpleNamespace(returncode=1, stderr="container unavailable", stdout="")
+
+    monkeypatch.setattr(zk_vault.subprocess, "run", _lookup_then_fail)
     with pytest.raises(pytest.fail.Exception, match="could not hash"):
         zk_vault._stored_sha256("vault-id", "file-id")
+    assert calls["n"] == 2, "the hash was not attempted after a successful path lookup"
 
 
 def test_degraded_alert_regression_cleans_only_its_row():
