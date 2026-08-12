@@ -91,7 +91,7 @@ pip-audit==2.10.1
     # via -r tests/requirements-test.txt
 pip-requirements-parser==32.0.1
     # via pip-audit
-pip-tools==7.6.0
+pip-tools==7.6.1
     # via -r tests/requirements-test.txt
 platformdirs==4.11.0
     # via pip-audit
