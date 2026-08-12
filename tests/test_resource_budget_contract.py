@@ -244,16 +244,33 @@ def test_the_sizing_table_follows_the_stated_formula():
             f"{file_mb:.0f} MB")
 
 
-def test_the_document_does_not_claim_upload_is_safe_or_the_target_met():
-    """Two sentences that would be quoted onward and are both false.
+def test_the_document_does_not_claim_the_target_is_met():
+    """A sentence that would be quoted onward, and is still false.
 
-    An earlier draft said upload was already bounded and needed no work. It is bounded only while
-    the client chooses small chunks, which the server does not require.
+    Download still holds whole files, so 500 MB is not reachable at the configured maximum file
+    size. The upload half of this check was true when it was written and is not any more; it is
+    replaced by the next test, which holds the document to its own measurement rather than to a
+    remembered state of the code.
     """
     # Whitespace-normalised, because these sentences wrap and an exact-substring check fails on
     # the line break rather than on the claim -- which is a test that breaks when the prose is
     # reflowed and stays silent when the meaning changes.
     text = " ".join(BUDGETS.read_text(encoding="utf-8").split())
-    assert "A client decides how much server memory its upload consumes" in text
     assert "Not reachable at the configured maximum file size" in text
     assert "Nothing here was tuned to reach the target" in text
+
+
+def test_the_two_upload_rows_agree_with_each_other():
+    """"The client no longer chooses", checked as arithmetic rather than as prose.
+
+    These two rows are the same file through the same endpoint, described differently by the
+    client. They were 22.7 MB and 273.7 MB -- a twelvefold spread the server had no say in.
+    Holding them within a factor of two is what the claim means, and it is the claim in this
+    document a reader is most likely to act on.
+    """
+    rows = {case.strip(): float(rise) for case, rise, _multiple in _document_rows()}
+    chunked = next(v for k, v in rows.items() if "5 MB chunks" in k)
+    single = next(v for k, v in rows.items() if "one chunk" in k)
+    assert single < chunked * 2, (
+        f"a single-chunk upload costs {single} MB against {chunked} MB in pieces; the request "
+        "body is being held rather than streamed, and the client is choosing again")

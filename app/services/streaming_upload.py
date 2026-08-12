@@ -5,6 +5,60 @@ import hashlib
 from pathlib import Path
 
 
+class ChunkTooLarge(Exception):
+    """A request body ran past the budget it was allowed."""
+
+
+class EmptyBody(Exception):
+    """A request body carried no bytes at all."""
+
+
+async def receive_bounded(stream, dest_path: Path, limit: int):
+    """Write an incoming body to `dest_path` as it arrives, refusing to exceed `limit`.
+
+    Returns ``(bytes_written, sha256_hex)``. The digest is accumulated in passing, because the
+    only other way to get it is to keep the body -- which is the thing this exists to avoid.
+
+    The whole point is that nothing larger than one piece of the stream is ever held. An earlier
+    version of the chunk handler accumulated the body in a bytearray and then copied it, bounded by
+    how much of the *file* was still outstanding rather than by any per-request size. That bound is
+    right for the session's transient disk and useless for memory: a client that declared its file
+    as a single chunk was permitted to hold all of it, twice. Measured at 128 MB, that was 273.7 MB
+    against 22.7 MB for the same file in 5 MB pieces -- the client chose the server's memory.
+
+    `dest_path` must be unique to this call. The file is now held open for the whole transfer
+    rather than for the length of one write, so a path shared with a concurrent caller is a path
+    two writers interleave into, and the cleanup below would delete the other one's work.
+
+    Both refusals -- over the limit, and nothing at all -- raise rather than returning, so that the
+    partial file is removed on one path instead of being the caller's job to remember. They are
+    plain exceptions rather than HTTP errors so this stays importable and testable without the API
+    stack; the caller maps them to statuses.
+    """
+    digest = hashlib.sha256()
+    written = 0
+    try:
+        with open(dest_path, 'wb') as handle:
+            async for piece in stream:
+                written += len(piece)
+                if written > limit:
+                    raise ChunkTooLarge(limit)
+                digest.update(piece)
+                handle.write(piece)
+        if not written:
+            raise EmptyBody()
+    except BaseException:
+        # Within a live session nothing reclaims an individual temp file -- the periodic sweeper
+        # and the completion paths remove the session directory wholesale, which is too late to
+        # help a session that is still uploading.
+        try:
+            dest_path.unlink()
+        except OSError:
+            pass
+        raise
+    return written, digest.hexdigest()
+
+
 class StreamingUploadContext:
     """
     Context manager for streaming file uploads with chunked encryption.
