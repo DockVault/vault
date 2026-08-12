@@ -29,11 +29,45 @@ SECRET_ENV_NAMES = {
 }
 
 
-def _clean_env():
+def _keys_in_dotenv(tmp_path):
+    """The setting names a `.env` under test defines, read from the file itself.
+
+    Derived rather than listed, so a name added to one of the `.env` files below cannot drift out
+    of this set.
+    """
+    path = tmp_path / ".env"
+    if not path.exists():
+        return set()
+    names = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            names.add(line.split("=", 1)[0].strip())
+    return names
+
+
+def _clean_env(tmp_path=None):
+    """The ambient environment, minus secrets, minus anything the `.env` under test defines.
+
+    That second exclusion matters more than it looks. A test that writes a `.env` and then asserts
+    the application picked it up is only testing that if the subprocess does not ALREADY carry
+    those names: python-dotenv does not override an existing variable. The workflow running this
+    suite exports several settings -- the rate-limit budgets among them, so tests do not trip a
+    429 -- and they were inherited straight through, so such an assertion measured the workflow's
+    value rather than the file it had just written. Whether it passed depended on whether the
+    variable happened to be set, which is a coin toss rather than a test.
+
+    Passing `tmp_path` is what asks for the exclusion. A caller that wants the process environment
+    to WIN over the file sets the variable itself afterwards and still wins -- see
+    `test_host_dotenv_load_is_explicit_and_process_environment_wins`. That is why this subtracts
+    from the ambient environment instead of overriding inside `_run`.
+    """
+    dotenv_keys = _keys_in_dotenv(tmp_path) if tmp_path is not None else set()
     env = {
         key: value
         for key, value in os.environ.items()
         if key not in SECRET_ENV_NAMES and key != "DOCKER_CONTAINER"
+        and key not in dotenv_keys
     }
     env["PYTHONPATH"] = str(ROOT)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -63,7 +97,7 @@ def _run(script, tmp_path, env=None):
     return subprocess.run(
         [sys.executable, "-c", script],
         cwd=tmp_path,
-        env=env or _clean_env(),
+        env=env if env is not None else _clean_env(tmp_path),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -116,7 +150,9 @@ def test_host_dotenv_load_is_explicit_and_process_environment_wins(tmp_path):
         ),
         encoding="utf-8",
     )
-    env = _clean_env()
+    # Built with the file's names subtracted, then ONE of them set back explicitly. That is what
+    # makes this a test of precedence rather than of whatever the runner happened to inherit.
+    env = _clean_env(tmp_path)
     env["API_PORT"] = "9191"
     script = """
 from pathlib import Path
@@ -166,7 +202,7 @@ assert middleware["TrustedHostMiddleware"].kwargs["allowed_hosts"] == [
 ]
 assert middleware["RateLimitMiddleware"].kwargs["default_limit"] == 7
 """
-    proc = _run(script, tmp_path, _clean_env())
+    proc = _run(script, tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == ""
     assert proc.stderr == ""
@@ -295,7 +331,7 @@ for name in (
 from app.core.config import bootstrap_entrypoint
 bootstrap_entrypoint("api", master_password=password)
 """
-    proc = _run(script, tmp_path, _clean_env())
+    proc = _run(script, tmp_path)
     output = proc.stdout + proc.stderr
     assert proc.returncode == 1
     assert "credential-decryption-failed" in proc.stderr
