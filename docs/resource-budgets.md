@@ -29,7 +29,7 @@ A 128 MB file, one transfer at a time, so the cost belongs to one half:
 | Case | Peak rise | Against file size |
 |---|---|---|
 | Upload, 5 MB chunks | 22.7 MB | **0.18×** — effectively flat |
-| Upload, one chunk for the whole file | 273.7 MB | **2.14×** |
+| Upload, one chunk for the whole file | 23.5 MB | **0.18×** |
 | Download | 267.9 MB | **2.09×** |
 
 ## What it says
@@ -39,24 +39,31 @@ then accumulates every piece in a list and joins them — so at the moment of th
 and the joined copy exist. One of those copies then stays resident for the whole response,
 including while a slow client reads it.
 
-**Upload costs nothing extra — but only because the client chose to be polite.** With 5 MB chunks
-the rise is 22.7 MB for a 128 MB file. With the same file declared as a single chunk it is 273.7 MB,
-the same as a download.
+**Upload costs the same whatever the client does with it.** 22.7 MB in 5 MB pieces, 23.5 MB as a
+single 128 MB chunk. That is the point of the two upload rows: they are the same workload described
+differently by the client, and the server now charges the same for both.
 
-That difference is not a server property. The chunk-upload handler buffers a request body bounded
-by *how much of the file is left*, not by the chunk size the client declared — and that declared
-size is echoed back at session start and never persisted or enforced. **A client decides how much
-server memory its upload consumes.** At the default 1 GB maximum file size, a single-chunk request
-is accepted and costs roughly 2 GB.
+It did not, until this was measured. The first run of this table put the single-chunk case at
+**273.7 MB — 2.14×, the same as a download.** The handler bounded the request body by *how much of
+the file was left* rather than by the chunk size the client declared, then accumulated it and copied
+it. That declared size was echoed back at session start and never persisted or enforced, so a client
+decided how much memory the server spent on it, and at the default 1 GB maximum file size a
+single-chunk request cost roughly 2 GB. The body now goes to the staged chunk file as it arrives,
+with its digest taken in passing; nothing larger than one piece of the stream is held.
 
-So there are two distinct problems, and only one of them is about streaming:
+That moves a cost rather than removing it, and the moved cost is worth stating: a request that is
+going to be refused for being too large is now partly on disk before it can be measured, where
+before it was in memory. The bound is the same either way — what remains of the session's declared
+size, which is disk that session was already approved to buffer — and the partial file is removed
+when the refusal is raised. What it is *not* is visible: staged files are skipped by the directory
+accounting, so a refused body in flight appears in no total. That matters for how many transfers a
+deployment admits at once, which is a separate piece of work.
 
-1. **Download holds whole files.** Fixed by yielding chunks from the reader instead of collecting
-   them — *and* by computing the stored checksum incrementally as they pass. Verifying it against a
-   reassembled buffer puts the whole file straight back in memory and gains nothing.
-2. **Upload trusts the client's chunk size.** Fixed by enforcing the declared size, or by streaming
-   the request body to the staged chunk file rather than accumulating it. This is a limit, not a
-   streaming change, and it belongs with the rest of the admission-control work.
+That leaves one problem, and it is the streaming one:
+
+**Download holds whole files.** Fixed by yielding chunks from the reader instead of collecting them
+— *and* by computing the stored checksum incrementally as they pass. Verifying it against a
+reassembled buffer puts the whole file straight back in memory and gains nothing.
 
 ## What a deployment needs
 
@@ -66,8 +73,8 @@ Redis ~11 MB, so about **140 MB** between them. The API rests at roughly 100 MB.
 For a file of size `F`, with one transfer in flight:
 
 ```
-total ≈ 240 MB  +  2.1F        (download, or an upload from an impolite client)
-total ≈ 240 MB  +  0.2F        (upload from a client using small chunks)
+total ≈ 240 MB  +  2.1F        (download)
+total ≈ 240 MB  +  0.2F        (upload, whatever chunk size the client picks)
 ```
 
 | Available RAM | Largest file one download can handle |
@@ -95,10 +102,9 @@ configuration rather than a consolation: set the file ceiling to match the memor
 other way round.
 
 Closing the gap means download not holding whole files, and the target is already measured and
-sitting in the table above: **22.7 MB for a 128 MB upload is what bounded looks like on this
-stack.** Once download matches it and the upload handler stops trusting the client's chunk size,
-`2.1F` collapses to a fixed window and a 500 MB deployment stops depending on how large its files
-are.
+sitting in the table above: **roughly 23 MB for a 128 MB upload is what bounded looks like on this
+stack, now for any chunk size the client picks.** Once download matches it, `2.1F` collapses to a
+fixed window and a 500 MB deployment stops depending on how large its files are.
 
 **Nothing here was tuned to reach the target.** The instruction was to report the honest floor.
 

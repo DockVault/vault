@@ -50,6 +50,7 @@ from app.services.vault_service import require_file_scope, require_folder_scope,
 from app.core.id_scope import id_in_scope
 from sqlalchemy.exc import IntegrityError
 from app.services.audit_logger import AuditLogger
+from app.services.streaming_upload import receive_bounded, ChunkTooLarge, EmptyBody
 from app.services import log_pull  # pure helpers for the authenticated log-pull endpoint
 from app.core.security import create_access_token, verify_access_token
 from app.core.config import initialize_runtime, settings
@@ -8673,42 +8674,77 @@ async def upload_chunk(
         if clen is not None and clen > remaining:
             raise HTTPException(status_code=413, detail="Chunk data exceeds the declared upload size")
 
-    # Real bound: stream the body and abort as soon as it would exceed the remaining
-    # budget, so a missing/understated Content-Length (chunked transfer-encoding, or a
-    # lying header) can't force an arbitrarily large body into memory before we reject it.
-    buf = bytearray()
-    async for piece in request.stream():
-        buf.extend(piece)
-        if len(buf) > remaining:
-            raise HTTPException(status_code=413, detail="Chunk data exceeds the declared upload size")
-    data = bytes(buf)
-    if not data:
+    # Staged under a name unique to this REQUEST, not to the chunk index. The body is streamed
+    # into this file across the whole transfer rather than written to it in one call at the end,
+    # so an index-derived name would be one two concurrent requests hold open at once: the second
+    # `open(..., 'wb')` truncates the first one's file, both then write at their own offsets, and
+    # either one's cleanup deletes the other's work. Re-sending a chunk is the documented retry,
+    # so two requests at one index are ordinary traffic rather than an attack.
+    tmp_path = sdir / f".chunk_{chunk_index:06d}.{uuid.uuid4().hex}.part"
+
+    # Straight to disk as it arrives, with the digest taken in passing. Nothing downstream wants
+    # the whole body -- it is written, hashed, and checked for emptiness, all of which stream --
+    # so nothing larger than one piece is held, whatever chunk size the client declared. See
+    # `receive_bounded` for what holding it used to cost.
+    #
+    # The bound is still `remaining`, what is left of the declared file, checked per piece so an
+    # absent or understated Content-Length cannot get past it. As a per-request bound it is
+    # generous, but it is the only size the session actually promises, and it now bounds transient
+    # disk rather than memory.
+    try:
+        # The byte count is not needed here: the counters below are recomputed from what is
+        # actually on disk, which is what stays right under a concurrent re-send.
+        _written, chunk_digest = await receive_bounded(request.stream(), tmp_path, remaining)
+    except ChunkTooLarge:
+        # The body reached disk before it could be measured, which is the trade for not holding it
+        # in memory. It is bounded by `remaining` -- disk this session was already approved to
+        # buffer -- and `receive_bounded` has removed it.
+        raise HTTPException(status_code=413, detail="Chunk data exceeds the declared upload size")
+    except EmptyBody:
         raise HTTPException(status_code=400, detail="Empty chunk")
 
-    # Write atomically so a dropped connection can't leave a truncated chunk.
-    tmp_path = sdir / f".chunk_{chunk_index:06d}.part"
-    with open(tmp_path, 'wb') as f:
-        f.write(data)
-    os.replace(tmp_path, chunk_path)
-    # Computed here, where the bytes are already in hand, and from what was actually written
-    # rather than from anything the client asserted. Best effort: a missing digest makes a
-    # resuming client re-send that chunk, which is slower and never wrong.
-    try:
-        import hashlib
-        _chunk_hash_path(sdir, chunk_index).write_text(
-            hashlib.sha256(data).hexdigest(), encoding='ascii')
-    except Exception:  # noqa: BLE001 -- a missing digest costs a re-send, never the upload
-        pass
-
-    # Serialize the counter update per session (SELECT ... FOR UPDATE) and recompute the counters from
-    # the AUTHORITATIVE on-disk chunk set, so concurrent PUTs — even a same-index re-send — converge to
-    # the true total instead of racing a read-modify-write (a blind += double-counts a same-index race;
-    # an absolute assignment clobbers a concurrent different-index write). Mirrors the disk-authoritative
-    # /complete and the ZK-path locking.
+    # Everything from here is under the per-session row lock (SELECT ... FOR UPDATE). It already
+    # existed to serialize the counter update; publishing the chunk needs it for the same reason.
+    # A chunk and its digest are two filesystem operations, so two requests at one index can
+    # otherwise finish them interleaved and leave one request's bytes under the other's digest --
+    # which tells a resuming client that a copy the server no longer holds still matches. Holding
+    # the lock across the rename makes the pair atomic against the only writers that can collide,
+    # which are other requests in this same session. The counters are then recomputed from the
+    # AUTHORITATIVE on-disk chunk set, so concurrent PUTs -- even a same-index re-send -- converge
+    # to the true total instead of racing a read-modify-write (a blind += double-counts a
+    # same-index race; an absolute assignment clobbers a concurrent different-index write).
+    # Mirrors the disk-authoritative /complete and the ZK-path locking.
     _total = session.total_chunks
     locked = db.query(ChunkedUploadSession).filter(
         ChunkedUploadSession.id == session.id
     ).with_for_update().first()
+
+    hash_path = _chunk_hash_path(sdir, chunk_index)
+    # A previous attempt's digest goes first. The lock keeps another request out, but a crash still
+    # lands somewhere, and this order leaves a resuming client with no digest, so it re-sends. The
+    # other order leaves the new bytes under the old digest.
+    try:
+        hash_path.unlink()
+    except OSError:
+        pass
+    try:
+        # Renamed only once it is whole, so a dropped connection cannot leave a truncated chunk
+        # under the name the assembler reads.
+        os.replace(tmp_path, chunk_path)
+    except OSError:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+    # From what was actually written rather than from anything the client asserted, accumulated
+    # while the body streamed past. Best effort: a missing digest makes a resuming client re-send
+    # that chunk, which is slower and never wrong.
+    try:
+        hash_path.write_text(chunk_digest, encoding='ascii')
+    except Exception:  # noqa: BLE001 -- a missing digest costs a re-send, never the upload
+        pass
+
     _present = sorted(sdir.glob("chunk_*"))
     _bytes = 0
     for _p in _present:
