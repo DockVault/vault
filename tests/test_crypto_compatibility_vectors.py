@@ -331,7 +331,11 @@ def test_current_readers_reject_unknown_standard_version_and_cross_format_confus
     unknown_version[len(reference.STANDARD_MAGIC)] = reference.STANDARD_VERSION + 1
     with pytest.raises(ValueError, match="header"):
         reference.decode_standard_0x10(bytes(unknown_version), **context)
-    with pytest.raises(security.EncryptionError, match="valid AES-GCM"):
+    # An unsupported version now reports itself as one, distinctly from a malformed file. The two
+    # are different instructions to whoever reads the log -- "update this deployment" against
+    # "restore this object" -- and this reader used to give the same sentence for both. Still a
+    # rejection; the assertion moved to the stronger property rather than being relaxed.
+    with pytest.raises(security.EncryptionError, match="Unsupported at-rest format version 0x11"):
         security.decrypt_gcm_chunk_stream(
             io.BytesIO(unknown_version), inputs["vault_id"], inputs["file_id"]
         )
@@ -350,7 +354,12 @@ def test_current_readers_reject_unknown_standard_version_and_cross_format_confus
         security.decrypt_gcm_chunk_stream(
             io.BytesIO(legacy_bytes), inputs["vault_id"], inputs["file_id"]
         )
-    with pytest.raises(security.EncryptionError, match="Incomplete chunk"):
+    # The reverse confusion: a chunk-stream blob handed to the legacy Fernet reader. It still
+    # refuses, and now refuses EARLIER -- the magic bytes read as an implausible record length and
+    # are rejected against the Fernet bound before anything is allocated, where previously the
+    # reader allocated first and discovered the problem on the short read. That is the whole point
+    # of the bound: this is the path by which a twelve-byte file asks for four gigabytes.
+    with pytest.raises(security.EncryptionError, match="Record length outside the permitted range"):
         b"".join(security.decrypt_chunk_stream(io.BytesIO(standard_bytes)))
 
 

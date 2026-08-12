@@ -36,17 +36,36 @@ class StreamingUploadContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Close file handle."""
+        """Close the stream -- writing its terminal first, if the format has one.
+
+        Only on a clean exit. A failed upload must NOT be terminated: a terminal says "this file is
+        complete", and writing one over a partial upload would turn a detectable truncation into an
+        object that authenticates as whole. On the error path the file is removed below anyway, but
+        the ordering matters more than the cleanup does, because the cleanup is best-effort.
+        """
+        terminal_failed = None
         if self.file_handle:
-            self.file_handle.close()
+            try:
+                if exc_type is None and hasattr(self.codec, 'terminal'):
+                    self.file_handle.write(self.codec.terminal())
+            except Exception as e:      # noqa: BLE001 - out of disk, I/O error
+                # Must not escape before the close below, or the handle leaks and the cleanup
+                # never runs -- `exc_type` is still None on this path, so the error branch would
+                # not fire either. The partial blob is unreadable regardless (no terminal), but
+                # leaking a descriptor and a file is not a good way to express that.
+                terminal_failed = e
+            finally:
+                self.file_handle.close()
 
         # If there was an error, clean up the file
-        if exc_type is not None and self.storage_path.exists():
+        if (exc_type is not None or terminal_failed is not None) and self.storage_path.exists():
             try:
                 self.storage_path.unlink()
             except:
                 pass
 
+        if terminal_failed is not None:
+            raise terminal_failed
         return False
 
     def write_chunk(self, chunk: bytes) -> int:

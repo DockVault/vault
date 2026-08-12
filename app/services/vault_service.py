@@ -1048,7 +1048,7 @@ class VaultService:
             Tuple of (File object, StreamingUploadContext)
         """
         from app.services.streaming_upload import StreamingUploadContext
-        from app.core.security import GcmChunkStreamCodec, IdentityChunkCodec, calculate_file_checksum
+        from app.core.security import GcmChunkStreamCodecV2, IdentityChunkCodec, calculate_file_checksum
         
         # Verify vault access
         self.permission_service.require_vault_permission(
@@ -1107,7 +1107,10 @@ class VaultService:
         # AES-256-GCM chunked stream whose per-chunk AAD binds the blob to THIS
         # vault+file (so a stored blob can't be swapped between vaults/files).
         is_zk = getattr(vault, 'type', 'standard') == 'zero_knowledge'
-        codec = IdentityChunkCodec() if is_zk else GcmChunkStreamCodec(vault_id, file_id)
+        # New Standard writes use 0x20. Existing 0x10 and legacy Fernet blobs keep being read;
+        # there is no bulk rewrite, and this does not introduce the first blob-rewriting migration
+        # in this codebase.
+        codec = IdentityChunkCodec() if is_zk else GcmChunkStreamCodecV2(vault_id, file_id)
 
         # Create streaming context
         context = StreamingUploadContext(
@@ -1394,7 +1397,18 @@ class VaultService:
             is_gcm_chunk_stream, decrypt_gcm_chunk_stream, decrypt_chunk_stream,
         )
 
-        if is_gcm_chunk_stream(storage_path):
+        # The identification itself can now fail, and it must be caught HERE: it used to return
+        # False for an unreadable file, which silently routed a healthy object to the wrong reader
+        # and called it damaged. Making it raise fixed that and moved the problem -- this call sits
+        # outside the try below, so the exception escaped as an unhandled 500 instead of the
+        # service's own error. Distinguishing "cannot read the file" from "not this format" is only
+        # worth anything if the distinction survives to the caller.
+        try:
+            looks_like_gcm = is_gcm_chunk_stream(storage_path)
+        except Exception as e:
+            raise FileServiceError(f"Failed to read file: {e}")
+
+        if looks_like_gcm:
             try:
                 with open(storage_path, 'rb') as f:
                     file_content = decrypt_gcm_chunk_stream(f, file.vault_id, file.id)
