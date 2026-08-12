@@ -78,6 +78,113 @@ _GCM_STREAM_HEADER = GCM_STREAM_MAGIC + bytes([GCM_STREAM_VERSION]) + b'\x00\x00
 _GCM_NONCE_SIZE = 12
 _CHUNK_AAD_DOMAIN = b'dockvault-chunk-aad-v1'
 
+# --- Format version 0x20: the same records, plus a terminal that makes truncation
+# --- detectable ------------------------------------------------------------------
+# 0x10 authenticates every record against its vault, file and position, so a record cannot be
+# swapped or reordered. What it cannot see is a record that is simply NOT THERE: a file cut short
+# decrypts perfectly up to the cut, and the only thing that noticed was the stored plaintext
+# checksum -- a bare hash in a column, which is not an integrity mechanism against anyone who can
+# write that column.
+#
+# 0x20 ends the stream with an authenticated terminal record binding the record count and the
+# total plaintext length, and requires the file to end there. A truncated file now fails to
+# produce a terminal, and a terminal cannot be lifted from a shorter file because it authenticates
+# a different count and length.
+#
+# Version 0x20 rather than 0x11: a test constructs its "unknown version" probe as
+# STANDARD_VERSION + 1, and a gap reads as a new generation rather than an increment.
+GCM_STREAM_VERSION_V2 = 0x20
+_GCM_STREAM_HEADER_V2_PREFIX = GCM_STREAM_MAGIC + bytes([GCM_STREAM_VERSION_V2]) + b'\x00\x00'
+# 16 random bytes naming ONE write of an object, stored in the header and bound into every
+# record's associated data.
+#
+# Without it a terminal authenticates only (vault, file, count, length), and any two writes of the
+# same object that happen to have the same shape produce interchangeable terminals. An actor with
+# disk access who kept an earlier write's terminal could then cut the current object down to a
+# matching record count, reattach that terminal, and the result would authenticate as a complete
+# file. The object id alone cannot separate the two writes: it is deliberately stable across a
+# resumed upload, because the name is sealed against it.
+#
+# The same reasoning, and the same 16 bytes, already appear in the zero-knowledge content format.
+_WRITE_ID_SIZE = 16
+_GCM_STREAM_HEADER_V2_SIZE = len(_GCM_STREAM_HEADER_V2_PREFIX) + _WRITE_ID_SIZE
+_CHUNK_AAD_DOMAIN_V2 = b'dockvault-chunk-aad-v2'
+_TERMINAL_AAD_DOMAIN_V2 = b'dockvault-terminal-aad-v2'
+# The marker in a record's length field that says "this is the terminal". The invariant below is
+# part of the grammar, not an arithmetic coincidence of today's numbers: if a legal data record
+# could ever be this long, a reader could not tell the two apart.
+_TERMINAL_MARKER = 0xFFFFFFFF
+
+# Absolute format constants, deliberately NOT configuration. An earlier draft derived the ceiling
+# from the deployment's maximum file size; that is a data-loss bug, because the setting is mutable
+# downward at runtime and nothing rewrites blobs, so lowering it would make every larger existing
+# object permanently unreadable. A reader's willingness to parse must not depend on a value that
+# can change under it.
+MAX_CHUNK_SIZE = 8 * 1024 * 1024                       # above the largest writer chunk (5 MiB)
+MAX_RECORD_BYTES = MAX_CHUNK_SIZE + _GCM_NONCE_SIZE + 16
+# 0x20 requires at least one plaintext byte per data record (5.2), so 29. 0x10 does NOT, and this
+# is not a theoretical difference: the frozen v0.10.0 release vector for 0x10 contains a
+# zero-plaintext record, and the independent cross-implementation decoder pins that floor at 28.
+# Applying the stricter number to the retained reader made a released, contract-pinned class of
+# object permanently undownloadable: the frozen release fixture for 0x10 contains exactly such a
+# record, so this is a rule the repository already pins, not a hypothetical.
+MIN_RECORD_BYTES = _GCM_NONCE_SIZE + 16 + 1            # 0x20: nonce + tag + one plaintext byte
+MIN_RECORD_BYTES_V1 = _GCM_NONCE_SIZE + 16             # 0x10: a zero-plaintext record is legal
+# Not file-ceiling / chunk-size, which gives ~1,024 and looks generous. The resumable path's record
+# count is driven by the client-chosen chunk count, capped at 200,000, plus 1 MiB sub-splitting
+# inside each staged chunk -- so the largest legitimate count is around 201,024.
+MAX_RECORDS = 2 ** 21
+# The implied ceiling, recorded rather than enforced: with a cap on records and a cap on each
+# record, the total is already bounded and a separate check for it can never fire. An earlier
+# version had one, which was dead code that read like a safeguard.
+MAX_TOTAL_PLAINTEXT = MAX_RECORDS * MAX_CHUNK_SIZE
+# A different overhead model: Fernet's token expands the plaintext by base64 and a 57-byte
+# envelope, so its records are legitimately larger than a GCM record of the same chunk.
+MAX_FERNET_RECORD_BYTES = 12 * 1024 * 1024
+
+assert MAX_RECORD_BYTES < _TERMINAL_MARKER, (
+    "a legal data record must never be able to carry the terminal's length marker")
+
+
+def _chunk_stream_aad_v2(vault_id, file_id, write_id: bytes, index: int) -> bytes:
+    """Per-record associated data for 0x20.
+
+    Three separations from v1, each load-bearing. The domain advances to v2, so a record lifted
+    out of a 0x10 file cannot authenticate inside a 0x20 one. The terminal has a domain of its own,
+    so neither can be accepted as the other. And the VERSION BYTE is bound -- not obvious, because
+    the relabel-0x20-as-0x10 downgrade already fails on the domain alone; it matters for the next
+    version, which might change reserved-byte semantics while keeping these domains and would
+    otherwise be freely downgradeable to 0x20.
+
+    The encoding is injective: every field after the domain is fixed-width, so the total length
+    determines the domain length and therefore the field split. A future domain MUST keep that
+    property -- no variable-width field without a length prefix.
+    """
+    if len(write_id) != _WRITE_ID_SIZE:
+        raise EncryptionError("Malformed write id")
+    return (_CHUNK_AAD_DOMAIN_V2 + bytes([GCM_STREAM_VERSION_V2]) + write_id
+            + _uuid_bytes(vault_id) + _uuid_bytes(file_id) + struct.pack('>Q', index))
+
+
+def _terminal_aad_v2(vault_id, file_id, write_id: bytes, chunk_count: int,
+                     plaintext_length: int) -> bytes:
+    """Associated data for the terminal record. `chunk_count` excludes the terminal itself.
+
+    Both values are known to the writer when it writes this, and recoverable by the reader from
+    its own running count and sum as it goes -- so neither has the availability problem that killed
+    a related design in this project.
+
+    Note what this does NOT do: the reader never learns these numbers from the terminal. AAD is an
+    input to decryption, not an output. The terminal decrypting successfully IS the verification,
+    and there is no comparison step afterwards -- any description of one is describing a value
+    compared with itself.
+    """
+    if len(write_id) != _WRITE_ID_SIZE:
+        raise EncryptionError("Malformed write id")
+    return (_TERMINAL_AAD_DOMAIN_V2 + bytes([GCM_STREAM_VERSION_V2]) + write_id
+            + _uuid_bytes(vault_id) + _uuid_bytes(file_id)
+            + struct.pack('>Q', chunk_count) + struct.pack('>Q', plaintext_length))
+
 
 def _uuid_bytes(value) -> bytes:
     """16 raw bytes of a UUID, accepting a uuid.UUID or its string form."""
@@ -126,6 +233,62 @@ class GcmChunkStreamCodec:
         return struct.pack('>I', _GCM_NONCE_SIZE + len(ct)) + nonce + ct
 
 
+class GcmChunkStreamCodecV2(GcmChunkStreamCodec):
+    """Writer for format 0x20: the 0x10 records, a v2 AAD, and a terminal.
+
+    Records are NOT required to be uniformly sized, and any rule demanding that would reject
+    legitimate uploads: the resumable path re-chunks each staged chunk file at 1 MiB, so a staged
+    chunk that is not a multiple of 1 MiB legally emits a short interior record. That is also why
+    the header carries no chunk-size field -- there is no single size "fixed at open" for a writer
+    to declare.
+    """
+
+    def __init__(self, vault_id, file_id):
+        super().__init__(vault_id, file_id)
+        self._records = 0
+        self._plaintext = 0
+        # Minted here, once per writer, and never accepted from a caller: a caller able to supply
+        # it could reproduce a previous write's value and reopen the replay this closes.
+        self._write_id = secrets.token_bytes(_WRITE_ID_SIZE)
+
+    def header(self) -> bytes:
+        return _GCM_STREAM_HEADER_V2_PREFIX + self._write_id
+
+    def encrypt(self, chunk: bytes, index: int) -> bytes:
+        # The writer is bounded as well as the reader. Without this a writer could emit more
+        # records than its own reader accepts, producing an object that uploads successfully and
+        # can never be downloaded.
+        if self._records >= MAX_RECORDS:
+            raise EncryptionError("Too many records for the at-rest format")
+        if len(chunk) > MAX_CHUNK_SIZE:
+            raise EncryptionError("Chunk exceeds the at-rest format maximum")
+        # The minimum is a writer bound too. A zero-length chunk produces a 28-byte record that
+        # this format's own reader refuses, so the file would upload and never download. Today the
+        # streaming writer returns early on an empty chunk, which makes this unreachable rather
+        # than unnecessary.
+        if not chunk:
+            raise EncryptionError("An empty record is not valid in this format")
+        nonce = secrets.token_bytes(_GCM_NONCE_SIZE)
+        aad = _chunk_stream_aad_v2(self._vault_id, self._file_id, self._write_id, index)
+        ct = self._aesgcm.encrypt(nonce, chunk, aad)
+        self._records += 1
+        self._plaintext += len(chunk)
+        return struct.pack('>I', _GCM_NONCE_SIZE + len(ct)) + nonce + ct
+
+    def terminal(self) -> bytes:
+        """The closing record: a length marker, a nonce, and a tag over empty plaintext.
+
+        Exactly 28 bytes after the length field, and a reader must read exactly that rather than
+        reading to end-of-file -- otherwise strict EOF is unreachable and trailing bytes get
+        misreported as a corrupt tag.
+        """
+        nonce = secrets.token_bytes(_GCM_NONCE_SIZE)
+        aad = _terminal_aad_v2(self._vault_id, self._file_id, self._write_id,
+                               self._records, self._plaintext)
+        tag = self._aesgcm.encrypt(nonce, b'', aad)
+        return struct.pack('>I', _TERMINAL_MARKER) + nonce + tag
+
+
 class IdentityChunkCodec:
     """Passthrough codec for zero-knowledge vaults: store the client's ciphertext
     verbatim with no header (parity with the previous identity-lambda behaviour)."""
@@ -141,15 +304,18 @@ def is_gcm_chunk_stream(storage_path) -> bool:
     """Cheap, non-decrypting peek: True iff the file begins with the GCM chunked-stream
     magic + version. Legacy Fernet streams start with a 4-byte chunk length (no magic),
     so they return False and route to decrypt_chunk_stream."""
+    prefix_len = len(GCM_STREAM_MAGIC) + 1
     try:
-        prefix_len = len(GCM_STREAM_MAGIC) + 1
         with open(storage_path, 'rb') as f:
             head = f.read(prefix_len)
-        return (len(head) == prefix_len
-                and head[:len(GCM_STREAM_MAGIC)] == GCM_STREAM_MAGIC
-                and head[len(GCM_STREAM_MAGIC)] == GCM_STREAM_VERSION)
-    except Exception:
-        return False
+    except OSError as e:
+        # A transient read failure is NOT "this is some other format". Swallowing it routed a
+        # healthy file to the wrong reader and reported an intact object as damaged -- the exact
+        # mislabel this work exists to remove, arriving through the cheapest possible path.
+        raise EncryptionError(f"Could not identify the stored format: {e}")
+    return (len(head) == prefix_len
+            and head[:len(GCM_STREAM_MAGIC)] == GCM_STREAM_MAGIC
+            and head[len(GCM_STREAM_MAGIC)] in (GCM_STREAM_VERSION, GCM_STREAM_VERSION_V2))
 
 
 def decrypt_gcm_chunk_stream(file_handle, vault_id, file_id) -> bytes:
@@ -159,25 +325,80 @@ def decrypt_gcm_chunk_stream(file_handle, vault_id, file_id) -> bytes:
     chunks (index differs)."""
     header = file_handle.read(len(_GCM_STREAM_HEADER))
     if (len(header) < len(_GCM_STREAM_HEADER)
-            or header[:len(GCM_STREAM_MAGIC)] != GCM_STREAM_MAGIC
-            or header[len(GCM_STREAM_MAGIC)] != GCM_STREAM_VERSION):
+            or header[:len(GCM_STREAM_MAGIC)] != GCM_STREAM_MAGIC):
         raise EncryptionError("Not a valid AES-GCM chunk stream")
+    version = header[len(GCM_STREAM_MAGIC)]
+    if version not in (GCM_STREAM_VERSION, GCM_STREAM_VERSION_V2):
+        # Deliberately distinct from the malformed case above. "This file was written by a newer
+        # build, update this deployment" and "this file is damaged, restore it" are different
+        # instructions, and an operator given the wrong one acts on the wrong thing.
+        raise EncryptionError(
+            f"Unsupported at-rest format version 0x{version:02x}; this build reads "
+            f"0x{GCM_STREAM_VERSION:02x} and 0x{GCM_STREAM_VERSION_V2:02x}")
+    write_id = b''
+    if version == GCM_STREAM_VERSION_V2:
+        # The v2 header is longer than the v1 one by the write id, so it is read in two parts:
+        # the shared prefix decides the version, and only then is the remainder known.
+        write_id = file_handle.read(_WRITE_ID_SIZE)
+        if len(write_id) != _WRITE_ID_SIZE:
+            raise EncryptionError("Truncated header")
+    if version == GCM_STREAM_VERSION_V2 and header[len(GCM_STREAM_MAGIC) + 1:] != b'\x00\x00':
+        # Promoted to a real channel by this version: a future format may give the reserved bytes
+        # meaning, and a reader that ignored them would silently misread such a file.
+        raise EncryptionError("Reserved header bytes are not zero")
+
     aesgcm = AESGCM(_gcm_stream_subkey(vault_id, file_id))
     out = []
     index = 0
+    total = 0
+    terminated = False
     try:
         while True:
             length_header = file_handle.read(4)
             if not length_header or len(length_header) < 4:
                 break
             rec_len = struct.unpack('>I', length_header)[0]
+
+            if version == GCM_STREAM_VERSION_V2 and rec_len == _TERMINAL_MARKER:
+                # Exactly 28 bytes, not "the rest of the file". Reading to EOF here would make the
+                # trailing-bytes check below unreachable and would misreport appended junk as a
+                # corrupt tag.
+                record = file_handle.read(_GCM_NONCE_SIZE + 16)
+                if len(record) != _GCM_NONCE_SIZE + 16:
+                    raise EncryptionError("Truncated terminal record")
+                aad = _terminal_aad_v2(vault_id, file_id, write_id, index, total)
+                aesgcm.decrypt(record[:_GCM_NONCE_SIZE], record[_GCM_NONCE_SIZE:], aad)
+                terminated = True
+                break
+
+            # Every bound is checked BEFORE the read. The reader this replaces allocated first and
+            # discovered the problem second, which is how a 48-byte file reaches a 4 GiB read.
+            floor = (MIN_RECORD_BYTES if version == GCM_STREAM_VERSION_V2
+                     else MIN_RECORD_BYTES_V1)
+            if rec_len < floor or rec_len > MAX_RECORD_BYTES:
+                raise EncryptionError("Record length outside the permitted range")
+            if index >= MAX_RECORDS:
+                raise EncryptionError("Too many records in encrypted file")
+
             record = file_handle.read(rec_len)
             if len(record) != rec_len:
                 raise EncryptionError("Incomplete chunk in encrypted file")
             nonce, ct = record[:_GCM_NONCE_SIZE], record[_GCM_NONCE_SIZE:]
-            aad = _chunk_stream_aad(vault_id, file_id, index)
-            out.append(aesgcm.decrypt(nonce, ct, aad))
+            aad = (_chunk_stream_aad_v2(vault_id, file_id, write_id, index)
+                   if version == GCM_STREAM_VERSION_V2
+                   else _chunk_stream_aad(vault_id, file_id, index))
+            plain = aesgcm.decrypt(nonce, ct, aad)
+            out.append(plain)
+            total += len(plain)
             index += 1
+
+        if version == GCM_STREAM_VERSION_V2:
+            if not terminated:
+                # The clause the version bump exists for. Without it a file cut short decrypts
+                # perfectly up to the cut and nothing says so.
+                raise EncryptionError("Encrypted file ended without a terminal record")
+            if file_handle.read(1):
+                raise EncryptionError("Trailing bytes after the terminal record")
     except EncryptionError:
         raise
     except Exception as e:
@@ -476,7 +697,15 @@ def decrypt_chunk_stream(file_handle):
                 break
             
             chunk_length = struct.unpack('>I', length_header)[0]
-            
+
+            # Bounded BEFORE the read, like the GCM reader. This is the path a 48-byte file uses
+            # to reach a 4 GiB allocation: a length field is four attacker-controlled bytes, and
+            # this reader used to hand them straight to read(). The ceiling is Fernet's, not the
+            # GCM one -- a Fernet token expands its plaintext by base64 plus a 57-byte envelope, so
+            # a legitimate record here is genuinely larger than a GCM record of the same chunk.
+            if chunk_length < 1 or chunk_length > MAX_FERNET_RECORD_BYTES:
+                raise EncryptionError("Record length outside the permitted range")
+
             # Read encrypted chunk
             encrypted_chunk = file_handle.read(chunk_length)
             if len(encrypted_chunk) != chunk_length:
