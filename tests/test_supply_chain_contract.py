@@ -250,7 +250,11 @@ def test_preflight_reproduces_installs_checks_and_audits_the_lock():
 
     test_input = (_ROOT / "tests" / "requirements-test.txt").read_text(encoding="utf-8")
     test_lock = (_ROOT / "tests" / "requirements-test.lock").read_text(encoding="utf-8")
-    for package, version in (("pip-tools", "7.6.0"), ("pip-audit", "2.10.1")):
+    # These are reviewed pins, not incidental ones: the preflight job regenerates and audits the
+    # production lock with exactly these tools, so moving either is a supply-chain decision. That
+    # is why the version is repeated here rather than read from the requirements file -- a bump has
+    # to be made twice, deliberately, and this assertion is the second time.
+    for package, version in (("pip-tools", "7.6.1"), ("pip-audit", "2.10.1")):
         assert f"{package}=={version}" in test_input
         assert f"{package}=={version}" in test_lock
 
