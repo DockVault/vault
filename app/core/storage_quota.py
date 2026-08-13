@@ -222,21 +222,26 @@ def check_grant(new_grant, *, current_grant, other_grants, stored_bytes,
         return (f"That would put the vault's limit ({format_bytes(new_total)}) below the "
                 f"{format_bytes(stored)} it already stores. Free up space in the vault first.")
 
-    if per_vault_ceiling is not None and new_total > per_vault_ceiling:
+    # The two ceilings below bound how much MORE may be allocated, so they are checked only when
+    # this change is an increase. A limit that tightens after the fact — an administrator lowering
+    # the per-vault maximum, or an account's quota being cut — would otherwise trap the storage
+    # already allocated: every reclaim still ends above the new bound, so nobody could take their
+    # own contribution back and the only way out would be deleting the vault. Moving toward
+    # compliance is always allowed; moving further away never is.
+    current_grant = int(current_grant or 0)
+    current_total = other + current_grant
+
+    if per_vault_ceiling is not None and new_total > per_vault_ceiling and new_total > current_total:
         return (f"That would put the vault's limit ({format_bytes(new_total)}) above the "
                 f"{format_bytes(per_vault_ceiling)} maximum an administrator allows per vault.")
 
-    if account_quota is not None:
+    if account_quota is not None and new_grant > current_grant:
         spent = int(allocated_elsewhere or 0) + new_grant
         if spent > account_quota:
             available = max(0, account_quota - int(allocated_elsewhere or 0))
             return (f"That would use {format_bytes(spent)} of your {format_bytes(account_quota)} "
                     f"storage quota. You can contribute up to {format_bytes(available)} to this vault.")
 
-    # Reassure the caller that reclaiming is bounded by what they personally gave: any decrease
-    # is fine as long as the checks above pass, and current_grant is accepted purely so callers
-    # can pass their read-modify-write state through one function.
-    _ = current_grant
     return None
 
 

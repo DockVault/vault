@@ -63,9 +63,12 @@ def test_deployment_limit_shows_its_ceiling_and_usage(page: Page, admin, admin_c
     label = page.locator("#setting-deployment-storage-max")
     if settings["deployment_storage_max_gb"]:
         # The ceiling is stated in words AND enforced by the input, so "-1 for unlimited" never
-        # has to be explained to anyone.
-        expect(label).to_contain_text(f"{settings['deployment_storage_max_gb']} GB maximum")
-        expect(field).to_have_attribute("max", str(settings["deployment_storage_max_gb"]))
+        # has to be explained to anyone. JSON carries the ceiling as a number, so a whole one
+        # renders as "50", not "50.0" — match the browser's own formatting.
+        ceiling = settings["deployment_storage_max_gb"]
+        shown = str(int(ceiling)) if float(ceiling) == int(ceiling) else str(ceiling)
+        expect(label).to_contain_text(f"{shown} GB maximum")
+        expect(field).to_have_attribute("max", shown)
     else:
         expect(label).to_contain_text("no deployment maximum")
     expect(page.locator("#setting-deployment-storage-help")).to_contain_text("stored of")

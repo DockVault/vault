@@ -408,7 +408,7 @@ def build_env_lines(cfg):
     # own default (-1, unlimited) applies, so an install that never mentions storage authors the
     # .env it always did.
     if cfg.get("max_storage_gb") not in (None, ""):
-        bare("MAX_STORAGE_GB", "%g" % float(cfg["max_storage_gb"]))
+        bare("MAX_STORAGE_GB", format_gb_value(cfg["max_storage_gb"]))
     if cfg.get("plan_log_pull"):
         # Opting in here closes the log-404 trap: the endpoint needs BOTH the plan flag and a
         # strong pepper before it will serve (then an admin still ticks a component in the UI).
@@ -897,6 +897,13 @@ def parse_max_storage_gb(raw):
         return None
 
 
+def format_gb_value(gb):
+    """A GB number as an .env value. Deliberately not '%g': that renders large numbers in
+    exponent notation ('1e+06'), and a whole number should read as '64', not '64.0'."""
+    gb = float(gb)
+    return str(int(gb)) if gb == int(gb) else repr(gb)
+
+
 def format_bytes(n):
     """Bytes as a short human string for the console ('2.50 GB', '512 MB', '900 B')."""
     n = int(n or 0)
@@ -921,6 +928,12 @@ def storage_limit_problem(requested_gb, stored_bytes):
         return "A negative limit other than -1 (unlimited) is not a size."
     if requested_gb == -1:
         return None
+    if requested_gb == 0:
+        # 0 in this variable means "no ceiling configured", the same as -1 — so accepting it here
+        # would hand an operator asking for a full stop the exact opposite. A stop is a LIVE limit,
+        # which the vault's own Settings page can express (its 0 does mean zero).
+        return ("0 here means 'no ceiling', not 'no storage'. To stop new uploads, set the live "
+                "limit to 0 in the vault's Settings -> Storage; use -1 here for no ceiling.")
     if stored_bytes is not None and requested_gb * GIB < stored_bytes:
         return ("%s is already stored, so the limit cannot go below that. Delete files first, "
                 "then lower the limit." % format_bytes(stored_bytes))
@@ -2800,14 +2813,14 @@ class DockVault:
                             "Uploads will fail when the disk fills, whatever the limit says."
                             % (requested, format_bytes(capacity[2])), "yellow"))
 
-        self._set_env_key(self._env_path(), "MAX_STORAGE_GB", "%g" % requested)
+        self._set_env_key(self._env_path(), "MAX_STORAGE_GB", format_gb_value(requested))
         if key_in_use == "PLAN_MAX_STORAGE_GB":
             # Leave the legacy key in place but neutralise it, so the two can never disagree about
             # the ceiling after this write.
             self._set_env_key(self._env_path(), "PLAN_MAX_STORAGE_GB", "-1")
             print(pal.paint("  PLAN_MAX_STORAGE_GB was in use; MAX_STORAGE_GB now carries the limit.",
                             "yellow"))
-        print(pal.paint("  Set MAX_STORAGE_GB=%g in .env." % requested, "green"))
+        print(pal.paint("  Set MAX_STORAGE_GB=%s in .env." % format_gb_value(requested), "green"))
 
         if args and getattr(args, "no_restart", False):
             print(pal.paint("  Not restarting; the new limit applies after the next restart.\n", "yellow"))

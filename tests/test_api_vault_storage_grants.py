@@ -327,6 +327,36 @@ def test_the_account_quota_bounds_what_one_contributor_can_give(admin, shared_va
     assert mc.put(f"/vaults/{vid}/storage", json={"granted_bytes": 2 * GIB}).status_code == 200
 
 
+def test_a_ceiling_lowered_after_the_fact_still_lets_people_reclaim(admin, shared_vault):
+    """An administrator tightening the per-vault maximum below an existing vault must not lock
+    everyone's storage inside it — giving it back is the move that restores compliance."""
+    vid = shared_vault["vault_id"]
+    oc, mc = shared_vault["owner_client"], shared_vault["manager_client"]
+    assert mc.put(f"/vaults/{vid}/storage", json={"granted_bytes": 5 * GIB}).status_code == 200
+
+    _set_quotas(admin, 1000, 2)          # the vault is now 6 GB against a 2 GB ceiling
+
+    back = mc.put(f"/vaults/{vid}/storage", json={"granted_bytes": 2 * GIB})
+    assert back.status_code == 200, back.text
+    assert back.json()["size_limit"] == 3 * GIB
+    # ...but growing further past the ceiling is still refused.
+    assert mc.put(f"/vaults/{vid}/storage", json={"granted_bytes": 6 * GIB}).status_code == 400
+    assert oc.get(f"/vaults/{vid}/storage").json()["size_limit"] == 3 * GIB
+
+
+def test_a_quota_cut_after_the_fact_still_lets_the_account_give_storage_back(admin, shared_vault):
+    vid = shared_vault["vault_id"]
+    mc = shared_vault["manager_client"]
+    assert mc.put(f"/vaults/{vid}/storage", json={"granted_bytes": 5 * GIB}).status_code == 200
+
+    _set_quotas(admin, 1, 1000)          # the manager is now 4 GB over their own budget
+
+    assert mc.put(f"/vaults/{vid}/storage", json={"granted_bytes": 1 * GIB}).status_code == 200
+    assert mc.get("/account/storage").json()["reserved_bytes"] == GIB
+    # and they cannot spend their way further over the budget
+    assert mc.put(f"/vaults/{vid}/storage", json={"granted_bytes": 3 * GIB}).status_code == 400
+
+
 def test_headroom_reported_for_a_contributor_accounts_for_the_others(admin, shared_vault):
     vid = shared_vault["vault_id"]
     mc = shared_vault["manager_client"]

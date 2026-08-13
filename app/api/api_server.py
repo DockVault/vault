@@ -34,7 +34,7 @@ from app.core.config import bootstrap_entrypoint
 bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
-from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, vault_members
+from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant
 from app.core import sharing_policy
 from app.core import storage_quota
 from app.core.key_wrap_algorithms import DIRECT_DEK_ALGO, TEAMPRIV_ALGO
@@ -1775,13 +1775,6 @@ def _settings_blob(db: Session) -> dict:
     return dict(row.value) if (row and row.value) else {}
 
 
-def _quota_setting_bytes(db: Session, key: str) -> int:
-    """A GB quota from the global settings blob -> bytes. Missing / non-positive / unparseable => 0,
-    which means UNLIMITED on that axis (not enforced). So a fresh deployment that never set the value
-    is unbounded, and an admin opts in by saving a positive number of GB."""
-    return storage_quota.quota_setting_bytes(_settings_blob(db).get(key)) or 0
-
-
 def _is_budget_exempt(user: User) -> bool:
     """Whether this identity is exempt from the per-account storage budget.
 
@@ -1859,10 +1852,17 @@ def _vault_grant_rows(db: Session, vault, commit: bool = True) -> list:
     # A read path has no other work in flight, so it persists the repair itself. A write path
     # passes commit=False: it is holding a row lock that its own commit will release, and
     # committing here would drop that lock halfway through the allocation.
-    if commit:
-        db.commit()
-    else:
-        db.flush()
+    try:
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+    except IntegrityError:
+        # Two unlocked reads repairing the same vault at once: both insert the owner's row and
+        # the (vault_id, user_id) constraint rejects the loser. The winner's row is the answer,
+        # so re-read it rather than turning a self-healing path into a 500.
+        db.rollback()
+        return db.query(VaultStorageGrant).filter(VaultStorageGrant.vault_id == vault.id).all()
     return rows
 
 

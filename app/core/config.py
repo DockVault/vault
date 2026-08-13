@@ -149,7 +149,9 @@ class Settings(BaseSettings):
     # this number stays in control of the maximum. Only bytes actually written count toward it:
     # empty vaults, however many, cost nothing. The earlier PLAN_MAX_STORAGE_GB spelling is still
     # accepted so an existing deployment's .env keeps working across an update.
-    max_storage_gb: int = Field(
+    # A float, not an int: an operator sizing a small deployment reasonably writes 1.5, and an
+    # int field would refuse the whole settings model and stop the deployment from starting.
+    max_storage_gb: float = Field(
         default=-1,
         validation_alias=AliasChoices("max_storage_gb", "plan_max_storage_gb"),
     )

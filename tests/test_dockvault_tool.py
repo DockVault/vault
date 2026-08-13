@@ -2429,3 +2429,34 @@ def test_volume_capacity_is_unknown_on_unusable_output(tmp_path, monkeypatch, st
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: _Proc(0, stdout=stdout))
     assert tool._volume_capacity() is None
+
+
+@pytest.mark.parametrize("value,expected", [
+    (64, "64"), (64.0, "64"), (-1, "-1"), (1.5, "1.5"), (0.5, "0.5"), (1e6, "1000000"),
+])
+def test_format_gb_value_never_writes_something_the_app_cannot_read(value, expected):
+    """The .env value is parsed by the app's settings model at startup, so exponent notation or a
+    stray '.0' is not a cosmetic matter — a deployment that cannot parse it will not start."""
+    assert dv.format_gb_value(value) == expected
+
+
+def test_a_fractional_ceiling_round_trips_into_the_app_settings(tmp_path, monkeypatch):
+    tool = _storage_tool(tmp_path, monkeypatch, stored=0)
+    tool.storage(argparse.Namespace(set_gb=1.5, non_interactive=True, no_restart=True))
+    written = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["MAX_STORAGE_GB"]
+    assert written == "1.5"
+    # The app must accept exactly what was written (an int-typed field would refuse it and the
+    # deployment would fail to start after the recreate).
+    from app.core.config import Settings
+    assert Settings(max_storage_gb=written).max_storage_gb == 1.5
+
+
+def test_zero_is_refused_because_it_would_mean_the_opposite(tmp_path, monkeypatch):
+    """MAX_STORAGE_GB=0 reads as 'no ceiling', so an operator asking for a full stop must not be
+    handed unlimited storage instead — they are pointed at the live limit, whose 0 means zero."""
+    tool = _storage_tool(tmp_path, monkeypatch, stored=0)
+    before = (tmp_path / ".env").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit):
+        tool.storage(argparse.Namespace(set_gb=0, non_interactive=True, no_restart=True))
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == before
+    assert "no ceiling" in dv.storage_limit_problem(0, 0)

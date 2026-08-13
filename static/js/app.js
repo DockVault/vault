@@ -10692,7 +10692,13 @@ async function loadVaultStorageCard() {
     const help = document.getElementById('vault-storage-help');
     if (editor) editor.hidden = !info.can_contribute;
     if (input && info.can_contribute) {
-        input.value = _gbFromBytes(info.my_grant_bytes).toFixed(2).replace(/\.00$/, '');
+        // GB is what a person wants to type, but bytes are what was allocated, and 2 decimal
+        // places do not survive the round trip: re-saving an untouched field would silently
+        // rewrite the allocation (and on a full vault the rounded-down value is refused
+        // outright). Remember the exact figure and re-send THAT when the text is unchanged.
+        input.value = _gbFromBytes(info.my_grant_bytes).toFixed(2).replace(/\.?0+$/, '');
+        input.dataset.exactBytes = String(info.my_grant_bytes);
+        input.dataset.renderedValue = input.value;
         if (info.my_max_grant_bytes === null || info.my_max_grant_bytes === undefined) {
             input.removeAttribute('max');
         } else {
@@ -10729,7 +10735,11 @@ async function saveVaultStorage() {
         showError('Enter how much storage you want to contribute, in GB (0 to withdraw yours).');
         return;
     }
-    const bytes = Math.round(gb * GIB_BYTES);
+    // An untouched field means "leave my allocation where it is", so send back the exact byte
+    // figure rather than the GB text's rounding of it.
+    const bytes = (input.value === input.dataset.renderedValue && input.dataset.exactBytes)
+        ? Number(input.dataset.exactBytes)
+        : Math.round(gb * GIB_BYTES);
     if (btn) btn.disabled = true;
     try {
         await apiRequest(`/vaults/${state.currentVault.id}/storage`, {

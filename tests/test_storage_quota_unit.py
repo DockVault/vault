@@ -220,6 +220,34 @@ def test_check_grant_refuses_passing_the_per_vault_ceiling():
     assert _check(3 * GIB, other_grants=2 * GIB, per_vault_ceiling=4 * GIB) is not None
 
 
+def test_a_ceiling_lowered_after_the_fact_does_not_trap_the_storage():
+    """An administrator lowering 'max vault size' below an existing vault must not strand what
+    people already allocated: every reclaim would still end above the new ceiling, so a strict
+    check would leave the only exit as deleting the vault."""
+    # 10 GB already allocated (mine 6, others 4); the ceiling has since dropped to 2 GB.
+    reclaim = _check(3 * GIB, current_grant=6 * GIB, other_grants=4 * GIB, per_vault_ceiling=2 * GIB)
+    assert reclaim is None
+    # ...but growing further away from the new ceiling is still refused.
+    assert _check(7 * GIB, current_grant=6 * GIB, other_grants=4 * GIB,
+                  per_vault_ceiling=2 * GIB) is not None
+
+
+def test_an_account_quota_cut_after_the_fact_does_not_trap_the_storage():
+    """Same trap, one level up: an account whose quota was cut below what it already allocated
+    has to be able to give storage BACK, which is the very thing that returns it to compliance."""
+    give_back = _check(2 * GIB, current_grant=5 * GIB, other_grants=GIB,
+                       account_quota=1 * GIB, allocated_elsewhere=0)
+    assert give_back is None
+    assert _check(6 * GIB, current_grant=5 * GIB, other_grants=GIB,
+                  account_quota=1 * GIB, allocated_elsewhere=0) is not None
+
+
+def test_holding_an_allocation_steady_is_never_refused():
+    """Re-saving the same number under a tightened bound is a no-op, not a violation."""
+    assert _check(5 * GIB, current_grant=5 * GIB, other_grants=0,
+                  per_vault_ceiling=GIB, account_quota=GIB) is None
+
+
 def test_check_grant_refuses_passing_the_account_budget():
     reason = _check(6 * GIB, account_quota=10 * GIB, allocated_elsewhere=5 * GIB)
     assert reason and "quota" in reason
