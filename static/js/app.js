@@ -898,6 +898,12 @@ function updateProfileUI(user) {
     // just revealed admin sidebar items — re-hide them in the SAME synchronous pass
     // (before any repaint) so they never flash on screen.
     hideAdminNavForTempSession();
+
+    // Settle the dashboard's admin-only content in the same synchronous pass, for the same
+    // reason. Both login paths call this before the dashboard screen is revealed, so the card
+    // is already in its final state on the first paint rather than appearing and vanishing
+    // when loadDashboardStats() later resolves.
+    applyDashboardAdminGating();
 }
 
 // Login
@@ -1101,7 +1107,9 @@ async function loadDashboardStats() {
             }
         }
         
-        // Update system status
+        // Update system status (the gating also runs at profile-render time, before first paint;
+        // repeating it here keeps the card correct if the dashboard is re-entered later.)
+        applyDashboardAdminGating();
         updateSystemStatus();
         
     } catch (error) {
@@ -1182,8 +1190,38 @@ async function loadRecentEvents() {
     }
 }
 
+// Who may see the dashboard's System Status card.
+//
+// A scoped temporary credential authenticates AS its owning account, so its role is the owner's
+// role — an admin-minted one reads as 'admin' here. Exclude it explicitly, the same way the
+// sidebar does (hideAdminNavForTempSession), or a temp session inherits the owner's view.
+function canSeeSystemStatus() {
+    return !!(currentUser && currentUser.role === 'admin' && !isScopedTemp);
+}
+
+// Show/hide the System Status card and reflow the row it sits in.
+//
+// Both branches are set explicitly rather than only hiding, because the same tab can move between
+// accounts (log out and back in, or a session restore) and a one-way toggle would strand the
+// previous account's layout. The grid's own default is the single-column, card-hidden state, so
+// the reveal is the exception and any failure leaves the safe layout in place.
+//
+// Note this is presentation only. GET /health is deliberately unauthenticated — it answers from a
+// fixed vocabulary with no paths or capacities — so hiding the card removes clutter a non-admin
+// cannot act on. It is not a confidentiality boundary and must not be described as one.
+function applyDashboardAdminGating() {
+    const card = document.getElementById('dashboard-system-status');
+    const grid = document.getElementById('dashboard-lower-grid');
+    const show = canSeeSystemStatus();
+    if (card) card.style.display = show ? '' : 'none';
+    if (grid) grid.style.gridTemplateColumns = show ? '2fr 1fr' : '1fr';
+}
+
 // Update system status indicators
 async function updateSystemStatus() {
+    // Don't fire the request for someone who cannot see the result: a pointless round trip whose
+    // only visible effect would be console noise.
+    if (!canSeeSystemStatus()) return;
     const setBadge = (id, ok, okText, badText, badClass = 'badge-error') => {
         const el = document.getElementById(id);
         if (!el) return;

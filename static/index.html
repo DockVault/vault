@@ -315,8 +315,13 @@
                         </div>
                     </div>
 
-                    <!-- Recent Events and System Status -->
-                    <div class="grid" style="grid-template-columns: 2fr 1fr; gap: var(--space-md);">
+                    <!-- Recent Events and System Status.
+                         System Status is administrator-only. It starts hidden and the grid starts
+                         as a single full-width column, so a non-admin never sees it even for one
+                         frame; applyDashboardAdminGating() restores the two-column layout for an
+                         administrator. Failing closed here means a JS error leaves the card hidden
+                         rather than exposed. -->
+                    <div id="dashboard-lower-grid" class="grid" style="grid-template-columns: 1fr; gap: var(--space-md);">
                         <!-- Recent Events -->
                         <div class="card">
                             <div class="card-header">
@@ -331,8 +336,8 @@
                             </div>
                         </div>
 
-                        <!-- System Status -->
-                        <div class="card">
+                        <!-- System Status (administrator-only; revealed by applyDashboardAdminGating) -->
+                        <div class="card" id="dashboard-system-status" style="display: none;">
                             <div class="card-header">
                                 <h3 class="text-xl font-bold"><svg class="icon"><use href="#i-shield"/></svg> System Status</h3>
                             </div>
