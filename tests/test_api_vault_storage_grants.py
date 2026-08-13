@@ -287,8 +287,10 @@ def test_a_temporary_credential_cannot_spend_the_account_budget(admin, owned_vau
     past the credential's time-box, so it needs an interactive session."""
     vid = owned_vault["vault"]["id"]
     # Minted from the ADMIN, whose own vault-storage writes would otherwise be allowed anywhere —
-    # so a 403 here is the temp-session gate, not a missing permission.
-    r = admin.post("/auth/temp-credentials", json={"validity_minutes": 10})
+    # so a 403 here is the temp-session gate, not a missing permission. The default lifetime is
+    # deliberate: a short-lived credential can expire midway through a later test that compares
+    # before/after snapshots of the credential store, turning this into a flake somewhere else.
+    r = admin.post("/auth/temp-credentials", json={})
     assert r.status_code == 200, r.text
     cred = r.json()
     tc = ApiClient()
