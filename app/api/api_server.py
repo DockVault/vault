@@ -51,8 +51,11 @@ from app.core.id_scope import id_in_scope
 from sqlalchemy.exc import IntegrityError
 from app.services.audit_logger import AuditLogger
 from app.services.streaming_upload import receive_bounded, ChunkTooLarge, EmptyBody
+from app.services.download_stream import ChecksumMismatch
 from app.services import log_pull  # pure helpers for the authenticated log-pull endpoint
-from app.core.security import create_access_token, verify_access_token
+from app.core.security import (
+    create_access_token, verify_access_token, EncryptionError, ObjectChangedDuringRead,
+)
 from app.core.config import initialize_runtime, settings
 from app.core.endpoint_permissions import (
     require_endpoint_permission,
@@ -9324,6 +9327,7 @@ async def download_file(
     tracker = None
     tracker_started = False
     stream_handed_off = False
+    download = None
 
     try:
         # Verify vault access and password. allow_share=True: a recipient with an active
@@ -9365,18 +9369,36 @@ async def download_file(
                     detail="This share has reached its download limit.",
                 )
 
-        file_content, file_name, mime_type = vault_service.download_file(
+        # Opened, not read. The walk inside this authenticates the terminal and settles
+        # truncation, a missing terminal, trailing bytes, a dropped record and a substituted blob
+        # -- so those now fail HERE, with no response body yet, instead of part-way through one.
+        download = vault_service.open_download_stream(
             file_id=file_id,
             user=current_user,
             file_password=file_password,
             allow_share=True,
         )
+        file_name, mime_type = download.name, download.mime_type
+
+        if download.total_length == 0:
+            # The hold-back signals a failed checksum by leaving the client short of a promised
+            # length. A zero-length response cannot be made shorter, so a mismatch raised inside
+            # the body arrives after the headers and the client sees a complete success. Settle it
+            # here, where it can still be an error status.
+            try:
+                download.verify_now()
+            except ChecksumMismatch:
+                download.close()
+                raise FileServiceError("File integrity check failed")
 
         # Never expose a zero-knowledge file name on a server-side surface.
         is_zk = _is_zk_vault(vault)
         disp_name = '(encrypted file)' if is_zk else (file_name or 'download')
         audit_name = None if is_zk else file_name
 
+        # Started BEFORE the response headers, which already carry the operation id. Starting it at
+        # the first byte instead would open a window where a cancel issued against the published id
+        # finds no tracker entry and fails silently.
         tracker = ProgressTracker()
         tracker_started = tracker.start_operation(
             operation_id=operation_id,
@@ -9384,14 +9406,18 @@ async def download_file(
             username=str(current_user.username),
             operation_type="download",
             file_name=disp_name,
-            total_size=len(file_content),
+            total_size=download.total_length,
             temp_credential_id=getattr(current_user, "_temp_cred_id", None),
             vault_id=str(vault_id),
         ) is not None
 
+        # Access was granted: that is the fact this row records, and it is true now. Whether the
+        # transfer then completed is a different fact, recorded at the end of the response by
+        # `file_streamer`. Writing 'success' here was how a failed or cancelled download came to be
+        # logged as a successful one.
         audit_logger.log_action(
             action='file_download',
-            status='success',
+            status='authorized',
             user=current_user,
             resource_type='file',
             resource_id=str(file_id),
@@ -9431,23 +9457,95 @@ async def download_file(
         from fastapi.responses import StreamingResponse
 
         async def file_streamer():
-            """Stream chunks until completion, disconnect, or atomic cancellation."""
-            chunk_size = 65536
-            offset = 0
-            total_size = len(file_content)
+            """Stream the file, holding the last piece back until the checksum has been checked.
+
+            The response length below comes from the authenticated terminal, so it is the writer's
+            sealed statement of the size rather than the server's opinion of it. That is what makes
+            a late failure visible: stopping early delivers fewer bytes than promised, and a
+            conforming client reports a truncated response. Completing the body and then deciding
+            the file was wrong would give the client a clean success instead.
+            """
+            served = 0
+            total_size = download.total_length
             cancellation_observed = False
+            disconnected = False
             terminal_success = False
+            failure = None
             try:
-                while offset < total_size:
-                    if tracker_started and tracker.is_cancelled(operation_id):
-                        cancellation_observed = True
-                        break
-                    chunk_end = min(offset + chunk_size, total_size)
-                    yield file_content[offset:chunk_end]
-                    offset = chunk_end
-                    await asyncio.sleep(0)
-                terminal_success = offset == total_size
+                try:
+                    for piece in download.chunks():
+                        if tracker_started and tracker.is_cancelled(operation_id):
+                            cancellation_observed = True
+                            break
+                        # Asked before each piece, because `served` counts bytes handed to the
+                        # server, not bytes that reached anyone: writes after a disconnect are
+                        # discarded silently, so a generator that only counts what it yielded runs
+                        # to the end and reports a client that left as having received everything.
+                        # Whether that happens at all depends on the file size against the socket
+                        # buffer, which is not a distinction an audit log should be making.
+                        if await request.is_disconnected():
+                            disconnected = True
+                            break
+                        yield piece
+                        served += len(piece)
+                        await asyncio.sleep(0)
+                    terminal_success = (not cancellation_observed and not disconnected
+                                        and served == total_size)
+                except ChecksumMismatch as exc:
+                    # Raised by the hold-back with the final piece still owed, so the client is
+                    # left short of the promised length rather than given a complete response for
+                    # a file that did not match what was stored for it.
+                    failure = exc
+                except ObjectChangedDuringRead as exc:
+                    # A delete or a same-name replacement racing this read. Not an integrity
+                    # failure, and recorded as itself so an operator is not sent looking for an
+                    # attacker who is not there.
+                    failure = exc
+                except EncryptionError as exc:
+                    failure = exc
             finally:
+                download.close()
+
+                # The completion record, written here rather than before the first byte. What the
+                # audit row above states is that access was granted; what this one states is what
+                # the transfer actually did.
+                try:
+                    audit_logger.log_action(
+                        action='file_download_completed',
+                        status='success' if terminal_success else 'failed',
+                        user=current_user,
+                        resource_type='file',
+                        resource_id=str(file_id),
+                        details={
+                            'vault_id': str(vault_id),
+                            'file_name': audit_name,
+                            'bytes_sent': served,
+                            'total_bytes': total_size,
+                            'outcome': (
+                                'completed' if terminal_success
+                                else 'cancelled' if cancellation_observed
+                                else 'disconnected' if disconnected
+                                else type(failure).__name__ if failure is not None
+                                else 'incomplete'
+                            ),
+                        },
+                        ip_address=request_ip,
+                    )
+                except Exception:      # noqa: BLE001 - a lost audit row must not mask the transfer
+                    try:
+                        db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                # A share grant is burned at authorization, because it is a cap on grants
+                # exercised and must be atomic before serving, and it stays burned however the
+                # transfer ends. Refunding a client-abandoned transfer would make a capped share
+                # uncapped for anyone willing to disconnect. Refunding a SERVER-side failure would
+                # be defensible -- a corrupt blob should not spend a recipient's budget for zero
+                # bytes -- but the burn is atomic across every covering claim, so returning it
+                # means returning exactly those and no others, exactly once. That is its own
+                # change; the completion record above at least says which case occurred.
+
                 transition = None
                 if tracker_started and not cancellation_observed:
                     transition = tracker.complete_operation(
@@ -9463,7 +9561,7 @@ async def download_file(
                                 "File downloaded" if terminal_success else "Download interrupted"
                             ),
                             "description": (
-                                f"{disp_name} ({offset:,} of {total_size:,} bytes transferred)"
+                                f"{disp_name} ({served:,} of {total_size:,} bytes transferred)"
                             ),
                             "user": current_user.username,
                             "ip": request_ip,
@@ -9473,7 +9571,7 @@ async def download_file(
                         },
                         "traffic": {
                             "upload": 0,
-                            "download": offset,
+                            "download": served,
                         },
                     })
                 elif tracker_started and tracker.is_cancelled(operation_id):
@@ -9483,7 +9581,7 @@ async def download_file(
                         "event": {
                             "type": "download",
                             "title": "Download cancelled",
-                            "description": f"{disp_name} stopped after {offset:,} bytes",
+                            "description": f"{disp_name} stopped after {served:,} bytes",
                             "user": current_user.username,
                             "ip": request_ip,
                             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -9501,7 +9599,9 @@ async def download_file(
             media_type=mime_type or 'application/octet-stream',
             headers={
                 'Content-Disposition': _content_disposition(disp_name),
-                'Content-Length': str(len(file_content)),
+                # From the terminal the walk authenticated, so a stream that stops
+                # early is a short body the client can detect.
+                'Content-Length': str(download.total_length),
                 'Cache-Control': 'no-cache',
                 'X-Operation-ID': operation_id,
             },
@@ -9545,11 +9645,17 @@ async def download_file(
         )
     finally:
         # Before response handoff, this function owns cleanup. Afterwards the
-        # streaming generator owns the terminal transition and local active set.
-        if operation_id and not stream_handed_off:
-            if tracker_started:
-                tracker.complete_operation(operation_id, success=False)
-            end_operation(operation_id)
+        # streaming generator owns the terminal transition, the open blob, and the local active
+        # set. The blob is now opened before the handoff, so anything that fails in between --
+        # every early failure the walk exists to produce -- would otherwise leak its descriptor
+        # for the life of the process.
+        if not stream_handed_off:
+            if download is not None:
+                download.close()
+            if operation_id:
+                if tracker_started:
+                    tracker.complete_operation(operation_id, success=False)
+                end_operation(operation_id)
 
 @app.post("/vaults/{vault_id}/files/{file_id}/delete")
 @require_endpoint_permission("FILE_DELETE")

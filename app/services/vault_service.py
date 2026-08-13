@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Tuple, BinaryIO
+import itertools
 import uuid
 import mimetypes
 
@@ -1329,6 +1330,22 @@ class VaultService:
         Returns:
             Tuple of (file_content, file_name, mime_type)
         """
+        file, vault = self._resolve_download(file_id, user, file_password, allow_share)
+        return self._open_stored_file(file, vault, file_id)
+
+    def _resolve_download(
+        self,
+        file_id: uuid.UUID,
+        user: User,
+        file_password: Optional[str],
+        allow_share: bool,
+    ):
+        """Authorize a download and return `(file, vault)`.
+
+        Extracted so the whole-file and streaming entry points cannot diverge. Every check below
+        is security-relevant and several are subtle; two copies of them is two places for one to be
+        updated and the other forgotten.
+        """
         file = self.db.query(File).filter(File.id == file_id).first()
 
         if not file:
@@ -1342,7 +1359,7 @@ class VaultService:
         # Defense-in-depth for the share path: a file/folder share grants READ on the vault but must
         # not download outside its subtree. The web download endpoint already stamps the recipient's
         # scope (via get_vault) and enforces require_file_scope before calling here; re-stamp + re-check
-        # so download_file is self-protecting regardless of caller. No-op for a whole-vault share or a
+        # so this is self-protecting regardless of caller. No-op for a whole-vault share or a
         # non-scoped principal (require_file_scope short-circuits when scope_ids is None).
         if allow_share:
             share_vault = self.db.query(Vault).filter(Vault.id == file.vault_id).first()
@@ -1357,52 +1374,111 @@ class VaultService:
         if file.password_hash:
             if not file_password:
                 raise PasswordRequiredError("File password is required")
-            
+
             if not verify_password(file_password, file.password_hash):
                 raise InvalidPasswordError("Invalid file password")
-        
+
         # Get vault for decryption
         vault = self.db.query(Vault).filter(Vault.id == file.vault_id).first()
-        
-        # Get file storage path
+        return file, vault
+
+    def open_download_stream(
+        self,
+        file_id: uuid.UUID,
+        user: User,
+        file_password: Optional[str] = None,
+        allow_share: bool = False,
+    ):
+        """The same download, opened for streaming instead of returned whole.
+
+        Every authorization step is shared with :meth:`download_file`, which is the point of the
+        arrangement: a second copy of the vault permission, share scope, download scope and
+        per-file password checks would be a second place for one of them to drift.
+
+        Returns a :class:`BoundedDownload`. The caller owns it and must close it.
+        """
+        file, vault = self._resolve_download(file_id, user, file_password, allow_share)
+        return self._open_stored_file(file, vault, file_id, whole=False)
+
+    def _open_stored_file(self, file, vault, file_id, whole: bool = True):
+        """Open the blob, pick a reader for its at-rest format, and describe what it will produce.
+
+        With `whole`, the pieces are joined and the historical `(bytes, name, mime)` tuple comes
+        back. Without, the caller receives the pieces and decides when to stop -- which is what
+        makes a bounded response possible, and what lets the stored checksum be enforced with
+        bytes still owed instead of after the last one has gone.
+        """
+        from app.core.security import EncryptionError, ObjectChangedDuringRead
+        from app.services.download_stream import BoundedDownload, ChecksumMismatch
+
         storage_path = self.storage_path / file.storage_path
-        
+
         if not storage_path.exists():
             raise FileNotFoundError(f"File data not found on disk: {file_id}")
 
-        # Zero-knowledge vault: the server stored the client's ciphertext verbatim
-        # and has no key to read it — return the bytes AS-IS (the client decrypts).
-        # Integrity here is over the stored ciphertext; plaintext integrity is the
-        # client's responsibility via its own AEAD.
-        if vault and getattr(vault, 'type', 'standard') == 'zero_knowledge':
-            with open(storage_path, 'rb') as f:
-                file_content = f.read()
-            if not verify_file_integrity(file_content, file.checksum_sha256):
+        is_zk = bool(vault) and getattr(vault, 'type', 'standard') == 'zero_knowledge'
+        # A ZK file's real MIME is client-encrypted (enc_mime); the server must never serve a
+        # plaintext mime_type -- a legacy pre-seal row still holds one, which would leak through
+        # the download Content-Type. Always a neutral type for ZK.
+        mime = ('application/octet-stream' if is_zk
+                else (file.mime_type or 'application/octet-stream'))
+
+        handle = open(storage_path, 'rb')
+        try:
+            download = self._reader_for(handle, storage_path, file, is_zk, mime)
+        except Exception:
+            handle.close()
+            raise
+
+        if not whole:
+            return download
+
+        with download:
+            try:
+                content = b''.join(download.chunks())
+            except ChecksumMismatch:
                 raise FileServiceError("File integrity check failed")
-            # A ZK file's real MIME is client-encrypted (enc_mime); the server must never serve a
-            # plaintext mime_type — a legacy pre-seal row still holds one, which would leak via the
-            # download Content-Type. Always return a neutral type for ZK.
-            return file_content, file.original_name, 'application/octet-stream'
+            except ObjectChangedDuringRead as e:
+                raise FileServiceError(f"Failed to read file: {e}")
+            except EncryptionError as e:
+                # Mid-stream decrypt failures used to be wrapped by this function, and callers --
+                # the SFTP path among them -- were written against that. Streaming moved them out
+                # of the try that used to catch them.
+                raise FileServiceError(f"Failed to decrypt file: {e}")
+        return content, download.name, download.mime_type
 
-        # Auto-detect the at-rest format and decrypt accordingly:
-        #  - AES-256-GCM chunked stream (MAGIC + version 0x10): the current format; each
-        #    chunk's AAD is bound to this file's vault_id + file_id, so a blob swapped in
-        #    from another file/vault fails to decrypt.
-        #  - otherwise: the legacy global-key Fernet chunk stream (length-prefixed tokens,
-        #    no magic header).
-        # NB: the old whole-file AES-GCM writer (upload_file + EncryptedFileStorage) is
-        # never called, and its detector compared only header[:5] to a 9-byte magic so it
-        # never matched — there are no such files to read.
+    def _reader_for(self, handle, storage_path, file, is_zk: bool, mime: str):
+        """Auto-detect the at-rest format and return a reader for it.
+
+         - AES-256-GCM chunked stream (MAGIC + version 0x10 or 0x20): the current formats. Every
+           record's AAD binds this file's vault_id and file_id, so a blob swapped in from another
+           file or vault fails to authenticate; 0x20 adds a terminal binding the record count and
+           the total plaintext length, which is what makes the length below authenticated.
+         - otherwise: the legacy global-key Fernet chunk stream (length-prefixed tokens, no magic).
+
+        NB: the old whole-file AES-GCM writer (upload_file + EncryptedFileStorage) is never called,
+        and its detector compared only header[:5] to a 9-byte magic so it never matched -- there
+        are no such files to read.
+        """
         from app.core.security import (
-            is_gcm_chunk_stream, decrypt_gcm_chunk_stream, decrypt_chunk_stream,
+            is_gcm_chunk_stream, decrypt_chunk_stream, GcmChunkStreamReader,
         )
+        from app.services.download_stream import BoundedDownload
 
-        # The identification itself can now fail, and it must be caught HERE: it used to return
-        # False for an unreadable file, which silently routed a healthy object to the wrong reader
-        # and called it damaged. Making it raise fixed that and moved the problem -- this call sits
-        # outside the try below, so the exception escaped as an unhandled 500 instead of the
-        # service's own error. Distinguishing "cannot read the file" from "not this format" is only
-        # worth anything if the distinction survives to the caller.
+        if is_zk:
+            # The server stored the client's ciphertext verbatim and holds no key for it. There are
+            # no records to walk, so the pieces are fixed-size windows, and the stored checksum --
+            # which is over the CIPHERTEXT here, the codec being a passthrough -- is the only
+            # integrity statement the server can make. Plaintext integrity stays the client's own
+            # AEAD, unchanged.
+            size = storage_path.stat().st_size
+            return BoundedDownload(
+                handle, _primed(_fixed_windows(handle)), size,
+                file.original_name, mime, file.checksum_sha256)
+
+        # The identification itself can fail, and it must be caught HERE: it used to return False
+        # for an unreadable file, which silently routed a healthy object to the wrong reader and
+        # called it damaged.
         try:
             looks_like_gcm = is_gcm_chunk_stream(storage_path)
         except Exception as e:
@@ -1410,26 +1486,30 @@ class VaultService:
 
         if looks_like_gcm:
             try:
-                with open(storage_path, 'rb') as f:
-                    file_content = decrypt_gcm_chunk_stream(f, file.vault_id, file.id)
+                reader = GcmChunkStreamReader(handle, file.vault_id, file.id)
+            except FileServiceError:
+                raise
             except Exception as e:
+                # The walk settles truncation, a missing terminal, trailing bytes, a dropped record
+                # and a substituted blob -- so this is where those now surface, before a response
+                # body exists rather than after most of it has been sent.
                 raise FileServiceError(f"Failed to decrypt file: {e}")
-        else:
-            # Legacy Fernet chunk stream (global key, length-prefixed tokens).
-            file_content_chunks = []
-            try:
-                with open(storage_path, 'rb') as f:
-                    for decrypted_chunk in decrypt_chunk_stream(f):
-                        file_content_chunks.append(decrypted_chunk)
-                file_content = b''.join(file_content_chunks)
-            except Exception as e:
-                raise FileServiceError(f"Failed to decrypt chunked file: {e}")
-        
-        # Verify integrity
-        if not verify_file_integrity(file_content, file.checksum_sha256):
-            raise FileServiceError("File integrity check failed")
-        
-        return file_content, file.original_name, file.mime_type or 'application/octet-stream'
+            return BoundedDownload(
+                handle, reader.records(), reader.total_length,
+                file.original_name, mime, file.checksum_sha256,
+                length_is_authenticated=reader.length_is_authenticated)
+
+        # Legacy Fernet chunk stream. Already a generator; the only reason this path was ever
+        # unbounded is that its caller joined the output. Its plaintext length is not derivable
+        # without decrypting -- padding hides up to 16 bytes per token -- so the recorded size is
+        # used, and it is not authenticated.
+        try:
+            pieces = _primed(_fernet_pieces(handle, decrypt_chunk_stream))
+        except Exception as e:
+            raise FileServiceError(f"Failed to decrypt chunked file: {e}")
+        return BoundedDownload(
+            handle, pieces, file.size_bytes or 0,
+            file.original_name, mime, file.checksum_sha256)
     
     def delete_file(self, file_id: uuid.UUID, user: User):
         """
@@ -1726,3 +1806,46 @@ class VaultService:
             return self._get_folder_path(vault_id, folder_id) / str(file_id)
         else:
             return self._get_vault_path(vault_id) / "files" / str(file_id)
+
+
+def _primed(pieces):
+    """Pull the first piece now, so a reader that fails on contact fails before it is streamed.
+
+    The chunk-stream reader does its structural work when it is constructed, so a malformed blob
+    of that format is already rejected before a caller has a response object. The other two readers
+    are plain generators: nothing in them runs until the first `next`, which under a streaming
+    response is after the headers have gone out. A blob that is simply not readable would then
+    produce a `200`, a full Content-Length, and an empty body -- where the reader this replaces
+    produced an error status.
+
+    Priming costs one piece held briefly and restores that behaviour.
+    """
+    iterator = iter(pieces)
+    try:
+        first = next(iterator)
+    except StopIteration:
+        return iter(())
+    return itertools.chain((first,), iterator)
+
+
+def _fixed_windows(handle, window: int = 1024 * 1024):
+    """Yield a file in fixed-size pieces.
+
+    For the zero-knowledge path, where the blob is one opaque object with no record structure to
+    follow. The window doubles as the hold-back size, so it bounds what a failing checksum costs.
+    """
+    while True:
+        piece = handle.read(window)
+        if not piece:
+            return
+        yield piece
+
+
+def _fernet_pieces(handle, decrypt_chunk_stream):
+    """Yield the legacy Fernet stream's plaintext one token at a time.
+
+    A thin wrapper so the caller receives pieces rather than a joined result; the generator it
+    wraps already produced them one at a time.
+    """
+    for piece in decrypt_chunk_stream(handle):
+        yield piece
