@@ -557,6 +557,15 @@
                                             <div class="progress-bar-fill" id="info-storage-bar-fill" style="width: 0%;"></div>
                                         </div>
                                     </div>
+                                    <div id="vault-storage-contributors" class="text-sm mb-md"></div>
+                                    <div id="vault-storage-editor" hidden>
+                                        <label class="text-sm text-secondary" for="vault-storage-input">Your contribution (GB)</label>
+                                        <div class="flex gap-sm items-center mt-xs">
+                                            <input type="number" id="vault-storage-input" class="form-control" min="0" step="0.1" style="max-width: 10rem;">
+                                            <button id="vault-storage-save-btn" type="button" class="btn btn-primary btn-sm">Save</button>
+                                        </div>
+                                        <small class="form-help" id="vault-storage-help"></small>
+                                    </div>
                                     <div class="alert alert-info" style="font-size: 0.875rem;">
                                         <span>💡</span>
                                         <span>Storage updates in real-time</span>
@@ -1211,14 +1220,25 @@
                             </div>
                             <div class="p-lg">
                                 <div class="form-group">
-                                    <label for="setting-default-quota">Per-account storage quota (GB)</label>
+                                    <label for="setting-deployment-storage">Deployment storage limit (GB)</label>
+                                    <div class="flex items-center gap-sm">
+                                        <input type="number" id="setting-deployment-storage" class="form-control" min="0" step="1" style="max-width: 12rem;">
+                                        <span class="text-secondary" id="setting-deployment-storage-max">of unlimited</span>
+                                    </div>
+                                    <div class="progress-bar mt-sm" style="height: 10px;">
+                                        <div class="progress-bar-fill" id="deployment-storage-bar-fill" style="width: 0%;"></div>
+                                    </div>
+                                    <small class="text-secondary" id="setting-deployment-storage-help">The most this deployment may store in total. Only files actually stored count — empty vaults cost nothing.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-default-quota">Default per-account storage quota (GB)</label>
                                     <input type="number" id="setting-default-quota" class="form-control" placeholder="Unlimited" min="0" step="1">
-                                    <small class="text-secondary">The total a single account's vaults may reserve (the sum of their declared sizes). <strong>Blank = unlimited.</strong> Admins are exempt.</small>
+                                    <small class="text-secondary">How much storage one account may allocate to vaults, in total. Spent when storage is allocated, refunded when it is reclaimed. <strong>Blank = unlimited.</strong> Admins are exempt, and a single account can be given its own quota in <strong>Users</strong>.</small>
                                 </div>
                                 <div class="form-group">
                                     <label for="setting-max-vault-size">Maximum size per vault (GB)</label>
                                     <input type="number" id="setting-max-vault-size" class="form-control" placeholder="Unlimited" min="0" step="1">
-                                    <small class="text-secondary">The largest any single vault may be set to. <strong>Blank = unlimited.</strong></small>
+                                    <small class="text-secondary">The largest any single vault may be set to, however many people contribute storage to it. <strong>Blank = unlimited.</strong></small>
                                 </div>
                                 <div class="form-group">
                                     <label for="setting-storage-path">Storage Path (Read-Only)</label>
@@ -1241,6 +1261,7 @@
                                             <p class="text-xl font-bold" id="storage-stat-available">-</p>
                                         </div>
                                     </div>
+                                    <small class="text-secondary" id="storage-stat-allocated">&nbsp;</small>
                                 </div>
                             </div>
                         </div>
@@ -2060,6 +2081,16 @@
                                         <input type="checkbox" id="edit-user-active">
                                         Active
                                     </label>
+                                </div>
+                                <div class="form-group" id="edit-user-storage-quota">
+                                    <label for="edit-user-quota-mode">Storage quota</label>
+                                    <select id="edit-user-quota-mode" class="form-control">
+                                        <option value="inherit">Use the deployment default</option>
+                                        <option value="custom">Set for this account (GB)</option>
+                                        <option value="unlimited">Unlimited</option>
+                                    </select>
+                                    <input type="number" id="edit-user-quota-gb" class="form-control mt-sm" min="0" step="1" placeholder="GB" hidden>
+                                    <small class="text-secondary" id="edit-user-quota-help">&nbsp;</small>
                                 </div>
                             </div>
                             <div class="modal-footer">

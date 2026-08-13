@@ -101,23 +101,44 @@ def deployment_storage_used(db) -> int:
     ).scalar() or 0)
 
 
+def deployment_storage_limit_bytes(db):
+    """The EFFECTIVE deployment-wide limit on stored bytes, or None when unlimited.
+
+    Two layers: MAX_STORAGE_GB is the deployment's hard ceiling, and an administrator may save
+    a lower live limit ('deployment_storage_limit_gb' in the global settings blob) from the
+    admin panel. A settings read that fails falls back to the env ceiling alone rather than to
+    'unlimited' — a database hiccup must not quietly remove the storage limit."""
+    from app.core import storage_quota
+    from app.core.models import SystemSetting
+    stored = None
+    try:
+        row = db.query(SystemSetting).filter(SystemSetting.key == "global").first()
+        if row and row.value:
+            stored = row.value.get("deployment_storage_limit_gb")
+    except Exception:
+        stored = None
+    return storage_quota.deployment_limit_bytes(settings.max_storage_gb, stored)
+
+
 def would_exceed_deployment_storage(db, additional_bytes: int):
-    """Whether adding `additional_bytes` would push the deployment past its PLAN storage
-    ceiling (settings.plan_max_storage_gb, GB; -1/0 => unlimited). Returns
-    (exceeds: bool, used_bytes: int, cap_bytes: int). Shared by the HTTP upload paths
-    (api_server) and the SFTP write path (sftp_server) so both honor the aggregate cap;
-    each caller turns a True into its own error (HTTP 413 / SFTP failure). A soft,
-    deployment-wide ceiling — the per-vault size_limit reservation stays the atomic guard.
-    cap_gb <= 0 (or None) means UNLIMITED: the plan layer coerces an absent/0 storage value
-    to -1, so a non-positive cap reaching here is 'no limit', never 'block everything'.
-    Under concurrency the cap is best-effort (a SUM, not a reservation): worst-case
-    overshoot ≈ (concurrent finalizes) × (per-vault size_limit)."""
-    cap_gb = settings.plan_max_storage_gb
-    if cap_gb is None or cap_gb <= 0:
+    """Whether adding `additional_bytes` would push the deployment past its storage limit
+    (see deployment_storage_limit_bytes). Returns (exceeds: bool, used_bytes: int,
+    cap_bytes: int). Shared by the HTTP upload paths (api_server) and the SFTP write path
+    (sftp_server) so both honor the aggregate limit; each caller turns a True into its own
+    error (HTTP 413 / SFTP failure).
+
+    This counts STORED bytes only — declaring a vault size allocates against the owner's own
+    account budget, never against the deployment, so a thousand empty vaults leave this number
+    untouched. The per-vault size_limit remains the atomic per-upload guard.
+
+    Under concurrency the limit is best-effort (a SUM, not a reservation): worst-case overshoot
+    ≈ (concurrent finalizes) × (per-vault size_limit)."""
+    from app.core import storage_quota
+    cap_bytes = deployment_storage_limit_bytes(db)
+    if cap_bytes is None:
         return (False, 0, 0)
-    cap_bytes = cap_gb * 1024 * 1024 * 1024
     used = deployment_storage_used(db)
-    return (used + max(0, additional_bytes or 0) > cap_bytes, used, cap_bytes)
+    return (storage_quota.would_exceed_deployment(used, additional_bytes, cap_bytes), used, cap_bytes)
 
 
 class FileServiceError(Exception):

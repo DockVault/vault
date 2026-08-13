@@ -1945,12 +1945,37 @@ async function fetchAccountStorage(excludeVaultId) {
     catch (_) { return null; }
 }
 function _bytesToGb(bytes) { return bytes / (1024 ** 3); }
-// Fill a "how much you can allocate" note + set the size input's soft max from /account/storage.
-// Pass the vault id being edited (else null) so its own reservation is excluded from the headroom.
+// Fill a "how much you can allocate" note + set the size input's soft max.
+//
+// For an EXISTING vault the bound comes from that vault's own storage endpoint, because on a
+// shared vault the largest total you may set includes what other contributors already put in —
+// the account endpoint alone would understate it and the input's max would block a legitimate
+// value. For a new vault there is no vault yet, so the account headroom is the whole story.
 async function renderVaultSizeAvailability(noteId, inputEl, excludeVaultId, baseText) {
     const note = document.getElementById(noteId);
     if (!note) return;
     const base = baseText || 'The most this vault may hold.';
+    const fmt = g => g.toFixed(g < 10 ? 2 : 0);
+
+    if (excludeVaultId) {
+        let info = null;
+        try { info = await apiRequest(`/vaults/${excludeVaultId}/storage`, { silent: true }); }
+        catch (_) { info = null; }
+        if (info) {
+            if (info.max_total_bytes == null) {
+                note.textContent = base + (info.budget_exempt ? ' No account storage limit.' : '');
+                if (inputEl) inputEl.removeAttribute('max');
+            } else {
+                const maxGb = _bytesToGb(info.max_total_bytes);
+                const others = info.others_grant_bytes || 0;
+                note.textContent = `${base} You can set it up to ${fmt(maxGb)} GB`
+                    + (others > 0 ? `, including ${formatBytes(others)} other people contributed.` : '.');
+                if (inputEl) inputEl.max = String(Math.max(0.1, maxGb));
+            }
+            return;
+        }
+    }
+
     const s = await fetchAccountStorage(excludeVaultId);
     if (!s) return;
     if (s.available_bytes == null) {  // unlimited on both axes (or budget-exempt admin)
@@ -1958,10 +1983,9 @@ async function renderVaultSizeAvailability(noteId, inputEl, excludeVaultId, base
         if (inputEl) inputEl.removeAttribute('max');
         return;
     }
-    const fmt = g => g.toFixed(g < 10 ? 2 : 0);
     const availGb = _bytesToGb(s.available_bytes);
     const usedGb = _bytesToGb(s.reserved_bytes || 0);
-    note.textContent = `${base} You can allocate up to ${fmt(availGb)} GB (${fmt(usedGb)} GB reserved on your account).`;
+    note.textContent = `${base} You can allocate up to ${fmt(availGb)} GB (${fmt(usedGb)} GB already allocated on your account).`;
     if (inputEl) inputEl.max = String(Math.max(0.1, availGb));
 }
 
@@ -3847,13 +3871,56 @@ function showEditUserModal(userId) {
             document.getElementById('edit-user-email').value = user.email;
             document.getElementById('edit-user-role').value = user.role;
             document.getElementById('edit-user-active').checked = user.is_active;
-            
+            renderUserQuotaField(user);
+
             // Show modal
             document.getElementById('edit-user-modal').classList.add('active');
         })
         .catch(error => {
             showError('Failed to load user: ' + error.message);
         });
+}
+
+// The per-account quota is a three-way choice, because "no override" and "unlimited" are
+// genuinely different: an account with no override follows the deployment default as it moves,
+// while an exempt account keeps its exemption. The GB box only appears for the middle answer.
+function renderUserQuotaField(user) {
+    const mode = document.getElementById('edit-user-quota-mode');
+    const gb = document.getElementById('edit-user-quota-gb');
+    const help = document.getElementById('edit-user-quota-help');
+    if (!mode || !gb) return;
+
+    const override = user.storage_quota_bytes;
+    if (override === null || override === undefined) {
+        mode.value = 'inherit';
+        gb.value = '';
+    } else if (override < 0) {
+        mode.value = 'unlimited';
+        gb.value = '';
+    } else {
+        mode.value = 'custom';
+        gb.value = String(_gbFromBytes(override));
+    }
+    gb.hidden = mode.value !== 'custom';
+    mode.onchange = () => {
+        gb.hidden = mode.value !== 'custom';
+        if (mode.value === 'custom' && !gb.value) gb.value = '';
+    };
+
+    if (help) {
+        help.textContent = 'Loading storage usage…';
+        apiRequest(`/users/${user.id}/storage`, { silent: true })
+            .then(s => {
+                const effective = (s.effective_quota_bytes === null || s.effective_quota_bytes === undefined)
+                    ? 'no limit' : formatBytes(s.effective_quota_bytes);
+                const dflt = s.default_quota_bytes ? formatBytes(s.default_quota_bytes) : 'unlimited';
+                help.textContent = s.budget_exempt
+                    ? `Administrators are exempt from storage quotas. Allocated so far: ${formatBytes(s.allocated_bytes)}.`
+                    : `Allocated ${formatBytes(s.allocated_bytes)} of ${effective}. `
+                      + `The deployment default is ${dflt}.`;
+            })
+            .catch(() => { help.textContent = ''; });
+    }
 }
 
 // Lock user
@@ -5366,6 +5433,7 @@ async function loadSettings() {
         document.getElementById('setting-default-quota').value = (settings.default_user_quota > 0) ? settings.default_user_quota : '';
         document.getElementById('setting-max-vault-size').value = (settings.max_vault_size > 0) ? settings.max_vault_size : '';
         document.getElementById('setting-storage-path').value = settings.storage_path || '';
+        renderDeploymentStorageSetting(settings);
         
         // Email
         document.getElementById('setting-smtp-server').value = settings.smtp_server || '';
@@ -5483,6 +5551,15 @@ async function saveAllSettings() {
             // Blank -> 0 (unlimited); the backend enforces a positive value and ignores 0.
             default_user_quota: parseInt(document.getElementById('setting-default-quota').value) || 0,
             max_vault_size: parseInt(document.getElementById('setting-max-vault-size').value) || 0,
+            // The deployment limit is the one field where 0 is a real answer (accept no more
+            // bytes), so blank must send null — "run at the deployment maximum" — rather than
+            // collapsing to 0 the way the two quotas above do.
+            deployment_storage_limit_gb: (function () {
+                const raw = (document.getElementById('setting-deployment-storage') || {}).value;
+                if (raw === undefined || raw === null || String(raw).trim() === '') return null;
+                const n = Number(raw);
+                return Number.isFinite(n) ? n : null;
+            })(),
             
             // Email
             smtp_server: document.getElementById('setting-smtp-server').value,
@@ -6181,14 +6258,67 @@ function renderStandardWhitelistPicker() {
     );
 }
 
+const GIB_BYTES = 1024 ** 3;
+
+// The deployment storage limit is a BOUNDED control, not a free-text number: the input's max is
+// the deployment's own ceiling (MAX_STORAGE_GB) and the label says what that ceiling is, so an
+// admin can see the room they have instead of being told to type -1 for "unlimited".
+function renderDeploymentStorageSetting(settings) {
+    const input = document.getElementById('setting-deployment-storage');
+    const maxLabel = document.getElementById('setting-deployment-storage-max');
+    const help = document.getElementById('setting-deployment-storage-help');
+    const bar = document.getElementById('deployment-storage-bar-fill');
+    if (!input) return;
+
+    const maxGb = settings.deployment_storage_max_gb;   // null => no deployment ceiling
+    const limitBytes = settings.deployment_storage_limit_bytes;
+    const usedBytes = settings.deployment_storage_used_bytes || 0;
+
+    if (maxGb > 0) {
+        input.max = String(maxGb);
+        if (maxLabel) maxLabel.textContent = `of ${maxGb} GB maximum`;
+    } else {
+        input.removeAttribute('max');
+        if (maxLabel) maxLabel.textContent = 'no deployment maximum configured';
+    }
+    // Blank means "run at the deployment maximum"; a saved number is shown as saved, including 0.
+    const saved = settings.deployment_storage_limit_gb;
+    input.value = (saved === null || saved === undefined || saved === '') ? '' : saved;
+    input.placeholder = maxGb > 0 ? String(maxGb) : 'Unlimited';
+
+    if (bar) {
+        const pct = (limitBytes > 0) ? Math.min(100, (usedBytes / limitBytes) * 100) : 0;
+        bar.style.width = `${pct}%`;
+        bar.classList.toggle('is-danger', pct >= 90);
+    }
+    if (help) {
+        const limitText = (limitBytes === null || limitBytes === undefined)
+            ? 'no limit' : formatBytes(limitBytes);
+        help.textContent =
+            `${formatBytes(usedBytes)} stored of ${limitText}. Only files actually stored count `
+            + 'toward this — empty vaults cost nothing. '
+            + (maxGb > 0
+                ? `Blank runs at the ${maxGb} GB deployment maximum; 0 stops new uploads.`
+                : 'Blank means unlimited; 0 stops new uploads.');
+    }
+}
+
 // Load storage statistics
 async function loadStorageStats() {
     try {
         const stats = await apiRequest('/storage/stats', { silent: true });
-        
+
         document.getElementById('storage-stat-total').textContent = formatBytes(stats.total || 0);
         document.getElementById('storage-stat-used').textContent = formatBytes(stats.used || 0);
         document.getElementById('storage-stat-available').textContent = formatBytes(stats.available || 0);
+        const allocated = document.getElementById('storage-stat-allocated');
+        if (allocated) {
+            // Allocated is reported, never enforced against the deployment limit: vaults may
+            // promise more than the disk holds because most of that promise is never filled.
+            allocated.textContent =
+                `${formatBytes(stats.allocated_bytes || 0)} allocated across ${stats.vault_count || 0} vault(s)`
+                + (stats.limit_bytes ? ` · limit ${formatBytes(stats.limit_bytes)}` : '');
+        }
     } catch (error) {
         console.log('Storage stats endpoint not available');
         // Show defaults
@@ -10032,6 +10162,9 @@ async function loadVaultInfo() {
             ? `${vault.expire_files_after_days} ${vault.expire_files_unit || 'days'}`
             : 'Never');
 
+        // Who paid for this vault's size, and the caller's own share of it.
+        await loadVaultStorageCard();
+
     } catch (error) {
         console.error('Failed to load vault info:', error);
     }
@@ -10496,9 +10629,125 @@ async function loadVaultSettings() {
         
         // Setup button event listeners with permission checks
         setupVaultSettingsButtons();
-        
+
     } catch (error) {
         console.error('Failed to load vault settings:', error);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vault storage: who paid for the size, and the caller's own share
+//
+// A vault's size limit is the SUM of what its owner and managers allocated out of their own
+// account quotas. The card therefore shows two different things: the vault's total (everyone's
+// business) and YOUR share of it (the only part you can move). Reclaiming is capped at your own
+// contribution, so the input's floor is 0 and its ceiling is your remaining account headroom.
+//
+// It lives in the vault's Info tab, not Settings: Settings is owner-only, and a MANAGER who may
+// fund the vault has to be able to reach the control. Every write is authorised server-side, so
+// the editor's visibility follows the server's own can_contribute answer rather than a
+// client-side guess about roles.
+// ---------------------------------------------------------------------------
+function _gbFromBytes(bytes) { return (bytes || 0) / GIB_BYTES; }
+
+async function loadVaultStorageCard() {
+    if (!state.currentVault) return;
+    const editor = document.getElementById('vault-storage-editor');
+    const list = document.getElementById('vault-storage-contributors');
+    if (!editor && !list) return;
+    let info;
+    try {
+        info = await apiRequest(`/vaults/${state.currentVault.id}/storage`, { silent: true });
+    } catch (e) {
+        if (editor) editor.hidden = true;
+        if (list) list.textContent = '';
+        return;
+    }
+
+    // Contributor breakdown — present only for people who administer the vault (the server
+    // omits it for everyone else, so an absent list is a permission answer, not an error).
+    if (list) {
+        list.textContent = '';
+        if (Array.isArray(info.contributors) && info.contributors.length > 1) {
+            const heading = document.createElement('p');
+            heading.className = 'text-secondary mb-xs';
+            heading.textContent = 'Contributed by';
+            list.appendChild(heading);
+            info.contributors.forEach(c => {
+                const row = document.createElement('div');
+                row.className = 'flex justify-between';
+                const who = document.createElement('span');
+                who.textContent = c.username + (c.is_owner ? ' (owner)' : '') + (c.is_you ? ' — you' : '');
+                const much = document.createElement('span');
+                much.className = 'font-medium';
+                much.textContent = formatBytes(c.granted_bytes);
+                row.appendChild(who);
+                row.appendChild(much);
+                list.appendChild(row);
+            });
+        }
+    }
+
+    const input = document.getElementById('vault-storage-input');
+    const help = document.getElementById('vault-storage-help');
+    if (editor) editor.hidden = !info.can_contribute;
+    if (input && info.can_contribute) {
+        input.value = _gbFromBytes(info.my_grant_bytes).toFixed(2).replace(/\.00$/, '');
+        if (info.my_max_grant_bytes === null || info.my_max_grant_bytes === undefined) {
+            input.removeAttribute('max');
+        } else {
+            input.max = String(_gbFromBytes(info.my_max_grant_bytes));
+        }
+    }
+    if (help && info.can_contribute) {
+        const parts = [];
+        if (info.others_grant_bytes > 0) {
+            parts.push(`Others contribute ${formatBytes(info.others_grant_bytes)} to this vault.`);
+        }
+        if (info.my_max_grant_bytes === null || info.my_max_grant_bytes === undefined) {
+            parts.push('You have no account storage limit.');
+        } else {
+            parts.push(`You can contribute up to ${formatBytes(info.my_max_grant_bytes)}.`);
+        }
+        parts.push('Lowering it returns the difference to your quota; the vault can never go below what it already stores.');
+        help.textContent = parts.join(' ');
+    }
+
+    // Bound here rather than with the Settings-tab buttons: this card lives in the Info tab, which
+    // a Manager can reach and Settings is not. Assigning onclick keeps it idempotent across reloads.
+    const saveBtn = document.getElementById('vault-storage-save-btn');
+    if (saveBtn) saveBtn.onclick = saveVaultStorage;
+}
+
+async function saveVaultStorage() {
+    if (!state.currentVault) return;
+    const input = document.getElementById('vault-storage-input');
+    const btn = document.getElementById('vault-storage-save-btn');
+    if (!input) return;
+    const gb = parseFloat(input.value);
+    if (!Number.isFinite(gb) || gb < 0) {
+        showError('Enter how much storage you want to contribute, in GB (0 to withdraw yours).');
+        return;
+    }
+    const bytes = Math.round(gb * GIB_BYTES);
+    if (btn) btn.disabled = true;
+    try {
+        await apiRequest(`/vaults/${state.currentVault.id}/storage`, {
+            method: 'PUT',
+            body: JSON.stringify({ granted_bytes: bytes }),
+        });
+        showSuccess('Vault storage updated');
+        // The vault object in memory carries the old limit; refresh it so the usage bar and any
+        // later save read the value the server just settled on, then redraw the whole Info tab
+        // (which owns the bar) rather than only the contribution controls.
+        try {
+            state.currentVault = await apiRequest(`/vaults/${state.currentVault.id}`, { silent: true });
+        } catch (_) { /* the card reload below still shows the authoritative numbers */ }
+        await loadVaultInfo();
+    } catch (error) {
+        // apiRequest surfaces the server's reason (quota exceeded, below stored bytes, ...).
+    } finally {
+        if (btn) btn.disabled = false;
     }
 }
 
@@ -11409,14 +11658,27 @@ document.addEventListener('DOMContentLoaded', () => {
             const email = document.getElementById('edit-user-email').value;
             const role = document.getElementById('edit-user-role').value;
             const isActive = document.getElementById('edit-user-active').checked;
-            
+
+            // Storage quota: 'inherit' clears the override (null), 'unlimited' exempts the
+            // account, a number sets an exact budget. A blank custom box is treated as
+            // 'inherit' rather than 0, which would otherwise strand the account at no storage.
+            const quotaMode = (document.getElementById('edit-user-quota-mode') || {}).value;
+            let storageQuotaGb = null;
+            if (quotaMode === 'unlimited') {
+                storageQuotaGb = 'unlimited';
+            } else if (quotaMode === 'custom') {
+                const raw = (document.getElementById('edit-user-quota-gb') || {}).value;
+                storageQuotaGb = (raw === '' || raw === undefined || raw === null) ? null : Number(raw);
+            }
+
             try {
                 await apiRequest(`/users/${userId}`, {
                     method: 'PATCH',
                     body: JSON.stringify({
                         email,
                         role,
-                        is_active: isActive
+                        is_active: isActive,
+                        storage_quota_gb: storageQuotaGb
                     })
                 });
 

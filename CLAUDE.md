@@ -3,7 +3,7 @@
 This repo is the DockVault vault service: a self-hostable encrypted file vault
 (FastAPI web/API on 8000 + SFTP on 2222, single image, `run_combined.py` runs both).
 Deploy paths: the host-side management tool `dockvault.py` lives at the repo ROOT (stdlib-only,
-needs host `python3`; menu: Setup / Backup & Restore / Volumes / Reset / Update / Logs) and drives
+needs host `python3`; menu: Setup / Backup & Restore / Volumes / Storage limit / Reset / Update / Logs) and drives
 `deploy/docker-compose.secure.yml` (production HTTPS). The `setup-secure.sh` / `setup-secure.ps1`
 scripts are retired thin shims that exec `dockvault.py setup`. Root `docker-compose.yml` +
 `docker-compose.secure.yml` are thin `include:` shims over the real files in `deploy/` so

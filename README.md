@@ -16,7 +16,11 @@ Licensed under **AGPL-3.0** — self-host it freely.
   stores ciphertext it cannot decrypt.
 - **Temporary, scoped credentials** — hand out time-limited, least-privilege access to a
   vault or path.
-- **Organizational groups**, per-user storage quotas, role-based access, and an audit log.
+- **Organizational groups**, role-based access, and an audit log.
+- **Storage limits at three levels** — a deployment ceiling (`MAX_STORAGE_GB`, which an
+  administrator can lower from the panel but never raise), a per-account quota users spend by
+  allocating storage to vaults, and a per-vault size that the owner *and* vault managers can each
+  top up from their own quota and reclaim again.
 - **Login rate-limiting** and durable session revocation.
 - **Single standalone image** — needs only its bundled PostgreSQL + Redis; no external
   services required.
@@ -292,7 +296,7 @@ its volumes, and won't overwrite existing volumes unless you pass `--force`.
 | Path | What lives there |
 |------|------------------|
 | `app/` | The Python application — `app/api/` (web/API server + the user-management/dashboard/ECC routers), `app/sftp/` (SFTP server), `app/core/` (config, models, security primitives), `app/services/` (vault/auth/domain services), `app/config/` (branding), `app/routers/` (info endpoints) |
-| `dockvault.py` | The management tool (Setup / Backup & Restore / Volumes / Reset / Update / Logs) — run from the repo root |
+| `dockvault.py` | The management tool (Setup / Backup & Restore / Volumes / Storage limit / Reset / Update / Logs) — run from the repo root |
 | `setup-secure.sh`, `setup-secure.ps1` | Retired shims that launch `dockvault.py setup` (kept for compatibility) |
 | `.env.example` | Config template — copy to `.env` and fill in (documents every key) |
 | `deploy/` | The real Compose stacks — `deploy/docker-compose.yml` (local trial), `deploy/docker-compose.secure.yml` (production HTTPS) |

@@ -39,6 +39,7 @@ MENU = [
     ("setup",   "Setup - configure + start the vault"),
     ("backup",  "Backup & Restore - snapshot / restore volumes + .env"),
     ("volumes", "Volumes - inspect / reuse / repoint DockVault volume sets"),
+    ("storage", "Storage limit - show usage + set the deployment maximum"),
     ("reset",   "Reset - tear down (optionally destroy data)"),
     ("update",  "Update - upgrade / downgrade the running image"),
     ("logs",    "Logs - enable + pull the authenticated log endpoint"),
@@ -403,6 +404,11 @@ def build_env_lines(cfg):
         bare("SFTP_HOST_PORT", int(cfg["sftp_host_port"]))
     if cfg.get("update_check_enabled"):
         bare("UPDATE_CHECK_ENABLED", "true")
+    # Deployment storage ceiling. Only written when the operator chose one: left out, the app's
+    # own default (-1, unlimited) applies, so an install that never mentions storage authors the
+    # .env it always did.
+    if cfg.get("max_storage_gb") not in (None, ""):
+        bare("MAX_STORAGE_GB", "%g" % float(cfg["max_storage_gb"]))
     if cfg.get("plan_log_pull"):
         # Opting in here closes the log-404 trap: the endpoint needs BOTH the plan flag and a
         # strong pepper before it will serve (then an admin still ticks a component in the UI).
@@ -876,6 +882,51 @@ DEFAULT_PROJECT = "dockvault-vault"
 _VOL_LS_FORMAT = '{{.Name}}\t{{.Label "com.dockvault.role"}}\t{{.Label "com.dockvault.bundle"}}'
 
 
+GIB = 1024 ** 3
+
+
+def parse_max_storage_gb(raw):
+    """The MAX_STORAGE_GB .env value -> a number of GB, or None when unset/blank/unparseable.
+    Accepts the historical PLAN_MAX_STORAGE_GB spelling at the call site, not here."""
+    text = (raw or "").strip().strip("'").strip('"')
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def format_bytes(n):
+    """Bytes as a short human string for the console ('2.50 GB', '512 MB', '900 B')."""
+    n = int(n or 0)
+    for unit, size in (("GB", GIB), ("MB", 1024 ** 2), ("KB", 1024)):
+        if n >= size:
+            value = n / size
+            return "%.2f %s" % (value, unit) if value < 10 else "%.0f %s" % (value, unit)
+    return "%d B" % n
+
+
+def storage_limit_problem(requested_gb, stored_bytes):
+    """Why a proposed deployment storage limit is unacceptable, or None when it is fine.
+
+    -1 (unlimited) is always acceptable. Otherwise the limit may not be set below what is ALREADY
+    stored, which would strand existing files above a limit nobody can satisfy without deleting
+    data. Physical disk capacity is deliberately NOT a refusal — a volume can be grown under a
+    running deployment — so the caller warns about it instead.
+    """
+    if requested_gb is None:
+        return "Enter a number of GB, or -1 for unlimited."
+    if requested_gb < 0 and requested_gb != -1:
+        return "A negative limit other than -1 (unlimited) is not a size."
+    if requested_gb == -1:
+        return None
+    if stored_bytes is not None and requested_gb * GIB < stored_bytes:
+        return ("%s is already stored, so the limit cannot go below that. Delete files first, "
+                "then lower the limit." % format_bytes(stored_bytes))
+    return None
+
+
 def gen_deployment_id():
     """A short, stable, label-safe bundle id for a fresh deployment (8 lowercase hex chars). Used as
     DEPLOYMENT_ID in .env so the deployment's volumes are labelled/grouped as one bundle."""
@@ -1019,6 +1070,10 @@ def new_set_config(current_env, new_prefix, new_id):
         "update_check_enabled": truthy("UPDATE_CHECK_ENABLED"),
         "plan_log_pull": truthy("PLAN_LOG_PULL"),
         "log_token_pepper": gen_hex(32) if truthy("PLAN_LOG_PULL") else "",
+        # A fresh volume set is still the same deployment: keep whatever storage ceiling the
+        # operator had configured rather than silently reverting it to unlimited.
+        "max_storage_gb": parse_max_storage_gb(
+            current_env.get("MAX_STORAGE_GB") or current_env.get("PLAN_MAX_STORAGE_GB")),
     }
     return cfg
 
@@ -1698,6 +1753,7 @@ class DockVault:
             "update_check_enabled": update_check,
             "plan_log_pull": log_pull,
             "log_token_pepper": gen_hex(32) if log_pull else "",
+            "max_storage_gb": (getattr(args, "max_storage_gb", None) if args else None),
             "_generated_pw": generated,
         }
 
@@ -2642,6 +2698,133 @@ class DockVault:
         print(pal.paint("  Now open Settings -> Logs in the vault UI, tick the Web/SFTP component, and mint a "
                         "token there.\n", "green"))
 
+    def _stored_bytes(self):
+        """Bytes actually stored across active vaults, straight from the deployment's database —
+        the same number the vault itself enforces against. None when it can't be read (engine
+        down, database not up yet), so callers degrade to 'unknown' instead of guessing."""
+        try:
+            r = self._run_dc("exec", "-T", "vault-db", "psql", "-U", "sftp_user", "-d", "sftp_db",
+                             "-tAc", "SELECT COALESCE(SUM(total_size_bytes), 0) FROM vaults "
+                                     "WHERE is_active = true", timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if getattr(r, "returncode", 1) != 0:
+            return None
+        try:
+            return int((r.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return None
+
+    def _volume_capacity(self):
+        """(used, available, total) bytes of the filesystem holding the storage volume, or None.
+
+        Read from INSIDE the app container so it reports the volume the vault actually writes to,
+        whatever the host path or driver is. Best-effort: purely informational."""
+        try:
+            r = self._run_dc("exec", "-T", "vault", "df", "-kP", "/app/storage", timeout=60)
+            if getattr(r, "returncode", 1) != 0:
+                r = self._run_dc("exec", "-T", "vault-api", "df", "-kP", "/app/storage", timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if getattr(r, "returncode", 1) != 0:
+            return None
+        lines = [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
+        if len(lines) < 2:
+            return None
+        parts = lines[-1].split()
+        if len(parts) < 4:
+            return None
+        try:  # df -kP columns: Filesystem 1024-blocks Used Available Capacity Mounted
+            total, used, avail = (int(parts[1]) * 1024, int(parts[2]) * 1024, int(parts[3]) * 1024)
+        except ValueError:
+            return None
+        return (used, avail, total)
+
+    def storage(self, args=None):
+        """Show what this deployment stores and set MAX_STORAGE_GB — the hard ceiling an
+        administrator can then tune DOWNWARD from inside the vault's Settings page.
+
+        Two independent numbers are reported because they answer different questions: the database
+        says how much the vault is storing (what the limit is enforced against), and the storage
+        volume says how much room the disk actually has. Lowering the limit below what is already
+        stored is refused; setting it above what the disk holds is only a warning, since a volume
+        can be grown under a running deployment."""
+        pal = self.pal
+        env = self._load_env()
+        # The older PLAN_MAX_STORAGE_GB spelling still configures a deployment, so read it as a
+        # fallback and report which key is actually in force.
+        raw = env.get("MAX_STORAGE_GB")
+        key_in_use = "MAX_STORAGE_GB"
+        if not (raw or "").strip():
+            legacy = env.get("PLAN_MAX_STORAGE_GB")
+            if (legacy or "").strip():
+                raw, key_in_use = legacy, "PLAN_MAX_STORAGE_GB"
+        current = parse_max_storage_gb(raw)
+
+        stored = self._stored_bytes()
+        capacity = self._volume_capacity()
+
+        print(pal.paint("\n  Deployment storage limit", "cyan"))
+        if current is None or current < 0:
+            print("  current limit: unlimited" + ("" if current is None else " (-1)"))
+        else:
+            print("  current limit: %g GB   (%s in .env)" % (current, key_in_use))
+        print("  stored now:    %s" % ("unknown - is the deployment running?" if stored is None
+                                       else format_bytes(stored)))
+        if capacity:
+            used, avail, total = capacity
+            print("  storage disk:  %s used, %s free of %s"
+                  % (format_bytes(used), format_bytes(avail), format_bytes(total)))
+        print("  Administrators can lower the live limit in the vault's Settings -> Storage; this")
+        print("  value is the ceiling they cannot go above.")
+
+        requested = getattr(args, "set_gb", None) if args else None
+        interactive = not (args and getattr(args, "non_interactive", False))
+        if requested is None and interactive:
+            answer = ask("New limit in GB (-1 for unlimited, blank to keep)", pal, default="")
+            if not (answer or "").strip():
+                print(pal.paint("  Left unchanged.\n", "yellow"))
+                return
+            requested = parse_max_storage_gb(answer)
+            if requested is None:
+                self._fail("that is not a number of GB")
+        if requested is None:
+            print(pal.paint("  Left unchanged.\n", "yellow"))
+            return
+
+        problem = storage_limit_problem(requested, stored)
+        if problem:
+            self._fail(problem)
+        if capacity and requested > 0 and requested * GIB > capacity[2]:
+            print(pal.paint("  Warning: %g GB is more than the storage volume currently holds (%s). "
+                            "Uploads will fail when the disk fills, whatever the limit says."
+                            % (requested, format_bytes(capacity[2])), "yellow"))
+
+        self._set_env_key(self._env_path(), "MAX_STORAGE_GB", "%g" % requested)
+        if key_in_use == "PLAN_MAX_STORAGE_GB":
+            # Leave the legacy key in place but neutralise it, so the two can never disagree about
+            # the ceiling after this write.
+            self._set_env_key(self._env_path(), "PLAN_MAX_STORAGE_GB", "-1")
+            print(pal.paint("  PLAN_MAX_STORAGE_GB was in use; MAX_STORAGE_GB now carries the limit.",
+                            "yellow"))
+        print(pal.paint("  Set MAX_STORAGE_GB=%g in .env." % requested, "green"))
+
+        if args and getattr(args, "no_restart", False):
+            print(pal.paint("  Not restarting; the new limit applies after the next restart.\n", "yellow"))
+            return
+        ok, _ = docker_available()
+        if not ok:
+            print(pal.paint("  Docker is not available; the new limit applies at the next start.\n",
+                            "yellow"))
+            return
+        if interactive and not confirm("Recreate the stack now so it takes effect?", pal, default=True):
+            print(pal.paint("  The new limit applies after the next restart.\n", "yellow"))
+            return
+        # env-only change: --force-recreate re-reads .env; do NOT rebuild (would clobber a release
+        # image previously pulled by the Update menu with a local build).
+        self._recreate_stack(build=False)
+        print(pal.paint("  Applied.\n", "green"))
+
     def handler(self, key):
         """Resolve a menu/command key to its bound handler, or None if unknown."""
         keys = {k for k, _ in MENU}
@@ -2695,6 +2878,8 @@ def build_parser():
     sp.add_argument("--image-source", dest="image_source", choices=("release", "build"),
                     help="release = pull the published GHCR image | build = build this checkout "
                          "(default with --non-interactive; interactive setup asks)")
+    sp.add_argument("--max-storage-gb", dest="max_storage_gb", type=float,
+                    help="deployment storage ceiling in GB (-1 = unlimited, the default)")
     sp.add_argument("--update-check", dest="update_check", action="store_true", help="enable the opt-in update check")
     sp.add_argument("--enable-log-pull", dest="enable_log_pull", action="store_true", help="enable the log-pull endpoint")
     sp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags/defaults, never prompt")
@@ -2706,6 +2891,14 @@ def build_parser():
     vp.add_argument("--target-prefix", dest="target_prefix", help="repoint: the target set's volume prefix")
     vp.add_argument("--env-source", dest="env_source", help="repoint: path to the target set's paired .env")
     vp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
+
+    stp = parsers["storage"]
+    stp.add_argument("--set-gb", dest="set_gb", type=float,
+                     help="new deployment storage ceiling in GB (-1 = unlimited)")
+    stp.add_argument("--no-restart", dest="no_restart", action="store_true",
+                     help="write .env only; apply at the next start")
+    stp.add_argument("--non-interactive", dest="non_interactive", action="store_true",
+                     help="use flags, never prompt (no --set-gb = show only)")
 
     rp = parsers["reset"]
     rp.add_argument("--confirm", dest="confirm", action="store_true",

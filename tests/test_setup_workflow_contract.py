@@ -56,6 +56,19 @@ def test_original_scenarios_a_through_h_remain_present():
         assert _SETUP.count(name) == 1
 
 
+def test_the_storage_limit_scenario_covers_report_enforce_and_refuse():
+    """The storage ceiling is managed from the host but enforced inside the vault, so the matrix
+    has to prove the whole chain — not just that the .env line was written."""
+    step = _step("Scenario J — the storage limit is reported, raised and refused",
+                 "Scenario I — install from the published release image")
+    assert "dockvault.py storage --non-interactive" in step        # reports without changing
+    assert "storage --set-gb 64" in step
+    assert "^MAX_STORAGE_GB=64$" in step
+    assert "deployment_storage_max_gb" in step                     # the vault agrees with the host
+    assert '"deployment_storage_limit_gb": 640' in step            # widening past the host is refused
+    assert "already stored" in step                                # and so is stranding stored files
+
+
 def test_profile_transitions_preserve_state_volumes_sftp_and_inventory():
     to_split = _step(
         "Profile transition — combined to split preserves deployment",
