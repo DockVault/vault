@@ -1817,12 +1817,6 @@ def _account_allocated_bytes(db: Session, user_id, exclude_vault_id=None) -> int
     return int(q.scalar() or 0)
 
 
-# Kept under its historical name because the concept (what an account has spent) is unchanged;
-# only the source of truth moved from "the size_limit of vaults you own" to "the storage you
-# allocated, wherever you allocated it".
-_account_reserved_bytes = _account_allocated_bytes
-
-
 def _max_allowed_vault_size_bytes(db: Session, owner: User, exclude_vault_id=None):
     """The largest total size_limit (bytes) this person may put on ONE vault they are the sole
     contributor to, bounded by the admin 'Max Vault Size' per-vault ceiling AND their remaining
@@ -1833,7 +1827,7 @@ def _max_allowed_vault_size_bytes(db: Session, owner: User, exclude_vault_id=Non
     return storage_quota.max_vault_total_bytes(ceiling, headroom)
 
 
-def _vault_grant_rows(db: Session, vault) -> list:
+def _vault_grant_rows(db: Session, vault, commit: bool = True) -> list:
     """This vault's storage-allocation ledger, repaired if it ever drifts from the vault's
     declared size_limit.
 
@@ -1849,20 +1843,48 @@ def _vault_grant_rows(db: Session, vault) -> list:
     limit = int(vault.size_limit or 0)
     if total == limit:
         return rows
-    owner_row = next((r for r in rows if r.user_id == vault.owner_id), None)
-    if owner_row is None:
-        owner_row = VaultStorageGrant(vault_id=vault.id, user_id=vault.owner_id, granted_bytes=0)
-        db.add(owner_row)
-        rows.append(owner_row)
-    owner_row.granted_bytes = max(0, int(owner_row.granted_bytes or 0) + (limit - total))
+    if total < limit:
+        # Storage the ledger cannot account for: a vault that predates the ledger, or one whose
+        # contributor's account was deleted. It belongs to the owner. The reverse case is NOT
+        # symmetrical and deliberately touches nobody's row — contributions adding up to more
+        # than the recorded limit means the limit is what is stale, and "repairing" it by
+        # subtracting from a row would delete storage somebody actually allocated.
+        owner_row = next((r for r in rows if r.user_id == vault.owner_id), None)
+        if owner_row is None:
+            owner_row = VaultStorageGrant(vault_id=vault.id, user_id=vault.owner_id, granted_bytes=0)
+            db.add(owner_row)
+            rows.append(owner_row)
+        owner_row.granted_bytes = int(owner_row.granted_bytes or 0) + (limit - total)
     vault.size_limit = sum(int(r.granted_bytes or 0) for r in rows)
-    db.commit()
+    # A read path has no other work in flight, so it persists the repair itself. A write path
+    # passes commit=False: it is holding a row lock that its own commit will release, and
+    # committing here would drop that lock halfway through the allocation.
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     return rows
 
 
-def _vault_storage_state(db: Session, vault) -> dict:
+def _lock_vault_for_allocation(db: Session, vault) -> None:
+    """Serialize allocation changes on ONE vault by taking a row lock on it.
+
+    Every allocation is read-modify-write across two tables (the contributor's row, then the
+    vault's derived size_limit), so two contributors writing at the same moment could each
+    compute a total that omitted the other's row. Locking the vault makes the ledger and the
+    limit it derives agree without a global lock: writes to different vaults never contend.
+    Released by the caller's commit/rollback.
+
+    populate_existing() is not optional. The handler has already loaded this vault on the way in,
+    and SQLAlchemy's identity map would hand back that same instance — lock emitted, attributes
+    unchanged — so the stored-bytes figure the allocation is then checked against would predate
+    the lock that was taken to make it trustworthy."""
+    db.query(Vault).filter(Vault.id == vault.id).populate_existing().with_for_update().first()
+
+
+def _vault_storage_state(db: Session, vault, commit: bool = True) -> dict:
     """The vault's allocation ledger as {user_id: bytes} plus the resulting total."""
-    rows = _vault_grant_rows(db, vault)
+    rows = _vault_grant_rows(db, vault, commit=commit)
     by_user = {r.user_id: int(r.granted_bytes or 0) for r in rows}
     return {"by_user": by_user, "total": sum(by_user.values())}
 
@@ -1898,7 +1920,8 @@ def _apply_vault_total(db: Session, vault, actor: User, requested_total: int) ->
     personally contributed. The remainder belongs to other contributors and is theirs to
     reclaim, so an owner cannot shrink a shared vault by cancelling somebody else's storage.
     """
-    state = _vault_storage_state(db, vault)
+    _lock_vault_for_allocation(db, vault)
+    state = _vault_storage_state(db, vault, commit=False)
     mine = state["by_user"].get(actor.id, 0)
     others = state["total"] - mine
     new_grant = int(requested_total) - others
@@ -6985,7 +7008,10 @@ async def set_vault_storage(
             detail="Only the vault owner or a vault manager can change this vault's storage.",
         )
 
-    state = _vault_storage_state(db, vault)
+    # Take the vault's row lock first, so a second contributor writing at the same moment cannot
+    # compute a total that omits this one. Held until the commit below.
+    _lock_vault_for_allocation(db, vault)
+    state = _vault_storage_state(db, vault, commit=False)
     mine = state["by_user"].get(current_user.id, 0)
     others = state["total"] - mine
     _enforce_grant(db, vault, current_user, payload.granted_bytes,

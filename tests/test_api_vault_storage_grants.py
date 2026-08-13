@@ -211,6 +211,37 @@ def test_the_owner_cannot_shrink_a_shared_vault_by_cancelling_a_manager_contribu
     assert ok.json()["size_limit"] == 5 * GIB     # the manager's contribution stands alone
 
 
+def test_simultaneous_contributions_all_survive(shared_vault):
+    """Two people funding the same vault at the same instant is the case the ledger exists for.
+    Each write is read-modify-write across two tables, so without serialization one writer's
+    total can omit the other's row — and a later repair would then take the difference out of
+    somebody's allocation. Every byte contributed must still be there afterwards."""
+    import threading
+
+    vid = shared_vault["vault_id"]
+    oc, mc = shared_vault["owner_client"], shared_vault["manager_client"]
+    results = {}
+
+    def _put(name, client, amount):
+        results[name] = client.put(f"/vaults/{vid}/storage", json={"granted_bytes": amount})
+
+    threads = [threading.Thread(target=_put, args=("owner", oc, 2 * GIB)),
+               threading.Thread(target=_put, args=("manager", mc, 5 * GIB))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    for name, r in results.items():
+        assert r.status_code == 200, f"{name}: {r.text}"
+
+    body = oc.get(f"/vaults/{vid}/storage").json()
+    contributions = {c["username"]: c["granted_bytes"] for c in body["contributors"]}
+    assert sorted(contributions.values()) == [2 * GIB, 5 * GIB]
+    assert body["size_limit"] == 7 * GIB
+    assert oc.get(f"/vaults/{vid}").json()["size_limit"] == 7 * GIB
+
+
 def test_a_manager_cannot_move_somebody_elses_allocation(shared_vault):
     """PUT sets the CALLER's own share, so a manager raising theirs never touches the owner's."""
     vid = shared_vault["vault_id"]

@@ -26,6 +26,9 @@ def _login(page: Page, username: str, password: str):
 def _open_storage_settings(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     page.click('.tab-btn[data-tab="storage"]')
+    # The settings form populates asynchronously and the app marks it ready by enabling Save.
+    # Typing before that lands is a race the form itself loses: the load overwrites the field.
+    expect(page.locator('#save-all-settings-btn[data-settings-ready="true"]')).to_be_enabled(timeout=15000)
 
 
 def _open_vault_info(page: Page, vault_id: str):
