@@ -496,7 +496,7 @@ jobs:
             -d "{\"username\": \"$ADMIN_USER\", \"password\": \"$ADMIN_PASS\"}" \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
           ceiling="$(curl -sSf --cacert certs/cert.pem "$BASE/settings" -H "Authorization: Bearer $token" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["deployment_storage_max_gb"])')"
+            | python3 -c 'import json,sys; v=json.load(sys.stdin)["deployment_storage_max_gb"]; print(f"{float(v):g}")')"
           [ "$ceiling" = "64" ] \
             || { echo "::error::the vault reports a ceiling of $ceiling, not 64"; exit 1; }
 
