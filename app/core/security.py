@@ -2,11 +2,13 @@
 Security utilities for password hashing, encryption, and credential generation.
 Implements industry-standard security practices.
 """
+import os
 import secrets
 import hashlib
 import hmac
 import base64
 import struct
+from array import array
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 import uuid
@@ -406,6 +408,265 @@ def decrypt_gcm_chunk_stream(file_handle, vault_id, file_id) -> bytes:
     return b''.join(out)
 
 
+class GcmChunkStreamReader:
+    """Reads a chunked at-rest stream without ever holding the whole plaintext.
+
+    The whole-file reader this exists beside decrypts every record into a list and joins it, which
+    costs about twice the file. Measured on 128 MB: 267.9 MB.
+
+    The reader is built in two parts. Construction performs a **walk**: it reads each record's
+    4-byte length prefix and steps over the body without reading it. That is enough to learn the
+    record count and the total plaintext length, because a record's length field covers nonce,
+    ciphertext and tag, so its plaintext length is `rec_len - 28`. Those two numbers are exactly
+    what the 0x20 terminal's AAD binds -- so **the terminal is authenticated before anything is
+    decrypted**, and truncation, substitution, reordering, a missing terminal and trailing bytes
+    all become failures that happen before a caller has emitted a single byte.
+
+    What the walk cannot see is an individual record's own tag: flipping bytes inside a body leaves
+    the framing intact. That is the one failure that remains late, and callers have to be built for
+    it.
+    """
+
+    def __init__(self, file_handle, vault_id, file_id):
+        self._fh = file_handle
+        self._vault_id = vault_id
+        self._file_id = file_id
+
+        try:
+            stat = os.fstat(file_handle.fileno())
+        except OSError as exc:
+            raise EncryptionError(f"Failed to read file: {exc}")
+        self._size = stat.st_size
+        # A live blob cannot be opened by path with a link count of zero, so this is only ever 1
+        # or more here; `_object_changed` looks for it reaching zero.
+        self._nlink = stat.st_nlink
+
+        # Every read below is POSITIONAL, through `_read_at`. Reading through the handle would go
+        # through its buffer, and that buffer is 128 KiB: seeking between length prefixes discards
+        # it and the next 4-byte read refills it, so the walk would pull 128 KiB from the device
+        # per record -- 128 MiB of I/O to walk a 1 GB file, to read 4 KiB of prefixes. It would
+        # also serve a small file's records out of a buffer filled before an overwrite, so a blob
+        # replaced underneath a reader would go unnoticed.
+        #
+        # The descriptor is fetched per read rather than cached. A descriptor NUMBER is only
+        # meaningful while its handle is open: if a caller closes the handle, the number is
+        # recycled and the next positional read returns some unrelated file's bytes into the
+        # decrypt path.
+        header = self._read_at(0, len(_GCM_STREAM_HEADER))
+        if (len(header) < len(_GCM_STREAM_HEADER)
+                or header[:len(GCM_STREAM_MAGIC)] != GCM_STREAM_MAGIC):
+            raise EncryptionError("Not a valid AES-GCM chunk stream")
+        self._version = header[len(GCM_STREAM_MAGIC)]
+        if self._version not in (GCM_STREAM_VERSION, GCM_STREAM_VERSION_V2):
+            raise EncryptionError(
+                f"Unsupported at-rest format version 0x{self._version:02x}; this build reads "
+                f"0x{GCM_STREAM_VERSION:02x} and 0x{GCM_STREAM_VERSION_V2:02x}")
+
+        self._write_id = b''
+        if self._version == GCM_STREAM_VERSION_V2:
+            # The header is 28 bytes for 0x20 and 12 for 0x10. Sizing it from the version is not
+            # optional: starting the walk at 12 on a 0x20 file reads the first four bytes of the
+            # write id as a length prefix and rejects every valid file.
+            self._write_id = self._read_at(len(_GCM_STREAM_HEADER), _WRITE_ID_SIZE)
+            if len(self._write_id) != _WRITE_ID_SIZE:
+                raise EncryptionError("Truncated header")
+            if header[len(GCM_STREAM_MAGIC) + 1:] != b'\x00\x00':
+                raise EncryptionError("Reserved header bytes are not zero")
+
+        self._data_start = (_GCM_STREAM_HEADER_V2_SIZE
+                            if self._version == GCM_STREAM_VERSION_V2
+                            else len(_GCM_STREAM_HEADER))
+        self._aesgcm = AESGCM(_gcm_stream_subkey(vault_id, file_id))
+        # One 4-byte entry per record. Deliberately not a list of tuples of (index, file offset,
+        # plaintext offset, length): the index position IS the record number and both offsets are
+        # prefix sums, so the tuple form stores four numbers where one is needed. At the record
+        # count this format permits that is the difference between 8 MiB and 368 MiB, and this is
+        # held per open reader.
+        self._lengths = array('I')
+        self._total_length = 0
+        self._walk()
+
+    # -- positional reads -------------------------------------------------------
+
+    def _read_at(self, offset: int, size: int) -> bytes:
+        """Exactly `size` bytes from `offset`, without disturbing or consulting any buffer.
+
+        `os.pread` is one syscall and does not move the file position, so concurrent readers on one
+        descriptor cannot interfere -- which the SFTP path will need.
+
+        Windows has no `pread`. The fallback is the same operation in two calls, but it goes
+        through the handle's buffer and therefore inherits everything described above: on a small
+        file it can serve records that were read before the blob changed underneath it. That is
+        tolerable only because it is never the deployment platform, and it is why several tests
+        covering concurrent modification are POSIX-only.
+        """
+        if hasattr(os, "pread"):
+            try:
+                fd = self._fh.fileno()
+            except (OSError, ValueError) as exc:
+                # ValueError is what a closed handle raises, and it is not an OSError.
+                raise EncryptionError(f"Failed to read file: {exc}")
+            out = b''
+            while len(out) < size:
+                piece = os.pread(fd, size - len(out), offset + len(out))
+                if not piece:
+                    break
+                out += piece
+            return out
+        try:
+            self._fh.seek(offset)
+            return self._fh.read(size)
+        except (OSError, ValueError) as exc:
+            raise EncryptionError(f"Failed to read file: {exc}")
+
+    # -- the walk ---------------------------------------------------------------
+
+    def _walk(self):
+        """Read every length prefix, step over every body, and verify the terminal.
+
+        Bodies are never read here, so this is not a second pass over the data. Truncation is
+        caught arithmetically against the size taken at construction rather than by seeking and
+        discovering a short read -- a seek past the end of a file succeeds silently, which would
+        make a truncated final record invisible.
+        """
+        pos = self._data_start
+        terminated = False
+        floor = (MIN_RECORD_BYTES if self._version == GCM_STREAM_VERSION_V2
+                 else MIN_RECORD_BYTES_V1)
+
+        while pos + 4 <= self._size:
+            length_header = self._read_at(pos, 4)
+            if len(length_header) < 4:
+                break
+            rec_len = struct.unpack('>I', length_header)[0]
+
+            if self._version == GCM_STREAM_VERSION_V2 and rec_len == _TERMINAL_MARKER:
+                terminal_len = _GCM_NONCE_SIZE + 16
+                if pos + 4 + terminal_len > self._size:
+                    raise EncryptionError("Truncated terminal record")
+                record = self._read_at(pos + 4, terminal_len)
+                if len(record) != terminal_len:
+                    raise EncryptionError("Truncated terminal record")
+                aad = _terminal_aad_v2(self._vault_id, self._file_id, self._write_id,
+                                       len(self._lengths), self._total_length)
+                try:
+                    self._aesgcm.decrypt(record[:_GCM_NONCE_SIZE], record[_GCM_NONCE_SIZE:], aad)
+                except Exception:
+                    # The count and length are AAD inputs, not values read out of the terminal, so
+                    # a successful decrypt IS the check that the walk's numbers are the writer's.
+                    self._raise_for_failure("Encrypted file failed terminal authentication")
+                terminated = True
+                pos += 4 + terminal_len
+                break
+
+            # Bounds before anything is trusted, so a corrupt length cannot make the walk
+            # expensive. The floor is version-dependent: 0x10 permits a zero-plaintext record and a
+            # frozen release fixture contains one.
+            if rec_len < floor or rec_len > MAX_RECORD_BYTES:
+                self._raise_for_failure("Record length outside the permitted range")
+            if len(self._lengths) >= MAX_RECORDS:
+                raise EncryptionError("Too many records in encrypted file")
+            if pos + 4 + rec_len > self._size:
+                self._raise_for_failure("Incomplete chunk in encrypted file")
+
+            self._lengths.append(rec_len)
+            self._total_length += rec_len - _GCM_NONCE_SIZE - 16
+            pos += 4 + rec_len
+
+        if self._version == GCM_STREAM_VERSION_V2:
+            if not terminated:
+                self._raise_for_failure("Encrypted file ended without a terminal record")
+            if pos != self._size:
+                self._raise_for_failure("Trailing bytes after the terminal record")
+        # 0x10 has no terminal and no strict EOF. A stray partial length prefix at the end is
+        # ignored, exactly as the whole-file reader ignores it -- this reader must not reject a
+        # file the reader it replaces accepts.
+
+    # -- what the walk learned --------------------------------------------------
+
+    @property
+    def total_length(self) -> int:
+        """Total plaintext bytes. For 0x20 this is authenticated by the terminal."""
+        return self._total_length
+
+    @property
+    def record_count(self) -> int:
+        return len(self._lengths)
+
+    @property
+    def version(self) -> int:
+        return self._version
+
+    @property
+    def length_is_authenticated(self) -> bool:
+        """True only for 0x20. 0x10 has no terminal, so its length is derived but unsigned."""
+        return self._version == GCM_STREAM_VERSION_V2
+
+    # -- reading ----------------------------------------------------------------
+
+    def _raise_for_failure(self, message: str):
+        """Raise, having first asked whether the object was replaced rather than damaged.
+
+        Used by the walk as well as by record decryption. The walk is where truncation, a missing
+        terminal and a failed terminal authentication all land, and those are exactly what a
+        concurrent delete produces -- so attributing only at record level would leave the entire
+        open-to-first-byte window reporting routine deletes as tampering.
+        """
+        if self._object_changed():
+            raise ObjectChangedDuringRead(
+                "The stored file was replaced or deleted while it was being read")
+        raise EncryptionError(message)
+
+    def _object_changed(self) -> bool:
+        """Has the blob been unlinked under this descriptor since it was opened?
+
+        `st_nlink == 0` and nothing else. It is exact for this codebase -- a delete and a same-name
+        replacement both unlink the old blob -- and it has no false positives: a live blob cannot
+        be opened by path with a link count of zero.
+
+        Two weaker signals were tried and rejected. Comparing the link count for *inequality* fires
+        on an unrelated hard link, and comparing modification times fires on any tool that restores
+        an mtime; both would report tampering as a routine delete, which silences the alarm instead
+        of dulling it. Modification time is also unusable on its own merits: the container
+        filesystem here has 10 ms granularity, and the shred runs immediately after the commit, so
+        whether an overwrite moved the timestamp is a question about the filesystem rather than
+        about the file.
+
+        The cost is that an overwrite not yet followed by its unlink reports as an integrity
+        failure. That is the safe direction: a spurious integrity alarm is noise, a spurious "it
+        was only a delete" is a missed one.
+        """
+        try:
+            return os.fstat(self._fh.fileno()).st_nlink == 0
+        except (OSError, ValueError):
+            # A closed or unusable descriptor is not evidence either way; do not claim a
+            # replacement on the strength of it.
+            return False
+
+    def _decrypt_at(self, index: int, offset: int) -> bytes:
+        rec_len = self._lengths[index]
+        record = self._read_at(offset + 4, rec_len)
+        if len(record) != rec_len:
+            self._raise_for_failure("Incomplete chunk in encrypted file")
+        aad = (_chunk_stream_aad_v2(self._vault_id, self._file_id, self._write_id, index)
+               if self._version == GCM_STREAM_VERSION_V2
+               else _chunk_stream_aad(self._vault_id, self._file_id, index))
+        try:
+            return self._aesgcm.decrypt(record[:_GCM_NONCE_SIZE], record[_GCM_NONCE_SIZE:], aad)
+        except Exception:
+            # The one failure the walk cannot pre-empt. Attribute it before calling it corruption:
+            # an ordinary delete racing an ordinary read arrives here looking identical.
+            self._raise_for_failure("Failed to decrypt AES-GCM chunk stream")
+
+    def records(self):
+        """Yield each record's plaintext in order, holding one record at a time."""
+        offset = self._data_start
+        for index in range(len(self._lengths)):
+            plain = self._decrypt_at(index, offset)
+            offset += 4 + self._lengths[index]
+            yield plain
+
+
 # --- Filename / MIME encryption at rest (Standard vaults) -------------------
 # Names/MIME were stored plaintext. Encrypt them at rest under the SAME deployment
 # secret that protects file CONTENT (the vault password is only an access gate, not the
@@ -525,6 +786,20 @@ class PasswordVerificationError(SecurityError):
 class EncryptionError(SecurityError):
     """Exception raised when encryption operations fail."""
     pass
+
+
+class ObjectChangedDuringRead(EncryptionError):
+    """The stored blob was replaced or deleted while it was being read.
+
+    Separate from a plain :class:`EncryptionError` because the two mean opposite things: one is a
+    damaged or tampered object, the other is an ordinary delete racing an ordinary read. Reporting
+    the second as the first trains an operator to ignore the alarm that matters.
+
+    It *subclasses* EncryptionError rather than standing alone so that a caller which does not know
+    about it still handles it. Every handler of the reader this replaces catches EncryptionError,
+    and a bare Exception here would escape all of them as an unhandled server error the moment a
+    file is deleted mid-download. Callers that want the distinction catch this first.
+    """
 
 
 # Password Hashing Functions
