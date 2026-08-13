@@ -1213,9 +1213,51 @@ function formatBytes(bytes) {
     return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
 }
 
-// Format timestamp to relative time
+// Parse a timestamp that came from the API.
+//
+// The server stores and reports UTC, but serialises it naively — .isoformat()
+// yields "2026-08-13T11:25:12.951177" with no trailing Z and no offset.
+// ECMAScript parses a date-TIME string in that form as LOCAL time (date-ONLY
+// strings are the opposite: those are defined as UTC). So on a UTC+3 machine a
+// record written a second ago parses three hours into the past: it displays as
+// "3h ago", and any countdown computed from it is three hours out — a
+// correctness bug, not only a cosmetic one.
+//
+// Attaching the UTC designator the server omitted fixes the instant; the
+// browser then renders it in the viewer's own zone via toLocale*(). Values that
+// already carry a zone (Z or +hh:mm), epoch numbers and Date objects pass
+// through untouched, so this keeps working if the API later starts emitting a
+// designator itself.
+//
+// Do NOT use this for a value read from <input type="datetime-local">: that is
+// local wall-clock by definition and must not be reinterpreted as UTC.
+function parseServerTime(value) {
+    if (value === null || value === undefined || value === '') return null;
+    if (value instanceof Date) return isNaN(value.getTime()) ? null : value;
+    if (typeof value === 'number') {
+        const n = new Date(value);
+        return isNaN(n.getTime()) ? null : n;
+    }
+    const s = String(value).trim();
+    const isDateTime = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(s);
+    // Accepts Z, ±hh:mm, ±hhmm and the hour-only ±hh that ISO 8601 also allows.
+    // Python never emits the hour-only form, but missing it would append a
+    // second designator and turn a valid instant into an unparseable one.
+    const hasZone = /(?:[zZ]|[+-]\d{2}(?::?\d{2})?)$/.test(s);
+    const d = new Date(isDateTime && !hasZone ? s.replace(' ', 'T') + 'Z' : s);
+    return isNaN(d.getTime()) ? null : d;
+}
+
+// An absolute API timestamp rendered in the viewer's own timezone.
+function formatServerTime(value, fallback) {
+    const d = parseServerTime(value);
+    return d ? d.toLocaleString() : (fallback === undefined ? '—' : fallback);
+}
+
+// Format timestamp to relative time (rendered in the viewer's local zone).
 function formatTimeAgo(timestamp) {
-    const date = new Date(timestamp);
+    const date = parseServerTime(timestamp);
+    if (!date) return '—';
     const now = new Date();
     const seconds = Math.floor((now - date) / 1000);
     
@@ -2809,7 +2851,7 @@ async function generateTempCreds(options = {}) {
 // Show temp credentials in a modal
 function showTempCredsModal(creds) {
     const sftpCmd = `sftp -P 2222 ${creds.temp_username}@localhost`;
-    const expires = creds.expires_at ? new Date(creds.expires_at).toLocaleString() : 'N/A';
+    const expires = formatServerTime(creds.expires_at, 'N/A');
     const validity = creds.validity_minutes != null
         ? `Valid for ${creds.validity_minutes} minute${creds.validity_minutes === 1 ? '' : 's'}` : '';
 
@@ -2932,9 +2974,13 @@ let tempCredsAll = [];
 // Classify a credential into a single status bucket.
 function credStatus(cred) {
     const now = new Date();
-    const exp = new Date(cred.expires_at);
+    const exp = parseServerTime(cred.expires_at);
     if (cred.is_used) return 'used';
-    if (now > exp) return 'expired';
+    // An expiry that cannot be read is reported as expired, never as active:
+    // this describes remaining access, so the conservative reading is the safe
+    // one. Stated explicitly rather than leaning on `now > null` coercing the
+    // null to epoch 0 and arriving at the same answer by accident.
+    if (!exp || now > exp) return 'expired';
     if (!cred.is_active) return 'deactivated';
     return 'active';
 }
@@ -2950,7 +2996,7 @@ async function loadTempCreds() {
         Object.values(tempCredTimers).forEach(timer => clearInterval(timer));
         tempCredTimers = {};
         tempCredsAll = creds || [];
-        tempCredsAll.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        tempCredsAll.sort((a, b) => parseServerTime(b.created_at) - parseServerTime(a.created_at));
         tempCredsLimit = 50;
         renderTempCreds();
     } catch (error) {
@@ -3073,12 +3119,12 @@ function toggleTempCredRow(id) {
 function renderTempCredItem(cred) { return renderTempCredRow(cred); }
 function renderTempCredRow(cred) {
     const now = new Date();
-    const expiresAt = new Date(cred.expires_at);
+    const expiresAt = parseServerTime(cred.expires_at);
 
     let status, statusBadge, dataStatus;
     if (cred.is_used) {
         status = 'Used'; statusBadge = 'secondary'; dataStatus = 'used';
-    } else if (now > expiresAt) {
+    } else if (!expiresAt || now > expiresAt) {   // unreadable expiry -> expired, see credStatus
         status = 'Expired'; statusBadge = 'error'; dataStatus = 'expired';
     } else if (!cred.is_active) {
         status = 'Deactivated'; statusBadge = 'error'; dataStatus = 'expired';
@@ -3098,13 +3144,13 @@ function renderTempCredRow(cred) {
             <td><span class="mono cred-name">${uname}</span></td>
             <td>${escapeHtml(cred.username)}</td>
             <td><span class="badge badge-${statusBadge}">${status}</span></td>
-            <td><span class="mono cred-expires" id="countdown-${uname}">${expiresAt.toLocaleString()}</span></td>
+            <td><span class="mono cred-expires" id="countdown-${uname}">${formatServerTime(cred.expires_at)}</span></td>
         </tr>
         <tr class="exp-detail${open ? ' is-open' : ''}" data-id="${uname}">
             <td colspan="5">
                 <div class="row-detail">
                     <div class="detail-meta">
-                        <span class="meta-item">${iconSvg('calendar', 'icon-sm')}<span class="meta-label">Created</span><span class="meta-value">${new Date(cred.created_at).toLocaleString()}</span></span>
+                        <span class="meta-item">${iconSvg('calendar', 'icon-sm')}<span class="meta-label">Created</span><span class="meta-value">${formatServerTime(cred.created_at)}</span></span>
                         ${cred.note ? `<span class="meta-item">${iconSvg('file-text', 'icon-sm')}<span class="meta-label">Note</span><span class="meta-value">${escapeHtml(cred.note)}</span></span>` : ''}
                         ${cred.can_create_temp_credentials ? `<span class="entity-note">${iconSvg('key', 'icon-sm')} Can create temp credentials</span>` : ''}
                         ${cred.active_session_count > 0 ? `<span class="entity-note">${iconSvg('activity', 'icon-sm')} ${cred.active_session_count} active session(s)</span>` : ''}
@@ -3127,7 +3173,7 @@ function startCountdownTimer(username, expiresAt) {
     
     const updateCountdown = () => {
         const now = new Date();
-        const expires = new Date(expiresAt);
+        const expires = parseServerTime(expiresAt);
         const timeLeft = expires - now;
         
         if (timeLeft <= 0) {
@@ -3399,8 +3445,8 @@ function renderUserRow(u) {
 }
 
 function renderUserDetail(u) {
-    const lastLogin = u.last_login ? new Date(u.last_login).toLocaleString() : 'Never';
-    const created = new Date(u.created_at).toLocaleString();
+    const lastLogin = formatServerTime(u.last_login, 'Never');
+    const created = formatServerTime(u.created_at);
     const inGroups = new Set((u.groups || []).map(g => g.id));
     const addable = usersView.groups.filter(g => !inGroups.has(g.id));
     return `
@@ -3614,7 +3660,7 @@ function openUserSettingsModal() {
     set('us-username', currentUser.username || '');
     set('us-email-display', currentUser.email || '');
     set('us-role', currentUser.role === 'admin' ? 'Administrator' : (currentUser.role || 'User'));
-    set('us-last-login', currentUser.last_login ? new Date(currentUser.last_login).toLocaleString() : '—');
+    set('us-last-login', formatServerTime(currentUser.last_login));
 
     const isTemp = isScopedTemp || !!(sessionAccess && sessionAccess.is_scoped_temp);
     document.querySelectorAll('#user-settings-modal .us-credential').forEach(s => { s.style.display = isTemp ? 'none' : ''; });
@@ -4612,8 +4658,8 @@ function updateMonitorUI() {
     }
     
     eventsList.innerHTML = filteredEvents.map(event => {
-        const time = new Date(event.timestamp);
-        const timeStr = time.toLocaleTimeString();
+        const time = parseServerTime(event.timestamp);
+        const timeStr = time ? time.toLocaleTimeString() : '—';
         
         // Event type badge color
         const typeColors = {
@@ -6418,12 +6464,15 @@ async function searchAuditLog() {
         }
         
         tbody.innerHTML = logs.map(log => {
-            const timestamp = new Date(log.timestamp);
+            // Audit rows are a security record: an unreadable timestamp must not
+            // render as the current instant, which would make an old or corrupted
+            // event look like it just happened.
+            const timestampText = formatServerTime(log.timestamp);
             const statusClass = log.status === 'success' ? 'success' : 'danger';
             
             return `
                 <tr>
-                    <td>${timestamp.toLocaleString()}</td>
+                    <td>${timestampText}</td>
                     <td>${escapeHtml(log.username || '-')}</td>
                     <td><span class="badge badge-secondary">${escapeHtml(log.action.replace('_', ' '))}</span></td>
                     <td><span class="badge badge-${statusClass}">${log.status}</span></td>
@@ -6801,8 +6850,8 @@ function friendlyFileType(item) {
 
 // A compact, single-line "modified" timestamp.
 function formatModified(iso) {
-    const d = new Date(iso);
-    if (isNaN(d.getTime())) return '—';
+    const d = parseServerTime(iso);
+    if (!d) return '—';
     const date = d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
     const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
     return `${date} · ${time}`;
@@ -10128,7 +10177,7 @@ async function loadVaultInfo() {
         // Details card
         setText('info-vault-name', vault.name);
         setText('info-vault-description', vault.description || 'No description');
-        setText('info-vault-created', vault.created_at ? new Date(vault.created_at).toLocaleString() : '-');
+        setText('info-vault-created', formatServerTime(vault.created_at, '-'));
 
         // Storage usage bar
         const storageBarFill = document.getElementById('info-storage-bar-fill');
@@ -10221,7 +10270,7 @@ async function loadVaultPermissions() {
             const managerOpt = (isOwnerOrAdmin || isManagerRow)
                 ? `<option value="manage" ${level === 'manage' ? 'selected' : ''}>Manager</option>`
                 : '';
-            const addedDate = perm.added_at ? new Date(perm.added_at) : null;
+            const addedDate = parseServerTime(perm.added_at);
             const added = (addedDate && !isNaN(addedDate)) ? addedDate.toLocaleDateString() : '—';
             return `
             <tr>
@@ -10589,7 +10638,7 @@ async function loadVaultSettings() {
         // Created date
         const createdEl = document.getElementById('settings-vault-created');
         if (createdEl) {
-            createdEl.textContent = new Date(vault.created_at).toLocaleString();
+            createdEl.textContent = formatServerTime(vault.created_at);
         }
         
         // Storage info
