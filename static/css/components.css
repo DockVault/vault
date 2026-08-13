@@ -779,7 +779,15 @@
     flex: 1;
     overflow-y: auto;
     padding: var(--space-lg);
-    background: var(--surface-0);
+    /* Deliberately unpainted so the PAGE surface (body, --surface-1) shows
+       through. This used to be --surface-0, which is the CARD surface: every
+       card then sat on a backdrop of exactly its own colour, so the only thing
+       separating a card from the region around it was its 1px border, and no
+       amount of retuning the surface ramp could register. Leaving it
+       transparent also means the region can never drift from the page colour
+       when a [data-bg] palette retints the ramp.
+       tests/test_ui_theme_palette.py pins this. */
+    background: transparent;
 }
 
 .content-section {

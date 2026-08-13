@@ -50,6 +50,38 @@ def test_preferences_reject_invalid_values(temp_user_client):
     assert "theme" not in out and "ui" not in out and "bogus" not in out
 
 
+def test_preferences_accept_every_offered_background(temp_user_client):
+    """Every background the picker offers must survive a round-trip.
+
+    The client list, the swatches and the CSS ramps are checked against each
+    other statically (tests/test_ui_theme_palette.py); this closes the loop at
+    runtime, because a name the server drops silently fails to follow the user
+    to their next device — the swatch works locally, then resets on reload.
+    """
+    offered = ["slate", "graphite", "navy", "ocean",
+               "forest", "warm", "ember", "plum"]
+    for name in offered:
+        r = temp_user_client.put("/users/me/preferences", json={"background": name})
+        assert r.status_code == 200, r.text
+        assert r.json().get("background") == name, (
+            f"background {name!r} was not stored — it is offered by the picker "
+            f"but missing from the server allowlist"
+        )
+
+
+def test_preferences_reject_unknown_background(temp_user_client):
+    """Widening the allowlist must not turn it into a pass-through."""
+    temp_user_client.put("/users/me/preferences", json={"background": "navy"})
+    r = temp_user_client.put(
+        "/users/me/preferences", json={"background": "<script>"}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json().get("background") == "navy", (
+        "an unknown background value overwrote the stored one; the client "
+        "writes this straight into a DOM attribute"
+    )
+
+
 def test_preferences_require_auth(anon):
     # No Authorization header -> 403 (HTTPBearer); an invalid token -> 401.
     assert anon.get("/users/me/preferences").status_code in (401, 403)

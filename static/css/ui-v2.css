@@ -52,12 +52,13 @@
     --error:   #d92d20;
     --info:    #175cd3;
 
-    /* Neutral gray ramp — cards on a quiet gray page */
+    /* Surface ramp — cards on a quiet, faintly cool page. Generated on the
+       ladder documented in §26; slate is the default option and lives here. */
     --surface-0: #ffffff;
-    --surface-1: #f4f5f7;
-    --surface-2: #ebedf0;
-    --surface-3: #d9dce2;
-    --surface-4: #b9bfc9;
+    --surface-1: #f2f6fa;
+    --surface-2: #e7ecf2;
+    --surface-3: #d2dbe4;
+    --surface-4: #aebcca;
 
     --text-primary:   #16191f;
     --text-secondary: #414855;
@@ -125,11 +126,11 @@
     --error:   #f97066;
     --info:    #53b1fd;
 
-    --surface-0: #1c2127;   /* cards / overlays */
-    --surface-1: #14171c;   /* page + rail background */
-    --surface-2: #262c34;   /* hover / inset */
-    --surface-3: #333a44;   /* hairline borders */
-    --surface-4: #454e5a;
+    --surface-0: #1c242c;   /* cards / overlays */
+    --surface-1: #0c141c;   /* page + rail background */
+    --surface-2: #272e36;   /* hover / inset */
+    --surface-3: #343b42;   /* hairline borders */
+    --surface-4: #444b51;
 
     --text-primary:   #e8ebef;
     --text-secondary: #a9b1bc;
@@ -261,7 +262,13 @@ code { background: var(--surface-2); color: var(--text-primary); border-radius: 
 .sidebar-item:hover { background: var(--hover-overlay); color: var(--text-primary); }
 .sidebar-item:hover .sidebar-icon { color: var(--text-secondary); }
 .sidebar-item.active {
-    background: var(--surface-0);
+    /* --brand-glow is the accent at low alpha. Laid over the opaque card
+       surface as a flat image layer it tints the selected row by the chosen
+       accent without introducing a visible gradient or a shadow, so the rail
+       still follows the skin's "accent only on selected/interactive states"
+       rule. Two colour stops of the same value = a flat wash, not a gradient. */
+    background-color: var(--surface-0);
+    background-image: linear-gradient(var(--brand-glow), var(--brand-glow));
     color: var(--text-primary);
     font-weight: 600;
     box-shadow: inset 0 0 0 1px var(--line);
@@ -1610,16 +1617,41 @@ button.chip:hover { filter: brightness(1.06); }
        palette retints the surface ramp (--surface-0..4); page background,
        rail, table heads, insets and hairlines all derive from it (including
        the v2 --line/--rail-bg/--thead-bg tokens, which are color-mixed from
-       the ramp). Dark ramps are re-derived around the v2 charcoal lightness.
-   ---------------------------------------------------------------------------- */
-[data-bg="graphite"] { --surface-0:#ffffff; --surface-1:#f2f3f4; --surface-2:#e9eaec; --surface-3:#d8dade; --surface-4:#b8bcc3; }
-[data-bg="navy"]     { --surface-0:#ffffff; --surface-1:#eff2f8; --surface-2:#e4e9f3; --surface-3:#d0d9ea; --surface-4:#adbdd9; }
-[data-bg="warm"]     { --surface-0:#ffffff; --surface-1:#f5f3ee; --surface-2:#edeae2; --surface-3:#ded8ca; --surface-4:#c4b9a2; }
-[data-bg="forest"]   { --surface-0:#ffffff; --surface-1:#eff4f0; --surface-2:#e4ece6; --surface-3:#d1ded5; --surface-4:#aec4b5; }
-[data-bg="plum"]     { --surface-0:#ffffff; --surface-1:#f3f0f6; --surface-2:#ebe6f1; --surface-3:#dcd2e8; --surface-4:#c0aed6; }
+       the ramp).
 
-[data-theme="dark"][data-bg="graphite"] { --surface-0:#1e2124; --surface-1:#161819; --surface-2:#282c30; --surface-3:#363b41; --surface-4:#4a5057; }
-[data-theme="dark"][data-bg="navy"]     { --surface-0:#1b2333; --surface-1:#131926; --surface-2:#252f45; --surface-3:#33405c; --surface-4:#465579; }
-[data-theme="dark"][data-bg="warm"]     { --surface-0:#242019; --surface-1:#1a1712; --surface-2:#302b22; --surface-3:#403a2e; --surface-4:#564e3e; }
-[data-theme="dark"][data-bg="forest"]   { --surface-0:#1a241d; --surface-1:#121a15; --surface-2:#243027; --surface-3:#324237; --surface-4:#44584a; }
-[data-theme="dark"][data-bg="plum"]     { --surface-0:#231d2c; --surface-1:#191420; --surface-2:#2f2739; --surface-3:#40354e; --surface-4:#564768; }
+       THE LADDER. Every option is generated from one OKLCH recipe rather than
+       picked by hand, which is what makes them read as one family instead of
+       eight unrelated swatches:
+
+         dark  L = .1890 .2560 .2990 .3480 .4080   (page, card, hover, border, divider)
+         light L = 1.000 .9700 .9420 .8880 .7900
+         chroma scales DOWN the ramp (x1 .92 .84 .76 .68 dark) so borders stay
+         structural instead of turning into colour.
+
+       Two properties are deliberate and are asserted by
+       tests/test_ui_theme_palette.py — change the numbers there too if you
+       ever retune this:
+
+       1. page -> card is the LARGEST lightness step in every dark ramp. It is
+          the boundary that makes a card read as an object sitting on the page,
+          so it gets the most separation, not the least.
+       2. every tinted option shares one chroma (within ~1.5x), so switching
+          background changes WHICH way the surface is tinted, not HOW MUCH.
+          `graphite` is the one deliberate exception: it is the no-tint option
+          and sits near chroma 0.
+   ---------------------------------------------------------------------------- */
+[data-bg="graphite"] { --surface-0:#ffffff; --surface-1:#f4f5f6; --surface-2:#ebeced; --surface-3:#d8dadd; --surface-4:#b7bbbf; }
+[data-bg="navy"]     { --surface-0:#ffffff; --surface-1:#f2f5fd; --surface-2:#e8ebf7; --surface-3:#d4d9ec; --surface-4:#b1bad6; }
+[data-bg="ocean"]    { --surface-0:#ffffff; --surface-1:#eff7f7; --surface-2:#e4eeef; --surface-3:#ccdedf; --surface-4:#a5c1c2; }
+[data-bg="forest"]   { --surface-0:#ffffff; --surface-1:#f1f7f2; --surface-2:#e7eee8; --surface-3:#d2ded4; --surface-4:#aec0b2; }
+[data-bg="warm"]     { --surface-0:#ffffff; --surface-1:#f9f4ef; --surface-2:#f1ebe3; --surface-3:#e2d8cb; --surface-4:#c7b8a4; }
+[data-bg="ember"]    { --surface-0:#ffffff; --surface-1:#fbf3f1; --surface-2:#f4e9e7; --surface-3:#e7d5d2; --surface-4:#cfb3ae; }
+[data-bg="plum"]     { --surface-0:#ffffff; --surface-1:#f7f3f9; --surface-2:#efeaf1; --surface-3:#dfd6e3; --surface-4:#c2b5c8; }
+
+[data-theme="dark"][data-bg="graphite"] { --surface-0:#222325; --surface-1:#121415; --surface-2:#2c2e2f; --surface-3:#393a3b; --surface-4:#494a4b; }
+[data-theme="dark"][data-bg="navy"]     { --surface-0:#1e2230; --surface-1:#0f1321; --surface-2:#292d3a; --surface-3:#363a46; --surface-4:#464955; }
+[data-theme="dark"][data-bg="ocean"]    { --surface-0:#182627; --surface-1:#071617; --surface-2:#233031; --surface-3:#303d3d; --surface-4:#414c4d; }
+[data-theme="dark"][data-bg="forest"]   { --surface-0:#1c261e; --surface-1:#0c170e; --surface-2:#273029; --surface-3:#333d36; --surface-4:#444c46; }
+[data-theme="dark"][data-bg="warm"]     { --surface-0:#292218; --surface-1:#1a1208; --surface-2:#332c23; --surface-3:#3f3930; --surface-4:#4f4941; }
+[data-theme="dark"][data-bg="ember"]    { --surface-0:#2d1f1d; --surface-1:#1d100d; --surface-2:#372a27; --surface-3:#433734; --surface-4:#524744; }
+[data-theme="dark"][data-bg="plum"]     { --surface-0:#27202a; --surface-1:#17111b; --surface-2:#312b34; --surface-3:#3d3740; --surface-4:#4d4750; }

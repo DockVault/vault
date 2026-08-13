@@ -452,12 +452,16 @@ def test_logout_returns_to_login(logged_in: Page):
 # --- June-16 appearance work: background palettes + centered empty states ----
 
 def test_background_palette_picker(logged_in: Page):
-    """The profile dropdown exposes 6 background palettes; choosing one sets
-    [data-bg] on <html> + marks it selected, and Slate (default) clears it."""
+    """The profile dropdown exposes the background palettes; choosing one sets
+    [data-bg] on <html> + marks it selected, and Slate (default) clears it.
+
+    Membership of the set is owned by tests/test_ui_theme_palette.py, which
+    holds the picker, both skins' CSS and the server allowlist to one list;
+    this test pins the picker's own behaviour."""
     page = logged_in
     page.click("#profile-btn")
     swatches = page.locator(".bg-swatch[data-bg]")
-    expect(swatches).to_have_count(6)
+    expect(swatches).to_have_count(8)
     expect(swatches.first).to_be_visible()
 
     page.click('.bg-swatch[data-bg="navy"]')

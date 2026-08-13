@@ -235,6 +235,131 @@ def test_console_keeps_theme_accent_and_background_axes(logged_in: Page):
     expect(html).to_have_attribute("data-bg", "navy")
 
 
+def test_every_background_swatch_retints_the_page(logged_in: Page):
+    """Each swatch in the picker must actually change the rendered surface.
+
+    A swatch whose [data-bg] name has no CSS block still sets the attribute and
+    still looks "selected" — it just silently renders as slate. Comparing the
+    computed background per option is the only check that catches that, and it
+    is what makes the two added options (ocean, ember) real rather than
+    decorative.
+    """
+    page = logged_in
+    if page.get_attribute("html", "data-theme") != "dark":
+        page.click("#theme-toggle")
+    assert page.get_attribute("html", "data-theme") == "dark"
+
+    _open_profile_dropdown(page)
+    names = page.eval_on_selector_all(
+        ".bg-swatch[data-bg]", "els => els.map(e => e.getAttribute('data-bg'))"
+    )
+    assert "ocean" in names and "ember" in names, (
+        f"the two added options are not in the picker: {names}"
+    )
+
+    seen = {}
+    for i, name in enumerate(names):
+        prev = page.evaluate("getComputedStyle(document.body).backgroundColor")
+        page.click(f'.bg-swatch[data-bg="{name}"]')
+        assert page.get_attribute("html", "data-bg") == (
+            None if name == "slate" else name
+        )
+        # The ramp is applied via CSS custom properties on <html>; wait out the
+        # body background-color transition before sampling. The first option may
+        # already be the active one, so nothing would change for it.
+        if i > 0:
+            page.wait_for_function(
+                "prev => getComputedStyle(document.body).backgroundColor !== prev",
+                arg=prev, timeout=3000,
+            )
+        seen[name] = page.evaluate(
+            "getComputedStyle(document.body).backgroundColor"
+        )
+
+    by_colour = {}
+    for name, colour in seen.items():
+        by_colour.setdefault(colour, []).append(name)
+    collided = {c: ns for c, ns in by_colour.items() if len(ns) > 1}
+    assert not collided, (
+        f"these background options render identically, so at least one has no "
+        f"CSS ramp and fell back to the default: {collided}"
+    )
+
+
+def test_cards_are_distinguishable_from_the_region_behind_them(logged_in: Page):
+    """A card must not render the same colour as the surface it sits on.
+
+    The static guard in tests/test_ui_theme_palette.py checks the stylesheet;
+    this checks what the browser actually computes, which is what catches a
+    later rule re-painting the content region from somewhere else.
+    """
+    page = logged_in
+    if page.get_attribute("html", "data-theme") != "dark":
+        page.click("#theme-toggle")
+    page.wait_for_timeout(400)
+
+    result = page.evaluate(
+        """() => {
+            const card = document.querySelector('.card');
+            if (!card) return { error: 'no card on the dashboard' };
+            // Walk up to the first ancestor that actually paints something.
+            let el = card.parentElement, backdrop = null;
+            while (el && el !== document.documentElement) {
+                const bg = getComputedStyle(el).backgroundColor;
+                if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') {
+                    backdrop = { sel: el.tagName + '.' + el.className, bg };
+                    break;
+                }
+                el = el.parentElement;
+            }
+            return {
+                card: getComputedStyle(card).backgroundColor,
+                backdrop,
+            };
+        }"""
+    )
+    assert "error" not in result, result.get("error")
+    assert result["backdrop"], "no painted ancestor found behind the card"
+    assert result["card"] != result["backdrop"]["bg"], (
+        f"the card renders {result['card']} on a backdrop of the same colour "
+        f"({result['backdrop']['sel']}); only its border separates it from the "
+        f"page, which is what makes the layout read flat"
+    )
+
+
+def test_selected_nav_item_picks_up_the_chosen_accent(logged_in: Page):
+    """Choosing an accent must reach the navigation, not just buttons.
+
+    --brand-glow is defined for every accent but was read by nothing in the
+    Console skin, so the rail stayed neutral whatever the user picked.
+    """
+    page = logged_in
+    if page.get_attribute("html", "data-theme") != "dark":
+        page.click("#theme-toggle")
+
+    def active_nav_layer():
+        return page.evaluate(
+            """() => {
+                const el = document.querySelector('.sidebar-item.active');
+                return el ? getComputedStyle(el).backgroundImage : null;
+            }"""
+        )
+
+    _open_profile_dropdown(page)
+    page.click('.accent-swatch[data-accent="teal"]')
+    teal = active_nav_layer()
+    assert teal and teal != "none", (
+        "the active navigation item carries no accent layer at all"
+    )
+
+    page.click('.accent-swatch[data-accent="rose"]')
+    rose = active_nav_layer()
+    assert rose != teal, (
+        f"switching accent left the active nav row unchanged ({teal!r}); the "
+        f"accent is not reaching the rail"
+    )
+
+
 def test_console_nav_sections_still_work(page: Page, fresh_admin):
     """Under Console every sidebar section still activates its view, and the
     injected rail group labels are presentational extras."""
