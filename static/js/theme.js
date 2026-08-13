@@ -4,7 +4,12 @@
  */
 
 const ACCENTS = ['teal', 'indigo', 'violet', 'rose', 'orange', 'sky'];
-const BACKGROUNDS = ['slate', 'graphite', 'navy', 'warm', 'forest', 'plum'];
+// Keep in sync with the [data-bg] blocks in BOTH skins (ui-v2.css §26,
+// redesign.css §18b), the swatch buttons in index.html, and the server-side
+// allowlist in app/api/api_server.py (_PREF_ALLOWED). A name missing from any
+// one of those silently falls back to slate, so
+// tests/test_ui_theme_palette.py asserts all five sources agree.
+const BACKGROUNDS = ['slate', 'graphite', 'navy', 'ocean', 'forest', 'warm', 'ember', 'plum'];
 // UI skins: 'v1' = Classic (redesign.css), 'v2' = Console (ui-v2.css).
 // The stylesheet swap itself happens pre-paint in ui-boot.js; ThemeManager
 // only owns persistence + the profile-dropdown switcher. Remove this axis

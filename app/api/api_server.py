@@ -4138,7 +4138,8 @@ async def update_own_account(
 _PREF_ALLOWED = {
     "theme": {"light", "dark"},
     "accent": {"teal", "indigo", "violet", "rose", "orange", "sky"},
-    "background": {"slate", "graphite", "navy", "warm", "forest", "plum"},
+    "background": {"slate", "graphite", "navy", "ocean",
+                   "forest", "warm", "ember", "plum"},
     "ui": {"v1", "v2"},
     # Per-user opt-out of browser-remembering a vault password. Stored as a string enum ('on'/'off')
     # because _sanitize_preferences keeps only string values in the whitelist (a bare bool is dropped).

@@ -478,13 +478,17 @@ label.checkbox-label,
    ---------------------------------------------------------------------------- */
 [data-bg="graphite"] { --surface-0:#ffffff; --surface-1:#f1f2f4; --surface-2:#e9eaed; --surface-3:#dcdee2; --surface-4:#c5c8ce; }
 [data-bg="navy"]     { --surface-0:#ffffff; --surface-1:#eaeef7; --surface-2:#e1e7f3; --surface-3:#d0d9ec; --surface-4:#b4c1de; }
+[data-bg="ocean"]    { --surface-0:#ffffff; --surface-1:#e9f3f4; --surface-2:#ddebed; --surface-3:#c7dfe2; --surface-4:#a3cace; }
 [data-bg="warm"]     { --surface-0:#ffffff; --surface-1:#f5f2ec; --surface-2:#ede8df; --surface-3:#e2dacd; --surface-4:#ccc1ad; }
+[data-bg="ember"]    { --surface-0:#ffffff; --surface-1:#f8eeec; --surface-2:#f2e4e1; --surface-3:#ebd4d0; --surface-4:#dbb8b1; }
 [data-bg="forest"]   { --surface-0:#ffffff; --surface-1:#edf3ee; --surface-2:#e3ece6; --surface-3:#d2e0d6; --surface-4:#b7ccbd; }
 [data-bg="plum"]     { --surface-0:#ffffff; --surface-1:#f2eef7; --surface-2:#ebe4f2; --surface-3:#ddd3ec; --surface-4:#c6b4de; }
 
 [data-theme="dark"][data-bg="graphite"] { --surface-0:#1a1c20; --surface-1:#0e0f12; --surface-2:#232529; --surface-3:#34373d; --surface-4:#474b53; }
 [data-theme="dark"][data-bg="navy"]     { --surface-0:#101a2e; --surface-1:#060b18; --surface-2:#17223c; --surface-3:#263654; --surface-4:#364a70; }
+[data-theme="dark"][data-bg="ocean"]    { --surface-0:#0a1f22; --surface-1:#021113; --surface-2:#0c292d; --surface-3:#153d41; --surface-4:#1c5358; }
 [data-theme="dark"][data-bg="warm"]     { --surface-0:#211e17; --surface-1:#15120b; --surface-2:#2c2820; --surface-3:#3e372c; --surface-4:#534a3b; }
+[data-theme="dark"][data-bg="ember"]    { --surface-0:#271713; --surface-1:#180a08; --surface-2:#341e1a; --surface-3:#4a2d27; --surface-4:#653e36; }
 [data-theme="dark"][data-bg="forest"]   { --surface-0:#111f18; --surface-1:#07120b; --surface-2:#19291f; --surface-3:#283d30; --surface-4:#395443; }
 [data-theme="dark"][data-bg="plum"]     { --surface-0:#1b1726; --surface-1:#0f0a18; --surface-2:#251c34; --surface-3:#372a4e; --surface-4:#4c386c; }
 
