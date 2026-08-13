@@ -208,55 +208,76 @@ def test_download_mode_prepares_its_file_before_sampling_starts(monkeypatch):
 # ------------------------------------------------------------------ the document's arithmetic
 
 def _document_rows():
-    """The measured table: (case, rise MB, multiple of the file)."""
+    """The measured table: (case, file size MB, rise MB, multiple of the file).
+
+    The file size is a column now rather than a sentence above the table, because the rows no
+    longer all describe the same size -- which is the point the two download rows are making.
+    """
     text = BUDGETS.read_text(encoding="utf-8")
-    return re.findall(r"\|\s*([^|]+?)\s*\|\s*([\d.]+) MB\s*\|\s*\*\*([\d.]+)×\*\*", text)
+    return re.findall(
+        r"\|\s*([^|]+?)\s*\|\s*(\d+) MB\s*\|\s*([\d.]+) MB\s*\|\s*\*\*([\d.]+)×\*\*",
+        text)
 
 
 def test_the_measured_multiples_match_the_measured_rises():
     """Two numbers written side by side drift, and the one nobody re-derives gets quoted."""
     rows = _document_rows()
-    assert len(rows) >= 3, f"expected the three measured cases, found {len(rows)}"
-    for case, rise_mb, multiple in rows:
-        expected = float(rise_mb) / 128.0          # every measured row is the 128 MB file
+    assert len(rows) >= 4, f"expected the measured cases, found {len(rows)}"
+    for case, file_mb, rise_mb, multiple in rows:
+        expected = float(rise_mb) / float(file_mb)
         assert abs(expected - float(multiple)) < 0.02, (
-            f"{case}: {rise_mb} MB over a 128 MB file is {expected:.2f}x, not {multiple}x")
+            f"{case}: {rise_mb} MB over a {file_mb} MB file is {expected:.2f}x, not {multiple}x")
 
 
 def test_the_sizing_table_follows_the_stated_formula():
     """The rows an operator acts on, checked against the rule the document gives for them.
 
-    The previous version stated a formula and a table that disagreed by up to 18%, because nothing
-    derived one from the other.
+    An earlier version stated a formula and a table that disagreed by up to 12%, because nothing
+    derived one from the other. The table now answers "how many concurrent transfers" rather than
+    "how large a file", because the per-transfer cost stopped depending on the file.
     """
     text = BUDGETS.read_text(encoding="utf-8")
-    fixed = int(re.search(r"total ≈ (\d+) MB", text).group(1))
-    slope = float(re.search(r"MB\s+\+\s+([\d.]+)F", text).group(1))
+    fixed = int(re.search(r"total \u2248 (\d+) MB", text).group(1))
+    per_transfer = int(re.search(r"\+\s+(\d+) MB per transfer", text).group(1))
 
-    rows = re.findall(r"\|\s*([\d.]+) (GB|MB)\s*\|\s*~([\d.]+) (GB|MB)\s*\|", text)
+    rows = re.findall(r"\|\s*([\d.]+) (GB|MB)\s*\|\s*~(\d+)\s*\|", text)
     assert len(rows) >= 4, f"expected the RAM sizing rows, found {len(rows)}"
-    for ram_value, ram_unit, file_value, file_unit in rows:
+    for ram_value, ram_unit, transfers in rows:
         ram_mb = float(ram_value) * (1024 if ram_unit == "GB" else 1)
-        file_mb = float(file_value) * (1024 if file_unit == "GB" else 1)
-        predicted = (ram_mb - fixed) / slope
-        assert abs(predicted - file_mb) / predicted < 0.12, (
-            f"{ram_value} {ram_unit}: the formula gives {predicted:.0f} MB, the table says "
-            f"{file_mb:.0f} MB")
+        predicted = (ram_mb - fixed) / per_transfer
+        assert abs(predicted - float(transfers)) / predicted < 0.15, (
+            f"{ram_value} {ram_unit}: the formula gives {predicted:.0f} transfers, the table says "
+            f"{transfers}")
 
 
-def test_the_document_does_not_claim_the_target_is_met():
-    """A sentence that would be quoted onward, and is still false.
+def test_the_document_states_a_cost_that_does_not_depend_on_file_size():
+    """The claim the whole change rests on, checked as arithmetic rather than read as prose.
 
-    Download still holds whole files, so 500 MB is not reachable at the configured maximum file
-    size. The upload half of this check was true when it was written and is not any more; it is
-    replaced by the next test, which holds the document to its own measurement rather than to a
-    remembered state of the code.
+    Two download rows at sizes a factor of four apart. If the cost still scaled with the file, the
+    larger one would be about four times the smaller; a fixed window means they sit within noise
+    of each other.
     """
-    # Whitespace-normalised, because these sentences wrap and an exact-substring check fails on
-    # the line break rather than on the claim -- which is a test that breaks when the prose is
-    # reflowed and stays silent when the meaning changes.
+    downloads = [(float(f), float(rise))
+                 for case, f, rise, _m in _document_rows() if case.strip() == "Download"]
+    assert len(downloads) >= 2, "there must be two download rows at different sizes to compare"
+    downloads.sort()
+    (small_file, small_rise), (large_file, large_rise) = downloads[0], downloads[-1]
+    assert large_file >= small_file * 2, "the two rows are too close in size to prove anything"
+    assert large_rise < small_rise * 1.25, (
+        f"a {large_file:.0f} MB download costs {large_rise} MB against {small_rise} MB for "
+        f"{small_file:.0f} MB; the cost still tracks the file size")
+
+
+def test_the_document_still_says_the_figures_were_not_tuned():
+    """The one claim about method rather than about numbers, and the easiest to quietly drop.
+
+    This file previously also pinned "not reachable at the configured maximum file size". That was
+    true when it was written and is not any more -- the target is met. The arithmetic checks above
+    are what hold the document to its own measurements now, rather than a remembered sentence.
+    """
+    # Whitespace-normalised, because the sentence wraps and an exact-substring check would fail on
+    # the line break rather than on the claim.
     text = " ".join(BUDGETS.read_text(encoding="utf-8").split())
-    assert "Not reachable at the configured maximum file size" in text
     assert "Nothing here was tuned to reach the target" in text
 
 
@@ -268,7 +289,7 @@ def test_the_two_upload_rows_agree_with_each_other():
     Holding them within a factor of two is what the claim means, and it is the claim in this
     document a reader is most likely to act on.
     """
-    rows = {case.strip(): float(rise) for case, rise, _multiple in _document_rows()}
+    rows = {case.strip(): float(rise) for case, _file, rise, _multiple in _document_rows()}
     chunked = next(v for k, v in rows.items() if "5 MB chunks" in k)
     single = next(v for k, v in rows.items() if "one chunk" in k)
     assert single < chunked * 2, (

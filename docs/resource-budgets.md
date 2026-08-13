@@ -24,20 +24,28 @@ across runs produced a negative cost, which is how this was noticed.
 
 ## The measurement
 
-A 128 MB file, one transfer at a time, so the cost belongs to one half:
+One transfer at a time, so the cost belongs to one half:
 
-| Case | Peak rise | Against file size |
-|---|---|---|
-| Upload, 5 MB chunks | 22.7 MB | **0.18×** — effectively flat |
-| Upload, one chunk for the whole file | 23.5 MB | **0.18×** |
-| Download | 267.9 MB | **2.09×** |
+| Case | File | Peak rise | Against file size |
+|---|---|---|---|
+| Upload, 5 MB chunks | 128 MB | 22.7 MB | **0.18×** |
+| Upload, one chunk for the whole file | 128 MB | 23.5 MB | **0.18×** |
+| Download | 128 MB | 15.2 MB | **0.12×** |
+| Download | 512 MB | 13.5 MB | **0.03×** |
 
 ## What it says
 
-**Download always costs about twice the file size.** The reader decrypts chunk by chunk, correctly,
-then accumulates every piece in a list and joins them — so at the moment of the join both the list
-and the joined copy exist. One of those copies then stays resident for the whole response,
-including while a slow client reads it.
+**Neither half of an HTTP transfer scales with the file any more.** The two download rows are the
+load-bearing ones:
+quadrupling the file did not raise the cost, it lowered it slightly, which is what a fixed window
+looks like once run-to-run spread is accounted for. The figure to carry forward is a constant of
+roughly 15 MB, not a multiple of anything.
+
+That is a change. The first version of this table put a 128 MB download at **267.9 MB — 2.09×**,
+the largest number here by a wide margin. The reader decrypted record by record, correctly, then
+accumulated every piece in a list and joined them, so at the join both the list and the joined copy
+existed and one stayed resident for the whole response — including while a slow client read it.
+Records are now decrypted one at a time and released as they are sent.
 
 **Upload costs the same whatever the client does with it.** 22.7 MB in 5 MB pieces, 23.5 MB as a
 single 128 MB chunk. That is the point of the two upload rows: they are the same workload described
@@ -59,54 +67,67 @@ when the refusal is raised. What it is *not* is visible: staged files are skippe
 accounting, so a refused body in flight appears in no total. That matters for how many transfers a
 deployment admits at once, which is a separate piece of work.
 
-That leaves one problem, and it is the streaming one:
+The download reader now yields each record as it is decrypted, and the stored checksum is computed
+as the bytes pass rather than over a reassembled copy — verifying it the old way would have put the
+whole file straight back in memory and given back everything the streaming saved.
 
-**Download holds whole files.** Fixed by yielding chunks from the reader instead of collecting them
-— *and* by computing the stored checksum incrementally as they pass. Verifying it against a
-reassembled buffer puts the whole file straight back in memory and gains nothing.
+## SFTP is not included in any of this
+
+Everything above and below measures the HTTP paths. **SFTP still reads whole files into memory**,
+and holds them for as long as a client leaves the file open rather than for the length of a
+transfer. Measured: opening a 120 MB file over SFTP and reading 4 KB of it moves that service from
+91 MB to 211 MB, and it stays there until the handle is closed.
+
+So a deployment sized from the numbers below is sized for its HTTP traffic only. If it also serves
+SFTP, add the largest file a client might open, times the number of handles they might hold.
 
 ## What a deployment needs
 
-The non-API services are flat and do not care about file size: database ~45 MB, SFTP ~84 MB,
-Redis ~11 MB, so about **140 MB** between them. The API rests at roughly 100 MB.
+Measured across the whole stack during a 128 MB download, with page cache excluded. The SFTP row is
+its resting figure; see above for what an open handle adds.
 
-For a file of size `F`, with one transfer in flight:
+| | At rest | Rise during a transfer |
+|---|---|---|
+| API | 126 MB | 23 MB |
+| Database | 37 MB | 8 MB |
+| SFTP | 85 MB | 4 MB |
+| Redis | 11 MB | 4 MB |
+| **Total** | **~260 MB** | **~40 MB** |
+
+So, for **any** file size:
 
 ```
-total ≈ 240 MB  +  2.1F        (download)
-total ≈ 240 MB  +  0.2F        (upload, whatever chunk size the client picks)
+total ≈ 260 MB  +  40 MB per transfer in flight
 ```
 
-| Available RAM | Largest file one download can handle |
+There is no longer a term in `F`. That is the whole point of the change, and it is why the table
+below asks a different question than it used to — "how many transfers", not "how large a file".
+
+| Available RAM | Concurrent transfers it supports |
 |---|---|
-| 500 MB | ~120 MB |
-| 1 GB | ~380 MB |
-| 2 GB | ~860 MB |
-| 4 GB | ~1.8 GB |
+| 500 MB | ~6 |
+| 1 GB | ~18 |
+| 2 GB | ~44 |
+| 4 GB | ~96 |
 
-Each additional simultaneous transfer adds its own `2.1F`; the 240 MB is paid once.
-
-**These rows are derived from the formula above, which is fitted to a single file size.** Two
-earlier points at 128 MB and 512 MB agreed on the slope to within 4%, but run-to-run spread on this
-host reached 11%, which is wider than that agreement — so treat the slope as approximate and the
-extrapolation to 1 GB as an estimate rather than a measurement.
+**Two cautions on those rows.** They extrapolate one measured point, and run-to-run spread on this
+host reaches 11%. More importantly, nothing in the server currently *limits* concurrency — the
+rows describe what the memory allows, not what the deployment enforces, and a hundred simultaneous
+requests will all be attempted. Admission control is separate work.
 
 ## On the 500 MB target
 
-**Not reachable at the configured maximum file size.** The default `MAX_FILE_SIZE_MB` is 1024,
-which needs roughly 2 GB for a download alone — which is why the API container's `mem_limit` is
-4 GB, and why that limit's comment tells you to keep the two in step.
+**Reached for HTTP, and no longer dependent on file size.** A 500 MB deployment fits the stack at
+rest with room for several concurrent HTTP transfers, whatever the files weigh. It is *not* reached
+for a deployment serving SFTP, which still holds an open file whole — see above. The default `MAX_FILE_SIZE_MB` of
+1024 no longer implies a multi-gigabyte peak, so the API container's 4 GB `mem_limit` is now
+generous rather than necessary.
 
-500 MB is reachable today for deployments whose files stay under about 120 MB. That is a real
-configuration rather than a consolation: set the file ceiling to match the memory instead of the
-other way round.
+The number that moved was download: **267.9 MB for a 128 MB file, now 15.2 MB — and 13.5 MB for a
+file four times larger.**
 
-Closing the gap means download not holding whole files, and the target is already measured and
-sitting in the table above: **roughly 23 MB for a 128 MB upload is what bounded looks like on this
-stack, now for any chunk size the client picks.** Once download matches it, `2.1F` collapses to a
-fixed window and a 500 MB deployment stops depending on how large its files are.
-
-**Nothing here was tuned to reach the target.** The instruction was to report the honest floor.
+**Nothing here was tuned to reach the target.** The instruction was to report the honest floor, and
+the floor moved because the code did.
 
 ## Reproducing
 
