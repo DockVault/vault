@@ -170,6 +170,13 @@ class User(Base):
     sftp_enabled = Column(Boolean, nullable=False, default=True, server_default='true')
     sftp_password_auth = Column(Boolean, nullable=False, default=True, server_default='true')
 
+    # Per-account storage budget, in bytes, spent by ALLOCATING storage to vaults (see
+    # VaultStorageGrant) rather than by storing files. Tri-state: NULL inherits the deployment
+    # default (the 'default_user_quota' setting), -1 exempts the account, and any other value
+    # >= 0 is an exact budget. Admin-settable per account so one user can be given more (or
+    # less) room than the deployment default without moving the default for everyone.
+    storage_quota_bytes = Column(BigInteger, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
@@ -616,6 +623,50 @@ class Vault(Base):
     __table_args__ = (
         Index('idx_vault_owner', 'owner_id'),
         Index('idx_vault_name', 'name'),
+    )
+
+
+class VaultStorageGrant(Base):
+    """One person's storage allocation to one vault — the ledger behind Vault.size_limit.
+
+    A vault's size limit is not a number somebody typed; it is the SUM of the allocations its
+    owner and managers have made out of their own account budgets. Keeping the contributions
+    itemised is what makes a SHARED vault work: if two managers each add 5 GB to a 1 GB vault,
+    the vault holds 11 GB and each of them can later reclaim exactly the 5 GB they put in —
+    never the other's, and never more than they gave.
+
+    INVARIANT: for every active vault, SUM(granted_bytes) == vaults.size_limit. Writes go
+    through the storage-allocation helpers in the API so the two can never drift; an existing
+    deployment is backfilled with a single owner-held grant for each vault it already has.
+    """
+    __tablename__ = 'vault_storage_grants'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    vault_id = Column(UUID(as_uuid=True), ForeignKey('vaults.id', ondelete='CASCADE'), nullable=False)
+    # CASCADE on the user too: deleting an account removes its rows. The vault's size_limit is
+    # NOT lowered to match — the next read repairs the ledger by attributing the now-unexplained
+    # difference to the owner, so a departing contributor never shrinks a vault out from under
+    # files already stored in it.
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+
+    granted_bytes = Column(BigInteger, nullable=False, default=0)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    vault = relationship('Vault', foreign_keys=[vault_id])
+    user = relationship('User', foreign_keys=[user_id])
+
+    __table_args__ = (
+        # One row per (vault, contributor): the allocation is absolute, so a concurrent
+        # double-write updates the same row instead of creating divergent duplicates that the
+        # SUM would then count twice.
+        UniqueConstraint('vault_id', 'user_id', name='uq_vault_storage_grant_vault_user'),
+        Index('idx_vault_storage_grant_vault', 'vault_id'),
+        Index('idx_vault_storage_grant_user', 'user_id'),
+        # No negative contributions: a would-be reclaim past zero must be rejected by the API,
+        # and the database refuses to store the result if that check is ever bypassed.
+        CheckConstraint('granted_bytes >= 0', name='ck_vault_storage_grant_non_negative'),
     )
 
 

@@ -2258,3 +2258,205 @@ def test_setup_does_not_claim_logs_are_above_when_there_are_none(tmp_path, monke
         tool.setup(argparse.Namespace(no_start=False, non_interactive=True))
     out = capsys.readouterr().out
     assert "log lines are above" not in out and "docker output above" in out
+
+
+# ---------------------------------------------------------------------------
+# Storage limit (MAX_STORAGE_GB): the deployment ceiling an administrator can then tune
+# downward from inside the vault. The tool's job is to report the two numbers that matter
+# (what is stored, what the disk holds) and to refuse a limit that would strand stored files.
+# ---------------------------------------------------------------------------
+
+def _storage_tool(tmp_path, monkeypatch, stored=None, capacity=None, env_extra=""):
+    (tmp_path / ".env").write_text(
+        "\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n" + env_extra, encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_stored_bytes", lambda: stored)
+    monkeypatch.setattr(tool, "_volume_capacity", lambda: capacity)
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (False, "no engine"))
+    return tool
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("50", 50.0), ("'50'", 50.0), ("-1", -1.0), ("0", 0.0), ("2.5", 2.5),
+    ("", None), ("   ", None), (None, None), ("unlimited", None),
+])
+def test_parse_max_storage_gb(raw, expected):
+    assert dv.parse_max_storage_gb(raw) == expected
+
+
+@pytest.mark.parametrize("value,expected", [
+    (0, "0 B"), (900, "900 B"), (1024, "1.00 KB"), (1024 ** 2, "1.00 MB"),
+    (dv.GIB, "1.00 GB"), (20 * dv.GIB, "20 GB"), (None, "0 B"),
+])
+def test_dockvault_format_bytes(value, expected):
+    assert dv.format_bytes(value) == expected
+
+
+def test_storage_limit_problem_allows_unlimited_and_a_roomy_limit():
+    assert dv.storage_limit_problem(-1, 5 * dv.GIB) is None
+    assert dv.storage_limit_problem(10, 5 * dv.GIB) is None
+    assert dv.storage_limit_problem(5, 5 * dv.GIB) is None      # exactly what is stored
+
+
+def test_storage_limit_problem_refuses_stranding_stored_files():
+    reason = dv.storage_limit_problem(1, 5 * dv.GIB)
+    assert reason and "already stored" in reason
+
+
+@pytest.mark.parametrize("bad", [None, -2, -0.5])
+def test_storage_limit_problem_refuses_nonsense(bad):
+    assert dv.storage_limit_problem(bad, 0) is not None
+
+
+def test_storage_limit_problem_without_a_usage_reading_cannot_refuse():
+    """A stopped deployment reports no stored bytes; the tool must still let an operator set a
+    limit rather than blocking on a number it cannot obtain."""
+    assert dv.storage_limit_problem(1, None) is None
+
+
+def test_storage_is_a_menu_entry_and_a_subcommand():
+    assert "storage" in {key for key, _ in dv.MENU}
+    args = dv.build_parser().parse_args(["storage", "--set-gb", "42", "--non-interactive"])
+    assert args.command == "storage" and args.set_gb == 42.0 and args.non_interactive is True
+
+
+def test_storage_show_only_reports_and_writes_nothing(tmp_path, monkeypatch, capsys):
+    tool = _storage_tool(tmp_path, monkeypatch, stored=3 * dv.GIB,
+                         capacity=(3 * dv.GIB, 97 * dv.GIB, 100 * dv.GIB),
+                         env_extra="MAX_STORAGE_GB=50\n")
+    before = (tmp_path / ".env").read_text(encoding="utf-8")
+    tool.storage(argparse.Namespace(set_gb=None, non_interactive=True, no_restart=False))
+    out = capsys.readouterr().out
+    assert "current limit: 50 GB" in out
+    assert "3.00 GB" in out                       # what is stored
+    assert "100 GB" in out                        # what the disk holds
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == before
+
+
+def test_storage_set_writes_the_env_and_leaves_the_stack_alone_with_no_restart(tmp_path, monkeypatch):
+    tool = _storage_tool(tmp_path, monkeypatch, stored=0)
+    recreated = []
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: recreated.append(build) or True)
+    tool.storage(argparse.Namespace(set_gb=25, non_interactive=True, no_restart=True))
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert env["MAX_STORAGE_GB"] == "25"
+    assert recreated == []
+
+
+def test_storage_set_recreates_without_building(tmp_path, monkeypatch):
+    """An env-only change must never rebuild — that would clobber a pulled release image."""
+    tool = _storage_tool(tmp_path, monkeypatch, stored=0)
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    recreated = []
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: recreated.append(build) or True)
+    tool.storage(argparse.Namespace(set_gb=8, non_interactive=True, no_restart=False))
+    assert recreated == [False]
+
+
+def test_storage_refuses_a_limit_below_what_is_stored(tmp_path, monkeypatch):
+    tool = _storage_tool(tmp_path, monkeypatch, stored=9 * dv.GIB)
+    before = (tmp_path / ".env").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit):
+        tool.storage(argparse.Namespace(set_gb=2, non_interactive=True, no_restart=True))
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == before
+
+
+def test_storage_warns_but_allows_a_limit_larger_than_the_disk(tmp_path, monkeypatch, capsys):
+    """A volume can be grown under a running deployment, so an over-provisioned limit is an
+    operator's decision to make — with a warning, not a refusal."""
+    tool = _storage_tool(tmp_path, monkeypatch, stored=0,
+                         capacity=(0, 10 * dv.GIB, 10 * dv.GIB))
+    tool.storage(argparse.Namespace(set_gb=500, non_interactive=True, no_restart=True))
+    assert "Warning" in capsys.readouterr().out
+    assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["MAX_STORAGE_GB"] == "500"
+
+
+def test_storage_reads_the_legacy_key_and_migrates_the_limit_onto_the_new_one(tmp_path, monkeypatch, capsys):
+    tool = _storage_tool(tmp_path, monkeypatch, stored=0, env_extra="PLAN_MAX_STORAGE_GB=30\n")
+    tool.storage(argparse.Namespace(set_gb=None, non_interactive=True, no_restart=True))
+    assert "current limit: 30 GB" in capsys.readouterr().out
+
+    tool.storage(argparse.Namespace(set_gb=40, non_interactive=True, no_restart=True))
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    # The two keys must never disagree afterwards: the new one carries the limit, the old one is
+    # neutralised rather than deleted (an operator may still be looking for it).
+    assert env["MAX_STORAGE_GB"] == "40" and env["PLAN_MAX_STORAGE_GB"] == "-1"
+
+
+def test_setup_writes_the_storage_ceiling_only_when_asked():
+    cfg = _reusable_env_cfg()
+    assert not [l for l in dv.build_env_lines(cfg) if l.startswith("MAX_STORAGE_GB")]
+    cfg["max_storage_gb"] = 64
+    assert "MAX_STORAGE_GB=64" in dv.build_env_lines(cfg)
+
+
+def test_setup_accepts_the_storage_flag():
+    args = dv.build_parser().parse_args(["setup", "--non-interactive", "--max-storage-gb", "64"])
+    assert args.max_storage_gb == 64.0
+
+
+def test_a_fresh_volume_set_keeps_the_configured_ceiling():
+    """'Volumes -> new' authors a fresh .env for the SAME deployment; silently reverting its
+    storage ceiling to unlimited would quietly widen what the deployment may store."""
+    cfg = dv.new_set_config({"MAX_STORAGE_GB": "64"}, "prefix-1", "dep-1")
+    assert cfg["max_storage_gb"] == 64.0
+    assert "MAX_STORAGE_GB=64" in dv.build_env_lines({**cfg, "server_name": "localhost"})
+
+
+def test_stored_bytes_parses_the_database_answer(tmp_path, monkeypatch):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: _Proc(0, stdout="\n 123456 \n"))
+    assert tool._stored_bytes() == 123456
+
+
+@pytest.mark.parametrize("proc", [_Proc(1, stdout=""), _Proc(0, stdout="not-a-number"), _Proc(0, stdout="")])
+def test_stored_bytes_is_unknown_when_the_database_cannot_answer(tmp_path, monkeypatch, proc):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: proc)
+    assert tool._stored_bytes() is None
+
+
+def test_volume_capacity_parses_df_output(tmp_path, monkeypatch):
+    df = ("Filesystem     1024-blocks    Used Available Capacity Mounted on\n"
+          "/dev/sda1          1048576  262144    786432      25% /app/storage\n")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: _Proc(0, stdout=df))
+    assert tool._volume_capacity() == (262144 * 1024, 786432 * 1024, 1048576 * 1024)
+
+
+@pytest.mark.parametrize("stdout", ["", "Filesystem 1024-blocks Used Available Capacity Mounted on\n", "garbage\nrow\n"])
+def test_volume_capacity_is_unknown_on_unusable_output(tmp_path, monkeypatch, stdout):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: _Proc(0, stdout=stdout))
+    assert tool._volume_capacity() is None
+
+
+@pytest.mark.parametrize("value,expected", [
+    (64, "64"), (64.0, "64"), (-1, "-1"), (1.5, "1.5"), (0.5, "0.5"), (1e6, "1000000"),
+])
+def test_format_gb_value_never_writes_something_the_app_cannot_read(value, expected):
+    """The .env value is parsed by the app's settings model at startup, so exponent notation or a
+    stray '.0' is not a cosmetic matter — a deployment that cannot parse it will not start."""
+    assert dv.format_gb_value(value) == expected
+
+
+def test_a_fractional_ceiling_round_trips_into_the_app_settings(tmp_path, monkeypatch):
+    tool = _storage_tool(tmp_path, monkeypatch, stored=0)
+    tool.storage(argparse.Namespace(set_gb=1.5, non_interactive=True, no_restart=True))
+    written = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["MAX_STORAGE_GB"]
+    assert written == "1.5"
+    # The app must accept exactly what was written (an int-typed field would refuse it and the
+    # deployment would fail to start after the recreate).
+    from app.core.config import Settings
+    assert Settings(max_storage_gb=written).max_storage_gb == 1.5
+
+
+def test_zero_is_refused_because_it_would_mean_the_opposite(tmp_path, monkeypatch):
+    """MAX_STORAGE_GB=0 reads as 'no ceiling', so an operator asking for a full stop must not be
+    handed unlimited storage instead — they are pointed at the live limit, whose 0 means zero."""
+    tool = _storage_tool(tmp_path, monkeypatch, stored=0)
+    before = (tmp_path / ".env").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit):
+        tool.storage(argparse.Namespace(set_gb=0, non_interactive=True, no_restart=True))
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == before
+    assert "no ceiling" in dv.storage_limit_problem(0, 0)

@@ -465,6 +465,65 @@ jobs:
             || { echo "::error::the deployment did not survive a refused re-run intact"; exit 1; }
           echo "H: refused without touching the live deployment"
 
+      - name: Scenario J — the storage limit is reported, raised and refused
+        # The deployment storage ceiling an operator manages from the host. Runs against the LIVE
+        # deployment scenario H left standing, because the two numbers this command exists to
+        # report — what the database says is stored, and what the storage volume holds — are only
+        # readable from a running stack. The refusal is the point of the scenario: a ceiling below
+        # what is already stored would strand files above a limit nothing could satisfy.
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 dockvault.py storage --non-interactive | tee /tmp/storage-show.log
+          grep -q "current limit" /tmp/storage-show.log \
+            || { echo "::error::storage did not report the current limit"; exit 1; }
+          grep -q "stored now" /tmp/storage-show.log \
+            || { echo "::error::storage did not report what is stored"; exit 1; }
+          grep -qi "unknown" /tmp/storage-show.log \
+            && { echo "::error::storage could not read usage from the running deployment"; exit 1; }
+
+          # Set a ceiling and prove the running vault enforces exactly it.
+          python3 dockvault.py storage --set-gb 64 --non-interactive
+          python3 .github/scripts/mask_env_secrets.py .env
+          grep -q "^MAX_STORAGE_GB=64$" .env \
+            || { echo "::error::storage did not write MAX_STORAGE_GB"; grep '^MAX_STORAGE_GB' .env || true; exit 1; }
+          for attempt in $(seq 1 30); do
+            curl -sSf --cacert certs/cert.pem "$BASE/health" >/dev/null 2>&1 && break
+            sleep 2
+          done
+          token="$(curl -sSf --cacert certs/cert.pem -X POST "$BASE/auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"username\": \"$ADMIN_USER\", \"password\": \"$ADMIN_PASS\"}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+          ceiling="$(curl -sSf --cacert certs/cert.pem "$BASE/settings" -H "Authorization: Bearer $token" \
+            | python3 -c 'import json,sys; v=json.load(sys.stdin)["deployment_storage_max_gb"]; print(f"{float(v):g}")')"
+          [ "$ceiling" = "64" ] \
+            || { echo "::error::the vault reports a ceiling of $ceiling, not 64"; exit 1; }
+
+          # An administrator may narrow it from inside the vault, but never widen it past the host.
+          over="$(curl -s -o /dev/null -w '%{http_code}' --cacert certs/cert.pem -X PUT "$BASE/settings" \
+            -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+            -d '{"deployment_storage_limit_gb": 640}')"
+          [ "$over" = "400" ] \
+            || { echo "::error::the vault accepted a limit above MAX_STORAGE_GB (HTTP $over)"; exit 1; }
+
+          # And the host tool refuses a ceiling below what is already stored.
+          stored_gb="$(docker exec vault-db psql -U sftp_user -d sftp_db -tAc \
+            'SELECT CEIL(COALESCE(SUM(total_size_bytes), 0)::numeric / (1024^3))::int FROM vaults WHERE is_active')"
+          if [ "${stored_gb:-0}" -gt 0 ]; then
+            set +e
+            python3 dockvault.py storage --set-gb 0 --non-interactive > /tmp/storage-refuse.log 2>&1
+            rc=$?
+            set -e
+            [ "$rc" -ne 0 ] || { echo "::error::storage accepted a limit below what is stored"; exit 1; }
+            grep -q "already stored" /tmp/storage-refuse.log \
+              || { echo "::error::the refusal did not say why"; cat /tmp/storage-refuse.log; exit 1; }
+          fi
+
+          python3 dockvault.py storage --set-gb -1 --non-interactive --no-restart
+          python3 .github/scripts/mask_env_secrets.py .env
+          echo "J: storage limit reported, enforced by the vault, and refused when it would strand files"
+
       - name: Scenario I — install from the published release image
         # The path a self-hoster takes when they do not want to build: setup pulls the published
         # image instead of compiling this checkout. Nothing else in this file covers it, and for a

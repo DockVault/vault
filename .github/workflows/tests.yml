@@ -86,6 +86,9 @@ jobs:
             echo "RATE_LIMIT_API_AUTH=100000"
             echo "RATE_LIMIT_API_UPLOAD=100000"
             echo "RATE_LIMIT_API_DOWNLOAD=100000"
+            # A real storage ceiling, so the suite exercises the bounded admin limit
+            # (the panel offers 0..MAX_STORAGE_GB) rather than only the unlimited default.
+            echo "MAX_STORAGE_GB=64"
           } > .env
           {
             echo "VAULT_ADMIN_USER=admin"

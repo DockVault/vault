@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, ValidationError, validator
+from pydantic import AliasChoices, Field, ValidationError, validator
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 
@@ -99,7 +99,6 @@ class Settings(BaseSettings):
     plan_zero_knowledge: bool = Field(default=True)         # may zero-knowledge vaults be created at all
     plan_force_zero_knowledge: bool = Field(default=False)  # plan mandates zero-knowledge org-wide (Enterprise)
     plan_max_zk_vaults: int = Field(default=-1)             # cap on ZK vaults (-1 unlimited, 0 none, N capped)
-    plan_max_storage_gb: int = Field(default=-1)            # aggregate storage cap across the deployment, GB (-1 unlimited)
     plan_max_users: int = Field(default=-1)                 # cap on user accounts (-1 unlimited, 0 = block all, N capped)
     # Operator-set allowlist of the vault TYPES this deployment may create (comma-separated,
     # e.g. "standard" to forbid zero-knowledge org-wide, or "zero_knowledge" for ZK-only).
@@ -144,6 +143,18 @@ class Settings(BaseSettings):
     # File Storage Configuration
     file_storage_path: str = Field(default="./storage")
     max_file_size_mb: int = Field(default=1024)
+    # The deployment's HARD ceiling on total STORED bytes, in GB (-1, the default, = unlimited).
+    # An administrator tunes the live limit from the admin panel, but only DOWNWARD from this
+    # value — the panel offers 0 .. MAX_STORAGE_GB and shows the ceiling, so the operator who set
+    # this number stays in control of the maximum. Only bytes actually written count toward it:
+    # empty vaults, however many, cost nothing. The earlier PLAN_MAX_STORAGE_GB spelling is still
+    # accepted so an existing deployment's .env keeps working across an update.
+    # A float, not an int: an operator sizing a small deployment reasonably writes 1.5, and an
+    # int field would refuse the whole settings model and stop the deployment from starting.
+    max_storage_gb: float = Field(
+        default=-1,
+        validation_alias=AliasChoices("max_storage_gb", "plan_max_storage_gb"),
+    )
     transfer_speed_limit_kb: int = Field(default=0)  # 0 = no limit, otherwise KB/s
     # Hours a resumable chunked-upload session may live before it is considered
     # abandoned and its buffered chunks under _uploads/<sid>/ become eligible for

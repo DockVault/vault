@@ -19,9 +19,16 @@ def test_storage_stats_shape(admin):
     r = admin.get("/storage/stats")
     assert r.status_code == 200, r.text
     body = r.json()
-    assert set(body) == {"total", "used", "available"}
-    assert all(isinstance(body[k], int) for k in body)
-    assert body["used"] >= 0
+    # Disk capacity, then the limit picture the Storage panel renders: what is STORED (the only
+    # thing the deployment limit counts), what vaults have been ALLOCATED (reported, never
+    # enforced against that limit), the live limit, and the deployment's own ceiling.
+    assert set(body) == {"total", "used", "available",
+                         "allocated_bytes", "limit_bytes", "max_bytes", "vault_count"}
+    for key in ("total", "used", "available", "allocated_bytes", "vault_count"):
+        assert isinstance(body[key], int) and body[key] >= 0
+    # A null limit/ceiling means "unlimited", which is the shipped default.
+    for key in ("limit_bytes", "max_bytes"):
+        assert body[key] is None or (isinstance(body[key], int) and body[key] >= 0)
     # if the storage volume could be stat'd, capacity is coherent
     if body["total"]:
         assert body["available"] <= body["total"]

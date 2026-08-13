@@ -34,8 +34,9 @@ from app.core.config import bootstrap_entrypoint
 bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
-from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId
+from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant
 from app.core import sharing_policy
+from app.core import storage_quota
 from app.core.key_wrap_algorithms import DIRECT_DEK_ALGO, TEAMPRIV_ALGO
 from app.config.branding import branding
 # NOTE: auth_service and vault_service BOTH define a class named RateLimitExceededError
@@ -570,6 +571,13 @@ class UserUpdate(BaseModel):
     # Per-account SFTP controls (settable by the user themselves or an admin).
     sftp_enabled: Optional[bool] = None
     sftp_password_auth: Optional[bool] = None
+    # Per-account storage budget, in GB, ADMIN-ONLY (a user raising their own would make the
+    # deployment default meaningless). Three shapes, because "unset" and "unlimited" are
+    # genuinely different states: omit the field to leave it alone, send the string "inherit"
+    # (or "default") to fall back to the deployment default, send "unlimited" to exempt the
+    # account, or send a number >= 0 for an exact budget. JSON null is read as "inherit" too,
+    # since that is what a cleared field in the admin UI means.
+    storage_quota_gb: Optional[object] = None
 
 
 class SelfUpdate(BaseModel):
@@ -602,6 +610,10 @@ class UserResponse(BaseModel):
     is_locked: bool
     sftp_enabled: bool = True
     sftp_password_auth: bool = True
+    # The account's storage override in bytes: null = inherits the deployment default,
+    # -1 = exempt, otherwise an exact budget. The effective number (and what the account has
+    # already allocated) comes from /users/{id}/storage.
+    storage_quota_bytes: Optional[int] = None
     created_at: datetime
     last_login: Optional[datetime]
     groups: List[GroupBrief] = []
@@ -1756,59 +1768,197 @@ _GIB = 1024 ** 3
 _INT64_MAX = 2 ** 63 - 1  # the size_limit column is BigInteger; a larger value overflows it
 
 
-def _quota_setting_bytes(db: Session, key: str) -> int:
-    """A GB quota from the global settings blob -> bytes. Missing / non-positive / unparseable => 0,
-    which means UNLIMITED on that axis (not enforced). So a fresh deployment that never set the value
-    is unbounded, and an admin opts in by saving a positive number of GB."""
+def _settings_blob(db: Session) -> dict:
+    """The global settings blob as a plain dict (empty when never saved)."""
     from app.core.models import SystemSetting
     row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
-    val = (row.value or {}).get(key) if (row and row.value) else None
-    try:
-        gb = float(val)
-    except (TypeError, ValueError):
-        return 0
-    return int(gb * _GIB) if gb > 0 else 0
+    return dict(row.value) if (row and row.value) else {}
 
 
-def _account_reserved_bytes(db: Session, owner_id, exclude_vault_id=None) -> int:
-    """Sum of the declared per-vault size_limit across an owner's ACTIVE vaults — a RESERVATION
-    (declared, not used), so a user can't oversubscribe their account budget by declaring large
-    limits they may never fill. Optionally excludes one vault (when re-sizing it)."""
+def _is_budget_exempt(user: User) -> bool:
+    """Whether this identity is exempt from the per-account storage budget.
+
+    "Full admin" = an interactive admin, NOT an admin-minted temp credential (which the codebase
+    deliberately does not treat as a full admin — mirrors the require_interactive_admin gate), so a
+    delegated credential can't over-consume the owner's account budget."""
+    return user.role == RoleEnum.ADMIN and not getattr(user, "_is_temp_session", False)
+
+
+def _account_quota_bytes(db: Session, user: User):
+    """This account's EFFECTIVE storage budget in bytes, or None when it has none.
+
+    Per-account override first (users.storage_quota_bytes: NULL inherits, -1 exempts, >= 0 is an
+    exact budget), otherwise the deployment default. A budget-exempt identity has no budget at
+    all — the per-vault ceiling still applies to them."""
+    if _is_budget_exempt(user):
+        return None
+    return storage_quota.account_quota_bytes(
+        getattr(user, "storage_quota_bytes", None), _settings_blob(db).get("default_user_quota"))
+
+
+def _account_allocated_bytes(db: Session, user_id, exclude_vault_id=None) -> int:
+    """How much of an account's budget is currently ALLOCATED: the sum of that person's storage
+    grants across ACTIVE vaults — including storage they contributed to vaults somebody else owns.
+    Optionally excludes one vault, so re-sizing a vault doesn't count its own current allocation
+    against the person changing it."""
     from sqlalchemy import func as _f
-    q = db.query(_f.coalesce(_f.sum(Vault.size_limit), 0)).filter(
-        Vault.owner_id == owner_id, Vault.is_active == True)  # noqa: E712
+    q = (db.query(_f.coalesce(_f.sum(VaultStorageGrant.granted_bytes), 0))
+         .join(Vault, Vault.id == VaultStorageGrant.vault_id)
+         .filter(VaultStorageGrant.user_id == user_id, Vault.is_active == True))  # noqa: E712
     if exclude_vault_id is not None:
-        q = q.filter(Vault.id != exclude_vault_id)
+        q = q.filter(VaultStorageGrant.vault_id != exclude_vault_id)
     return int(q.scalar() or 0)
 
 
 def _max_allowed_vault_size_bytes(db: Session, owner: User, exclude_vault_id=None):
-    """The largest size_limit (bytes) this owner may declare for ONE vault, bounded by the admin
-    'Max Vault Size' per-vault ceiling AND — for non-admins — the remaining per-account budget
-    ('Default User Storage Quota' minus what the owner's OTHER active vaults already reserve). Admins
-    are still bounded by the per-vault ceiling but exempt from the account budget. Returns None when
-    both axes are unlimited (nothing to enforce)."""
-    caps = []
-    ceiling = _quota_setting_bytes(db, "max_vault_size")
-    if ceiling > 0:
-        caps.append(ceiling)
-    # "Full admin" = an interactive admin, NOT an admin-minted temp credential (which the codebase
-    # deliberately does not treat as a full admin — mirrors the require_interactive_admin gate), so a
-    # delegated credential can't over-consume the owner's account budget.
-    is_full_admin = owner.role == RoleEnum.ADMIN and not getattr(owner, "_is_temp_session", False)
-    if not is_full_admin:
-        budget = _quota_setting_bytes(db, "default_user_quota")
-        if budget > 0:
-            caps.append(max(0, budget - _account_reserved_bytes(db, owner.id, exclude_vault_id)))
-    return min(caps) if caps else None
+    """The largest total size_limit (bytes) this person may put on ONE vault they are the sole
+    contributor to, bounded by the admin 'Max Vault Size' per-vault ceiling AND their remaining
+    account budget. Returns None when both axes are unlimited (nothing to enforce)."""
+    ceiling = storage_quota.quota_setting_bytes(_settings_blob(db).get("max_vault_size"))
+    headroom = storage_quota.account_headroom_bytes(
+        _account_quota_bytes(db, owner), _account_allocated_bytes(db, owner.id, exclude_vault_id))
+    return storage_quota.max_vault_total_bytes(ceiling, headroom)
+
+
+def _vault_grant_rows(db: Session, vault, commit: bool = True) -> list:
+    """This vault's storage-allocation ledger, repaired if it ever drifts from the vault's
+    declared size_limit.
+
+    The ledger's SUM is the vault's limit. A vault created before the ledger existed (or a
+    size_limit edited straight in the database) leaves an unexplained difference, and that
+    difference belongs to the OWNER — that is precisely what the historical single-owner model
+    meant. A NEGATIVE difference (contributions adding up to more than the recorded limit) is
+    resolved the other way, by raising the limit to what people actually contributed, because
+    silently deleting somebody's contribution is never the right repair.
+    """
+    rows = db.query(VaultStorageGrant).filter(VaultStorageGrant.vault_id == vault.id).all()
+    total = sum(int(r.granted_bytes or 0) for r in rows)
+    limit = int(vault.size_limit or 0)
+    if total == limit:
+        return rows
+    if total < limit:
+        # Storage the ledger cannot account for: a vault that predates the ledger, or one whose
+        # contributor's account was deleted. It belongs to the owner. The reverse case is NOT
+        # symmetrical and deliberately touches nobody's row — contributions adding up to more
+        # than the recorded limit means the limit is what is stale, and "repairing" it by
+        # subtracting from a row would delete storage somebody actually allocated.
+        owner_row = next((r for r in rows if r.user_id == vault.owner_id), None)
+        if owner_row is None:
+            owner_row = VaultStorageGrant(vault_id=vault.id, user_id=vault.owner_id, granted_bytes=0)
+            db.add(owner_row)
+            rows.append(owner_row)
+        owner_row.granted_bytes = int(owner_row.granted_bytes or 0) + (limit - total)
+    vault.size_limit = sum(int(r.granted_bytes or 0) for r in rows)
+    # A read path has no other work in flight, so it persists the repair itself. A write path
+    # passes commit=False: it is holding a row lock that its own commit will release, and
+    # committing here would drop that lock halfway through the allocation.
+    try:
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+    except IntegrityError:
+        # Two unlocked reads repairing the same vault at once: both insert the owner's row and
+        # the (vault_id, user_id) constraint rejects the loser. The winner's row is the answer,
+        # so re-read it rather than turning a self-healing path into a 500.
+        db.rollback()
+        return db.query(VaultStorageGrant).filter(VaultStorageGrant.vault_id == vault.id).all()
+    return rows
+
+
+def _lock_vault_for_allocation(db: Session, vault) -> None:
+    """Serialize allocation changes on ONE vault by taking a row lock on it.
+
+    Every allocation is read-modify-write across two tables (the contributor's row, then the
+    vault's derived size_limit), so two contributors writing at the same moment could each
+    compute a total that omitted the other's row. Locking the vault makes the ledger and the
+    limit it derives agree without a global lock: writes to different vaults never contend.
+    Released by the caller's commit/rollback.
+
+    populate_existing() is not optional. The handler has already loaded this vault on the way in,
+    and SQLAlchemy's identity map would hand back that same instance — lock emitted, attributes
+    unchanged — so the stored-bytes figure the allocation is then checked against would predate
+    the lock that was taken to make it trustworthy."""
+    db.query(Vault).filter(Vault.id == vault.id).populate_existing().with_for_update().first()
+
+
+def _vault_storage_state(db: Session, vault, commit: bool = True) -> dict:
+    """The vault's allocation ledger as {user_id: bytes} plus the resulting total."""
+    rows = _vault_grant_rows(db, vault, commit=commit)
+    by_user = {r.user_id: int(r.granted_bytes or 0) for r in rows}
+    return {"by_user": by_user, "total": sum(by_user.values())}
+
+
+def _write_vault_grant(db: Session, vault, user_id, new_grant: int) -> int:
+    """Set one contributor's allocation on a vault to an absolute value and re-derive the
+    vault's size_limit from the ledger. Returns the vault's new total.
+
+    Absolute, not a delta, so a retried request converges instead of stacking. A zero
+    allocation keeps its row: the history of "this person contributed here" is worth more than
+    the row it costs, and it makes the reclaim path a plain update."""
+    row = db.query(VaultStorageGrant).filter(
+        VaultStorageGrant.vault_id == vault.id, VaultStorageGrant.user_id == user_id).first()
+    if row is None:
+        row = VaultStorageGrant(vault_id=vault.id, user_id=user_id, granted_bytes=0)
+        db.add(row)
+    row.granted_bytes = int(new_grant)
+    row.updated_at = datetime.now(timezone.utc)
+    db.flush()
+    from sqlalchemy import func as _f
+    total = int(db.query(_f.coalesce(_f.sum(VaultStorageGrant.granted_bytes), 0))
+                .filter(VaultStorageGrant.vault_id == vault.id).scalar() or 0)
+    vault.size_limit = total
+    vault.updated_at = datetime.now(timezone.utc)
+    return total
+
+
+def _apply_vault_total(db: Session, vault, actor: User, requested_total: int) -> None:
+    """Move a vault's TOTAL size limit to `requested_total` by adjusting the actor's own
+    allocation — the owner-facing spelling of the same ledger operation.
+
+    Growing spends the actor's budget; shrinking refunds it, but only down to what the actor
+    personally contributed. The remainder belongs to other contributors and is theirs to
+    reclaim, so an owner cannot shrink a shared vault by cancelling somebody else's storage.
+    """
+    _lock_vault_for_allocation(db, vault)
+    state = _vault_storage_state(db, vault, commit=False)
+    mine = state["by_user"].get(actor.id, 0)
+    others = state["total"] - mine
+    new_grant = int(requested_total) - others
+    if new_grant < 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Other contributors have allocated {storage_quota.format_bytes(others)} to this "
+                    f"vault, so its limit cannot go below that. You can reclaim up to your own "
+                    f"{storage_quota.format_bytes(mine)}."),
+        )
+    _enforce_grant(db, vault, actor, new_grant, current_grant=mine, other_grants=others)
+    _write_vault_grant(db, vault, actor.id, new_grant)
+
+
+def _enforce_grant(db: Session, vault, actor: User, new_grant: int, *, current_grant: int,
+                   other_grants: int) -> None:
+    """Reject (400) an allocation the actor's budget, the vault's stored bytes or the admin's
+    per-vault ceiling does not allow."""
+    reason = storage_quota.check_grant(
+        new_grant,
+        current_grant=current_grant,
+        other_grants=other_grants,
+        stored_bytes=vault.total_size_bytes or 0,
+        per_vault_ceiling=storage_quota.quota_setting_bytes(_settings_blob(db).get("max_vault_size")),
+        account_quota=_account_quota_bytes(db, actor),
+        allocated_elsewhere=_account_allocated_bytes(db, actor.id, exclude_vault_id=vault.id),
+    )
+    if reason:
+        raise HTTPException(status_code=400, detail=reason)
 
 
 def _enforce_vault_size(db: Session, owner: User, requested_bytes: int, exclude_vault_id=None) -> None:
     """Reject a requested per-vault size_limit that exceeds the owner's available headroom (the
     per-vault ceiling and/or the per-account budget). No-op when both are unlimited. The account
-    budget is a best-effort reservation (a SELECT-then-write, not a lock), like the deployment-wide
-    storage cap: two concurrent creates can overshoot by at most one vault's declared size — the
-    per-upload guard remains the atomic backstop on ACTUAL bytes."""
+    budget is a best-effort allocation (a SELECT-then-write, not a lock): two concurrent creates
+    can overshoot by at most one vault's declared size — the per-upload guard remains the atomic
+    backstop on ACTUAL bytes."""
     cap = _max_allowed_vault_size_bytes(db, owner, exclude_vault_id)
     if cap is not None and requested_bytes > cap:
         raise HTTPException(
@@ -2001,14 +2151,27 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             detail="directory_search_scope must be 'deployment' or 'same_department'",
         )
 
-    # Storage quotas (GB). default_user_quota = per-account budget (sum of an owner's vault size
-    # reservations); max_vault_size = the per-vault ceiling. Both are enforced at vault create/resize
-    # (see _enforce_vault_size); 0 / absent means unlimited on that axis.
+    # Storage quotas (GB). default_user_quota = the per-account budget an account spends by
+    # ALLOCATING storage to vaults; max_vault_size = the per-vault ceiling. Both are enforced at
+    # vault create/resize (see _enforce_vault_size); 0 / absent means unlimited on that axis.
     for gb_key in ("default_user_quota", "max_vault_size"):
         if gb_key in payload and payload[gb_key] is not None:
             v = payload[gb_key]
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
                 raise HTTPException(status_code=400, detail=f"{gb_key} must be a non-negative number of GB")
+
+    # Deployment-wide limit on STORED bytes (GB). Unlike the two quotas above, 0 is a real value
+    # here (accept no further bytes) and null clears the override so the deployment runs at its
+    # configured maximum — the admin panel offers a bounded 0..MAX_STORAGE_GB range rather than a
+    # magic "unlimited" number. Refused when it exceeds that maximum or falls below what is
+    # already stored, both of which the message names outright.
+    if "deployment_storage_limit_gb" in payload and payload["deployment_storage_limit_gb"] is not None:
+        from app.services.vault_service import deployment_storage_used
+        reason = storage_quota.validate_deployment_limit(
+            payload["deployment_storage_limit_gb"], settings.max_storage_gb,
+            deployment_storage_used(db))
+        if reason:
+            raise HTTPException(status_code=400, detail=reason)
 
     # Upload policy: allowed_file_types (extension allowlist; empty = allow all) + max_file_size (MB).
     if "allowed_file_types" in payload and payload["allowed_file_types"] is not None:
@@ -2077,6 +2240,14 @@ async def get_settings(
     # Always report the EFFECTIVE directory-search policy so the admin toggle reflects the default
     # ('deployment') even when never explicitly saved.
     data["directory_search_scope"] = _directory_search_scope(db)
+    # Storage limits render as a bounded range, so the panel needs the deployment's hard maximum
+    # (null = none configured) and the limit currently in force alongside the raw stored value —
+    # a blank field could otherwise not tell "not set" from "unlimited".
+    from app.services.vault_service import deployment_storage_used, deployment_storage_limit_bytes
+    data["deployment_storage_max_gb"] = (settings.max_storage_gb
+                                         if (settings.max_storage_gb or 0) > 0 else None)
+    data["deployment_storage_limit_bytes"] = deployment_storage_limit_bytes(db)
+    data["deployment_storage_used_bytes"] = deployment_storage_used(db)
     # Overlay the EFFECTIVE Temporary Vault Passcode policy (incl. the ZK-in-scope toggle) so the
     # Settings card renders correct defaults even when never saved (feature default OFF, allow-ZK ON).
     data.update(_temp_passcode_policy(db))
@@ -3564,9 +3735,16 @@ async def storage_stats(
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
-    """Storage usage for this deployment: bytes stored across active vaults, plus the
-    capacity of the underlying storage volume."""
-    from app.services.vault_service import deployment_storage_used
+    """Storage usage for this deployment: bytes stored across active vaults, the capacity of the
+    underlying storage volume, and the limit picture the admin panel renders.
+
+    `limit_bytes` is what is actually enforced on stored bytes (null = unlimited); `max_bytes` is
+    the deployment's hard ceiling from MAX_STORAGE_GB, which the panel shows as the top of the
+    range an admin may choose from. `allocated_bytes` is the sum of every active vault's declared
+    limit — reported so an operator can see how much has been promised, NOT enforced against this
+    limit: an empty vault costs nothing until files land in it."""
+    from sqlalchemy import func as _f
+    from app.services.vault_service import deployment_storage_used, deployment_storage_limit_bytes
     used = deployment_storage_used(db)
     total = available = 0
     try:
@@ -3575,7 +3753,19 @@ async def storage_stats(
     except OSError as e:
         # Capacity is best-effort — never fail the panel if the path can't be stat'd.
         print(f"storage_stats: disk_usage unavailable: {e}")
-    return {"total": total, "used": used, "available": available}
+    allocated = int(db.query(_f.coalesce(_f.sum(Vault.size_limit), 0)).filter(
+        Vault.is_active == True).scalar() or 0)  # noqa: E712
+    limit = deployment_storage_limit_bytes(db)
+    return {
+        "total": total,
+        "used": used,
+        "available": available,
+        "allocated_bytes": allocated,
+        "limit_bytes": limit,
+        "max_bytes": storage_quota.env_ceiling_bytes(settings.max_storage_gb),
+        "vault_count": int(db.query(_f.count(Vault.id)).filter(
+            Vault.is_active == True).scalar() or 0),  # noqa: E712
+    }
 
 
 # ==============================================================================
@@ -4140,6 +4330,45 @@ async def get_user(
     return UserResponse.model_validate(user)
 
 
+@app.get("/users/{user_id}/storage")
+@require_endpoint_permission("USER_VIEW")
+async def get_user_storage(
+    user_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """One account's storage budget and what it has spent, for the admin user editor.
+
+    Returns the EFFECTIVE quota (null = none) alongside the raw override and where the number
+    came from, so the editor can show "inherits the 10 GB default" rather than a bare figure an
+    administrator would have to guess the origin of."""
+    # Own-or-admin, checked BEFORE the existence lookup to avoid an enumeration oracle (mirrors
+    # get_user above).
+    if current_user.role != RoleEnum.ADMIN and current_user.id != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    override = user.storage_quota_bytes
+    quota = _account_quota_bytes(db, user)
+    allocated = _account_allocated_bytes(db, user.id)
+    return {
+        "user_id": str(user.id),
+        "username": user.username,
+        "storage_quota_bytes": override,
+        "effective_quota_bytes": quota,
+        "allocated_bytes": allocated,
+        "available_bytes": storage_quota.account_headroom_bytes(quota, allocated),
+        "default_quota_bytes": storage_quota.quota_setting_bytes(
+            _settings_blob(db).get("default_user_quota")),
+        "budget_exempt": _is_budget_exempt(user),
+        "quota_source": ("exempt" if _is_budget_exempt(user) else
+                         "account" if override is not None else
+                         "default" if quota is not None else "unlimited"),
+    }
+
+
 @app.patch("/users/{user_id}", response_model=UserResponse)
 @require_endpoint_permission("USER_MANAGE")
 async def update_user(
@@ -4239,6 +4468,18 @@ async def update_user(
             revoked = _revoke_sessions(db, user_id=user.id, actor_username=current_user.username)
             if revoked:
                 print(f"🔒 Revoked {revoked} live session(s) for locked/deactivated user {user.username}")
+
+        # Per-account storage budget. Admin-only and deliberately outside the self-service
+        # branch above: a user who could raise their own quota would make the deployment
+        # default advisory. Absent = leave as-is, which is why model_fields_set is consulted
+        # rather than the value (an explicit null means "inherit the default").
+        if "storage_quota_gb" in user_update.model_fields_set:
+            try:
+                new_quota = storage_quota.parse_account_quota_input(user_update.storage_quota_gb)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            changes['storage_quota_bytes'] = {'old': user.storage_quota_bytes, 'new': new_quota}
+            user.storage_quota_bytes = new_quota
 
         # Deactivation also offboards the user's zero-knowledge key access — parity with the
         # user-management deactivate/toggle paths. Blacklist their active wrapped-DEK rows (owner
@@ -5750,18 +5991,19 @@ def _zk_vault_count(db) -> int:
 
 
 def _enforce_deployment_storage_quota(db, additional_bytes: int) -> None:
-    """Plan cap on TOTAL stored bytes across the deployment (settings.plan_max_storage_gb,
-    GB; -1/0 => unlimited) — raises 413 if an upload would exceed it. Shares the check
-    with the SFTP write path via vault_service.would_exceed_deployment_storage so a
-    customer can't sidestep the per-vault size_limit by creating many vaults, on either
-    transport. Permissive default (-1) leaves dev/un-gated deployments unrestricted."""
+    """Deployment-wide limit on TOTAL stored bytes (MAX_STORAGE_GB, narrowed by the admin
+    panel) — raises 413 if an upload would exceed it. Shares the check with the SFTP write
+    path via vault_service.would_exceed_deployment_storage so a customer can't sidestep the
+    per-vault size_limit by creating many vaults, on either transport. Permissive default
+    (-1, no admin limit saved) leaves un-gated deployments unrestricted."""
     from app.services.vault_service import would_exceed_deployment_storage
     exceeds, used, cap_bytes = would_exceed_deployment_storage(db, additional_bytes)
     if exceeds:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=(f"Your plan's {cap_bytes // (1024 ** 3)} GB storage limit would be exceeded "
-                    f"({used / (1024 ** 3):.2f} GB already used). Upgrade your plan or free up space."),
+            detail=(f"This deployment's {storage_quota.format_bytes(cap_bytes)} storage limit would "
+                    f"be exceeded ({storage_quota.format_bytes(used)} already stored). Free up space "
+                    f"or ask an administrator to raise the limit."),
         )
 
 
@@ -5850,18 +6092,26 @@ async def account_storage(
     db: Session = Depends(get_db),
 ):
     """The current account's storage picture, so the UI can show how much a new/edited vault may
-    declare. Bytes; a null bound means UNLIMITED on that axis. reserved = the SUM of the owner's
-    declared vault size_limits; available = the largest size a vault may declare right now (pass
-    exclude_vault_id when editing a vault, so its OWN current reservation doesn't count against it)."""
-    budget = _quota_setting_bytes(db, "default_user_quota")
-    ceiling = _quota_setting_bytes(db, "max_vault_size")
-    is_full_admin = current_user.role == RoleEnum.ADMIN and not getattr(current_user, "_is_temp_session", False)
+    declare. Bytes; a null bound means UNLIMITED on that axis. reserved = the storage this account
+    has ALLOCATED (to its own vaults and to shared vaults it helps fund); available = the largest
+    size a vault may declare right now (pass exclude_vault_id when editing a vault, so its OWN
+    current allocation doesn't count against it).
+
+    quota_source names where the budget came from, so the UI can say "set for your account" rather
+    than implying every account has the same one."""
+    ceiling = storage_quota.quota_setting_bytes(_settings_blob(db).get("max_vault_size"))
+    is_full_admin = _is_budget_exempt(current_user)
+    quota = _account_quota_bytes(db, current_user)
+    override = getattr(current_user, "storage_quota_bytes", None)
     return {
-        "reserved_bytes": _account_reserved_bytes(db, current_user.id),
-        "account_quota_bytes": (budget or None) if not is_full_admin else None,
-        "per_vault_max_bytes": ceiling or None,
+        "reserved_bytes": _account_allocated_bytes(db, current_user.id),
+        "account_quota_bytes": quota,
+        "per_vault_max_bytes": ceiling,
         "available_bytes": _max_allowed_vault_size_bytes(db, current_user, exclude_vault_id),
         "budget_exempt": is_full_admin,
+        "quota_source": ("exempt" if is_full_admin else
+                         "account" if override is not None else
+                         "default" if quota is not None else "unlimited"),
     }
 
 
@@ -5945,6 +6195,11 @@ async def create_vault(
             raise HTTPException(status_code=409,
                                 detail="That vault id is already in use.") from exc
         raise
+
+    # Open the vault's storage-allocation ledger: the creator funds the whole initial size out
+    # of their own budget, and is therefore the one who can later reclaim it.
+    _write_vault_grant(db, vault, current_user.id, requested_size)
+    db.commit()
 
     # Zero-knowledge vaults: the DEK is generated AND wrapped IN THE BROWSER to the
     # owner's own public key; the owner's wrapped copy is supplied here. The server
@@ -6573,10 +6828,11 @@ async def update_vault_settings(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Size limit ({size_limit} bytes) cannot be less than current usage ({current_size} bytes)"
                 )
-            # Ceiling: can't exceed the per-vault ceiling or the owner's remaining account budget
-            # (excluding THIS vault's own current reservation). The owner is enforced above.
-            _enforce_vault_size(db, current_user, size_limit, exclude_vault_id=vault_id)
-            vault.size_limit = size_limit
+            # Ceiling: can't exceed the per-vault ceiling or the owner's remaining account budget.
+            # Applied through the allocation ledger, so the difference is charged to (or refunded
+            # from) the owner's own budget and any storage other contributors added to this shared
+            # vault stays theirs.
+            _apply_vault_total(db, vault, current_user, size_limit)
             updated_fields.append('size_limit')
         
         if 'expire_files_after_days' in settings_update:
@@ -6632,6 +6888,151 @@ async def update_vault_settings(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update settings: {str(e)}"
         )
+
+
+class VaultStorageUpdate(BaseModel):
+    """Set the caller's OWN storage allocation on a vault, in bytes (absolute, not a delta)."""
+    granted_bytes: int = Field(..., ge=0, le=storage_quota.INT64_MAX)
+
+    @field_validator("granted_bytes", mode="before")
+    @classmethod
+    def _reject_bool(cls, v):
+        # bool is a subclass of int, so pydantic would happily read `true` as a 1-byte
+        # allocation and silently shrink the vault to one byte.
+        if isinstance(v, bool):
+            raise ValueError("granted_bytes must be a number of bytes")
+        return v
+
+
+def _vault_storage_payload(db: Session, vault, current_user: User) -> dict:
+    """The vault's storage picture for one viewer: the totals everyone may see, the viewer's own
+    allocation and how far they could raise it, and — only for people who administer the vault —
+    the itemised contributor list. A plain member has no business knowing whose budget paid for
+    the vault, so they get the totals and their own row and nothing else."""
+    state = _vault_storage_state(db, vault)
+    mine = state["by_user"].get(current_user.id, 0)
+    others = state["total"] - mine
+    ceiling = storage_quota.quota_setting_bytes(_settings_blob(db).get("max_vault_size"))
+    quota = _account_quota_bytes(db, current_user)
+    allocated_elsewhere = _account_allocated_bytes(db, current_user.id, exclude_vault_id=vault.id)
+    headroom = storage_quota.account_headroom_bytes(quota, allocated_elsewhere)
+    max_total = storage_quota.max_vault_total_bytes(ceiling, headroom, others)
+    manages = _can_manage_vault(db, vault, current_user)
+
+    payload = {
+        "vault_id": str(vault.id),
+        "size_limit": int(vault.size_limit or 0),
+        "used_bytes": int(vault.total_size_bytes or 0),
+        "my_grant_bytes": mine,
+        "others_grant_bytes": others,
+        # The largest TOTAL this viewer could set the vault to right now (None = unbounded), and
+        # the largest allocation of their own that implies.
+        "max_total_bytes": max_total,
+        "my_max_grant_bytes": None if max_total is None else max(0, max_total - others),
+        "per_vault_max_bytes": ceiling,
+        "account_quota_bytes": quota,
+        "account_allocated_bytes": allocated_elsewhere + mine,
+        "budget_exempt": _is_budget_exempt(current_user),
+        "can_contribute": manages and not getattr(current_user, "_is_temp_session", False),
+    }
+    if manages:
+        names = {u.id: u.username for u in db.query(User).filter(
+            User.id.in_(list(state["by_user"].keys()) or [vault.owner_id])).all()}
+        payload["contributors"] = sorted(
+            ({"user_id": str(uid),
+              "username": names.get(uid, "(removed account)"),
+              "granted_bytes": granted,
+              "is_owner": uid == vault.owner_id,
+              "is_you": uid == current_user.id}
+             for uid, granted in state["by_user"].items()),
+            key=lambda c: (-c["granted_bytes"], c["username"]),
+        )
+    return payload
+
+
+@app.get("/vaults/{vault_id}/storage")
+@require_endpoint_permission("VAULT_VIEW")
+@require_vault_cap("vault.see_info")
+async def get_vault_storage(
+    vault_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """This vault's storage: how much it may hold, how much it holds, and who allocated it."""
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    try:
+        vault = vault_service.get_vault(vault_id, current_user, None, require_password=False)
+    except ResourceNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    return _vault_storage_payload(db, vault, current_user)
+
+
+@app.put("/vaults/{vault_id}/storage")
+@require_endpoint_permission("VAULT_SETTINGS")
+@require_vault_cap("vault.change_expiry")
+async def set_vault_storage(
+    vault_id: uuid.UUID,
+    payload: VaultStorageUpdate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Set the caller's own storage allocation on this vault, out of their account quota.
+
+    Open to the owner and to Managers, so a shared vault can be funded by the people who run it
+    — each of them adding storage from their own budget and reclaiming exactly what they added,
+    never anybody else's. A temporary credential is refused outright: spending an account's
+    storage budget outlives the credential's time-box, so it needs an interactive session.
+    """
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    try:
+        vault = vault_service.get_vault(vault_id, current_user, None, require_password=False)
+    except ResourceNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(
+            status_code=403,
+            detail="A temporary credential cannot change storage allocation; use an interactive session.",
+        )
+    if not _can_manage_vault(db, vault, current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the vault owner or a vault manager can change this vault's storage.",
+        )
+
+    # Take the vault's row lock first, so a second contributor writing at the same moment cannot
+    # compute a total that omits this one. Held until the commit below.
+    _lock_vault_for_allocation(db, vault)
+    state = _vault_storage_state(db, vault, commit=False)
+    mine = state["by_user"].get(current_user.id, 0)
+    others = state["total"] - mine
+    _enforce_grant(db, vault, current_user, payload.granted_bytes,
+                   current_grant=mine, other_grants=others)
+    total = _write_vault_grant(db, vault, current_user.id, payload.granted_bytes)
+    db.commit()
+
+    try:
+        AuditLogger(db).log_action(
+            action="vault_storage_allocated",
+            status="success",
+            user=current_user,
+            ip_address=get_client_ip(request),
+            details={"vault_id": str(vault.id), "granted_bytes": payload.granted_bytes,
+                     "previous_bytes": mine, "size_limit": total},
+        )
+    except Exception:
+        pass  # never fail the allocation just because the audit write did
+
+    db.refresh(vault)
+    return _vault_storage_payload(db, vault, current_user)
 
 
 # Vault Permission Endpoints
@@ -8366,7 +8767,7 @@ async def init_chunked_upload(
         raise HTTPException(status_code=413, detail=f"File exceeds maximum size of {_max_file_bytes // (1024 * 1024)}MB")
     if vault.size_limit and (vault.total_size_bytes or 0) + body.total_size > vault.size_limit:
         raise HTTPException(status_code=413, detail="File would exceed the vault size limit")
-    _enforce_deployment_storage_quota(db, body.total_size)   # plan aggregate storage ceiling
+    _enforce_deployment_storage_quota(db, body.total_size)   # deployment-wide stored-bytes limit
 
     folder_uuid = None
     if body.folder_id:
@@ -8947,7 +9348,7 @@ async def complete_chunked_upload(
         # Final size-limit guard now that the true plaintext size is known.
         if vault.size_limit and (vault.total_size_bytes or 0) + final_size > vault.size_limit:
             raise HTTPException(status_code=413, detail="File would exceed the vault size limit")
-        _enforce_deployment_storage_quota(db, final_size)   # plan aggregate storage ceiling
+        _enforce_deployment_storage_quota(db, final_size)   # deployment-wide stored-bytes limit
 
         # Zero-knowledge upload-vs-rekey race guard. Lock the vault row and confirm the
         # client encrypted under the CURRENT DEK epoch; if the vault was re-keyed during
@@ -11141,6 +11542,34 @@ def _run_lightweight_migrations():
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS enc_mime TEXT",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS name_bi VARCHAR(64)",
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS name_key_version INTEGER",
+            # Per-account storage budget (NULL inherits the deployment default, -1 exempts).
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_quota_bytes BIGINT",
+            # Storage-allocation ledger. create_all builds the table on a fresh database; these
+            # cover a database that already has vaults, and seed one owner-held grant per vault so
+            # the ledger's invariant (SUM(granted_bytes) == vaults.size_limit) holds from the first
+            # request after an update. The INSERT is guarded by NOT EXISTS, so re-running it on a
+            # deployment whose contributions have since changed cannot resurrect the old figure.
+            """CREATE TABLE IF NOT EXISTS vault_storage_grants (
+                   id            UUID      PRIMARY KEY,
+                   vault_id      UUID      NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+                   user_id       UUID      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                   granted_bytes BIGINT    NOT NULL DEFAULT 0,
+                   created_at    TIMESTAMP,
+                   updated_at    TIMESTAMP,
+                   CONSTRAINT uq_vault_storage_grant_vault_user UNIQUE (vault_id, user_id),
+                   CONSTRAINT ck_vault_storage_grant_non_negative CHECK (granted_bytes >= 0)
+               )""",
+            "CREATE INDEX IF NOT EXISTS idx_vault_storage_grant_vault "
+            "ON vault_storage_grants (vault_id)",
+            "CREATE INDEX IF NOT EXISTS idx_vault_storage_grant_user "
+            "ON vault_storage_grants (user_id)",
+            """INSERT INTO vault_storage_grants
+                   (id, vault_id, user_id, granted_bytes, created_at, updated_at)
+               SELECT gen_random_uuid(), v.id, v.owner_id, GREATEST(COALESCE(v.size_limit, 0), 0),
+                      (now() AT TIME ZONE 'utc'), (now() AT TIME ZONE 'utc')
+                 FROM vaults v
+                WHERE NOT EXISTS (SELECT 1 FROM vault_storage_grants g
+                                   WHERE g.vault_id = v.id)""",
             # Harden vault_member_keys.key_version like dek_version: the version-aware
             # get_vault_keys read matches on key_version == epoch, so a NULL would make a row
             # unfetchable. Backfill any NULL to 1, then enforce default+NOT NULL. Must run

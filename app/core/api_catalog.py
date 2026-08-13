@@ -191,6 +191,16 @@ API_CATALOG = {
                 resource_type="user",
                 ui_widgets=["user-details-modal"]
             ),
+            APIEndpoint(
+                method="GET",
+                path="/users/{user_id}/storage",
+                function_name="get_user_storage",
+                description="Storage budget and allocation for one account",
+                role_requirement=RoleRequirement.USER,
+                requires_ownership=True,
+                resource_type="user",
+                ui_widgets=["edit-user-storage-quota"]
+            ),
         ]
     ),
     
@@ -298,6 +308,14 @@ API_CATALOG = {
                 role_requirement=RoleRequirement.USER,
                 ui_widgets=["vault-view", "vault-header", "vault-details"]
             ),
+            APIEndpoint(
+                method="GET",
+                path="/vaults/{vault_id}/storage",
+                function_name="get_vault_storage",
+                description="Vault storage usage, limit and who allocated it",
+                role_requirement=RoleRequirement.USER,
+                ui_widgets=["vault-storage-card", "vault-storage-bar"]
+            ),
         ]
     ),
     
@@ -368,6 +386,15 @@ API_CATALOG = {
                 requires_ownership=True,
                 resource_type="vault",
                 ui_widgets=["vault-settings-tab", "update-size-limit-btn", "set-expiration-btn"]
+            ),
+            APIEndpoint(
+                method="PUT",
+                path="/vaults/{vault_id}/storage",
+                function_name="set_vault_storage",
+                description="Allocate or reclaim your own storage on a vault (owner or manager)",
+                role_requirement=RoleRequirement.USER,
+                resource_type="vault",
+                ui_widgets=["vault-storage-card", "vault-storage-save-btn"]
             ),
         ]
     ),
