@@ -566,6 +566,10 @@ function showConfirm(message, title = 'Confirm Action', requireInput = null) {
             // Store handler for cleanup
             inputEl._handler = inputHandler;
         } else {
+            // Clear here too, not only in the branch that asks for typed input. This is the branch
+            // a plain confirm takes, and it is what would otherwise carry a passphrase left by an
+            // earlier prompt through any number of later dialogs.
+            inputEl.value = '';
             inputEl.style.display = 'none';
             confirmBtn.disabled = false;
         }
@@ -591,6 +595,11 @@ function showConfirm(message, title = 'Confirm Action', requireInput = null) {
         // Cleanup function
         const cleanup = () => {
             modal.classList.remove('active');
+            // Clear here as well as in showPrompt, so "the field is empty once a dialog closes"
+            // holds for both primitives rather than one. Today's requireInput callers pass a
+            // username to type back, not a secret — but the two functions share one input, and an
+            // invariant that holds only on alternate paths is one refactor from not holding.
+            inputEl.value = '';
             confirmBtn.removeEventListener('click', confirmHandler);
             cancelBtn.removeEventListener('click', cancelHandler);
             closeBtn.removeEventListener('click', cancelHandler);
@@ -652,6 +661,13 @@ function showPrompt(message, title = 'Enter value', options = {}) {
 
         const cleanup = () => {
             modal.classList.remove('active');
+            // Clear before anything else. This one input is reused by every prompt, including the
+            // zero-knowledge master passphrase — the value the interface itself calls unrecoverable
+            // and the only key to every zero-knowledge vault. Hiding the field does not remove its
+            // value, so without this the passphrase stays readable in the page as the value of a
+            // hidden text input, and survives until some later dialog happens to overwrite it. A
+            // plain confirm does not, so that can be an arbitrarily long time.
+            inputEl.value = '';
             inputEl.type = 'text';
             inputEl.style.display = 'none';
             confirmBtn.removeEventListener('click', onConfirm);
@@ -941,7 +957,14 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         
         const data = await response.json();
         authToken = data.access_token;
-        
+
+        // The credentials have been accepted and are no longer needed. Without this the account
+        // password sits in the login field for the whole session — every session, every user, no
+        // user action required — on a screen that is merely deactivated rather than unloaded.
+        // logout() already resets this form; this closes the window from the other end.
+        const loginForm = document.getElementById('login-form');
+        if (loginForm) loginForm.reset();
+
         // Store token with storage helper (handles private mode)
         storage.setItem('authToken', authToken);
         
@@ -1039,6 +1062,15 @@ function logout() {
     // login screen shows (matters when logout runs from the boot verify path).
     document.documentElement.removeAttribute('data-auth');
     document.getElementById('login-form').reset();
+    // Dismiss any dialog still standing, and empty what it was holding.
+    //
+    // showScreen only swaps `.screen` elements; a modal is not one, so a dialog open at logout is
+    // never dismissed and its cleanup never runs. That matters most for the longest-lived dialog
+    // in the app: the zero-knowledge unlock prompt. A session can expire from a background poll
+    // while the user has typed their master passphrase and not yet submitted, and the login screen
+    // would then appear with that passphrase still in the page — which is exactly the shared-tab
+    // hand-off this function's own storage scrub exists to prevent.
+    closeModal();
     showScreen('login-screen');
 }
 
@@ -11443,6 +11475,26 @@ function closeModal() {
         modal.classList.remove('active');
     });
     closeFilePreview(); // free any in-memory decrypted preview blob
+    clearCredentialInputsOnClose();
+}
+
+// Empty the credential fields of any dialog that just closed.
+//
+// Several dialogs reset themselves when they OPEN, which bounds how long a typed password lingers
+// — but only until the next open. Someone who types one, cancels, and never returns leaves it in
+// the page for the rest of the session, and two dialogs (create-user, admin change-password) have
+// no reset on open at all. Clearing on the way out makes that window zero for all of them.
+//
+// Found BY TYPE rather than from a hand-kept list of ids, so a dialog added later cannot quietly
+// opt out of this simply by existing. Scoped to dialogs on purpose: the login field and the SMTP
+// settings field are not in modals, and the SMTP one is a stored deployment credential that is
+// meant to persist in its form.
+function clearCredentialInputsOnClose() {
+    document.querySelectorAll('.modal input[type="password"]').forEach(el => { el.value = ''; });
+    // The shared prompt input is switched back to type=text as it closes, so the selector above
+    // cannot see it even though it is the field most likely to be holding a passphrase.
+    const shared = document.getElementById('confirm-modal-input');
+    if (shared) shared.value = '';
 }
 
 // Copy to Clipboard
