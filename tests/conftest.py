@@ -11,9 +11,12 @@ Config (all optional, sensible defaults):
   VAULT_ADMIN_USER / VAULT_ADMIN_PASS
         default: read from ../.env (ADMIN_USERNAME / ADMIN_PASSWORD)
 """
+import base64
+import json
 import os
 import random
 import socket
+import time
 import uuid
 from pathlib import Path
 
@@ -264,7 +267,13 @@ def create_zk_vault(client, name=None, wrapped_dek=None, ephemeral_public_key=No
 class ApiClient:
     """Thin requests.Session wrapper that knows the base URL and bearer token."""
 
-    def __init__(self, base_url: str = BASE_URL):
+    # Re-authenticate this many seconds before the token would expire. Comfortably longer than any
+    # single request, short enough to cost one extra login per token lifetime.
+    RENEW_MARGIN_SECONDS = 120
+    # Floor between consecutive renewals; see _renew_if_stale.
+    MIN_RENEW_INTERVAL_SECONDS = 30
+
+    def __init__(self, base_url: str = BASE_URL, renew_before_expiry: bool = False):
         self.base_url = base_url
         self.session = requests.Session()
         # Each client uses a distinct source IP so the per-IP login rate limit
@@ -272,6 +281,10 @@ class ApiClient:
         self.session.headers["X-Forwarded-For"] = _random_ip()
         self.token = None
         self.user = None
+        # Opt-in; see _renew_if_stale for why it is off by default.
+        self._renew_before_expiry = renew_before_expiry
+        self._credentials = None
+        self._last_renew_at = None
 
     # -- auth -------------------------------------------------------------
     def login(self, username: str, password: str):
@@ -284,8 +297,70 @@ class ApiClient:
         data = r.json()
         self.token = data["access_token"]
         self.user = data.get("user")
+        self._credentials = (username, password)
         self.session.headers.update({"Authorization": f"Bearer {self.token}"})
         return data
+
+    def _token_claims(self) -> dict:
+        """This token's claims, or {} if they cannot be read.
+
+        No signature check: the client is reading its own token to decide when to renew, which is
+        not a trust decision.
+        """
+        if not self.token:
+            return {}
+        try:
+            payload = self.token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            return json.loads(base64.urlsafe_b64decode(payload))
+        except Exception:  # noqa: BLE001 — an unreadable token simply never triggers renewal
+            return {}
+
+    def _token_expires_at(self):
+        return self._token_claims().get("exp")
+
+    def _renew_if_stale(self):
+        """Re-login when the access token is close to expiring.
+
+        The token defaults to a 30-minute life while the session-scoped `admin` client logs in once
+        and lives for the whole run, so any run longer than that failed every remaining admin call
+        with 401 — and the `finally` blocks that clean up failed too, leaking fixtures into whatever
+        ran next and producing a second, unrelated-looking set of failures.
+
+        Deliberately PROACTIVE, and deliberately not a retry on 401. Several tests assert that a
+        client which HAS logged in then gets 401 — once its session is denylisted, durably revoked,
+        logged out, or its account locked. Re-authenticating in response to a 401 would turn those
+        into 200s and silently mask the security regressions they exist to catch. Renewing on age
+        never changes what a 401 means.
+
+        Off by default for the same reason: only a client that outlives a token needs it, and every
+        other client here is function-scoped.
+        """
+        if not (self._renew_before_expiry and self._credentials):
+            return
+        exp = self._token_expires_at()
+        if exp is None or exp - time.time() > self.RENEW_MARGIN_SECONDS:
+            return
+        # Never renew more often than this. A token whose whole life is shorter than the margin is
+        # "about to expire" the moment it is minted, so without a floor every single request would
+        # log in again until the shared per-username login budget was exhausted — and deployments
+        # really do run short tokens (a suite elsewhere sets the session timeout to one minute).
+        # Rate-limiting the renewal handles that without assuming anything about the lifetime.
+        now = time.time()
+        if self._last_renew_at is not None and now - self._last_renew_at < self.MIN_RENEW_INTERVAL_SECONDS:
+            return
+        self._last_renew_at = now
+        try:
+            self.login(*self._credentials)
+        except Exception:  # noqa: BLE001
+            # Never raise out of a verb. login() raises for status, and a re-login can legitimately
+            # fail — a 429 from the shared per-username login budget, say. Raising here would
+            # replace a caller's expected response with an exception from deep inside the client,
+            # and worse, would abort a `finally:` cleanup mid-teardown and leak fixtures into the
+            # next test. That is the failure this renewal exists to prevent, so it must not become
+            # a new way to cause it. Keeping the stale token is no worse than not renewing at all:
+            # the caller sees the 401 it would have seen anyway.
+            pass
 
     def clone_anonymous(self) -> "ApiClient":
         return ApiClient(self.base_url)
@@ -295,18 +370,23 @@ class ApiClient:
         return path if path.startswith("http") else f"{self.base_url}{path}"
 
     def get(self, path, **kw):
+        self._renew_if_stale()
         return self.session.get(self._url(path), timeout=30, **kw)
 
     def post(self, path, **kw):
+        self._renew_if_stale()
         return self.session.post(self._url(path), timeout=60, **kw)
 
     def put(self, path, **kw):
+        self._renew_if_stale()
         return self.session.put(self._url(path), timeout=30, **kw)
 
     def patch(self, path, **kw):
+        self._renew_if_stale()
         return self.session.patch(self._url(path), timeout=30, **kw)
 
     def delete(self, path, **kw):
+        self._renew_if_stale()
         return self.session.delete(self._url(path), timeout=30, **kw)
 
     # -- high-level helpers used by fixtures/tests -----------------------
@@ -421,8 +501,20 @@ def admin_creds():
 
 @pytest.fixture(scope="session")
 def admin(admin_creds):
-    """A session-scoped ApiClient logged in as the admin user."""
-    client = ApiClient()
+    """A session-scoped ApiClient logged in as the admin user.
+
+    This is the one client that outlives an access token, so it is the one that renews before
+    expiry. Without that, any run longer than the token's 30-minute life failed every remaining
+    admin call — including the cleanup in `finally` blocks, which then leaked fixtures into the
+    next run. See ApiClient._renew_if_stale for why this renews on age rather than on a 401.
+
+    Note a renewal mints a NEW session for this account, and logging in terminates the account's
+    other non-temp sessions — so a test that holds an open SFTP connection authenticated as this
+    same admin account while making admin HTTP calls could see that connection dropped. No test
+    does today (the SFTP suites authenticate as temp credentials or throwaway users), but it is
+    the non-obvious consequence of renewing here.
+    """
+    client = ApiClient(renew_before_expiry=True)
     client.login(admin_creds["username"], admin_creds["password"])
     return client
 
