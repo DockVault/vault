@@ -2443,6 +2443,27 @@ LOGS_SETTINGS_KEY = "logs"
 _LOG_SINK_PATH = os.environ.get("LOG_PULL_SINK_PATH", "./logs/combined.log")
 
 
+def _log_sink_components() -> set:
+    """Which components are actually being WRITTEN to the log sink this API reads.
+
+    Only run_combined.py writes it, and it names the components it spawned (see mark_sink_active
+    there). That answers a question the API cannot answer for itself, in two parts: every other
+    deployment shape — the dev stack and both `split` profiles — starts app.api.api_server
+    directly, so nothing is written at all; and even under the launcher the SFTP child is spawned
+    only when RUN_SFTP is set, which the shipped default leaves empty.
+
+    Without this, a pull is indistinguishable from a component that merely has no lines yet: both
+    are HTTP 200 with an empty list, forever. The admin panel uses it to stop offering a command
+    that cannot succeed.
+    """
+    if str(os.environ.get("VAULT_LOG_SINK_ACTIVE", "")).strip().lower() not in ("1", "true", "yes", "on"):
+        return set()
+    raw = str(os.environ.get("VAULT_LOG_SINK_COMPONENTS", "")).strip()
+    named = {c.strip() for c in raw.split(",") if c.strip()}
+    # An older launcher that set the active marker without naming components still wrote `web`.
+    return (named or {"web"}) & set(log_pull.SERVEABLE_COMPONENTS)
+
+
 def _load_logs_settings(db) -> dict:
     """Per-component enable flags, in a DEDICATED SystemSetting('logs') row (like 'brand', not
     the shared 'global' row). Fail-closed to {} (feature off) on any read error."""
@@ -2618,6 +2639,13 @@ async def get_logs_settings(
     toks = db.query(LogPullToken).order_by(LogPullToken.created_at.desc()).all()
     return {
         "ceiling": _log_ceiling_on(),
+        # Per SERVEABLE component: is anything actually writing its lines into the sink? False in
+        # every shape that starts the API directly instead of through run_combined.py, false when
+        # the sink could not be opened, and false for `sftp` when RUN_SFTP is unset — the shipped
+        # default — because the launcher then never spawns that child. Per component rather than a
+        # single flag precisely because that last case differs between the two.
+        "sink_available": {c: (c in _log_sink_components())
+                           for c in log_pull.SERVEABLE_COMPONENTS},
         "components": list(log_pull.KNOWN_COMPONENTS),
         "serveable": list(log_pull.SERVEABLE_COMPONENTS),
         "flags": {c: bool(flags.get(c, False)) for c in log_pull.KNOWN_COMPONENTS},

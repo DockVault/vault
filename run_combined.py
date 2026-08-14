@@ -153,6 +153,47 @@ def _spawn(target: str, label: str) -> None:
     _PROCS.append((target, p))
 
 
+def mark_sink_active() -> bool:
+    """Tell the children that a log sink is actually being written, and where.
+
+    The API serves the authenticated log pull by reading the sink file, but it is a CHILD of this
+    launcher and cannot otherwise tell whether anything is writing one. Only this launcher writes
+    it, so every other shape — the dev stack and both `split` profiles, which start
+    ``app.api.api_server`` directly — has no sink at all. Without a marker the API cannot
+    distinguish "no lines yet" from "nothing will ever write lines", and the admin panel hands out
+    a command that returns 200 with an empty list forever.
+
+    Deliberately set from ``_sink_logger`` rather than from "did we intend to have a sink", so a
+    sink that failed to initialise (an unwritable logs directory under a read-only root filesystem,
+    which ``_init_sink`` swallows by design) also reports unavailable rather than pretending.
+
+    It also names WHICH components are actually written, because a sink existing does not mean
+    every component flows into it: the SFTP child is spawned only when RUN_SFTP is truthy, and the
+    shipped default leaves it empty. Reporting a bare "sink active" there would tell an operator
+    that SFTP logs are collected when nothing writes a single ``[sftp]`` line — reproducing, for
+    that component, exactly the dead end this marker exists to prevent.
+
+    These are internal parent-to-child markers, not operator settings: they are exported into the
+    environment the children inherit, and nothing outside this process tree should set them. But
+    the whole ``.env`` reaches the container via ``env_file``, so a stale value COULD be inherited
+    from outside — hence the explicit clear on the failure path rather than a bare early return,
+    which would leave a forged marker in place precisely when the sink is broken.
+
+    Must run BEFORE the first _spawn, which snapshots os.environ per child. Returns whether a sink
+    was marked active.
+    """
+    if _sink_logger is None:
+        os.environ.pop("VAULT_LOG_SINK_ACTIVE", None)
+        os.environ.pop("VAULT_LOG_SINK_COMPONENTS", None)
+        return False
+    os.environ["VAULT_LOG_SINK_ACTIVE"] = "1"
+    # `web` is always spawned; `sftp` only under RUN_SFTP. Ordered and comma-separated so the
+    # reader can treat it as a plain set.
+    components = ["web"] + (["sftp"] if _truthy(os.environ.get("RUN_SFTP")) else [])
+    os.environ["VAULT_LOG_SINK_COMPONENTS"] = ",".join(components)
+    return True
+
+
 def mark_sftp_in_container() -> bool:
     """Tell the children that SFTP, if this deployment runs it, runs in THIS container.
 
@@ -232,7 +273,8 @@ def main() -> None:
     # and drop — safe — but starting the writer first captures early startup lines too).
     _init_sink()
     threading.Thread(target=_sink_writer_loop, daemon=True).start()
-    # Must run BEFORE the first spawn — _spawn snapshots os.environ per child.
+    # Both markers must run BEFORE the first spawn — _spawn snapshots os.environ per child.
+    mark_sink_active()
     mark_sftp_in_container()
     # Start the API first — its lifespan runs the schema create/migrations the SFTP
     # server relies on.

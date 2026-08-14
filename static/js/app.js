@@ -5287,6 +5287,12 @@ async function loadLogSettings() {
     const note = document.getElementById('log-ceiling-note');
     const genBtn = document.getElementById('log-token-generate-btn');
     const anyEnabled = (data.components || []).some(c => (data.flags || {})[c]);
+    // Components the admin has TICKED that are serveable but have no writer. Restricted to the
+    // serveable set on purpose: db-diag/redis-diag 404 for a different reason entirely, and
+    // blaming the deployment shape for those would send an admin down the wrong path.
+    const sinkMap = data.sink_available || {};
+    const uncollected = (data.serveable || []).filter(
+        c => (data.flags || {})[c] && !sinkMap[c]);
     if (note) {
         if (!data.ceiling) {
             // Self-host-correct guidance: the endpoint 404s until BOTH env vars are set. Don't
@@ -5300,15 +5306,41 @@ async function loadLogSettings() {
             note.textContent = 'The endpoint is enabled, but no component is exposed to /logs yet — '
                 + 'tick Web (and/or SFTP) below and a token scoped to it will return logs.';
             note.style.display = '';
+        } else if (uncollected.length) {
+            // The third reason, and the only one that does NOT surface as a 404: every gate
+            // passes, the request succeeds, and the answer is an empty list — because nothing is
+            // writing that component's lines. Named per component, because the two differ: the
+            // whole deployment shape can lack a writer, or SFTP alone can, when the launcher runs
+            // without it. Saying "web and sftp" when only one is affected sends an admin looking
+            // in the wrong place.
+            const which = uncollected.length > 1
+                ? uncollected.join(' and ') + ' logs are'
+                : uncollected[0] + ' logs are';
+            note.textContent = which + ' not being collected in this deployment, so a token scoped '
+                + 'to it returns no new lines rather than an error. Lines are collected only by the '
+                + 'combined launcher — a deployment that starts the API directly, such as the '
+                + 'development stack or the "split" profile, collects nothing, and SFTP lines are '
+                + 'collected only when SFTP runs in the same container. Note a pull may still '
+                + 'return older lines left in the log volume by a previous configuration.';
+            note.style.display = '';
         } else {
             note.style.display = 'none';
         }
     }
     if (genBtn) {
-        // Don't let an admin mint a token + copy a curl for an endpoint that can only 404.
-        genBtn.disabled = !data.ceiling;
-        genBtn.title = data.ceiling ? '' : 'Enable the log endpoint first (see the note above).';
-        if (!data.ceiling) toggleLogTokenGenerate(false);  // collapse the mint panel if it was open
+        // Don't let an admin mint a token + copy a curl that cannot work — whether because the
+        // endpoint 404s (no ceiling / nothing ticked) or because it answers 200 with nothing.
+        // The title must name the SAME reason the note shows, or it points at a message that
+        // isn't there.
+        // Deliberately NOT gated on "no component ticked": minting before ticking one has always
+        // been allowed (the note nudges instead), and a token minted now works as soon as the
+        // component is switched on. Blocking it would be a behaviour change beyond this fix.
+        let why = '';
+        if (!data.ceiling) why = 'Enable the log endpoint first (see the note above).';
+        else if (uncollected.length) why = 'This deployment does not collect those logs (see the note above).';
+        genBtn.disabled = !!why;
+        genBtn.title = why;
+        if (why) toggleLogTokenGenerate(false);  // collapse the mint panel if it was open
     }
     renderLogFlags(data);
     const stealth = document.getElementById('log-stealth-toggle');
