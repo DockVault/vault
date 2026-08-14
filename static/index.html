@@ -1796,7 +1796,10 @@
                                 </div>
                                 <div class="form-group">
                                     <label for="vault-desc">Description</label>
-                                    <textarea id="vault-desc" class="form-control" rows="3"></textarea>
+                                    <!-- One row by default so the dialog stays short enough to show its
+                                         buttons; still a textarea, so newlines work and it can be
+                                         dragged taller (see #create-vault-modal #vault-desc). -->
+                                    <textarea id="vault-desc" class="form-control" rows="1"></textarea>
                                 </div>
                                 <div class="form-group">
                                     <label for="vault-size-gb">Maximum size (GB)</label>

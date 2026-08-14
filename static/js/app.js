@@ -2070,6 +2070,16 @@ async function renderVaultSizeAvailability(noteId, inputEl, excludeVaultId, base
 }
 
 async function showCreateVault() {
+    // Clear whatever a previous, abandoned open left behind. Only a SUCCESSFUL create reset the
+    // form, so cancelling and reopening used to show the old name, description and password.
+    // reset() restores the markup defaults (including size = 1 GB), so it has to run before the
+    // explicit field setup below rather than after it.
+    //
+    // This matters more now the description is one row tall: stale text that used to be obvious
+    // in a three-row box can sit mostly out of sight in a one-row one.
+    const form = document.getElementById('create-vault-form');
+    if (form) form.reset();
+
     // The zero-knowledge option is only offered when the deployment enables it.
     const grp = document.getElementById('vault-type-group');
     const sel = document.getElementById('vault-type');
