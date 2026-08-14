@@ -2018,6 +2018,42 @@ function syncCreateVaultForm() {
     if (hierWrap) hierWrap.style.display = isZk ? '' : 'none';
 }
 
+// The create-vault size hint, with the "you can change this later" clause only for a reader who
+// actually will be able to.
+//
+// Changing a vault's size limit afterwards is PATCH /vaults/{id}/settings — NOT PATCH /vaults/{id},
+// which only edits name and description and merely echoes size_limit back. That endpoint is gated
+// by the VAULT_SETTINGS group, the vault.change_expiry cap, and an OWNER-ONLY check with no admin
+// arm: a non-owning administrator cannot change someone else's vault size. Here that last check is
+// satisfied by construction, because whoever creates the vault becomes its owner. So for this
+// dialog VAULT_SETTINGS is the whole question, and hasPermission() already returns true for an
+// admin.
+//
+// Worth knowing before "tightening" this: VAULT_SETTINGS is a role default for BOTH `user` and
+// `admin` (app/core/api_catalog.py), exactly like VAULT_CREATE. So on a default deployment every
+// account that can reach this dialog can also change the limit later, and the clause is simply
+// true for them. It is withheld only where an administrator has deliberately revoked the group —
+// which is the case this exists for. Making the clause admin-only would hide a true and useful
+// statement from ordinary users.
+//
+// A scoped temporary credential is never promised "later", whatever its owner's groups say. It
+// authenticates AS the owning account, so hasPermission() would report the OWNER's authority
+// rather than the credential's — the same trap the action buttons avoid by testing scope caps
+// instead (see updateActionButtonPermissions). Rather than reproduce that per-vault cap lookup for
+// a vault that does not exist yet, the promise is simply withheld: the credential expires, so a
+// claim about what its holder may do later is one this dialog cannot honestly make.
+//
+// The static copy in index.html is the WITHOUT-clause variant, so the promise is added by this
+// function rather than rendered and then withdrawn.
+const _SIZE_HINT_BASE = 'The most this vault may hold. Default 1 GB.';
+const _SIZE_HINT_EDITABLE =
+    "The most this vault may hold. Default 1 GB; you can change it later in the vault's policies.";
+
+function createVaultSizeHintBase() {
+    if (isScopedTemp) return _SIZE_HINT_BASE;
+    return hasPermission('VAULT_SETTINGS') ? _SIZE_HINT_EDITABLE : _SIZE_HINT_BASE;
+}
+
 // Create Vault Modal
 async function fetchAccountStorage(excludeVaultId) {
     const qs = excludeVaultId ? `?exclude_vault_id=${encodeURIComponent(excludeVaultId)}` : '';
@@ -2141,8 +2177,7 @@ async function showCreateVault() {
     // Reset the size to the 1 GB default + surface how much the account can still allocate.
     const sizeInput = document.getElementById('vault-size-gb');
     if (sizeInput) sizeInput.value = '1';
-    renderVaultSizeAvailability('vault-size-avail', sizeInput, null,
-        'The most this vault may hold. Default 1 GB; changeable later in policies.');
+    renderVaultSizeAvailability('vault-size-avail', sizeInput, null, createVaultSizeHintBase());
 
     // Reflect the resolved type into password + team-mode visibility, then show.
     syncCreateVaultForm();
