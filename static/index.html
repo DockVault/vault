@@ -370,6 +370,29 @@
                                 <button id="vault-filter-all" class="seg-btn active" type="button">All</button>
                                 <button id="vault-filter-fav" class="seg-btn" type="button"><svg class="icon icon-sm"><use href="#i-star"/></svg> Favorites</button>
                             </div>
+                            <!-- Ordering: sort key, direction, and where favourites sit. Grouped
+                                 with the existing filter/view segments rather than added as loose
+                                 buttons, so the toolbar stays one cluster of related controls. -->
+                            <!-- The selects carry aria-label rather than a visually-hidden <label>:
+                                 there is no .sr-only helper in either skin, so such a label would
+                                 simply render. -->
+                            <div class="vault-sort-group" role="group" aria-label="Sort vaults">
+                                <select id="vault-sort" class="vault-sort-select" aria-label="Sort vaults by">
+                                    <option value="name">Name</option>
+                                    <option value="size">Size used</option>
+                                    <option value="files">Files</option>
+                                    <option value="created">Created</option>
+                                    <option value="viewed">Last viewed by me</option>
+                                </select>
+                                <button id="vault-sort-dir" class="seg-btn vault-sort-dir" type="button"
+                                        aria-label="Sort ascending" title="Ascending"
+                                        data-dir="asc">&#8593;</button>
+                                <select id="vault-fav-group" class="vault-sort-select" aria-label="Where favorites appear">
+                                    <option value="first">Favorites first</option>
+                                    <option value="last">Favorites last</option>
+                                    <option value="mixed">Favorites mixed in</option>
+                                </select>
+                            </div>
                             <div class="seg-filter" role="group" aria-label="Vault view">
                                 <button id="vaults-view-grid" class="seg-btn active" type="button" data-vaults-view="grid" title="Grid view" aria-label="Grid view"><svg class="icon icon-sm"><use href="#i-grid"/></svg></button>
                                 <button id="vaults-view-list" class="seg-btn" type="button" data-vaults-view="list" title="List view" aria-label="List view"><svg class="icon icon-sm"><use href="#i-list"/></svg></button>

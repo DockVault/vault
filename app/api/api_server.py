@@ -962,6 +962,10 @@ class VaultResponse(BaseModel):
     type: str = 'standard'               # confidentiality tier: 'standard' | 'zero_knowledge'
     my_permission: Optional[str] = None  # owner | delete | write | read | none — caller's effective level
     is_favorite: bool = False            # starred by the caller
+    # When the CALLER last opened this vault, or null if they never have. Personal to the
+    # requester and never anyone else's activity — distinct from last_accessed above, which is
+    # the last access by any member.
+    last_viewed_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -4144,6 +4148,12 @@ _PREF_ALLOWED = {
     # Per-user opt-out of browser-remembering a vault password. Stored as a string enum ('on'/'off')
     # because _sanitize_preferences keeps only string values in the whitelist (a bare bool is dropped).
     "never_remember_vault_password": {"on", "off"},
+    # How the vault list is ordered. Kept here rather than in localStorage so the ordering follows
+    # the account across browsers and devices, the way the theme already does. String enums,
+    # because _sanitize_preferences only keeps whitelisted strings.
+    "vault_sort": {"name", "size", "files", "created", "viewed"},
+    "vault_sort_dir": {"asc", "desc"},
+    "vault_fav_group": {"first", "last", "mixed"},
 }
 
 
@@ -4166,6 +4176,9 @@ class PreferencesUpdate(BaseModel):
     background: Optional[str] = None
     ui: Optional[str] = None
     never_remember_vault_password: Optional[str] = None
+    vault_sort: Optional[str] = None
+    vault_sort_dir: Optional[str] = None
+    vault_fav_group: Optional[str] = None
 
 
 @app.get("/users/me/preferences")
@@ -6333,6 +6346,9 @@ async def list_vaults(
         ).fetchall()
     }
 
+    # When did the CALLER last open each of these? One query, like fav_ids above — never per row.
+    view_times = _vault_view_times(db, current_user)
+
     from app.core.temp_scope import scope_ids as _scope_ids
     _fnr = _force_no_remember_vault_password(db)
     result = []
@@ -6362,7 +6378,8 @@ async def list_vaults(
             'is_active': vault.is_active,
             'type': vault.type,
             'my_permission': _effective_vault_permission(vault, perms, current_user),
-            'is_favorite': vault.id in fav_ids
+            'is_favorite': vault.id in fav_ids,
+            'last_viewed_at': view_times.get(vault.id),
         }
         result.append(vault_dict)
     
@@ -6377,6 +6394,7 @@ async def get_vault(
     vault_id: uuid.UUID,
     request: Request,
     x_vault_password: Optional[str] = Header(None),
+    x_access_check: Optional[str] = Header(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -6384,6 +6402,13 @@ async def get_vault(
     Get vault details (metadata only - no password required).
     An optional X-Vault-Password HEADER soft-verifies the vault password (rate-limited). The password
     is taken from the header, never a URL query string (which would leak into access logs).
+
+    X-Access-Check marks a background liveness probe rather than a person opening the vault. The
+    client polls this endpoint every 20 seconds while a vault view is on screen, so it can notice
+    revoked access; counting those as views would make a vault left open in a background tab
+    permanently the "most recently viewed" one, and would rewrite the same row three times a minute
+    for as long as the tab lived. A caller can only ever suppress their OWN bookmark by sending it,
+    so a header needs no stronger guarantee than this.
     """
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
@@ -6447,8 +6472,15 @@ async def get_vault(
             'is_active': vault.is_active,
             'type': vault.type,
             'my_permission': _effective_vault_permission(vault, base_perms, current_user),
-            'is_favorite': _is_vault_favorite(db, current_user.id, vault.id)
+            'is_favorite': _is_vault_favorite(db, current_user.id, vault.id),
+            'last_viewed_at': _vault_view_times(db, current_user, vault.id).get(vault.id),
         }
+        # Opening the detail view IS the view. Stamped after the payload is built, so the value
+        # returned is the PREVIOUS visit rather than the current instant — otherwise every read
+        # would report "just now" and the ordering would be useless. A background access-check
+        # poll is not a view (see the X-Access-Check note above).
+        if not x_access_check:
+            _stamp_vault_view(db, current_user, vault.id)
         return VaultResponse(**vault_dict)
 
     except (PasswordRequiredError, InvalidPasswordError) as e:
@@ -6461,6 +6493,62 @@ async def get_vault(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e)
         )
+
+
+def _stamp_vault_view(db: Session, user: User, vault_id: uuid.UUID) -> None:
+    """Record that THIS user opened this vault, for the "last viewed by me" ordering.
+
+    Called from the HTTP vault-detail handler, deliberately NOT from VaultService.get_vault():
+    that runs for downloads, file operations and SFTP too, so stamping there would record a
+    "view" for things nobody looked at.
+
+    A temporary credential never stamps. It authenticates AS the owning account, so the row it
+    would write is the owner's — attributing activity to a person who did not act, and leaking the
+    credential holder's movements into the owner's ordering.
+
+    Best-effort: a failure here must never turn a successful vault read into an error, so it is
+    committed in its own transaction and rolled back on any problem.
+    """
+    if getattr(user, "_is_temp_session", False):
+        return
+    from app.core.models import vault_views
+    from sqlalchemy.dialects.postgresql import insert as _pg_insert
+    try:
+        now = datetime.utcnow()
+        stmt = _pg_insert(vault_views).values(
+            user_id=user.id, vault_id=vault_id, viewed_at=now
+        ).on_conflict_do_update(
+            index_elements=[vault_views.c.user_id, vault_views.c.vault_id],
+            set_={"viewed_at": now},
+        )
+        db.execute(stmt)
+        db.commit()
+    except Exception:  # noqa: BLE001 — never fail a read because the bookmark write failed
+        db.rollback()
+
+
+def _vault_view_times(db: Session, user: User, vault_id: uuid.UUID = None) -> dict:
+    """{vault_id: viewed_at} for ONE user, in a single query (not N+1).
+
+    Returns nothing for a temporary credential. A temp session authenticates AS the owning
+    account, so `current_user.id` here is the OWNER's id and an unguarded read would hand the
+    credential holder the owner's viewing history — a continuously updating record of when the
+    owner last opened each vault, for the life of the credential. That is the mirror image of the
+    write guard in _stamp_vault_view: the write must not be attributed to the owner, and the read
+    must not be disclosed to the holder.
+    """
+    if getattr(user, "_is_temp_session", False):
+        return {}
+    from app.core.models import vault_views
+    from sqlalchemy import select as _select
+    stmt = _select(vault_views.c.vault_id, vault_views.c.viewed_at).where(
+        vault_views.c.user_id == user.id
+    )
+    # The single-vault path needs one row; without this it pulled the caller's whole history on
+    # every vault-detail request, which the client issues on a 20-second timer.
+    if vault_id is not None:
+        stmt = stmt.where(vault_views.c.vault_id == vault_id)
+    return {r[0]: r[1] for r in db.execute(stmt).fetchall()}
 
 
 def _is_vault_favorite(db: Session, user_id: uuid.UUID, vault_id: uuid.UUID) -> bool:

@@ -424,6 +424,44 @@
     justify-content: flex-end;
 }
 
+/* Vault-list ordering controls — sort key, direction, favourites placement.
+ *
+ * Styled here in the shared base, not per skin, so both skins get the same cluster: the two skins
+ * each define .seg-filter/.seg-btn separately and duplicating a third group in both would drift.
+ * The direction toggle reuses .seg-btn (defined by whichever skin is active) so it matches the
+ * neighbouring segmented controls without restating their colours here.
+ */
+.vault-sort-group {
+    display: inline-flex;
+    align-items: stretch;
+    gap: var(--space-xs, .25rem);
+}
+.vault-sort-select {
+    padding: .4rem .55rem;
+    font-size: .82rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    background: var(--surface-1);
+    border: 1px solid var(--surface-3);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    max-width: 12rem;
+}
+.vault-sort-select:hover { color: var(--text-primary); }
+/* The direction arrow is a glyph, not an icon sprite, so give it a predictable square footprint
+   instead of inheriting the text-width of an arrow character.
+   Selector is `button.vault-sort-dir` (0,1,1) on purpose: this file loads BEFORE both skin sheets,
+   and .seg-btn there declares `border: 0; background: transparent` at the same (0,1,0) specificity,
+   so a bare .vault-sort-dir loses the tie and the button renders borderless next to two bordered
+   selects — the opposite of the grouping intended here. */
+button.vault-sort-dir {
+    border: 1px solid var(--surface-3);
+    border-radius: var(--radius-md);
+    background: var(--surface-1);
+    min-width: 2rem;
+    justify-content: center;
+}
+
 /* Create-vault modal: keep Cancel / Create Vault reachable without scrolling.
  *
  * By default a .modal-content caps at 90vh and scrolls as ONE block, so header, body and footer

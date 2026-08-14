@@ -138,7 +138,12 @@ const state = {
     // or null when the session is not a scoped temp cred (=> no extra button gating).
     tempVaultCaps: null,
     // Vaults-list view filter: 'all' | 'favorites'
-    vaultFilter: 'all'
+    vaultFilter: 'all',
+    // Vaults-list ordering. Hydrated from the account's saved preferences on login (falling back
+    // to localStorage), so it follows the user across browsers — see applyVaultOrderPrefs.
+    vaultSort: null,        // 'name' | 'size' | 'files' | 'created' | 'viewed'
+    vaultSortDir: null,     // 'asc' | 'desc'
+    vaultFavGroup: null,    // 'first' | 'last' | 'mixed'
 };
 
 state._loadRemembered();
@@ -1377,14 +1382,169 @@ function setupVaultsViewControls() {
     });
 }
 
+// ---- Vault-list ordering -------------------------------------------------------------------
+// Sorting is done here rather than server-side because GET /vaults already returns every field
+// involved, so re-ordering costs no request and the list never flickers through a refetch.
+
+const VAULT_SORT_KEYS = ['name', 'size', 'files', 'created', 'viewed'];
+const VAULT_FAV_GROUPS = ['first', 'last', 'mixed'];
+
+// Comparable value per sort key. Null means "no value" and is always ordered LAST regardless of
+// direction — a vault you have never opened is not the "most recently viewed" one, and flipping to
+// ascending should not float every never-viewed vault to the top.
+function vaultSortValue(v, key) {
+    switch (key) {
+        case 'size': return v.total_size_bytes == null ? null : Number(v.total_size_bytes);
+        case 'files': return v.file_count == null ? null : Number(v.file_count);
+        case 'created': {
+            const d = parseServerTime(v.created_at);
+            return d ? d.getTime() : null;
+        }
+        case 'viewed': {
+            const d = parseServerTime(v.last_viewed_at);
+            return d ? d.getTime() : null;
+        }
+        case 'name':
+        default:
+            return (v.name || '').toLowerCase();
+    }
+}
+
+// Order a COPY of the list. Stable: equal keys fall back to name and then id, so a re-render never
+// reshuffles rows that compare the same — Array.prototype.sort is only guaranteed stable for the
+// comparator's own equal cases, and "same size" is a very common tie here.
+function sortVaults(list, key, dir, favGroup) {
+    key = VAULT_SORT_KEYS.includes(key) ? key : 'name';
+    favGroup = VAULT_FAV_GROUPS.includes(favGroup) ? favGroup : 'first';
+    const sign = dir === 'desc' ? -1 : 1;
+
+    const cmpValues = (a, b) => {
+        if (typeof a === 'string' || typeof b === 'string') {
+            return String(a).localeCompare(String(b));
+        }
+        return a < b ? -1 : (a > b ? 1 : 0);
+    };
+
+    return list.slice().sort((x, y) => {
+        if (favGroup !== 'mixed') {
+            const fx = x.is_favorite ? 1 : 0;
+            const fy = y.is_favorite ? 1 : 0;
+            if (fx !== fy) return favGroup === 'first' ? fy - fx : fx - fy;
+        }
+        const vx = vaultSortValue(x, key);
+        const vy = vaultSortValue(y, key);
+        // Nulls are resolved BEFORE the direction is applied, or `* sign` would flip them to the
+        // front in descending order — putting every never-viewed vault above the ones you actually
+        // opened, which is the opposite of what "sort by last viewed" should ever show.
+        if (vx === null || vy === null) {
+            if (vx !== null || vy !== null) return vx === null ? 1 : -1;
+        } else {
+            const primary = cmpValues(vx, vy);
+            if (primary !== 0) return primary * sign;
+        }
+        // Deterministic tie-breaks, NOT multiplied by `sign`: flipping direction should not also
+        // reshuffle rows that were already equal on the sort key.
+        const byName = String(x.name || '').localeCompare(String(y.name || ''));
+        if (byName !== 0) return byName;
+        return String(x.id).localeCompare(String(y.id));
+    });
+}
+
+// Read the persisted ordering out of a server preferences payload, falling back to localStorage.
+//
+// The fallback covers a never-configured account and the window before the preferences fetch
+// resolves. It deliberately does NOT override a stored server value — so if a write fails, the
+// choice survives in this tab but is lost at the next login. Making the local copy win would
+// require versioning the two against each other; noted rather than silently implied.
+function applyVaultOrderPrefs(prefs) {
+    const pick = (value, allowed, fallbackKey, dflt) => {
+        if (typeof value === 'string' && allowed.includes(value)) return value;
+        try {
+            const local = localStorage.getItem(fallbackKey);
+            if (local && allowed.includes(local)) return local;
+        } catch (_) { /* storage blocked */ }
+        return dflt;
+    };
+    const p = prefs || {};
+    state.vaultSort = pick(p.vault_sort, VAULT_SORT_KEYS, 'vaultSort', 'name');
+    state.vaultSortDir = pick(p.vault_sort_dir, ['asc', 'desc'], 'vaultSortDir', 'asc');
+    state.vaultFavGroup = pick(p.vault_fav_group, VAULT_FAV_GROUPS, 'vaultFavGroup', 'first');
+}
+
+// Persist to the account, and to localStorage as an immediate local fallback. Best-effort: an
+// ordering preference is not worth surfacing an error toast for.
+//
+// Debounced, because changing key, direction and grouping in quick succession would otherwise fire
+// three PUTs carrying the whole triple. The server merges under a row lock so nothing is lost
+// there, but the requests can still land out of order and let an earlier one overwrite the newer
+// choice.
+let _vaultOrderPersistTimer = null;
+function persistVaultOrderPrefs() {
+    if (_vaultOrderPersistTimer) clearTimeout(_vaultOrderPersistTimer);
+    _vaultOrderPersistTimer = setTimeout(_persistVaultOrderPrefsNow, 250);
+}
+
+function _persistVaultOrderPrefsNow() {
+    _vaultOrderPersistTimer = null;
+    try {
+        localStorage.setItem('vaultSort', state.vaultSort);
+        localStorage.setItem('vaultSortDir', state.vaultSortDir);
+        localStorage.setItem('vaultFavGroup', state.vaultFavGroup);
+    } catch (_) { /* storage blocked */ }
+    apiRequest('/users/me/preferences', {
+        method: 'PUT',
+        body: JSON.stringify({
+            vault_sort: state.vaultSort,
+            vault_sort_dir: state.vaultSortDir,
+            vault_fav_group: state.vaultFavGroup,
+        }),
+        silent: true,
+    }).catch(() => { /* the local fallback already holds this browser's choice */ });
+}
+
+// Reflect state into the controls and wire them exactly once.
+function setupVaultSortControls() {
+    const sortEl = document.getElementById('vault-sort');
+    const dirEl = document.getElementById('vault-sort-dir');
+    const favEl = document.getElementById('vault-fav-group');
+    if (!sortEl || !dirEl || !favEl) return;
+
+    if (!state.vaultSort) applyVaultOrderPrefs(null);
+    sortEl.value = state.vaultSort;
+    favEl.value = state.vaultFavGroup;
+    const asc = state.vaultSortDir !== 'desc';
+    dirEl.dataset.dir = asc ? 'asc' : 'desc';
+    dirEl.textContent = asc ? '↑' : '↓';
+    dirEl.title = asc ? 'Ascending' : 'Descending';
+    dirEl.setAttribute('aria-label', asc ? 'Sort ascending' : 'Sort descending');
+
+    if (state._vaultSortWired) return;
+    state._vaultSortWired = true;
+    const onChange = () => {
+        state.vaultSort = sortEl.value;
+        state.vaultFavGroup = favEl.value;
+        persistVaultOrderPrefs();
+        renderVaults();
+    };
+    sortEl.addEventListener('change', onChange);
+    favEl.addEventListener('change', onChange);
+    dirEl.addEventListener('click', () => {
+        state.vaultSortDir = state.vaultSortDir === 'desc' ? 'asc' : 'desc';
+        persistVaultOrderPrefs();
+        renderVaults();
+    });
+}
+
 function renderVaults() {
     const container = document.getElementById('vaults-list');
     if (!container) return;
     applyVaultsView();
     setupVaultsViewControls();
+    setupVaultSortControls();
     const all = state.allVaults || [];
     const favOnly = state.vaultFilter === 'favorites';
-    const vaults = favOnly ? all.filter(v => v.is_favorite) : all;
+    const filtered = favOnly ? all.filter(v => v.is_favorite) : all;
+    const vaults = sortVaults(filtered, state.vaultSort, state.vaultSortDir, state.vaultFavGroup);
 
     const allBtn = document.getElementById('vault-filter-all');
     const favBtn = document.getElementById('vault-filter-fav');
@@ -8780,7 +8940,13 @@ function startVaultAccessWatch(vaultId) {
         if (!view || !view.classList.contains('active')) return;
         try {
             const resp = await fetch(`${API_BASE}/vaults/${vaultId}`, {
-                headers: { 'Authorization': `Bearer ${authToken}` }
+                headers: {
+                    'Authorization': `Bearer ${authToken}`,
+                    // This is a liveness probe, not the user opening the vault. Without the marker
+                    // a vault left open in a background tab would re-stamp its own "last viewed"
+                    // three times a minute and sit permanently at the top of that ordering.
+                    'X-Access-Check': '1',
+                }
             });
             if (resp.status === 403 || resp.status === 404) {
                 clearInterval(state.accessCheckInterval);
@@ -11373,6 +11539,10 @@ async function applyServerPreferences() {
         prefs = await resp.json();
     } catch (_) { return false; }
     if (!prefs || typeof prefs !== 'object') return false;
+
+    // Vault-list ordering. Applied before any early-return below so the list is ordered the
+    // account's way on first paint rather than jumping after a later refresh.
+    applyVaultOrderPrefs(prefs);
 
     // Per-user "never remember my vault password" preference (stored as 'on'/'off'). Apply it
     // before any early-return below so the opt-out always takes effect.

@@ -143,6 +143,28 @@ vault_favorites = Table(
 )
 
 
+# When each user last OPENED each vault, so the list can be ordered by "last viewed by me".
+#
+# Deliberately separate from Vault.last_accessed, which is one column recording the last access by
+# ANYONE. On a shared vault that is a different question with a different answer, and it cannot
+# express "the one I looked at yesterday" for the person asking.
+#
+# A whole new TABLE rather than a column on vaults, because init_db() only runs create_all(), which
+# creates missing tables but never ALTERs existing ones — so a new table migrates onto an
+# already-deployed vault for free, whereas a new column would need a hand-written ALTER.
+#
+# Rows are personal data about one user's activity: every read is filtered to the requesting user,
+# and both foreign keys cascade so deleting either the user or the vault takes the history with it.
+vault_views = Table(
+    'vault_views',
+    Base.metadata,
+    Column('user_id', UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), primary_key=True),
+    Column('vault_id', UUID(as_uuid=True), ForeignKey('vaults.id', ondelete='CASCADE'), primary_key=True),
+    Column('viewed_at', DateTime, nullable=False, default=datetime.utcnow),
+)
+
+
+
 class User(Base):
     """User model for authentication and authorization."""
     __tablename__ = 'users'
