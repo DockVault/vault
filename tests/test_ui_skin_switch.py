@@ -194,16 +194,10 @@ def test_console_keeps_theme_accent_and_background_axes(logged_in: Page):
     if page.get_attribute("html", "data-theme") != "light":
         page.click("#theme-toggle")
     assert page.get_attribute("html", "data-theme") == "light"
-    light_bg = page.evaluate("getComputedStyle(document.body).backgroundColor")
+    light_bg = _settled_body_colour(page)
     page.click("#theme-toggle")
     assert page.get_attribute("html", "data-theme") == "dark"
-    # Wait out the background-color transition before comparing (getComputedStyle
-    # returns the mid-transition value otherwise).
-    page.wait_for_function(
-        "prev => getComputedStyle(document.body).backgroundColor !== prev",
-        arg=light_bg, timeout=3000,
-    )
-    dark_bg = page.evaluate("getComputedStyle(document.body).backgroundColor")
+    dark_bg = _settled_body_colour(page)
     assert dark_bg != light_bg
 
     # Accent picker: choosing indigo re-tints the brand token.
@@ -216,13 +210,14 @@ def test_console_keeps_theme_accent_and_background_axes(logged_in: Page):
     assert brand == "#818cf8"  # v2 dark indigo
 
     # Background picker: navy retints the surface ramp.
+    # Both samples must be SETTLED values. Waiting only for "different from the previous sample"
+    # made this pass vacuously: dark_bg was captured mid-ramp, so the dark transition moved past
+    # it on its own and the wait was already satisfied before navy did anything — meaning this
+    # assertion held even if [data-bg="navy"] had no CSS ramp at all, which is the exact defect
+    # test_every_background_swatch_retints_the_page exists to catch.
     page.click('.bg-swatch[data-bg="navy"]')
     assert page.get_attribute("html", "data-bg") == "navy"
-    page.wait_for_function(
-        "prev => getComputedStyle(document.body).backgroundColor !== prev",
-        arg=dark_bg, timeout=3000,
-    )
-    navy_bg = page.evaluate("getComputedStyle(document.body).backgroundColor")
+    navy_bg = _settled_body_colour(page)
     assert navy_bg != dark_bg
 
     # All axes persist together with the skin across a reload.
@@ -233,6 +228,38 @@ def test_console_keeps_theme_accent_and_background_axes(logged_in: Page):
     expect(html).to_have_attribute("data-theme", "dark")
     expect(html).to_have_attribute("data-accent", "indigo")
     expect(html).to_have_attribute("data-bg", "navy")
+
+
+def _settled_body_colour(page: Page, timeout: int = 5000) -> str:
+    """The body background colour once its transition has FINISHED.
+
+    The previous approach waited only until the colour differed from the previous swatch's, which
+    is not the same thing: the ramp is animated, so on a loaded machine that returns an
+    intermediate frame. Two swatches with different targets can pass through the same intermediate
+    value on the way, and the test then reports them as rendering identically — which is exactly
+    how this failed in CI, claiming navy and forest collided at a colour that is neither of them.
+
+    Sampling until the value stops changing is stable however slow the machine is: a transition in
+    progress moves between samples, a finished one repeats.
+
+    Polled on a timer rather than through requestAnimationFrame. Headless Chromium throttles or
+    suspends animation frames when the page is not visible, so an rAF-driven wait resolves late or
+    not at all depending on load — which would trade one flake for another.
+    """
+    page.evaluate("() => { window.__bgSamples = []; }")
+    page.wait_for_function(
+        """() => {
+             const s = window.__bgSamples;
+             s.push(getComputedStyle(document.body).backgroundColor);
+             const n = s.length;
+             // Three equal samples at the polling interval below: a transition in progress moves
+             // between them, a finished one repeats.
+             return n >= 3 && s[n - 1] === s[n - 2] && s[n - 2] === s[n - 3];
+           }""",
+        polling=100,
+        timeout=timeout,
+    )
+    return page.evaluate("() => getComputedStyle(document.body).backgroundColor")
 
 
 def test_every_background_swatch_retints_the_page(logged_in: Page):
@@ -258,23 +285,12 @@ def test_every_background_swatch_retints_the_page(logged_in: Page):
     )
 
     seen = {}
-    for i, name in enumerate(names):
-        prev = page.evaluate("getComputedStyle(document.body).backgroundColor")
+    for name in names:
         page.click(f'.bg-swatch[data-bg="{name}"]')
         assert page.get_attribute("html", "data-bg") == (
             None if name == "slate" else name
         )
-        # The ramp is applied via CSS custom properties on <html>; wait out the
-        # body background-color transition before sampling. The first option may
-        # already be the active one, so nothing would change for it.
-        if i > 0:
-            page.wait_for_function(
-                "prev => getComputedStyle(document.body).backgroundColor !== prev",
-                arg=prev, timeout=3000,
-            )
-        seen[name] = page.evaluate(
-            "getComputedStyle(document.body).backgroundColor"
-        )
+        seen[name] = _settled_body_colour(page)
 
     by_colour = {}
     for name, colour in seen.items():
