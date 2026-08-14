@@ -138,7 +138,12 @@ const state = {
     // or null when the session is not a scoped temp cred (=> no extra button gating).
     tempVaultCaps: null,
     // Vaults-list view filter: 'all' | 'favorites'
-    vaultFilter: 'all'
+    vaultFilter: 'all',
+    // Vaults-list ordering. Hydrated from the account's saved preferences on login (falling back
+    // to localStorage), so it follows the user across browsers — see applyVaultOrderPrefs.
+    vaultSort: null,        // 'name' | 'size' | 'files' | 'created' | 'viewed'
+    vaultSortDir: null,     // 'asc' | 'desc'
+    vaultFavGroup: null,    // 'first' | 'last' | 'mixed'
 };
 
 state._loadRemembered();
@@ -898,6 +903,12 @@ function updateProfileUI(user) {
     // just revealed admin sidebar items — re-hide them in the SAME synchronous pass
     // (before any repaint) so they never flash on screen.
     hideAdminNavForTempSession();
+
+    // Settle the dashboard's admin-only content in the same synchronous pass, for the same
+    // reason. Both login paths call this before the dashboard screen is revealed, so the card
+    // is already in its final state on the first paint rather than appearing and vanishing
+    // when loadDashboardStats() later resolves.
+    applyDashboardAdminGating();
 }
 
 // Login
@@ -1101,7 +1112,9 @@ async function loadDashboardStats() {
             }
         }
         
-        // Update system status
+        // Update system status (the gating also runs at profile-render time, before first paint;
+        // repeating it here keeps the card correct if the dashboard is re-entered later.)
+        applyDashboardAdminGating();
         updateSystemStatus();
         
     } catch (error) {
@@ -1182,8 +1195,38 @@ async function loadRecentEvents() {
     }
 }
 
+// Who may see the dashboard's System Status card.
+//
+// A scoped temporary credential authenticates AS its owning account, so its role is the owner's
+// role — an admin-minted one reads as 'admin' here. Exclude it explicitly, the same way the
+// sidebar does (hideAdminNavForTempSession), or a temp session inherits the owner's view.
+function canSeeSystemStatus() {
+    return !!(currentUser && currentUser.role === 'admin' && !isScopedTemp);
+}
+
+// Show/hide the System Status card and reflow the row it sits in.
+//
+// Both branches are set explicitly rather than only hiding, because the same tab can move between
+// accounts (log out and back in, or a session restore) and a one-way toggle would strand the
+// previous account's layout. The grid's own default is the single-column, card-hidden state, so
+// the reveal is the exception and any failure leaves the safe layout in place.
+//
+// Note this is presentation only. GET /health is deliberately unauthenticated — it answers from a
+// fixed vocabulary with no paths or capacities — so hiding the card removes clutter a non-admin
+// cannot act on. It is not a confidentiality boundary and must not be described as one.
+function applyDashboardAdminGating() {
+    const card = document.getElementById('dashboard-system-status');
+    const grid = document.getElementById('dashboard-lower-grid');
+    const show = canSeeSystemStatus();
+    if (card) card.style.display = show ? '' : 'none';
+    if (grid) grid.style.gridTemplateColumns = show ? '2fr 1fr' : '1fr';
+}
+
 // Update system status indicators
 async function updateSystemStatus() {
+    // Don't fire the request for someone who cannot see the result: a pointless round trip whose
+    // only visible effect would be console noise.
+    if (!canSeeSystemStatus()) return;
     const setBadge = (id, ok, okText, badText, badClass = 'badge-error') => {
         const el = document.getElementById(id);
         if (!el) return;
@@ -1339,14 +1382,169 @@ function setupVaultsViewControls() {
     });
 }
 
+// ---- Vault-list ordering -------------------------------------------------------------------
+// Sorting is done here rather than server-side because GET /vaults already returns every field
+// involved, so re-ordering costs no request and the list never flickers through a refetch.
+
+const VAULT_SORT_KEYS = ['name', 'size', 'files', 'created', 'viewed'];
+const VAULT_FAV_GROUPS = ['first', 'last', 'mixed'];
+
+// Comparable value per sort key. Null means "no value" and is always ordered LAST regardless of
+// direction — a vault you have never opened is not the "most recently viewed" one, and flipping to
+// ascending should not float every never-viewed vault to the top.
+function vaultSortValue(v, key) {
+    switch (key) {
+        case 'size': return v.total_size_bytes == null ? null : Number(v.total_size_bytes);
+        case 'files': return v.file_count == null ? null : Number(v.file_count);
+        case 'created': {
+            const d = parseServerTime(v.created_at);
+            return d ? d.getTime() : null;
+        }
+        case 'viewed': {
+            const d = parseServerTime(v.last_viewed_at);
+            return d ? d.getTime() : null;
+        }
+        case 'name':
+        default:
+            return (v.name || '').toLowerCase();
+    }
+}
+
+// Order a COPY of the list. Stable: equal keys fall back to name and then id, so a re-render never
+// reshuffles rows that compare the same — Array.prototype.sort is only guaranteed stable for the
+// comparator's own equal cases, and "same size" is a very common tie here.
+function sortVaults(list, key, dir, favGroup) {
+    key = VAULT_SORT_KEYS.includes(key) ? key : 'name';
+    favGroup = VAULT_FAV_GROUPS.includes(favGroup) ? favGroup : 'first';
+    const sign = dir === 'desc' ? -1 : 1;
+
+    const cmpValues = (a, b) => {
+        if (typeof a === 'string' || typeof b === 'string') {
+            return String(a).localeCompare(String(b));
+        }
+        return a < b ? -1 : (a > b ? 1 : 0);
+    };
+
+    return list.slice().sort((x, y) => {
+        if (favGroup !== 'mixed') {
+            const fx = x.is_favorite ? 1 : 0;
+            const fy = y.is_favorite ? 1 : 0;
+            if (fx !== fy) return favGroup === 'first' ? fy - fx : fx - fy;
+        }
+        const vx = vaultSortValue(x, key);
+        const vy = vaultSortValue(y, key);
+        // Nulls are resolved BEFORE the direction is applied, or `* sign` would flip them to the
+        // front in descending order — putting every never-viewed vault above the ones you actually
+        // opened, which is the opposite of what "sort by last viewed" should ever show.
+        if (vx === null || vy === null) {
+            if (vx !== null || vy !== null) return vx === null ? 1 : -1;
+        } else {
+            const primary = cmpValues(vx, vy);
+            if (primary !== 0) return primary * sign;
+        }
+        // Deterministic tie-breaks, NOT multiplied by `sign`: flipping direction should not also
+        // reshuffle rows that were already equal on the sort key.
+        const byName = String(x.name || '').localeCompare(String(y.name || ''));
+        if (byName !== 0) return byName;
+        return String(x.id).localeCompare(String(y.id));
+    });
+}
+
+// Read the persisted ordering out of a server preferences payload, falling back to localStorage.
+//
+// The fallback covers a never-configured account and the window before the preferences fetch
+// resolves. It deliberately does NOT override a stored server value — so if a write fails, the
+// choice survives in this tab but is lost at the next login. Making the local copy win would
+// require versioning the two against each other; noted rather than silently implied.
+function applyVaultOrderPrefs(prefs) {
+    const pick = (value, allowed, fallbackKey, dflt) => {
+        if (typeof value === 'string' && allowed.includes(value)) return value;
+        try {
+            const local = localStorage.getItem(fallbackKey);
+            if (local && allowed.includes(local)) return local;
+        } catch (_) { /* storage blocked */ }
+        return dflt;
+    };
+    const p = prefs || {};
+    state.vaultSort = pick(p.vault_sort, VAULT_SORT_KEYS, 'vaultSort', 'name');
+    state.vaultSortDir = pick(p.vault_sort_dir, ['asc', 'desc'], 'vaultSortDir', 'asc');
+    state.vaultFavGroup = pick(p.vault_fav_group, VAULT_FAV_GROUPS, 'vaultFavGroup', 'first');
+}
+
+// Persist to the account, and to localStorage as an immediate local fallback. Best-effort: an
+// ordering preference is not worth surfacing an error toast for.
+//
+// Debounced, because changing key, direction and grouping in quick succession would otherwise fire
+// three PUTs carrying the whole triple. The server merges under a row lock so nothing is lost
+// there, but the requests can still land out of order and let an earlier one overwrite the newer
+// choice.
+let _vaultOrderPersistTimer = null;
+function persistVaultOrderPrefs() {
+    if (_vaultOrderPersistTimer) clearTimeout(_vaultOrderPersistTimer);
+    _vaultOrderPersistTimer = setTimeout(_persistVaultOrderPrefsNow, 250);
+}
+
+function _persistVaultOrderPrefsNow() {
+    _vaultOrderPersistTimer = null;
+    try {
+        localStorage.setItem('vaultSort', state.vaultSort);
+        localStorage.setItem('vaultSortDir', state.vaultSortDir);
+        localStorage.setItem('vaultFavGroup', state.vaultFavGroup);
+    } catch (_) { /* storage blocked */ }
+    apiRequest('/users/me/preferences', {
+        method: 'PUT',
+        body: JSON.stringify({
+            vault_sort: state.vaultSort,
+            vault_sort_dir: state.vaultSortDir,
+            vault_fav_group: state.vaultFavGroup,
+        }),
+        silent: true,
+    }).catch(() => { /* the local fallback already holds this browser's choice */ });
+}
+
+// Reflect state into the controls and wire them exactly once.
+function setupVaultSortControls() {
+    const sortEl = document.getElementById('vault-sort');
+    const dirEl = document.getElementById('vault-sort-dir');
+    const favEl = document.getElementById('vault-fav-group');
+    if (!sortEl || !dirEl || !favEl) return;
+
+    if (!state.vaultSort) applyVaultOrderPrefs(null);
+    sortEl.value = state.vaultSort;
+    favEl.value = state.vaultFavGroup;
+    const asc = state.vaultSortDir !== 'desc';
+    dirEl.dataset.dir = asc ? 'asc' : 'desc';
+    dirEl.textContent = asc ? '↑' : '↓';
+    dirEl.title = asc ? 'Ascending' : 'Descending';
+    dirEl.setAttribute('aria-label', asc ? 'Sort ascending' : 'Sort descending');
+
+    if (state._vaultSortWired) return;
+    state._vaultSortWired = true;
+    const onChange = () => {
+        state.vaultSort = sortEl.value;
+        state.vaultFavGroup = favEl.value;
+        persistVaultOrderPrefs();
+        renderVaults();
+    };
+    sortEl.addEventListener('change', onChange);
+    favEl.addEventListener('change', onChange);
+    dirEl.addEventListener('click', () => {
+        state.vaultSortDir = state.vaultSortDir === 'desc' ? 'asc' : 'desc';
+        persistVaultOrderPrefs();
+        renderVaults();
+    });
+}
+
 function renderVaults() {
     const container = document.getElementById('vaults-list');
     if (!container) return;
     applyVaultsView();
     setupVaultsViewControls();
+    setupVaultSortControls();
     const all = state.allVaults || [];
     const favOnly = state.vaultFilter === 'favorites';
-    const vaults = favOnly ? all.filter(v => v.is_favorite) : all;
+    const filtered = favOnly ? all.filter(v => v.is_favorite) : all;
+    const vaults = sortVaults(filtered, state.vaultSort, state.vaultSortDir, state.vaultFavGroup);
 
     const allBtn = document.getElementById('vault-filter-all');
     const favBtn = document.getElementById('vault-filter-fav');
@@ -1980,6 +2178,42 @@ function syncCreateVaultForm() {
     if (hierWrap) hierWrap.style.display = isZk ? '' : 'none';
 }
 
+// The create-vault size hint, with the "you can change this later" clause only for a reader who
+// actually will be able to.
+//
+// Changing a vault's size limit afterwards is PATCH /vaults/{id}/settings — NOT PATCH /vaults/{id},
+// which only edits name and description and merely echoes size_limit back. That endpoint is gated
+// by the VAULT_SETTINGS group, the vault.change_expiry cap, and an OWNER-ONLY check with no admin
+// arm: a non-owning administrator cannot change someone else's vault size. Here that last check is
+// satisfied by construction, because whoever creates the vault becomes its owner. So for this
+// dialog VAULT_SETTINGS is the whole question, and hasPermission() already returns true for an
+// admin.
+//
+// Worth knowing before "tightening" this: VAULT_SETTINGS is a role default for BOTH `user` and
+// `admin` (app/core/api_catalog.py), exactly like VAULT_CREATE. So on a default deployment every
+// account that can reach this dialog can also change the limit later, and the clause is simply
+// true for them. It is withheld only where an administrator has deliberately revoked the group —
+// which is the case this exists for. Making the clause admin-only would hide a true and useful
+// statement from ordinary users.
+//
+// A scoped temporary credential is never promised "later", whatever its owner's groups say. It
+// authenticates AS the owning account, so hasPermission() would report the OWNER's authority
+// rather than the credential's — the same trap the action buttons avoid by testing scope caps
+// instead (see updateActionButtonPermissions). Rather than reproduce that per-vault cap lookup for
+// a vault that does not exist yet, the promise is simply withheld: the credential expires, so a
+// claim about what its holder may do later is one this dialog cannot honestly make.
+//
+// The static copy in index.html is the WITHOUT-clause variant, so the promise is added by this
+// function rather than rendered and then withdrawn.
+const _SIZE_HINT_BASE = 'The most this vault may hold. Default 1 GB.';
+const _SIZE_HINT_EDITABLE =
+    "The most this vault may hold. Default 1 GB; you can change it later in the vault's policies.";
+
+function createVaultSizeHintBase() {
+    if (isScopedTemp) return _SIZE_HINT_BASE;
+    return hasPermission('VAULT_SETTINGS') ? _SIZE_HINT_EDITABLE : _SIZE_HINT_BASE;
+}
+
 // Create Vault Modal
 async function fetchAccountStorage(excludeVaultId) {
     const qs = excludeVaultId ? `?exclude_vault_id=${encodeURIComponent(excludeVaultId)}` : '';
@@ -2032,6 +2266,16 @@ async function renderVaultSizeAvailability(noteId, inputEl, excludeVaultId, base
 }
 
 async function showCreateVault() {
+    // Clear whatever a previous, abandoned open left behind. Only a SUCCESSFUL create reset the
+    // form, so cancelling and reopening used to show the old name, description and password.
+    // reset() restores the markup defaults (including size = 1 GB), so it has to run before the
+    // explicit field setup below rather than after it.
+    //
+    // This matters more now the description is one row tall: stale text that used to be obvious
+    // in a three-row box can sit mostly out of sight in a one-row one.
+    const form = document.getElementById('create-vault-form');
+    if (form) form.reset();
+
     // The zero-knowledge option is only offered when the deployment enables it.
     const grp = document.getElementById('vault-type-group');
     const sel = document.getElementById('vault-type');
@@ -2093,8 +2337,7 @@ async function showCreateVault() {
     // Reset the size to the 1 GB default + surface how much the account can still allocate.
     const sizeInput = document.getElementById('vault-size-gb');
     if (sizeInput) sizeInput.value = '1';
-    renderVaultSizeAvailability('vault-size-avail', sizeInput, null,
-        'The most this vault may hold. Default 1 GB; changeable later in policies.');
+    renderVaultSizeAvailability('vault-size-avail', sizeInput, null, createVaultSizeHintBase());
 
     // Reflect the resolved type into password + team-mode visibility, then show.
     syncCreateVaultForm();
@@ -5044,6 +5287,12 @@ async function loadLogSettings() {
     const note = document.getElementById('log-ceiling-note');
     const genBtn = document.getElementById('log-token-generate-btn');
     const anyEnabled = (data.components || []).some(c => (data.flags || {})[c]);
+    // Components the admin has TICKED that are serveable but have no writer. Restricted to the
+    // serveable set on purpose: db-diag/redis-diag 404 for a different reason entirely, and
+    // blaming the deployment shape for those would send an admin down the wrong path.
+    const sinkMap = data.sink_available || {};
+    const uncollected = (data.serveable || []).filter(
+        c => (data.flags || {})[c] && !sinkMap[c]);
     if (note) {
         if (!data.ceiling) {
             // Self-host-correct guidance: the endpoint 404s until BOTH env vars are set. Don't
@@ -5057,15 +5306,41 @@ async function loadLogSettings() {
             note.textContent = 'The endpoint is enabled, but no component is exposed to /logs yet — '
                 + 'tick Web (and/or SFTP) below and a token scoped to it will return logs.';
             note.style.display = '';
+        } else if (uncollected.length) {
+            // The third reason, and the only one that does NOT surface as a 404: every gate
+            // passes, the request succeeds, and the answer is an empty list — because nothing is
+            // writing that component's lines. Named per component, because the two differ: the
+            // whole deployment shape can lack a writer, or SFTP alone can, when the launcher runs
+            // without it. Saying "web and sftp" when only one is affected sends an admin looking
+            // in the wrong place.
+            const which = uncollected.length > 1
+                ? uncollected.join(' and ') + ' logs are'
+                : uncollected[0] + ' logs are';
+            note.textContent = which + ' not being collected in this deployment, so a token scoped '
+                + 'to it returns no new lines rather than an error. Lines are collected only by the '
+                + 'combined launcher — a deployment that starts the API directly, such as the '
+                + 'development stack or the "split" profile, collects nothing, and SFTP lines are '
+                + 'collected only when SFTP runs in the same container. Note a pull may still '
+                + 'return older lines left in the log volume by a previous configuration.';
+            note.style.display = '';
         } else {
             note.style.display = 'none';
         }
     }
     if (genBtn) {
-        // Don't let an admin mint a token + copy a curl for an endpoint that can only 404.
-        genBtn.disabled = !data.ceiling;
-        genBtn.title = data.ceiling ? '' : 'Enable the log endpoint first (see the note above).';
-        if (!data.ceiling) toggleLogTokenGenerate(false);  // collapse the mint panel if it was open
+        // Don't let an admin mint a token + copy a curl that cannot work — whether because the
+        // endpoint 404s (no ceiling / nothing ticked) or because it answers 200 with nothing.
+        // The title must name the SAME reason the note shows, or it points at a message that
+        // isn't there.
+        // Deliberately NOT gated on "no component ticked": minting before ticking one has always
+        // been allowed (the note nudges instead), and a token minted now works as soon as the
+        // component is switched on. Blocking it would be a behaviour change beyond this fix.
+        let why = '';
+        if (!data.ceiling) why = 'Enable the log endpoint first (see the note above).';
+        else if (uncollected.length) why = 'This deployment does not collect those logs (see the note above).';
+        genBtn.disabled = !!why;
+        genBtn.title = why;
+        if (why) toggleLogTokenGenerate(false);  // collapse the mint panel if it was open
     }
     renderLogFlags(data);
     const stealth = document.getElementById('log-stealth-toggle');
@@ -8697,7 +8972,13 @@ function startVaultAccessWatch(vaultId) {
         if (!view || !view.classList.contains('active')) return;
         try {
             const resp = await fetch(`${API_BASE}/vaults/${vaultId}`, {
-                headers: { 'Authorization': `Bearer ${authToken}` }
+                headers: {
+                    'Authorization': `Bearer ${authToken}`,
+                    // This is a liveness probe, not the user opening the vault. Without the marker
+                    // a vault left open in a background tab would re-stamp its own "last viewed"
+                    // three times a minute and sit permanently at the top of that ordering.
+                    'X-Access-Check': '1',
+                }
             });
             if (resp.status === 403 || resp.status === 404) {
                 clearInterval(state.accessCheckInterval);
@@ -11290,6 +11571,10 @@ async function applyServerPreferences() {
         prefs = await resp.json();
     } catch (_) { return false; }
     if (!prefs || typeof prefs !== 'object') return false;
+
+    // Vault-list ordering. Applied before any early-return below so the list is ordered the
+    // account's way on first paint rather than jumping after a later refresh.
+    applyVaultOrderPrefs(prefs);
 
     // Per-user "never remember my vault password" preference (stored as 'on'/'off'). Apply it
     // before any early-return below so the opt-out always takes effect.

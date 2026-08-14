@@ -315,8 +315,13 @@
                         </div>
                     </div>
 
-                    <!-- Recent Events and System Status -->
-                    <div class="grid" style="grid-template-columns: 2fr 1fr; gap: var(--space-md);">
+                    <!-- Recent Events and System Status.
+                         System Status is administrator-only. It starts hidden and the grid starts
+                         as a single full-width column, so a non-admin never sees it even for one
+                         frame; applyDashboardAdminGating() restores the two-column layout for an
+                         administrator. Failing closed here means a JS error leaves the card hidden
+                         rather than exposed. -->
+                    <div id="dashboard-lower-grid" class="grid" style="grid-template-columns: 1fr; gap: var(--space-md);">
                         <!-- Recent Events -->
                         <div class="card">
                             <div class="card-header">
@@ -331,8 +336,8 @@
                             </div>
                         </div>
 
-                        <!-- System Status -->
-                        <div class="card">
+                        <!-- System Status (administrator-only; revealed by applyDashboardAdminGating) -->
+                        <div class="card" id="dashboard-system-status" style="display: none;">
                             <div class="card-header">
                                 <h3 class="text-xl font-bold"><svg class="icon"><use href="#i-shield"/></svg> System Status</h3>
                             </div>
@@ -364,6 +369,29 @@
                             <div class="seg-filter" role="group" aria-label="Filter vaults">
                                 <button id="vault-filter-all" class="seg-btn active" type="button">All</button>
                                 <button id="vault-filter-fav" class="seg-btn" type="button"><svg class="icon icon-sm"><use href="#i-star"/></svg> Favorites</button>
+                            </div>
+                            <!-- Ordering: sort key, direction, and where favourites sit. Grouped
+                                 with the existing filter/view segments rather than added as loose
+                                 buttons, so the toolbar stays one cluster of related controls. -->
+                            <!-- The selects carry aria-label rather than a visually-hidden <label>:
+                                 there is no .sr-only helper in either skin, so such a label would
+                                 simply render. -->
+                            <div class="vault-sort-group" role="group" aria-label="Sort vaults">
+                                <select id="vault-sort" class="vault-sort-select" aria-label="Sort vaults by">
+                                    <option value="name">Name</option>
+                                    <option value="size">Size used</option>
+                                    <option value="files">Files</option>
+                                    <option value="created">Created</option>
+                                    <option value="viewed">Last viewed by me</option>
+                                </select>
+                                <button id="vault-sort-dir" class="seg-btn vault-sort-dir" type="button"
+                                        aria-label="Sort ascending" title="Ascending"
+                                        data-dir="asc">&#8593;</button>
+                                <select id="vault-fav-group" class="vault-sort-select" aria-label="Where favorites appear">
+                                    <option value="first">Favorites first</option>
+                                    <option value="last">Favorites last</option>
+                                    <option value="mixed">Favorites mixed in</option>
+                                </select>
                             </div>
                             <div class="seg-filter" role="group" aria-label="Vault view">
                                 <button id="vaults-view-grid" class="seg-btn active" type="button" data-vaults-view="grid" title="Grid view" aria-label="Grid view"><svg class="icon icon-sm"><use href="#i-grid"/></svg></button>
@@ -1791,12 +1819,19 @@
                                 </div>
                                 <div class="form-group">
                                     <label for="vault-desc">Description</label>
-                                    <textarea id="vault-desc" class="form-control" rows="3"></textarea>
+                                    <!-- One row by default so the dialog stays short enough to show its
+                                         buttons; still a textarea, so newlines work and it can be
+                                         dragged taller (see #create-vault-modal #vault-desc). -->
+                                    <textarea id="vault-desc" class="form-control" rows="1"></textarea>
                                 </div>
                                 <div class="form-group">
                                     <label for="vault-size-gb">Maximum size (GB)</label>
                                     <input type="number" id="vault-size-gb" class="form-control" min="0.1" step="0.1" value="1">
-                                    <small class="form-help" id="vault-size-avail">The most this vault may hold. Default 1 GB; you can change it later in the vault's policies.</small>
+                                    <!-- Deliberately the WITHOUT-clause wording: the "you can change
+                                         it later" promise is added by createVaultSizeHintBase() only
+                                         for a reader who holds VAULT_SETTINGS, so it is never shown
+                                         here and then withdrawn a moment later. -->
+                                    <small class="form-help" id="vault-size-avail">The most this vault may hold. Default 1 GB.</small>
                                 </div>
                                 <!-- The top-level vault password is a web access gate for STANDARD
                                      vaults only; zero-knowledge vaults are unlocked by the browser-side

@@ -424,6 +424,108 @@
     justify-content: flex-end;
 }
 
+/* Vault-list ordering controls — sort key, direction, favourites placement.
+ *
+ * Styled here in the shared base, not per skin, so both skins get the same cluster: the two skins
+ * each define .seg-filter/.seg-btn separately and duplicating a third group in both would drift.
+ * The direction toggle reuses .seg-btn (defined by whichever skin is active) so it matches the
+ * neighbouring segmented controls without restating their colours here.
+ */
+.vault-sort-group {
+    display: inline-flex;
+    align-items: stretch;
+    gap: var(--space-xs, .25rem);
+}
+.vault-sort-select {
+    padding: .4rem .55rem;
+    font-size: .82rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    background: var(--surface-1);
+    border: 1px solid var(--surface-3);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    max-width: 12rem;
+}
+.vault-sort-select:hover { color: var(--text-primary); }
+/* The direction arrow is a glyph, not an icon sprite, so give it a predictable square footprint
+   instead of inheriting the text-width of an arrow character.
+   Selector is `button.vault-sort-dir` (0,1,1) on purpose: this file loads BEFORE both skin sheets,
+   and .seg-btn there declares `border: 0; background: transparent` at the same (0,1,0) specificity,
+   so a bare .vault-sort-dir loses the tie and the button renders borderless next to two bordered
+   selects — the opposite of the grouping intended here. */
+button.vault-sort-dir {
+    border: 1px solid var(--surface-3);
+    border-radius: var(--radius-md);
+    background: var(--surface-1);
+    min-width: 2rem;
+    justify-content: center;
+}
+
+/* Create-vault modal: keep Cancel / Create Vault reachable without scrolling.
+ *
+ * By default a .modal-content caps at 90vh and scrolls as ONE block, so header, body and footer
+ * scroll together and a tall form pushes the buttons out of view. That is what happens here once
+ * the vault-type chooser is shown (zero-knowledge available): measured at 1280px wide with the
+ * chooser present, the dialog needs 817px on the Classic skin and 689px on Console, against 90vh
+ * of usable space — so Classic overflowed at every height tested (900/800/700) and Console
+ * overflowed at 700.
+ *
+ * Shortening the description field alone does not fix that (it is worth ~45px of the ~99px
+ * Classic overflow at 800px), so the layout is what changes: the dialog becomes a flex column
+ * whose BODY scrolls while the header and footer stay put. The buttons are then visible at any
+ * viewport height, including states this form does not have yet.
+ *
+ * Deliberately scoped to this one dialog by id. The same pattern would suit every modal, but
+ * changing the shared .modal-content layout would touch ~20 dialogs at once — several with their
+ * own structure — and that deserves its own change with its own sweep, not a side effect of this
+ * one. The id selector (1,1,0) also outranks the .modal-content rule both skins define (0,1,0),
+ * so this holds regardless of stylesheet order.
+ *
+ * The footer sits INSIDE the <form>, so the form is the flex child that must be allowed to shrink
+ * (min-height: 0); without that, a flex item's automatic minimum size keeps it at content height
+ * and the body never scrolls.
+ *
+ * overflow-y stays `auto`, NOT `hidden`. In normal use the body absorbs everything and the dialog
+ * never scrolls, so this is invisible — but the header and footer are `flex: 0 0 auto` and their
+ * automatic minimum size floors them at content height, so when even header + footer alone exceed
+ * 90vh (roughly a 220px-tall viewport on Classic — reachable at 400% zoom, a WCAG reflow case)
+ * something has to give. `auto` degrades to a scrollbar, the way the whole dialog used to;
+ * `hidden` would clip the buttons off with no way to reach them, which is worse than the bug this
+ * block fixes. ui-v2.css records the same lesson from a previous incident: a bare `overflow:
+ * hidden` on .modal-content clipped a tall dialog with no scrollbar at all.
+ */
+#create-vault-modal .modal-content {
+    display: flex;
+    flex-direction: column;
+    max-height: 90vh;
+    overflow-y: auto;             /* the body absorbs overflow; this is the last-resort scroller */
+}
+#create-vault-modal #create-vault-form {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+#create-vault-modal .modal-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+}
+#create-vault-modal .modal-header,
+#create-vault-modal .modal-footer {
+    flex: 0 0 auto;
+}
+
+/* The description defaults to one line (rows="1" in the markup) and stays a real textarea:
+ * newlines are still accepted, and it can be dragged taller. Classic computes `resize: both`,
+ * which lets a horizontal drag push the field outside the dialog, so both skins are pinned to
+ * vertical here.
+ */
+#create-vault-modal #vault-desc {
+    resize: vertical;
+}
+
 /* Close Button */
 .modal-close {
     position: absolute;
