@@ -93,6 +93,33 @@ def get_active_operations_count() -> int:
         return len(active_operations)
 
 
+# The count above reports; this one decides. They are deliberately separate: the registry tracks
+# every operation for the activity feed and cancellation, while admission governs only the two
+# things that hold memory for a duration -- serving a download, and assembling an upload.
+from app.core.transfer_admission import TransferAdmission, TransferBusy  # noqa: E402
+
+transfer_admission = TransferAdmission(
+    limit=settings.max_concurrent_transfers,
+    max_waiting=settings.max_queued_transfers,
+    wait_seconds=settings.transfer_queue_wait_seconds,
+)
+
+
+def _busy_response(exc: TransferBusy) -> HTTPException:
+    """Turn a refusal into something a client can act on.
+
+    503 with Retry-After, not 500: the deployment is working correctly and is momentarily full,
+    which is a different thing from the file being unreadable. A client that cannot tell those
+    apart either retries something hopeless or gives up on something that would have worked.
+    """
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=(f"The server is already handling {exc.limit} transfers. "
+                f"Try again in a few seconds."),
+        headers={"Retry-After": str(exc.retry_after)},
+    )
+
+
 # Initialize FastAPI app
 # Security: Conditionally disable API docs in production
 app = FastAPI(
@@ -7983,6 +8010,53 @@ def _reject_unreplaceable_upload(db, vault_id, folder_id, filename, user, name_b
         )
 
 
+_MEDIA_TOKEN_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+.^_`|~-")
+
+
+def _is_media_token(text: str) -> bool:
+    return bool(text) and all(c in _MEDIA_TOKEN_CHARS for c in text)
+
+
+def _safe_media_type(value: Optional[str]) -> str:
+    """A stored MIME type reduced to something that can be put in a header.
+
+    A MIME type is whatever the client said it was and is stored verbatim, so this cannot assume it
+    is well formed. Two ways a stored string breaks the response: anything outside Latin-1 raises
+    while the header is being encoded, and a control character -- CR and LF are ASCII, so they
+    survive any encode -- would let it inject header content. What passes is a conservative
+    type/subtype with optional parameters; anything else becomes the generic type, which is always
+    safe to serve. The filename beside it is guarded the same way, in _content_disposition.
+    """
+    text = (value or "").strip()
+    if not text or len(text) > 255:
+        return "application/octet-stream"
+    if any(not (32 <= ord(c) <= 126) for c in text):
+        return "application/octet-stream"
+
+    essence, _, rest = text.partition(";")
+    kind, slash, subtype = essence.strip().partition("/")
+    if not slash or not _is_media_token(kind) or not _is_media_token(subtype):
+        return "application/octet-stream"
+
+    while rest:
+        parameter, _, rest = rest.partition(";")
+        name, equals, raw = parameter.strip().partition("=")
+        # An empty segment is not a parameter. Passing "text/plain;" through unchanged leaves the
+        # framework to render it as "text/plain;; charset=utf-8".
+        if not equals or not _is_media_token(name.strip()):
+            return "application/octet-stream"
+        raw = raw.strip()
+        if raw.startswith('"'):
+            if (not raw.endswith('"') or len(raw) < 2
+                    or "\\" in raw or '"' in raw[1:-1]):
+                return "application/octet-stream"
+        elif not _is_media_token(raw):
+            return "application/octet-stream"
+
+    return text
+
+
 def _content_disposition(file_name: str) -> str:
     """Build an RFC 6266 Content-Disposition for a download. Includes an ASCII-only
     filename= fallback AND a UTF-8 filename* so non-Latin-1 names (any unicode name —
@@ -8032,6 +8106,19 @@ async def upload_file(
     audit_logger = AuditLogger(db)
     from app.core.database import redis_client
     
+    # One transfer slot for the request, not one per file. A request carrying several files is
+    # one transfer as far as memory goes -- the files are read and encrypted one after another --
+    # and taking a slot per file would let a request commit its first file and then be refused
+    # partway through, which is a worse answer than either accepting or refusing the whole thing.
+    transfer_slot = None
+
+    # Bound here, not where they are first used, because the teardown at the end of this function
+    # reads them on EVERY path out -- including the ones that raise before the vault has even been
+    # looked up. Left to be bound later, an authorization denial raises past them and the teardown
+    # fails with an unbound name, turning a clean 403 into a 500.
+    reservation_key = None
+    vault_size_limit = 0
+
     try:
         # Verify vault access and password (from header for security)
         vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
@@ -8172,6 +8259,22 @@ async def upload_file(
                         detail=f"Upload rejected: Vault size limit would be exceeded"
                     )
         
+        # Admitted on the same ceiling as a download: reading the submitted bytes and pushing
+        # them through the encryption pipeline holds memory for a duration in the same way, and a
+        # deployment's capacity is the two together rather than each apart.
+        #
+        # Taken once for the request rather than once per file -- a request carrying several files
+        # is one transfer as far as memory goes, and admitting each file separately would let a
+        # request commit its first file and then be refused partway through. Taken before the
+        # operation is registered, so a refusal leaves nothing in the registry, and returned by the
+        # request-level finally on every path out -- which also returns the space reservation taken
+        # above, the one thing that does precede admission.
+        if files:
+            try:
+                transfer_slot = await transfer_admission.acquire()
+            except TransferBusy as busy:
+                raise _busy_response(busy)
+
         for upload_file in files:
             # Validate filename
             if not upload_file.filename:
@@ -8185,7 +8288,7 @@ async def upload_file(
             
             # Track in local set
             start_operation(operation_id)
-            
+
             # Track in Redis for cancellation and progress
             from app.services.activity_monitor import ProgressTracker
             tracker = ProgressTracker()
@@ -8199,9 +8302,11 @@ async def upload_file(
                 temp_credential_id=getattr(current_user, "_temp_cred_id", None),
                 vault_id=str(vault_id),
             )
+
             _op_ok = False  # set True only after the file is fully committed (drives complete_operation)
 
-            # Wrap entire upload in try-finally to ensure reservation cleanup
+            # Per-file teardown: the progress record and the operation entry. The transfer slot
+            # and the space reservation belong to the request, and are released at the end of it.
             try:
                 # Same-name policy = replace; reject up front if the uploader can't.
                 _reject_unreplaceable_upload(db, vault_id, folder_uuid, upload_file.filename, current_user)
@@ -8445,15 +8550,6 @@ async def upload_file(
                 )
                     
             finally:
-                # CLEANUP: Release space reservation if it was created
-                if reservation_key and vault_size_limit > 0:
-                    try:
-                        reserved_amount = redis_client.get(reservation_key)
-                        redis_client.delete(reservation_key)
-                        if reserved_amount:
-                            print(f"🧹 Reservation cleanup: {int(reserved_amount) / (1024*1024):.2f} MB")
-                    except Exception as e:
-                        print(f"⚠️ Failed to cleanup reservation in finally: {e}")
                 
                 # Mark the Redis progress record complete + clear it (it was never completed before, so
                 # every finished/failed upload used to leave a dangling operation:* record until TTL).
@@ -8507,6 +8603,25 @@ async def upload_file(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to upload file: {str(e)}"
         )
+    finally:
+        # Every path out of the request returns the slot, including the ones that raise before a
+        # single file is read (where there is nothing to return and this is a no-op). A slot lost
+        # here does not fail loudly: it shrinks the ceiling permanently, one leak at a time, until
+        # the deployment refuses every transfer.
+        if transfer_slot is not None:
+            transfer_admission.release(transfer_slot)
+
+        # The space reservation goes back on the same terms, and for the same reason: held after
+        # the request is over it counts against the vault for its full five-minute life, so a
+        # refused or abandoned upload makes the vault look fuller than it is.
+        if reservation_key and vault_size_limit > 0:
+            try:
+                reserved_amount = redis_client.get(reservation_key)
+                redis_client.delete(reservation_key)
+                if reserved_amount:
+                    print(f"🧹 Reservation cleanup: {int(reserved_amount) / (1024*1024):.2f} MB")
+            except Exception as exc:
+                print(f"⚠️ Failed to cleanup reservation in finally: {exc}")
 
 
 # ============================================================================
@@ -9325,7 +9440,33 @@ async def complete_chunked_upload(
     x_vault_password: Optional[str] = Header(None),
 ):
     """Assemble buffered chunks through the real encryption pipeline and create
-    the File record. Rejects with the missing indices if any chunk is absent."""
+    the File record. Rejects with the missing indices if any chunk is absent.
+
+    Admitted on the transfer ceiling. This is the assembling half of an upload -- it reads the
+    staged chunks and pushes them through the encryption pipeline -- so it holds memory for a
+    duration in the same way a download does, and it is the path the product's own client takes.
+    The chunk writes before it are not admitted: each streams straight to disk and holds nothing.
+    """
+    transfer_slot = None
+
+    async def admit():
+        """Take the transfer slot. Called by the body once the request has earned one."""
+        nonlocal transfer_slot
+        try:
+            transfer_slot = await transfer_admission.acquire()
+        except TransferBusy as busy:
+            raise _busy_response(busy)
+
+    try:
+        return await _complete_chunked_upload(
+            vault_id, session_id, request, current_user, db, x_vault_password, admit)
+    finally:
+        if transfer_slot is not None:
+            transfer_admission.release(transfer_slot)
+
+
+async def _complete_chunked_upload(vault_id, session_id, request, current_user, db,
+                                   x_vault_password, admit):
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
@@ -9360,6 +9501,12 @@ async def complete_chunked_upload(
     # out from under the chunk reads. The row is deleted on success regardless.
     session.expires_at = datetime.utcnow() + timedelta(hours=_chunk_session_ttl_hours())
     db.commit()
+
+    # Everything above is authorization and validation, and costs nothing to answer. From here the
+    # request reads the staged chunks and encrypts them, which is what the ceiling governs -- so
+    # this is where it is applied, and a caller who is going to be told 403, 404, 409 or 410 is
+    # told that instead of being made to queue for a slot they were never going to use.
+    await admit()
 
     sdir = _upload_session_dir(vault_service, str(session.id))
     present = _received_chunk_indices(sdir)
@@ -9868,8 +10015,9 @@ async def download_file(
     operation_id = None
     tracker = None
     tracker_started = False
-    stream_handed_off = False
+    streaming_response = None
     download = None
+    transfer_slot = None
 
     try:
         # Verify vault access and password. allow_share=True: a recipient with an active
@@ -9885,10 +10033,10 @@ async def download_file(
         require_file_scope(db, current_user, vault_id, file_id)
         require_download_scope(db, current_user, vault_id, file_id)
 
-        operation_id = f"download_{uuid.uuid4()}"
-        start_operation(operation_id)
-
-        # The file must belong to the vault used for the access/password gate.
+        # The file must belong to the vault used for the access/password gate. Resolved before the
+        # transfer slot is taken: naming a file that is not there costs nothing to answer, and a
+        # caller who is going to be told 404 should not first be made to queue behind real
+        # transfers -- nor should the attempt show up as load the deployment shed.
         file_record = db.query(File).filter(
             File.id == file_id, File.vault_id == vault_id
         ).first()
@@ -9898,7 +10046,16 @@ async def download_file(
                 detail="File not found",
             )
 
-        # Atomically consume a capped share download before serving bytes.
+        operation_id = f"download_{uuid.uuid4()}"
+        try:
+            transfer_slot = await transfer_admission.acquire()
+        except TransferBusy as busy:
+            raise _busy_response(busy)
+        start_operation(operation_id)
+
+        # Atomically consume a capped share download before serving bytes. This one stays AFTER
+        # admission on purpose: it spends one of the recipient's downloads, and a transfer that was
+        # refused for want of a slot must not be charged for.
         if str(vault_id) in (getattr(current_user, '_share_vault_scope', None) or {}):
             if not permission_service.burn_share_download(
                 current_user,
@@ -10047,6 +10204,9 @@ async def download_file(
                     failure = exc
             finally:
                 download.close()
+                # Held for the whole response, not just the endpoint: the slot is what the transfer
+                # occupies, and the transfer is still happening while this generator runs.
+                transfer_admission.release(transfer_slot)
 
                 # The completion record, written here rather than before the first byte. What the
                 # audit row above states is that access was granted; what this one states is what
@@ -10135,10 +10295,13 @@ async def download_file(
                     })
                 end_operation(operation_id)
 
-        stream_handed_off = True
-        return StreamingResponse(
+        # The teardown below asks whether this exists rather than reading a flag someone has to
+        # remember to set in the right place. Building a response can fail -- it encodes the
+        # headers -- and a flag set a line too early skipped the teardown entirely, holding the
+        # transfer slot, the open blob and the operation entry for the life of the process.
+        streaming_response = StreamingResponse(
             file_streamer(),
-            media_type=mime_type or 'application/octet-stream',
+            media_type=_safe_media_type(mime_type),
             headers={
                 'Content-Disposition': _content_disposition(disp_name),
                 # From the terminal the walk authenticated, so a stream that stops
@@ -10148,6 +10311,7 @@ async def download_file(
                 'X-Operation-ID': operation_id,
             },
         )
+        return streaming_response
 
     except (PasswordRequiredError, InvalidPasswordError) as e:
         raise HTTPException(
@@ -10191,7 +10355,12 @@ async def download_file(
         # set. The blob is now opened before the handoff, so anything that fails in between --
         # every early failure the walk exists to produce -- would otherwise leak its descriptor
         # for the life of the process.
-        if not stream_handed_off:
+        # No response object means the request never got as far as handing anything over, so
+        # this owns the cleanup. Once it exists, the streaming generator's own teardown does --
+        # the one exception being a connection that dies before the framework starts iterating,
+        # which is not reachable through the middleware stack in front of this.
+        if streaming_response is None:
+            transfer_admission.release(transfer_slot)
             if download is not None:
                 download.close()
             if operation_id:
@@ -10907,8 +11076,12 @@ async def get_monitoring_metrics(
         upload_traffic = upload_count * 1024 * 1024  # Estimate: 1MB per upload
         download_traffic = download_count * 1024 * 1024  # Estimate: 1MB per download
         
-        # Active operations (for now, return 0 - will be implemented via WebSocket)
-        active_operations = 0
+        # What the deployment is actually carrying, and what the transfer ceiling has done about
+        # it. The docs tell an operator to size MAX_CONCURRENT_TRANSFERS against their memory, and
+        # they cannot do that without seeing how close to it they run: a refusal otherwise leaves
+        # no trace but a 503 in the access log.
+        active_operations = get_active_operations_count()
+        transfers = transfer_admission.stats()
         
         # Total files
         total_files = db.query(func.count(File.id)).scalar() or 0
@@ -10920,6 +11093,12 @@ async def get_monitoring_metrics(
             "uploadTraffic": upload_traffic,
             "downloadTraffic": download_traffic,
             "activeOperations": active_operations,
+            "transfersInFlight": transfers["in_flight"],
+            "transfersWaiting": transfers["waiting"],
+            "transferLimit": transfers["limit"],
+            "transfersPeak": transfers["peak_in_flight"],
+            "transfersAdmitted": transfers["admitted"],
+            "transfersRefused": transfers["refused"],
             "totalFiles": total_files
             # Timestamp removed: Including timestamp prevents ETag caching since it changes every request
             # Frontend can add timestamp when displaying if needed

@@ -39,7 +39,7 @@ MENU = [
     ("setup",   "Setup - configure + start the vault"),
     ("backup",  "Backup & Restore - snapshot / restore volumes + .env"),
     ("volumes", "Volumes - inspect / reuse / repoint DockVault volume sets"),
-    ("storage", "Storage limit - show usage + set the deployment maximum"),
+    ("storage", "Limits - storage the deployment may hold, transfers it may carry"),
     ("reset",   "Reset - tear down (optionally destroy data)"),
     ("update",  "Update - upgrade / downgrade the running image"),
     ("logs",    "Logs - enable + pull the authenticated log endpoint"),
@@ -228,6 +228,7 @@ import base64   # noqa: E402
 import glob     # noqa: E402
 import hashlib  # noqa: E402
 import json     # noqa: E402
+import math     # noqa: E402
 import re       # noqa: E402
 
 # The three secrets the compose file demands (an existing .env must carry these to be reusable).
@@ -409,6 +410,13 @@ def build_env_lines(cfg):
     # .env it always did.
     if cfg.get("max_storage_gb") not in (None, ""):
         bare("MAX_STORAGE_GB", format_gb_value(cfg["max_storage_gb"]))
+    # Transfer ceiling. The one that costs memory is MAX_CONCURRENT_TRANSFERS; the other two only
+    # shape what happens to callers who arrive at a full deployment. Same rule as storage: written
+    # only when this deployment has a value, so an install that never mentions them authors the
+    # .env it always did and the app's own defaults apply.
+    for key in ("max_concurrent_transfers", "max_queued_transfers", "transfer_queue_wait_seconds"):
+        if cfg.get(key) not in (None, ""):
+            bare(key.upper(), str(cfg[key]))
     if cfg.get("plan_log_pull"):
         # Opting in here closes the log-404 trap: the endpoint needs BOTH the plan flag and a
         # strong pepper before it will serve (then an admin still ticks a component in the UI).
@@ -897,6 +905,69 @@ def parse_max_storage_gb(raw):
         return None
 
 
+def _unquoted(raw):
+    """A configured value as text: an .env line, or a number argparse has already converted.
+
+    `--max-concurrent-transfers 0` arrives here as the integer 0, which is both un-strippable and
+    falsy -- so treating "no value" as falsiness would raise on one input and silently discard the
+    other. Only None and an empty string mean unset.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, (int, float)):
+        return repr(raw)
+    return str(raw).strip().strip("'").strip('"')
+
+
+def _finite_float(raw):
+    """An .env value as a finite float, or None. 'inf' and 'nan' parse as floats and then break
+    every comparison downstream, so they are unusable values rather than numbers."""
+    text = _unquoted(raw)
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def parse_transfer_limit(raw):
+    """MAX_CONCURRENT_TRANSFERS -> the ceiling the application would apply, or None if unset.
+
+    Clamped rather than rejected, because the application clamps: it reads anything below one as
+    one. Dropping a 0 here would carry it forward as "not configured", which is the default of
+    sixteen -- silently widening a ceiling an operator had set as tight as it goes."""
+    value = _finite_float(raw)
+    return None if value is None else max(1, int(value))
+
+
+def parse_transfer_queue(raw):
+    """MAX_QUEUED_TRANSFERS -> the waiting room the application would apply, or None if unset.
+    Zero is a real choice (refuse at once rather than queue); negatives read as zero."""
+    value = _finite_float(raw)
+    return None if value is None else max(0, int(value))
+
+
+# The application caps the wait at an hour (TransferAdmission.MAX_WAIT_SECONDS). Mirrored here
+# rather than imported, because this tool runs from a checkout that may not have the application
+# importable -- the value is locked to the application's by a test.
+TRANSFER_WAIT_CEILING_SECONDS = 3600
+
+
+def parse_transfer_wait(raw):
+    """TRANSFER_QUEUE_WAIT_SECONDS -> seconds, as the application would read them, or None.
+
+    Clamped to the same ceiling the application applies, so what the tool writes back is what the
+    deployment was actually doing rather than what its .env happened to say. Whole numbers come
+    back whole so the .env reads '20' rather than '20.0'."""
+    value = _finite_float(raw)
+    if value is None:
+        return None
+    value = min(float(TRANSFER_WAIT_CEILING_SECONDS), max(0.0, value))
+    return int(value) if value == int(value) else value
+
+
 def format_gb_value(gb):
     """A GB number as an .env value. Deliberately not '%g': that renders large numbers in
     exponent notation ('1e+06'), and a whole number should read as '64', not '64.0'."""
@@ -1087,6 +1158,13 @@ def new_set_config(current_env, new_prefix, new_id):
         # operator had configured rather than silently reverting it to unlimited.
         "max_storage_gb": parse_max_storage_gb(
             current_env.get("MAX_STORAGE_GB") or current_env.get("PLAN_MAX_STORAGE_GB")),
+        # Likewise for the transfer ceiling: an operator who lowered it to fit the machine's
+        # memory should not find it back at the default because they took a fresh volume set.
+        "max_concurrent_transfers": parse_transfer_limit(
+            current_env.get("MAX_CONCURRENT_TRANSFERS")),
+        "max_queued_transfers": parse_transfer_queue(current_env.get("MAX_QUEUED_TRANSFERS")),
+        "transfer_queue_wait_seconds": parse_transfer_wait(
+            current_env.get("TRANSFER_QUEUE_WAIT_SECONDS")),
     }
     return cfg
 
@@ -1767,6 +1845,14 @@ class DockVault:
             "plan_log_pull": log_pull,
             "log_token_pepper": gen_hex(32) if log_pull else "",
             "max_storage_gb": (getattr(args, "max_storage_gb", None) if args else None),
+            # Flags only at install time, as the storage ceiling beside them is. The Limits menu
+            # is where these are shown and changed, with the memory each one implies.
+            "max_concurrent_transfers": parse_transfer_limit(
+                getattr(args, "max_concurrent_transfers", None) if args else None),
+            "max_queued_transfers": parse_transfer_queue(
+                getattr(args, "max_queued_transfers", None) if args else None),
+            "transfer_queue_wait_seconds": parse_transfer_wait(
+                getattr(args, "transfer_queue_wait_seconds", None) if args else None),
             "_generated_pw": generated,
         }
 
@@ -2791,8 +2877,29 @@ class DockVault:
         print("  Administrators can lower the live limit in the vault's Settings -> Storage; this")
         print("  value is the ceiling they cannot go above.")
 
+        limit = parse_transfer_limit(env.get("MAX_CONCURRENT_TRANSFERS")) or 16
+        queued = parse_transfer_queue(env.get("MAX_QUEUED_TRANSFERS"))
+        queued = 32 if queued is None else queued
+        print(pal.paint("\n  Transfers at once", "cyan"))
+        print("  current ceiling: %d  (%d more may wait for a slot)" % (limit, queued))
+        print("  Each transfer in flight costs the deployment a fixed amount of memory whatever")
+        print("  the file weighs: budget roughly 260 MB plus 40 MB per transfer across the stack.")
+        print("  At %d that is about %d MB. Lower it on a small machine." % (limit, 260 + 40 * limit))
+
         requested = getattr(args, "set_gb", None) if args else None
         interactive = not (args and getattr(args, "non_interactive", False))
+
+        wanted = parse_transfer_limit(getattr(args, "set_transfers", None) if args else None)
+        if wanted is None and interactive:
+            answer = ask("Transfers at once (blank to keep %d)" % limit, pal, default="")
+            if (answer or "").strip():
+                wanted = parse_transfer_limit(answer)
+                if wanted is None:
+                    self._fail("that is not a number of transfers")
+        if wanted is not None and wanted != limit:
+            self._set_env_key(self._env_path(), "MAX_CONCURRENT_TRANSFERS", str(wanted))
+            print(pal.paint("  Set MAX_CONCURRENT_TRANSFERS=%d in .env (about %d MB at that "
+                            "ceiling)." % (wanted, 260 + 40 * wanted), "green"))
         if requested is None and interactive:
             answer = ask("New limit in GB (-1 for unlimited, blank to keep)", pal, default="")
             if not (answer or "").strip():
@@ -2893,6 +3000,17 @@ def build_parser():
                          "(default with --non-interactive; interactive setup asks)")
     sp.add_argument("--max-storage-gb", dest="max_storage_gb", type=float,
                     help="deployment storage ceiling in GB (-1 = unlimited, the default)")
+    sp.add_argument("--max-concurrent-transfers", dest="max_concurrent_transfers", type=int,
+                    help="how many uploads and downloads may run at once (16 by default). Each "
+                         "costs a fixed amount of memory whatever the file weighs, so lower this "
+                         "on a small machine; see docs/resource-budgets.md")
+    sp.add_argument("--max-queued-transfers", dest="max_queued_transfers", type=int,
+                    help="how many transfers may wait for a slot before callers are refused "
+                         "(32 by default; 0 = refuse at once rather than queue)")
+    sp.add_argument("--transfer-queue-wait-seconds", dest="transfer_queue_wait_seconds",
+                    type=float,
+                    help="how long a transfer waits for a slot before the caller is told to come "
+                         "back (20 by default)")
     sp.add_argument("--update-check", dest="update_check", action="store_true", help="enable the opt-in update check")
     sp.add_argument("--enable-log-pull", dest="enable_log_pull", action="store_true", help="enable the log-pull endpoint")
     sp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags/defaults, never prompt")
@@ -2908,6 +3026,9 @@ def build_parser():
     stp = parsers["storage"]
     stp.add_argument("--set-gb", dest="set_gb", type=float,
                      help="new deployment storage ceiling in GB (-1 = unlimited)")
+    stp.add_argument("--set-transfers", dest="set_transfers", type=int,
+                     help="new ceiling on transfers in flight (16 by default); each costs a fixed "
+                          "amount of memory whatever the file weighs")
     stp.add_argument("--no-restart", dest="no_restart", action="store_true",
                      help="write .env only; apply at the next start")
     stp.add_argument("--non-interactive", dest="non_interactive", action="store_true",

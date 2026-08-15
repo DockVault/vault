@@ -1,0 +1,161 @@
+"""How many transfers a deployment will carry at once.
+
+Every transfer now costs a bounded, roughly constant amount of memory -- about 40 MB for an HTTP
+transfer of any size, one or two records for an open SFTP handle. What was never bounded is how
+many of them happen at the same time. A hundred simultaneous downloads were all attempted, and the
+count that existed fed a dashboard statistic and gated nothing.
+
+Bounding one transfer and not their number leaves the same failure available, reached a different
+way: the per-transfer figure is what makes a limit meaningful, not what makes it unnecessary.
+
+The rules this implements:
+
+- **Nothing is silently dropped.** A caller that arrives while the deployment is full waits for a
+  slot. Only when it has waited too long, or when even the waiting room is full, is it turned away.
+- **Being turned away does not look like a failed transfer.** It is a distinct status with a
+  `Retry-After`, so a client can tell "come back shortly" from "this file is broken" -- a
+  distinction the caller cannot make if both arrive as a five hundred.
+- **Waiting is bounded too.** An unbounded queue is an unbounded memory cost of its own, and a
+  caller left waiting indefinitely is a worse experience than a prompt refusal it can act on.
+"""
+
+import asyncio
+import math
+import threading
+
+
+class TransferBusy(Exception):
+    """The deployment is carrying as many transfers as it will, and this one waited long enough.
+
+    Carries the interval a caller should wait before trying again, so the refusal is actionable
+    rather than merely a rejection.
+    """
+
+    def __init__(self, retry_after: int, waiting: int, limit: int):
+        super().__init__(
+            f"The server is handling its maximum of {limit} concurrent transfers")
+        self.retry_after = retry_after
+        self.waiting = waiting
+        self.limit = limit
+
+
+class TransferAdmission:
+    """A bounded number of transfer slots, with a bounded queue for the overflow.
+
+    Slots are taken and released explicitly rather than through a context manager, because the
+    thing that holds one is a streaming response: it outlives the endpoint that started it, and is
+    released in the generator's own teardown. That is the same shape as the operation registry
+    beside it, deliberately.
+    """
+
+    # A wait long enough that nobody is coming back for the answer. Configuring one is the same
+    # mistake as configuring no timeout at all, and it has to be bounded somewhere: the refusal
+    # carries a Retry-After, which is an integer number of seconds, so an unbounded float here
+    # turns every refusal into a server error instead of a "come back shortly".
+    MAX_WAIT_SECONDS = 3600.0
+
+    def __init__(self, limit: int, max_waiting: int, wait_seconds: float):
+        self._limit = max(1, int(limit))
+        self._max_waiting = max(0, int(max_waiting))
+        self._wait_seconds = self._usable_wait(wait_seconds)
+        self._semaphore = asyncio.Semaphore(self._limit)
+        # A token per admitted transfer, rather than a count. A count cannot tell a release by the
+        # holder from a release by something that never held anything, and it is wrong in a way
+        # that is hard to see: a stray release hands out a slot nobody took, quietly raising the
+        # real ceiling above the configured one. It also cannot be read correctly while a waiter is
+        # between being woken and being counted.
+        #
+        # Guarded by a plain lock rather than an asyncio primitive because the statistics are read
+        # by an endpoint that is not necessarily on the loop this gate runs on.
+        self._counter_lock = threading.Lock()
+        self._live = set()
+        self._waiting = 0
+        # Counted since start, so an operator can tell "sized correctly" from "shed load all
+        # afternoon". Without it the only trace of a refusal is a 503 in the access log, which
+        # says nothing about how close to the ceiling the deployment usually runs.
+        self._refused = 0
+        self._peak_in_flight = 0
+        # Every slot ever handed out. Read beside the refusal count it is the shed-load ratio, and
+        # it is the only external evidence of how many times a request was admitted -- which is
+        # how a caller can tell one transfer from several sharing a request.
+        self._admitted = 0
+
+    @classmethod
+    def _usable_wait(cls, wait_seconds) -> float:
+        """The configured wait, as a number of seconds this can actually act on.
+
+        A float field accepts `inf` and `nan`, and both arrive here intact. `inf` reads as "wait
+        as long as it takes", which is honoured up to the ceiling above rather than allowed to
+        break the refusal path; `nan` is not a duration at all and reads as no wait.
+        """
+        value = float(wait_seconds)
+        if math.isnan(value):
+            return 0.0
+        return min(cls.MAX_WAIT_SECONDS, max(0.0, value))
+
+    async def acquire(self):
+        """Take a slot, waiting if the deployment is full. Raises :class:`TransferBusy` if not.
+
+        Returns a token, which is what gives the slot back. The waiting room is checked before
+        joining it, so a burst that is never going to be served is refused now rather than after a
+        timeout each.
+        """
+        if self._semaphore.locked():
+            with self._counter_lock:
+                if self._waiting >= self._max_waiting:
+                    waiting = self._waiting
+                    self._refused += 1
+                    raise TransferBusy(
+                        retry_after=self._retry_after(), waiting=waiting, limit=self._limit)
+                self._waiting += 1
+            try:
+                await asyncio.wait_for(self._semaphore.acquire(), timeout=self._wait_seconds)
+            except asyncio.TimeoutError:
+                with self._counter_lock:
+                    # Minus this caller: it is being refused, not left waiting, and reporting
+                    # itself as one of the queue makes a deployment look busier than it is.
+                    waiting = max(0, self._waiting - 1)
+                    self._refused += 1
+                raise TransferBusy(
+                    retry_after=self._retry_after(), waiting=waiting, limit=self._limit)
+            finally:
+                with self._counter_lock:
+                    self._waiting -= 1
+        else:
+            await self._semaphore.acquire()
+
+        token = object()
+        with self._counter_lock:
+            self._live.add(token)
+            self._admitted += 1
+            self._peak_in_flight = max(self._peak_in_flight, len(self._live))
+        return token
+
+    def release(self, token) -> None:
+        """Give a slot back. Anything other than a token from a live acquire does nothing."""
+        with self._counter_lock:
+            if token not in self._live:
+                return
+            self._live.discard(token)
+        self._semaphore.release()
+
+    def _retry_after(self) -> int:
+        """Seconds to suggest. Long enough to be worth honouring, short enough to be useful."""
+        return max(1, int(self._wait_seconds))
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    def stats(self) -> dict:
+        with self._counter_lock:
+            return {
+                "limit": self._limit,
+                "in_flight": len(self._live),
+                "waiting": self._waiting,
+                "max_waiting": self._max_waiting,
+                "wait_seconds": self._wait_seconds,
+                "peak_in_flight": self._peak_in_flight,
+                "refused": self._refused,
+                "admitted": self._admitted,
+            }

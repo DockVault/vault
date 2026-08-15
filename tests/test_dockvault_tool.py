@@ -2403,6 +2403,214 @@ def test_a_fresh_volume_set_keeps_the_configured_ceiling():
     assert "MAX_STORAGE_GB=64" in dv.build_env_lines({**cfg, "server_name": "localhost"})
 
 
+# The transfer ceiling (MAX_CONCURRENT_TRANSFERS and the two queue settings beside it). It is a
+# memory ceiling in the same sense MAX_STORAGE_GB is a disk one, so it is handled on the same
+# terms: written only when the deployment has a value, and carried across a fresh volume set.
+
+
+# The parsers must agree with TransferAdmission.__init__, which clamps rather than rejects:
+# max(1, int(limit)), max(0, int(max_waiting)), max(0.0, float(wait_seconds)). A parser that
+# DROPPED an out-of-range value would carry it forward as "unset", i.e. the default -- so a
+# deployment pinned to the tightest possible ceiling would silently come back at sixteen.
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("16", 16), ("  8  ", 8), ("'4'", 4), ('"2"', 2), ("8.0", 8),
+    ("0", 1), ("-3", 1),                     # the application reads these as one; so must the tool
+    ("", None), (None, None), ("many", None), ("inf", None), ("nan", None),
+])
+def test_parse_transfer_limit(raw, expected):
+    assert dv.parse_transfer_limit(raw) == expected
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("32", 32), ("0", 0), ("-1", 0), ("", None), ("lots", None), ("Infinity", None),
+])
+def test_parse_transfer_queue(raw, expected):
+    """Zero is a real choice here -- refuse at once rather than queue -- and negatives read as it."""
+    assert dv.parse_transfer_queue(raw) == expected
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("20", 20), ("2.5", 2.5), ("'30'", 30), ("0", 0), ("-5", 0),
+    ("", None), ("soon", None), ("inf", None), ("-inf", None), ("nan", None),
+])
+def test_parse_transfer_wait(raw, expected):
+    """A whole number comes back whole: '20' should not be written back as '20.0'."""
+    assert dv.parse_transfer_wait(raw) == expected
+
+
+@pytest.mark.parametrize("parser", ["parse_transfer_limit", "parse_transfer_queue",
+                                    "parse_transfer_wait"])
+@pytest.mark.parametrize("hostile", ["inf", "-inf", "nan", "Infinity", "1e400"])
+def test_a_hand_edited_env_cannot_crash_the_tool(parser, hostile):
+    """These read a file a person may have edited. Every sibling parser in the tool tolerates
+    nonsense by returning None; a non-finite float used to escape as OverflowError instead and
+    abort the fresh-volume-set flow with a traceback."""
+    assert getattr(dv, parser)(hostile) is None
+
+
+def test_the_carried_settings_are_what_the_deployment_was_running():
+    """What the tool writes must be what the running deployment was already doing, value for value.
+
+    Checked against the real path a value takes -- the settings layer, then the gate -- rather than
+    against a table or against the gate alone. A value the settings layer rejects is one the
+    application will not start with, and reporting a number for it would be a wrong answer of a
+    different kind than reporting the wrong number.
+    """
+    import pydantic
+    from app.core.config import Settings
+    from app.core.transfer_admission import TransferAdmission
+
+    def running(**env):
+        """What a deployment configured this way would actually apply, or None if it won't boot."""
+        try:
+            settings = Settings(**env)
+        except pydantic.ValidationError:
+            return None
+        gate = TransferAdmission(
+            limit=settings.max_concurrent_transfers,
+            max_waiting=settings.max_queued_transfers,
+            wait_seconds=settings.transfer_queue_wait_seconds)
+        return gate.stats()
+
+    for raw in ("0", "-3", "1", "4", "16"):
+        applied = running(max_concurrent_transfers=raw)
+        assert applied is not None, f"MAX_CONCURRENT_TRANSFERS={raw} should still boot"
+        assert dv.parse_transfer_limit(raw) == applied["limit"], (
+            f"MAX_CONCURRENT_TRANSFERS={raw} runs as {applied['limit']} but the tool would carry "
+            f"{dv.parse_transfer_limit(raw)}")
+
+    for raw in ("0", "32", "-1"):
+        applied = running(max_queued_transfers=raw)
+        assert applied is not None, f"MAX_QUEUED_TRANSFERS={raw} should still boot"
+        assert dv.parse_transfer_queue(raw) == applied["max_waiting"]
+
+    # Including the hour ceiling: an operator who asked for two hours is running one, and the tool
+    # must say one rather than repeat what the .env claims.
+    for raw in ("0", "20", "2.5", "7200"):
+        applied = running(transfer_queue_wait_seconds=raw)
+        assert applied is not None, f"TRANSFER_QUEUE_WAIT_SECONDS={raw} should still boot"
+        assert dv.parse_transfer_wait(raw) == applied["wait_seconds"], (
+            f"TRANSFER_QUEUE_WAIT_SECONDS={raw} runs as {applied['wait_seconds']} but the tool "
+            f"would carry {dv.parse_transfer_wait(raw)}")
+
+    assert dv.TRANSFER_WAIT_CEILING_SECONDS == TransferAdmission.MAX_WAIT_SECONDS, (
+        "the tool's copy of the wait ceiling has drifted from the application's")
+
+
+def test_a_value_the_application_will_not_start_with_is_not_carried_as_a_number():
+    """The tool must not paper over a setting that stops the deployment booting.
+
+    A fractional or exponential ceiling reads fine as a float and is rejected by the settings
+    layer, so the deployment does not start at all. Carrying a rounded number for it would author
+    an .env that looks different from the one the operator had, without fixing anything.
+    """
+    import pydantic
+    from app.core.config import Settings
+
+    for raw in ("4.7", "1e3"):
+        try:
+            Settings(max_concurrent_transfers=raw)
+        except pydantic.ValidationError:
+            continue
+        pytest.fail(f"the settings layer now accepts {raw!r}; this test's premise is stale")
+
+
+def test_the_limits_menu_can_read_and_change_the_transfer_ceiling():
+    """The rule is that a setting the application reads is a setting this tool can write.
+
+    The ceiling is reported beside the storage limit -- the two answer the same question about how
+    big a deployment may get, one in disk and one in memory -- and is changed from the same place.
+    """
+    args = dv.build_parser().parse_args(["storage", "--non-interactive", "--set-transfers", "4"])
+    assert dv.parse_transfer_limit(args.set_transfers) == 4
+
+    label = dict(dv.MENU)["storage"]
+    assert "transfer" in label.lower(), (
+        f"the menu does not mention transfers, so nobody will find the setting there: {label!r}")
+
+
+def test_the_transfer_flags_survive_argparse():
+    """These parsers read two sources, and one of them does not hand them strings.
+
+    argparse types these flags as int and float, so a parser that assumes text raises on every
+    one of them -- and a parser that treats "no value" as falsiness turns `--max-concurrent-
+    transfers 0` into "unset", which is the default of sixteen: the widening the carry-forward
+    exists to prevent, reintroduced through the flag beside it.
+    """
+    args = dv.build_parser().parse_args([
+        "setup", "--non-interactive",
+        "--max-concurrent-transfers", "4",
+        "--max-queued-transfers", "0",
+        "--transfer-queue-wait-seconds", "2.5",
+    ])
+    assert dv.parse_transfer_limit(args.max_concurrent_transfers) == 4
+    assert dv.parse_transfer_queue(args.max_queued_transfers) == 0
+    assert dv.parse_transfer_wait(args.transfer_queue_wait_seconds) == 2.5
+
+    tightest = dv.build_parser().parse_args(
+        ["setup", "--non-interactive", "--max-concurrent-transfers", "0"])
+    assert dv.parse_transfer_limit(tightest.max_concurrent_transfers) == 1, (
+        "a ceiling of zero was read as unset, so the deployment would come up at the default")
+
+    unset = dv.build_parser().parse_args(["setup", "--non-interactive"])
+    assert dv.parse_transfer_limit(unset.max_concurrent_transfers) is None
+    assert dv.parse_transfer_queue(unset.max_queued_transfers) is None
+    assert dv.parse_transfer_wait(unset.transfer_queue_wait_seconds) is None
+
+
+def test_setup_writes_the_transfer_ceiling_only_when_asked():
+    cfg = _reusable_env_cfg()
+    assert not [l for l in dv.build_env_lines(cfg) if l.startswith("MAX_CONCURRENT_TRANSFERS")]
+    cfg["max_concurrent_transfers"] = 4
+    assert "MAX_CONCURRENT_TRANSFERS=4" in dv.build_env_lines(cfg)
+
+
+def test_setup_accepts_the_transfer_ceiling_flag():
+    args = dv.build_parser().parse_args(
+        ["setup", "--non-interactive", "--max-concurrent-transfers", "4"])
+    assert args.max_concurrent_transfers == 4
+
+
+def test_a_fresh_volume_set_keeps_the_configured_transfer_ceiling():
+    """An operator who lowered the ceiling to fit the machine's memory should not find it back at
+    the default because they took a fresh volume set -- on a small machine that is the difference
+    between a deployment that sheds load and one that is killed for using too much."""
+    cfg = dv.new_set_config({
+        "MAX_CONCURRENT_TRANSFERS": "4",
+        "MAX_QUEUED_TRANSFERS": "0",
+        "TRANSFER_QUEUE_WAIT_SECONDS": "5",
+    }, "prefix-1", "dep-1")
+    assert cfg["max_concurrent_transfers"] == 4
+    assert cfg["max_queued_transfers"] == 0
+    assert cfg["transfer_queue_wait_seconds"] == 5
+
+    lines = dv.build_env_lines({**cfg, "server_name": "localhost"})
+    assert "MAX_CONCURRENT_TRANSFERS=4" in lines
+    assert "MAX_QUEUED_TRANSFERS=0" in lines          # zero is carried, not treated as unset
+    assert "TRANSFER_QUEUE_WAIT_SECONDS=5" in lines
+
+
+def test_a_fresh_volume_set_says_nothing_when_the_ceiling_was_never_configured():
+    """The common case: an .env that never mentioned transfers authors one that still doesn't, so
+    the application's own defaults keep applying."""
+    cfg = dv.new_set_config({}, "prefix-1", "dep-1")
+    lines = dv.build_env_lines({**cfg, "server_name": "localhost"})
+    assert not [l for l in lines if l.startswith(("MAX_CONCURRENT_TRANSFERS",
+                                                  "MAX_QUEUED_TRANSFERS",
+                                                  "TRANSFER_QUEUE_WAIT_SECONDS"))]
+
+
+def test_the_written_transfer_ceiling_is_what_the_application_reads():
+    """The tool and the application must agree about the value, not just its spelling."""
+    from app.core.config import Settings
+    cfg = dv.new_set_config({"MAX_CONCURRENT_TRANSFERS": "4"}, "prefix-1", "dep-1")
+    written = dv.parse_env("\n".join(
+        dv.build_env_lines({**cfg, "server_name": "localhost"})))["MAX_CONCURRENT_TRANSFERS"]
+    assert Settings(max_concurrent_transfers=written).max_concurrent_transfers == 4
+
+
 def test_stored_bytes_parses_the_database_answer(tmp_path, monkeypatch):
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: _Proc(0, stdout="\n 123456 \n"))

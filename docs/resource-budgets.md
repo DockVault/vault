@@ -141,10 +141,43 @@ below asks a different question than it used to — "how many transfers", not "h
 | 2 GB | ~44 |
 | 4 GB | ~96 |
 
-**Two cautions on those rows.** They extrapolate one measured point, and run-to-run spread on this
-host reaches 11%. More importantly, nothing in the server currently *limits* concurrency — the
-rows describe what the memory allows, not what the deployment enforces, and a hundred simultaneous
-requests will all be attempted. Admission control is separate work.
+Set `MAX_CONCURRENT_TRANSFERS` at or below the figure for the memory available; the default of 16
+suits 1 GB and above.
+
+**A caution on those rows:** they extrapolate one measured point, and run-to-run spread on this
+host reaches 11%.
+
+**Concurrency is now enforced, not merely described.** `MAX_CONCURRENT_TRANSFERS` (16 by default)
+caps how many transfers are carried at once, counting downloads and upload assembly together.
+Arrivals beyond it wait — a burst is normal traffic — and are only turned away once the queue
+(`MAX_QUEUED_TRANSFERS`, 32) is also full or the wait (`TRANSFER_QUEUE_WAIT_SECONDS`, 20) expires.
+A refusal is a `503` with `Retry-After`, deliberately distinct from a failure, so a client can tell
+"come back shortly" from "this file is broken".
+
+At the default ceiling the transfer memory is about 16 × 40 MB = 640 MB on top of the ~260 MB
+resting, which is why a deployment with less memory than that should lower it. **Open SFTP handles
+are not counted by this ceiling** — they are not transfers, they are held state, they are bounded
+separately by two record-sizes each, and SFTP runs as its own process, so an in-process ceiling
+could not cover them in any case.
+
+**What the ceiling does not cover.** A multipart upload's body is received and spooled by the web
+framework before the endpoint runs, so those bytes arrive whether or not the deployment has a slot
+free — the ceiling governs the encryption work that follows, not the receive. Each part is spooled
+to disk above 1 MB, so this is bounded per request rather than per file, but it is not zero and it
+is not counted here. The resumable path the browser uses does not have this property: its chunks
+are written straight to disk by the application itself.
+
+**What the ceiling costs, stated plainly.** A slot is held for as long as its transfer takes, and a
+transfer has no deadline. A client that opens a download and then stops reading holds its slot
+until it disconnects, so sixteen such clients will make the deployment answer `503` to everyone
+else until they hang up — measured. Nor does cancelling the request necessarily help: a slot comes back
+when the server next tries to write to a connection that has gone (up to about a minute, measured),
+and never at all while the client keeps the connection open and simply declines to read. That is a
+trade, not an oversight: the alternative was attempting every transfer at once, which ends in the
+process being killed rather than in callers being asked to come back. Recovery is immediate once the
+stalled clients disconnect, and a proxy with a response timeout in front of the deployment removes
+the exposure entirely. Bounding how long
+a slot may be held with no forward progress is the proper fix and is not in this change.
 
 ## On the 500 MB target
 
