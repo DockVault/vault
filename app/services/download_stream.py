@@ -128,3 +128,49 @@ class BoundedDownload:
     def __exit__(self, *exc):
         self.close()
         return False
+
+
+class RandomAccessFile:
+    """A stored file a caller can read arbitrary ranges from, without holding it.
+
+    The SFTP contract is "any offset, any order, any number of times", and it was met by keeping
+    the entire plaintext in memory for as long as the client left the file open -- not for the
+    length of a transfer, which is what made it the most expensive read in the system. A 120 MB
+    file cost 120 MB from the moment it was opened until the moment it was closed.
+
+    What replaces it is the index the format walk already produces plus a two-record cache, so the
+    resident cost is a few bytes per record and at most two decrypted records.
+    """
+
+    def __init__(self, handle, read_range, size, name):
+        self._handle = handle
+        self._read_range = read_range
+        self.size = size
+        self.name = name
+
+    @classmethod
+    def from_bytes(cls, content: bytes, name):
+        """A whole-file fallback, for a format whose record boundaries cannot be found cheaply.
+
+        The clamping matters: a slice interprets a negative offset or length from the end of the
+        buffer, so `content[0:-5]` would return almost the whole file where the indexed reader
+        returns nothing. Two implementations of one contract have to answer degenerate arguments
+        the same way, whether or not a caller can currently produce them.
+        """
+        def _slice(offset: int, length: int) -> bytes:
+            if length <= 0 or offset < 0 or offset >= len(content):
+                return b''
+            return content[offset:offset + length]
+
+        return cls(None, _slice, len(content), name)
+
+    def read(self, offset: int, length: int) -> bytes:
+        return self._read_range(offset, length)
+
+    def close(self):
+        if self._handle is not None:
+            try:
+                self._handle.close()
+            except Exception:      # noqa: BLE001 - closing is best effort
+                pass
+            self._handle = None
