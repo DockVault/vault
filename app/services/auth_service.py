@@ -21,6 +21,7 @@ from app.core.security import (
     hash_password, verify_password, generate_temporary_credentials,
     verify_temporary_credential, generate_session_token, vault_password_fingerprint
 )
+from app.core.email_identity import email_in_use, normalize_email
 from app.core.session_hash_utils import hash_session_token
 from app.core.database import redis_client, get_db_context
 from app.core.config import settings
@@ -143,17 +144,19 @@ class AuthService:
     def create_user(
         self,
         username: str,
-        email: str,
+        email: Optional[str],
         password: str,
         role: RoleEnum = RoleEnum.USER,
         created_by: Optional[uuid.UUID] = None
     ) -> User:
         """
         Create a new user account.
-        
+
         Args:
             username: Unique username
-            email: User email address
+            email: User email address, or None for an account with no email. Stored canonically
+                (trimmed and lowercased); uniqueness is checked case-insensitively, and any number
+                of email-less accounts may coexist.
             password: Plain text password (will be hashed)
             role: User role
             created_by: UUID of user creating this account
@@ -164,24 +167,29 @@ class AuthService:
         Raises:
             ValueError: If username or email already exists
         """
-        # Check if username or email already exists
-        existing_user = self.db.query(User).filter(
-            or_(User.username == username, User.email == email)
-        ).first()
-        
-        if existing_user:
-            if existing_user.username == username:
-                raise ValueError(f"Username '{username}' already exists")
-            else:
-                raise ValueError(f"Email '{email}' already exists")
-        
+        # Username and email are checked SEPARATELY, and that is not a stylistic change. The single
+        # or_(User.username == username, User.email == email) this replaces compiled to
+        # `email IS NULL` whenever email was None — SQLAlchemy renders `col == None` that way — so
+        # it matched the FIRST email-less row and made the SECOND email-less account impossible to
+        # create, reporting the nonsensical "Email 'None' already exists".
+        normalized_email = normalize_email(email)
+
+        if self.db.query(User.id).filter(User.username == username).first():
+            raise ValueError(f"Username '{username}' already exists")
+
+        # Case-insensitive, so `BOB@x.com` cannot be registered alongside `bob@x.com`. An absent
+        # address never collides: Postgres treats NULLs as distinct under UNIQUE, and the
+        # application check has to agree or email-less accounts would exclude one another.
+        if email_in_use(self.db, normalized_email):
+            raise ValueError(f"Email '{normalized_email}' already exists")
+
         # Hash password
         password_hash = hash_password(password)
-        
-        # Create user
+
+        # Create user, storing the canonical (trimmed, lowercased) address.
         user = User(
             username=username,
-            email=email,
+            email=normalized_email,
             password_hash=password_hash,
             role=role,
             created_by=created_by

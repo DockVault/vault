@@ -17,6 +17,7 @@ from sqlalchemy import func, and_, or_
 from pydantic import BaseModel, EmailStr, Field
 
 from app.core.database import get_db
+from app.core.email_identity import email_in_use, normalize_email
 from app.core.models import User, TemporaryCredential, RoleEnum, AuditLog, ActiveSession
 from app.services.auth_service import AuthService
 from app.services.audit_logger import AuditLogger
@@ -127,7 +128,7 @@ class UserListItem(BaseModel):
     """User list item with summary info"""
     id: uuid.UUID
     username: str
-    email: str
+    email: Optional[str] = None
     role: RoleEnum
     is_active: bool
     is_locked: bool
@@ -143,7 +144,7 @@ class UserDetailResponse(BaseModel):
     """Detailed user information"""
     id: uuid.UUID
     username: str
-    email: str
+    email: Optional[str] = None
     role: RoleEnum
     is_active: bool
     is_locked: bool
@@ -462,6 +463,7 @@ def _blacklist_user_vault_keys(db: Session, user_id, revoked_by) -> int:
 async def update_user(
     user_id: uuid.UUID,
     update_data: UserUpdateRequest,
+    request: Request,
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
@@ -473,17 +475,15 @@ async def update_user(
         raise HTTPException(status_code=404, detail="User not found")
     
     # Update fields
-    if update_data.email is not None:
-        # Check if email already exists
-        existing = db.query(User).filter(
-            and_(
-                User.email == update_data.email,
-                User.id != user_id
-            )
-        ).first()
-        if existing:
+    # Omitting "email" leaves the address alone; sending it as an explicit null clears it. The
+    # previous `is not None` test collapsed those two into one, so an address could be replaced but
+    # never removed.
+    if "email" in update_data.model_fields_set:
+        new_email = normalize_email(update_data.email)
+        # Case-insensitive: the previous `==` let an admin store BOB@x.com beside bob@x.com.
+        if new_email is not None and email_in_use(db, new_email, exclude_user_id=user_id):
             raise HTTPException(status_code=400, detail="Email already in use")
-        user.email = update_data.email
+        user.email = new_email
     
     if update_data.role is not None:
         user.role = update_data.role
@@ -509,7 +509,13 @@ async def update_user(
     )
     
     # Return updated details
-    return await get_user_detail(user_id, current_user, db)
+    # Keyword args, not positional: get_user_detail is wrapped by require_endpoint_permission,
+    # whose wrapper reads current_user and db out of **kwargs. Called positionally they arrive as
+    # *args, the wrapper sees None for both, and every call returned 401 -- AFTER this function had
+    # already committed the change. The caller saw a failure that had in fact succeeded.
+    return await get_user_detail(
+        user_id=user_id, request=request, current_user=current_user, db=db
+    )
 
 @router.post("/users/{user_id}/toggle-active")
 @require_endpoint_permission("USER_MANAGE")

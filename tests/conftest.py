@@ -54,6 +54,19 @@ ADMIN_USER = os.environ.get("VAULT_ADMIN_USER") or _ENV.get("ADMIN_USERNAME", "a
 ADMIN_PASS = os.environ.get("VAULT_ADMIN_PASS") or _ENV.get("ADMIN_PASSWORD", "")
 
 
+class _GenerateEmail:
+    """Sentinel meaning "no email argument was given, so make one up".
+
+    Exists so that ``None`` can mean what a reader expects it to mean -- genuinely no email --
+    rather than being indistinguishable from "not specified". See ApiClient.create_user.
+    """
+    def __repr__(self):
+        return "GENERATE_EMAIL"
+
+
+GENERATE_EMAIL = _GenerateEmail()
+
+
 def unique(prefix: str = "t") -> str:
     """A short unique token for names/emails that won't collide across runs."""
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
@@ -405,16 +418,32 @@ class ApiClient:
         params = {"vault_password": vault_password} if vault_password else None
         return self.post(f"/vaults/{vault_id}/delete", params=params)
 
-    def create_user(self, username=None, email=None, password=None, role="user"):
+    def create_user(self, username=None, email=GENERATE_EMAIL, password=None, role="user"):
+        """Create a user. `email` has three meanings, and the distinction matters.
+
+        * omitted (the default) -> a unique address is generated, as it always was;
+        * ``None``              -> the field is left OUT of the request entirely, creating an
+                                   account with NO email;
+        * a string              -> sent verbatim, so a test can supply a deliberately odd address
+                                   (different case, surrounding whitespace, malformed).
+
+        The default is a sentinel rather than ``None`` on purpose. This used to read
+        ``email or f"{username}@example.com"``, so a test asking for an email-less account by
+        passing ``email=None`` silently got a generated address instead -- and would have passed
+        just as happily with optional-email support removed entirely.
+        """
         username = username or unique("user")
         body = {
             "username": username,
-            # NB: .test / .local TLDs are rejected by the email validator as
-            # reserved/special-use, so use a normal domain.
-            "email": email or f"{username}@example.com",
             "password": password or "TestPassw0rd!123",
             "role": role,
         }
+        if email is GENERATE_EMAIL:
+            # NB: .test / .local TLDs are rejected by the email validator as
+            # reserved/special-use, so use a normal domain.
+            body["email"] = f"{username}@example.com"
+        elif email is not None:
+            body["email"] = email
         r = self.post("/users", json=body)
         r.raise_for_status()
         out = r.json()

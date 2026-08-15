@@ -171,7 +171,10 @@ class User(Base):
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     username = Column(String(255), unique=True, nullable=False, index=True)
-    email = Column(String(255), unique=True, nullable=False, index=True)
+    # Optional: an account may have no email at all. Uniqueness stays case-insensitive via the
+    # lower(email) index built at boot; NULLs are distinct under UNIQUE, so any number of
+    # email-less accounts coexist. See app/core/email_identity.py.
+    email = Column(String(255), unique=True, nullable=True, index=True)
     password_hash = Column(String(255), nullable=False)
     role = Column(Enum(RoleEnum), nullable=False, default=RoleEnum.USER)
     

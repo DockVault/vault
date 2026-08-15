@@ -37,6 +37,9 @@ from app.core.database import get_db, init_db, check_db_connection, check_redis_
 from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant
 from app.core import sharing_policy
 from app.core import storage_quota
+from app.core.email_identity import (
+    EMAIL_LOWER_UNIQUE_INDEX, email_in_use, find_email_collisions, normalize_email,
+)
 from app.core.key_wrap_algorithms import DIRECT_DEK_ALGO, TEAMPRIV_ALGO
 from app.config.branding import branding
 # NOTE: auth_service and vault_service BOTH define a class named RateLimitExceededError
@@ -552,7 +555,11 @@ def _validate_chip_color(value: Optional[str]) -> Optional[str]:
 
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
-    email: EmailStr
+    # Optional at the schema layer so an omitted address is a policy question, not a 422 schema
+    # dump. EmailStr still applies to anything actually supplied, so "no email" and "a bad email"
+    # stay distinguishable. The org policy that can make an address mandatory arrives with the
+    # Accounts & Access settings; until then an omitted email is simply accepted.
+    email: Optional[EmailStr] = None
     password: str = Field(..., min_length=8)
     role: RoleEnum = RoleEnum.USER
 
@@ -604,7 +611,7 @@ class GroupBrief(BaseModel):
 class UserResponse(BaseModel):
     id: uuid.UUID
     username: str
-    email: str
+    email: Optional[str] = None
     role: RoleEnum
     is_active: bool
     is_locked: bool
@@ -683,7 +690,7 @@ class GroupUpdate(BaseModel):
 class GroupMemberRef(BaseModel):
     id: uuid.UUID
     username: str
-    email: str
+    email: Optional[str] = None
     role: RoleEnum
     group_role: str = 'member'
 
@@ -993,7 +1000,7 @@ class VaultPermissionAdd(BaseModel):
 class VaultPermissionResponse(BaseModel):
     user_id: uuid.UUID
     username: str
-    email: str
+    email: Optional[str] = None
     read_permission: bool
     write_permission: bool
     delete_permission: bool
@@ -1028,7 +1035,7 @@ class UserPermissionsResponse(BaseModel):
     """Response model for user's permissions"""
     user_id: uuid.UUID
     username: str
-    email: str
+    email: Optional[str] = None
     role: str
     granted_groups: List[str]
     permissions: List[dict]
@@ -4127,7 +4134,13 @@ async def update_own_account(
 
     audit_logger = AuditLogger(db)
     changes = []
-    changing_email = body.email is not None and body.email != user.email
+    # Omitting "email" and sending it explicitly as null are DIFFERENT requests: the first leaves
+    # the address alone, the second clears it. `Optional[EmailStr] = None` collapses both to None,
+    # so ask pydantic which fields the client actually sent. Without this a user could never remove
+    # their own address — the request would be indistinguishable from one that never mentioned it.
+    email_supplied = "email" in body.model_fields_set
+    new_email = normalize_email(body.email) if email_supplied else None
+    changing_email = email_supplied and new_email != user.email
     sensitive = body.new_password is not None or changing_email
     if sensitive:
         if not body.current_password or not user.password_hash or not verify_password(body.current_password, user.password_hash):
@@ -4138,10 +4151,15 @@ async def update_own_account(
         user.password_hash = hash_password(body.new_password)
         changes.append("password")
     if changing_email:
-        # email is unique — reject a clash with a clean 400 instead of a commit-time 500.
-        if db.query(User.id).filter(User.email == str(body.email), User.id != user.id).first():
+        # Case-insensitive, so a clash cannot be slipped through by changing only the case. The
+        # previous check compared against str(body.email), which would have matched the literal
+        # string "None" once an address could legitimately be absent.
+        if new_email is not None and email_in_use(db, new_email, exclude_user_id=user.id):
             raise HTTPException(status_code=400, detail="That email address is already in use.")
-        user.email = str(body.email)
+        # Clearing an address is allowed here because a username still identifies the account. Once
+        # an organization can require an address to BE the login identifier, clearing it under that
+        # policy has to be refused instead — that check belongs right here, where the policy lands.
+        user.email = new_email
         changes.append("email")
     if body.sftp_enabled is not None and body.sftp_enabled != user.sftp_enabled:
         user.sftp_enabled = body.sftp_enabled
@@ -4449,10 +4467,16 @@ async def update_user(
     # Track changes for audit log
     changes = {}
     
-    # Non-admin users can only update their own email and password
-    if user_update.email is not None:
-        changes['email'] = {'old': user.email, 'new': user_update.email}
-        user.email = user_update.email
+    # Non-admin users can only update their own email and password.
+    # "email" omitted leaves the address alone; sent as an explicit null clears it.
+    if "email" in user_update.model_fields_set:
+        new_email = normalize_email(user_update.email)
+        # This path previously assigned the address with NO uniqueness check at all, so an exact
+        # duplicate reached the database and surfaced as an uncaught IntegrityError 500.
+        if new_email is not None and email_in_use(db, new_email, exclude_user_id=user.id):
+            raise HTTPException(status_code=400, detail="That email address is already in use.")
+        changes['email'] = {'old': user.email, 'new': new_email}
+        user.email = new_email
     
     if user_update.password is not None:
         _validate_password_policy(db, user_update.password)
@@ -11661,6 +11685,13 @@ def _run_lightweight_migrations():
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS name_key_version INTEGER",
             # Per-account storage budget (NULL inherits the deployment default, -1 exempts).
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_quota_bytes BIGINT",
+            # Email becomes optional. This ALTER is what makes an UPGRADED install match a fresh
+            # one: create_all() only ever creates tables, so without this line the model would say
+            # nullable while every existing deployment kept NOT NULL -- and creating an email-less
+            # user would fail at the database for every self-hoster while the suite stayed green,
+            # because the suite installs fresh. The case-insensitive uniqueness index is NOT here:
+            # it needs a collision check first, so it lives in code after this loop.
+            "ALTER TABLE users ALTER COLUMN email DROP NOT NULL",
             # Storage-allocation ledger. create_all builds the table on a fresh database; these
             # cover a database that already has vaults, and seed one owner-held grant per vault so
             # the ledger's invariant (SUM(granted_bytes) == vaults.size_limit) holds from the first
@@ -11735,6 +11766,54 @@ def _run_lightweight_migrations():
                 except Exception as e:
                     db.rollback()
                     print(f"⚠ Migration step skipped ({stmt}): {e}")
+
+            # Case-insensitive uniqueness on users.email. Deliberately NOT a string in the list
+            # above, because it is conditional: a deployment that already holds two addresses
+            # differing only in case cannot build this index at all.
+            #
+            # Such a deployment BOOTS anyway, with a warning naming the accounts.
+            # Refusing to start would take a self-hosted vault down in the middle of an unattended
+            # update and keep it down until someone hand-edited the database; nulling the newer
+            # duplicate would silently destroy an address that may be that person's only way in.
+            #
+            # The consequence has to be stated plainly, because it is load-bearing: on a colliding
+            # install this index does NOT exist, so the application check in
+            # app/core/email_identity.py is the only guard there is. It is not belt-and-braces and
+            # must not be deleted as redundant with the index.
+            try:
+                collisions = find_email_collisions(db)
+                if collisions:
+                    print(
+                        f"⚠ users.email: {len(collisions)} address(es) are held by more than one "
+                        f"account differing only in case, so the case-insensitive unique index "
+                        f"({EMAIL_LOWER_UNIQUE_INDEX}) was NOT created. Uniqueness is still enforced "
+                        f"by the application, but two concurrent requests could still race. "
+                        f"Resolve these accounts and restart:"
+                    )
+                    for normalized, usernames in collisions:
+                        print(f"    {normalized}  ->  {usernames}")
+                else:
+                    # Canonicalize what is already there before indexing it. Rows written by an
+                    # older release kept whatever case the caller typed, so without this an
+                    # upgraded install holds a mix of folded and unfolded addresses. Uses the
+                    # DATABASE's lower(), the same function the index and every lookup use, so
+                    # there is one definition of "lowercase" everywhere. Safe to run only in this
+                    # branch: the preflight has just proven no two rows collide under lower(), so
+                    # this cannot violate the plain unique constraint.
+                    db.execute(text(
+                        "UPDATE users SET email = lower(email) "
+                        "WHERE email IS NOT NULL AND email <> lower(email)"
+                    ))
+                    db.execute(text(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS {EMAIL_LOWER_UNIQUE_INDEX} "
+                        f"ON users (lower(email))"
+                    ))
+                    db.commit()
+            except Exception as e:
+                # Own try/except so a failure here cannot abort anything else; every statement in
+                # the loop above already committed independently.
+                db.rollback()
+                print(f"⚠ users.email case-insensitive index skipped: {e}")
     except Exception as e:
         print(f"⚠ Lightweight migrations skipped: {e}")
 
