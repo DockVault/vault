@@ -4134,7 +4134,13 @@ async def update_own_account(
 
     audit_logger = AuditLogger(db)
     changes = []
-    changing_email = body.email is not None and body.email != user.email
+    # Omitting "email" and sending it explicitly as null are DIFFERENT requests: the first leaves
+    # the address alone, the second clears it. `Optional[EmailStr] = None` collapses both to None,
+    # so ask pydantic which fields the client actually sent. Without this a user could never remove
+    # their own address — the request would be indistinguishable from one that never mentioned it.
+    email_supplied = "email" in body.model_fields_set
+    new_email = normalize_email(body.email) if email_supplied else None
+    changing_email = email_supplied and new_email != user.email
     sensitive = body.new_password is not None or changing_email
     if sensitive:
         if not body.current_password or not user.password_hash or not verify_password(body.current_password, user.password_hash):
@@ -4145,10 +4151,15 @@ async def update_own_account(
         user.password_hash = hash_password(body.new_password)
         changes.append("password")
     if changing_email:
-        # email is unique — reject a clash with a clean 400 instead of a commit-time 500.
-        if db.query(User.id).filter(User.email == str(body.email), User.id != user.id).first():
+        # Case-insensitive, so a clash cannot be slipped through by changing only the case. The
+        # previous check compared against str(body.email), which would have matched the literal
+        # string "None" once an address could legitimately be absent.
+        if new_email is not None and email_in_use(db, new_email, exclude_user_id=user.id):
             raise HTTPException(status_code=400, detail="That email address is already in use.")
-        user.email = str(body.email)
+        # Clearing an address is allowed here because a username still identifies the account. Once
+        # an organization can require an address to BE the login identifier, clearing it under that
+        # policy has to be refused instead — that check belongs right here, where the policy lands.
+        user.email = new_email
         changes.append("email")
     if body.sftp_enabled is not None and body.sftp_enabled != user.sftp_enabled:
         user.sftp_enabled = body.sftp_enabled
@@ -4456,10 +4467,16 @@ async def update_user(
     # Track changes for audit log
     changes = {}
     
-    # Non-admin users can only update their own email and password
-    if user_update.email is not None:
-        changes['email'] = {'old': user.email, 'new': user_update.email}
-        user.email = user_update.email
+    # Non-admin users can only update their own email and password.
+    # "email" omitted leaves the address alone; sent as an explicit null clears it.
+    if "email" in user_update.model_fields_set:
+        new_email = normalize_email(user_update.email)
+        # This path previously assigned the address with NO uniqueness check at all, so an exact
+        # duplicate reached the database and surfaced as an uncaught IntegrityError 500.
+        if new_email is not None and email_in_use(db, new_email, exclude_user_id=user.id):
+            raise HTTPException(status_code=400, detail="That email address is already in use.")
+        changes['email'] = {'old': user.email, 'new': new_email}
+        user.email = new_email
     
     if user_update.password is not None:
         _validate_password_policy(db, user_update.password)

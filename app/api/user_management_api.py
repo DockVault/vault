@@ -17,6 +17,7 @@ from sqlalchemy import func, and_, or_
 from pydantic import BaseModel, EmailStr, Field
 
 from app.core.database import get_db
+from app.core.email_identity import email_in_use, normalize_email
 from app.core.models import User, TemporaryCredential, RoleEnum, AuditLog, ActiveSession
 from app.services.auth_service import AuthService
 from app.services.audit_logger import AuditLogger
@@ -473,17 +474,15 @@ async def update_user(
         raise HTTPException(status_code=404, detail="User not found")
     
     # Update fields
-    if update_data.email is not None:
-        # Check if email already exists
-        existing = db.query(User).filter(
-            and_(
-                User.email == update_data.email,
-                User.id != user_id
-            )
-        ).first()
-        if existing:
+    # Omitting "email" leaves the address alone; sending it as an explicit null clears it. The
+    # previous `is not None` test collapsed those two into one, so an address could be replaced but
+    # never removed.
+    if "email" in update_data.model_fields_set:
+        new_email = normalize_email(update_data.email)
+        # Case-insensitive: the previous `==` let an admin store BOB@x.com beside bob@x.com.
+        if new_email is not None and email_in_use(db, new_email, exclude_user_id=user_id):
             raise HTTPException(status_code=400, detail="Email already in use")
-        user.email = update_data.email
+        user.email = new_email
     
     if update_data.role is not None:
         user.role = update_data.role
