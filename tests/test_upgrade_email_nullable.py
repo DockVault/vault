@@ -151,7 +151,7 @@ def upgrade_stack(tmp_path_factory):
 
 
 def _login(base_url, username, password):
-    r = requests.post(f"{base_url}/api/login",
+    r = requests.post(f"{base_url}/auth/login",
                       json={"username": username, "password": password}, timeout=30)
     r.raise_for_status()
     return r.json()["access_token"]
