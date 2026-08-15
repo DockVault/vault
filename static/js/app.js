@@ -3999,11 +3999,20 @@ function wireUserSettingsModal() {
         e.preventDefault(); _usHideError();
         const email = document.getElementById('us-new-email').value.trim();
         const cur = document.getElementById('us-email-cur-pw').value;
-        if (!email) { _usShowError('Enter a new email address.'); return; }
         if (!cur) { _usShowError('Enter your current password.'); return; }
+        // An empty box CLEARS the address rather than being rejected: an account may have no
+        // email. Sent as an explicit null, because the backend reads an omitted field as "leave
+        // it alone" and "" is not a valid address. Requiring the current password above is what
+        // keeps this deliberate, so it needs no second confirmation.
         try {
-            const updated = await apiRequest('/users/me', { method: 'PATCH', body: JSON.stringify({ current_password: cur, email }) });
-            if (updated && updated.email) { currentUser.email = updated.email; document.getElementById('us-email-display').textContent = updated.email; }
+            const updated = await apiRequest('/users/me', { method: 'PATCH', body: JSON.stringify({ current_password: cur, email: email || null }) });
+            // Note the missing `&& updated.email`: guarding on the new value meant a successful
+            // CLEAR left the old address on screen, looking as though nothing had happened.
+            if (updated) {
+                currentUser.email = updated.email || null;
+                document.getElementById('us-email-display').textContent = updated.email || 'Not set';
+                document.getElementById('us-new-email').value = '';
+            }
             showSuccess('Email updated');
             document.getElementById('us-email-cur-pw').value = '';
         } catch (err) { _usShowError(err.message || 'Could not update email.'); }
@@ -4189,7 +4198,7 @@ function showEditUserModal(userId) {
             // Populate form with user data
             document.getElementById('edit-user-id').value = user.id;
             document.getElementById('edit-user-username').value = user.username;
-            document.getElementById('edit-user-email').value = user.email;
+            document.getElementById('edit-user-email').value = user.email || '';
             document.getElementById('edit-user-role').value = user.role;
             document.getElementById('edit-user-active').checked = user.is_active;
             renderUserQuotaField(user);
@@ -4339,14 +4348,14 @@ document.getElementById('create-user-form').addEventListener('submit', async (e)
     const role = document.getElementById('new-role').value;
     
     try {
+        // A blank box means "no email", so the field is OMITTED rather than sent as "".
+        // An empty string is not a valid address and would come back as a 422.
+        const payload = { username, password, role };
+        if (email.trim()) payload.email = email.trim();
+
         await apiRequest('/users', {
             method: 'POST',
-            body: JSON.stringify({
-                username,
-                email,
-                password,
-                role
-            })
+            body: JSON.stringify(payload)
         });
         
         closeModal();
@@ -12071,7 +12080,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 await apiRequest(`/users/${userId}`, {
                     method: 'PATCH',
                     body: JSON.stringify({
-                        email,
+                        // Clearing the box CLEARS the address, so send an explicit null rather
+                        // than "". The backend distinguishes an omitted field (leave alone) from
+                        // an explicit null (clear); "" is neither, and fails validation.
+                        email: email.trim() ? email.trim() : null,
                         role,
                         is_active: isActive,
                         storage_quota_gb: storageQuotaGb
