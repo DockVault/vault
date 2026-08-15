@@ -2450,17 +2450,85 @@ def test_a_hand_edited_env_cannot_crash_the_tool(parser, hostile):
     assert getattr(dv, parser)(hostile) is None
 
 
-def test_the_carried_ceiling_is_the_one_the_deployment_was_running():
+def test_the_carried_settings_are_what_the_deployment_was_running():
     """What the tool writes must be what the running deployment was already doing, value for value.
 
-    Checked against the gate itself rather than against a table, so the two cannot drift apart.
+    Checked against the real path a value takes -- the settings layer, then the gate -- rather than
+    against a table or against the gate alone. A value the settings layer rejects is one the
+    application will not start with, and reporting a number for it would be a wrong answer of a
+    different kind than reporting the wrong number.
     """
+    import pydantic
+    from app.core.config import Settings
     from app.core.transfer_admission import TransferAdmission
-    for raw in ("0", "-3", "1", "4", "16", "8.0"):
-        carried = dv.parse_transfer_limit(raw)
-        running = TransferAdmission(limit=float(raw), max_waiting=0, wait_seconds=1).stats()["limit"]
-        assert carried == running, (
-            f"MAX_CONCURRENT_TRANSFERS={raw} runs as {running} but the tool would carry {carried}")
+
+    def running(**env):
+        """What a deployment configured this way would actually apply, or None if it won't boot."""
+        try:
+            settings = Settings(**env)
+        except pydantic.ValidationError:
+            return None
+        gate = TransferAdmission(
+            limit=settings.max_concurrent_transfers,
+            max_waiting=settings.max_queued_transfers,
+            wait_seconds=settings.transfer_queue_wait_seconds)
+        return gate.stats()
+
+    for raw in ("0", "-3", "1", "4", "16"):
+        applied = running(max_concurrent_transfers=raw)
+        assert applied is not None, f"MAX_CONCURRENT_TRANSFERS={raw} should still boot"
+        assert dv.parse_transfer_limit(raw) == applied["limit"], (
+            f"MAX_CONCURRENT_TRANSFERS={raw} runs as {applied['limit']} but the tool would carry "
+            f"{dv.parse_transfer_limit(raw)}")
+
+    for raw in ("0", "32", "-1"):
+        applied = running(max_queued_transfers=raw)
+        assert applied is not None, f"MAX_QUEUED_TRANSFERS={raw} should still boot"
+        assert dv.parse_transfer_queue(raw) == applied["max_waiting"]
+
+    # Including the hour ceiling: an operator who asked for two hours is running one, and the tool
+    # must say one rather than repeat what the .env claims.
+    for raw in ("0", "20", "2.5", "7200"):
+        applied = running(transfer_queue_wait_seconds=raw)
+        assert applied is not None, f"TRANSFER_QUEUE_WAIT_SECONDS={raw} should still boot"
+        assert dv.parse_transfer_wait(raw) == applied["wait_seconds"], (
+            f"TRANSFER_QUEUE_WAIT_SECONDS={raw} runs as {applied['wait_seconds']} but the tool "
+            f"would carry {dv.parse_transfer_wait(raw)}")
+
+    assert dv.TRANSFER_WAIT_CEILING_SECONDS == TransferAdmission.MAX_WAIT_SECONDS, (
+        "the tool's copy of the wait ceiling has drifted from the application's")
+
+
+def test_a_value_the_application_will_not_start_with_is_not_carried_as_a_number():
+    """The tool must not paper over a setting that stops the deployment booting.
+
+    A fractional or exponential ceiling reads fine as a float and is rejected by the settings
+    layer, so the deployment does not start at all. Carrying a rounded number for it would author
+    an .env that looks different from the one the operator had, without fixing anything.
+    """
+    import pydantic
+    from app.core.config import Settings
+
+    for raw in ("4.7", "1e3"):
+        try:
+            Settings(max_concurrent_transfers=raw)
+        except pydantic.ValidationError:
+            continue
+        pytest.fail(f"the settings layer now accepts {raw!r}; this test's premise is stale")
+
+
+def test_the_limits_menu_can_read_and_change_the_transfer_ceiling():
+    """The rule is that a setting the application reads is a setting this tool can write.
+
+    The ceiling is reported beside the storage limit -- the two answer the same question about how
+    big a deployment may get, one in disk and one in memory -- and is changed from the same place.
+    """
+    args = dv.build_parser().parse_args(["storage", "--non-interactive", "--set-transfers", "4"])
+    assert dv.parse_transfer_limit(args.set_transfers) == 4
+
+    label = dict(dv.MENU)["storage"]
+    assert "transfer" in label.lower(), (
+        f"the menu does not mention transfers, so nobody will find the setting there: {label!r}")
 
 
 def test_the_transfer_flags_survive_argparse():

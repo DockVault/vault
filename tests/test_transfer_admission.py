@@ -296,3 +296,8 @@ def test_an_unusable_wait_still_produces_an_answer_a_client_can_act_on(configure
         finally:
             gate.release(held)
     _run(_go())
+
+
+def test_the_wait_ceiling_is_an_hour():
+    """Pinned because the management tool mirrors this number rather than importing it."""
+    assert TransferAdmission.MAX_WAIT_SECONDS == 3600.0

@@ -48,6 +48,12 @@ class TransferAdmission:
     beside it, deliberately.
     """
 
+    # A wait long enough that nobody is coming back for the answer. Configuring one is the same
+    # mistake as configuring no timeout at all, and it has to be bounded somewhere: the refusal
+    # carries a Retry-After, which is an integer number of seconds, so an unbounded float here
+    # turns every refusal into a server error instead of a "come back shortly".
+    MAX_WAIT_SECONDS = 3600.0
+
     def __init__(self, limit: int, max_waiting: int, wait_seconds: float):
         self._limit = max(1, int(limit))
         self._max_waiting = max(0, int(max_waiting))
@@ -73,12 +79,6 @@ class TransferAdmission:
         # it is the only external evidence of how many times a request was admitted -- which is
         # how a caller can tell one transfer from several sharing a request.
         self._admitted = 0
-
-    # A wait long enough that nobody is coming back for the answer. Configuring one is the same
-    # mistake as configuring no timeout at all, and it has to be bounded somewhere: the refusal
-    # carries a Retry-After, which is an integer number of seconds, so an unbounded float here
-    # turns every refusal into a server error instead of a "come back shortly".
-    MAX_WAIT_SECONDS = 3600.0
 
     @classmethod
     def _usable_wait(cls, wait_seconds) -> float:

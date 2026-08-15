@@ -8010,7 +8010,6 @@ def _reject_unreplaceable_upload(db, vault_id, folder_id, filename, user, name_b
         )
 
 
-_BACKSLASH = chr(92)
 _MEDIA_TOKEN_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+.^_`|~-")
 
@@ -8043,12 +8042,14 @@ def _safe_media_type(value: Optional[str]) -> str:
     while rest:
         parameter, _, rest = rest.partition(";")
         name, equals, raw = parameter.strip().partition("=")
+        # An empty segment is not a parameter. Passing "text/plain;" through unchanged leaves the
+        # framework to render it as "text/plain;; charset=utf-8".
         if not equals or not _is_media_token(name.strip()):
             return "application/octet-stream"
         raw = raw.strip()
         if raw.startswith('"'):
             if (not raw.endswith('"') or len(raw) < 2
-                    or _BACKSLASH in raw or '"' in raw[1:-1]):
+                    or "\\" in raw or '"' in raw[1:-1]):
                 return "application/octet-stream"
         elif not _is_media_token(raw):
             return "application/octet-stream"
@@ -8110,6 +8111,13 @@ async def upload_file(
     # and taking a slot per file would let a request commit its first file and then be refused
     # partway through, which is a worse answer than either accepting or refusing the whole thing.
     transfer_slot = None
+
+    # Bound here, not where they are first used, because the teardown at the end of this function
+    # reads them on EVERY path out -- including the ones that raise before the vault has even been
+    # looked up. Left to be bound later, an authorization denial raises past them and the teardown
+    # fails with an unbound name, turning a clean 403 into a 500.
+    reservation_key = None
+    vault_size_limit = 0
 
     try:
         # Verify vault access and password (from header for security)
@@ -8297,7 +8305,8 @@ async def upload_file(
 
             _op_ok = False  # set True only after the file is fully committed (drives complete_operation)
 
-            # Wrap entire upload in try-finally to ensure reservation cleanup
+            # Per-file teardown: the progress record and the operation entry. The transfer slot
+            # and the space reservation belong to the request, and are released at the end of it.
             try:
                 # Same-name policy = replace; reject up front if the uploader can't.
                 _reject_unreplaceable_upload(db, vault_id, folder_uuid, upload_file.filename, current_user)
@@ -10006,7 +10015,7 @@ async def download_file(
     operation_id = None
     tracker = None
     tracker_started = False
-    stream_handed_off = False
+    streaming_response = None
     download = None
     transfer_slot = None
 
@@ -10286,9 +10295,10 @@ async def download_file(
                     })
                 end_operation(operation_id)
 
-        # Built BEFORE the handover is recorded. Constructing a response can fail -- it encodes
-        # the headers -- and a failure after the flag is set skips the teardown below entirely,
-        # losing the transfer slot for the life of the process.
+        # The teardown below asks whether this exists rather than reading a flag someone has to
+        # remember to set in the right place. Building a response can fail -- it encodes the
+        # headers -- and a flag set a line too early skipped the teardown entirely, holding the
+        # transfer slot, the open blob and the operation entry for the life of the process.
         streaming_response = StreamingResponse(
             file_streamer(),
             media_type=_safe_media_type(mime_type),
@@ -10301,10 +10311,6 @@ async def download_file(
                 'X-Operation-ID': operation_id,
             },
         )
-        # Only now: the response exists, so the generator will run and its teardown owns the slot,
-        # the open blob and the operation entry. Recorded before this point, a failure while
-        # building the response would have left all three held with nothing to release them.
-        stream_handed_off = True
         return streaming_response
 
     except (PasswordRequiredError, InvalidPasswordError) as e:
@@ -10349,7 +10355,11 @@ async def download_file(
         # set. The blob is now opened before the handoff, so anything that fails in between --
         # every early failure the walk exists to produce -- would otherwise leak its descriptor
         # for the life of the process.
-        if not stream_handed_off:
+        # No response object means the request never got as far as handing anything over, so
+        # this owns the cleanup. Once it exists, the streaming generator's own teardown does --
+        # the one exception being a connection that dies before the framework starts iterating,
+        # which is not reachable through the middleware stack in front of this.
+        if streaming_response is None:
             transfer_admission.release(transfer_slot)
             if download is not None:
                 download.close()

@@ -580,3 +580,32 @@ def test_a_refused_upload_does_not_reserve_space_it_never_uses(admin):
         f"their space reservations behind: {stored.text[:200]}")
 
     admin.delete(f"/vaults/{vid}")
+
+
+def test_the_request_teardown_never_masks_the_real_answer(admin, temp_user_client, temp_vault):
+    """An upload that is refused before it reaches the vault must still say why.
+
+    The teardown at the end of the upload request releases the transfer slot and the space
+    reservation, and it runs on every path out -- including the ones that raise before either
+    exists. If it reads something that was never bound, it raises on the way out and replaces the
+    real answer with a server error: a caller who should have been told "you may not write here"
+    is told "something broke", and the deployment looks unhealthy instead of correct.
+    """
+    vid = temp_vault["id"]
+
+    denied = temp_user_client.post(
+        f"/vaults/{vid}/files",
+        files=[("files", (unique("denied") + ".bin", b"d" * 2048,
+                          "application/octet-stream"))])
+    assert denied.status_code in (401, 403, 404), (
+        f"a caller with no write access was answered {denied.status_code}; the teardown replaced "
+        f"the real answer: {denied.text[:200]}")
+
+    # And the refusal cost nothing: the deployment still accepts a legitimate upload.
+    stored = admin.post(
+        f"/vaults/{vid}/files",
+        files=[("files", (unique("after-denial") + ".bin", b"a" * 2048,
+                          "application/octet-stream"))])
+    assert stored.status_code == 200, (
+        f"an upload after a denied one was answered {stored.status_code}; the denied request kept "
+        "its slot or its space reservation")
