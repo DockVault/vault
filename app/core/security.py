@@ -2,6 +2,7 @@
 Security utilities for password hashing, encryption, and credential generation.
 Implements industry-standard security practices.
 """
+import bisect
 import os
 import secrets
 import hashlib
@@ -484,6 +485,9 @@ class GcmChunkStreamReader:
         # held per open reader.
         self._lengths = array('I')
         self._total_length = 0
+        # Built by the random-access path only; a sequential read never touches either.
+        self._plain_cum = None
+        self._cache = []
         self._walk()
 
     # -- positional reads -------------------------------------------------------
@@ -657,6 +661,79 @@ class GcmChunkStreamReader:
             # The one failure the walk cannot pre-empt. Attribute it before calling it corruption:
             # an ordinary delete racing an ordinary read arrives here looking identical.
             self._raise_for_failure("Failed to decrypt AES-GCM chunk stream")
+
+    # -- random access -----------------------------------------------------------
+
+    def _plaintext_offsets(self):
+        """Cumulative plaintext offsets, one per record plus a total. Built once, on demand.
+
+        Only the random-access path needs this, so a sequential download never pays for it.
+
+        Deriving the FILE offset from it needs no second array: a record occupies its 4-byte length
+        prefix plus a 12-byte nonce plus its ciphertext plus a 16-byte tag, so its length field is
+        always its plaintext length plus 28, and
+
+            file_offset(i) = data_start + 32 * i + plaintext_offset(i)
+
+        which is exact for both retained versions because both use the same nonce and tag sizes.
+        Storing the file offsets as well would double an array that is already the largest thing
+        this object holds.
+        """
+        if self._plain_cum is None:
+            cum = array('Q')
+            cum.append(0)
+            total = 0
+            for length in self._lengths:
+                total += length - _GCM_NONCE_SIZE - 16
+                cum.append(total)
+            self._plain_cum = cum
+        return self._plain_cum
+
+    def _record_at(self, plaintext_offset: int) -> int:
+        """Index of the record containing `plaintext_offset`."""
+        cum = self._plaintext_offsets()
+        return bisect.bisect_right(cum, plaintext_offset) - 1
+
+    def _cached_record(self, index: int) -> bytes:
+        """Decrypt record `index`, reusing the last two.
+
+        The cache is not an optimisation. Clients read sequentially in small requests -- 32 KiB is
+        typical -- so a 1 MiB record covers about thirty of them, and without a cache each of those
+        reads decrypts the same record from scratch. Two entries rather than one, so that a read
+        spanning a boundary does not evict the record the next read will want.
+        """
+        for cached_index, plain in self._cache:
+            if cached_index == index:
+                return plain
+        cum = self._plaintext_offsets()
+        plain = self._decrypt_at(index, self._data_start + 32 * index + cum[index])
+        self._cache.append((index, plain))
+        del self._cache[:-2]
+        return plain
+
+    def read_range(self, offset: int, length: int) -> bytes:
+        """Plaintext bytes `[offset, offset + length)`, decrypting only the records they touch.
+
+        Past the end returns empty; a request straddling the end returns what exists. Both match
+        what a caller slicing a whole-file buffer would have got.
+        """
+        if length <= 0 or offset < 0:
+            return b''
+        cum = self._plaintext_offsets()
+        total = cum[-1]
+        if offset >= total:
+            return b''
+        end = min(offset + length, total)
+
+        out = bytearray()
+        index = self._record_at(offset)
+        while len(out) < end - offset and index < len(self._lengths):
+            plain = self._cached_record(index)
+            start_in_record = max(0, offset - cum[index])
+            wanted = (end - offset) - len(out)
+            out += plain[start_in_record:start_in_record + wanted]
+            index += 1
+        return bytes(out)
 
     def records(self):
         """Yield each record's plaintext in order, holding one record at a time."""

@@ -135,9 +135,10 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
     """
     A single open-file handle.
 
-    Read mode: the (decrypted) file content is loaded into ``readbuf`` up front
-    (mirrors the web download, which also materialises the whole file) and served
-    by offset.
+    Read mode: ``reader`` answers ranges from the stored file, decrypting only the records a
+    request touches. It used to hold the entire decrypted file instead -- for the life of the
+    handle, not the length of a transfer, so a client that opened a large file and walked away
+    held all of it until it closed.
 
     Write mode: incoming bytes are buffered to a temp file; on ``close`` the
     assembled plaintext is pushed through the real encryption pipeline via the
@@ -148,8 +149,9 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
 
     def __init__(self, flags: int = 0):
         super().__init__(flags)
-        # read mode
-        self.readbuf: Optional[bytes] = None
+        # Read mode. `reader` answers ranges without holding the file; the whole plaintext used to
+        # sit here instead, for as long as the client left the handle open.
+        self.reader = None
         # write mode
         self.writepath: Optional[str] = None
         self.writefile = None
@@ -163,11 +165,18 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         self.attrs: Optional[paramiko.SFTPAttributes] = None
 
     def read(self, offset: int, length: int):
-        if self.readbuf is None:
+        if self.reader is None:
             return paramiko.SFTP_OP_UNSUPPORTED
-        if offset >= len(self.readbuf):
+        if offset >= self.reader.size:
             return paramiko.SFTP_EOF
-        return self.readbuf[offset:offset + length]
+        try:
+            return self.reader.read(offset, length)
+        except Exception as e:  # noqa: BLE001 - a read failure must not drop the connection
+            # Reaching here means a record would not authenticate, or the blob moved underneath
+            # the handle. Either way the client gets a failure for this read rather than bytes
+            # that were not verified.
+            safe_event('read.failed', e)
+            return paramiko.SFTP_FAILURE
 
     def write(self, offset: int, data: bytes):
         if self.writefile is None:
@@ -193,6 +202,15 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         return paramiko.SFTP_OP_UNSUPPORTED
 
     def close(self):
+        # Read mode: release the blob. Held for the life of the handle, so a client that opens a
+        # file and leaves is the case this matters for.
+        if self.reader is not None:
+            try:
+                self.reader.close()
+            except Exception:  # noqa: BLE001 - closing is best effort
+                pass
+            self.reader = None
+
         # Write mode: assemble + encrypt + persist.
         if self.writefile is not None:
             try:
@@ -216,7 +234,6 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
                     os.remove(self.writepath)
             except Exception:  # noqa: BLE001
                 pass
-        self.readbuf = None
 
 
 class SFTPServerInterface(paramiko.SFTPServerInterface):
@@ -740,9 +757,10 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             if not self._scope_ok_file(db, user, vault.id, f.id):
                 return paramiko.SFTP_NO_SUCH_FILE
             try:
-                # download_file re-resolves the file's REAL vault and re-checks
-                # READ permission + any per-file password — same as the web path.
-                content, name, _mime = vault_service.download_file(f.id, user)
+                # Re-resolves the file's REAL vault and re-checks READ permission + any per-file
+                # password, through the same function the web path uses. Opens the blob and reads
+                # its framing; it does not read the file.
+                reader = vault_service.open_random_reader(f.id, user)
             except (PermissionDeniedError, PasswordRequiredError, InvalidPasswordError):
                 return paramiko.SFTP_PERMISSION_DENIED
             except VaultFileNotFoundError:
@@ -751,12 +769,15 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 safe_event('download.failed', e, file=f.id)
                 return paramiko.SFTP_FAILURE
 
+            name = reader.name
             self._audit(user, "file_download", str(f.id),
                         {"vault_id": str(vault.id), "file_name": name, "via": "sftp"})
 
             handle = VaultSFTPHandle(flags=os.O_RDONLY)
-            handle.readbuf = content
-            handle.attrs = self._file_attr(name, size=len(content), mtime=self._ts(f.created_at))
+            handle.reader = reader
+            # The size the format itself reports, which for the current format is authenticated by
+            # its terminal -- unlike the directory listing's, which comes from the database row.
+            handle.attrs = self._file_attr(name, size=reader.size, mtime=self._ts(f.created_at))
             return handle
 
     def _open_write(self, segments: List[str]):

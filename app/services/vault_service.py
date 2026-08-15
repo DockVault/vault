@@ -1421,6 +1421,75 @@ class VaultService:
         file, vault = self._resolve_download(file_id, user, file_password, allow_share)
         return self._open_stored_file(file, vault, file_id, whole=False)
 
+    def open_random_reader(
+        self,
+        file_id: uuid.UUID,
+        user: User,
+        file_password: Optional[str] = None,
+    ):
+        """Authorize a read and return something that answers arbitrary byte ranges.
+
+        For SFTP, whose contract is "any offset, any order, any number of times". The download
+        entry points serve a stream from beginning to end; this one serves a file a client will
+        seek around in, and holds the same index the stream's walk already builds rather than the
+        file itself.
+
+        Shares :meth:`_resolve_download`, so the permission, scope and per-file password checks are
+        the same ones the HTTP path runs -- `allow_share` is False, because a share claim confers
+        nothing over SFTP.
+
+        Returns a :class:`RandomAccessFile`. The caller owns it and must close it.
+        """
+        file, vault = self._resolve_download(file_id, user, file_password, allow_share=False)
+        return self._open_random(file, vault, file_id)
+
+    def _open_random(self, file, vault, file_id):
+        from app.core.security import is_gcm_chunk_stream, GcmChunkStreamReader
+        from app.services.download_stream import RandomAccessFile
+
+        storage_path = self.storage_path / file.storage_path
+        if not storage_path.exists():
+            raise FileNotFoundError(f"File data not found on disk: {file_id}")
+
+        handle = open(storage_path, 'rb')
+        try:
+            try:
+                looks_like_gcm = is_gcm_chunk_stream(storage_path)
+            except Exception as e:
+                raise FileServiceError(f"Failed to read file: {e}")
+
+            if looks_like_gcm:
+                try:
+                    reader = GcmChunkStreamReader(handle, file.vault_id, file.id)
+                except Exception as e:
+                    raise FileServiceError(f"Failed to decrypt file: {e}")
+
+                if not reader.length_is_authenticated:
+                    # The retained format has no terminal, so nothing signs its length. The
+                    # whole-file read this replaces caught a truncation incidentally, by hashing
+                    # everything and comparing; a reader that only decrypts what is asked for
+                    # cannot. Comparing the walk's total against the recorded size restores that,
+                    # and costs nothing. It is unauthenticated -- whoever can rewrite the blob can
+                    # usually rewrite the row -- but it is what this format already had.
+                    recorded = file.size_bytes or 0
+                    if recorded and reader.total_length != recorded:
+                        raise FileServiceError(
+                            "Failed to read file: stored length does not match the record")
+
+                return RandomAccessFile(handle, reader.read_range, reader.total_length,
+                                        file.original_name)
+
+            # Legacy Fernet keeps the whole-file behaviour. Its plaintext lengths are not derivable
+            # from the framing -- padding hides up to sixteen bytes per token -- so an index cannot
+            # be built without decrypting everything anyway. No writer produces this format, so the
+            # exposure shrinks as those files are replaced and cannot grow.
+            content, _name, _mime = self._open_stored_file(file, vault, file_id)
+            handle.close()
+            return RandomAccessFile.from_bytes(content, file.original_name)
+        except Exception:
+            handle.close()
+            raise
+
     def _open_stored_file(self, file, vault, file_id, whole: bool = True):
         """Open the blob, pick a reader for its at-rest format, and describe what it will produce.
 
