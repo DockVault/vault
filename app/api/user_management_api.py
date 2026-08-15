@@ -127,7 +127,7 @@ class UserListItem(BaseModel):
     """User list item with summary info"""
     id: uuid.UUID
     username: str
-    email: str
+    email: Optional[str] = None
     role: RoleEnum
     is_active: bool
     is_locked: bool
@@ -143,7 +143,7 @@ class UserDetailResponse(BaseModel):
     """Detailed user information"""
     id: uuid.UUID
     username: str
-    email: str
+    email: Optional[str] = None
     role: RoleEnum
     is_active: bool
     is_locked: bool
