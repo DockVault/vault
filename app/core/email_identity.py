@@ -30,8 +30,25 @@ from app.core.models import User
 EMAIL_LOWER_UNIQUE_INDEX = "uq_users_email_lower"
 
 
+def _fold_ascii(value: str) -> str:
+    """Lowercase ASCII only, leaving everything else for the database to fold.
+
+    Python's `str.lower()` and Postgres's `lower()` agree on ASCII and can DISAGREE outside it:
+    `'İ'.lower()` is `i` followed by a combining dot above (U+0307), while Postgres returns a bare
+    `i`. A value folded by one and compared against the other does not match, which is precisely
+    how two accounts end up holding one address as printed — the impersonation case this module
+    exists to prevent.
+
+    So there is exactly ONE implementation of "the same address" in play: Postgres's. Non-ASCII is
+    left untouched here and folded by the database on BOTH sides of every comparison and in the
+    unique index. ASCII is folded here too, because that covers every real address and keeps the
+    stored value readable.
+    """
+    return "".join(c.lower() if c.isascii() else c for c in value)
+
+
 def normalize_email(value) -> Optional[str]:
-    """Canonical stored form of an address: trimmed and lowercased, or None.
+    """Canonical stored form of an address: trimmed and ASCII-lowercased, or None.
 
     Accepts anything stringable (notably pydantic's `EmailStr`) so callers do not each have to
     remember the `str()`. Whitespace-only and empty input collapse to None — see the module note on
@@ -42,7 +59,7 @@ def normalize_email(value) -> Optional[str]:
     """
     if value is None:
         return None
-    normalized = str(value).strip().lower()
+    normalized = _fold_ascii(str(value).strip())
     return normalized or None
 
 
@@ -60,7 +77,10 @@ def email_in_use(db, email, exclude_user_id=None) -> bool:
     normalized = normalize_email(email)
     if normalized is None:
         return False
-    query = db.query(User.id).filter(func.lower(User.email) == normalized)
+    # BOTH sides are folded by the database, not one here and one there. A legacy row still holds
+    # whatever bytes an older release stored, so folding the candidate in Python and the column in
+    # SQL would compare two different notions of "lowercase" and miss a genuine duplicate.
+    query = db.query(User.id).filter(func.lower(User.email) == func.lower(normalized))
     if exclude_user_id is not None:
         query = query.filter(User.id != exclude_user_id)
     return query.first() is not None
@@ -77,11 +97,16 @@ def find_email_collisions(db):
     """
     rows = db.execute(text(
         """
-        SELECT lower(trim(email)) AS normalized,
+        -- Groups on lower(email), the EXACT expression the unique index uses. Grouping on
+        -- lower(trim(email)) instead would report a collision for two rows that differ only in
+        -- surrounding whitespace, which the index would happily accept -- skipping the index
+        -- forever on a database that could build it, and naming two accounts whose addresses
+        -- print identically so the operator has nothing to act on.
+        SELECT lower(email) AS normalized,
                string_agg(username, ', ' ORDER BY username) AS usernames
           FROM users
-         WHERE email IS NOT NULL AND trim(email) <> ''
-         GROUP BY lower(trim(email))
+         WHERE email IS NOT NULL AND email <> ''
+         GROUP BY lower(email)
         HAVING count(*) > 1
          ORDER BY normalized
         """

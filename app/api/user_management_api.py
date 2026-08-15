@@ -463,6 +463,7 @@ def _blacklist_user_vault_keys(db: Session, user_id, revoked_by) -> int:
 async def update_user(
     user_id: uuid.UUID,
     update_data: UserUpdateRequest,
+    request: Request,
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
@@ -508,7 +509,13 @@ async def update_user(
     )
     
     # Return updated details
-    return await get_user_detail(user_id, current_user, db)
+    # Keyword args, not positional: get_user_detail is wrapped by require_endpoint_permission,
+    # whose wrapper reads current_user and db out of **kwargs. Called positionally they arrive as
+    # *args, the wrapper sees None for both, and every call returned 401 -- AFTER this function had
+    # already committed the change. The caller saw a failure that had in fact succeeded.
+    return await get_user_detail(
+        user_id=user_id, request=request, current_user=current_user, db=db
+    )
 
 @router.post("/users/{user_id}/toggle-active")
 @require_endpoint_permission("USER_MANAGE")

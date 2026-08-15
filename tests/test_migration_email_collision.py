@@ -61,9 +61,15 @@ def _restart_api_and_wait(timeout=180):
     return False
 
 
-def _logs_since(marker_time):
+def _recent_logs(window="5m"):
+    """A RELATIVE window, deliberately.
+
+    `docker logs --since` reads a bare timestamp as LOCAL time. Building one from `time.gmtime`
+    puts the window in the future on any host behind UTC, so the test sees no logs and fails for
+    a reason that has nothing to do with the code. A duration has no timezone to get wrong.
+    """
     out = subprocess.run(
-        ["docker", "logs", API, "--since", marker_time],
+        ["docker", "logs", API, "--since", window],
         capture_output=True, text=True, timeout=60,
     )
     return out.stdout + out.stderr
@@ -94,7 +100,6 @@ def test_a_pre_existing_case_collision_is_survived_not_fatal():
             )
         assert not _index_exists()
 
-        marker = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 2))
         booted = _restart_api_and_wait()
 
         assert booted, (
@@ -102,7 +107,7 @@ def test_a_pre_existing_case_collision_is_survived_not_fatal():
             "self-hoster would be left with a vault that is down mid-update"
         )
 
-        logs = _logs_since(marker)
+        logs = _recent_logs()
         assert INDEX in logs, (
             "boot produced no mention of the skipped index; the operator's only signal that "
             f"uniqueness is degraded is this warning. Logs:\n{logs[-1500:]}"
@@ -133,31 +138,77 @@ def test_a_pre_existing_case_collision_is_survived_not_fatal():
 
 
 def test_the_index_is_rebuilt_once_the_collision_is_resolved():
-    """The warning has to be actionable: resolving the accounts and restarting must fix it.
+    """Resolving the collision and restarting must actually restore the index.
 
-    Without this, "skip on collision" could be a permanent downgrade rather than a deferral, and
-    an operator who did the work would get no reward for it.
+    Otherwise "skip on collision" is a permanent downgrade rather than a deferral, and an operator
+    who does the work gets nothing for it.
+
+    This test previously only inserted a NON-colliding user and checked the index came back, which
+    passes identically against an unconditional CREATE UNIQUE INDEX -- it never exercised the
+    conditional at all. It now seeds a real collision, proves the index is skipped, removes one of
+    the two accounts, and proves the restart rebuilds it.
     """
     assert _index_exists(), "expected the clean-install index to be present before this test"
 
     local = f"resolve_{uuid.uuid4().hex[:10]}"
+    user_a, user_b = f"{local}_a", f"{local}_b"
+    try:
+        _psql(f"DROP INDEX IF EXISTS {INDEX}", fetch=False)
+        for username, address in ((user_a, f"{local}@example.com"),
+                                  (user_b, f"{local.upper()}@EXAMPLE.COM")):
+            _psql(
+                "INSERT INTO users (id, username, email, password_hash, role, is_active, "
+                "created_at) VALUES (gen_random_uuid(), "
+                f"'{username}', '{address}', 'x', 'USER', true, now())",
+                fetch=False,
+            )
+
+        assert _restart_api_and_wait(), "the stack did not come back up with a collision present"
+        assert not _index_exists(), "the index was built despite a live collision"
+
+        # Resolve it, exactly as the warning tells the operator to.
+        _psql(f"DELETE FROM users WHERE username = '{user_b}'", fetch=False)
+
+        assert _restart_api_and_wait(), "the stack did not come back up after the collision was resolved"
+        assert _index_exists(), (
+            "the collision was resolved but the index was NOT rebuilt on the next boot, so the "
+            "skip is a permanent downgrade rather than a deferral"
+        )
+    finally:
+        _psql(f"DELETE FROM users WHERE username IN ('{user_a}', '{user_b}')", fetch=False)
+        _psql(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {INDEX} ON users (lower(email))", fetch=False
+        )
+        _restart_api_and_wait()
+
+
+def test_the_migration_canonicalizes_addresses_written_by_an_older_release():
+    """Legacy rows keep whatever case was typed; the boot pass must fold them.
+
+    Without it an upgraded install holds a mix of folded and unfolded addresses, and any lookup
+    that folds one side in Python compares two different notions of lowercase.
+    """
+    assert _index_exists()
+
+    local = f"legacy_{uuid.uuid4().hex[:10]}"
     username = f"{local}_x"
+    mixed = f"{local.upper()}@Example.COM"
     try:
         _psql(f"DROP INDEX IF EXISTS {INDEX}", fetch=False)
         _psql(
             "INSERT INTO users (id, username, email, password_hash, role, is_active, created_at) "
-            f"VALUES (gen_random_uuid(), '{username}', '{local}@example.com', 'x', 'USER', true, "
-            "now())",
+            f"VALUES (gen_random_uuid(), '{username}', '{mixed}', 'x', 'USER', true, now())",
             fetch=False,
         )
-        # No collision this time, so the boot SHOULD build the index.
+        assert _psql(f"SELECT email FROM users WHERE username='{username}'") == mixed
+
         assert _restart_api_and_wait(), "the stack did not come back up"
-        assert _index_exists(), (
-            "the index was not created on a clean database — the skip path is firing when it "
-            "should not, silently leaving every deployment without race protection"
+        assert _psql(f"SELECT email FROM users WHERE username='{username}'") == mixed.lower(), (
+            "a legacy mixed-case address was not canonicalized by the boot migration"
         )
     finally:
         _psql(f"DELETE FROM users WHERE username = '{username}'", fetch=False)
         _psql(
             f"CREATE UNIQUE INDEX IF NOT EXISTS {INDEX} ON users (lower(email))", fetch=False
         )
+        _restart_api_and_wait()

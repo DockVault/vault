@@ -11793,6 +11793,17 @@ def _run_lightweight_migrations():
                     for normalized, usernames in collisions:
                         print(f"    {normalized}  ->  {usernames}")
                 else:
+                    # Canonicalize what is already there before indexing it. Rows written by an
+                    # older release kept whatever case the caller typed, so without this an
+                    # upgraded install holds a mix of folded and unfolded addresses. Uses the
+                    # DATABASE's lower(), the same function the index and every lookup use, so
+                    # there is one definition of "lowercase" everywhere. Safe to run only in this
+                    # branch: the preflight has just proven no two rows collide under lower(), so
+                    # this cannot violate the plain unique constraint.
+                    db.execute(text(
+                        "UPDATE users SET email = lower(email) "
+                        "WHERE email IS NOT NULL AND email <> lower(email)"
+                    ))
                     db.execute(text(
                         f"CREATE UNIQUE INDEX IF NOT EXISTS {EMAIL_LOWER_UNIQUE_INDEX} "
                         f"ON users (lower(email))"

@@ -99,11 +99,14 @@ def test_an_email_less_user_can_log_in(admin, sweeper):
 # Strict + canonical
 # ---------------------------------------------------------------------------
 
-def test_a_supplied_address_is_stored_lowercased_and_trimmed(admin, sweeper):
+def test_a_supplied_address_is_stored_lowercased(admin, sweeper):
     """Normalization on write.
 
     Asserting only that creation succeeds would pass without any normalization at all, so this
     pins the exact stored bytes.
+
+    Scoped to LOWERCASING on purpose. The padding in the input is stripped by `EmailStr` before
+    `normalize_email` ever sees it, so this cannot prove the trim -- the direct test below does.
     """
     user = sweeper(admin.create_user(email="  MiXeD.Case@Example.COM  "))
     assert user["email"] == "mixed.case@example.com", (
@@ -170,10 +173,12 @@ def test_a_case_variant_duplicate_is_refused(admin, sweeper):
 
 
 def test_a_whitespace_padded_duplicate_is_refused(admin, sweeper):
-    """Trimming has to happen BEFORE the uniqueness check, not after it.
+    """A padded duplicate must not slip past the uniqueness check.
 
-    A backend that trimmed only on store would let this through the check and then write a
-    colliding row.
+    Honest about what this proves: `EmailStr` strips before any of our code runs, so this exercises
+    the schema and the check together, NOT our trimming -- removing `.strip()` from
+    `normalize_email` leaves it green. The trim is still load-bearing for values that never pass
+    through `EmailStr` (the seeded admin address), which is what the unit test below covers.
     """
     address = f"{_name()}@example.com"
     sweeper(admin.create_user(email=address))
@@ -305,3 +310,103 @@ def test_the_email_less_account_actually_appears_in_the_list(admin, sweeper):
 
     row = next(r for r in listed if r["id"] == user["id"])
     assert row["email"] is None
+
+
+def test_normalize_email_trims_values_that_bypass_the_schema():
+    """The trim only matters where `EmailStr` is not in the way.
+
+    The seeded admin address is read straight from configuration and validated by nothing, so this
+    is the path where trimming genuinely applies. Unlike the HTTP tests above, deleting `.strip()`
+    makes this one fail.
+    """
+    from app.core.email_identity import normalize_email
+
+    assert normalize_email("  Padded@Example.COM  ") == "padded@example.com"
+    assert normalize_email("   ") is None, "whitespace-only must collapse to no-email, not to ''"
+    assert normalize_email("") is None
+
+
+def test_a_dotted_capital_i_cannot_create_a_twin_of_an_existing_address(admin, sweeper):
+    """Python and Postgres do not fold U+0130 the same way, and that gap is exploitable.
+
+    `'İ'.lower()` in Python is `i` PLUS a combining dot above (U+0307); Postgres's `lower()` gives
+    a bare `i`. Fold the candidate in Python and the stored column in SQL and the two never match,
+    so the duplicate check passes and the unique index -- keyed on the database's fold -- sees two
+    different keys. Result: two accounts holding one address as printed, which is the exact
+    impersonation case this whole area exists to prevent.
+
+    Non-vacuous: revert `email_in_use` to comparing a Python-folded candidate against
+    `func.lower(User.email)` and the second create returns 200 instead of 400.
+    """
+    local = f"{_name()}İx"
+    first = admin.post("/users", json={
+        "username": _name(), "email": f"{local}@example.com",
+        "password": PASSWORD, "role": "user",
+    })
+    if first.status_code >= 400:
+        pytest.skip(f"the address validator rejects this local part outright: {first.text[:120]}")
+    sweeper(first.json())
+
+    second = admin.post("/users", json={
+        "username": _name(), "email": f"{local}@example.com",
+        "password": PASSWORD, "role": "user",
+    })
+    assert second.status_code == 400, (
+        f"a second account was created on the same printed address ({second.status_code}) -- the "
+        f"two case-folding implementations disagree"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The user-management update path, which had no coverage at all
+# ---------------------------------------------------------------------------
+
+def test_the_management_update_path_reports_success_when_it_succeeds(admin, sweeper):
+    """It committed the change and then returned 401.
+
+    `get_user_detail` is wrapped by a permission decorator that reads `current_user` and `db` out
+    of `**kwargs`; it was called positionally, so the wrapper saw None for both and raised 401 --
+    after the update had already been written. A caller could not tell a real failure from this
+    one, and nothing in the suite noticed because nothing tested this endpoint.
+    """
+    user = sweeper(admin.create_user())
+    fresh = f"{_name()}@example.com"
+
+    r = admin.put(f"/api/user-management/users/{user['id']}", json={"email": fresh})
+    assert r.status_code == 200, (
+        f"the management update returned {r.status_code} for a change that succeeded: "
+        f"{r.text[:200]}"
+    )
+    assert r.json()["email"] == fresh
+    assert admin.get(f"/users/{user['id']}").json()["email"] == fresh
+
+
+def test_the_management_update_path_refuses_a_case_variant_duplicate(admin, sweeper):
+    taken = f"{_name()}@example.com"
+    sweeper(admin.create_user(email=taken))
+    other = sweeper(admin.create_user())
+
+    r = admin.put(f"/api/user-management/users/{other['id']}", json={"email": taken.upper()})
+    assert r.status_code == 400, (
+        f"the management path accepted a case-variant duplicate ({r.status_code})"
+    )
+
+
+def test_the_management_update_path_clears_on_an_explicit_null(admin, sweeper):
+    user = sweeper(admin.create_user())
+    assert user["email"] is not None
+
+    r = admin.put(f"/api/user-management/users/{user['id']}", json={"email": None})
+    assert r.status_code == 200, f"clearing was refused ({r.status_code}): {r.text[:200]}"
+    assert admin.get(f"/users/{user['id']}").json()["email"] is None
+
+
+def test_an_explicit_null_in_the_create_body_is_accepted(admin, sweeper):
+    """The helper OMITS the key for an email-less account, so nothing else sends a literal null."""
+    username = _name()
+    r = admin.post("/users", json={
+        "username": username, "email": None, "password": PASSWORD, "role": "user",
+    })
+    assert r.status_code < 400, f"an explicit null was rejected on create: {r.text[:200]}"
+    sweeper(r.json())
+    assert r.json()["email"] is None
