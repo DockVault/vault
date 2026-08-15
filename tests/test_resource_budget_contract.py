@@ -257,15 +257,23 @@ def test_the_document_states_a_cost_that_does_not_depend_on_file_size():
     larger one would be about four times the smaller; a fixed window means they sit within noise
     of each other.
     """
-    downloads = [(float(f), float(rise))
-                 for case, f, rise, _m in _document_rows() if case.strip() == "Download"]
-    assert len(downloads) >= 2, "there must be two download rows at different sizes to compare"
-    downloads.sort()
-    (small_file, small_rise), (large_file, large_rise) = downloads[0], downloads[-1]
-    assert large_file >= small_file * 2, "the two rows are too close in size to prove anything"
-    assert large_rise < small_rise * 1.25, (
-        f"a {large_file:.0f} MB download costs {large_rise} MB against {small_rise} MB for "
-        f"{small_file:.0f} MB; the cost still tracks the file size")
+    by_case = {}
+    for case, file_mb, rise, _m in _document_rows():
+        if case.strip().startswith("Download"):
+            by_case.setdefault(case.strip(), []).append((float(file_mb), float(rise)))
+
+    assert len(by_case) >= 2, (
+        "both download kinds must be measured: they share an endpoint but not a reader, so a "
+        "figure from one says nothing about the other")
+
+    for case, rows in by_case.items():
+        assert len(rows) >= 2, f"{case}: needs two sizes to show the cost does not track the file"
+        rows.sort()
+        (small_file, small_rise), (large_file, large_rise) = rows[0], rows[-1]
+        assert large_file >= small_file * 2, f"{case}: the two sizes are too close to prove anything"
+        assert large_rise < small_rise * 1.25, (
+            f"{case}: a {large_file:.0f} MB download costs {large_rise} MB against {small_rise} MB "
+            f"for {small_file:.0f} MB; the cost still tracks the file size")
 
 
 def test_the_document_still_says_the_figures_were_not_tuned():

@@ -77,44 +77,24 @@ def test_a_large_download_does_not_cost_the_file_in_memory(admin, temp_vault):
     Before this, a download cost about twice the file: the reader collected every decrypted record
     and joined them, and one copy stayed resident for the whole response. The threshold is loose --
     half the file -- because this distinguishes "scales with the file" from "does not".
+
+    Sampled continuously. An earlier version read memory before and after the request, which
+    measures the residue rather than the peak and passed against a build that held the whole file.
     """
-    import os
-    import subprocess
-
-    container = os.environ.get("VAULT_API_CONTAINER", "vault-api")
-    script = (
-        'if [ -r /sys/fs/cgroup/memory.current ]; then '
-        'cur=$(cat /sys/fs/cgroup/memory.current); '
-        'fil=$(awk \'/^inactive_file /{a=$2} /^active_file /{b=$2} END{print a+b}\' '
-        '/sys/fs/cgroup/memory.stat); '
-        'else cur=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes); '
-        'fil=$(awk \'/^total_inactive_file /{a=$2} /^total_active_file /{b=$2} END{print a+b}\' '
-        '/sys/fs/cgroup/memory/memory.stat); fi; echo $((cur - ${fil:-0}))'
-    )
-
-    def anon():
-        try:
-            out = subprocess.run(["docker", "exec", container, "sh", "-c", script],
-                                 capture_output=True, text=True, timeout=60)
-        except (OSError, subprocess.SubprocessError) as exc:
-            pytest.skip(f"cannot reach the API container: {exc}")
-        if out.returncode != 0 or not out.stdout.strip().isdigit():
-            pytest.skip(f"cannot read the API container's cgroup: {out.stderr.strip()[:120]}")
-        return int(out.stdout.strip())
+    from memory_probe import CgroupSampler
 
     vid = temp_vault["id"]
     size = 64 * MB
     body = bytes((i * 7 + 3) % 256 for i in range(65536)) * (size // 65536)
     file_id = _upload(admin, vid, unique("big") + ".bin", body, chunk_size=MB)
 
-    before = anon()
-    got = admin.get(f"/vaults/{vid}/files/{file_id}/download")
-    after = anon()
+    with CgroupSampler() as sampler:
+        got = admin.get(f"/vaults/{vid}/files/{file_id}/download")
+    rise = sampler.rise
 
     assert got.status_code == 200
     assert hashlib.sha256(got.content).hexdigest() == hashlib.sha256(body).hexdigest(), (
         "the download did not return what was stored, so this measured nothing")
-    rise = after - before
     assert rise < size // 2, (
         f"a {size // MB} MB download raised allocated memory by {rise / MB:.1f} MB; the file is "
         "being held rather than streamed")
