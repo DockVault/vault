@@ -32,14 +32,23 @@ One transfer at a time, so the cost belongs to one half:
 | Upload, one chunk for the whole file | 128 MB | 23.5 MB | **0.18×** |
 | Download | 128 MB | 15.2 MB | **0.12×** |
 | Download | 512 MB | 13.5 MB | **0.03×** |
+| Download, zero-knowledge | 128 MB | 15.1 MB | **0.12×** |
+| Download, zero-knowledge | 512 MB | 15.7 MB | **0.03×** |
 
 ## What it says
 
-**Neither half of an HTTP transfer scales with the file any more.** The two download rows are the
+**Neither half of an HTTP transfer scales with the file any more.** The four download rows are the
 load-bearing ones:
-quadrupling the file did not raise the cost, it lowered it slightly, which is what a fixed window
-looks like once run-to-run spread is accounted for. The figure to carry forward is a constant of
-roughly 15 MB, not a multiple of anything.
+quadrupling the file did not raise the cost, which is what a fixed window looks like once
+run-to-run spread is accounted for. The figure to carry forward is a constant of roughly 15 MB,
+not a multiple of anything.
+
+**Zero-knowledge vaults are measured separately, and they had to be.** They share the download
+endpoint but not the reader: the blob is the client's ciphertext stored verbatim, so there is
+nothing to decrypt and it is served in fixed windows rather than records. A figure taken against a
+standard vault says nothing about that path, and a budget run that only covered standard vaults
+would have passed while this one still cost twice the file. It does not — it costs the same
+constant.
 
 That is a change. The first version of this table put a 128 MB download at **267.9 MB — 2.09×**,
 the largest number here by a wide margin. The reader decrypted record by record, correctly, then
