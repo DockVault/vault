@@ -292,22 +292,26 @@ def test_a_completed_upload_gives_its_slot_back(admin, temp_vault):
     """
     vid = temp_vault["id"]
 
+    # One more upload than the deployment has slots. Below that, a leak is invisible: on a ceiling
+    # of sixteen, three uploads that each kept their slot still leave thirteen free and every
+    # assertion here passes.
     first = None
-    for i in range(3):
+    for i in range(_limit() + 1):
         stored = admin.post(
             f"/vaults/{vid}/files",
             files=[("files", (unique(f"multi{i}") + ".bin", b"m" * 4096,
                               "application/octet-stream"))])
         assert stored.status_code == 200, (
-            f"upload {i} was answered {stored.status_code}; the previous upload kept its slot")
+            f"upload {i} of {_limit() + 1} was answered {stored.status_code}; an earlier upload "
+            "kept its slot")
         first = first or stored.json()["files"][0]["id"]
 
     # End on something the ceiling actually governs. A listing is not admitted, so it answers 200
     # whether or not the slot came back, and would have proved nothing.
     got = admin.get(f"/vaults/{vid}/files/{first}/download")
     assert got.status_code == 200, (
-        f"a download after three uploads was answered {got.status_code}; the uploads kept their "
-        "slots and the deployment has no capacity left")
+        f"a download after {_limit() + 1} uploads was answered {got.status_code}; the uploads "
+        "kept their slots and the deployment has no capacity left")
 
 
 def test_a_multi_file_upload_takes_one_slot_for_the_whole_request(admin, temp_vault):
@@ -322,7 +326,10 @@ def test_a_multi_file_upload_takes_one_slot_for_the_whole_request(admin, temp_va
     vid = temp_vault["id"]
     names = [unique(f"onerequest{i}") + ".bin" for i in range(3)]
 
-    before = _transfer_stats(admin)["transfersAdmitted"]
+    idle = _transfer_stats(admin)
+    assert idle["transfersInFlight"] == 0, (
+        "something else was transferring; this counts admissions and needs a quiet deployment")
+    before = idle["transfersAdmitted"]
     stored = admin.post(f"/vaults/{vid}/files", files=[
         ("files", (name, b"a" * (256 * 1024), "application/octet-stream")) for name in names])
     assert stored.status_code == 200, stored.text
@@ -413,7 +420,8 @@ def test_a_refused_upload_leaves_nothing_behind(admin, temp_vault):
 @pytest.mark.skipif(
     os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
     reason="needs a deployment configured with MAX_CONCURRENT_TRANSFERS=1 and no queue")
-def test_a_caller_with_no_access_is_refused_access_not_a_slot(admin, temp_vault):
+def test_a_caller_with_no_access_is_refused_access_not_a_slot(admin, temp_user_client,
+                                                             temp_vault):
     """Authorization is answered before the ceiling is consulted.
 
     Admitting first means a caller who cannot touch the vault -- or who names one that does not
@@ -422,8 +430,10 @@ def test_a_caller_with_no_access_is_refused_access_not_a_slot(admin, temp_vault)
     every parked request keeps a real transfer out.
     """
     vid = temp_vault["id"]
+    outsider = temp_user_client
     body = b"A" * (24 * MB)
     file_id = _upload(admin, vid, unique("authz") + ".bin", body)
+    baseline_refusals = _transfer_stats(admin)["transfersRefused"]
 
     def _hold():
         client = admin.clone_anonymous()
@@ -437,16 +447,136 @@ def test_a_caller_with_no_access_is_refused_access_not_a_slot(admin, temp_vault)
     holder.start()
     time.sleep(1.5)
 
+    # Without this the test proves nothing: if the holder never took the slot, every answer below
+    # is the ordinary one and the test passes on the defective code too.
+    assert _transfer_stats(admin)["transfersInFlight"] == 1, (
+        "the holding download never took the slot, so nothing here is being tested")
+
     absent = "00000000-0000-4000-8000-000000000000"
     answers = {
         "complete": admin.post(f"/vaults/{absent}/uploads/{absent}/complete").status_code,
         "download": admin.get(f"/vaults/{vid}/files/{absent}/download").status_code,
+        # A real caller who is really not allowed, not just a resource that is not there.
+        "outsider-complete": outsider.post(
+            f"/vaults/{vid}/uploads/{absent}/complete").status_code,
+        "outsider-download": outsider.get(
+            f"/vaults/{vid}/files/{file_id}/download").status_code,
     }
+    refused_before_reaching_the_gate = _transfer_stats(admin)["transfersRefused"]
 
     holder.join(timeout=60)
+
+    assert refused_before_reaching_the_gate == baseline_refusals, (
+        "a caller who was never allowed in was counted as load the deployment shed")
 
     for path, code in answers.items():
         assert code != 503, (
             f"the {path} endpoint made a caller queue for a slot before telling them the thing "
             "they named does not exist")
         assert code in (403, 404, 409, 410), f"unexpected answer from {path}: {code}"
+
+
+def test_a_stored_mime_type_cannot_take_the_deployment_down(admin, temp_vault):
+    """A MIME type is whatever the client said it was, and it is stored verbatim.
+
+    It ends up in the Content-Type header, which is encoded as Latin-1, so a value outside that
+    range raises while the response is being built -- and it raises every time, for that file, for
+    ever. Worse, it raises after the download has recorded that it handed its transfer slot to the
+    streaming generator, so the slot is never returned: a handful of such files and the deployment
+    refuses all transfers until it is restarted. One upload, no privileges, no large file.
+    """
+    vid = temp_vault["id"]
+    hostile = [
+        "text/plain; note=\u2603",              # outside Latin-1: raises in the header encode
+        "text/plain\r\nX-Injected: yes",         # header injection, and ASCII, so an encode allows it
+        "\u00e9" * 4,                            # Latin-1 but not a media type at all
+    ]
+
+    before = _transfer_stats(admin)
+    for i, mime in enumerate(hostile):
+        name = unique(f"mime{i}") + ".bin"
+        body = b"hostile mime" * 64
+        init = admin.post(f"/vaults/{vid}/uploads", json={
+            "file_name": name, "total_size": len(body), "total_chunks": 1,
+            "chunk_size": MB, "mime_type": mime,
+        })
+        assert init.status_code == 200, init.text
+        sid = init.json()["session_id"]
+        assert admin.put(f"/vaults/{vid}/uploads/{sid}/chunks/0",
+                         data=body, headers=_OCTET).status_code == 200
+        stored = admin.post(f"/vaults/{vid}/uploads/{sid}/complete")
+        assert stored.status_code == 200, stored.text
+
+        got = admin.get(f"/vaults/{vid}/files/{stored.json()['id']}/download")
+        assert got.status_code == 200, (
+            f"a file stored with mime_type {mime!r} cannot be downloaded at all: "
+            f"{got.status_code}")
+        assert got.content == body
+        assert "\r" not in got.headers.get("Content-Type", ""), "the stored value reached a header"
+
+    after = _transfer_stats(admin)
+    assert after["transfersInFlight"] == before["transfersInFlight"], (
+        f"{len(hostile)} downloads left "
+        f"{after['transfersInFlight'] - before['transfersInFlight']} transfer slots held; the "
+        "ceiling now shrinks every time one of these files is fetched")
+
+
+@pytest.mark.skipif(
+    os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
+    reason="needs a deployment configured with MAX_CONCURRENT_TRANSFERS=1 and no queue")
+def test_a_refused_upload_does_not_reserve_space_it_never_uses(admin):
+    """Being refused must not make the vault look fuller than it is.
+
+    An upload reserves the space it is about to need before it is admitted, and the reservation
+    lives for five minutes. If a refusal leaves it behind, a trickle of refused uploads holds a
+    size-limited vault at "not enough space" while storing nothing at all -- a denial of service
+    against the vault, made out of requests the deployment already declined to do any work for.
+    """
+    made = admin.post("/vaults", json={
+        "name": unique("reservation"), "vault_type": "standard",
+        "size_limit_gb": 0.05,                        # ~51 MB: the reservation path only runs
+    })                                                # on a vault that actually has a ceiling
+    assert made.status_code == 200, made.text
+    vid = made.json()["id"]
+    ceiling = admin.get(f"/vaults/{vid}").json().get("size_limit") or 0
+    assert ceiling > 0, (
+        "this vault has no size limit, so nothing reserves space and the test proves nothing")
+
+    filler = b"F" * (24 * MB)                          # half the ceiling, really stored
+    file_id = _upload(admin, vid, unique("filler") + ".bin", filler, chunk_size=6 * MB)
+
+    def _hold():
+        client = admin.clone_anonymous()
+        client.session.headers.update({"Authorization": f"Bearer {admin.token}"})
+        response = client.get(f"/vaults/{vid}/files/{file_id}/download", stream=True)
+        next(response.iter_content(8192))
+        time.sleep(10)
+        response.close()
+
+    holder = threading.Thread(target=_hold)
+    holder.start()
+    time.sleep(1.5)
+
+    refused = 0
+    for i in range(4):
+        answer = admin.post(
+            f"/vaults/{vid}/files",
+            files=[("files", (unique(f"phantom{i}") + ".bin", b"p" * (4 * MB),
+                              "application/octet-stream"))])
+        assert answer.status_code == 503, f"expected a refusal, got {answer.status_code}"
+        refused += 1
+
+    holder.join(timeout=60)
+    assert refused == 4
+
+    # The slot is free again. The only thing that could stop this is space the refusals reserved
+    # and never gave back.
+    stored = admin.post(
+        f"/vaults/{vid}/files",
+        files=[("files", (unique("real") + ".bin", b"r" * (16 * MB),
+                          "application/octet-stream"))])
+    assert stored.status_code == 200, (
+        f"a real upload was answered {stored.status_code} after {refused} refused ones; they left "
+        f"their space reservations behind: {stored.text[:200]}")
+
+    admin.delete(f"/vaults/{vid}")

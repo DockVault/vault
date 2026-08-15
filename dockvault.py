@@ -906,7 +906,19 @@ def parse_max_storage_gb(raw):
 
 
 def _unquoted(raw):
-    return (raw or "").strip().strip("'").strip('"')
+    """A configured value as text: an .env line, or a number argparse has already converted.
+
+    `--max-concurrent-transfers 0` arrives here as the integer 0, which is both un-strippable and
+    falsy -- so treating "no value" as falsiness would raise on one input and silently discard the
+    other. Only None and an empty string mean unset.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, bool):          # not a quantity; argparse never produces one for these
+        return ""
+    if isinstance(raw, (int, float)):
+        return repr(raw)
+    return str(raw).strip().strip("'").strip('"')
 
 
 def _finite_float(raw):

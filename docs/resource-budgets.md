@@ -160,6 +160,13 @@ are not counted by this ceiling** — they are not transfers, they are held stat
 separately by two record-sizes each, and SFTP runs as its own process, so an in-process ceiling
 could not cover them in any case.
 
+**What the ceiling does not cover.** A multipart upload's body is received and spooled by the web
+framework before the endpoint runs, so those bytes arrive whether or not the deployment has a slot
+free — the ceiling governs the encryption work that follows, not the receive. Each part is spooled
+to disk above 1 MB, so this is bounded per request rather than per file, but it is not zero and it
+is not counted here. The resumable path the browser uses does not have this property: its chunks
+are written straight to disk by the application itself.
+
 **What the ceiling costs, stated plainly.** A slot is held for as long as its transfer takes, and a
 transfer has no deadline. A client that opens a download and then stops reading holds its slot
 until it disconnects, so sixteen such clients will make the deployment answer `503` to everyone

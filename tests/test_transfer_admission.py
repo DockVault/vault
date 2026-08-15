@@ -237,19 +237,62 @@ def test_the_counters_report_what_the_gate_actually_did():
     _run(_go())
 
 
-def test_a_release_nobody_made_does_not_count_as_an_admission():
-    """The counters must not be movable by something that never held a slot."""
+def test_a_release_nobody_made_cannot_raise_the_ceiling_or_the_counters():
+    """A stray release must not hand out a slot, and must not look like a transfer.
+
+    Both halves matter and only one of them is about the numbers: a release from something that
+    never held a slot would raise the real ceiling above the configured one, which is the whole
+    reason slots are tokens rather than a count. Checked by trying to exceed the ceiling
+    afterwards, because asserting on the counters alone passes even when the ceiling has moved.
+    """
     gate = TransferAdmission(limit=1, max_waiting=0, wait_seconds=0.01)
 
     async def _go():
-        gate.release(object())
-        gate.release(None)
-        assert gate.stats()["admitted"] == 0
+        for stray in (object(), None, "not a token"):
+            gate.release(stray)
+        assert gate.stats()["admitted"] == 0, "a stray release counted as a transfer"
         assert gate.stats()["in_flight"] == 0
 
-        token = await gate.acquire()
-        gate.release(token)
-        gate.release(token)                       # a second release of a real token
+        held = await gate.acquire()
+        gate.release(held)
+        gate.release(held)                        # a second release of a real token
         assert gate.stats()["admitted"] == 1
         assert gate.stats()["in_flight"] == 0
+
+        # The ceiling is still one. If any of the five releases above reached the semaphore, it is
+        # now two or more and this second acquire succeeds.
+        again = await gate.acquire()
+        with pytest.raises(TransferBusy):
+            await gate.acquire()
+        gate.release(again)
+    _run(_go())
+
+
+@pytest.mark.parametrize("configured,expected", [
+    (float("inf"), TransferAdmission.MAX_WAIT_SECONDS),
+    (float("nan"), 0.0),
+    (-5.0, 0.0),
+    (20.0, 20.0),
+    (7200.0, TransferAdmission.MAX_WAIT_SECONDS),
+])
+def test_an_unusable_wait_still_produces_an_answer_a_client_can_act_on(configured, expected):
+    """A float setting accepts inf and nan, and both used to reach the refusal path intact.
+
+    The refusal carries Retry-After, which is a whole number of seconds: an infinite wait made
+    building it raise, so a full deployment answered 500 -- indistinguishable from a broken one --
+    instead of "come back shortly". The counter had already moved by then, so the deployment also
+    recorded shedding load it never told anyone about.
+    """
+    gate = TransferAdmission(limit=1, max_waiting=0, wait_seconds=configured)
+    assert gate.stats()["wait_seconds"] == expected
+
+    async def _go():
+        held = await gate.acquire()
+        try:
+            with pytest.raises(TransferBusy) as refusal:
+                await gate.acquire()
+            assert isinstance(refusal.value.retry_after, int)
+            assert refusal.value.retry_after >= 1
+        finally:
+            gate.release(held)
     _run(_go())

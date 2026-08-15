@@ -8010,6 +8010,52 @@ def _reject_unreplaceable_upload(db, vault_id, folder_id, filename, user, name_b
         )
 
 
+_BACKSLASH = chr(92)
+_MEDIA_TOKEN_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+.^_`|~-")
+
+
+def _is_media_token(text: str) -> bool:
+    return bool(text) and all(c in _MEDIA_TOKEN_CHARS for c in text)
+
+
+def _safe_media_type(value: Optional[str]) -> str:
+    """A stored MIME type reduced to something that can be put in a header.
+
+    A MIME type is whatever the client said it was and is stored verbatim, so this cannot assume it
+    is well formed. Two ways a stored string breaks the response: anything outside Latin-1 raises
+    while the header is being encoded, and a control character -- CR and LF are ASCII, so they
+    survive any encode -- would let it inject header content. What passes is a conservative
+    type/subtype with optional parameters; anything else becomes the generic type, which is always
+    safe to serve. The filename beside it is guarded the same way, in _content_disposition.
+    """
+    text = (value or "").strip()
+    if not text or len(text) > 255:
+        return "application/octet-stream"
+    if any(not (32 <= ord(c) <= 126) for c in text):
+        return "application/octet-stream"
+
+    essence, _, rest = text.partition(";")
+    kind, slash, subtype = essence.strip().partition("/")
+    if not slash or not _is_media_token(kind) or not _is_media_token(subtype):
+        return "application/octet-stream"
+
+    while rest:
+        parameter, _, rest = rest.partition(";")
+        name, equals, raw = parameter.strip().partition("=")
+        if not equals or not _is_media_token(name.strip()):
+            return "application/octet-stream"
+        raw = raw.strip()
+        if raw.startswith('"'):
+            if (not raw.endswith('"') or len(raw) < 2
+                    or _BACKSLASH in raw or '"' in raw[1:-1]):
+                return "application/octet-stream"
+        elif not _is_media_token(raw):
+            return "application/octet-stream"
+
+    return text
+
+
 def _content_disposition(file_name: str) -> str:
     """Build an RFC 6266 Content-Disposition for a download. Includes an ASCII-only
     filename= fallback AND a UTF-8 filename* so non-Latin-1 names (any unicode name —
@@ -8211,9 +8257,10 @@ async def upload_file(
         #
         # Taken once for the request rather than once per file -- a request carrying several files
         # is one transfer as far as memory goes, and admitting each file separately would let a
-        # request commit its first file and then be refused partway through. Taken before anything
-        # is registered or reserved, so a refusal has nothing to unwind, and returned by the outer
-        # finally on every path out.
+        # request commit its first file and then be refused partway through. Taken before the
+        # operation is registered, so a refusal leaves nothing in the registry, and returned by the
+        # request-level finally on every path out -- which also returns the space reservation taken
+        # above, the one thing that does precede admission.
         if files:
             try:
                 transfer_slot = await transfer_admission.acquire()
@@ -8494,15 +8541,6 @@ async def upload_file(
                 )
                     
             finally:
-                # CLEANUP: Release space reservation if it was created
-                if reservation_key and vault_size_limit > 0:
-                    try:
-                        reserved_amount = redis_client.get(reservation_key)
-                        redis_client.delete(reservation_key)
-                        if reserved_amount:
-                            print(f"🧹 Reservation cleanup: {int(reserved_amount) / (1024*1024):.2f} MB")
-                    except Exception as e:
-                        print(f"⚠️ Failed to cleanup reservation in finally: {e}")
                 
                 # Mark the Redis progress record complete + clear it (it was never completed before, so
                 # every finished/failed upload used to leave a dangling operation:* record until TTL).
@@ -8563,6 +8601,18 @@ async def upload_file(
         # the deployment refuses every transfer.
         if transfer_slot is not None:
             transfer_admission.release(transfer_slot)
+
+        # The space reservation goes back on the same terms, and for the same reason: held after
+        # the request is over it counts against the vault for its full five-minute life, so a
+        # refused or abandoned upload makes the vault look fuller than it is.
+        if reservation_key and vault_size_limit > 0:
+            try:
+                reserved_amount = redis_client.get(reservation_key)
+                redis_client.delete(reservation_key)
+                if reserved_amount:
+                    print(f"🧹 Reservation cleanup: {int(reserved_amount) / (1024*1024):.2f} MB")
+            except Exception as exc:
+                print(f"⚠️ Failed to cleanup reservation in finally: {exc}")
 
 
 # ============================================================================
@@ -10236,10 +10286,12 @@ async def download_file(
                     })
                 end_operation(operation_id)
 
-        stream_handed_off = True
-        return StreamingResponse(
+        # Built BEFORE the handover is recorded. Constructing a response can fail -- it encodes
+        # the headers -- and a failure after the flag is set skips the teardown below entirely,
+        # losing the transfer slot for the life of the process.
+        streaming_response = StreamingResponse(
             file_streamer(),
-            media_type=mime_type or 'application/octet-stream',
+            media_type=_safe_media_type(mime_type),
             headers={
                 'Content-Disposition': _content_disposition(disp_name),
                 # From the terminal the walk authenticated, so a stream that stops
@@ -10249,6 +10301,11 @@ async def download_file(
                 'X-Operation-ID': operation_id,
             },
         )
+        # Only now: the response exists, so the generator will run and its teardown owns the slot,
+        # the open blob and the operation entry. Recorded before this point, a failure while
+        # building the response would have left all three held with nothing to release them.
+        stream_handed_off = True
+        return streaming_response
 
     except (PasswordRequiredError, InvalidPasswordError) as e:
         raise HTTPException(

@@ -20,6 +20,7 @@ The rules this implements:
 """
 
 import asyncio
+import math
 import threading
 
 
@@ -50,7 +51,7 @@ class TransferAdmission:
     def __init__(self, limit: int, max_waiting: int, wait_seconds: float):
         self._limit = max(1, int(limit))
         self._max_waiting = max(0, int(max_waiting))
-        self._wait_seconds = max(0.0, float(wait_seconds))
+        self._wait_seconds = self._usable_wait(wait_seconds)
         self._semaphore = asyncio.Semaphore(self._limit)
         # A token per admitted transfer, rather than a count. A count cannot tell a release by the
         # holder from a release by something that never held anything, and it is wrong in a way
@@ -73,6 +74,25 @@ class TransferAdmission:
         # how a caller can tell one transfer from several sharing a request.
         self._admitted = 0
 
+    # A wait long enough that nobody is coming back for the answer. Configuring one is the same
+    # mistake as configuring no timeout at all, and it has to be bounded somewhere: the refusal
+    # carries a Retry-After, which is an integer number of seconds, so an unbounded float here
+    # turns every refusal into a server error instead of a "come back shortly".
+    MAX_WAIT_SECONDS = 3600.0
+
+    @classmethod
+    def _usable_wait(cls, wait_seconds) -> float:
+        """The configured wait, as a number of seconds this can actually act on.
+
+        A float field accepts `inf` and `nan`, and both arrive here intact. `inf` reads as "wait
+        as long as it takes", which is honoured up to the ceiling above rather than allowed to
+        break the refusal path; `nan` is not a duration at all and reads as no wait.
+        """
+        value = float(wait_seconds)
+        if math.isnan(value):
+            return 0.0
+        return min(cls.MAX_WAIT_SECONDS, max(0.0, value))
+
     async def acquire(self):
         """Take a slot, waiting if the deployment is full. Raises :class:`TransferBusy` if not.
 
@@ -92,7 +112,9 @@ class TransferAdmission:
                 await asyncio.wait_for(self._semaphore.acquire(), timeout=self._wait_seconds)
             except asyncio.TimeoutError:
                 with self._counter_lock:
-                    waiting = self._waiting
+                    # Minus this caller: it is being refused, not left waiting, and reporting
+                    # itself as one of the queue makes a deployment look busier than it is.
+                    waiting = max(0, self._waiting - 1)
                     self._refused += 1
                 raise TransferBusy(
                     retry_after=self._retry_after(), waiting=waiting, limit=self._limit)

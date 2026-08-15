@@ -2463,6 +2463,35 @@ def test_the_carried_ceiling_is_the_one_the_deployment_was_running():
             f"MAX_CONCURRENT_TRANSFERS={raw} runs as {running} but the tool would carry {carried}")
 
 
+def test_the_transfer_flags_survive_argparse():
+    """These parsers read two sources, and one of them does not hand them strings.
+
+    argparse types these flags as int and float, so a parser that assumes text raises on every
+    one of them -- and a parser that treats "no value" as falsiness turns `--max-concurrent-
+    transfers 0` into "unset", which is the default of sixteen: the widening the carry-forward
+    exists to prevent, reintroduced through the flag beside it.
+    """
+    args = dv.build_parser().parse_args([
+        "setup", "--non-interactive",
+        "--max-concurrent-transfers", "4",
+        "--max-queued-transfers", "0",
+        "--transfer-queue-wait-seconds", "2.5",
+    ])
+    assert dv.parse_transfer_limit(args.max_concurrent_transfers) == 4
+    assert dv.parse_transfer_queue(args.max_queued_transfers) == 0
+    assert dv.parse_transfer_wait(args.transfer_queue_wait_seconds) == 2.5
+
+    tightest = dv.build_parser().parse_args(
+        ["setup", "--non-interactive", "--max-concurrent-transfers", "0"])
+    assert dv.parse_transfer_limit(tightest.max_concurrent_transfers) == 1, (
+        "a ceiling of zero was read as unset, so the deployment would come up at the default")
+
+    unset = dv.build_parser().parse_args(["setup", "--non-interactive"])
+    assert dv.parse_transfer_limit(unset.max_concurrent_transfers) is None
+    assert dv.parse_transfer_queue(unset.max_queued_transfers) is None
+    assert dv.parse_transfer_wait(unset.transfer_queue_wait_seconds) is None
+
+
 def test_setup_writes_the_transfer_ceiling_only_when_asked():
     cfg = _reusable_env_cfg()
     assert not [l for l in dv.build_env_lines(cfg) if l.startswith("MAX_CONCURRENT_TRANSFERS")]
