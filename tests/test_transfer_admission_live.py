@@ -54,6 +54,13 @@ def _deployment_setting(name, default):
     return out.stdout.strip()
 
 
+def _transfer_stats(client):
+    """The gate's own counters, as the monitor reports them."""
+    metrics = client.get("/api/monitoring/metrics")
+    assert metrics.status_code == 200, metrics.text
+    return metrics.json()
+
+
 def _limit():
     value = _deployment_setting("MAX_CONCURRENT_TRANSFERS", "16")
     if not value.isdigit():
@@ -285,41 +292,46 @@ def test_a_completed_upload_gives_its_slot_back(admin, temp_vault):
     """
     vid = temp_vault["id"]
 
+    first = None
     for i in range(3):
         stored = admin.post(
             f"/vaults/{vid}/files",
             files=[("files", (unique(f"multi{i}") + ".bin", b"m" * 4096,
                               "application/octet-stream"))])
-        assert stored.status_code == 200, stored.text
+        assert stored.status_code == 200, (
+            f"upload {i} was answered {stored.status_code}; the previous upload kept its slot")
+        first = first or stored.json()["files"][0]["id"]
 
-    got = admin.get(f"/vaults/{vid}/files")
-    assert got.status_code == 200, "the deployment stopped serving after three uploads"
+    # End on something the ceiling actually governs. A listing is not admitted, so it answers 200
+    # whether or not the slot came back, and would have proved nothing.
+    got = admin.get(f"/vaults/{vid}/files/{first}/download")
+    assert got.status_code == 200, (
+        f"a download after three uploads was answered {got.status_code}; the uploads kept their "
+        "slots and the deployment has no capacity left")
 
 
-@pytest.mark.skipif(
-    os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
-    reason="needs a deployment configured with MAX_CONCURRENT_TRANSFERS=1 and no queue")
 def test_a_multi_file_upload_takes_one_slot_for_the_whole_request(admin, temp_vault):
-    """Several files in one request, on a deployment with exactly one slot and no waiting room.
+    """Several files in one request must be admitted once, not once each.
 
-    The ceiling used to be taken once per file, which meant a request could store its first file,
-    find the deployment full when it reached the second, and answer 503 -- leaving the caller to
-    work out which of the files they sent had landed. It is now taken once for the request.
-
-    What this test can show is the visible half: the request is served as a unit and every file it
-    carried is stored, on a deployment that has no slot to spare between files. The partial-commit
-    case itself is a race measured in microseconds -- the gap between one file returning the slot
-    and the next taking it -- and was confirmed by construction rather than by a test, because a
-    test that tries to land inside that window is a test that fails at random.
+    A slot per file leaves a window in which a request stores its first file, finds the deployment
+    full when it reaches the second, and answers 503 -- leaving the caller to work out which of the
+    files they sent had landed. The window itself is microseconds wide and no test can reliably
+    land inside it, so what is checked here is the cause rather than the symptom: the number of
+    times the gate admitted something. One request, one admission, whatever it was carrying.
     """
     vid = temp_vault["id"]
     names = [unique(f"onerequest{i}") + ".bin" for i in range(3)]
 
+    before = _transfer_stats(admin)["transfersAdmitted"]
     stored = admin.post(f"/vaults/{vid}/files", files=[
         ("files", (name, b"a" * (256 * 1024), "application/octet-stream")) for name in names])
     assert stored.status_code == 200, stored.text
-    assert {f["name"] for f in stored.json()["files"]} == set(names), (
-        "the upload reported storing something other than the three files it was given")
+    after = _transfer_stats(admin)["transfersAdmitted"]
+
+    assert after - before == 1, (
+        f"a request carrying {len(names)} files was admitted {after - before} times; a slot per "
+        "file lets a request be refused partway through work it has already begun")
+    assert {f["name"] for f in stored.json()["files"]} == set(names)
 
     listing = admin.get(f"/vaults/{vid}/files")
     assert listing.status_code == 200
@@ -349,3 +361,92 @@ def test_the_ceiling_is_visible_to_an_operator(admin):
         "the reported ceiling is not the one the deployment was configured with")
     assert body["transfersInFlight"] <= body["transferLimit"]
     assert body["transfersPeak"] >= body["transfersInFlight"]
+
+
+@pytest.mark.skipif(
+    os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
+    reason="needs a deployment configured with MAX_CONCURRENT_TRANSFERS=1 and no queue")
+def test_a_refused_upload_leaves_nothing_behind(admin, temp_vault):
+    """A 503 must cost the deployment nothing.
+
+    The ceiling is here to bound what traffic can make the process hold. If being refused still
+    registered an operation, a caller could grow a process-global set one cheap request at a time
+    -- unbounded, by exactly the path that was supposed to bound it -- and the operation count an
+    operator reads would climb and never come back down.
+    """
+    vid = temp_vault["id"]
+    body = b"L" * (24 * MB)
+    file_id = _upload(admin, vid, unique("leak") + ".bin", body)
+
+    def _hold():
+        client = admin.clone_anonymous()
+        client.session.headers.update({"Authorization": f"Bearer {admin.token}"})
+        response = client.get(f"/vaults/{vid}/files/{file_id}/download", stream=True)
+        next(response.iter_content(8192))
+        time.sleep(8)
+        response.close()
+
+    holder = threading.Thread(target=_hold)
+    holder.start()
+    time.sleep(1.5)
+
+    before = _transfer_stats(admin)
+    refusals = 0
+    for i in range(12):
+        answer = admin.post(
+            f"/vaults/{vid}/files",
+            files=[("files", (unique(f"refused{i}") + ".bin", b"r" * 512,
+                              "application/octet-stream"))])
+        assert answer.status_code == 503, f"expected a refusal, got {answer.status_code}"
+        refusals += 1
+    after = _transfer_stats(admin)
+
+    holder.join(timeout=60)
+
+    assert after["transfersRefused"] - before["transfersRefused"] == refusals, (
+        "the gate did not count every refusal it made")
+    assert after["activeOperations"] <= before["activeOperations"], (
+        f"{refusals} refused uploads left {after['activeOperations'] - before['activeOperations']} "
+        "operations registered; a refusal must cost the deployment nothing")
+
+
+@pytest.mark.skipif(
+    os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
+    reason="needs a deployment configured with MAX_CONCURRENT_TRANSFERS=1 and no queue")
+def test_a_caller_with_no_access_is_refused_access_not_a_slot(admin, temp_vault):
+    """Authorization is answered before the ceiling is consulted.
+
+    Admitting first means a caller who cannot touch the vault -- or who names one that does not
+    exist -- is made to wait for a transfer slot and then told 503. On a deployment with a waiting
+    room that is the cheapest denial of service available: no vault, no file, no bytes sent, and
+    every parked request keeps a real transfer out.
+    """
+    vid = temp_vault["id"]
+    body = b"A" * (24 * MB)
+    file_id = _upload(admin, vid, unique("authz") + ".bin", body)
+
+    def _hold():
+        client = admin.clone_anonymous()
+        client.session.headers.update({"Authorization": f"Bearer {admin.token}"})
+        response = client.get(f"/vaults/{vid}/files/{file_id}/download", stream=True)
+        next(response.iter_content(8192))
+        time.sleep(6)
+        response.close()
+
+    holder = threading.Thread(target=_hold)
+    holder.start()
+    time.sleep(1.5)
+
+    absent = "00000000-0000-4000-8000-000000000000"
+    answers = {
+        "complete": admin.post(f"/vaults/{absent}/uploads/{absent}/complete").status_code,
+        "download": admin.get(f"/vaults/{vid}/files/{absent}/download").status_code,
+    }
+
+    holder.join(timeout=60)
+
+    for path, code in answers.items():
+        assert code != 503, (
+            f"the {path} endpoint made a caller queue for a slot before telling them the thing "
+            "they named does not exist")
+        assert code in (403, 404, 409, 410), f"unexpected answer from {path}: {code}"

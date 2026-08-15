@@ -2408,29 +2408,59 @@ def test_a_fresh_volume_set_keeps_the_configured_ceiling():
 # terms: written only when the deployment has a value, and carried across a fresh volume set.
 
 
-@pytest.mark.parametrize("raw,expected", [
-    ("16", 16), ("  8  ", 8), ("'4'", 4), ('"2"', 2),
-    ("", None), (None, None), ("many", None), ("1.5", None),
-    ("0", None), ("-3", None),          # a ceiling below one refuses everything; not a setting
-])
-def test_parse_positive_int(raw, expected):
-    assert dv.parse_positive_int(raw) == expected
+# The parsers must agree with TransferAdmission.__init__, which clamps rather than rejects:
+# max(1, int(limit)), max(0, int(max_waiting)), max(0.0, float(wait_seconds)). A parser that
+# DROPPED an out-of-range value would carry it forward as "unset", i.e. the default -- so a
+# deployment pinned to the tightest possible ceiling would silently come back at sixteen.
 
 
 @pytest.mark.parametrize("raw,expected", [
-    ("32", 32), ("0", 0), ("", None), ("-1", None), ("lots", None),
+    ("16", 16), ("  8  ", 8), ("'4'", 4), ('"2"', 2), ("8.0", 8),
+    ("0", 1), ("-3", 1),                     # the application reads these as one; so must the tool
+    ("", None), (None, None), ("many", None), ("inf", None), ("nan", None),
 ])
-def test_parse_non_negative_int(raw, expected):
-    """Zero is a real choice here -- it means refuse immediately rather than queue."""
-    assert dv.parse_non_negative_int(raw) == expected
+def test_parse_transfer_limit(raw, expected):
+    assert dv.parse_transfer_limit(raw) == expected
 
 
 @pytest.mark.parametrize("raw,expected", [
-    ("20", 20), ("2.5", 2.5), ("'30'", 30), ("", None), ("0", None), ("-5", None), ("soon", None),
+    ("32", 32), ("0", 0), ("-1", 0), ("", None), ("lots", None), ("Infinity", None),
 ])
-def test_parse_positive_number(raw, expected):
+def test_parse_transfer_queue(raw, expected):
+    """Zero is a real choice here -- refuse at once rather than queue -- and negatives read as it."""
+    assert dv.parse_transfer_queue(raw) == expected
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("20", 20), ("2.5", 2.5), ("'30'", 30), ("0", 0), ("-5", 0),
+    ("", None), ("soon", None), ("inf", None), ("-inf", None), ("nan", None),
+])
+def test_parse_transfer_wait(raw, expected):
     """A whole number comes back whole: '20' should not be written back as '20.0'."""
-    assert dv.parse_positive_number(raw) == expected
+    assert dv.parse_transfer_wait(raw) == expected
+
+
+@pytest.mark.parametrize("parser", ["parse_transfer_limit", "parse_transfer_queue",
+                                    "parse_transfer_wait"])
+@pytest.mark.parametrize("hostile", ["inf", "-inf", "nan", "Infinity", "1e400"])
+def test_a_hand_edited_env_cannot_crash_the_tool(parser, hostile):
+    """These read a file a person may have edited. Every sibling parser in the tool tolerates
+    nonsense by returning None; a non-finite float used to escape as OverflowError instead and
+    abort the fresh-volume-set flow with a traceback."""
+    assert getattr(dv, parser)(hostile) is None
+
+
+def test_the_carried_ceiling_is_the_one_the_deployment_was_running():
+    """What the tool writes must be what the running deployment was already doing, value for value.
+
+    Checked against the gate itself rather than against a table, so the two cannot drift apart.
+    """
+    from app.core.transfer_admission import TransferAdmission
+    for raw in ("0", "-3", "1", "4", "16", "8.0"):
+        carried = dv.parse_transfer_limit(raw)
+        running = TransferAdmission(limit=float(raw), max_waiting=0, wait_seconds=1).stats()["limit"]
+        assert carried == running, (
+            f"MAX_CONCURRENT_TRANSFERS={raw} runs as {running} but the tool would carry {carried}")
 
 
 def test_setup_writes_the_transfer_ceiling_only_when_asked():

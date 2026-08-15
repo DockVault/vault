@@ -8205,6 +8205,21 @@ async def upload_file(
                         detail=f"Upload rejected: Vault size limit would be exceeded"
                     )
         
+        # Admitted on the same ceiling as a download: reading the submitted bytes and pushing
+        # them through the encryption pipeline holds memory for a duration in the same way, and a
+        # deployment's capacity is the two together rather than each apart.
+        #
+        # Taken once for the request rather than once per file -- a request carrying several files
+        # is one transfer as far as memory goes, and admitting each file separately would let a
+        # request commit its first file and then be refused partway through. Taken before anything
+        # is registered or reserved, so a refusal has nothing to unwind, and returned by the outer
+        # finally on every path out.
+        if files:
+            try:
+                transfer_slot = await transfer_admission.acquire()
+            except TransferBusy as busy:
+                raise _busy_response(busy)
+
         for upload_file in files:
             # Validate filename
             if not upload_file.filename:
@@ -8233,18 +8248,6 @@ async def upload_file(
                 vault_id=str(vault_id),
             )
 
-            # Admitted on the same ceiling as a download: this reads the submitted bytes and pushes
-            # them through the encryption pipeline, so it holds memory for a duration in the same
-            # way, and a deployment's capacity is the two of them together rather than each apart.
-            #
-            # Held for the whole request and returned by the outer finally, so a second file never
-            # has to be admitted again once the first was: the alternative refuses a caller
-            # halfway through work it already began.
-            if transfer_slot is None:
-                try:
-                    transfer_slot = await transfer_admission.acquire()
-                except TransferBusy as busy:
-                    raise _busy_response(busy)
             _op_ok = False  # set True only after the file is fully committed (drives complete_operation)
 
             # Wrap entire upload in try-finally to ensure reservation cleanup
@@ -9385,20 +9388,26 @@ async def complete_chunked_upload(
     duration in the same way a download does, and it is the path the product's own client takes.
     The chunk writes before it are not admitted: each streams straight to disk and holds nothing.
     """
-    try:
-        transfer_slot = await transfer_admission.acquire()
-    except TransferBusy as busy:
-        raise _busy_response(busy)
+    transfer_slot = None
+
+    async def admit():
+        """Take the transfer slot. Called by the body once the request has earned one."""
+        nonlocal transfer_slot
+        try:
+            transfer_slot = await transfer_admission.acquire()
+        except TransferBusy as busy:
+            raise _busy_response(busy)
 
     try:
         return await _complete_chunked_upload(
-            vault_id, session_id, request, current_user, db, x_vault_password)
+            vault_id, session_id, request, current_user, db, x_vault_password, admit)
     finally:
-        transfer_admission.release(transfer_slot)
+        if transfer_slot is not None:
+            transfer_admission.release(transfer_slot)
 
 
 async def _complete_chunked_upload(vault_id, session_id, request, current_user, db,
-                                   x_vault_password):
+                                   x_vault_password, admit):
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
@@ -9433,6 +9442,12 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
     # out from under the chunk reads. The row is deleted on success regardless.
     session.expires_at = datetime.utcnow() + timedelta(hours=_chunk_session_ttl_hours())
     db.commit()
+
+    # Everything above is authorization and validation, and costs nothing to answer. From here the
+    # request reads the staged chunks and encrypts them, which is what the ceiling governs -- so
+    # this is where it is applied, and a caller who is going to be told 403, 404, 409 or 410 is
+    # told that instead of being made to queue for a slot they were never going to use.
+    await admit()
 
     sdir = _upload_session_dir(vault_service, str(session.id))
     present = _received_chunk_indices(sdir)
@@ -9959,14 +9974,10 @@ async def download_file(
         require_file_scope(db, current_user, vault_id, file_id)
         require_download_scope(db, current_user, vault_id, file_id)
 
-        operation_id = f"download_{uuid.uuid4()}"
-        try:
-            transfer_slot = await transfer_admission.acquire()
-        except TransferBusy as busy:
-            raise _busy_response(busy)
-        start_operation(operation_id)
-
-        # The file must belong to the vault used for the access/password gate.
+        # The file must belong to the vault used for the access/password gate. Resolved before the
+        # transfer slot is taken: naming a file that is not there costs nothing to answer, and a
+        # caller who is going to be told 404 should not first be made to queue behind real
+        # transfers -- nor should the attempt show up as load the deployment shed.
         file_record = db.query(File).filter(
             File.id == file_id, File.vault_id == vault_id
         ).first()
@@ -9976,7 +9987,16 @@ async def download_file(
                 detail="File not found",
             )
 
-        # Atomically consume a capped share download before serving bytes.
+        operation_id = f"download_{uuid.uuid4()}"
+        try:
+            transfer_slot = await transfer_admission.acquire()
+        except TransferBusy as busy:
+            raise _busy_response(busy)
+        start_operation(operation_id)
+
+        # Atomically consume a capped share download before serving bytes. This one stays AFTER
+        # admission on purpose: it spends one of the recipient's downloads, and a transfer that was
+        # refused for want of a slot must not be charged for.
         if str(vault_id) in (getattr(current_user, '_share_vault_scope', None) or {}):
             if not permission_service.burn_share_download(
                 current_user,
@@ -11010,6 +11030,7 @@ async def get_monitoring_metrics(
             "transfersWaiting": transfers["waiting"],
             "transferLimit": transfers["limit"],
             "transfersPeak": transfers["peak_in_flight"],
+            "transfersAdmitted": transfers["admitted"],
             "transfersRefused": transfers["refused"],
             "totalFiles": total_files
             # Timestamp removed: Including timestamp prevents ETag caching since it changes every request

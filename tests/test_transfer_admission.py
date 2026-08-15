@@ -197,3 +197,59 @@ def test_the_configuration_is_reported():
     assert stats["limit"] == 7
     assert stats["max_waiting"] == 3
     assert stats["wait_seconds"] == 15
+
+
+def test_the_counters_report_what_the_gate_actually_did():
+    """An operator sizing against the ceiling needs the history, not just the configuration.
+
+    "In flight" alone cannot distinguish a deployment that is comfortably below its ceiling from
+    one that has been shedding load all afternoon and happens to be quiet when it is looked at.
+    """
+    gate = TransferAdmission(limit=2, max_waiting=0, wait_seconds=0.01)
+    fresh = gate.stats()
+    assert (fresh["admitted"], fresh["refused"], fresh["peak_in_flight"]) == (0, 0, 0)
+
+    async def _go():
+        first = await gate.acquire()
+        second = await gate.acquire()
+        at_capacity = gate.stats()
+        assert at_capacity["admitted"] == 2
+        assert at_capacity["peak_in_flight"] == 2
+        assert at_capacity["in_flight"] == 2
+
+        with pytest.raises(TransferBusy):
+            await gate.acquire()
+        assert gate.stats()["refused"] == 1
+
+        gate.release(first)
+        gate.release(second)
+        emptied = gate.stats()
+        assert emptied["in_flight"] == 0
+        # The peak and the totals are history: they do not fall when the deployment quietens.
+        assert emptied["peak_in_flight"] == 2
+        assert emptied["admitted"] == 2
+        assert emptied["refused"] == 1
+
+        third = await gate.acquire()
+        assert gate.stats()["admitted"] == 3, "a reused slot is still an admission"
+        assert gate.stats()["peak_in_flight"] == 2, "one in flight is not a new peak"
+        gate.release(third)
+    _run(_go())
+
+
+def test_a_release_nobody_made_does_not_count_as_an_admission():
+    """The counters must not be movable by something that never held a slot."""
+    gate = TransferAdmission(limit=1, max_waiting=0, wait_seconds=0.01)
+
+    async def _go():
+        gate.release(object())
+        gate.release(None)
+        assert gate.stats()["admitted"] == 0
+        assert gate.stats()["in_flight"] == 0
+
+        token = await gate.acquire()
+        gate.release(token)
+        gate.release(token)                       # a second release of a real token
+        assert gate.stats()["admitted"] == 1
+        assert gate.stats()["in_flight"] == 0
+    _run(_go())

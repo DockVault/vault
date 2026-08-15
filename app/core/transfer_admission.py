@@ -68,6 +68,10 @@ class TransferAdmission:
         # says nothing about how close to the ceiling the deployment usually runs.
         self._refused = 0
         self._peak_in_flight = 0
+        # Every slot ever handed out. Read beside the refusal count it is the shed-load ratio, and
+        # it is the only external evidence of how many times a request was admitted -- which is
+        # how a caller can tell one transfer from several sharing a request.
+        self._admitted = 0
 
     async def acquire(self):
         """Take a slot, waiting if the deployment is full. Raises :class:`TransferBusy` if not.
@@ -101,6 +105,7 @@ class TransferAdmission:
         token = object()
         with self._counter_lock:
             self._live.add(token)
+            self._admitted += 1
             self._peak_in_flight = max(self._peak_in_flight, len(self._live))
         return token
 
@@ -111,10 +116,6 @@ class TransferAdmission:
                 return
             self._live.discard(token)
         self._semaphore.release()
-
-    def _note_refusal(self) -> None:
-        with self._counter_lock:
-            self._refused += 1
 
     def _retry_after(self) -> int:
         """Seconds to suggest. Long enough to be worth honouring, short enough to be useful."""
@@ -134,4 +135,5 @@ class TransferAdmission:
                 "wait_seconds": self._wait_seconds,
                 "peak_in_flight": self._peak_in_flight,
                 "refused": self._refused,
+                "admitted": self._admitted,
             }

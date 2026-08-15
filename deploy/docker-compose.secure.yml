@@ -178,9 +178,12 @@ services:
     read_only: true
     tmpfs:
       - /tmp:mode=1777
-    # Runs both halves; the web download path materialises a decrypted file in RAM (~2x
-    # max_file_size_mb), so keep mem_limit well above that. Raise it if you serve large files
-    # over both web and SFTP concurrently.
+    # Runs both halves. Neither one materialises a file in memory any more: uploads and downloads
+    # are streamed, so a transfer costs a fixed amount whatever the file weighs and the setting to
+    # size against is MAX_CONCURRENT_TRANSFERS (16 by default), not MAX_FILE_SIZE_MB. Budget about
+    # 130 MB at rest plus 25 MB per concurrent transfer for this container -- roughly 530 MB at the
+    # default ceiling -- and lower the ceiling rather than the file size on a small machine. Open
+    # SFTP handles are separate and cost a couple of records each. See docs/resource-budgets.md.
     mem_limit: 4g
     pids_limit: 512
     cpus: 2.0
@@ -273,9 +276,11 @@ services:
     read_only: true
     tmpfs:
       - /tmp:mode=1777
-    # Resource ceilings so one vault can't exhaust the host (co-tenant DoS). The download path
-    # materialises the whole decrypted file in RAM (legacy Fernet codec briefly ~2x), so mem_limit
-    # stays comfortably above ~2x max_file_size_mb (default 1024 MB) + concurrency; size per plan tier.
+    # Resource ceilings so one vault can't exhaust the host (co-tenant DoS). The download path no
+    # longer materialises the file in memory -- it is streamed -- so what to size against is
+    # MAX_CONCURRENT_TRANSFERS (16 by default) rather than MAX_FILE_SIZE_MB: about 130 MB at rest
+    # plus 25 MB per concurrent transfer for this container, so roughly 530 MB at the default
+    # ceiling. Size per plan tier; see docs/resource-budgets.md.
     mem_limit: 4g
     pids_limit: 512
     cpus: 2.0

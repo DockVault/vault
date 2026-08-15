@@ -228,6 +228,7 @@ import base64   # noqa: E402
 import glob     # noqa: E402
 import hashlib  # noqa: E402
 import json     # noqa: E402
+import math     # noqa: E402
 import re       # noqa: E402
 
 # The three secrets the compose file demands (an existing .env must carry these to be reusable).
@@ -908,35 +909,9 @@ def _unquoted(raw):
     return (raw or "").strip().strip("'").strip('"')
 
 
-def parse_positive_int(raw):
-    """An .env integer that must be at least 1 -> int, or None when unset/blank/unusable.
-
-    Anything below one is not a smaller ceiling, it is a deployment that refuses every transfer,
-    so it is treated as "not configured" rather than carried forward."""
-    text = _unquoted(raw)
-    if not text:
-        return None
-    try:
-        value = int(text)
-    except ValueError:
-        return None
-    return value if value >= 1 else None
-
-
-def parse_non_negative_int(raw):
-    """An .env integer that may be zero (an empty waiting room is a valid choice)."""
-    text = _unquoted(raw)
-    if not text:
-        return None
-    try:
-        value = int(text)
-    except ValueError:
-        return None
-    return value if value >= 0 else None
-
-
-def parse_positive_number(raw):
-    """An .env number that must be above zero -> int when whole, else float; None when unusable."""
+def _finite_float(raw):
+    """An .env value as a finite float, or None. 'inf' and 'nan' parse as floats and then break
+    every comparison downstream, so they are unusable values rather than numbers."""
     text = _unquoted(raw)
     if not text:
         return None
@@ -944,8 +919,34 @@ def parse_positive_number(raw):
         value = float(text)
     except ValueError:
         return None
-    if value <= 0:
+    return value if math.isfinite(value) else None
+
+
+def parse_transfer_limit(raw):
+    """MAX_CONCURRENT_TRANSFERS -> the ceiling the application would apply, or None if unset.
+
+    Clamped rather than rejected, because the application clamps: it reads anything below one as
+    one. Dropping a 0 here would carry it forward as "not configured", which is the default of
+    sixteen -- silently widening a ceiling an operator had set as tight as it goes."""
+    value = _finite_float(raw)
+    return None if value is None else max(1, int(value))
+
+
+def parse_transfer_queue(raw):
+    """MAX_QUEUED_TRANSFERS -> the waiting room the application would apply, or None if unset.
+    Zero is a real choice (refuse at once rather than queue); negatives read as zero."""
+    value = _finite_float(raw)
+    return None if value is None else max(0, int(value))
+
+
+def parse_transfer_wait(raw):
+    """TRANSFER_QUEUE_WAIT_SECONDS -> seconds, as the application would read them, or None.
+
+    Whole numbers come back whole so the .env reads '20' rather than '20.0'."""
+    value = _finite_float(raw)
+    if value is None:
         return None
+    value = max(0.0, value)
     return int(value) if value == int(value) else value
 
 
@@ -1141,10 +1142,10 @@ def new_set_config(current_env, new_prefix, new_id):
             current_env.get("MAX_STORAGE_GB") or current_env.get("PLAN_MAX_STORAGE_GB")),
         # Likewise for the transfer ceiling: an operator who lowered it to fit the machine's
         # memory should not find it back at the default because they took a fresh volume set.
-        "max_concurrent_transfers": parse_positive_int(
+        "max_concurrent_transfers": parse_transfer_limit(
             current_env.get("MAX_CONCURRENT_TRANSFERS")),
-        "max_queued_transfers": parse_non_negative_int(current_env.get("MAX_QUEUED_TRANSFERS")),
-        "transfer_queue_wait_seconds": parse_positive_number(
+        "max_queued_transfers": parse_transfer_queue(current_env.get("MAX_QUEUED_TRANSFERS")),
+        "transfer_queue_wait_seconds": parse_transfer_wait(
             current_env.get("TRANSFER_QUEUE_WAIT_SECONDS")),
     }
     return cfg
@@ -1826,8 +1827,12 @@ class DockVault:
             "plan_log_pull": log_pull,
             "log_token_pepper": gen_hex(32) if log_pull else "",
             "max_storage_gb": (getattr(args, "max_storage_gb", None) if args else None),
-            "max_concurrent_transfers": parse_positive_int(
+            "max_concurrent_transfers": parse_transfer_limit(
                 getattr(args, "max_concurrent_transfers", None) if args else None),
+            "max_queued_transfers": parse_transfer_queue(
+                getattr(args, "max_queued_transfers", None) if args else None),
+            "transfer_queue_wait_seconds": parse_transfer_wait(
+                getattr(args, "transfer_queue_wait_seconds", None) if args else None),
             "_generated_pw": generated,
         }
 
@@ -2958,6 +2963,13 @@ def build_parser():
                     help="how many uploads and downloads may run at once (16 by default). Each "
                          "costs a fixed amount of memory whatever the file weighs, so lower this "
                          "on a small machine; see docs/resource-budgets.md")
+    sp.add_argument("--max-queued-transfers", dest="max_queued_transfers", type=int,
+                    help="how many transfers may wait for a slot before callers are refused "
+                         "(32 by default; 0 = refuse at once rather than queue)")
+    sp.add_argument("--transfer-queue-wait-seconds", dest="transfer_queue_wait_seconds",
+                    type=float,
+                    help="how long a transfer waits for a slot before the caller is told to come "
+                         "back (20 by default)")
     sp.add_argument("--update-check", dest="update_check", action="store_true", help="enable the opt-in update check")
     sp.add_argument("--enable-log-pull", dest="enable_log_pull", action="store_true", help="enable the log-pull endpoint")
     sp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags/defaults, never prompt")
