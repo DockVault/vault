@@ -207,6 +207,22 @@ class Settings(BaseSettings):
     rate_limit_api_upload_window: int = Field(default=60)
     rate_limit_api_download: int = Field(default=50)  # File downloads
     rate_limit_api_download_window: int = Field(default=60)
+
+    # How many file transfers the deployment carries at once, and what happens to the rest.
+    #
+    # A transfer costs a bounded amount of memory now -- roughly 40 MB across the stack, whatever
+    # the file weighs -- so a ceiling here is what turns that into a ceiling on the deployment.
+    # Sixteen leaves the measured worst case inside the container limit with a wide margin, and is
+    # far more concurrency than a self-hosted vault normally sees; a deployment with less memory
+    # than the default should lower it, and one serving many people at once may raise it. See
+    # docs/resource-budgets.md for the arithmetic.
+    #
+    # Arrivals beyond the ceiling wait rather than being refused, because a burst is normal and a
+    # refusal a client cannot distinguish from a broken file is not. Only when the waiting room is
+    # also full, or a caller has waited out the timeout, is it told to come back.
+    max_concurrent_transfers: int = Field(default=16)
+    max_queued_transfers: int = Field(default=32)
+    transfer_queue_wait_seconds: float = Field(default=20.0)
     
     # Security Monitoring Configuration
     security_failed_login_warning: int = Field(default=5)  # Failed logins before WARNING alert

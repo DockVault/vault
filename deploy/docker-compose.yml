@@ -156,10 +156,11 @@ services:
       - /app/certs:mode=1777
     # Resource ceilings so a heavy/compromised vault can't exhaust the shared host (co-tenant DoS
     # on the shared-worker SaaS topology). Generous dev/standalone defaults; the SaaS control plane
-    # sizes these per plan tier at provision time. NOTE: the download path materialises the whole
-    # decrypted file in RAM (the legacy Fernet codec briefly holds ~2x), so mem_limit must stay
-    # comfortably above ~2x max_file_size_mb (default 1024 MB) plus concurrency headroom — keep the
-    # two in step if you change either, or a legitimate max-size download will be OOM-killed.
+    # sizes these per plan tier at provision time. A transfer no longer costs a multiple of the
+    # file: downloads and uploads are streamed, so each costs roughly 40 MB across the stack
+    # whatever the file weighs, and the ceiling that matters is MAX_CONCURRENT_TRANSFERS (16 by
+    # default) rather than MAX_FILE_SIZE_MB. Size this as roughly 260 MB plus 40 MB per concurrent
+    # transfer; the 4 GB below is generous rather than necessary. See docs/resource-budgets.md.
     mem_limit: 4g
     pids_limit: 512
     cpus: 2.0

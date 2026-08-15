@@ -93,6 +93,33 @@ def get_active_operations_count() -> int:
         return len(active_operations)
 
 
+# The count above reports; this one decides. They are deliberately separate: the registry tracks
+# every operation for the activity feed and cancellation, while admission governs only the two
+# things that hold memory for a duration -- serving a download, and assembling an upload.
+from app.core.transfer_admission import TransferAdmission, TransferBusy  # noqa: E402
+
+transfer_admission = TransferAdmission(
+    limit=settings.max_concurrent_transfers,
+    max_waiting=settings.max_queued_transfers,
+    wait_seconds=settings.transfer_queue_wait_seconds,
+)
+
+
+def _busy_response(exc: TransferBusy) -> HTTPException:
+    """Turn a refusal into something a client can act on.
+
+    503 with Retry-After, not 500: the deployment is working correctly and is momentarily full,
+    which is a different thing from the file being unreadable. A client that cannot tell those
+    apart either retries something hopeless or gives up on something that would have worked.
+    """
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=(f"The server is already handling {exc.limit} transfers. "
+                f"Try again in a few seconds."),
+        headers={"Retry-After": str(exc.retry_after)},
+    )
+
+
 # Initialize FastAPI app
 # Security: Conditionally disable API docs in production
 app = FastAPI(
@@ -8183,6 +8210,14 @@ async def upload_file(
             # Create operation ID for tracking
             operation_id = f"upload_{uuid.uuid4()}"
             
+            # Admitted on the same ceiling as a download: this path reads the submitted bytes
+            # and pushes them through the encryption pipeline, so it holds memory for a duration in
+            # the same way. A deployment's capacity is the two of them together, not each apart.
+            try:
+                transfer_slot = await transfer_admission.acquire()
+            except TransferBusy as busy:
+                raise _busy_response(busy)
+
             # Track in local set
             start_operation(operation_id)
             
@@ -8465,6 +8500,7 @@ async def upload_file(
 
                 # Always end operation tracking
                 end_operation(operation_id)
+                transfer_admission.release(transfer_slot)
         
         return {
             'message': f'Successfully uploaded {len(uploaded_files)} file(s)',
@@ -9870,6 +9906,7 @@ async def download_file(
     tracker_started = False
     stream_handed_off = False
     download = None
+    transfer_slot = None
 
     try:
         # Verify vault access and password. allow_share=True: a recipient with an active
@@ -9886,6 +9923,10 @@ async def download_file(
         require_download_scope(db, current_user, vault_id, file_id)
 
         operation_id = f"download_{uuid.uuid4()}"
+        try:
+            transfer_slot = await transfer_admission.acquire()
+        except TransferBusy as busy:
+            raise _busy_response(busy)
         start_operation(operation_id)
 
         # The file must belong to the vault used for the access/password gate.
@@ -10047,6 +10088,9 @@ async def download_file(
                     failure = exc
             finally:
                 download.close()
+                # Held for the whole response, not just the endpoint: the slot is what the transfer
+                # occupies, and the transfer is still happening while this generator runs.
+                transfer_admission.release(transfer_slot)
 
                 # The completion record, written here rather than before the first byte. What the
                 # audit row above states is that access was granted; what this one states is what
@@ -10192,6 +10236,7 @@ async def download_file(
         # every early failure the walk exists to produce -- would otherwise leak its descriptor
         # for the life of the process.
         if not stream_handed_off:
+            transfer_admission.release(transfer_slot)
             if download is not None:
                 download.close()
             if operation_id:

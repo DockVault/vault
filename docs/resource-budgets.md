@@ -141,10 +141,23 @@ below asks a different question than it used to — "how many transfers", not "h
 | 2 GB | ~44 |
 | 4 GB | ~96 |
 
-**Two cautions on those rows.** They extrapolate one measured point, and run-to-run spread on this
-host reaches 11%. More importantly, nothing in the server currently *limits* concurrency — the
-rows describe what the memory allows, not what the deployment enforces, and a hundred simultaneous
-requests will all be attempted. Admission control is separate work.
+Set `MAX_CONCURRENT_TRANSFERS` at or below the figure for the memory available; the default of 16
+suits 1 GB and above.
+
+**A caution on those rows:** they extrapolate one measured point, and run-to-run spread on this
+host reaches 11%.
+
+**Concurrency is now enforced, not merely described.** `MAX_CONCURRENT_TRANSFERS` (16 by default)
+caps how many transfers are carried at once, counting downloads and upload assembly together.
+Arrivals beyond it wait — a burst is normal traffic — and are only turned away once the queue
+(`MAX_QUEUED_TRANSFERS`, 32) is also full or the wait (`TRANSFER_QUEUE_WAIT_SECONDS`, 20) expires.
+A refusal is a `503` with `Retry-After`, deliberately distinct from a failure, so a client can tell
+"come back shortly" from "this file is broken".
+
+At the default ceiling the transfer memory is about 16 × 40 MB = 640 MB on top of the ~260 MB
+resting, which is why a deployment with less memory than that should lower it. **Open SFTP handles
+are not counted by this ceiling** — they are not transfers, they are held state, and they are
+bounded separately by two record-sizes each.
 
 ## On the 500 MB target
 
