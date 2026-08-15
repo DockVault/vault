@@ -152,6 +152,7 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # Read mode. `reader` answers ranges without holding the file; the whole plaintext used to
         # sit here instead, for as long as the client left the handle open.
         self.reader = None
+        self.file_id = None
         # write mode
         self.writepath: Optional[str] = None
         self.writefile = None
@@ -164,18 +165,26 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # shared
         self.attrs: Optional[paramiko.SFTPAttributes] = None
 
+    # A single read is answered in at most this much. The protocol allows a server to return fewer
+    # bytes than asked for, and clients loop; real ones ask for 32 KB at a time and never reach
+    # this. What it stops is a client asking for the whole file in one request, which would
+    # assemble all of it in memory -- about five times over, once the response is framed -- and
+    # hold the session for the duration. Without it the per-handle bound is only a convention the
+    # client is trusted to keep.
+    MAX_READ = 1024 * 1024
+
     def read(self, offset: int, length: int):
         if self.reader is None:
             return paramiko.SFTP_OP_UNSUPPORTED
         if offset >= self.reader.size:
             return paramiko.SFTP_EOF
         try:
-            return self.reader.read(offset, length)
+            return self.reader.read(offset, min(length, self.MAX_READ))
         except Exception as e:  # noqa: BLE001 - a read failure must not drop the connection
             # Reaching here means a record would not authenticate, or the blob moved underneath
             # the handle. Either way the client gets a failure for this read rather than bytes
             # that were not verified.
-            safe_event('read.failed', e)
+            safe_event('read.failed', e, file=self.file_id)
             return paramiko.SFTP_FAILURE
 
     def write(self, offset: int, data: bytes):
@@ -775,6 +784,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
 
             handle = VaultSFTPHandle(flags=os.O_RDONLY)
             handle.reader = reader
+            handle.file_id = str(f.id)
             # The size the format itself reports, which for the current format is authenticated by
             # its terminal -- unlike the directory listing's, which comes from the database row.
             handle.attrs = self._file_attr(name, size=reader.size, mtime=self._ts(f.created_at))

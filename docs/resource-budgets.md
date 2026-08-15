@@ -85,8 +85,19 @@ large file and walked away held all of it.
 | …then seek 50 MB in and read again | **2.2 MB** |
 
 Closing returns to the resting figure exactly. The reader answers ranges out of the index the
-format walk already builds and keeps the last two decrypted records, so what is resident is a few
-bytes per record plus those two — not the file, and not a function of how far a client seeks.
+format walk already builds and keeps the last two decrypted records, so what is resident is the
+index plus **one or two record-sizes** — not the file, and not a function of how far a client
+seeks.
+
+**That figure depends on how the file was written, and the writers do not agree.** The resumable
+and SFTP upload paths write 1 MiB records; the direct multipart upload writes 5 MiB ones. Measured
+on the same 12 MB file: **1.0 MB per handle when it was written in 1 MiB records, 5.2 MB when it
+was written in 5 MiB ones**, doubling to 10.2 MB for a read that straddles a boundary. Twenty such
+handles cost 201 MB. The ceiling is two records, and a record may be up to 8 MiB, so size for
+**2 × the largest record a writer produces, per concurrent handle** — not for the 1.0 MB headline.
+
+A single read is answered in at most 1 MiB regardless of what the client asks for, so no one
+request can re-materialise a file. Nothing caps how many handles may be open at once.
 
 **One format is exempt.** Legacy Fernet blobs still read whole, because their plaintext record
 lengths are not derivable from the framing — padding hides up to sixteen bytes per token, so an
@@ -130,12 +141,13 @@ requests will all be attempted. Admission control is separate work.
 
 **Reached, and no longer dependent on file size — on either protocol.** A 500 MB deployment fits
 the stack at rest with room for several concurrent transfers, whatever the files weigh, and an idle
-SFTP handle on a large file no longer counts against it. The default `MAX_FILE_SIZE_MB` of 1024 no
+SFTP handle costs one or two records rather than the file. Size the SFTP side by concurrent handles
+times two record-sizes, as above, and remember that nothing enforces either count. The default `MAX_FILE_SIZE_MB` of 1024 no
 longer implies a multi-gigabyte peak, so the API container's 4 GB `mem_limit` is now generous
 rather than necessary.
 
 Two numbers moved. Download: **267.9 MB for a 128 MB file, now 15.2 MB — and 13.5 MB for a file
-four times larger.** An open SFTP handle: **100.2 MB for a 96 MB file, now 1.0 MB.**
+four times larger.** An open SFTP handle: **100.2 MB for a 96 MB file, now 1.0 MB** — with the caveat above about the writer's record size.
 
 **Nothing here was tuned to reach the target.** The instruction was to report the honest floor, and
 the floor moved because the code did.

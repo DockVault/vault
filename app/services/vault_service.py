@@ -1451,6 +1451,15 @@ class VaultService:
         if not storage_path.exists():
             raise FileNotFoundError(f"File data not found on disk: {file_id}")
 
+        if vault is not None and getattr(vault, 'type', 'standard') == 'zero_knowledge':
+            # The blob is the client's ciphertext, stored verbatim, and the server holds no key for
+            # it -- there are no records to index and nothing to decrypt. SFTP never reaches this
+            # (it refuses any vault that is not standard), but this is a public method and the
+            # sequential opener beside it makes the same check first. Failing here is better than
+            # routing an attacker-chosen blob that happens to start with the format magic into a
+            # reader that will try to authenticate it under the deployment key.
+            raise FileServiceError("Zero-knowledge files cannot be read by range")
+
         handle = open(storage_path, 'rb')
         try:
             try:

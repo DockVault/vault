@@ -43,9 +43,28 @@ def _sftp_session(username, password):
         transport.close()
 
 
-def _anon_bytes(container_env="VAULT_SFTP_CONTAINER", default="vault-sftp"):
+def _sftp_container():
+    """The container serving the deployment under test.
+
+    Derived from the port rather than defaulted. A default of "vault-sftp" reads a DIFFERENT
+    deployment on this host: the session connects to one server and the measurement comes from
+    another, the delta is nothing, and the test passes however the server behaves. That is exactly
+    what it did until it was checked.
+    """
+    named = os.environ.get("VAULT_SFTP_CONTAINER")
+    if named:
+        return named
+    found = subprocess.run(
+        ["docker", "ps", "--format", "{{.Names}}", "--filter", f"publish={SFTP_PORT}"],
+        capture_output=True, text=True, timeout=60).stdout.split()
+    if not found:
+        pytest.skip(f"cannot identify the container serving SFTP port {SFTP_PORT}")
+    return found[0]
+
+
+def _anon_bytes():
     """Allocated memory in a container, page cache excluded."""
-    container = os.environ.get(container_env, default)
+    container = _sftp_container()
     script = (
         'if [ -r /sys/fs/cgroup/memory.current ]; then '
         'cur=$(cat /sys/fs/cgroup/memory.current); '
@@ -115,6 +134,12 @@ def test_an_open_handle_does_not_hold_the_file(admin, admin_creds, temp_vault):
     assert held < size // 3, (
         f"an open handle on a {size // MB} MB file holds {held / MB:.1f} MB; the file is being "
         "read into memory rather than indexed")
+    # Non-vacuity. An open handle decrypts the record the read landed in, so it MUST move memory
+    # by something. A reading of zero means the session and the measurement are looking at
+    # different deployments, which is how this test used to pass regardless of the server.
+    assert held > 128 * 1024, (
+        f"an open handle moved {held} bytes, which is too little to be this deployment; the "
+        "measurement is probably reading a different container than the session connected to")
     # And nothing accumulates: closing must give it back, whatever it was.
     assert after_close - resting < size // 3
 
