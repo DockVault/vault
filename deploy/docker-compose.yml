@@ -157,10 +157,12 @@ services:
     # Resource ceilings so a heavy/compromised vault can't exhaust the shared host (co-tenant DoS
     # on the shared-worker SaaS topology). Generous dev/standalone defaults; the SaaS control plane
     # sizes these per plan tier at provision time. A transfer no longer costs a multiple of the
-    # file: downloads and uploads are streamed, so each costs roughly 40 MB across the stack
-    # whatever the file weighs, and the ceiling that matters is MAX_CONCURRENT_TRANSFERS (16 by
-    # default) rather than MAX_FILE_SIZE_MB. Size this as roughly 260 MB plus 40 MB per concurrent
-    # transfer; the 4 GB below is generous rather than necessary. See docs/resource-budgets.md.
+    # file: downloads and uploads are streamed, so each costs a fixed amount whatever the file
+    # weighs, and the ceiling that matters is MAX_CONCURRENT_TRANSFERS (16 by default) rather than
+    # MAX_FILE_SIZE_MB. For THIS container specifically, budget about 130 MB at rest plus 25 MB per
+    # concurrent transfer -- roughly 530 MB at the default ceiling, so the 4 GB below is generous
+    # rather than necessary. The 260 MB + 40 MB figures in docs/resource-budgets.md are whole-stack
+    # totals across all four services; do not apply them to a single container.
     mem_limit: 4g
     pids_limit: 512
     cpus: 2.0

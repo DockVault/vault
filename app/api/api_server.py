@@ -8059,6 +8059,12 @@ async def upload_file(
     audit_logger = AuditLogger(db)
     from app.core.database import redis_client
     
+    # One transfer slot for the request, not one per file. A request carrying several files is
+    # one transfer as far as memory goes -- the files are read and encrypted one after another --
+    # and taking a slot per file would let a request commit its first file and then be refused
+    # partway through, which is a worse answer than either accepting or refusing the whole thing.
+    transfer_slot = None
+
     try:
         # Verify vault access and password (from header for security)
         vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
@@ -8210,17 +8216,9 @@ async def upload_file(
             # Create operation ID for tracking
             operation_id = f"upload_{uuid.uuid4()}"
             
-            # Admitted on the same ceiling as a download: this path reads the submitted bytes
-            # and pushes them through the encryption pipeline, so it holds memory for a duration in
-            # the same way. A deployment's capacity is the two of them together, not each apart.
-            try:
-                transfer_slot = await transfer_admission.acquire()
-            except TransferBusy as busy:
-                raise _busy_response(busy)
-
             # Track in local set
             start_operation(operation_id)
-            
+
             # Track in Redis for cancellation and progress
             from app.services.activity_monitor import ProgressTracker
             tracker = ProgressTracker()
@@ -8234,6 +8232,19 @@ async def upload_file(
                 temp_credential_id=getattr(current_user, "_temp_cred_id", None),
                 vault_id=str(vault_id),
             )
+
+            # Admitted on the same ceiling as a download: this reads the submitted bytes and pushes
+            # them through the encryption pipeline, so it holds memory for a duration in the same
+            # way, and a deployment's capacity is the two of them together rather than each apart.
+            #
+            # Held for the whole request and returned by the outer finally, so a second file never
+            # has to be admitted again once the first was: the alternative refuses a caller
+            # halfway through work it already began.
+            if transfer_slot is None:
+                try:
+                    transfer_slot = await transfer_admission.acquire()
+                except TransferBusy as busy:
+                    raise _busy_response(busy)
             _op_ok = False  # set True only after the file is fully committed (drives complete_operation)
 
             # Wrap entire upload in try-finally to ensure reservation cleanup
@@ -8500,7 +8511,6 @@ async def upload_file(
 
                 # Always end operation tracking
                 end_operation(operation_id)
-                transfer_admission.release(transfer_slot)
         
         return {
             'message': f'Successfully uploaded {len(uploaded_files)} file(s)',
@@ -8543,6 +8553,13 @@ async def upload_file(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to upload file: {str(e)}"
         )
+    finally:
+        # Every path out of the request returns the slot, including the ones that raise before a
+        # single file is read (where there is nothing to return and this is a no-op). A slot lost
+        # here does not fail loudly: it shrinks the ceiling permanently, one leak at a time, until
+        # the deployment refuses every transfer.
+        if transfer_slot is not None:
+            transfer_admission.release(transfer_slot)
 
 
 # ============================================================================
@@ -9361,7 +9378,27 @@ async def complete_chunked_upload(
     x_vault_password: Optional[str] = Header(None),
 ):
     """Assemble buffered chunks through the real encryption pipeline and create
-    the File record. Rejects with the missing indices if any chunk is absent."""
+    the File record. Rejects with the missing indices if any chunk is absent.
+
+    Admitted on the transfer ceiling. This is the assembling half of an upload -- it reads the
+    staged chunks and pushes them through the encryption pipeline -- so it holds memory for a
+    duration in the same way a download does, and it is the path the product's own client takes.
+    The chunk writes before it are not admitted: each streams straight to disk and holds nothing.
+    """
+    try:
+        transfer_slot = await transfer_admission.acquire()
+    except TransferBusy as busy:
+        raise _busy_response(busy)
+
+    try:
+        return await _complete_chunked_upload(
+            vault_id, session_id, request, current_user, db, x_vault_password)
+    finally:
+        transfer_admission.release(transfer_slot)
+
+
+async def _complete_chunked_upload(vault_id, session_id, request, current_user, db,
+                                   x_vault_password):
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
@@ -10952,8 +10989,12 @@ async def get_monitoring_metrics(
         upload_traffic = upload_count * 1024 * 1024  # Estimate: 1MB per upload
         download_traffic = download_count * 1024 * 1024  # Estimate: 1MB per download
         
-        # Active operations (for now, return 0 - will be implemented via WebSocket)
-        active_operations = 0
+        # What the deployment is actually carrying, and what the transfer ceiling has done about
+        # it. The docs tell an operator to size MAX_CONCURRENT_TRANSFERS against their memory, and
+        # they cannot do that without seeing how close to it they run: a refusal otherwise leaves
+        # no trace but a 503 in the access log.
+        active_operations = get_active_operations_count()
+        transfers = transfer_admission.stats()
         
         # Total files
         total_files = db.query(func.count(File.id)).scalar() or 0
@@ -10965,6 +11006,11 @@ async def get_monitoring_metrics(
             "uploadTraffic": upload_traffic,
             "downloadTraffic": download_traffic,
             "activeOperations": active_operations,
+            "transfersInFlight": transfers["in_flight"],
+            "transfersWaiting": transfers["waiting"],
+            "transferLimit": transfers["limit"],
+            "transfersPeak": transfers["peak_in_flight"],
+            "transfersRefused": transfers["refused"],
             "totalFiles": total_files
             # Timestamp removed: Including timestamp prevents ETag caching since it changes every request
             # Frontend can add timestamp when displaying if needed

@@ -156,8 +156,21 @@ A refusal is a `503` with `Retry-After`, deliberately distinct from a failure, s
 
 At the default ceiling the transfer memory is about 16 × 40 MB = 640 MB on top of the ~260 MB
 resting, which is why a deployment with less memory than that should lower it. **Open SFTP handles
-are not counted by this ceiling** — they are not transfers, they are held state, and they are
-bounded separately by two record-sizes each.
+are not counted by this ceiling** — they are not transfers, they are held state, they are bounded
+separately by two record-sizes each, and SFTP runs as its own process, so an in-process ceiling
+could not cover them in any case.
+
+**What the ceiling costs, stated plainly.** A slot is held for as long as its transfer takes, and a
+transfer has no deadline. A client that opens a download and then stops reading holds its slot
+until it disconnects, so sixteen such clients will make the deployment answer `503` to everyone
+else until they hang up — measured. Nor does cancelling the request necessarily help: a slot comes back
+when the server next tries to write to a connection that has gone (up to about a minute, measured),
+and never at all while the client keeps the connection open and simply declines to read. That is a
+trade, not an oversight: the alternative was attempting every transfer at once, which ends in the
+process being killed rather than in callers being asked to come back. Recovery is immediate once the
+stalled clients disconnect, and a proxy with a response timeout in front of the deployment removes
+the exposure entirely. Bounding how long
+a slot may be held with no forward progress is the proper fix and is not in this change.
 
 ## On the 500 MB target
 

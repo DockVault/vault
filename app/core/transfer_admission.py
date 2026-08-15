@@ -63,6 +63,11 @@ class TransferAdmission:
         self._counter_lock = threading.Lock()
         self._live = set()
         self._waiting = 0
+        # Counted since start, so an operator can tell "sized correctly" from "shed load all
+        # afternoon". Without it the only trace of a refusal is a 503 in the access log, which
+        # says nothing about how close to the ceiling the deployment usually runs.
+        self._refused = 0
+        self._peak_in_flight = 0
 
     async def acquire(self):
         """Take a slot, waiting if the deployment is full. Raises :class:`TransferBusy` if not.
@@ -74,14 +79,19 @@ class TransferAdmission:
         if self._semaphore.locked():
             with self._counter_lock:
                 if self._waiting >= self._max_waiting:
+                    waiting = self._waiting
+                    self._refused += 1
                     raise TransferBusy(
-                        retry_after=self._retry_after(), waiting=self._waiting, limit=self._limit)
+                        retry_after=self._retry_after(), waiting=waiting, limit=self._limit)
                 self._waiting += 1
             try:
                 await asyncio.wait_for(self._semaphore.acquire(), timeout=self._wait_seconds)
             except asyncio.TimeoutError:
+                with self._counter_lock:
+                    waiting = self._waiting
+                    self._refused += 1
                 raise TransferBusy(
-                    retry_after=self._retry_after(), waiting=self._waiting, limit=self._limit)
+                    retry_after=self._retry_after(), waiting=waiting, limit=self._limit)
             finally:
                 with self._counter_lock:
                     self._waiting -= 1
@@ -91,6 +101,7 @@ class TransferAdmission:
         token = object()
         with self._counter_lock:
             self._live.add(token)
+            self._peak_in_flight = max(self._peak_in_flight, len(self._live))
         return token
 
     def release(self, token) -> None:
@@ -100,6 +111,10 @@ class TransferAdmission:
                 return
             self._live.discard(token)
         self._semaphore.release()
+
+    def _note_refusal(self) -> None:
+        with self._counter_lock:
+            self._refused += 1
 
     def _retry_after(self) -> int:
         """Seconds to suggest. Long enough to be worth honouring, short enough to be useful."""
@@ -117,4 +132,6 @@ class TransferAdmission:
                 "waiting": self._waiting,
                 "max_waiting": self._max_waiting,
                 "wait_seconds": self._wait_seconds,
+                "peak_in_flight": self._peak_in_flight,
+                "refused": self._refused,
             }

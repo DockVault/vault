@@ -409,6 +409,13 @@ def build_env_lines(cfg):
     # .env it always did.
     if cfg.get("max_storage_gb") not in (None, ""):
         bare("MAX_STORAGE_GB", format_gb_value(cfg["max_storage_gb"]))
+    # Transfer ceiling. The one that costs memory is MAX_CONCURRENT_TRANSFERS; the other two only
+    # shape what happens to callers who arrive at a full deployment. Same rule as storage: written
+    # only when this deployment has a value, so an install that never mentions them authors the
+    # .env it always did and the app's own defaults apply.
+    for key in ("max_concurrent_transfers", "max_queued_transfers", "transfer_queue_wait_seconds"):
+        if cfg.get(key) not in (None, ""):
+            bare(key.upper(), str(cfg[key]))
     if cfg.get("plan_log_pull"):
         # Opting in here closes the log-404 trap: the endpoint needs BOTH the plan flag and a
         # strong pepper before it will serve (then an admin still ticks a component in the UI).
@@ -897,6 +904,51 @@ def parse_max_storage_gb(raw):
         return None
 
 
+def _unquoted(raw):
+    return (raw or "").strip().strip("'").strip('"')
+
+
+def parse_positive_int(raw):
+    """An .env integer that must be at least 1 -> int, or None when unset/blank/unusable.
+
+    Anything below one is not a smaller ceiling, it is a deployment that refuses every transfer,
+    so it is treated as "not configured" rather than carried forward."""
+    text = _unquoted(raw)
+    if not text:
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if value >= 1 else None
+
+
+def parse_non_negative_int(raw):
+    """An .env integer that may be zero (an empty waiting room is a valid choice)."""
+    text = _unquoted(raw)
+    if not text:
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def parse_positive_number(raw):
+    """An .env number that must be above zero -> int when whole, else float; None when unusable."""
+    text = _unquoted(raw)
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return int(value) if value == int(value) else value
+
+
 def format_gb_value(gb):
     """A GB number as an .env value. Deliberately not '%g': that renders large numbers in
     exponent notation ('1e+06'), and a whole number should read as '64', not '64.0'."""
@@ -1087,6 +1139,13 @@ def new_set_config(current_env, new_prefix, new_id):
         # operator had configured rather than silently reverting it to unlimited.
         "max_storage_gb": parse_max_storage_gb(
             current_env.get("MAX_STORAGE_GB") or current_env.get("PLAN_MAX_STORAGE_GB")),
+        # Likewise for the transfer ceiling: an operator who lowered it to fit the machine's
+        # memory should not find it back at the default because they took a fresh volume set.
+        "max_concurrent_transfers": parse_positive_int(
+            current_env.get("MAX_CONCURRENT_TRANSFERS")),
+        "max_queued_transfers": parse_non_negative_int(current_env.get("MAX_QUEUED_TRANSFERS")),
+        "transfer_queue_wait_seconds": parse_positive_number(
+            current_env.get("TRANSFER_QUEUE_WAIT_SECONDS")),
     }
     return cfg
 
@@ -1767,6 +1826,8 @@ class DockVault:
             "plan_log_pull": log_pull,
             "log_token_pepper": gen_hex(32) if log_pull else "",
             "max_storage_gb": (getattr(args, "max_storage_gb", None) if args else None),
+            "max_concurrent_transfers": parse_positive_int(
+                getattr(args, "max_concurrent_transfers", None) if args else None),
             "_generated_pw": generated,
         }
 
@@ -2893,6 +2954,10 @@ def build_parser():
                          "(default with --non-interactive; interactive setup asks)")
     sp.add_argument("--max-storage-gb", dest="max_storage_gb", type=float,
                     help="deployment storage ceiling in GB (-1 = unlimited, the default)")
+    sp.add_argument("--max-concurrent-transfers", dest="max_concurrent_transfers", type=int,
+                    help="how many uploads and downloads may run at once (16 by default). Each "
+                         "costs a fixed amount of memory whatever the file weighs, so lower this "
+                         "on a small machine; see docs/resource-budgets.md")
     sp.add_argument("--update-check", dest="update_check", action="store_true", help="enable the opt-in update check")
     sp.add_argument("--enable-log-pull", dest="enable_log_pull", action="store_true", help="enable the log-pull endpoint")
     sp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags/defaults, never prompt")

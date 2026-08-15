@@ -2403,6 +2403,87 @@ def test_a_fresh_volume_set_keeps_the_configured_ceiling():
     assert "MAX_STORAGE_GB=64" in dv.build_env_lines({**cfg, "server_name": "localhost"})
 
 
+# The transfer ceiling (MAX_CONCURRENT_TRANSFERS and the two queue settings beside it). It is a
+# memory ceiling in the same sense MAX_STORAGE_GB is a disk one, so it is handled on the same
+# terms: written only when the deployment has a value, and carried across a fresh volume set.
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("16", 16), ("  8  ", 8), ("'4'", 4), ('"2"', 2),
+    ("", None), (None, None), ("many", None), ("1.5", None),
+    ("0", None), ("-3", None),          # a ceiling below one refuses everything; not a setting
+])
+def test_parse_positive_int(raw, expected):
+    assert dv.parse_positive_int(raw) == expected
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("32", 32), ("0", 0), ("", None), ("-1", None), ("lots", None),
+])
+def test_parse_non_negative_int(raw, expected):
+    """Zero is a real choice here -- it means refuse immediately rather than queue."""
+    assert dv.parse_non_negative_int(raw) == expected
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("20", 20), ("2.5", 2.5), ("'30'", 30), ("", None), ("0", None), ("-5", None), ("soon", None),
+])
+def test_parse_positive_number(raw, expected):
+    """A whole number comes back whole: '20' should not be written back as '20.0'."""
+    assert dv.parse_positive_number(raw) == expected
+
+
+def test_setup_writes_the_transfer_ceiling_only_when_asked():
+    cfg = _reusable_env_cfg()
+    assert not [l for l in dv.build_env_lines(cfg) if l.startswith("MAX_CONCURRENT_TRANSFERS")]
+    cfg["max_concurrent_transfers"] = 4
+    assert "MAX_CONCURRENT_TRANSFERS=4" in dv.build_env_lines(cfg)
+
+
+def test_setup_accepts_the_transfer_ceiling_flag():
+    args = dv.build_parser().parse_args(
+        ["setup", "--non-interactive", "--max-concurrent-transfers", "4"])
+    assert args.max_concurrent_transfers == 4
+
+
+def test_a_fresh_volume_set_keeps_the_configured_transfer_ceiling():
+    """An operator who lowered the ceiling to fit the machine's memory should not find it back at
+    the default because they took a fresh volume set -- on a small machine that is the difference
+    between a deployment that sheds load and one that is killed for using too much."""
+    cfg = dv.new_set_config({
+        "MAX_CONCURRENT_TRANSFERS": "4",
+        "MAX_QUEUED_TRANSFERS": "0",
+        "TRANSFER_QUEUE_WAIT_SECONDS": "5",
+    }, "prefix-1", "dep-1")
+    assert cfg["max_concurrent_transfers"] == 4
+    assert cfg["max_queued_transfers"] == 0
+    assert cfg["transfer_queue_wait_seconds"] == 5
+
+    lines = dv.build_env_lines({**cfg, "server_name": "localhost"})
+    assert "MAX_CONCURRENT_TRANSFERS=4" in lines
+    assert "MAX_QUEUED_TRANSFERS=0" in lines          # zero is carried, not treated as unset
+    assert "TRANSFER_QUEUE_WAIT_SECONDS=5" in lines
+
+
+def test_a_fresh_volume_set_says_nothing_when_the_ceiling_was_never_configured():
+    """The common case: an .env that never mentioned transfers authors one that still doesn't, so
+    the application's own defaults keep applying."""
+    cfg = dv.new_set_config({}, "prefix-1", "dep-1")
+    lines = dv.build_env_lines({**cfg, "server_name": "localhost"})
+    assert not [l for l in lines if l.startswith(("MAX_CONCURRENT_TRANSFERS",
+                                                  "MAX_QUEUED_TRANSFERS",
+                                                  "TRANSFER_QUEUE_WAIT_SECONDS"))]
+
+
+def test_the_written_transfer_ceiling_is_what_the_application_reads():
+    """The tool and the application must agree about the value, not just its spelling."""
+    from app.core.config import Settings
+    cfg = dv.new_set_config({"MAX_CONCURRENT_TRANSFERS": "4"}, "prefix-1", "dep-1")
+    written = dv.parse_env("\n".join(
+        dv.build_env_lines({**cfg, "server_name": "localhost"})))["MAX_CONCURRENT_TRANSFERS"]
+    assert Settings(max_concurrent_transfers=written).max_concurrent_transfers == 4
+
+
 def test_stored_bytes_parses_the_database_answer(tmp_path, monkeypatch):
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: _Proc(0, stdout="\n 123456 \n"))
