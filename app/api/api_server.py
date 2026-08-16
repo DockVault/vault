@@ -11905,6 +11905,24 @@ def _run_lightweight_migrations():
             # Optional per-file/folder ID scope on a selected-mode vault grant (NULL = whole vault).
             "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS scope_ids JSONB",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS vault_access_mode VARCHAR(10) DEFAULT 'selected'",
+            # Converge these two on the model, which declares both NOT NULL.
+            #
+            # ADD COLUMN alone did not, and could not: on a database where the column already
+            # exists the statement is a no-op, so every deployment that had already upgraded kept a
+            # nullable column while a fresh install -- built by create_all from the model -- got a
+            # NOT NULL one. Two installs of one release with two different physical schemas, and
+            # nothing compared them.
+            #
+            # Backfill first. SET NOT NULL cannot apply while a NULL remains, and on an upgraded
+            # deployment the rows written before the column existed hold exactly that. The values
+            # match the column defaults, which is what those rows have been read as all along.
+            "UPDATE temporary_credentials SET can_create_temp_credentials = FALSE "
+            "WHERE can_create_temp_credentials IS NULL",
+            "ALTER TABLE temporary_credentials "
+            "ALTER COLUMN can_create_temp_credentials SET NOT NULL",
+            "UPDATE temporary_credentials SET vault_access_mode = 'selected' "
+            "WHERE vault_access_mode IS NULL",
+            "ALTER TABLE temporary_credentials ALTER COLUMN vault_access_mode SET NOT NULL",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS created_by_temp_credential_id UUID",
             # Per-vault SFTP password proof: fingerprint of the vault password hash proven
             # when this grant was minted (re-checked on SFTP access; voided by a rotation).
