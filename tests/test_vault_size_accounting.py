@@ -248,14 +248,14 @@ def test_the_limit_holds_when_separate_accounts_upload_into_one_vault(admin):
 
 
 @pytest.mark.skip(reason=(
-    "DOES NOT REPRODUCE YET, and is checked in rather than deleted so the next attempt starts "
-    "here. The hole is real and was demonstrated by review: two concurrent multipart requests from "
-    "ONE ordinary account put 250% of a vault's ceiling into it, and sixteen put 400%. This test "
-    "does not reproduce it because every request goes through the one `admin` client, whose "
-    "requests.Session pools a single connection and serialises them -- verified by restoring the "
-    "stale read and watching it still pass. It needs an independent client per thread, as the "
-    "multi-account test above uses. The production re-gate it was written for IS in place."))
-def test_the_direct_multipart_path_cannot_exceed_the_ceiling_either(admin):
+    "STILL DOES NOT REPRODUCE, and the reason is now specific rather than vague. With "
+    "Content-Length present the atomic reservation IS taken and does hold the line -- eight "
+    "concurrent requests, each on its own client and connection, stay inside the ceiling even with "
+    "the fix reverted. The breach review demonstrated needs a CHUNKED request, which is what skips "
+    "the reservation and leaves only the stale read; requests' multipart encoder will not produce "
+    "one (a generator body raises). Reproducing it needs urllib3 or a hand-rolled multipart body. "
+    "The production re-gate for it is in place; this is the test that has not caught up."))
+def test_the_direct_multipart_path_cannot_exceed_the_ceiling_either(admin, admin_creds):
     """The path the first fix missed, attacked the way it was actually broken.
 
     The resumable path was fixed and this one was not, which made the fix look complete while a
@@ -284,20 +284,26 @@ def test_the_direct_multipart_path_cannot_exceed_the_ceiling_either(admin):
         statuses = []
         lock = threading.Lock()
 
-        def _run(index):
-            # A plain body, so Content-Length is present and the reservation is taken. This still
-            # breaches the ceiling, because both guards consume a size read once before the stream
-            # began. Omitting the header removes the reservation as well and makes it worse, which
-            # is a second hole in the same place; this covers the one that needs no special client.
+        def _run(index, client):
+            # Its OWN client. Sharing one meant sharing one pooled connection, which serialised
+            # the requests and made this test unable to fail -- confirmed by restoring the defect
+            # and watching it pass anyway.
             files = {"files": (f"mp-{index}.bin", body, "application/octet-stream")}
             try:
-                status = admin.post(f"/vaults/{vault_id}/files", files=files).status_code
+                status = client.post(f"/vaults/{vault_id}/files", files=files).status_code
             except Exception:                         # noqa: BLE001
                 status = "error"
             with lock:
                 statuses.append(status)
 
-        threads = [threading.Thread(target=_run, args=(i,)) for i in range(count)]
+        from conftest import ApiClient
+        clients = []
+        for _ in range(count):
+            one = ApiClient()
+            one.login(admin_creds["username"], admin_creds["password"])
+            clients.append(one)
+
+        threads = [threading.Thread(target=_run, args=(i, clients[i])) for i in range(count)]
         for thread in threads:
             thread.start()
         for thread in threads:

@@ -1185,8 +1185,7 @@ class VaultService:
             match,
         ).all():
             paths.append(ex.storage_path)
-            vault.total_size_bytes = max(0, (vault.total_size_bytes or 0) - (ex.size_bytes or 0))
-            vault.file_count = max(0, (vault.file_count or 0) - 1)
+            self._adjust_vault_totals(vault, -(ex.size_bytes or 0), -1)
             self.db.delete(ex)
         if paths:
             # Force the DELETEs to hit the DB NOW, before the caller inserts the replacement
@@ -1209,6 +1208,29 @@ class VaultService:
                 # The blob's relative path is a storage path; the exception carries the
                 # ABSOLUTE one on an OSError. Neither belongs in a log an operator pastes.
                 safe_event('blob.replace-cleanup.failed', e)
+
+    def _adjust_vault_totals(self, vault, size_delta, count_delta):
+        """Move a vault's size and file counters by a delta, atomically and never below zero.
+
+        In SQL, for the same reason the increment is: `vault.total_size_bytes -= n` in Python reads
+        the value this session loaded, subtracts, and writes the whole number back, so it erases any
+        change another session committed in between. On the way up that loses stored bytes and
+        unbounds the size limit. On the way down it does the same in reverse -- and two of the
+        subtraction sites had no floor at all, so a lost update could drive the counter negative,
+        which the limit check reads as free headroom.
+
+        GREATEST is applied in the database rather than in Python for the same reason as the
+        arithmetic: a floor computed from a stale read is not a floor.
+        """
+        self.db.query(Vault).filter(Vault.id == vault.id).update(
+            {
+                Vault.total_size_bytes: func.greatest(
+                    0, func.coalesce(Vault.total_size_bytes, 0) + size_delta),
+                Vault.file_count: func.greatest(
+                    0, func.coalesce(Vault.file_count, 0) + count_delta),
+            },
+            synchronize_session=False,
+        )
 
     def finalize_streaming_upload(self, file_info: dict, total_size: int, checksum: str,
                                   zk_key_version: Optional[int] = None,
@@ -1658,8 +1680,7 @@ class VaultService:
         # pointing at a destroyed blob (every download then 500s with FileNotFoundError). Destroying
         # the blob AFTER a successful commit leaves at most a recoverable/GC-able orphan on failure
         # (mirrors the _remove_blobs-after-commit ordering in finalize_streaming_upload).
-        vault.total_size_bytes -= file.size_bytes
-        vault.file_count -= 1
+        self._adjust_vault_totals(vault, -(file.size_bytes or 0), -1)
         self.db.delete(file)
         self.db.commit()
 
@@ -1871,8 +1892,7 @@ class VaultService:
                 _path = self.storage_path / file.storage_path
                 vault = file.vault
                 if vault:
-                    vault.total_size_bytes -= file.size_bytes
-                    vault.file_count -= 1
+                    self._adjust_vault_totals(vault, -(file.size_bytes or 0), -1)
                 self.db.delete(file)
                 stale_paths.append(_path)
             except Exception as e:
