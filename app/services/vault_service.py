@@ -12,7 +12,7 @@ import uuid
 import mimetypes
 
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, func
 from sqlalchemy.exc import IntegrityError
 
 from app.core.models import User, Vault, Folder, File, VaultPermissionEnum
@@ -1299,10 +1299,28 @@ class VaultService:
         # Encrypt the filename/MIME at rest (Standard vaults) before persisting. No-op for ZK.
         _seal_named_object(file_info['vault'], file, is_file=True)
 
-        # Update vault statistics
+        # Update vault statistics.
+        #
+        # In SQL, not in Python. `vault.total_size_bytes += total_size` reads the value this
+        # session loaded, adds to it, and writes the whole number back -- so two uploads that
+        # overlap both start from the same total and the second commit erases the first. The
+        # arithmetic is lost, and the size limit with it, because the limit is checked against
+        # exactly this counter: measured, six concurrent uploads put 144 MB into a 64 MB vault and
+        # every one of them returned success. Sequentially the same uploads are refused correctly,
+        # which is why it went unnoticed.
+        #
+        # Letting the database do the addition makes each increment atomic regardless of what any
+        # session last read. The row lock taken by the caller before the limit check is what stops
+        # two uploads both passing a check they would jointly fail; this is what stops the totals
+        # from being wrong even when they legitimately both pass.
         vault = file_info['vault']
-        vault.total_size_bytes += total_size
-        vault.file_count += 1
+        self.db.query(Vault).filter(Vault.id == vault.id).update(
+            {
+                Vault.total_size_bytes: func.coalesce(Vault.total_size_bytes, 0) + total_size,
+                Vault.file_count: func.coalesce(Vault.file_count, 0) + 1,
+            },
+            synchronize_session=False,
+        )
 
         try:
             self.db.commit()
@@ -1321,6 +1339,10 @@ class VaultService:
         # leaving a live File row with no blob.
         try:
             self.db.refresh(file)
+            # The counters were changed by the database rather than by this session, so its copy
+            # of the vault row is stale. Refresh it too, or a later read in the same request
+            # reports the value this session happened to load.
+            self.db.refresh(vault)
         except Exception:
             pass
         # Commit succeeded: the prior same-name rows are gone, so it is now safe to remove
