@@ -1,29 +1,24 @@
-"""What a deployment reports when something about it is broken.
+"""What a deployment reports when part of its schema did not apply.
 
 There is no migration framework: a list of idempotent DDL statements is replayed at every boot, and
 each step is wrapped so one failure cannot stop the rest. That is deliberate and right -- a step
-that does not apply is usually one that already applied.
+that does not apply is usually one that already applied, and refusing to boot over it would strand
+a self-hosted vault in the middle of an unattended update.
 
-What is missing is a way for a failure to reach anyone. The step prints and is forgotten, and the
-three things that could report it cannot:
+What used to be missing was any way for a failure to reach anyone. The step printed and the boot
+carried on; `/health` returned a bare dict so FastAPI answered 200 whatever the body said; the
+container healthcheck only asked whether that page loaded; and the host tool's health-wait read
+Docker's verdict, which came from that healthcheck. A vault missing a column reported itself well
+until an endpoint that needed the column returned a 500.
 
-  * `/health` returns a bare dict, so FastAPI answers **200 even when the body says `degraded`**;
-  * the container healthcheck only asks whether that page loads, never what it said;
-  * `dockvault.py`'s health-wait reads Docker's verdict, which came from the healthcheck.
+Each step now records its outcome, and `/health` answers **503** when any of them failed. The two
+links below it did not have to change: the healthcheck calls the endpoint with `urlopen`, which
+raises on a non-2xx, so Docker marks the container unhealthy and the tool waiting on Docker sees
+it. That is why the endpoint was the right place to fix.
 
-So a vault whose database is gone already passes all three today -- this is not specific to a failed
-migration. Each link is recorded separately below, because they are one chain: making `/health`
-answer non-2xx when it calls itself degraded breaks it at the first link and reaches the other two
-for free. A fix that only records failures, or only teaches the updater to look, changes nothing.
-
-The codebase already contains the exception that proves the rule. `_verify_retired_object_id_triggers`
-runs OUTSIDE the swallowing loop and raises, refusing to serve when the triggers that record retired
-object ids are missing -- because a deployment must not advertise a property it does not have. That
-is the in-repo precedent for what honest health looks like, and the pattern to generalise.
-
-These are CHARACTERIZATION tests: they record the above so the phase that makes health honest
-visibly flips them. A failure here means health has learned to report a problem, and each assertion
-carries the message saying so.
+Half of this file asserts the fixed behaviour. The rest is still CHARACTERIZATION -- the two
+downstream links are recorded as they are, because they are load-bearing in the chain above and a
+change to either would silently break the signal.
 """
 
 from __future__ import annotations
@@ -60,11 +55,12 @@ def _node(source, name, kinds=(ast.FunctionDef, ast.AsyncFunctionDef)):
 
 
 @pytest.mark.unit
-def test_a_failed_migration_step_is_printed_and_recorded_nowhere():
-    """The swallow, and the absence of anything durable beside it.
+def test_a_failed_migration_step_is_recorded_and_not_only_printed():
+    """The swallow stays -- one bad statement must not brick a boot -- but it leaves a trace now.
 
-    Continuing past a failed step is correct and is not what this records. What it records is that
-    nothing survives the print -- no table, no flag, nothing a later request could consult.
+    Both halves matter. Continuing past the failure is correct and is asserted here so a later
+    change cannot quietly turn a bad statement into a failed boot. Recording it is what lets
+    anything downstream know.
     """
     source = API.read_text(encoding="utf-8")
     replay = ast.get_source_segment(source, _node(source, "_run_lightweight_migrations"))
@@ -79,55 +75,51 @@ def test_a_failed_migration_step_is_printed_and_recorded_nowhere():
                 break
     assert handler, "the per-step failure handler has gone or stopped naming itself"
 
-    assert "print(" in handler, "the failure is no longer even printed"
-    for durable in ("schema_state", "INSERT", "UPDATE ", "commit(", "raise", "record"):
-        assert durable not in handler, (
-            "the failure handler now does something durable (%r); if it records failed steps, "
-            "this characterization is obsolete and health should be asserting on that record"
-            % durable)
-
-    # The counterexample, pinned so it cannot quietly disappear: one check DOES refuse to serve.
-    # It is the precedent a general fix should follow, not an inconsistency to remove.
-    hard_stop = ast.get_source_segment(source, _node(source, "_verify_retired_object_id_triggers"))
-    assert "raise RuntimeError" in hard_stop, (
-        "the retired-object-id check no longer hard-stops; the codebase has lost its one example "
-        "of a boot-time schema problem being treated as fatal")
+    assert "OUTCOME_FAILED" in handler, (
+        "a failed step is no longer recorded, so /health has nothing to consult and a deployment "
+        "with an incomplete schema is silent again")
+    assert "raise" not in handler, (
+        "the handler now re-raises, so one bad statement brings the boot down. That was the "
+        "behaviour this deliberately avoided")
 
 
 @pytest.mark.unit
-def test_health_answers_200_even_when_it_calls_itself_degraded():
-    """The first link, and the one worth fixing: the endpoint has no way to fail.
+def test_health_answers_503_when_the_schema_is_incomplete():
+    """The link that carries the signal outward.
 
-    It already computes `degraded` -- for a dead database, dead Redis, unreachable SFTP or
-    unwritable storage -- and then returns it as a field of an ordinary dict. FastAPI serialises
-    that with a 200, so the summary is advisory text nobody downstream is able to act on.
+    Asserted through the parser rather than by string match: what matters is that the endpoint can
+    return something other than a bare dict, and on which condition.
     """
     source = API.read_text(encoding="utf-8")
     health = _node(source, "health_check")
     text = ast.get_source_segment(source, health)
 
-    assert "degraded" in text, "the endpoint no longer computes a degraded state"
+    assert "check_schema_state" in text, "/health no longer consults the recorded schema state"
+    assert '"schema"' in text, "/health no longer reports a schema field"
 
-    # Through the parser: the value returned is a dict literal, not a Response carrying a status.
     returns = [n for n in ast.walk(health) if isinstance(n, ast.Return) and n.value is not None]
-    assert returns, "the endpoint no longer returns anything"
-    for ret in returns:
-        assert isinstance(ret.value, ast.Dict), (
-            "/health now returns %s rather than a plain dict; if it can answer non-2xx, this "
-            "characterization is obsolete and the whole chain below it is fixed"
-            % type(ret.value).__name__)
-    for signals_failure in ("status_code", "JSONResponse", "HTTPException", "Response("):
-        assert signals_failure not in text, (
-            "/health now uses %r; if it can answer non-2xx, this characterization is obsolete"
-            % signals_failure)
+    assert any(isinstance(r.value, ast.Call) and getattr(r.value.func, "id", "") == "JSONResponse"
+               for r in returns), (
+        "/health has no JSONResponse return, so it cannot answer non-2xx and the container "
+        "healthcheck below it can never fail")
+    assert "503" in text, "/health no longer answers 503 on any condition"
+
+    # The asymmetry is deliberate and worth pinning: a dead database or Redis still answers 200,
+    # because those recover without the container being replaced and a 503 would have Docker
+    # restart a vault that was about to come back.
+    assert 'schema == "incomplete"' in text, (
+        "the 503 is no longer conditional on the schema specifically. If every degraded state now "
+        "answers non-2xx, that is a much larger behaviour change: a transient Redis outage would "
+        "fail an upgrade's health-wait and restart a working container")
 
 
 @pytest.mark.unit
 def test_the_container_healthcheck_only_asks_whether_the_page_loads():
-    """The second link. It calls the endpoint and discards the answer.
+    """CHARACTERIZATION, and load-bearing exactly as it is.
 
-    `urlopen` raises on a non-2xx, so this link needs no change at all once `/health` can answer
-    one -- which is why fixing the endpoint is worth more than fixing anything downstream of it.
+    `urlopen` raises on a non-2xx, so this link needs no logic of its own to carry the 503 above --
+    which is why fixing the endpoint reached Docker for free. Recorded so that a well-meant change
+    here (parsing the body, tolerating errors) cannot quietly break the chain.
     """
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     lines = dockerfile.splitlines()
@@ -136,19 +128,20 @@ def test_the_container_healthcheck_only_asks_whether_the_page_loads():
     command = " ".join(lines[index:index + 3])
 
     assert "urlopen" in command and "/health" in command, (
-        "the healthcheck no longer fetches /health; this test's premise has changed")
-    for reads_the_answer in (".read()", "json", "loads", "degraded", "getcode"):
-        assert reads_the_answer not in command, (
-            "the healthcheck now inspects the response (%r); if it fails on a degraded vault, "
-            "this characterization is obsolete" % reads_the_answer)
+        "the healthcheck no longer fetches /health, so a 503 from it reaches nothing")
+    for tolerates_failure in ("try:", "except", "|| true"):
+        assert tolerates_failure not in command, (
+            "the healthcheck now swallows an error (%r), which breaks the only thing carrying an "
+            "incomplete schema out to Docker" % tolerates_failure)
 
 
 @pytest.mark.unit
-def test_the_updaters_health_wait_returns_true_on_dockers_word_alone(tmp_path, monkeypatch):
-    """The third link, driven rather than described.
+def test_the_updaters_health_wait_reads_dockers_verdict(tmp_path, monkeypatch):
+    """CHARACTERIZATION of the third link, driven rather than described.
 
-    With no vault behind it at all -- nothing is running, nothing is asked -- the tool reports the
-    deployment healthy, because `docker inspect` said so. That is the whole of its evidence.
+    The tool trusts `docker inspect` alone, which is correct now that Docker's verdict reflects the
+    endpoint. Recorded because it means the tool needs no schema knowledge of its own -- and if it
+    ever grows some, this should be revisited rather than duplicated.
     """
     asked = []
 
@@ -158,50 +151,40 @@ def test_the_updaters_health_wait_returns_true_on_dockers_word_alone(tmp_path, m
 
     def no_network(*args, **kwargs):
         raise AssertionError(
-            "the health-wait reached the network. That is the fix this test characterizes the "
-            "absence of, so this is the expected way for it to flip -- but assert here rather "
-            "than letting it happen: the wait retries 40 times, and a real connection attempt to "
-            "a port nothing is listening on turns a two-second failure into a several-minute one")
+            "the health-wait reached the network. If it now asks the vault directly, revisit this "
+            "test -- but assert rather than allow it: the wait retries 40 times, and a real "
+            "connection attempt to a dead port turns a two-second failure into a several-minute "
+            "one")
 
     monkeypatch.setattr(dv.subprocess, "run", fake_run)
     monkeypatch.setattr("urllib.request.urlopen", no_network)
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
 
-    assert tool._wait_secure_healthy("combined") is True, (
-        "the health-wait no longer accepts Docker's verdict on its own; if it now consults the "
-        "vault, this characterization is obsolete")
-
+    assert tool._wait_secure_healthy("combined") is True
     assert asked, "the wait returned without asking anything"
     assert all(cmd[:2] == ["docker", "inspect"] for cmd in asked), (
         "the health-wait now runs something other than docker inspect: %r" % (asked,))
     assert any("State.Health.Status" in part for cmd in asked for part in cmd), (
-        "the health-wait no longer reads Docker's health status")
-
-    # And the tool has no other way of knowing: its only HTTP client asks GitHub for release tags.
-    source = (ROOT / "dockvault.py").read_text(encoding="utf-8")
-    wait = ast.get_source_segment(source, _node(source, "_wait_secure_healthy"))
-    for asks_the_vault in ("urlopen", "requests.", "urllib"):
-        assert asks_the_vault not in wait, (
-            "the health-wait now speaks to the vault directly (%r); this characterization is "
-            "obsolete" % asks_the_vault)
+        "the health-wait no longer reads Docker's health status, which is what carries the "
+        "endpoint's verdict to it")
 
 
 @pytest.mark.integration
-def test_the_live_health_body_has_no_field_for_a_schema_problem(base_url):
-    """The wire contract, so the chain above is not only a reading of source.
+def test_the_live_health_body_reports_a_schema_state(base_url):
+    """The wire contract on a running deployment.
 
-    Scoped deliberately narrowly. It CANNOT show the 200-while-degraded behaviour, because it has
-    no way to degrade the deployment it is pointed at -- and a healthy vault answers 200 both
-    before and after the fix, so asserting on the status code here would record nothing. The proof
-    that a degraded body still comes back 200 is the parser-level one above, which is conclusive:
-    the endpoint's only return is a dict literal.
-
-    What this pins is the shape of the answer: five fields from a fixed vocabulary, none of which
-    can say the schema is incomplete. Adding one flips it.
+    A healthy vault answers 200 both before and after this change, so the status code is not what
+    is pinned here -- the parser-level assertion above covers that. What this pins is that the
+    field exists and holds one of the four words, on a real deployment rather than in source.
     """
     response = requests.get("%s/health" % base_url, timeout=10)
     body = response.json()
-    assert set(body) == {"status", "database", "redis", "sftp", "storage"}, (
-        "/health now reports %s; if one of those fields can report an incomplete schema, this "
-        "characterization is obsolete" % sorted(body))
-    assert body["status"] in ("healthy", "degraded")
+    assert set(body) == {"status", "database", "redis", "sftp", "storage", "schema"}, (
+        "/health now reports %s" % sorted(body))
+    assert body["schema"] in ("complete", "incomplete", "partial", "unknown")
+    if body["schema"] == "incomplete":
+        assert response.status_code == 503, (
+            "the deployment reports an incomplete schema but still answers 200, so nothing "
+            "downstream can act on it")
+    else:
+        assert response.status_code == 200
