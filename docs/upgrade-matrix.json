@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "about": "Declares what it takes to move between released versions of DockVault. Every release must appear here before it can be cut; the release workflow refuses otherwise. Edges are declared between ADJACENT releases only -- a longer upgrade is composed by walking them in order, rather than being asserted as a single hop nobody tested.",
+  "kinds": {
+    "direct": "The upgrade can be taken in one step. Any caveats are listed in the edge's conditions.",
+    "blocked": "The upgrade must not be taken. The edge says why, and what to do instead."
+  },
+  "versions": {
+    "0.6.0": {
+      "released": "2026-07-21",
+      "notes": "First published release."
+    },
+    "0.7.0": {
+      "released": "2026-07-22",
+      "notes": "No schema change."
+    },
+    "0.7.1": {
+      "released": "2026-07-22",
+      "notes": "No schema change."
+    },
+    "0.7.2": {
+      "released": "2026-07-22",
+      "notes": "No schema change."
+    },
+    "0.8.0": {
+      "released": "2026-07-23",
+      "notes": "No schema change."
+    },
+    "0.9.0": {
+      "released": "2026-07-24",
+      "notes": "No schema change."
+    },
+    "0.10.0": {
+      "released": "2026-08-02",
+      "notes": "No schema change. Every release up to here shares one physical schema: the set of boot DDL statements is byte-identical across all of them, and the model differs only in comment text."
+    }
+  },
+  "edges": [
+    { "from": "0.6.0", "to": "0.7.0", "kind": "direct", "reversible": true, "requires_backup": false },
+    { "from": "0.7.0", "to": "0.7.1", "kind": "direct", "reversible": true, "requires_backup": false },
+    { "from": "0.7.1", "to": "0.7.2", "kind": "direct", "reversible": true, "requires_backup": false },
+    { "from": "0.7.2", "to": "0.8.0", "kind": "direct", "reversible": true, "requires_backup": false },
+    { "from": "0.8.0", "to": "0.9.0", "kind": "direct", "reversible": true, "requires_backup": false },
+    { "from": "0.9.0", "to": "0.10.0", "kind": "direct", "reversible": true, "requires_backup": false }
+  ],
+  "waivers": []
+}
