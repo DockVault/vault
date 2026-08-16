@@ -1,0 +1,24 @@
+{
+  "schema": "dockvault-crypto-manifest-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "format": "zero-knowledge direct recipient DEK wrap v2",
+  "vectors": [
+    {
+      "path": "direct-wrap-v2-baseline.json",
+      "sha256": "cdf6ddde3b15230454b05020ad0845f25988b0dab3d36bfaa7006b9b6cdc819e"
+    },
+    {
+      "path": "direct-wrap-v2-high-epoch.json",
+      "sha256": "18f7c48463dc3cab901fad01d289984e68ea8d01b30567d9a445e40619cb6356"
+    },
+    {
+      "path": "direct-wrap-v2-swapped-ids.json",
+      "sha256": "2e7a1b2c9a904923ce5dbdb598f35d6bdc958d1a36622ee3516ec5e1aefb274e"
+    },
+    {
+      "path": "direct-wrap-v2-uppercase-ids.json",
+      "sha256": "a73f29acb9f7fff056eabcf21031689d898e8b60fd9c50825bd1b57a2dabaecc"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "schema": "dockvault-crypto-vector-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "format": "zero-knowledge direct recipient DEK wrap v2",
+  "purpose": 1,
+  "description": "Ids supplied in UPPERCASE. Both runtimes must lowercase before binding, so the expected bytes are identical to the baseline vector's -- that identity is the assertion. Without this, dropping the normalisation step changes nothing any test can see.",
+  "inputs": {
+    "vault_id": "3F2504E0-4F89-41D3-9A0C-0305E82C3301",
+    "recipient_user_id": "9B1DEB4D-3B7D-4BAD-9BDD-2B0D7B3DCB6D",
+    "dek_epoch": 1,
+    "dek_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "nonce_hex": "0a0b0c0d0e0f101112131415",
+    "ephemeral_private_scalar_hex": "1f2e3d4c5b6a798897a6b5c4d3e2f1000112233445566778899aabbccddeeff0011223344556677889",
+    "recipient_private_scalar_hex": "0fedcba9876543210112233445566778899aabbccddeeff00112233445566778899aabbccddeeff001",
+    "other_recipient_private_scalar_hex": "2a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f5051",
+    "other_vault_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "other_recipient_user_id": "16fd2706-8baf-433b-82eb-8c7fada847da"
+  },
+  "expected": {
+    "wrapped_dek_b64": "RFZaMgIBAAAKCwwNDg8QERITFBVUbbaFXqVXCDQGc/5/1haBx5m4oNhWl5TST9ykOYHF88CZEYYeQ1wcvtzbjJE234E=",
+    "ephemeral_public_key_b64": "BOmQs4G6CUzREx1uKybXl/kQvXGOPwcIjl7nZdB21AlwkaPK3oF6BL6FjRVUPcz8lzQd92mjaNLanhDVOTJjOZHNlgDxbYCtDPUD3BoxhlMcdXQIbJ/DD/IoAQvg+gE3Zg==",
+    "short_plaintext_wrapped_b64": "RFZaMgIBAAAKCwwNDg8QERITFBX+xh4s8Ar7pZal01/ZcbIkZAdBV4MUeN4aZczXL2wIOg==",
+    "short_plaintext_point_b64": "BOmQs4G6CUzREx1uKybXl/kQvXGOPwcIjl7nZdB21AlwkaPK3oF6BL6FjRVUPcz8lzQd92mjaNLanhDVOTJjOZHNlgDxbYCtDPUD3BoxhlMcdXQIbJ/DD/IoAQvg+gE3Zg=="
+  }
+}
