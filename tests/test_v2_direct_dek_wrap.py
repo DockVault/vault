@@ -362,54 +362,99 @@ def test_both_gated_write_sites_pass_a_complete_transcript():
     assert source.count("lib.ZK_WRAP_WRITE_V2") == 3
 
 
+def _wrap_call(source: str, fn: str, after: int = 0) -> tuple[str, int]:
+    """The text of one `await <fn>(...)` CALL, and where it started.
+
+    Anchored on the call rather than the bare name: matching the name finds the choke point's own
+    declaration first, and asserting against a function signature proves nothing.
+    """
+    i = source.index("await " + fn, after)
+    return source[i:source.index(";", i)], i
+
+
+def _bound(call: str, field: str) -> str:
+    """The exact value bound to `field` in a transcript literal, whitespace-normalised.
+
+    Substring matching is what this replaces, and it was wrong in both directions. `"dekEpoch: 1"`
+    is a prefix of `"dekEpoch: 10"`, so a rotation labelling every survivor ten epochs ahead passed;
+    the same held for every other field, since each real value is a prefix of a plausible wrong one
+    (`userId` of `userIdOfSharer`, `uid` of `uidBeingRemoved`, `payload.id` of `payload.idOther`).
+    In the other direction the match broke on harmless edits -- a removed space, a parenthesised
+    expression, a renamed local -- so it failed on refactors and passed on defects.
+
+    Reading to the delimiter fixes both: the value is whatever sits between the colon and the next
+    comma or closing brace, with whitespace collapsed.
+    """
+    marker = field + ":"
+    if marker not in call:
+        # Shorthand: `{ vaultId, ... }` binds the local of the same name, which is a real binding
+        # and has to be read as one rather than reported as a missing field.
+        import re as _re
+        if _re.search(r"[{,]\s*" + _re.escape(field) + r"\s*[,}]", call):
+            return field
+        raise AssertionError(f"{field} is not bound at this call site at all: {' '.join(call.split())}")
+    i = call.index(marker) + len(marker)
+    end = min(
+        (pos for pos in (call.find(",", i), call.find("}", i)) if pos != -1),
+        default=len(call),
+    )
+    value = " ".join(call[i:end].split())
+    # A redundant outer parenthesis is the same value written differently, and failing on it makes
+    # this a test of formatting rather than of what is bound.
+    while value.startswith("(") and value.endswith(")"):
+        value = value[1:-1].strip()
+    return value
+
+
 def test_every_direct_write_site_binds_the_right_values():
-    """The gated direct sites -- the VALUES, not just the field names.
+    """The gated direct sites -- the VALUES, exactly, not a substring of them.
 
-    The existing site test collects source lines carrying both `recipientUserId:` and `dekEpoch:`,
-    asserts there are exactly four, and asserts each mentions `vaultId`. It never distinguishes a
-    read from a write and never looks at what is bound, so three wrong-value mutations pass the
-    whole suite today:
+    The site test this replaces collected source lines carrying both `recipientUserId:` and
+    `dekEpoch:`, counted four, and asserted each mentioned `vaultId`. It never separated a read
+    from a write and never looked at a value, so three wrong values passed the whole suite. Its
+    first replacement caught those three and still let seven near neighbours through, because it
+    compared prefixes -- it had been calibrated to the mutations its author thought of, which is a
+    test shaped by the bugs someone imagined rather than by the values that are correct.
 
-        share  : recipientUserId: userId          -> myUserId      (wraps to the sharer)
-        rekey  : dekEpoch: fromVersion + 1        -> fromVersion   (stamps the pre-rotation epoch)
-        rekey  : recipientUserId: uid             -> revokedUserId (names the person removed)
-
-    Each produces a wrap that decrypts for nobody who needs it, and none of these lines runs while
-    the writer is gated off -- so a wrong value ships silently and fires for whoever enables the
-    version-2 writer first. The team sites got this check after four such mutations survived; the
-    direct sites never did.
+    Each of these produces a wrap that is perfectly well formed and opens for nobody, and none of
+    these lines runs while the writer is gated off, so a wrong value ships quietly and surfaces for
+    whoever enables version 2 first.
     """
     source = APP_JS.read_text(encoding="utf-8")
 
-    def call(fn, after=0):
-        # Anchored on `await <fn>(` -- a CALL. Matching the bare name finds the choke point's own
-        # declaration first, and asserting against a function signature proves nothing.
-        i = source.index("await " + fn, after)
-        return source[i:source.index(";", i)], i
+    # Creation: the vault's own id, the creator as recipient, epoch 1 because it is the first.
+    create, i = _wrap_call(source, "zkWrapDekForRecipient(")
+    assert _bound(create, "vaultId") == "payload.id", _bound(create, "vaultId")
+    assert _bound(create, "recipientUserId") == "myUserId", _bound(create, "recipientUserId")
+    assert _bound(create, "dekEpoch") == "1", (
+        f"a new vault's first DEK is epoch 1, not {_bound(create, 'dekEpoch')!r}")
 
-    # Creation: the vault's own id, the creator as recipient, epoch 1 by definition.
-    create, i = call("zkWrapDekForRecipient(")
-    assert "vaultId: payload.id" in create, create
-    assert "dekEpoch: 1" in create, create
+    # Share: the recipient is the person being granted access, not the person granting it, and the
+    # epoch is the one the wrapped DEK actually belongs to.
+    share, j = _wrap_call(source, "zkWrapDekForRecipient(", i + 1)
+    assert _bound(share, "vaultId") == "vaultId", _bound(share, "vaultId")
+    assert _bound(share, "recipientUserId") == "userId", (
+        f"the share path wraps to {_bound(share, 'recipientUserId')!r}; if that is the sharer, the "
+        "recipient holds a well-formed wrap they cannot open")
+    assert _bound(share, "dekEpoch") == "shareEpoch", _bound(share, "dekEpoch")
 
-    # Share: the RECIPIENT is the person being granted access, not the person doing the granting,
-    # and the epoch is the one the wrapped DEK actually belongs to.
-    share, j = call("zkWrapDekForRecipient(", i + 1)
-    assert "recipientUserId: userId" in share, share
-    assert "myUserId" not in share, (
-        "the share path is wrapping to the sharer's own account; the recipient could not open it")
-    assert "dekEpoch: shareEpoch" in share, share
+    # Rotation: the NEW epoch, and each survivor named by the loop variable. Naming the removed
+    # member would re-grant exactly the access the rotation exists to withdraw.
+    rekey, _ = _wrap_call(source, "zkWrapDekForRecipient(", j + 1)
+    assert _bound(rekey, "vaultId") == "vaultId", _bound(rekey, "vaultId")
+    assert _bound(rekey, "recipientUserId") == "uid", (
+        f"the rotation wraps to {_bound(rekey, 'recipientUserId')!r}")
+    assert _bound(rekey, "dekEpoch") == "fromVersion + 1", (
+        f"the rotation stamps {_bound(rekey, 'dekEpoch')!r}; every survivor's key would be "
+        "labelled with an epoch the server never assigns")
 
-    # Rotation: the new epoch is what the server stores the wrap under, and each member is named
-    # by the loop variable -- naming the removed member would re-grant exactly the person the
-    # rotation exists to exclude.
-    rekey, _ = call("zkWrapDekForRecipient(", j + 1)
-    assert "dekEpoch: fromVersion + 1" in rekey, (
-        "the rotation is stamping the pre-rotation epoch, so every re-wrap is labelled as the key "
-        "it replaces")
-    assert "recipientUserId: uid" in rekey, rekey
-    assert "revokedUserId" not in rekey, (
-        "the rotation is naming the member being removed as the recipient")
+
+def test_there_are_exactly_three_direct_write_sites():
+    """A fourth would be unreviewed, and these assertions are positional."""
+    source = APP_JS.read_text(encoding="utf-8")
+    assert source.count("await zkWrapDekForRecipient(") == 3, (
+        "the number of direct wrap sites changed; the value assertions above address them by "
+        "order of appearance and no longer describe what they claim to")
 
 
 def test_the_share_epoch_is_computed_once_and_used_for_both_statements():

@@ -281,9 +281,49 @@ def test_a_revocation_rewraps_the_survivors_under_version_2_at_the_new_epoch(bro
             f"the re-wrap is labelled with the epoch it replaces: {rotated.get('key_version')} "
             f"after rotating to {epoch_before + 1}")
 
-        # The owner can still read what was written under the previous epoch. A re-wrap stamped
-        # with the wrong epoch passes every check above and fails exactly here.
         _open_vault(owner_page, owner_vid)
+
+        # THE assertion of this test, and the one an earlier version of it was missing. Reading the
+        # pre-rotation file is NOT it: that file is at epoch 1, so the read resolves the owner's
+        # OLD legacy wrap and never touches the version-2 re-wrap the rotation just made. Both of
+        # the mistakes this test is named for -- stamping the epoch being replaced, naming the
+        # removed member -- passed that read, because it decrypts a different key.
+        #
+        # Ask for the new epoch's DEK directly. That is the wrap the rotation wrote, and nothing
+        # else in the suite opens it.
+        opened = owner_page.evaluate(
+            """async ({ vaultId, epoch }) => {
+                try {
+                    const dek = await zkGetVaultDek(vaultId, epoch);
+                    return dek ? 'opened' : 'no-dek';
+                } catch (e) { return 'error: ' + (e && (e.code || e.message)); }
+            }""",
+            {"vaultId": owner_vid, "epoch": epoch_before + 1},
+        )
+        assert opened == "opened", (
+            f"the owner cannot open the key the rotation wrapped for them at epoch "
+            f"{epoch_before + 1}: {opened}. The re-wrap is well formed and bound to the wrong "
+            "vault, recipient or epoch")
+
+        # End to end as well: a file written AFTER the rotation uses the new key, so this reads
+        # through the re-wrap rather than around it.
+        after_body = (f"EPOCH TWO {_u('after')} ").encode() * 8
+        owner_page.set_input_files("#file-upload-input", files=[
+            {"name": _u("after") + ".txt", "mimeType": "text/plain", "buffer": after_body}])
+        after_id = None
+        for _ in range(40):
+            items = owner.get(f"/vaults/{owner_vid}/files").json()["items"]
+            fresh = [i for i in items if i["type"] == "file" and i["id"] != file_id]
+            if fresh:
+                after_id = fresh[0]["id"]
+                break
+            owner_page.wait_for_timeout(500)
+        assert after_id, "the post-rotation upload never landed"
+        assert _read_a_file(owner_page, owner_vid, after_id) == after_body, (
+            "a file written after the rotation does not read back; the re-wrapped key is unusable")
+
+        # And the pre-rotation file still opens, which is the separate promise that a rotation does
+        # not strand old content.
         assert _read_a_file(owner_page, owner_vid, file_id) == body, (
             "the owner cannot read their own pre-rotation file after re-wrapping under v2")
     finally:
