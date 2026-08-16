@@ -81,3 +81,78 @@ def check_storage_status() -> str:
             os.remove(probe)
         except OSError:
             pass
+
+
+# Computed once, after the boot-time replay has run, and never again while the process lives.
+#
+# The value cannot change: the replay only happens in the lifespan handler, before the app serves
+# anything. Re-reading it would put a database round trip in the container healthcheck's path
+# every thirty seconds for the life of the deployment, to re-derive a constant -- and that cost is
+# measurable, not theoretical. It showed up as a memory rise during a large download that happened
+# to overlap a healthcheck.
+_SCHEMA_STATE: str | None = None
+
+
+def refresh_schema_state() -> str:
+    """Read the recorded schema state and remember it. Called once at startup."""
+    global _SCHEMA_STATE
+    _SCHEMA_STATE = _read_schema_state()
+    return _SCHEMA_STATE
+
+
+def check_schema_state() -> str:
+    """The schema state as of this process's boot.
+
+    Falls back to reading when nothing has been remembered yet, so a caller that arrives before
+    startup finished -- or a test exercising this directly -- still gets a real answer rather than
+    a default.
+    """
+    if _SCHEMA_STATE is not None:
+        return _SCHEMA_STATE
+    return _read_schema_state()
+
+
+def _read_schema_state() -> str:
+    """``complete`` | ``incomplete`` | ``partial`` | ``unknown``.
+
+    Reads what the boot-time DDL replay recorded about itself. The four answers are distinct on
+    purpose, because they call for different things from whoever reads them:
+
+    * ``complete`` -- every declared step applied.
+    * ``incomplete`` -- at least one step FAILED. The deployment is missing schema it believes it
+      has, and requests that need it will error. This is the state that makes ``/health`` answer
+      non-2xx.
+    * ``partial`` -- a step was deliberately skipped because the data made it inapplicable, which
+      today means the case-insensitive email index on a deployment holding two addresses differing
+      only in case. The code chose to boot rather than refuse, and that choice stands; reporting it
+      as a failure would restart a container that is working as designed. It is surfaced so the
+      operator can see a difference from a fresh install that used to be invisible.
+    * ``unknown`` -- the record could not be read. Reported honestly rather than as ``complete``:
+      "cannot tell" and "fine" are different answers, and defaulting to the reassuring one is the
+      habit this whole surface exists to break. A deployment whose database is unreachable is
+      already reporting that separately.
+    """
+    try:
+        from sqlalchemy import func, select
+
+        from app.core.database import get_db_context
+        from app.core.models import SchemaStep
+
+        with get_db_context() as db:
+            counts = dict(
+                db.execute(
+                    select(SchemaStep.outcome, func.count()).group_by(SchemaStep.outcome)
+                ).all()
+            )
+    except Exception:
+        return "unknown"
+
+    if counts.get(SchemaStep.OUTCOME_FAILED):
+        return "incomplete"
+    if counts.get(SchemaStep.OUTCOME_SKIPPED):
+        return "partial"
+    if not counts:
+        # No rows at all. Either the replay has never run here, or it could not record -- both mean
+        # the question has not been answered, and neither is evidence that the schema is right.
+        return "unknown"
+    return "complete"

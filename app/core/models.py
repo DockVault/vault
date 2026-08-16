@@ -1530,3 +1530,58 @@ class RetiredObjectId(Base):
         # "what did this vault retire", which is the only non-lookup use.
         Index('idx_retired_object_vault', 'vault_id'),
     )
+
+
+class SchemaStep(Base):
+    """The outcome of every boot-time DDL statement, so an incomplete schema can be reported.
+
+    There is no migration framework here, and that is a deliberate choice: a list of idempotent DDL
+    statements is replayed on every boot, each wrapped so one failure cannot stop the rest. A step
+    that does not apply is usually one that already applied, and refusing to boot over it would
+    strand a self-hosted vault in the middle of an unattended update.
+
+    What was missing is any trace of a failure that was NOT benign. The step printed and the boot
+    carried on, so `/health` had nothing to consult, the container healthcheck reported well, and
+    the tool that waits on it agreed -- while the first real sign of trouble was a 500 from
+    whichever endpoint needed the column that never arrived. This table is that trace.
+
+    **Keyed by a hash of the statement, not by its position.** An index would shift whenever a
+    statement was inserted above, silently reattributing one step's outcome to another. Hashing the
+    text means an edited statement is a NEW step, which is the right reading: a statement that was
+    changed after failing is not the statement that failed.
+
+    **Rows for statements no longer in the list are deleted on each boot.** Otherwise a step that
+    failed, and was then fixed by editing its SQL, would leave its old row behind reporting failure
+    forever, and health would never recover. The table describes the CURRENT list and nothing else.
+
+    `detail` holds the database's error message for an operator reading this table directly. It is
+    deliberately not surfaced by `/health`, which is unauthenticated and says only that the schema
+    is incomplete.
+    """
+    __tablename__ = 'schema_steps'
+
+    # Applied cleanly, or already in place -- both indistinguishable and both fine.
+    OUTCOME_APPLIED = 'applied'
+    # Raised, and nothing else is known. This is what makes a deployment unhealthy.
+    OUTCOME_FAILED = 'failed'
+    # Deliberately not applied, because a precondition in the data says it cannot be. Visible in
+    # health, but not a failure: the code chose this over refusing to boot.
+    OUTCOME_SKIPPED = 'skipped'
+
+    step_id = Column(String(32), primary_key=True)
+    # First line of the statement, for an operator scanning the table. Truncated: some statements
+    # are whole DO blocks.
+    summary = Column(String(200), nullable=False)
+    outcome = Column(String(16), nullable=False)
+    detail = Column(Text, nullable=True)
+    # The version that last ran this step, so "when did this deployment last get this right" is
+    # answerable without correlating logs.
+    app_version = Column(String(32), nullable=True)
+    recorded_at = Column(DateTime, nullable=False,
+                         server_default=text("(now() AT TIME ZONE 'utc')"),
+                         default=datetime.utcnow)
+
+    __table_args__ = (
+        # The only question health asks: is anything currently failed.
+        Index('idx_schema_steps_outcome', 'outcome'),
+    )

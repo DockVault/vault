@@ -7,6 +7,7 @@ Performance: Key endpoints support ETag-based conditional responses to reduce tr
 """
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
+import hashlib
 import uuid
 import json
 
@@ -34,7 +35,7 @@ from app.core.config import bootstrap_entrypoint
 bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
-from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant
+from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep
 from app.core import sharing_policy
 from app.core import storage_quota
 from app.core.email_identity import (
@@ -1495,27 +1496,51 @@ async def health_check():
     Unauthenticated, so every value comes from a short fixed vocabulary — see
     `app/core/health.py`. No paths, capacities or error text.
     """
-    from app.core.health import check_sftp_status, check_storage_status
+    from app.core.health import (check_schema_state, check_sftp_status,
+                                 check_storage_status)
 
     db_ok = check_db_connection()
     redis_ok = check_redis_connection()
     sftp = check_sftp_status()
     storage = check_storage_status()
+    schema = check_schema_state()
 
     # SFTP is opt-in, so `disabled` is a healthy state, and so is `external` (a split deployment
     # serves SFTP from its own container, which this process cannot and should not answer for) —
     # only a vault that was meant to serve SFTP from HERE and is not counts against the summary.
     # Storage that cannot be written to is degraded even while the API answers: uploads will
     # fail, and nothing else would have said so.
-    degraded = (not db_ok) or (not redis_ok) or sftp == "unreachable" or storage != "writable"
+    degraded = ((not db_ok) or (not redis_ok) or sftp == "unreachable"
+                or storage != "writable" or schema != "complete")
 
-    return {
+    body = {
         "status": "degraded" if degraded else "healthy",
         "database": "connected" if db_ok else "disconnected",
         "redis": "connected" if redis_ok else "disconnected",
         "sftp": sftp,
         "storage": storage,
+        # `complete` | `incomplete` | `partial` | `unknown`. A one-word summary and nothing else:
+        # this endpoint is unauthenticated, so it says THAT the schema is wrong, never what is
+        # wrong with it. The detail is in schema_steps, for someone with database access.
+        "schema": schema,
     }
+
+    # An incomplete schema is the one state here that answers non-2xx, and the asymmetry is
+    # deliberate.
+    #
+    # It is the only condition that cannot resolve itself. A database or Redis that is down comes
+    # back, and storage that is unwritable becomes writable, without the container being replaced --
+    # so reporting those as hard failures would have Docker restart a vault that was about to
+    # recover, and would make `dockvault.py`'s health-wait fail an upgrade that actually worked. A
+    # step that did not apply stays not-applied until something changes and the process restarts,
+    # and every request needing that column fails meanwhile.
+    #
+    # This is also what carries the signal outward for free: the container healthcheck calls this
+    # endpoint with urlopen, which raises on a non-2xx, so Docker marks the container unhealthy and
+    # the tool that waits on Docker's verdict sees it. Neither of them needed changing.
+    if schema == "incomplete":
+        return JSONResponse(status_code=503, content=body)
+    return body
 
 
 @app.get("/audit/events")
@@ -11710,6 +11735,99 @@ def _backfill_default_permissions():
         print(f"⚠ Permission backfill skipped: {e}")
 
 
+def _app_version():
+    """The running version, or None. Never raises: this is provenance on a bookkeeping row."""
+    try:
+        from app.config.branding import branding
+        return (branding.app_version or None)
+    except Exception:
+        return None
+
+
+class _SchemaStepRecorder:
+    """Writes what each boot-time DDL step did, so an incomplete schema stops being invisible.
+
+    Every write is best-effort and swallowed. That looks like the very habit this phase exists to
+    end, and it is the opposite: this is BOOKKEEPING about the schema, not the schema. A recorder
+    that could abort a boot would make honest health strictly more dangerous than silence, which is
+    not a trade worth making to know about a failure. When recording itself fails, `/health` reports
+    the schema state as unknown rather than claiming it is fine.
+
+    Each write commits on its own. The steps it describes have already committed independently, so
+    holding these to the end would mean losing the whole record to one late error -- including the
+    record of the failure that caused it.
+    """
+
+    def __init__(self, db):
+        self.db = db
+        self.seen = set()
+        self.broken = False
+
+    @staticmethod
+    def step_id(statement):
+        return hashlib.sha256(statement.encode("utf-8")).hexdigest()[:32]
+
+    @staticmethod
+    def _summary(statement):
+        """One readable line, for an operator scanning the table."""
+        collapsed = " ".join(statement.split())
+        return collapsed[:197] + "..." if len(collapsed) > 200 else collapsed
+
+    @staticmethod
+    def _safe_detail(detail):
+        """The error's first line only, capped.
+
+        A Postgres error carries a DETAIL: section, and for a constraint violation that section is
+        the offending ROW -- every column of it. The statements replayed here include data
+        migrations over `users`, so a failure could put real addresses into this table, where they
+        would then travel in every database backup. The first line names the constraint and the
+        relation, which is what a person debugging this needs; the row is not.
+        """
+        if not detail:
+            return None
+        return str(detail).strip().splitlines()[0][:500] or None
+
+    def record(self, statement, outcome, detail=None):
+        identifier = self.step_id(statement)
+        self.seen.add(identifier)
+        try:
+            existing = self.db.get(SchemaStep, identifier)
+            if existing is None:
+                self.db.add(SchemaStep(
+                    step_id=identifier, summary=self._summary(statement), outcome=outcome,
+                    detail=self._safe_detail(detail), app_version=_app_version(),
+                    recorded_at=datetime.utcnow()))
+            else:
+                existing.outcome = outcome
+                existing.detail = self._safe_detail(detail)
+                existing.app_version = _app_version()
+                existing.recorded_at = datetime.utcnow()
+            self.db.commit()
+        except Exception as exc:
+            self.db.rollback()
+            self.broken = True
+            print(f"⚠ Could not record the outcome of a schema step: {exc}")
+
+    def forget_steps_no_longer_declared(self):
+        """Drop rows for statements that are no longer in the list.
+
+        Without this, a step that failed and was then fixed by EDITING its SQL would leave its old
+        row behind reporting failure for good -- the hash changes, so the fix records a new row and
+        never touches the old one -- and health would never recover. The table describes the
+        current list and nothing else.
+        """
+        if self.broken or not self.seen:
+            return
+        try:
+            self.db.query(SchemaStep).filter(
+                SchemaStep.step_id.notin_(self.seen)).delete(synchronize_session=False)
+            self.db.commit()
+        except Exception as exc:
+            self.db.rollback()
+            self.broken = True
+            print(f"⚠ Could not prune stale schema-step records: {exc}")
+
+
 def _run_lightweight_migrations():
     """Idempotent column additions for existing tables. create_all() only creates
     missing TABLES, not missing COLUMNS, so new columns on existing tables must be
@@ -11973,13 +12091,19 @@ def _run_lightweight_migrations():
                END $$;""",
         ]
         with get_db_context() as db:
+            recorder = _SchemaStepRecorder(db)
             for stmt in statements:
                 try:
                     db.execute(text(stmt))
                     db.commit()
+                    recorder.record(stmt, SchemaStep.OUTCOME_APPLIED)
                 except Exception as e:
                     db.rollback()
                     print(f"⚠ Migration step skipped ({stmt}): {e}")
+                    # The point of the record: the failure now survives the print. Without it
+                    # /health has nothing to consult, and a deployment missing a column reports
+                    # itself well until an endpoint that needed the column returns a 500.
+                    recorder.record(stmt, SchemaStep.OUTCOME_FAILED, str(e))
 
             # Case-insensitive uniqueness on users.email. Deliberately NOT a string in the list
             # above, because it is conditional: a deployment that already holds two addresses
@@ -11994,9 +12118,17 @@ def _run_lightweight_migrations():
             # install this index does NOT exist, so the application check in
             # app/core/email_identity.py is the only guard there is. It is not belt-and-braces and
             # must not be deleted as redundant with the index.
+            email_index_step = "conditional: users.email case-insensitive unique index"
             try:
                 collisions = find_email_collisions(db)
                 if collisions:
+                    # Recorded, not merely printed. This is the conditional degradation the phase
+                    # exists to surface: the deployment boots correctly and serves, but it is
+                    # running without a uniqueness index that a fresh install has.
+                    recorder.record(
+                        email_index_step, SchemaStep.OUTCOME_SKIPPED,
+                        f"{len(collisions)} address(es) held by more than one account differing "
+                        "only in case; resolve them and restart to build the index")
                     print(
                         f"⚠ users.email: {len(collisions)} address(es) are held by more than one "
                         f"account differing only in case, so the case-insensitive unique index "
@@ -12023,11 +12155,15 @@ def _run_lightweight_migrations():
                         f"ON users (lower(email))"
                     ))
                     db.commit()
+                    recorder.record(email_index_step, SchemaStep.OUTCOME_APPLIED)
             except Exception as e:
                 # Own try/except so a failure here cannot abort anything else; every statement in
                 # the loop above already committed independently.
                 db.rollback()
                 print(f"⚠ users.email case-insensitive index skipped: {e}")
+                recorder.record(email_index_step, SchemaStep.OUTCOME_FAILED, str(e))
+
+            recorder.forget_steps_no_longer_declared()
     except Exception as e:
         print(f"⚠ Lightweight migrations skipped: {e}")
 
@@ -12245,6 +12381,9 @@ async def lifespan(app: FastAPI):
     init_db()
     print("Database initialized")
     _run_lightweight_migrations()
+    # After the replay, so the remembered value describes what this boot actually achieved.
+    from app.core.health import refresh_schema_state
+    print(f"Schema state: {refresh_schema_state()}")
     _backfill_encrypted_names()
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
     _seed_admin_user()
