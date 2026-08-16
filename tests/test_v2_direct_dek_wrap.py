@@ -360,3 +360,72 @@ def test_both_gated_write_sites_pass_a_complete_transcript():
     # site inherits the decision rather than having to remember it. `test_v2_team_wraps`
     # names them individually; this only pins that the count has not grown by accident.
     assert source.count("lib.ZK_WRAP_WRITE_V2") == 3
+
+
+def test_every_direct_write_site_binds_the_right_values():
+    """The gated direct sites -- the VALUES, not just the field names.
+
+    The existing site test collects source lines carrying both `recipientUserId:` and `dekEpoch:`,
+    asserts there are exactly four, and asserts each mentions `vaultId`. It never distinguishes a
+    read from a write and never looks at what is bound, so three wrong-value mutations pass the
+    whole suite today:
+
+        share  : recipientUserId: userId          -> myUserId      (wraps to the sharer)
+        rekey  : dekEpoch: fromVersion + 1        -> fromVersion   (stamps the pre-rotation epoch)
+        rekey  : recipientUserId: uid             -> revokedUserId (names the person removed)
+
+    Each produces a wrap that decrypts for nobody who needs it, and none of these lines runs while
+    the writer is gated off -- so a wrong value ships silently and fires for whoever enables the
+    version-2 writer first. The team sites got this check after four such mutations survived; the
+    direct sites never did.
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+
+    def call(fn, after=0):
+        # Anchored on `await <fn>(` -- a CALL. Matching the bare name finds the choke point's own
+        # declaration first, and asserting against a function signature proves nothing.
+        i = source.index("await " + fn, after)
+        return source[i:source.index(";", i)], i
+
+    # Creation: the vault's own id, the creator as recipient, epoch 1 by definition.
+    create, i = call("zkWrapDekForRecipient(")
+    assert "vaultId: payload.id" in create, create
+    assert "dekEpoch: 1" in create, create
+
+    # Share: the RECIPIENT is the person being granted access, not the person doing the granting,
+    # and the epoch is the one the wrapped DEK actually belongs to.
+    share, j = call("zkWrapDekForRecipient(", i + 1)
+    assert "recipientUserId: userId" in share, share
+    assert "myUserId" not in share, (
+        "the share path is wrapping to the sharer's own account; the recipient could not open it")
+    assert "dekEpoch: shareEpoch" in share, share
+
+    # Rotation: the new epoch is what the server stores the wrap under, and each member is named
+    # by the loop variable -- naming the removed member would re-grant exactly the person the
+    # rotation exists to exclude.
+    rekey, _ = call("zkWrapDekForRecipient(", j + 1)
+    assert "dekEpoch: fromVersion + 1" in rekey, (
+        "the rotation is stamping the pre-rotation epoch, so every re-wrap is labelled as the key "
+        "it replaces")
+    assert "recipientUserId: uid" in rekey, rekey
+    assert "revokedUserId" not in rekey, (
+        "the rotation is naming the member being removed as the recipient")
+
+
+def test_the_share_epoch_is_computed_once_and_used_for_both_statements():
+    """The wrap and the declaration that accompanies it must not disagree.
+
+    The wrap binds an epoch cryptographically; the request body tells the server which epoch the
+    blob is for. Computed separately with different fallbacks -- which an earlier version did, one
+    to 1 and one to absent -- they are two answers to the same question on adjacent lines, and the
+    recipient ends up holding a key labelled as something it is not.
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+    assert "const shareEpoch = " in source, "the single-value share epoch is gone"
+    i = source.index("const shareEpoch = ")
+    window = source[i:i + 1600]
+    assert window.count("shareEpoch") >= 3, (
+        "shareEpoch is computed but not used by both the wrap and the declaration beside it")
+    assert "dekEpoch: shareEpoch" in window
+    assert "dek_version: shareEpoch" in window, (
+        "the request body no longer derives its epoch from the same value the wrap binds")
