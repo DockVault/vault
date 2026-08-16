@@ -63,6 +63,11 @@ def _assert_v2_direct(wrap: bytes, what: str) -> None:
         "effect, and everything else in this test passed on the legacy writer")
     assert wrap[:6] == V2_DIRECT_HEADER, (
         f"{what}: header {wrap[:8]!r} is not a version-2 direct wrap")
+    # The reserved pair is the format's breaking-change channel: a reader treats any non-zero value
+    # as malformed rather than as something newer it can skip. A writer that filled it would
+    # produce wraps this build refuses, and checking six of the eight header bytes would miss it.
+    assert wrap[6:8] == b"\x00\x00", (
+        f"{what}: reserved bytes are {wrap[6:8]!r}, so every reader will call this malformed")
 
 
 def _assert_legacy(wrap: bytes, what: str) -> None:
@@ -370,6 +375,11 @@ def test_a_version_2_wrap_still_opens_in_a_page_that_never_enabled_the_writer(br
 
         _login(member_page, member_user["_username"], member_user["_password"])
         member_vid = _create_zk_vault_via_ui(member_page, member, "passphrase-member-789")
+
+        # Created before the flip, and asserted so: without this the "legacy first" ordering is a
+        # property of where the line happens to sit, and moving the flip above the vault creation
+        # leaves the test passing while proving something weaker.
+        _assert_legacy(_wrap_for(owner, owner_vid), "the owner's wrap at creation")
 
         assert owner_page.evaluate(ENABLE_V2_WRAPS) is True
         _grant_via_ui(owner_page, member_user)

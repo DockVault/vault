@@ -87,12 +87,19 @@ function installDeterministicCrypto({ randomHex = [], generatedPairs = [] } = {}
     };
 }
 
+// Reports the code AND the guard that raised it. The code alone is too coarse to pin behaviour:
+// a truncated payload and a wrap of a wrong-sized key both answer WRAP_INVALID, but one is caught
+// by the length dispatch and the other by the header check, and a change that merged them would
+// be invisible.
 async function rejected(operation) {
     try {
         await operation();
         return null;
     } catch (err) {
-        return err && err.code ? err.code : String((err && err.message) || err);
+        if (err && err.code) {
+            return err.operation ? `${err.code} @ ${err.operation}` : err.code;
+        }
+        return String((err && err.message) || err);
     }
 }
 

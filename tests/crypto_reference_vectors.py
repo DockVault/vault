@@ -559,6 +559,35 @@ def encode_direct_dek_wrap_v2(vector: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def encode_hostile_direct_dek_wrap_v2(vector: dict[str, Any], plaintext: bytes) -> dict[str, str]:
+    """A well-formed v2 direct wrap carrying something other than a 32-byte DEK.
+
+    Deliberately separate from the real encoder, which refuses this -- as it should, and as the
+    browser does. A reader's guards cannot be tested by a writer that will not break the rules, so
+    the rule-breaking lives here, named for what it is, rather than being hand-assembled in a
+    throwaway script that nothing keeps in step with the format.
+    """
+    inputs = vector["inputs"]
+    header = _v2_header(V2_PURPOSE_DIRECT_DEK)
+    context = _v2_direct_context(
+        inputs["vault_id"], inputs["recipient_user_id"], inputs["dek_epoch"]
+    )
+    shared = _ecdh(
+        inputs["ephemeral_private_scalar_hex"], inputs["recipient_private_scalar_hex"]
+    )
+    wrapping_key = _hkdf(
+        shared, salt=V2_SALT, info=V2_INFO_DEK_DIRECT + b"\x00" + context
+    )
+    nonce = bytes.fromhex(inputs["nonce_hex"])
+    body = AESGCM(wrapping_key).encrypt(nonce, plaintext, header + context)
+    return {
+        "wrapped_dek_b64": b64e(header + nonce + body),
+        "ephemeral_public_key_b64": b64e(
+            p384_public_raw(inputs["ephemeral_private_scalar_hex"])
+        ),
+    }
+
+
 def decode_direct_dek_wrap_v2(
     wrapped_dek_b64: str,
     *,

@@ -15,6 +15,10 @@
     {
       "path": "direct-wrap-v2-swapped-ids.json",
       "sha256": "2e7a1b2c9a904923ce5dbdb598f35d6bdc958d1a36622ee3516ec5e1aefb274e"
+    },
+    {
+      "path": "direct-wrap-v2-uppercase-ids.json",
+      "sha256": "a73f29acb9f7fff056eabcf21031689d898e8b60fd9c50825bd1b57a2dabaecc"
     }
   ]
 }

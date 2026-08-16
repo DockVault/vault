@@ -38,24 +38,54 @@ NODE_HARNESS = Path(__file__).parent / "js" / "direct_wrap_v2.js"
 # bytes are malformed, UNSUPPORTED means they are well formed and this build will not read them,
 # and FAILED means authentication failed -- i.e. tampering, or the wrong context. Collapsing any
 # two of those loses the distinction between "someone is attacking this" and "update the app".
+# What the reader must answer for each hostile payload: the code AND the guard that raises it.
+#
+# The code alone is too coarse. Three cases answer WRAP_INVALID from three different places, and a
+# change that merged them would be invisible while quietly removing a check -- which is exactly
+# what happens if the point-length or point-on-curve guards are deleted, because the import that
+# follows fails with the same code.
+#
+# The split between the three codes is itself load-bearing: malformed, unsupported and
+# authentication-failed tell a caller different things, and collapsing any two loses the
+# difference between "someone is attacking this" and "update the application".
 EXPECTED_REFUSALS = {
-    "magic_tampered": "WRAP_INVALID",
-    "version_below": "WRAP_INVALID",
-    "version_future": "WRAP_UNSUPPORTED",
-    "purpose_team": "WRAP_UNSUPPORTED",
-    "reserved_set": "WRAP_INVALID",
-    "nonce_tampered": "WRAP_FAILED",
-    "tag_tampered": "WRAP_FAILED",
-    "truncated": "WRAP_INVALID",
-    "point_short": "WRAP_INVALID",
-    "point_off_curve": "WRAP_INVALID",
-    "wrong_vault": "WRAP_FAILED",
-    "wrong_recipient_id": "WRAP_FAILED",
-    "wrong_epoch": "WRAP_FAILED",
-    "wrong_key": "WRAP_FAILED",
-    "no_context": "WRAP_INVALID",
-    "empty_context": "WRAP_INVALID",
-    "short_plaintext": "WRAP_INVALID",
+    # Caught by the dispatcher's whole-header check, before any purpose-specific reader.
+    "magic_tampered": "WRAP_INVALID @ unwrapVaultDEK.v2",
+    "version_below": "WRAP_INVALID @ unwrapVaultDEK.v2",
+    "reserved_set": "WRAP_INVALID @ unwrapVaultDEK.v2",
+    # The wire version, checked separately because the AAD is built from canonical bytes and so
+    # cannot pin the byte actually on the wire.
+    "version_future": "WRAP_UNSUPPORTED @ unwrapVaultDEK.v2.version",
+    # The caller states which purpose it expects; the payload never selects one.
+    #
+    # UNRESOLVED, and pinned here as CURRENT BEHAVIOUR rather than as an endorsement: the error
+    # contract defines "unsupported" as a format this build does not implement, whose advice is
+    # "update this deployment, the grant is fine". Neither half fits. This build DOES implement
+    # purpose 0x02, and a team wrap arriving at a direct read is a role substitution -- the thing
+    # the envelope design names first among its threats -- so "your grant is fine" is the wrong
+    # thing to tell an operator. The design's own taxonomy assigns malformed to a purpose outside
+    # the known range and unsupported to a version above this build's; in-range-but-unexpected is
+    # unenumerated. Changing it is a protocol decision, not a test change.
+    "purpose_team": "WRAP_UNSUPPORTED @ unwrapVaultDEK.v2.purpose",
+    # Authentication failures: the bytes are well formed and do not verify.
+    "nonce_tampered": "WRAP_FAILED @ unwrapVaultDEK.v2",
+    "tag_tampered": "WRAP_FAILED @ unwrapVaultDEK.v2",
+    "wrong_vault": "WRAP_FAILED @ unwrapVaultDEK.v2",
+    "wrong_recipient_id": "WRAP_FAILED @ unwrapVaultDEK.v2",
+    "wrong_epoch": "WRAP_FAILED @ unwrapVaultDEK.v2",
+    "wrong_key": "WRAP_FAILED @ unwrapVaultDEK.v2",
+    # Structural, each at its own guard. Naming the guard is what keeps these three distinct: all
+    # three would still say WRAP_INVALID if their checks were removed and the failure fell through
+    # to a later one.
+    "truncated": "WRAP_INVALID @ unwrapVaultDEK.length",
+    "short_plaintext": "WRAP_INVALID @ unwrapVaultDEK.length",
+    "point_short": "WRAP_INVALID @ unwrapVaultDEK.v2.point",
+    "point_off_curve": "WRAP_INVALID @ unwrapVaultDEK.v2.curve",
+    # The transcript inputs are not optional, and their absence is structural rather than an
+    # authentication failure -- which would read as tampering when it is a caller that was not
+    # updated.
+    "no_context": "WRAP_INVALID @ unwrapVaultDEK.v2.context",
+    "empty_context": "WRAP_INVALID @ v2Transcript.uuid",
 }
 
 
@@ -65,7 +95,12 @@ def _vector_names() -> list[str]:
 
 
 def _vector(name: str) -> dict:
-    return json.loads((FIXTURE_DIR / name).read_text(encoding="utf-8"))
+    """Read through the shared loader, which enforces the test-only markers.
+
+    A bare json.loads silently accepts a fixture without them, and these files must never carry
+    production-derived material.
+    """
+    return reference.load_unreleased_vector(FIXTURE_DIR / name)
 
 
 @pytest.fixture(scope="module")
@@ -127,6 +162,22 @@ def test_the_browser_reads_bytes_it_did_not_write(name, browser_results):
 
 
 @pytest.mark.parametrize("name", _vector_names())
+def test_the_reference_encoder_reproduces_the_stored_bytes(name):
+    """Run the independent encoder, rather than trusting bytes it produced once.
+
+    Without this the write side of "the two runtimes agree" is asserted only against frozen output:
+    the encoder could drift arbitrarily and nothing would notice, because nothing would call it.
+    Every other format in this repository is checked this way; this one was not.
+    """
+    vector = _vector(name)
+    produced = reference.encode_direct_dek_wrap_v2(vector)
+    assert produced["wrapped_dek_b64"] == vector["expected"]["wrapped_dek_b64"], (
+        "the reference encoder no longer reproduces its own stored vector")
+    assert (produced["ephemeral_public_key_b64"]
+            == vector["expected"]["ephemeral_public_key_b64"])
+
+
+@pytest.mark.parametrize("name", _vector_names())
 def test_the_reference_decoder_reads_the_stored_bytes(name):
     """The other direction, without Node in the picture at all."""
     vector = _vector(name)
@@ -170,6 +221,32 @@ def test_swapping_the_two_bound_ids_produces_different_bytes():
             != swapped["expected"]["wrapped_dek_b64"]), (
         "exchanging the vault id and the recipient id left the wrap unchanged, so the two are "
         "concatenated in a way that does not distinguish them")
+
+
+def test_case_is_normalised_identically_by_both_runtimes(browser_results):
+    """Uppercase ids must produce byte-identical output to lowercase ones.
+
+    This is the one place the reference encoder was written from the browser rather than from the
+    specification: the spec states the encoding is lowercase, and says nothing about accepting
+    uppercase and normalising it, so the validator was mirrored. Mirrored code proves nothing by
+    agreeing with its original -- unless a vector pins the behaviour they share. Every other vector
+    holds ids that are already lowercase, so removing the normalisation step changes nothing any of
+    them can see.
+    """
+    upper = _vector("direct-wrap-v2-uppercase-ids.json")
+    baseline = _vector("direct-wrap-v2-baseline.json")
+
+    assert upper["inputs"]["vault_id"] != upper["inputs"]["vault_id"].lower(), (
+        "this vector is supposed to supply UPPERCASE ids; it no longer does")
+    assert upper["inputs"]["vault_id"].lower() == baseline["inputs"]["vault_id"]
+    assert upper["expected"]["wrapped_dek_b64"] == baseline["expected"]["wrapped_dek_b64"], (
+        "the same ids in a different case produced different bytes, so one side is not "
+        "normalising")
+
+    written = browser_results["direct-wrap-v2-uppercase-ids.json"]["writer"]
+    assert written["ok"], written.get("error")
+    assert written["value"]["wrapped_dek_b64"] == upper["expected"]["wrapped_dek_b64"], (
+        "the browser does not normalise case the way the reference encoder does")
 
 
 def test_the_grammar_constants_are_what_the_specification_says():
@@ -241,7 +318,9 @@ def test_a_wrap_of_the_wrong_sized_key_cannot_even_be_the_right_length(browser_r
         assert cases["short_plaintext_byte_length"] == 52, (
             "a wrap of a 16-byte key should be 52 bytes; if it is 68 the plaintext-length check "
             "is reachable after all and deserves a test of its own")
-        assert cases["short_plaintext"] == "WRAP_INVALID"
+        assert cases["short_plaintext"] == "WRAP_INVALID @ unwrapVaultDEK.length", (
+            "a wrap of a wrong-sized key is refused somewhere other than the length "
+            "dispatch, which means the plaintext-length check may be reachable after all")
 
 
 def test_an_epoch_outside_the_grammar_is_refused():
