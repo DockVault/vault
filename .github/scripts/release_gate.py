@@ -110,7 +110,10 @@ def validate_release(
         raise ReleaseGateError("tagged commit is not an ancestor of origin/main")
 
     waiver = _check_upgrade_matrix(
-        upgrade_matrix or repository / "docs" / "upgrade-matrix.json", version)
+        upgrade_matrix or repository / "docs" / "upgrade-matrix.json",
+        version,
+        _released_versions(repository),
+    )
 
     return ReleaseMetadata(
         version=version,
@@ -139,7 +142,23 @@ def _upgrade_matrix_module():
     return module
 
 
-def _check_upgrade_matrix(path: Path, version: str) -> str | None:
+def _released_versions(repository: Path) -> set[str]:
+    """The versions that have actually been released, from the tags in this checkout.
+
+    A failure to read tags is an error rather than an empty answer: treating "cannot see" as "none
+    exist" would turn the phantom-version check into a no-op exactly when it cannot do its job.
+
+    There is deliberately no check that the version being cut is among them. It always is -- the
+    caller has already resolved `refs/tags/v<version>` to a commit before reaching here, so a
+    missing tag has failed the gate several lines earlier, with a clearer message.
+    """
+    listed = _git(repository, ["tag", "--list", "v*"], check=False)
+    if listed.returncode != 0:
+        raise ReleaseGateError("cannot list tags, so declared versions cannot be checked")
+    return {line[1:] for line in listed.stdout.split() if line.startswith("v")}
+
+
+def _check_upgrade_matrix(path: Path, version: str, released: set[str]) -> str | None:
     """Require the release to have declared how an operator reaches it.
 
     Returns the stated reason when this version is waived in the matrix, else None.
@@ -158,6 +177,7 @@ def _check_upgrade_matrix(path: Path, version: str) -> str | None:
     matrix = _upgrade_matrix_module()
     try:
         data = matrix.validate_matrix(matrix.load_matrix(path))
+        matrix.assert_no_phantom_versions(data, released, version)
         reason = matrix.assert_release_declared(data, version)
     except matrix.UpgradeMatrixError as exc:
         raise ReleaseGateError(str(exc)) from exc

@@ -33,7 +33,9 @@ MAX_BYTES = 256 * 1024
 SUPPORTED_SCHEMA_VERSION = 1
 
 _UTF8_BOM = b"\xef\xbb\xbf"
-_VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+", re.ASCII)
+# No leading zeros: "0.10.00" and "0.10.0" would be two keys for one release, and the second would
+# never match a tag.
+_VERSION_RE = re.compile(r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2}", re.ASCII)
 _ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*", re.ASCII)
 _DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
 
@@ -73,8 +75,27 @@ def _no_unknown_keys(mapping: dict, allowed: set[str], where: str) -> None:
     _require(not unknown, f"{where} has unknown key(s): {', '.join(unknown)}")
 
 
+def _no_duplicate_keys(pairs):
+    """Reject a duplicated key instead of letting the last one win.
+
+    `json.loads` keeps the last of a repeated key and says nothing. In a file that is read by a
+    human in review and by a machine at release time, that is a silent disagreement: the reviewer
+    reads the block that lost.
+    """
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise UpgradeMatrixError(f"upgrade matrix repeats the key {key!r}")
+        seen.add(key)
+    return dict(pairs)
+
+
 def load_matrix(path: Path) -> dict:
     """Read and parse the matrix, refusing anything that is not plainly a UTF-8 JSON object."""
+    # A symlink would let the file the gate validates differ from the file the release publishes,
+    # which is the one property the copy-verbatim step exists to guarantee.
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise UpgradeMatrixError(f"the upgrade matrix must be a regular file, not {path}")
     try:
         raw = path.read_bytes()
     except OSError as exc:
@@ -82,7 +103,8 @@ def load_matrix(path: Path) -> dict:
     _require(len(raw) <= MAX_BYTES, f"upgrade matrix is larger than {MAX_BYTES} bytes")
     _require(not raw.startswith(_UTF8_BOM), "upgrade matrix must not contain a UTF-8 BOM")
     try:
-        data = json.loads(raw.decode("utf-8", errors="strict"))
+        data = json.loads(raw.decode("utf-8", errors="strict"),
+                          object_pairs_hook=_no_duplicate_keys)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise UpgradeMatrixError(f"upgrade matrix is not valid UTF-8 JSON: {exc}") from exc
     _require(isinstance(data, dict), "upgrade matrix must be a JSON object")
@@ -178,8 +200,26 @@ def validate_matrix(data: dict) -> dict:
 
     # Adjacency completeness. Declaring edges only between neighbours is what lets a longer upgrade
     # be composed by walking them, so a missing neighbour link silently breaks every path across it.
+    #
+    # "Adjacent" is by version order, but the requirement is skipped where the later version was
+    # released EARLIER -- a backport. Inserting 0.9.1 after 0.10.0 has shipped makes (0.9.1, 0.10.0)
+    # newly adjacent by version, and demanding that edge would force the maintainer to assert an
+    # upgrade from a backport into a release that predates its fix. There is no honest answer to
+    # that demand, so the price of shipping a backport would be a false declaration.
+    #
+    # Skipping it outright would orphan the later version if its real predecessor link were also
+    # removed, so the fallback still requires SOMETHING released no later than it to lead in.
     ordered = sorted(versions, key=_sort_key)
-    missing = [f"{a} -> {b}" for a, b in zip(ordered, ordered[1:]) if (a, b) not in seen]
+    missing = []
+    for earlier, later in zip(ordered, ordered[1:]):
+        if (earlier, later) in seen:
+            continue
+        if versions[later]["released"] >= versions[earlier]["released"]:
+            missing.append(f"{earlier} -> {later}")
+        elif not any(target == later and source != later
+                     and versions[source]["released"] <= versions[later]["released"]
+                     for source, target in seen):
+            missing.append(f"(some release older than {later}) -> {later}")
     _require(not missing, "no edge declared between adjacent releases: " + ", ".join(missing))
 
     waivers = data.get("waivers", [])
@@ -206,6 +246,27 @@ def validate_matrix(data: dict) -> dict:
 def waived_versions(data: dict) -> dict[str, str]:
     """Versions allowed to ship undeclared, mapped to the stated reason."""
     return {w["version"]: w["reason"] for w in data.get("waivers", [])}
+
+
+def assert_no_phantom_versions(data: dict, released: set[str], being_cut: str) -> None:
+    """Every declared version must be a release that exists, or the one being cut right now.
+
+    Adjacency completeness is satisfied by any chain of entries, so a version nobody released could
+    be invented to bridge a gap: the file would validate, the gate would find the fabricated
+    predecessor supplying an inbound edge, and the published matrix would describe a release nobody
+    can install.
+
+    `being_cut` is exempt because the release commit necessarily declares itself before its tag is
+    reachable everywhere.
+    """
+    phantom = sorted(v for v in data.get("versions", {})
+                     if v not in released and v != being_cut)
+    if phantom:
+        raise UpgradeMatrixError(
+            f"docs/upgrade-matrix.json declares {', '.join(phantom)}, which are not released "
+            "versions. A version that does not exist can satisfy the adjacency rule while "
+            "describing a release nobody can get"
+        )
 
 
 def assert_release_declared(data: dict, version: str) -> str | None:

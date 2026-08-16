@@ -60,6 +60,18 @@ def _new_repository(path: Path) -> str:
         (_ROOT / "docs" / "upgrade-matrix.json").read_bytes())
     _git(path, "add", "VERSION", "payload.txt", "docs/upgrade-matrix.json")
     _git(path, "commit", "-m", "main candidate")
+    # Tag every version the matrix declares. The gate checks that a declared version corresponds to
+    # a release that exists, so a repository carrying the real matrix without the real tags is
+    # describing something that could not exist -- and would be rejected for a reason that has
+    # nothing to do with what these tests are about.
+    #
+    # All except 0.8.0: each test tags its own release under test, sometimes annotated, sometimes
+    # on another branch. The fixture supplies the history around it, not the release itself.
+    import json as _json
+    for _declared in _json.loads(
+            (path / "docs" / "upgrade-matrix.json").read_text(encoding="utf-8"))["versions"]:
+        if _declared != "0.8.0":
+            _git(path, "tag", f"v{_declared}")
     sha = _git(path, "rev-parse", "HEAD")
     _git(path, "update-ref", "refs/remotes/origin/main", sha)
     return sha

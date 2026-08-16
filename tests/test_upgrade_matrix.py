@@ -102,10 +102,19 @@ def test_every_released_tag_has_an_entry_and_a_way_to_reach_it():
     # Checked here rather than in the validator on purpose: at release time the tag being cut does
     # exist, but the validator runs without a guaranteed view of the tag list, and a check that
     # silently passes when it cannot see tags would be worse than no check.
-    phantom = [v for v in data["versions"] if v not in released]
+    #
+    # The version in VERSION is exempt: a release-prep commit bumps it and adds the matrix entry
+    # together, and the tag only appears afterwards. Without the exemption the two rules deadlock --
+    # the gate refuses to cut a version the matrix does not declare, and this refuses a declared
+    # version that is not yet tagged, so main would be red for the whole window between the two.
+    # It holds only if the bump and the entry land in the same commit, which is what release prep
+    # does and what the gate independently enforces at tag time by comparing tag to VERSION.
+    preparing = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    phantom = [v for v in data["versions"] if v not in released and v != preparing]
     assert not phantom, (
-        f"docs/upgrade-matrix.json declares {phantom}, which are not released tags. A version that "
-        "does not exist can satisfy the adjacency rule while describing a release nobody can get")
+        f"docs/upgrade-matrix.json declares {phantom}, which are not released tags and are not the "
+        f"version being prepared ({preparing}). A version that does not exist can satisfy the "
+        "adjacency rule while describing a release nobody can get")
 
 
 def test_the_committed_matrix_declares_every_released_edge_direct():
@@ -267,7 +276,11 @@ def _repo(tmp_path, version, matrix):
     git("config", "user.name", "test")
     git("add", "-A")
     git("commit", "-qm", version)
-    git("tag", f"v{version}")
+    # Tag every version the matrix declares, not only the one being cut: the gate now checks that
+    # a declared version corresponds to a real release, so a fixture that declares versions it
+    # never tagged is describing a repository that could not exist.
+    for declared in sorted(set(matrix.get("versions", {})) | {version}):
+        git("tag", f"v{declared}")
     # The gate requires the tagged commit to be an ancestor of the main ref it is given.
     return tmp_path
 
@@ -500,3 +513,115 @@ def test_every_workflow_that_runs_pytest_fetches_tags():
     assert not offenders, (
         "these workflows run pytest but check out without tags, so the released-versions check "
         f"will fail in them: {', '.join(offenders)}. Add `fetch-tags: true` to their checkout")
+
+
+# --- what the last round of attacks found ---------------------------------------------------
+
+def test_a_backport_released_after_a_later_version_does_not_have_to_lie(tmp_path):
+    """Cutting 0.9.1 after 0.10.0 has shipped must not require asserting 0.9.1 -> 0.10.0.
+
+    Adjacency is by version order, so inserting a backport makes (0.9.1, 0.10.0) newly adjacent and
+    the naive rule demands an edge out of the backport into a release that predates its fix. There
+    is no honest answer to that demand: `direct` claims an untested and backwards hop, `blocked`
+    admits the pair is not really adjacent. The price of shipping a backport would be a false
+    declaration, which is precisely what this gate exists to prevent -- so the requirement is
+    skipped where the later version was released earlier.
+    """
+    data = _valid()
+    data["versions"]["0.2.1"] = {"released": "2026-02-01", "notes": "backport, shipped later"}
+    data["edges"].append({"from": "0.2.0", "to": "0.2.1", "kind": "direct",
+                          "reversible": True, "requires_backup": False})
+    um.validate_matrix(data)   # no edge 0.2.1 -> ... is demanded
+
+    repo = _repo(tmp_path, "0.2.1", data)
+    assert _run_gate(repo, "0.2.1", tmp_path).version == "0.2.1"
+
+
+def test_the_backport_exemption_does_not_let_a_release_be_orphaned():
+    """The narrow shape of that exemption, because skipping the rule outright opens a hole.
+
+    If the backport's insertion is used as cover to also drop the real predecessor link, the later
+    version ends up with no way in at all. Something released no later than it must still lead in.
+    """
+    data = _valid()
+    # 0.1.5 sorts between the two but shipped after both: the backport shape. Its own inbound edge
+    # is declared; 0.2.0's is not, so 0.2.0 is left with no way in at all.
+    data["versions"]["0.1.5"] = {"released": "2026-02-01", "notes": "backport"}
+    data["edges"] = [{"from": "0.1.0", "to": "0.1.5", "kind": "direct",
+                      "reversible": True, "requires_backup": False}]
+    with pytest.raises(um.UpgradeMatrixError, match="older than 0.2.0"):
+        um.validate_matrix(data)
+
+
+def test_an_ordinary_forward_gap_is_still_rejected():
+    """Non-vacuity for the two above: the relaxed rule still catches the case it is meant to."""
+    data = _valid()
+    data["versions"]["0.3.0"] = {"released": "2026-03-01", "notes": "later in both senses"}
+    with pytest.raises(um.UpgradeMatrixError, match=r"0\.2\.0 -> 0\.3\.0"):
+        um.validate_matrix(data)
+
+
+def test_the_gate_rejects_a_version_that_was_never_released(tmp_path):
+    """Closed at the gate, not only in the test lane.
+
+    A fabricated predecessor satisfies adjacency and supplies the inbound edge the gate looks for,
+    so without this the matrix could describe a release nobody can install and still cut a tag.
+    """
+    data = _valid()
+    data["versions"]["0.1.5"] = {"released": "2026-01-15", "notes": "never existed"}
+    data["edges"] = [
+        {"from": "0.1.0", "to": "0.1.5", "kind": "direct",
+         "reversible": True, "requires_backup": False},
+        {"from": "0.1.5", "to": "0.2.0", "kind": "direct",
+         "reversible": True, "requires_backup": False},
+    ]
+    repo = _repo(tmp_path, "0.2.0", data)
+    subprocess.run(["git", "tag", "-d", "v0.1.5"], cwd=repo, capture_output=True, timeout=60)
+    with pytest.raises(gate.ReleaseGateError, match="not released versions"):
+        _run_gate(repo, "0.2.0", tmp_path)
+
+
+def test_a_repeated_json_key_is_rejected(tmp_path):
+    """json.loads keeps the last one and says nothing, so a reviewer reads the block that lost."""
+    path = tmp_path / "dupe.json"
+    path.write_text(
+        '{"schema_version": 1, "schema_version": 2, "about": "x"}', encoding="utf-8", newline="")
+    with pytest.raises(um.UpgradeMatrixError, match="repeats the key"):
+        um.load_matrix(path)
+
+
+def test_a_version_with_a_leading_zero_is_rejected():
+    """"0.10.00" and "0.10.0" would be two keys for one release, and one could never match a tag."""
+    data = _valid()
+    data["versions"]["0.02.0"] = {"released": "2026-01-05", "notes": "x"}
+    with pytest.raises(um.UpgradeMatrixError, match="malformed"):
+        um.validate_matrix(data)
+
+
+def test_a_symlinked_matrix_is_refused(tmp_path):
+    """The gate must validate the same bytes the release publishes.
+
+    A symlink would let those differ, which defeats the one property the copy-verbatim step exists
+    to guarantee.
+    """
+    real = tmp_path / "real.json"
+    real.write_bytes(MATRIX_PATH.read_bytes())
+    link = tmp_path / "link.json"
+    try:
+        link.symlink_to(real)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform/user cannot create symlinks")
+    with pytest.raises(um.UpgradeMatrixError, match="regular file"):
+        um.load_matrix(link)
+
+
+def test_the_release_workflow_does_not_redirect_the_gate_to_another_file():
+    """The gate reads docs/upgrade-matrix.json; the staging step copies that same path.
+
+    Passing --upgrade-matrix in the workflow would let the gate validate one file while the release
+    published another, and nothing else would notice.
+    """
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    assert "--upgrade-matrix" not in workflow, (
+        "release.yml now points the gate at a specific matrix path; make sure it is the same file "
+        "the staging step copies, or the published asset is not the one that was validated")
