@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+from app_source import bound_value, call_text, positional_arg
+
 pytestmark = [pytest.mark.unit, pytest.mark.crypto_compatibility]
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -362,50 +364,6 @@ def test_both_gated_write_sites_pass_a_complete_transcript():
     assert source.count("lib.ZK_WRAP_WRITE_V2") == 3
 
 
-def _wrap_call(source: str, fn: str, after: int = 0) -> tuple[str, int]:
-    """The text of one `await <fn>(...)` CALL, and where it started.
-
-    Anchored on the call rather than the bare name: matching the name finds the choke point's own
-    declaration first, and asserting against a function signature proves nothing.
-    """
-    i = source.index("await " + fn, after)
-    return source[i:source.index(";", i)], i
-
-
-def _bound(call: str, field: str) -> str:
-    """The exact value bound to `field` in a transcript literal, whitespace-normalised.
-
-    Substring matching is what this replaces, and it was wrong in both directions. `"dekEpoch: 1"`
-    is a prefix of `"dekEpoch: 10"`, so a rotation labelling every survivor ten epochs ahead passed;
-    the same held for every other field, since each real value is a prefix of a plausible wrong one
-    (`userId` of `userIdOfSharer`, `uid` of `uidBeingRemoved`, `payload.id` of `payload.idOther`).
-    In the other direction the match broke on harmless edits -- a removed space, a parenthesised
-    expression, a renamed local -- so it failed on refactors and passed on defects.
-
-    Reading to the delimiter fixes both: the value is whatever sits between the colon and the next
-    comma or closing brace, with whitespace collapsed.
-    """
-    marker = field + ":"
-    if marker not in call:
-        # Shorthand: `{ vaultId, ... }` binds the local of the same name, which is a real binding
-        # and has to be read as one rather than reported as a missing field.
-        import re as _re
-        if _re.search(r"[{,]\s*" + _re.escape(field) + r"\s*[,}]", call):
-            return field
-        raise AssertionError(f"{field} is not bound at this call site at all: {' '.join(call.split())}")
-    i = call.index(marker) + len(marker)
-    end = min(
-        (pos for pos in (call.find(",", i), call.find("}", i)) if pos != -1),
-        default=len(call),
-    )
-    value = " ".join(call[i:end].split())
-    # A redundant outer parenthesis is the same value written differently, and failing on it makes
-    # this a test of formatting rather than of what is bound.
-    while value.startswith("(") and value.endswith(")"):
-        value = value[1:-1].strip()
-    return value
-
-
 def test_every_direct_write_site_binds_the_right_values():
     """The gated direct sites -- the VALUES, exactly, not a substring of them.
 
@@ -423,30 +381,36 @@ def test_every_direct_write_site_binds_the_right_values():
     source = APP_JS.read_text(encoding="utf-8")
 
     # Creation: the vault's own id, the creator as recipient, epoch 1 because it is the first.
-    create, i = _wrap_call(source, "zkWrapDekForRecipient(")
-    assert _bound(create, "vaultId") == "payload.id", _bound(create, "vaultId")
-    assert _bound(create, "recipientUserId") == "myUserId", _bound(create, "recipientUserId")
-    assert _bound(create, "dekEpoch") == "1", (
-        f"a new vault's first DEK is epoch 1, not {_bound(create, 'dekEpoch')!r}")
+    create, i = call_text(source, "zkWrapDekForRecipient(")
+    assert bound_value(create, "vaultId") == "payload.id", bound_value(create, "vaultId")
+    assert bound_value(create, "recipientUserId") == "myUserId", bound_value(create, "recipientUserId")
+    assert bound_value(create, "dekEpoch") == "1", (
+        f"a new vault's first DEK is epoch 1, not {bound_value(create, 'dekEpoch')!r}")
+    assert positional_arg(create, 1) == "myPub", positional_arg(create, 1)
 
     # Share: the recipient is the person being granted access, not the person granting it, and the
     # epoch is the one the wrapped DEK actually belongs to.
-    share, j = _wrap_call(source, "zkWrapDekForRecipient(", i + 1)
-    assert _bound(share, "vaultId") == "vaultId", _bound(share, "vaultId")
-    assert _bound(share, "recipientUserId") == "userId", (
-        f"the share path wraps to {_bound(share, 'recipientUserId')!r}; if that is the sharer, the "
+    share, j = call_text(source, "zkWrapDekForRecipient(", i + 1)
+    assert bound_value(share, "vaultId") == "vaultId", bound_value(share, "vaultId")
+    assert bound_value(share, "recipientUserId") == "userId", (
+        f"the share path wraps to {bound_value(share, 'recipientUserId')!r}; if that is the sharer, the "
         "recipient holds a well-formed wrap they cannot open")
-    assert _bound(share, "dekEpoch") == "shareEpoch", _bound(share, "dekEpoch")
+    assert bound_value(share, "dekEpoch") == "shareEpoch", bound_value(share, "dekEpoch")
+    # The key the wrap is sealed to, which the transcript cannot speak for. A correct transcript
+    # sealed to the wrong key is a wrap the named recipient cannot open.
+    assert positional_arg(share, 1) == "recipientPub", positional_arg(share, 1)
 
     # Rotation: the NEW epoch, and each survivor named by the loop variable. Naming the removed
     # member would re-grant exactly the access the rotation exists to withdraw.
-    rekey, _ = _wrap_call(source, "zkWrapDekForRecipient(", j + 1)
-    assert _bound(rekey, "vaultId") == "vaultId", _bound(rekey, "vaultId")
-    assert _bound(rekey, "recipientUserId") == "uid", (
-        f"the rotation wraps to {_bound(rekey, 'recipientUserId')!r}")
-    assert _bound(rekey, "dekEpoch") == "fromVersion + 1", (
-        f"the rotation stamps {_bound(rekey, 'dekEpoch')!r}; every survivor's key would be "
+    rekey, _ = call_text(source, "zkWrapDekForRecipient(", j + 1)
+    assert bound_value(rekey, "vaultId") == "vaultId", bound_value(rekey, "vaultId")
+    assert bound_value(rekey, "recipientUserId") == "uid", (
+        f"the rotation wraps to {bound_value(rekey, 'recipientUserId')!r}")
+    assert bound_value(rekey, "dekEpoch") == "fromVersion + 1", (
+        f"the rotation stamps {bound_value(rekey, 'dekEpoch')!r}; every survivor's key would be "
         "labelled with an epoch the server never assigns")
+    assert positional_arg(rekey, 0) == "newDek", positional_arg(rekey, 0)
+    assert positional_arg(rekey, 1) == "recipientPub", positional_arg(rekey, 1)
 
 
 def test_there_are_exactly_three_direct_write_sites():

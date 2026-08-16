@@ -26,6 +26,8 @@ from pathlib import Path
 
 import pytest
 
+from app_source import bound_value, call_text, positional_arg
+
 pytestmark = [pytest.mark.unit, pytest.mark.crypto_compatibility]
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -323,7 +325,7 @@ def test_the_share_path_uses_the_right_account_at_each_end():
     read_call = share[read_at:share.index(";", read_at)]
     write_call = share[write_at:share.index(";", write_at)]
 
-    assert "recipientUserId: keys.recipient_user_id" in read_call, (
+    assert bound_value(read_call, "recipientUserId") == "keys.recipient_user_id", (
         f"the read must name the account the server says the wrap was made for: {read_call}"
     )
     assert "recipientUserId: userId" in write_call, (
@@ -336,37 +338,83 @@ def test_the_share_path_uses_the_right_account_at_each_end():
 
 
 def test_every_team_write_site_binds_the_right_values():
-    """The gated sites again -- but the VALUES this time, not just the field names.
+    """The gated team sites -- the VALUES, exactly, not a substring of them.
 
-    The direct wrap's equivalent check filters for lines carrying both a recipient and an epoch,
-    and no team site carries both: the DEK wrap binds vault and epoch, the private wrap binds vault
-    and recipient. So all five team sites fell through that filter entirely, and four separate
-    wrong-value mutations passed the whole suite. None of these lines executes while the writer is
-    gated off, so a wrong value here ships silently and surfaces as an unopenable wrap for whoever
-    turns it on first.
+    This test was written after four wrong values passed the whole suite. It caught those four and
+    then let their near neighbours through, because it asked whether the call CONTAINED the right
+    text: `"dekEpoch: 1"` is also true of `dekEpoch: 10`, `recipientUserId: uid` of
+    `recipientUserId: uidBeingRemoved`, `vaultId: payload.id` of `vaultId: payload.idOther`. The
+    same flaw was found in the direct wrap's equivalent by review and fixed there; this is the
+    sibling, fixed the same way and sharing the same reader so the two cannot drift.
+
+    What makes these worth checking at all: none of these lines runs while the writer is gated off,
+    so a wrong value ships quietly and produces a vault that opens for nobody.
     """
     source = APP_JS.read_text(encoding="utf-8")
 
-    def call(fn, after=0):
-        # `await` anchors on a CALL. Matching the bare name finds the choke point's own
-        # declaration first, and asserting against a function signature proves nothing.
-        i = source.index("await " + fn, after)
-        return source[i:source.index(";", i)], i
+    # Creation. The team DEK wrap binds the vault and the epoch -- epoch 1, because the vault is
+    # new -- and binds no recipient at all: one wrap serves every member, which is the point of the
+    # hierarchical mode.
+    create_dek, i = call_text(source, "zkWrapTeamDek(")
+    assert bound_value(create_dek, "vaultId") == "payload.id", bound_value(create_dek, "vaultId")
+    assert bound_value(create_dek, "dekEpoch") == "1", bound_value(create_dek, "dekEpoch")
+    # The TEAM public key, because that is what a team DEK is sealed to. Sealing it to the
+    # creator's own key instead makes a vault only its creator can open, which is the opposite of
+    # what the hierarchical mode is for -- and the transcript would be identical either way.
+    assert positional_arg(create_dek, 1) == "teamKp.publicKey", positional_arg(create_dek, 1)
 
-    # Creation: epoch is 1 by definition, and the recipient is the creator.
-    create_dek, i = call("zkWrapTeamDek(")
-    assert "vaultId: payload.id" in create_dek and "dekEpoch: 1" in create_dek, create_dek
-    create_priv, _ = call("zkWrapTeamPrivateKey(")
-    assert "vaultId: payload.id" in create_priv, create_priv
-    assert "recipientUserId: myUserId" in create_priv, create_priv
+    # The team PRIVATE key wrap binds the vault and the recipient, and no epoch: the only epoch
+    # that would mean anything here is the team keypair's, which the server assigns.
+    create_priv, p = call_text(source, "zkWrapTeamPrivateKey(")
+    assert bound_value(create_priv, "vaultId") == "payload.id", bound_value(create_priv, "vaultId")
+    assert bound_value(create_priv, "recipientUserId") == "myUserId", (
+        bound_value(create_priv, "recipientUserId"))
+    assert positional_arg(create_priv, 0) == "teamKp.privateKey", positional_arg(create_priv, 0)
+    assert positional_arg(create_priv, 1) == "myPub", positional_arg(create_priv, 1)
 
-    # Rotation: the server stores the wrap under to_version, which is fromVersion + 1, and each
-    # member is named by the loop variable rather than the person being removed.
-    rot_dek, j = call("zkWrapTeamDek(", i + 1)
-    assert "dekEpoch: fromVersion + 1" in rot_dek, rot_dek
-    rot_priv, _ = call("zkWrapTeamPrivateKey(", j)
-    assert "recipientUserId: uid" in rot_priv, rot_priv
-    assert "revokedUserId" not in rot_priv, "the rotation is naming the member being removed"
+    # Rotation. The server stores the wrap under to_version, which is fromVersion + 1; stamping the
+    # epoch being replaced labels every re-wrap as the key it supersedes.
+    rot_dek, j = call_text(source, "zkWrapTeamDek(", i + 1)
+    assert bound_value(rot_dek, "dekEpoch") == "fromVersion + 1", bound_value(rot_dek, "dekEpoch")
+    # Asserted here because every other site asserts it and this one did not: a rotation stamped
+    # with another vault's id re-wraps the key to a transcript no member of THIS vault will build.
+    assert bound_value(rot_dek, "vaultId") == "vaultId", bound_value(rot_dek, "vaultId")
+    assert positional_arg(rot_dek, 1) == "teamKp.publicKey", positional_arg(rot_dek, 1)
+
+    # SHARE. Never asserted before: the earlier version of this test walked two team-private sites
+    # and there are three, so the one in the middle -- the share path, which unwraps the team
+    # private key with the sharer's identity and re-wraps it to the recipient -- was checked by
+    # nothing. Wrapping to the sharer here hands the recipient a key they cannot open.
+    share_priv, k = call_text(source, "zkWrapTeamPrivateKey(", p + 1)
+    assert bound_value(share_priv, "vaultId") == "vaultId", bound_value(share_priv, "vaultId")
+    # Sealed to the RECIPIENT's key. Sealed to the team's own, or to the sharer's, it is a
+    # well-formed wrap nobody who needs it can open -- and no transcript check would notice.
+    assert positional_arg(share_priv, 0) == "teamPriv", positional_arg(share_priv, 0)
+    assert positional_arg(share_priv, 1) == "recipientPub", positional_arg(share_priv, 1)
+    assert bound_value(share_priv, "recipientUserId") == "userId", (
+        f"the team share wraps the private key to "
+        f"{bound_value(share_priv, 'recipientUserId')!r}, not the recipient")
+
+    # And on rotation each member is named by the loop variable. Naming the member being removed
+    # would hand the new team private key to exactly the person the rotation exists to exclude.
+    rot_priv, _ = call_text(source, "zkWrapTeamPrivateKey(", k + 1)
+    assert bound_value(rot_priv, "vaultId") == "vaultId", bound_value(rot_priv, "vaultId")
+    assert positional_arg(rot_priv, 0) == "teamKp.privateKey", positional_arg(rot_priv, 0)
+    assert positional_arg(rot_priv, 1) == "recipientPub", (
+        f"the rotation seals the team private key to {positional_arg(rot_priv, 1)!r}; every "
+        "surviving member would hold a wrap no key of theirs can open")
+    assert bound_value(rot_priv, "recipientUserId") == "uid", (
+        f"the rotation wraps the team private key to "
+        f"{bound_value(rot_priv, 'recipientUserId')!r}")
+
+
+def test_the_number_of_team_write_sites_has_not_changed():
+    """The assertions above address these sites by order of appearance."""
+    source = APP_JS.read_text(encoding="utf-8")
+    assert source.count("await zkWrapTeamDek(") == 2, "the team DEK write sites changed"
+    assert source.count("await zkWrapTeamPrivateKey(") == 3, (
+        "the team private write sites changed; there are three -- create, share and rotate -- and "
+        "an earlier version of these assertions walked only two, leaving the share path unchecked")
 
 
 def test_a_missing_recipient_is_refused_rather_than_encoded():

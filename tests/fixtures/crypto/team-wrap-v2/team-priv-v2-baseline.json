@@ -1,0 +1,23 @@
+{
+  "schema": "dockvault-crypto-vector-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "format": "zero-knowledge team private key wrap v2",
+  "purpose": 3,
+  "description": "A team private key wrap. It binds the vault and the recipient and NO epoch -- the only epoch that would mean anything is the team keypair's, which the server assigns -- and it is variable length, so unlike the two DEK wraps its length cannot identify it and the header does all the work.",
+  "inputs": {
+    "vault_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+    "recipient_user_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+    "team_private_pkcs8_b64": "MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDAAAAAAAAAAD+3LqYdlQyEBEiM0RVZneImaq7zN3u/wARIjNEVWZ3iJmqu8zd7v8AGhZANiAARZmI5n2jZuYZZoEp84O8GJ9zXeI+AVQbzbawbPGtrh6bdbd4AnBgseNETWqn4MuZdmlrjPLtr/Qv1ilNqDV472bWSmof17wS99uGnZ8ykviV+pSNCDuLFq6iZT3tv4TEo=",
+    "nonce_hex": "2a2b2c2d2e2f303132333435",
+    "ephemeral_private_scalar_hex": "1f2e3d4c5b6a798897a6b5c4d3e2f1000112233445566778899aabbccddeeff0011223344556677889",
+    "recipient_private_scalar_hex": "2a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f5051",
+    "team_private_scalar_hex": "0fedcba9876543210112233445566778899aabbccddeeff00112233445566778899aabbccddeeff001",
+    "other_vault_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "other_recipient_user_id": "16fd2706-8baf-433b-82eb-8c7fada847da"
+  },
+  "expected": {
+    "wrapped_key_b64": "RFZaMgIDAAAqKywtLi8wMTIzNDUleiAiNvOjk9wpCHyQVTZGjfY9VGkHibtRwJlkITmdDeaCV/pr4Ac3UObofAjCwgcVNM2c9JufEjY7qJFM0PMBHZuDJJs8JIiq8Zhsoj+x1mipoyNuIDPD4A+4L3P9WfTmvh+XiiB1bubMvK8Iy0qVgov+CsvcDCVvWpklAml8AmtAi111Prn4SP9hPJ9Mf0en2xm3kLmJow5VvEOKgZgA4K0hBI1RDn+IWfcwu26dCnSmCguDiRDpd+/klTLYQ0jtoUko4VLeFkk=",
+    "ephemeral_public_key_b64": "BOmQs4G6CUzREx1uKybXl/kQvXGOPwcIjl7nZdB21AlwkaPK3oF6BL6FjRVUPcz8lzQd92mjaNLanhDVOTJjOZHNlgDxbYCtDPUD3BoxhlMcdXQIbJ/DD/IoAQvg+gE3Zg=="
+  }
+}
