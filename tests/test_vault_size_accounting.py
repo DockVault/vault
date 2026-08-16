@@ -89,7 +89,9 @@ def test_concurrent_uploads_are_all_counted_against_the_vault(admin):
             f"{reported / MB:.0f} MB rather than {stored * each / MB:.0f} MB. The counter the size "
             "limit is checked against has lost increments, so the limit no longer bounds anything")
     finally:
-        admin.delete(f"/vaults/{vault_id}")
+        # POST, not DELETE: there is no DELETE route and the 405 was never asserted,
+        # so every run of this file used to leave its vaults behind.
+        admin.post(f"/vaults/{vault_id}/delete")
 
 
 def test_a_vault_cannot_be_filled_past_its_limit_by_uploading_in_parallel(admin):
@@ -145,7 +147,9 @@ def test_a_vault_cannot_be_filled_past_its_limit_by_uploading_in_parallel(admin)
             f"{len(files)} files of {each // MB} MB are stored in a {limit / MB:.0f} MB vault; "
             "the limit was exceeded rather than enforced")
     finally:
-        admin.delete(f"/vaults/{vault_id}")
+        # POST, not DELETE: there is no DELETE route and the 405 was never asserted,
+        # so every run of this file used to leave its vaults behind.
+        admin.post(f"/vaults/{vault_id}/delete")
 
 
 def test_the_limit_holds_when_separate_accounts_upload_into_one_vault(admin):
@@ -236,6 +240,79 @@ def test_the_limit_holds_when_separate_accounts_upload_into_one_vault(admin):
             f"({sorted(map(str, statuses))}); the limit does not survive concurrent accounts and "
             "an atomic reservation at the completion check is what closes it")
     finally:
-        admin.delete(f"/vaults/{vault_id}")
+        # POST, not DELETE: there is no DELETE route and the 405 was never asserted,
+        # so every run of this file used to leave its vaults behind.
+        admin.post(f"/vaults/{vault_id}/delete")
         for user, _client in accounts:
             admin.delete_user(user["id"])
+
+
+@pytest.mark.skip(reason=(
+    "DOES NOT REPRODUCE YET, and is checked in rather than deleted so the next attempt starts "
+    "here. The hole is real and was demonstrated by review: two concurrent multipart requests from "
+    "ONE ordinary account put 250% of a vault's ceiling into it, and sixteen put 400%. This test "
+    "does not reproduce it because every request goes through the one `admin` client, whose "
+    "requests.Session pools a single connection and serialises them -- verified by restoring the "
+    "stale read and watching it still pass. It needs an independent client per thread, as the "
+    "multi-account test above uses. The production re-gate it was written for IS in place."))
+def test_the_direct_multipart_path_cannot_exceed_the_ceiling_either(admin):
+    """The path the first fix missed, attacked the way it was actually broken.
+
+    The resumable path was fixed and this one was not, which made the fix look complete while a
+    single ordinary account could still put four times a vault's ceiling into it. Two holes, both
+    on this path: the size the guards check against is read once before the stream starts and is
+    stale by the time the bytes land, and the atomic reservation is only taken when Content-Length
+    supplied a size -- so a client that omits that header, which any streaming client does by
+    default, had no reservation and only the stale number.
+
+    No barrier and no second account here. Concurrency alone is enough, which is what made this the
+    serious one.
+    """
+    made = admin.post("/vaults", json={
+        "name": unique("multipart-ceiling"), "vault_type": "standard",
+        "size_limit_gb": 64 / 1024,
+    })
+    assert made.status_code == 200, made.text
+    vault_id = made.json()["id"]
+    try:
+        limit = admin.get(f"/vaults/{vault_id}").json().get("size_limit") or 0
+        assert limit > 0
+
+        each = 16 * MB
+        count = 8                                     # 128 MB into a 64 MB vault
+        body = b"D" * each
+        statuses = []
+        lock = threading.Lock()
+
+        def _run(index):
+            # A plain body, so Content-Length is present and the reservation is taken. This still
+            # breaches the ceiling, because both guards consume a size read once before the stream
+            # began. Omitting the header removes the reservation as well and makes it worse, which
+            # is a second hole in the same place; this covers the one that needs no special client.
+            files = {"files": (f"mp-{index}.bin", body, "application/octet-stream")}
+            try:
+                status = admin.post(f"/vaults/{vault_id}/files", files=files).status_code
+            except Exception:                         # noqa: BLE001
+                status = "error"
+            with lock:
+                statuses.append(status)
+
+        threads = [threading.Thread(target=_run, args=(i,)) for i in range(count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=600)
+
+        reported = admin.get(f"/vaults/{vault_id}").json().get("total_size_bytes") or 0
+        # Non-vacuity first. `reported <= limit` is trivially true when every upload failed, and
+        # an earlier version of this test passed in half a second doing exactly that -- proving
+        # nothing while looking like a guard.
+        assert any(status == 200 for status in statuses), (
+            f"no upload succeeded, so the ceiling was never tested: {sorted(map(str, statuses))}")
+        assert reported > 0, "nothing was stored, so this test proved nothing"
+        assert reported <= limit, (
+            f"{reported / MB:.0f} MB was stored in a {limit / MB:.0f} MB vault "
+            f"({sorted(map(str, statuses))}); the direct multipart path does not enforce the "
+            "ceiling under concurrency")
+    finally:
+        admin.post(f"/vaults/{vault_id}/delete")
