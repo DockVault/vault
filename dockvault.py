@@ -1405,6 +1405,95 @@ def fetch_release_tags(url=RELEASES_URL, fetch=None):
         return []
 
 
+# Where a released version's upgrade description lives when this checkout does not have it.
+# Raw content rather than the release asset API: no token, no rate-limited JSON hop, and the file
+# is the same bytes the release published.
+MATRIX_RAW_URL = ("https://raw.githubusercontent.com/DockVault/vault/%s/docs/upgrade-matrix.json")
+MATRIX_LOCAL = os.path.join("docs", "upgrade-matrix.json")
+
+
+def _semver_key(version):
+    return tuple(int(part) for part in version.split("."))
+
+
+def plan_upgrade_path(matrix, current, target):
+    """What it takes to get from `current` to `target`, walking one adjacent edge at a time.
+
+    Returns a dict: `steps` (the edges traversed, in order), `requires_backup`, `irreversible`,
+    `blocked` (the first blocked edge, or None), `conditions`, and `known` (False when the matrix
+    cannot describe the hop at all).
+
+    Composed from adjacent edges rather than looked up as a single hop, because that is how the
+    matrix is authored: an edge is only declared between neighbouring releases, so a longer upgrade
+    is a walk. A pair nobody tested therefore has no edge to find, which is the point -- it comes
+    back unknown instead of coming back safe.
+    """
+    unknown = {"steps": [], "requires_backup": True, "irreversible": True, "blocked": None,
+               "conditions": [], "known": False}
+    if not isinstance(matrix, dict):
+        return unknown
+    versions = matrix.get("versions") or {}
+    current = (current or "").lstrip("vV")
+    target = (target or "").lstrip("vV")
+    if current not in versions or target not in versions:
+        return unknown
+    try:
+        ordered = sorted(versions, key=_semver_key)
+    except (TypeError, ValueError):
+        return unknown
+    if _semver_key(target) < _semver_key(current):
+        # A downgrade. The matrix describes forward edges only, and reversing one is not the same
+        # claim, so this is deliberately not classified from it.
+        return unknown
+
+    edges = {(e.get("from"), e.get("to")): e for e in (matrix.get("edges") or [])}
+    walk = ordered[ordered.index(current):ordered.index(target) + 1]
+    steps = []
+    for a, b in zip(walk, walk[1:]):
+        edge = edges.get((a, b))
+        if edge is None:
+            return unknown
+        steps.append(edge)
+
+    return {
+        "steps": steps,
+        "requires_backup": any(e.get("requires_backup") for e in steps),
+        "irreversible": any(not e.get("reversible", True) for e in steps),
+        "blocked": next((e for e in steps if e.get("kind") == "blocked"), None),
+        "conditions": [c for e in steps for c in (e.get("conditions") or [])],
+        "known": True,
+    }
+
+
+def fetch_upgrade_matrix(tag, root=None, opener=None):
+    """The upgrade matrix describing a hop TO `tag`. Returns (matrix_or_None, source_description).
+
+    The published file for the target is preferred over this checkout's copy: the checkout may be
+    older than the release being installed, and an older file cannot describe a newer hop. The
+    local copy is the offline fallback and is labelled as possibly stale.
+    """
+    import json as _json
+
+    if tag:
+        url = MATRIX_RAW_URL % (tag if tag.startswith("v") else "v" + tag)
+        try:
+            import urllib.request
+            get = opener or urllib.request.urlopen
+            with get(url, timeout=15) as response:
+                return _json.loads(response.read().decode("utf-8")), "the published %s matrix" % tag
+        except Exception:
+            pass
+
+    if root:
+        local = os.path.join(root, MATRIX_LOCAL)
+        try:
+            with open(local, encoding="utf-8") as handle:
+                return _json.load(handle), "this checkout's matrix (may predate the target)"
+        except Exception:
+            pass
+    return None, "no upgrade matrix could be read"
+
+
 def read_version_file(root):
     """The current version from <root>/VERSION, or 'unknown'."""
     try:
@@ -2386,7 +2475,17 @@ class DockVault:
             self._fail("no .env found - nothing to back up (run Setup first)")
         names = set_volume_names(prefix)
         ts = _timestamp()
-        bundle = os.path.join(self._backup_root(args), "dockvault-%s-%s" % (prefix, ts))
+        root = self._backup_root(args)
+        bundle = os.path.join(root, "dockvault-%s-%s" % (prefix, ts))
+        # The stamp has second resolution, so two backups inside one second want the same
+        # directory and the second one dies on FileExistsError. That used to need an operator
+        # typing quickly; now that an upgrade takes a backup on its own, two in a second is
+        # something the tool can do to itself -- and failing to back up is the one outcome the
+        # gate above must not produce by accident.
+        suffix = 1
+        while os.path.exists(bundle):
+            bundle = os.path.join(root, "dockvault-%s-%s-%d" % (prefix, ts, suffix))
+            suffix += 1
         try:
             os.makedirs(bundle)
             # Restrict the whole bundle dir to the owner (makedirs' mode is umask-masked): the volume
@@ -2684,6 +2783,80 @@ class DockVault:
             print("  Its .env (no longer matching any data) was moved to: %s" % archived)
         print(pal.paint("  Run Setup to start a fresh deployment.\n", "cyan"))
 
+    def _running_version(self, profiles=None):
+        """(version, where_it_came_from). The container is asked first, and that is the fix.
+
+        `VERSION` in the checkout describes what was last checked out, not what is running: the
+        pull path rewrites DOCKVAULT_IMAGE and recreates from the published image without touching
+        the file. Read it after a pull upgrade and the tool reports the version it was installed
+        at, which then becomes the origin for every later hop -- including the comparison that
+        decides whether the next change is a downgrade.
+
+        Asked over `docker exec` rather than HTTP: the endpoint that carries the version sits
+        behind whatever port and certificate the deployment chose, and a self-signed certificate on
+        a non-default port is the normal case here, not an edge one.
+        """
+        service = self._web_service(profiles or self._load_env().get("COMPOSE_PROFILES", "combined"))
+        try:
+            out = subprocess.run(["docker", "exec", service, "cat", "/app/VERSION"],
+                                 capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            out = None
+        if out is not None and out.returncode == 0:
+            found = (out.stdout or "").strip()
+            if parse_semver(found):
+                return found, "the running container"
+        fallback = read_version_file(self.root)
+        return fallback, "this checkout's VERSION file (nothing is running to ask)"
+
+    def _describe_hop(self, plan, source, current, tag):
+        """Print what the hop does. Returns nothing; the caller decides what to require."""
+        pal = self.pal
+        print(pal.paint("\n  What this change involves", "cyan"))
+        print("    described by : %s" % source)
+        if not plan["known"]:
+            print(pal.paint(
+                "    NOT DESCRIBED: the matrix does not describe %s -> %s. This is treated as "
+                "needing a backup and as possibly irreversible, because an undescribed change is "
+                "not a safe one -- read the release notes before continuing."
+                % (current, tag), "yellow"))
+            return
+        print("    steps        : %d adjacent release(s)" % len(plan["steps"]))
+        print("    reversible   : %s" % ("no" if plan["irreversible"] else "yes"))
+        print("    backup       : %s" % ("required" if plan["requires_backup"] else "not required"))
+        for condition in plan["conditions"]:
+            print(pal.paint("    note         : %s" % condition.get("summary", ""), "yellow"))
+            if condition.get("detect"):
+                print("                   check with: %s" % condition["detect"])
+
+    def _require_backup(self, args, interactive, reason):
+        """Take a backup, or accept an operator's word that one exists. False = do not proceed.
+
+        Takes one by default rather than looking for a recent bundle and trusting it. What this
+        does NOT do is prove the backup restores -- verifying that means standing up a second
+        deployment from it, which this command is not going to do behind the operator's back. The
+        prompt says so rather than implying a guarantee it cannot make.
+        """
+        pal = self.pal
+        print(pal.paint("\n  A backup is required: %s" % reason, "yellow"))
+        if args and getattr(args, "backup_verified", False):
+            print("  --backup-verified given: proceeding on your own backup. This tool has not "
+                  "checked that it exists or that it restores.")
+            return True
+        if interactive and not confirm("Take a backup now (recommended)?", pal, default=True):
+            print(pal.paint("  Refusing to proceed without a backup. Re-run with "
+                            "--backup-verified if you keep backups elsewhere.", "red"))
+            return False
+        try:
+            self._do_backup(self._load_env(), args)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            print(pal.paint("  the backup did not complete: %s" % exc, "red"))
+            return False
+        print(pal.paint("  Backup written. Note that it has not been test-restored.", "green"))
+        return True
+
     def update(self, args=None):
         """Update menu: show the current version, list releases newest-first (fail-closed to a manual
         tag), pick one to upgrade OR downgrade to, WARN about the no-down-migration schema risk +
@@ -2694,10 +2867,10 @@ class DockVault:
         if not ok:
             self._fail(msg)
         env = self._load_env()
-        current = read_version_file(self.root)
+        current, version_source = self._running_version(env.get("COMPOSE_PROFILES", "combined"))
         interactive = not (args and getattr(args, "non_interactive", False))
         print(pal.paint("\n  DockVault update", "cyan"))
-        print("  current version : %s" % current)
+        print("  current version : %s  (from %s)" % (current, version_source))
         print("  update check    : %s (every %s min)" % (
             (env.get("UPDATE_CHECK_ENABLED") or "false"),
             env.get("UPDATE_CHECK_INTERVAL_MINUTES") or "360"))
@@ -2722,13 +2895,43 @@ class DockVault:
         print(pal.paint("\n  %s: %s -> %s" % ("DOWNGRADE" if down else "Version change", current, tag),
                         "red" if down else "yellow"))
         print(pal.paint("  The database has no down-migrations, so a change across a schema change can fail", "yellow"))
-        print(pal.paint("  to start (a downgrade especially). BACK UP FIRST (Backup & Restore menu).", "yellow"))
+        print(pal.paint("  to start (a downgrade especially).", "yellow"))
+
+        matrix, matrix_source = fetch_upgrade_matrix(tag, root=self.root)
+        plan = plan_upgrade_path(matrix, current, tag)
+        self._describe_hop(plan, matrix_source, current, tag)
+
+        if plan["blocked"] is not None:
+            self._fail("the upgrade matrix says this change must not be taken directly: %s"
+                       % plan["blocked"].get("reason", "no reason recorded"))
+
+        dry_run = bool(getattr(args, "dry_run", False)) if args else False
+        if dry_run:
+            print(pal.paint("\n  --dry-run: nothing was changed.\n", "cyan"))
+            return
+
         confirmed = bool(getattr(args, "yes", False)) if args else False
         if interactive:
             confirmed = confirm("Proceed with the version change?", pal, default=False)
         if not confirmed:
             print(pal.paint("  Cancelled.\n", "yellow"))
             return
+
+        # An irreversible change is acknowledged in words, not with a keypress. The point is to
+        # make the operator state the thing they are accepting, so it cannot be got past by
+        # reflex on a prompt that looks like every other prompt.
+        if plan["irreversible"] and interactive:
+            typed = ask("This change cannot be rolled back. Type 'i accept' to continue", pal)
+            if typed.strip().lower() != "i accept":
+                print(pal.paint("  Cancelled.\n", "yellow"))
+                return
+
+        if plan["requires_backup"] or plan["irreversible"] or down:
+            why = ("the matrix marks this change as needing one" if plan["requires_backup"]
+                   else "this change cannot be rolled back" if plan["irreversible"]
+                   else "this is a downgrade, and there are no down-migrations")
+            if not self._require_backup(args, interactive, why):
+                return
 
         if from_source:
             print(pal.paint("  git checkout %s + rebuild ..." % tag, "cyan"))
@@ -3051,6 +3254,8 @@ def build_parser():
     up.add_argument("--tag", dest="tag", help="version tag to switch to (e.g. v0.6.0)")
     up.add_argument("--source", dest="source", action="store_true", help="build from source (git checkout) instead of pulling the GHCR image")
     up.add_argument("--yes", dest="yes", action="store_true", help="confirm the version change (required in --non-interactive)")
+    up.add_argument("--dry-run", dest="dry_run", action="store_true", help="report what the change involves and stop, changing nothing")
+    up.add_argument("--backup-verified", dest="backup_verified", action="store_true", help="you keep backups elsewhere; skip taking one (not checked)")
     up.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
 
     lp = parsers["logs"]

@@ -17,8 +17,18 @@ printed unconditionally on every path, so it still appears. What the stale compa
 the DOWNGRADE label that tells an operator the warning is about THEM this time, and the red it is
 printed in. The generic caution survives; the specific one does not.
 
-These are CHARACTERIZATION tests. They record today's behaviour so the phase that makes the pull
-path maintain `VERSION` -- or stops reading it as the source of truth -- visibly flips them.
+WHAT CHANGED SINCE THESE WERE WRITTEN. The pull path still does not rewrite `VERSION`, and that is
+now harmless: the tool asks the RUNNING CONTAINER what it is and only falls back to the file when
+nothing is running to ask. So the consequence described above -- an operator being told the wrong
+current version, and a step backwards announced as an ordinary change -- no longer happens on a
+live deployment.
+
+These tests run with nothing running, so they exercise the fallback, and that is deliberate. They
+pin two things worth keeping: that the file really is stale after a pull upgrade (so the fallback
+is a fallback and not a second source of truth), and that when the tool is reduced to it, the
+protection does not go with the label -- a downgrade it cannot classify is still gated on a backup.
+A live deployment reading its version from the container is asserted separately, in the upgrade-gate
+tests.
 
 Nothing here touches Docker or the network: the update paths are driven with their compose and
 health calls stubbed, so what runs is the tool's real decision-making.
@@ -65,6 +75,11 @@ def _stub_the_engine(monkeypatch, tool):
     monkeypatch.setattr(tool, "_recreate_stack", lambda build: True)
     monkeypatch.setattr(tool, "_start_secure_stack", lambda *a, **k: True)
     monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    # Recorded rather than performed. A downgrade now requires a backup, so these runs would
+    # otherwise write real bundles into the deployment root for tests that are about what the tool
+    # SAYS -- and two updates inside one second collide on the timestamped bundle name.
+    tool.backups_taken = []
+    monkeypatch.setattr(tool, "_do_backup", lambda env, args: tool.backups_taken.append(True))
 
 
 def _update(tool, tag, source=False):
@@ -93,8 +108,9 @@ def test_the_pull_path_moves_the_image_and_leaves_version_behind(tmp_path, monke
     assert dv.read_version_file(str(tmp_path)) == "0.9.0"
 
 
-def test_a_stale_version_file_suppresses_the_downgrade_warning(tmp_path, monkeypatch, capsys):
-    """The consequence an operator actually meets, driven rather than reasoned about.
+def test_with_nothing_running_the_stale_file_still_costs_the_downgrade_label(tmp_path, monkeypatch,
+                                                                             capsys):
+    """What the fallback costs, and what it does not.
 
     Two updates in sequence, both through the pull path. The first goes to 0.10.0. The second goes
     to 0.9.5 -- a genuine step backwards from what is running -- and is announced as an ordinary
@@ -127,6 +143,11 @@ def test_a_stale_version_file_suppresses_the_downgrade_warning(tmp_path, monkeyp
     assert "no down-migrations" in second, (
         "the no-down-migrations warning is supposed to print on every path; if it has become "
         "conditional, the surrounding docstring is now wrong")
+    # And the consequence of the stale comparison, now that a downgrade is gated: the tool did
+    # demand a backup, because it treats an unclassifiable hop as the worst case -- so the missing
+    # DOWNGRADE label costs the operator the label, not the protection.
+    assert tool.backups_taken, (
+        "a step backwards proceeded without a backup; the stale version cost more than the label")
 
     # The same question asked of the version actually deployed, to show the warning was not
     # withheld for some other reason: it is withheld only because 'current' is wrong.
