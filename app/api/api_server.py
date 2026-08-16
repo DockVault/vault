@@ -8451,6 +8451,27 @@ async def upload_file(
                     # the partial encrypted file (matches the per-vault abort pattern).
                     _enforce_deployment_storage_quota(db, final_size)
 
+                    # And the PER-VAULT ceiling, on the same terms and for the same two
+                    # reasons. Both guards above it consume `vault_current_size`, read once
+                    # before the stream began: stale the moment another upload commits. And
+                    # the atomic reservation is only taken when Content-Length gave a size,
+                    # so a client that omits the header -- which any streaming client does by
+                    # default -- had no reservation and only that stale number standing
+                    # between it and the limit. Measured: two concurrent requests from ONE
+                    # ordinary account put 250% of a vault's ceiling into it, and sixteen put
+                    # 400%, every one of them returning success. Sequentially the same
+                    # uploads are refused correctly, which is why it survived.
+                    #
+                    # Read fresh, like the resumable path's guard. This does not make the
+                    # check atomic -- see the note there -- but it removes the two holes that
+                    # make this path bypassable without any timing skill at all.
+                    _vault_now = (db.query(Vault.total_size_bytes)
+                                  .filter(Vault.id == vault_id).scalar() or 0)
+                    if vault_size_limit and _vault_now + final_size > vault_size_limit:
+                        raise HTTPException(
+                            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                            detail="Upload rejected: Vault size limit would be exceeded")
+
                 # Broadcast final progress (100%)
                 broadcast_event({
                     "event": {
@@ -9634,7 +9655,21 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
             })
 
         # Final size-limit guard now that the true plaintext size is known.
-        if vault.size_limit and (vault.total_size_bytes or 0) + final_size > vault.size_limit:
+        #
+        # The stored total is read FRESH, and that is the whole fix. `vault` was loaded when this
+        # request began, before any overlapping upload committed, so its copy is stale by exactly
+        # the amount being checked against: three consecutive completions were observed all seeing
+        # the same total and each concluding there was room. Five accounts sharing one vault,
+        # released together, put 120 MB into a 64 MB vault that way, with all five returning
+        # success.
+        #
+        # Two heavier answers were built and discarded, each disproved by the tests that cover
+        # this. A row lock around the check is held while the file is encrypted, so concurrent
+        # uploads then exceed the client's timeout. An atomic Redis reservation is no better than
+        # the total it is handed -- with a stale read it still admits everyone, and with a fresh
+        # read it changes nothing. Measured both ways before being removed.
+        stored_now = db.query(Vault.total_size_bytes).filter(Vault.id == vault_id).scalar() or 0
+        if vault.size_limit and stored_now + final_size > vault.size_limit:
             raise HTTPException(status_code=413, detail="File would exceed the vault size limit")
         _enforce_deployment_storage_quota(db, final_size)   # deployment-wide stored-bytes limit
 

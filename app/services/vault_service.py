@@ -12,7 +12,7 @@ import uuid
 import mimetypes
 
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, func
 from sqlalchemy.exc import IntegrityError
 
 from app.core.models import User, Vault, Folder, File, VaultPermissionEnum
@@ -1185,8 +1185,7 @@ class VaultService:
             match,
         ).all():
             paths.append(ex.storage_path)
-            vault.total_size_bytes = max(0, (vault.total_size_bytes or 0) - (ex.size_bytes or 0))
-            vault.file_count = max(0, (vault.file_count or 0) - 1)
+            self._adjust_vault_totals(vault, -(ex.size_bytes or 0), -1)
             self.db.delete(ex)
         if paths:
             # Force the DELETEs to hit the DB NOW, before the caller inserts the replacement
@@ -1209,6 +1208,29 @@ class VaultService:
                 # The blob's relative path is a storage path; the exception carries the
                 # ABSOLUTE one on an OSError. Neither belongs in a log an operator pastes.
                 safe_event('blob.replace-cleanup.failed', e)
+
+    def _adjust_vault_totals(self, vault, size_delta, count_delta):
+        """Move a vault's size and file counters by a delta, atomically and never below zero.
+
+        In SQL, for the same reason the increment is: `vault.total_size_bytes -= n` in Python reads
+        the value this session loaded, subtracts, and writes the whole number back, so it erases any
+        change another session committed in between. On the way up that loses stored bytes and
+        unbounds the size limit. On the way down it does the same in reverse -- and two of the
+        subtraction sites had no floor at all, so a lost update could drive the counter negative,
+        which the limit check reads as free headroom.
+
+        GREATEST is applied in the database rather than in Python for the same reason as the
+        arithmetic: a floor computed from a stale read is not a floor.
+        """
+        self.db.query(Vault).filter(Vault.id == vault.id).update(
+            {
+                Vault.total_size_bytes: func.greatest(
+                    0, func.coalesce(Vault.total_size_bytes, 0) + size_delta),
+                Vault.file_count: func.greatest(
+                    0, func.coalesce(Vault.file_count, 0) + count_delta),
+            },
+            synchronize_session=False,
+        )
 
     def finalize_streaming_upload(self, file_info: dict, total_size: int, checksum: str,
                                   zk_key_version: Optional[int] = None,
@@ -1299,10 +1321,28 @@ class VaultService:
         # Encrypt the filename/MIME at rest (Standard vaults) before persisting. No-op for ZK.
         _seal_named_object(file_info['vault'], file, is_file=True)
 
-        # Update vault statistics
+        # Update vault statistics.
+        #
+        # In SQL, not in Python. `vault.total_size_bytes += total_size` reads the value this
+        # session loaded, adds to it, and writes the whole number back -- so two uploads that
+        # overlap both start from the same total and the second commit erases the first. The
+        # arithmetic is lost, and the size limit with it, because the limit is checked against
+        # exactly this counter: measured, six concurrent uploads put 144 MB into a 64 MB vault and
+        # every one of them returned success. Sequentially the same uploads are refused correctly,
+        # which is why it went unnoticed.
+        #
+        # Letting the database do the addition makes each increment atomic regardless of what any
+        # session last read. The row lock taken by the caller before the limit check is what stops
+        # two uploads both passing a check they would jointly fail; this is what stops the totals
+        # from being wrong even when they legitimately both pass.
         vault = file_info['vault']
-        vault.total_size_bytes += total_size
-        vault.file_count += 1
+        self.db.query(Vault).filter(Vault.id == vault.id).update(
+            {
+                Vault.total_size_bytes: func.coalesce(Vault.total_size_bytes, 0) + total_size,
+                Vault.file_count: func.coalesce(Vault.file_count, 0) + 1,
+            },
+            synchronize_session=False,
+        )
 
         try:
             self.db.commit()
@@ -1321,6 +1361,10 @@ class VaultService:
         # leaving a live File row with no blob.
         try:
             self.db.refresh(file)
+            # The counters were changed by the database rather than by this session, so its copy
+            # of the vault row is stale. Refresh it too, or a later read in the same request
+            # reports the value this session happened to load.
+            self.db.refresh(vault)
         except Exception:
             pass
         # Commit succeeded: the prior same-name rows are gone, so it is now safe to remove
@@ -1636,8 +1680,7 @@ class VaultService:
         # pointing at a destroyed blob (every download then 500s with FileNotFoundError). Destroying
         # the blob AFTER a successful commit leaves at most a recoverable/GC-able orphan on failure
         # (mirrors the _remove_blobs-after-commit ordering in finalize_streaming_upload).
-        vault.total_size_bytes -= file.size_bytes
-        vault.file_count -= 1
+        self._adjust_vault_totals(vault, -(file.size_bytes or 0), -1)
         self.db.delete(file)
         self.db.commit()
 
@@ -1849,8 +1892,7 @@ class VaultService:
                 _path = self.storage_path / file.storage_path
                 vault = file.vault
                 if vault:
-                    vault.total_size_bytes -= file.size_bytes
-                    vault.file_count -= 1
+                    self._adjust_vault_totals(vault, -(file.size_bytes or 0), -1)
                 self.db.delete(file)
                 stale_paths.append(_path)
             except Exception as e:

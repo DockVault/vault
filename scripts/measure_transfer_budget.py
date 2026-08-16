@@ -59,6 +59,70 @@ done
 """
 
 
+def container_cpu_seconds(container):
+    """CPU seconds this container has used since it started, or None if unreadable.
+
+    Both cgroup layouts: v2 keeps microseconds in `cpu.stat`, v1 keeps nanoseconds in
+    `cpuacct.usage`. On a v1 host Docker bind-mounts each container's own cgroup subtree at
+    /sys/fs/cgroup, so the counter read from inside is that container's even though the cgroup
+    NAMESPACE is shared -- an earlier version of this file assumed the opposite and refused to
+    report. Checked by perturbation instead of by assumption: burning CPU in one container moves
+    that container's counter and not the others'.
+
+    The counter is monotonic, so a measurement is a difference across a window, and the window has
+    to be one in which the stack is otherwise quiet. Reading it seconds after a heavy transfer, on
+    a stack still finishing that work, is what produced the nonsense that caused the wrong
+    diagnosis.
+    """
+    for command, scale in (
+        ("awk '/^usage_usec/ {print $2}' /sys/fs/cgroup/cpu.stat", 1_000_000),
+        ("cat /sys/fs/cgroup/cpuacct/cpuacct.usage", 1_000_000_000),
+    ):
+        try:
+            out = subprocess.run(["docker", "exec", container, "sh", "-c", command],
+                                 capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        value = (out.stdout or "").strip()
+        if out.returncode == 0 and value.isdigit():
+            return int(value) / scale
+    return None
+
+
+def simultaneous_peak(samplers, step=0.05):
+    """Max over time of the summed allocation across containers -- the real whole-stack figure.
+
+    Each container is sampled independently, so the series do not share timestamps. They are walked
+    on a common clock, carrying each container's last reading forward, and the maximum of the sum
+    is taken. Returns None when any container produced too little to align.
+    """
+    # A sampler that kept no timestamps cannot contribute to an aligned total, and there is no
+    # honest figure to compute from a subset -- so this reports nothing rather than a partial sum.
+    if any(not getattr(s, "series", None) for s in samplers):
+        return None
+    series = [sorted(s.series) for s in samplers]
+    if any(len(one) < 2 for one in series):
+        return None
+    start = max(one[0][0] for one in series)
+    end = min(one[-1][0] for one in series)
+    if end <= start:
+        return None
+
+    cursors = [0] * len(series)
+    held = [None] * len(series)
+    best = 0
+    now = start
+    while now <= end:
+        for i, one in enumerate(series):
+            while cursors[i] < len(one) and one[cursors[i]][0] <= now:
+                held[i] = one[cursors[i]][1]
+                cursors[i] += 1
+        if all(v is not None for v in held):
+            best = max(best, sum(held))
+        now += step
+    return best or None
+
+
 class CgroupSampler(threading.Thread):
     """Peak memory for one container, sampled from inside it."""
 
@@ -75,6 +139,11 @@ class CgroupSampler(threading.Thread):
         # The honest figure is the rise from this run's own resting reading.
         self.floor_anon = None
         self.samples = 0
+        # (monotonic seconds, anon bytes) for every reading. Summing each container's own peak
+        # overstates the total, because the peaks do not occur at the same moment -- measured, by
+        # 7-13%. The timestamps were already being discarded; keeping them is the whole difference
+        # between an upper bound and the number a machine actually has to hold.
+        self.series = []
 
     def run(self) -> None:
         self._proc = subprocess.Popen(
@@ -96,6 +165,7 @@ class CgroupSampler(threading.Thread):
                 self.peak_total = max(self.peak_total, total)
                 self.peak_anon = max(self.peak_anon, anon)
                 self.floor_anon = anon if self.floor_anon is None else min(self.floor_anon, anon)
+                self.series.append((time.monotonic(), anon))
                 self.samples += 1
         except Exception:                          # noqa: BLE001 - a lost sample is not a failure
             pass
@@ -164,6 +234,10 @@ def main() -> int:
     parser.add_argument("--mode", choices=("both", "upload", "download"), default="both",
                         help="both = one upload and one download at the same time; the single "
                              "modes attribute the cost to one half")
+    parser.add_argument("--transfers", type=int, default=1,
+                        help="how many of each direction to run at once. The published capacity "
+                             "table extrapolated to 27 concurrent transfers from a measurement of "
+                             "two; this is what tests whether the cost is actually linear")
     parser.add_argument("--chunk-mb", type=float, default=5.0,
                         help="transport chunk the client declares. 0 means one chunk for the "
                              "whole file, which is what an impolite client can ask for")
@@ -190,6 +264,7 @@ def main() -> int:
             for sampler in samplers:
                 sampler.start()
             time.sleep(0.3)                        # let each one take a resting reading first
+            cpu_before = {c: container_cpu_seconds(c) for c in args.containers}
 
             outcomes: list[dict] = []
             errors: list[str] = []
@@ -215,11 +290,15 @@ def main() -> int:
                 except Exception as exc:           # noqa: BLE001
                     errors.append(f"download: {exc}")
 
+            # N of each direction, not one. Whether the cost is linear in the number of
+            # concurrent transfers is an assumption the capacity table rests on entirely, and it
+            # was never tested -- the table extrapolated to twenty-seven from a run of two.
             work = []
-            if args.mode in ("both", "upload"):
-                work.append(threading.Thread(target=_do_upload))
-            if args.mode in ("both", "download"):
-                work.append(threading.Thread(target=_do_download))
+            for _ in range(max(1, args.transfers)):
+                if args.mode in ("both", "upload"):
+                    work.append(threading.Thread(target=_do_upload))
+                if args.mode in ("both", "download"):
+                    work.append(threading.Thread(target=_do_download))
 
             started = time.monotonic()
             for thread in work:
@@ -244,6 +323,11 @@ def main() -> int:
                     f"{size_mb} MB: too few samples from {thin} over {wall:.1f}s to call any of "
                     "this a peak")
 
+            cpu_after = {c: container_cpu_seconds(c) for c in args.containers}
+            cpu_used = {c: (None if cpu_before.get(c) is None or cpu_after.get(c) is None
+                            else round(cpu_after[c] - cpu_before[c], 2))
+                        for c in args.containers}
+
             peaks = {s.container: round(s.peak_anon / MB, 1) for s in samplers}
             rises = {s.container: round((s.peak_anon - (s.floor_anon or s.peak_anon)) / MB, 1)
                      for s in samplers}
@@ -261,6 +345,16 @@ def main() -> int:
                 "peak_including_cache_mb": {s.container: round(s.peak_total / MB, 1)
                                             for s in samplers},
                 "sum_of_peaks_mb": round(sum(peaks.values()), 1),
+                # The number a machine actually has to hold, as distinct from the sum of peaks
+                # that never coincide. This is the one to size against.
+                "simultaneous_peak_mb": (
+                    None if simultaneous_peak(samplers) is None
+                    else round(simultaneous_peak(samplers) / MB, 1)),
+                "transfers_at_once": len(work),
+                "cpu_seconds": cpu_used,
+                "cpu_seconds_total": (
+                    None if any(v is None for v in cpu_used.values())
+                    else round(sum(v for v in cpu_used.values()), 2)),
             })
 
             print(f"\n{size_mb} MB  mode={args.mode}  chunk={chunk_bytes // MB or size_mb} MB "
