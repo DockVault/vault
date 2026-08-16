@@ -559,6 +559,138 @@ def encode_direct_dek_wrap_v2(vector: dict[str, Any]) -> dict[str, str]:
     }
 
 
+V2_PURPOSE_TEAM_DEK = 0x02
+V2_PURPOSE_TEAM_PRIV = 0x03
+V2_INFO_DEK_TEAM = b"dockvault-zk-dek-team-v2"
+V2_INFO_TEAMPRIV = b"dockvault-zk-teampriv-v2"
+
+
+def _v2_team_dek_context(vault_id: str, dek_epoch: int) -> bytes:
+    """Vault and epoch, and deliberately NO recipient.
+
+    One team-DEK wrap serves every member -- that is what the hierarchical mode is for -- so there
+    is no recipient to bind. The member-specific step is the team PRIVATE key wrap below.
+    """
+    return _v2_uuid_text(vault_id) + b"\x00" + _v2_epoch(dek_epoch)
+
+
+def _v2_team_priv_context(vault_id: str, recipient_user_id: str) -> bytes:
+    """Vault and recipient, and deliberately NO epoch.
+
+    The only epoch that would mean anything here is the team keypair's, and the server assigns it;
+    binding the DEK epoch instead would tie a key to a rotation it has nothing to do with.
+    """
+    return _v2_uuid_text(vault_id) + b"\x00" + _v2_uuid_text(recipient_user_id)
+
+
+def _v2_seal(plaintext: bytes, purpose: int, context: bytes, info_label: bytes,
+             ephemeral_scalar_hex: str, peer_scalar_hex: str, nonce_hex: str) -> dict[str, str]:
+    """The sealing the two TEAM wraps share: header, nonce, AES-GCM over the transcript.
+
+    Not the direct wrap, which is written out longhand a few functions up. That mirrors the
+    browser, which also hand-rolls the direct one and routes both team wraps through a shared
+    helper -- and mirroring it is deliberate rather than accidental: a shared helper here would
+    make a mistake in the sealing consistent across both team constructions in BOTH runtimes, which
+    is exactly the agreement a second implementation is supposed to be unable to produce.
+    """
+    header = _v2_header(purpose)
+    shared = _ecdh(ephemeral_scalar_hex, peer_scalar_hex)
+    key = _hkdf(shared, salt=V2_SALT, info=info_label + b"\x00" + context)
+    nonce = bytes.fromhex(nonce_hex)
+    if len(nonce) != 12:
+        raise ValueError("a v2 nonce is 12 bytes")
+    body = AESGCM(key).encrypt(nonce, plaintext, header + context)
+    return {
+        "wrapped_b64": b64e(header + nonce + body),
+        "ephemeral_public_key_b64": b64e(p384_public_raw(ephemeral_scalar_hex)),
+    }
+
+
+def _v2_open(wrapped_b64: str, purpose: int, context: bytes, info_label: bytes,
+             ephemeral_public_key_b64: str, recipient_scalar_hex: str) -> bytes:
+    wrapped = b64d(wrapped_b64)
+    if len(wrapped) < 8 + 12 + 16:
+        raise ValueError("truncated v2 payload")
+    if wrapped[0:4] != V2_MAGIC:
+        raise ValueError("not a v2 payload: bad magic")
+    if wrapped[4] != V2_VERSION:
+        raise ValueError("unsupported v2 version")
+    if wrapped[5] != purpose:
+        raise ValueError("this payload is not the purpose the caller expected")
+    if wrapped[6:8] != b"\x00\x00":
+        raise ValueError("reserved bytes must be zero")
+
+    point = b64d(ephemeral_public_key_b64)
+    if len(point) != 97 or point[0] != 0x04:
+        raise ValueError("the ephemeral public key is an uncompressed P-384 point")
+    peer = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP384R1(), point)
+    shared = _p384_private(recipient_scalar_hex).exchange(ec.ECDH(), peer)
+    key = _hkdf(shared, salt=V2_SALT, info=info_label + b"\x00" + context)
+    return AESGCM(key).decrypt(wrapped[8:20], wrapped[20:], _v2_header(purpose) + context)
+
+
+def encode_team_dek_wrap_v2(vector: dict[str, Any]) -> dict[str, str]:
+    """The version-2 team DEK wrap (purpose 0x02), wrapped to the vault's TEAM public key."""
+    i = vector["inputs"]
+    dek = bytes.fromhex(i["dek_hex"])
+    if len(dek) != 32:
+        raise ValueError("a team DEK wrap carries a 32-byte DEK")
+    out = _v2_seal(
+        dek, V2_PURPOSE_TEAM_DEK,
+        _v2_team_dek_context(i["vault_id"], i["dek_epoch"]), V2_INFO_DEK_TEAM,
+        i["ephemeral_private_scalar_hex"], i["team_private_scalar_hex"], i["nonce_hex"])
+    if len(b64d(out["wrapped_b64"])) != V2_DIRECT_WRAP_BYTES:
+        raise ValueError("a team DEK wrap is the same fixed 68 bytes as a direct one")
+    return {"wrapped_dek_b64": out["wrapped_b64"],
+            "ephemeral_public_key_b64": out["ephemeral_public_key_b64"]}
+
+
+def decode_team_dek_wrap_v2(wrapped_dek_b64: str, *, ephemeral_public_key_b64: str,
+                            team_private_scalar_hex: str, vault_id: str,
+                            dek_epoch: int) -> bytes:
+    if len(b64d(wrapped_dek_b64)) != V2_DIRECT_WRAP_BYTES:
+        raise ValueError("not a v2 team DEK wrap: wrong length")
+    dek = _v2_open(wrapped_dek_b64, V2_PURPOSE_TEAM_DEK,
+                   _v2_team_dek_context(vault_id, dek_epoch), V2_INFO_DEK_TEAM,
+                   ephemeral_public_key_b64, team_private_scalar_hex)
+    if len(dek) != 32:
+        raise ValueError("a team DEK wrap carries exactly a 32-byte DEK")
+    return dek
+
+
+def encode_team_priv_wrap_v2(vector: dict[str, Any]) -> dict[str, str]:
+    """The version-2 team PRIVATE key wrap (purpose 0x03), wrapped to a member's account key.
+
+    Variable length, unlike the two DEK wraps: it carries a PKCS#8 private key rather than a
+    32-byte secret, so length cannot be used to recognise it and the header does all the work.
+    """
+    i = vector["inputs"]
+    plaintext = b64d(i["team_private_pkcs8_b64"])
+    out = _v2_seal(
+        plaintext, V2_PURPOSE_TEAM_PRIV,
+        _v2_team_priv_context(i["vault_id"], i["recipient_user_id"]), V2_INFO_TEAMPRIV,
+        i["ephemeral_private_scalar_hex"], i["recipient_private_scalar_hex"], i["nonce_hex"])
+    return {"wrapped_key_b64": out["wrapped_b64"],
+            "ephemeral_public_key_b64": out["ephemeral_public_key_b64"]}
+
+
+def decode_team_priv_wrap_v2(wrapped_key_b64: str, *, ephemeral_public_key_b64: str,
+                             recipient_private_scalar_hex: str, vault_id: str,
+                             recipient_user_id: str) -> bytes:
+    return _v2_open(wrapped_key_b64, V2_PURPOSE_TEAM_PRIV,
+                    _v2_team_priv_context(vault_id, recipient_user_id), V2_INFO_TEAMPRIV,
+                    ephemeral_public_key_b64, recipient_private_scalar_hex)
+
+
+def team_private_pkcs8(scalar_hex: str) -> bytes:
+    """A P-384 private key in the PKCS#8 DER form the browser exports and wraps."""
+    return _p384_private(scalar_hex).private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+
+
 def encode_hostile_direct_dek_wrap_v2(vector: dict[str, Any], plaintext: bytes) -> dict[str, str]:
     """A well-formed v2 direct wrap carrying something other than a 32-byte DEK.
 

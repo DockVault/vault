@@ -1,0 +1,24 @@
+{
+  "schema": "dockvault-crypto-vector-v1",
+  "test_only": true,
+  "notice": "PUBLIC TEST VECTOR - NOT A SECRET - NEVER USED BY A DEPLOYMENT",
+  "format": "zero-knowledge team DEK wrap v2",
+  "purpose": 2,
+  "description": "A team DEK wrap at epoch 1. It binds the vault and the epoch and NO recipient -- one wrap serves every member -- and is sealed to the vault's TEAM public key rather than to any person.",
+  "inputs": {
+    "vault_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+    "dek_epoch": 1,
+    "dek_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "nonce_hex": "0a0b0c0d0e0f101112131415",
+    "ephemeral_private_scalar_hex": "1f2e3d4c5b6a798897a6b5c4d3e2f1000112233445566778899aabbccddeeff0011223344556677889",
+    "team_private_scalar_hex": "0fedcba9876543210112233445566778899aabbccddeeff00112233445566778899aabbccddeeff001",
+    "recipient_private_scalar_hex": "2a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f5051",
+    "recipient_user_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+    "other_vault_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "other_recipient_user_id": "16fd2706-8baf-433b-82eb-8c7fada847da"
+  },
+  "expected": {
+    "wrapped_dek_b64": "RFZaMgICAAAKCwwNDg8QERITFBWcsjouq5xLKl0+9Bp3ugVqKMybBgdAUaCcsIiHyES51BRKx+x5XxmHzIM76EWxuKg=",
+    "ephemeral_public_key_b64": "BOmQs4G6CUzREx1uKybXl/kQvXGOPwcIjl7nZdB21AlwkaPK3oF6BL6FjRVUPcz8lzQd92mjaNLanhDVOTJjOZHNlgDxbYCtDPUD3BoxhlMcdXQIbJ/DD/IoAQvg+gE3Zg=="
+  }
+}
