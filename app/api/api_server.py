@@ -9634,7 +9634,21 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
             })
 
         # Final size-limit guard now that the true plaintext size is known.
-        if vault.size_limit and (vault.total_size_bytes or 0) + final_size > vault.size_limit:
+        #
+        # The stored total is read FRESH, and that is the whole fix. `vault` was loaded when this
+        # request began, before any overlapping upload committed, so its copy is stale by exactly
+        # the amount being checked against: three consecutive completions were observed all seeing
+        # the same total and each concluding there was room. Five accounts sharing one vault,
+        # released together, put 120 MB into a 64 MB vault that way, with all five returning
+        # success.
+        #
+        # Two heavier answers were built and discarded, each disproved by the tests that cover
+        # this. A row lock around the check is held while the file is encrypted, so concurrent
+        # uploads then exceed the client's timeout. An atomic Redis reservation is no better than
+        # the total it is handed -- with a stale read it still admits everyone, and with a fresh
+        # read it changes nothing. Measured both ways before being removed.
+        stored_now = db.query(Vault.total_size_bytes).filter(Vault.id == vault_id).scalar() or 0
+        if vault.size_limit and stored_now + final_size > vault.size_limit:
             raise HTTPException(status_code=413, detail="File would exceed the vault size limit")
         _enforce_deployment_storage_quota(db, final_size)   # deployment-wide stored-bytes limit
 

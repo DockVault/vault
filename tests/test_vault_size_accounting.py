@@ -146,3 +146,96 @@ def test_a_vault_cannot_be_filled_past_its_limit_by_uploading_in_parallel(admin)
             "the limit was exceeded rather than enforced")
     finally:
         admin.delete(f"/vaults/{vault_id}")
+
+
+def test_the_limit_holds_when_separate_accounts_upload_into_one_vault(admin):
+    """The case a single account cannot reach, and the one that decided against a reservation.
+
+    An account has a ceiling on simultaneous upload sessions, so a single-account test is throttled
+    below the threshold where the check-then-act at completion could race. Separate accounts do not
+    share that ceiling, so this is where the race should surface if it is reachable at all -- and
+    it is the reason an atomic reservation was written for this path.
+
+    It does not surface. Five accounts, released together from a barrier so their completions land
+    at the same moment, still cannot put 120 MB into a 64 MB vault: the atomic counter is committed
+    before the next completion reads it, and the reads serialise. That measurement is why the
+    reservation is not in the tree -- machinery nothing can show a need for is machinery nothing
+    exercises.
+
+    If this test ever fails, the reservation is the answer and the reasoning above is where to
+    start.
+    """
+    from conftest import ApiClient
+
+    made = admin.post("/vaults", json={
+        "name": unique("shared-ceiling"), "vault_type": "standard", "size_limit_gb": 64 / 1024,
+    })
+    assert made.status_code == 200, made.text
+    vault_id = made.json()["id"]
+    limit = admin.get(f"/vaults/{vault_id}").json().get("size_limit") or 0
+    assert limit > 0
+
+    accounts = []
+    try:
+        for _ in range(5):
+            user = admin.create_user()
+            granted = admin.post(f"/vaults/{vault_id}/permissions",
+                                 json={"user_id": user["id"], "level": "write"})
+            assert granted.status_code in (200, 201), granted.text
+            client = ApiClient()
+            client.login(user["_username"], user["_password"])
+            accounts.append((user, client))
+
+        each = 24 * MB
+        body = b"M" * each
+        statuses = []
+        lock = threading.Lock()
+        # Released together, so the completions -- the part that checks the limit -- overlap
+        # instead of being spread out by how long the bytes take to arrive.
+        gate = threading.Barrier(len(accounts))
+
+        def _run(index, client):
+            outcome = None
+            try:
+                init = client.post(f"/vaults/{vault_id}/uploads", json={
+                    "file_name": f"shared-{index}.bin", "total_size": len(body),
+                    "total_chunks": 1, "chunk_size": len(body),
+                    "mime_type": "application/octet-stream"})
+                if init.status_code != 200:
+                    outcome = init.status_code
+                else:
+                    session = init.json()["session_id"]
+                    put = client.put(f"/vaults/{vault_id}/uploads/{session}/chunks/0",
+                                     data=body, headers=_OCTET)
+                    outcome = put.status_code if put.status_code != 200 else None
+                    if outcome is None:
+                        gate.wait(timeout=300)
+                        outcome = client.post(
+                            f"/vaults/{vault_id}/uploads/{session}/complete").status_code
+            except Exception:                        # noqa: BLE001
+                outcome = "error"
+            finally:
+                if outcome is not None and not gate.broken:
+                    try:
+                        gate.wait(timeout=1)         # never strand the others behind a failure
+                    except Exception:                # noqa: BLE001
+                        gate.abort()
+            with lock:
+                statuses.append(outcome)
+
+        threads = [threading.Thread(target=_run, args=(i, c))
+                   for i, (_user, c) in enumerate(accounts)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=600)
+
+        reported = admin.get(f"/vaults/{vault_id}").json().get("total_size_bytes") or 0
+        assert reported <= limit, (
+            f"five accounts put {reported / MB:.0f} MB into a {limit / MB:.0f} MB vault "
+            f"({sorted(map(str, statuses))}); the limit does not survive concurrent accounts and "
+            "an atomic reservation at the completion check is what closes it")
+    finally:
+        admin.delete(f"/vaults/{vault_id}")
+        for user, _client in accounts:
+            admin.delete_user(user["id"])
