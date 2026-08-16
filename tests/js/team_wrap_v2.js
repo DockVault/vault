@@ -143,12 +143,31 @@ async function teamDekResults(vector) {
     };
     const member = await fixedP384KeyPair(i.recipient_private_scalar_hex);
 
+    // Does the BROWSER bind a recipient? Ask it to write the same wrap with a different one and
+    // require identical bytes. Asserting this on the reference encoder alone proves nothing: that
+    // encoder does not read the field, so changing it is a no-op by construction and the test
+    // passes whatever the browser does.
+    installDeterministicCrypto({ randomHex: [i.nonce_hex], generatedPairs: [
+        await fixedP384KeyPair(i.ephemeral_private_scalar_hex)] });
+    const withRecipient = await capture(async () => {
+        const l = new ECCCryptoLibrary();
+        const k = await realSubtle.importKey(
+            'raw', Buffer.from(i.dek_hex, 'hex'), { name: 'AES-GCM', length: 256 }, true,
+            ['encrypt', 'decrypt']);
+        const out = await l.wrapTeamDEKV2(k, team.publicKey, {
+            vaultId: i.vault_id, dekEpoch: i.dek_epoch,
+            recipientUserId: i.other_recipient_user_id,
+        });
+        return out.wrappedDEK;
+    });
+
     return {
         writer: written.ok
             ? { wrapped_dek_b64: written.value.wrappedDEK,
                 ephemeral_public_key_b64: written.value.ephemeralPublicKey, ok: true }
             : written,
         reader: read,
+        unbound_field_ignored: withRecipient,
         adversarial: {
             // The direct purpose in a team read: the caller states the purpose, the payload never
             // selects it, so a direct wrap must not be openable here.
@@ -212,12 +231,24 @@ async function teamPrivResults(vector) {
         return b64(bytes);
     };
 
+    // The mirror-image question for the private wrap: does an epoch reach its transcript?
+    installDeterministicCrypto({ randomHex: [i.nonce_hex], generatedPairs: [
+        await fixedP384KeyPair(i.ephemeral_private_scalar_hex)] });
+    const withEpoch = await capture(async () => {
+        const l = new ECCCryptoLibrary();
+        const out = await l.wrapTeamPrivateKeyV2(team.privateKey, member.publicKey, {
+            vaultId: i.vault_id, recipientUserId: i.recipient_user_id, dekEpoch: 99,
+        });
+        return out.wrappedKey;
+    });
+
     return {
         writer: written.ok
             ? { wrapped_key_b64: written.value.wrappedKey,
                 ephemeral_public_key_b64: written.value.ephemeralPublicKey, ok: true }
             : written,
         reader: read,
+        unbound_field_ignored: withEpoch,
         adversarial: {
             purpose_team_dek: await rejected(() => readWith(mutate(5, 0x02),
                 e.ephemeral_public_key_b64)),

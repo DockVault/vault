@@ -186,8 +186,51 @@ def test_the_wrong_epoch_is_refused_however_it_is_wrong(browser_results):
         assert got == want, f"{name}: expected {want}, got {got}"
 
 
-def test_the_team_dek_binds_no_recipient():
-    """A claim about ABSENCE, which no round trip can make.
+def test_the_browser_ignores_a_recipient_offered_to_the_team_dek(browser_results):
+    """The absence claim, asked of the SHIPPED writer rather than of the reference encoder.
+
+    Asserting it on the reference alone proves nothing: that encoder never reads
+    `recipient_user_id`, so changing it is a no-op by construction and the assertion holds whatever
+    the browser does. The question that matters is whether the browser binds one -- so the harness
+    hands it a recipient and requires the bytes to come out unchanged.
+
+    If a recipient WERE bound, one wrap would stop serving every member, and the failure would not
+    be an error: it would be a vault that silently opens only for the member it was minted against.
+    """
+    for name in _names():
+        vector = _vector(name)
+        if vector["purpose"] != TEAM_DEK:
+            continue
+        offered = browser_results[name]["unbound_field_ignored"]
+        assert offered["ok"], f"the browser raised when offered a recipient: {offered.get('error')}"
+        assert offered["value"] == vector["expected"]["wrapped_dek_b64"], (
+            "offering a recipient changed the team DEK wrap, so the browser binds one and a single "
+            "wrap no longer serves every member")
+
+
+def test_the_browser_ignores_an_epoch_offered_to_the_team_private_wrap(browser_results):
+    """The mirror image, also asked of the shipped writer.
+
+    Binding the DEK epoch here would tie a member's team key to a rotation it has nothing to do
+    with, and every DEK rotation would lock members out of a key that had not changed.
+    """
+    for name in _names():
+        vector = _vector(name)
+        if vector["purpose"] != TEAM_PRIV:
+            continue
+        offered = browser_results[name]["unbound_field_ignored"]
+        assert offered["ok"], f"the browser raised when offered an epoch: {offered.get('error')}"
+        assert offered["value"] == vector["expected"]["wrapped_key_b64"], (
+            "offering an epoch changed the team private key wrap, so an epoch reaches its "
+            "transcript")
+
+
+def test_the_reference_encoder_agrees_about_what_is_not_bound():
+    """The same two claims for the encoder, which is the other half of the comparison.
+
+    Weaker than the pair above and kept for a reason: if the reference began binding a field the
+    browser does not, the byte comparison would fail and say only that the two disagree. These say
+    which side moved.
 
     One team DEK wrap serves every member. If a recipient were bound, each member would need their
     own -- and the way that failure would present is not an error but a vault that silently only
@@ -211,13 +254,6 @@ def test_the_team_dek_binds_no_recipient():
             baseline["wrapped_dek_b64"], f"{field} is not bound into the team DEK wrap"
 
 
-def test_the_team_private_key_wrap_binds_no_epoch():
-    """The mirror-image claim, for the same reason.
-
-    The only epoch that would mean anything here is the team keypair's, and the server assigns it.
-    Binding the DEK epoch instead would tie a member's team key to a rotation it has nothing to do
-    with, and every DEK rotation would lock members out of a key that had not changed.
-    """
     vector = _vector("team-priv-v2-baseline.json")
     baseline = reference.encode_team_priv_wrap_v2(vector)
 

@@ -585,12 +585,13 @@ def _v2_team_priv_context(vault_id: str, recipient_user_id: str) -> bytes:
 
 def _v2_seal(plaintext: bytes, purpose: int, context: bytes, info_label: bytes,
              ephemeral_scalar_hex: str, peer_scalar_hex: str, nonce_hex: str) -> dict[str, str]:
-    """The sealing all three v2 wraps share: header, nonce, AES-GCM over the transcript.
+    """The sealing the two TEAM wraps share: header, nonce, AES-GCM over the transcript.
 
-    The browser hand-rolls this for the direct wrap and routes both team wraps through a shared
-    helper. Written once here on purpose -- if the two implementations agree only because each has
-    its own copy of the same mistake, that is exactly what a second implementation is supposed to
-    expose.
+    Not the direct wrap, which is written out longhand a few functions up. That mirrors the
+    browser, which also hand-rolls the direct one and routes both team wraps through a shared
+    helper -- and mirroring it is deliberate rather than accidental: a shared helper here would
+    make a mistake in the sealing consistent across both team constructions in BOTH runtimes, which
+    is exactly the agreement a second implementation is supposed to be unable to produce.
     """
     header = _v2_header(purpose)
     shared = _ecdh(ephemeral_scalar_hex, peer_scalar_hex)
