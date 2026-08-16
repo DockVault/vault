@@ -12,6 +12,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import struct
 import uuid
 from pathlib import Path
@@ -466,6 +467,143 @@ def _ecdh(private_scalar_hex: str, peer_scalar_hex: str) -> bytes:
     return _p384_private(private_scalar_hex).exchange(
         ec.ECDH(), _p384_private(peer_scalar_hex).public_key()
     )
+
+
+V2_PURPOSE_DIRECT_DEK = 0x01
+V2_INFO_DEK_DIRECT = b"dockvault-zk-dek-direct-v2"
+V2_DIRECT_WRAP_BYTES = 68           # 8 header + 12 nonce + 32 ciphertext + 16 tag
+V2_EPOCH_MIN = 1
+V2_EPOCH_MAX = 0x7FFFFFFF
+
+# The browser validates a UUID with this exact pattern and then emits the matched text verbatim.
+# Deliberately NOT uuid.UUID(): that accepts braces, a urn: prefix and an unhyphenated run of 32
+# hex digits, and normalises all of them -- so a vector encoded through it could carry a value the
+# browser refuses, and the two runtimes would disagree about what is even encodable.
+_V2_UUID_TEXT = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _v2_uuid_text(value: str) -> bytes:
+    """A UUID as the 36 lowercase hyphenated ASCII bytes the v2 wrap grammar binds.
+
+    Note this is the OPPOSITE convention to the Standard-vault chunk grammar in the same product,
+    which binds the raw 16 bytes. Encoding one as the other still round-trips against itself, which
+    is exactly why it has to be pinned by a stored vector rather than by a round-trip test.
+    """
+    text = str(value).lower()
+    if not _V2_UUID_TEXT.match(text):
+        raise ValueError("v2 grammar needs a 36-character lowercase hyphenated uuid")
+    return text.encode("ascii")
+
+
+def _v2_epoch(value: int) -> bytes:
+    epoch = int(value)
+    if not V2_EPOCH_MIN <= epoch <= V2_EPOCH_MAX:
+        raise ValueError("dek epoch out of range for the v2 grammar")
+    return struct.pack(">I", epoch)
+
+
+def _v2_header(purpose: int) -> bytes:
+    """Magic, version, purpose, and two reserved bytes that MUST be zero.
+
+    Reserved is a breaking-change channel rather than an extension channel: a reader treats a
+    non-zero value as malformed, not as something newer it could skip.
+    """
+    return V2_MAGIC + bytes([V2_VERSION, purpose, 0x00, 0x00])
+
+
+def _v2_direct_context(vault_id: str, recipient_user_id: str, dek_epoch: int) -> bytes:
+    return (
+        _v2_uuid_text(vault_id) + b"\x00"
+        + _v2_uuid_text(recipient_user_id) + b"\x00"
+        + _v2_epoch(dek_epoch)
+    )
+
+
+def encode_direct_dek_wrap_v2(vector: dict[str, Any]) -> dict[str, str]:
+    """Write the version-2 direct recipient DEK wrap (purpose 0x01), independently.
+
+    Written from the specification rather than from the browser's code, because the point of the
+    exercise is that two implementations agree. The browser derives and verifies through a single
+    transcript builder shared by its writer and its reader, so any self-consistent change to the
+    grammar -- reordering the context, dropping the separators, encoding the uuids as raw bytes,
+    widening the epoch, renaming the info label -- round-trips perfectly there and is invisible.
+    This encoder is the second opinion that makes those visible.
+    """
+    inputs = vector["inputs"]
+    header = _v2_header(V2_PURPOSE_DIRECT_DEK)
+    context = _v2_direct_context(
+        inputs["vault_id"], inputs["recipient_user_id"], inputs["dek_epoch"]
+    )
+    shared = _ecdh(
+        inputs["ephemeral_private_scalar_hex"], inputs["recipient_private_scalar_hex"]
+    )
+    wrapping_key = _hkdf(
+        shared, salt=V2_SALT, info=V2_INFO_DEK_DIRECT + b"\x00" + context
+    )
+    nonce = bytes.fromhex(inputs["nonce_hex"])
+    if len(nonce) != 12:
+        raise ValueError("the v2 wrap nonce is 12 bytes")
+    dek = bytes.fromhex(inputs["dek_hex"])
+    if len(dek) != 32:
+        raise ValueError("the wrapped key is a 32-byte DEK")
+
+    body = AESGCM(wrapping_key).encrypt(nonce, dek, header + context)
+    wrapped = header + nonce + body
+    if len(wrapped) != V2_DIRECT_WRAP_BYTES:
+        raise ValueError("a v2 direct wrap is exactly 68 bytes")
+    return {
+        "wrapped_dek_b64": b64e(wrapped),
+        "ephemeral_public_key_b64": b64e(
+            p384_public_raw(inputs["ephemeral_private_scalar_hex"])
+        ),
+    }
+
+
+def decode_direct_dek_wrap_v2(
+    wrapped_dek_b64: str,
+    *,
+    ephemeral_public_key_b64: str,
+    recipient_private_scalar_hex: str,
+    vault_id: str,
+    recipient_user_id: str,
+    dek_epoch: int,
+) -> bytes:
+    """Read a version-2 direct wrap, refusing everything the grammar says to refuse.
+
+    The context is a required argument rather than something recovered from the payload: none of it
+    is carried on the wire. That is the point of the construction -- a wrap that is moved to
+    another vault, another recipient or another epoch does not decode, because the caller's own
+    idea of where it is decrypts it or nothing does.
+    """
+    wrapped = b64d(wrapped_dek_b64)
+    if len(wrapped) != V2_DIRECT_WRAP_BYTES:
+        raise ValueError("not a v2 direct wrap: wrong length")
+    if wrapped[0:4] != V2_MAGIC:
+        raise ValueError("not a v2 direct wrap: bad magic")
+    if wrapped[4] != V2_VERSION:
+        raise ValueError("unsupported v2 version")
+    if wrapped[5] != V2_PURPOSE_DIRECT_DEK:
+        raise ValueError("this payload is not a direct DEK wrap")
+    if wrapped[6:8] != b"\x00\x00":
+        raise ValueError("reserved bytes must be zero")
+
+    point = b64d(ephemeral_public_key_b64)
+    if len(point) != 97 or point[0] != 0x04:
+        raise ValueError("the ephemeral public key is an uncompressed P-384 point")
+    # from_encoded_point rejects a point that is not on the curve, which is the check that stops a
+    # crafted point from steering the shared secret.
+    peer = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP384R1(), point)
+
+    header = _v2_header(V2_PURPOSE_DIRECT_DEK)
+    context = _v2_direct_context(vault_id, recipient_user_id, dek_epoch)
+    shared = _p384_private(recipient_private_scalar_hex).exchange(ec.ECDH(), peer)
+    wrapping_key = _hkdf(
+        shared, salt=V2_SALT, info=V2_INFO_DEK_DIRECT + b"\x00" + context
+    )
+    dek = AESGCM(wrapping_key).decrypt(wrapped[8:20], wrapped[20:], header + context)
+    if len(dek) != 32:
+        raise ValueError("a direct wrap carries exactly a 32-byte DEK")
+    return dek
 
 
 def encode_direct_dek_wrap(vector: dict[str, Any]) -> dict[str, str]:
