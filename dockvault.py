@@ -2475,7 +2475,17 @@ class DockVault:
             self._fail("no .env found - nothing to back up (run Setup first)")
         names = set_volume_names(prefix)
         ts = _timestamp()
-        bundle = os.path.join(self._backup_root(args), "dockvault-%s-%s" % (prefix, ts))
+        root = self._backup_root(args)
+        bundle = os.path.join(root, "dockvault-%s-%s" % (prefix, ts))
+        # The stamp has second resolution, so two backups inside one second want the same
+        # directory and the second one dies on FileExistsError. That used to need an operator
+        # typing quickly; now that an upgrade takes a backup on its own, two in a second is
+        # something the tool can do to itself -- and failing to back up is the one outcome the
+        # gate above must not produce by accident.
+        suffix = 1
+        while os.path.exists(bundle):
+            bundle = os.path.join(root, "dockvault-%s-%s-%d" % (prefix, ts, suffix))
+            suffix += 1
         try:
             os.makedirs(bundle)
             # Restrict the whole bundle dir to the owner (makedirs' mode is umask-masked): the volume
