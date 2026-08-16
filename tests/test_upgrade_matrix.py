@@ -475,3 +475,28 @@ def test_staging_the_asset_reproduces_the_committed_file_byte_for_byte(tmp_path)
     assert (tmp_path / destination).read_bytes() == (ROOT / source).read_bytes()
     assert (ROOT / source) == MATRIX_PATH, (
         f"the staged file is {source}, not the one the gate validates")
+
+
+def test_every_workflow_that_runs_pytest_fetches_tags():
+    """Because fixing one of them and assuming the rest is how this went wrong the first time.
+
+    The check above compares the matrix against the releases that exist, and it reads them from
+    `git tag -l`. actions/checkout does not fetch tags by default, so any workflow that runs the
+    suite without asking for them turns that check into a hard failure -- which is the designed
+    behaviour, but it should be caught here rather than discovered in CI.
+
+    File-level rather than per-step: a workflow that runs pytest anywhere and never asks for tags
+    is the regression worth catching, and matching checkout blocks to jobs would be more parsing
+    than the question deserves.
+    """
+    workflows = ROOT / ".github" / "workflows"
+    offenders = []
+    for path in sorted(workflows.glob("*.yml")):
+        text = path.read_text(encoding="utf-8")
+        if "-m pytest" not in text or "actions/checkout" not in text:
+            continue
+        if "fetch-tags: true" not in text and "fetch-depth: 0" not in text:
+            offenders.append(path.name)
+    assert not offenders, (
+        "these workflows run pytest but check out without tags, so the released-versions check "
+        f"will fail in them: {', '.join(offenders)}. Add `fetch-tags: true` to their checkout")
