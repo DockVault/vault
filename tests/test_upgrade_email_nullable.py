@@ -64,8 +64,53 @@ def upgrade_stack(tmp_path_factory):
         pulled = _run(["docker", "pull", BASELINE_IMAGE], timeout=900)
         if pulled.returncode != 0:
             pytest.skip(f"cannot pull {BASELINE_IMAGE}: {pulled.stderr[-300:]}")
+    for state in _boot_stack(tmp_path_factory, BASELINE_IMAGE, "upg"):
+        _seed_then_upgrade(state)
+        yield state
 
-    project = f"upg{uuid.uuid4().hex[:8]}"
+
+
+def _seed_then_upgrade(st):
+    """Record what the old release looked like, write data on it, then upgrade over its volumes.
+
+    In the fixture rather than in a test, deliberately. It used to live in the first test, which
+    made every later test in the module depend on that one having run first -- run the schema
+    comparison on its own and it compared the BASELINE against a fresh install, reporting a page of
+    differences that had nothing to do with what it was checking. A fixture called "upgrade_stack"
+    has to hand back an upgraded stack.
+
+    What it observed before upgrading is recorded on the state so the assertions stay in the tests.
+    """
+    st["pre"] = {
+        "email_nullable": st["psql"](
+            "SELECT is_nullable FROM information_schema.columns "
+            "WHERE table_name='users' AND column_name='email'"),
+    }
+
+    token = _login(st["base_url"], st["env"]["ADMIN_USERNAME"], st["env"]["ADMIN_PASSWORD"])
+    st["legacy_user"] = f"legacy_{uuid.uuid4().hex[:8]}"
+    made = requests.post(f"{st['base_url']}/users", timeout=30,
+                         headers={"Authorization": f"Bearer {token}"},
+                         json={"username": st["legacy_user"],
+                               "email": f"{st['legacy_user']}@example.com",
+                               "password": "TestPassw0rd!123", "role": "user"})
+    assert made.status_code < 400, f"could not seed data on the old release: {made.text[:200]}"
+
+    st["override"](_candidate_image())
+    up = st["compose"]("up", "-d")
+    assert up.returncode == 0, f"the upgrade did not start: {up.stderr[-400:]}"
+    assert st["wait_healthy"](), (
+        "the deployment did not come back up after the upgrade -- this is exactly the "
+        "unattended-update failure the phase exists to prevent")
+
+
+def _boot_stack(tmp_path_factory, image, prefix):
+    """Bring up one throwaway stack on `image` and hand back its handles.
+
+    Shared by both fixtures. Duplicating it would mean two copies of the volume-naming and
+    teardown-by-exact-name rules, and those are the parts that must not drift.
+    """
+    project = f"{prefix}{uuid.uuid4().hex[:8]}"
     workdir = str(tmp_path_factory.mktemp(project))
     port = 30400 + (int(uuid.uuid4().hex[:4], 16) % 300)
 
@@ -133,11 +178,11 @@ def upgrade_stack(tmp_path_factory):
         "base_url": f"http://127.0.0.1:{port}",
     }
 
-    override(BASELINE_IMAGE)
+    override(image)
     up = compose("up", "-d")
     if up.returncode != 0 or not wait_healthy():
         compose("down", timeout=300)
-        pytest.skip(f"baseline stack did not come up: {up.stderr[-400:]}")
+        pytest.skip(f"{prefix} stack did not come up: {up.stderr[-400:]}")
 
     yield state
 
@@ -158,37 +203,14 @@ def _login(base_url, username, password):
 
 
 def test_email_becomes_nullable_on_an_upgraded_install(upgrade_stack):
-    """Boot the previous release, write data, then upgrade in place over the same volumes."""
+    """The schema change reaches an install that already existed, not only a fresh one."""
     st = upgrade_stack
     env, psql = st["env"], st["psql"]
 
-    # --- Phase 1: the OLD release. Establish that it really is "old". ---
-    assert psql(
-        "SELECT is_nullable FROM information_schema.columns "
-        "WHERE table_name='users' AND column_name='email'"
-    ) == "NO", (
-        "the baseline image already has a nullable email, so this test cannot prove the ALTER "
-        "runs -- pick an older baseline"
-    )
-
-    token = _login(st["base_url"], env["ADMIN_USERNAME"], env["ADMIN_PASSWORD"])
-    headers = {"Authorization": f"Bearer {token}"}
-    legacy_name = f"legacy_{uuid.uuid4().hex[:8]}"
-    made = requests.post(f"{st['base_url']}/users", headers=headers, timeout=30, json={
-        "username": legacy_name, "email": f"{legacy_name}@example.com",
-        "password": "TestPassw0rd!123", "role": "user",
-    })
-    assert made.status_code < 400, f"could not seed data on the old release: {made.text[:200]}"
-
-    # --- Phase 2: the CANDIDATE, same volumes. ---
-    candidate = _candidate_image()
-    st["override"](candidate)
-    up = st["compose"]("up", "-d")
-    assert up.returncode == 0, f"the upgrade did not start: {up.stderr[-400:]}"
-    assert st["wait_healthy"](), (
-        "the deployment did not come back up after the upgrade -- this is exactly the "
-        "unattended-update failure the phase exists to prevent"
-    )
+    assert st["pre"]["email_nullable"] == "NO", (
+        "the baseline image already had a nullable email, so this proves nothing about the ALTER "
+        "running -- pick an older baseline")
+    legacy_name = st["legacy_user"]
 
     # The data written by the old release must still be there; otherwise the volumes were not
     # reused and every assertion below would be about a fresh install.
@@ -237,3 +259,78 @@ def test_the_upgrade_creates_tables_added_since_the_baseline(upgrade_stack):
     assert st["psql"](
         "SELECT count(*) FROM information_schema.tables WHERE table_name='vault_views'"
     ) == "1", "a table added after the baseline release was not created by the upgrade"
+
+
+# --- the whole schema, not three named things -------------------------------------------------
+
+SCHEMA_QUERY = (
+    "SELECT table_name || '.' || column_name || ' ' || data_type "
+    "|| ' null=' || is_nullable "
+    "|| ' default=' || coalesce(column_default, '-') "
+    "FROM information_schema.columns "
+    "WHERE table_schema = 'public' ORDER BY table_name, column_name"
+)
+
+
+@pytest.fixture(scope="module")
+def fresh_stack(tmp_path_factory):
+    """A second throwaway stack, booted from the candidate on empty volumes.
+
+    The upgraded install has to be compared against something, and the only honest comparison is a
+    fresh install of the same code. Asserting the upgraded schema against a list written into the
+    test would just move the drift into the test file.
+    """
+    yield from _boot_stack(tmp_path_factory, _candidate_image(), "fresh")
+
+
+def _column_map(psql):
+    rows = [line for line in psql(SCHEMA_QUERY).splitlines() if line.strip()]
+    assert len(rows) > 100, f"only {len(rows)} columns found; the query is not seeing the schema"
+    return {line.split(" ", 1)[0]: line.split(" ", 1)[1] for line in rows}
+
+
+def test_a_fresh_install_and_an_upgraded_install_have_the_same_schema(upgrade_stack, fresh_stack):
+    """The comparison nothing was making, which is why two columns could drift unnoticed.
+
+    The harness already booted the previous release, seeded it, and upgraded over the same volumes.
+    What it checked was three things it named -- one column, one index, one table -- so anything not
+    on that list was upgraded without anyone looking. This enumerates instead, and diffs.
+
+    Reported as a set difference rather than an equality assertion so a failure names the columns
+    that disagree and how, which is the whole use of the test.
+
+    WHAT THIS DOES NOT COVER, stated because the name reads as though it covers everything. The
+    baseline is the previous release, and that release's own create_all already built its tables
+    from its model. So a column whose ALTER has always disagreed with its declaration looks
+    identical on both sides here: both got the model's shape, neither took the ALTER path. The
+    divergence this phase closed is exactly that case, and it is caught by the scratch-table replay
+    in test_upgrade_schema_divergence.py, which constructs the older shape by hand rather than
+    hoping the baseline has it. Verified by removing the fix: this test still passed, and that one
+    failed naming both columns.
+
+    What this DOES catch is drift introduced since the baseline -- a column added to a pre-existing
+    table between then and now whose ALTER does not match its declaration -- which is the case
+    nothing was checking at all. Upgrading from the OLDEST supported release instead would widen it
+    further, at the cost of another stack boot; worth doing deliberately rather than by accident.
+    """
+    upgraded = _column_map(upgrade_stack["psql"])
+    fresh = _column_map(fresh_stack["psql"])
+
+    only_upgraded = sorted(set(upgraded) - set(fresh))
+    only_fresh = sorted(set(fresh) - set(upgraded))
+    differing = sorted(
+        f"{name}: upgraded has [{upgraded[name]}], fresh has [{fresh[name]}]"
+        for name in set(upgraded) & set(fresh) if upgraded[name] != fresh[name]
+    )
+
+    problems = []
+    if only_upgraded:
+        problems.append("only on the upgraded install: " + ", ".join(only_upgraded))
+    if only_fresh:
+        problems.append("only on a fresh install: " + ", ".join(only_fresh))
+    if differing:
+        problems.append("differ: " + "; ".join(differing))
+
+    assert not problems, (
+        "a fresh install and an upgraded one do not have the same schema, so one of them is "
+        "running a shape nobody tested:\n  " + "\n  ".join(problems))
