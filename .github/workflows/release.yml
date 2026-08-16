@@ -26,6 +26,7 @@ jobs:
       tag: ${{ steps.gate.outputs.tag }}
       sha: ${{ steps.gate.outputs.sha }}
       image: ${{ steps.gate.outputs.image }}
+      upgrade_entry_waived: ${{ steps.gate.outputs.upgrade_entry_waived }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -372,6 +373,12 @@ jobs:
           push-to-registry: true
           create-storage-record: false
 
+      # Published as an asset so an operator, or the site, can read what it takes to reach this
+      # version without cloning the repository. Copied verbatim from the file the gate has already
+      # validated: a regenerated or reformatted copy could disagree with what it claims to describe.
+      - name: Stage the upgrade matrix as a release asset
+        run: cp docs/upgrade-matrix.json upgrade.json
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
@@ -381,3 +388,4 @@ jobs:
             dockvault-${{ steps.publish_gate.outputs.tag }}-amd64.spdx.json
             dockvault-${{ steps.publish_gate.outputs.tag }}-arm64.spdx.json
             dockvault-${{ steps.publish_gate.outputs.tag }}.openvex.json
+            upgrade.json

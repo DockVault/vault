@@ -26,6 +26,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Tags, because part of the offline lane checks the upgrade matrix against the releases
+          # that actually exist. Tags only, not full history: the check reads `git tag -l`, so
+          # fetch-depth: 0 would slow every run to fetch commits nothing looks at.
+          fetch-tags: true
           persist-credentials: false
 
       - name: Set up Python 3.14
