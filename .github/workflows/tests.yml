@@ -221,6 +221,73 @@ jobs:
             sleep 3
           done
 
+      # The log-pull endpoint sits behind a process-start ceiling that defaults off and is
+      # set in no workflow, so seven checks across four files -- including the ones asserting
+      # that a web-scoped token is refused on sftp -- have never run with it on. Same shape
+      # as the transfer ceiling above: turn it on, run, put it back.
+      #
+      # The pepper is not decoration. Without a strong one the vault starts normally and
+      # log-pull stays off with only a warning on stderr, which is how these tests came to
+      # skip everywhere in the first place. So the ceiling is asserted before anything runs:
+      # a step that silently reproduced the original condition would be worse than no step.
+      - name: Exercise the log-pull endpoint with its ceiling on
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_TOKEN_PEPPER="$(openssl rand -hex 32)"
+          echo "::add-mask::${LOG_TOKEN_PEPPER}"
+          sed -i '/^PLAN_LOG_PULL=/d;/^LOG_TOKEN_PEPPER=/d' .env
+          echo 'PLAN_LOG_PULL=true' >> .env
+          echo "LOG_TOKEN_PEPPER=${LOG_TOKEN_PEPPER}" >> .env
+          docker compose up -d --force-recreate vault-api
+          for attempt in $(seq 1 40); do
+            if curl -fsS --max-time 5 http://127.0.0.1:8200/health >/dev/null 2>&1; then break; fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "::error::vault-api did not come back with the log ceiling applied"
+              exit 1
+            fi
+            sleep 3
+          done
+          python - <<'PY'
+          import os
+          import sys
+
+          import requests
+
+          BASE = "http://127.0.0.1:8200"
+          session = requests.Session()
+          login = session.post(
+              f"{BASE}/auth/login",
+              json={"username": os.environ["VAULT_ADMIN_USER"],
+                    "password": os.environ["VAULT_ADMIN_PASS"]},
+              timeout=15,
+          )
+          login.raise_for_status()
+          session.headers["Authorization"] = f"Bearer {login.json()['access_token']}"
+          settings = session.get(f"{BASE}/settings/logs", timeout=15)
+          settings.raise_for_status()
+          if not settings.json().get("ceiling"):
+              sys.exit(
+                  "::error::the log ceiling is still off after the recreate, so the tests "
+                  "below would skip exactly as they always have"
+              )
+          print("log ceiling confirmed on")
+          PY
+          python -m pytest tests/test_api_log_pull.py tests/test_api_log_sink_availability.py \
+            tests/test_ui_log_access.py tests/test_ui_log_token_usage.py --maxfail=1
+          # Back to the shipped default. The ceiling-off assertions live in the same files and
+          # ran in the main pass, so nothing below needs it on.
+          sed -i '/^PLAN_LOG_PULL=/d;/^LOG_TOKEN_PEPPER=/d' .env
+          docker compose up -d --force-recreate vault-api
+          for attempt in $(seq 1 40); do
+            if curl -fsS --max-time 5 http://127.0.0.1:8200/health >/dev/null 2>&1; then break; fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "::error::vault-api did not return after restoring the shipped ceiling"
+              exit 1
+            fi
+            sleep 3
+          done
+
       - name: Exercise login throttling and Redis outage fallback
         shell: bash
         run: |
