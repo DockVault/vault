@@ -158,3 +158,14 @@ jobs:
 
       - name: Run the offline fast lane
         run: python -m pytest -m "unit and not docker" --maxfail=1
+
+      # Undefined names, and nothing else. A name used only inside a function body is not
+      # resolved until that body runs, so a missing import in a test that needs a container
+      # survives collection, survives the offline lane, and surfaces twenty minutes later in
+      # the full suite -- which is exactly how one reached CI. This answers in about a second.
+      #
+      # Deliberately one rule. The repository has plenty of unused imports and similar lint
+      # noise; enforcing style here would turn an unrelated tidy-up into a merge blocker. F821
+      # is never a matter of taste: the name is either defined or the code raises.
+      - name: Reject undefined names
+        run: python -m ruff check --select F821 app tests dockvault.py .github/scripts
