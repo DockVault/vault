@@ -143,3 +143,27 @@ def test_the_banner_does_not_call_a_blocked_upgrade_a_drop_in(page: Page, admin_
     text = page.locator("#update-banner-text")
     expect(text).not_to_contain_text("drop-in")
     expect(text).to_contain_text("advises against")
+
+
+def test_the_banner_says_a_staged_upgrade_is_still_one_update(page: Page, admin_creds):
+    """More stages means it takes longer, not that the operator does more.
+
+    Said explicitly because "runs in 3 stages" otherwise reads as three things to do, when the tool
+    performs them itself in one command.
+    """
+    _mock_status(page, _banner_payload({"known": True, "requires_backup": True,
+                                        "irreversible": False, "blocked": False,
+                                        "conditions": [], "steps": 3, "stages": 2}))
+    _open_general(page, admin_creds)
+    text = page.locator("#update-banner-text")
+    expect(text).to_contain_text("2 stages")
+    expect(text).to_contain_text("single update")
+
+
+def test_an_ordinary_upgrade_says_nothing_about_stages(page: Page, admin_creds):
+    """Non-vacuity, and noise control: the common case must not grow a sentence about staging."""
+    _mock_status(page, _banner_payload({"known": True, "requires_backup": False,
+                                        "irreversible": False, "blocked": False,
+                                        "conditions": [], "steps": 1, "stages": 1}))
+    _open_general(page, admin_creds)
+    expect(page.locator("#update-banner-text")).not_to_contain_text("stages")

@@ -444,3 +444,122 @@ def test_the_shortest_declared_route_is_taken():
     assert plan["known"] and len(plan["steps"]) == 1, (
         "expected the one-hop route; a longer walk would report a backup this upgrade does not need")
     assert not plan["requires_backup"]
+
+
+# --- a release the upgrade has to land on -------------------------------------------------------
+
+def _staged_matrix(*, stop_at="0.2.0", backup_on_first=False):
+    """0.1.0 -> 0.2.0 -> 0.3.0, where 0.2.0 cannot be passed through in one step."""
+    versions = {
+        "0.1.0": {"released": "2026-01-01", "notes": "a"},
+        "0.2.0": {"released": "2026-01-02", "notes": "b"},
+        "0.3.0": {"released": "2026-01-03", "notes": "c"},
+    }
+    if stop_at:
+        versions[stop_at]["must_land_here"] = True
+    return {
+        "schema_version": 1, "about": "t", "kinds": {"direct": "a", "blocked": "b"},
+        "versions": versions,
+        "edges": [
+            {"from": "0.1.0", "to": "0.2.0", "kind": "direct",
+             "reversible": True, "requires_backup": backup_on_first},
+            {"from": "0.2.0", "to": "0.3.0", "kind": "direct",
+             "reversible": True, "requires_backup": False},
+        ],
+    }
+
+
+def test_an_ordinary_upgrade_is_still_one_recreate():
+    """The default has to stay the default.
+
+    Staging exists for the rare release that cannot be passed through. If declaring nothing
+    produced two legs, every ordinary upgrade would get slower and more fragile for no reason.
+    """
+    plan = dv.plan_upgrade_path(_staged_matrix(stop_at=None), "0.1.0", "0.3.0")
+    assert [leg["to"] for leg in plan["legs"]] == ["0.3.0"]
+
+
+def test_a_release_marked_must_land_here_splits_the_upgrade():
+    plan = dv.plan_upgrade_path(_staged_matrix(), "0.1.0", "0.3.0")
+    assert [leg["to"] for leg in plan["legs"]] == ["0.2.0", "0.3.0"]
+    # The overall verdict is still the union: what the whole change involves, not one leg's share.
+    assert plan["known"] and plan["steps"] and len(plan["steps"]) == 2
+
+
+def test_each_leg_carries_its_own_requirements():
+    """So a stage that needs a backup can be told apart from one that does not."""
+    plan = dv.plan_upgrade_path(_staged_matrix(backup_on_first=True), "0.1.0", "0.3.0")
+    first, second = plan["legs"]
+    assert first["to"] == "0.2.0" and first["requires_backup"] is True
+    assert second["to"] == "0.3.0" and second["requires_backup"] is False
+    assert plan["requires_backup"] is True, "the whole change still needs one"
+
+
+def test_landing_on_the_marked_release_itself_is_one_leg():
+    """Stopping AT the version is not passing through it, so nothing is split."""
+    plan = dv.plan_upgrade_path(_staged_matrix(), "0.1.0", "0.2.0")
+    assert [leg["to"] for leg in plan["legs"]] == ["0.2.0"]
+
+
+def test_the_tool_performs_every_leg_itself(tmp_path, monkeypatch, capsys):
+    """One command, several recreates. The operator does not run update twice.
+
+    This is the whole point of doing it in the tool: an instruction to come back and run it again
+    is one an operator can miss, and a deployment left on an intermediate release because nobody
+    read the last line is worse than one that took longer.
+    """
+    tool = _deployment(tmp_path, matrix=_staged_matrix())
+    _stub(monkeypatch, tool, backups=[])
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.1.0", "the running container"))
+    images = []
+    monkeypatch.setattr(tool, "_set_env_key",
+                        lambda path, key, value: images.append(value) if key == "DOCKVAULT_IMAGE"
+                        else None)
+    recreates = []
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: recreates.append(build) or True)
+
+    tool.update(argparse.Namespace(non_interactive=True, tag="v0.3.0", source=False, yes=True))
+
+    assert images == ["ghcr.io/dockvault/vault:v0.2.0", "ghcr.io/dockvault/vault:v0.3.0"], images
+    assert len(recreates) == 2, "each leg is its own recreate"
+    out = capsys.readouterr().out
+    assert "2 stages" in out and "one command" in out, out
+
+
+def test_a_stage_that_does_not_come_back_stops_the_rest(tmp_path, monkeypatch, capsys):
+    """The property that makes staging worth doing.
+
+    The next stage's migration is written assuming this one finished. Running it over a boot that
+    did not complete is how a recoverable problem becomes an unrecoverable one -- so the walk stops,
+    and says where the deployment is, which is a real release rather than somewhere in between.
+    """
+    tool = _deployment(tmp_path, matrix=_staged_matrix())
+    _stub(monkeypatch, tool, backups=[])
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.1.0", "the running container"))
+    images = []
+    monkeypatch.setattr(tool, "_set_env_key",
+                        lambda path, key, value: images.append(value) if key == "DOCKVAULT_IMAGE"
+                        else None)
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: False)
+
+    tool.update(argparse.Namespace(non_interactive=True, tag="v0.3.0", source=False, yes=True))
+
+    assert images == ["ghcr.io/dockvault/vault:v0.2.0"], (
+        "the second stage ran after the first failed to come back: %r" % (images,))
+    out = capsys.readouterr().out
+    assert "NOT run" in out and "v0.2.0" in out, out
+
+
+def test_the_backup_is_taken_once_for_the_whole_change(tmp_path, monkeypatch):
+    """Before anything moves, not before each leg.
+
+    The meaningful restore point is the deployment as it was before the upgrade started. A backup
+    taken between stages captures a database already half-migrated, which is not a state anyone
+    wants to be restored to.
+    """
+    backups = []
+    tool = _deployment(tmp_path, matrix=_staged_matrix(backup_on_first=True))
+    _stub(monkeypatch, tool, backups=backups)
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.1.0", "the running container"))
+    tool.update(argparse.Namespace(non_interactive=True, tag="v0.3.0", source=False, yes=True))
+    assert len(backups) == 1, f"expected one backup for the whole change, got {len(backups)}"

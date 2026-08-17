@@ -1455,6 +1455,40 @@ def _walk_edges(matrix, current, target):
     return None
 
 
+def _split_into_legs(matrix, steps):
+    """Group the route's edges into the legs the upgrade must actually be performed in.
+
+    A version marked `must_land_here` cannot be passed through in one recreate: the deployment has
+    to come up ON it, finish its boot, and be verified before continuing. That happens where a
+    migration needs the previous release's data already rewritten, or where a change is staged
+    across two releases and the second assumes the first has run.
+
+    The operator still runs ONE upgrade. The legs are what the tool does underneath, and what the
+    database goes through -- not extra work for the person. A route with no such version is one leg,
+    which is the ordinary case and stays a single recreate.
+    """
+    versions = matrix.get("versions") or {}
+    legs, current = [], []
+    for edge in steps:
+        current.append(edge)
+        if versions.get(edge.get("to"), {}).get("must_land_here"):
+            legs.append(current)
+            current = []
+    if current:
+        legs.append(current)
+    return legs
+
+
+def _leg_summary(leg):
+    return {
+        "to": leg[-1]["to"],
+        "steps": leg,
+        "requires_backup": any(e.get("requires_backup") for e in leg),
+        "irreversible": any(not e.get("reversible", True) for e in leg),
+        "conditions": [c for e in leg for c in (e.get("conditions") or [])],
+    }
+
+
 def plan_upgrade_path(matrix, current, target):
     """What it takes to get from `current` to `target`, walking one adjacent edge at a time.
 
@@ -1467,8 +1501,8 @@ def plan_upgrade_path(matrix, current, target):
     is a walk. A pair nobody tested therefore has no edge to find, which is the point -- it comes
     back unknown instead of coming back safe.
     """
-    unknown = {"steps": [], "requires_backup": True, "irreversible": True, "blocked": None,
-               "conditions": [], "known": False}
+    unknown = {"steps": [], "legs": [], "requires_backup": True, "irreversible": True,
+               "blocked": None, "conditions": [], "known": False}
     if not isinstance(matrix, dict):
         return unknown
     versions = matrix.get("versions") or {}
@@ -1491,6 +1525,9 @@ def plan_upgrade_path(matrix, current, target):
 
     return {
         "steps": steps,
+        # What the tool performs, in order. One leg unless the route crosses a version the
+        # deployment has to land on; the operator runs one upgrade either way.
+        "legs": [_leg_summary(leg) for leg in _split_into_legs(matrix, steps)],
         "requires_backup": any(e.get("requires_backup") for e in steps),
         "irreversible": any(not e.get("reversible", True) for e in steps),
         "blocked": next((e for e in steps if e.get("kind") == "blocked"), None),
@@ -3001,6 +3038,41 @@ class DockVault:
             if not self._require_backup(args, interactive, why):
                 return
 
+        # One upgrade for the operator; one or more legs underneath.
+        #
+        # A leg exists per version the route has to LAND on -- see `must_land_here`. Ordinarily
+        # there is exactly one and this is a single recreate, unchanged. Where there are more, the
+        # tool walks them itself rather than telling the operator to run the command again: the
+        # stop is a property of what the database has to go through, not of what the person has to
+        # remember.
+        legs = [leg["to"] for leg in plan.get("legs") or []] or [tag.lstrip("vV")]
+        if len(legs) > 1:
+            print(pal.paint(
+                "\n  This upgrade runs in %d stages, because %s cannot be passed through in one "
+                "step: %s. It is still one command -- it just takes longer."
+                % (len(legs), "a release" if len(legs) == 2 else "some releases",
+                   " -> ".join(legs)), "cyan"))
+
+        for index, leg_version in enumerate(legs, start=1):
+            leg_tag = leg_version if leg_version.startswith("v") else "v" + leg_version
+            if len(legs) > 1:
+                print(pal.paint("\n  Stage %d of %d: %s" % (index, len(legs), leg_tag), "cyan"))
+            if not self._perform_leg(leg_tag, from_source, index, len(legs)):
+                return
+
+        healthy = self._wait_secure_healthy(self._load_env().get("COMPOSE_PROFILES", "combined"))
+        print(pal.paint("\n  Update to %s: %s.\n" % (tag, "healthy" if healthy else "NOT healthy - check the logs"),
+                        "green" if healthy else "red"))
+
+    def _perform_leg(self, tag, from_source, index=1, total=1):
+        """Move the deployment onto one version and prove it came up before going on.
+
+        Returns False when the deployment did not come back. The caller stops there rather than
+        continuing to the next leg: a stage that failed leaves the deployment on a REAL release,
+        which is a defined state someone can reason about, and stacking the next migration on top
+        of a boot that did not finish is how a recoverable problem becomes an unrecoverable one.
+        """
+        pal = self.pal
         if from_source:
             print(pal.paint("  git checkout %s + rebuild ..." % tag, "cyan"))
             try:
@@ -3025,13 +3097,27 @@ class DockVault:
                 self._fail("docker compose pull failed: %s" % exc)
             if pr.returncode != 0:
                 self._fail("docker compose pull failed - is %s published? (or use --source to build)" % image)
+
         # from-source rebuilds the local Dockerfile; the pull path recreates from the pulled image
         # WITHOUT --build (a rebuild would clobber the just-pulled release image with a local build).
         if not (self._start_secure_stack() if from_source else self._recreate_stack(build=False)):
             self._fail("the stack did not come up after the update - check 'docker compose ... logs'.")
-        healthy = self._wait_secure_healthy(self._load_env().get("COMPOSE_PROFILES", "combined"))
-        print(pal.paint("\n  Update to %s: %s.\n" % (tag, "healthy" if healthy else "NOT healthy - check the logs"),
-                        "green" if healthy else "red"))
+
+        if total == 1:
+            return True
+
+        # Between stages the deployment must actually be up, because the next stage's migration is
+        # written assuming this one finished. A stage that only half-applied and then had the next
+        # release's statements run over it is the situation staging exists to avoid.
+        if not self._wait_secure_healthy(self._load_env().get("COMPOSE_PROFILES", "combined")):
+            print(pal.paint(
+                "\n  Stage %d of %d (%s) did not come back healthy, so the remaining stages were "
+                "NOT run. The deployment is on %s, which is a released version -- check "
+                "'docker compose ... logs', then run update again to continue."
+                % (index, total, tag, tag), "red"))
+            return False
+        print(pal.paint("  Stage %d of %d (%s) is up." % (index, total, tag), "green"))
+        return True
 
     def logs(self, args=None):
         """Guided 'enable authenticated log pull'. The GET /logs endpoint is default-OFF; it needs
