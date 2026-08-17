@@ -91,6 +91,10 @@ jobs:
             echo "RATE_LIMIT_API_AUTH=100000"
             echo "RATE_LIMIT_API_UPLOAD=100000"
             echo "RATE_LIMIT_API_DOWNLOAD=100000"
+            # The shipped default, stated rather than left implicit: the SSH-key throttle
+            # test asks the deployment what budget it is enforcing, so that it can tell a
+            # throttle which should have engaged from a deployment that cannot show one.
+            echo "RATE_LIMIT_SFTP_KEY_ATTEMPTS=30"
             # A real storage ceiling, so the suite exercises the bounded admin limit
             # (the panel offers 0..MAX_STORAGE_GB) rather than only the unlimited default.
             echo "MAX_STORAGE_GB=64"
@@ -308,9 +312,14 @@ jobs:
             sleep 3
           done
           docker compose exec -T vault-redis redis-cli FLUSHALL
+          # Both files gate work on VAULT_REDIS_OUTAGE_TEST. Setting it on the command line
+          # of an invocation that named only one of them left the other's fail-open check --
+          # that the general API classes stay available while Redis is down -- selected
+          # nowhere at all.
           VAULT_REDIS_OUTAGE_TEST=1 \
           VAULT_REDIS_CONTAINER=vault-redis \
-            python -m pytest tests/test_login_throttle.py --maxfail=1
+            python -m pytest tests/test_login_throttle.py \
+              tests/test_api_rate_limit_classes.py --maxfail=1
 
       - name: Container logs
         if: failure()

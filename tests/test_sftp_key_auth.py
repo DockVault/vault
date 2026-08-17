@@ -13,11 +13,18 @@ import pytest
 
 paramiko = pytest.importorskip("paramiko")
 
+from conftest import configured_int_setting  # noqa: E402
+
 SFTP_HOST = os.environ.get("VAULT_SFTP_HOST", "127.0.0.1")
 SFTP_PORT = int(os.environ.get("VAULT_SFTP_PORT", "2322"))
 
 
 pytestmark = pytest.mark.sftp
+
+# Bad key offers to make in the throttle test. Comfortably over the shipped budget (30),
+# which is what lets the test tell a throttle that should have engaged from one that
+# should not have.
+_BAD_OFFERS = 40
 
 # A refused/failed SSH auth surfaces as one of these.
 _AUTH_ERR = (paramiko.SSHException, EOFError, OSError)
@@ -169,9 +176,10 @@ def test_sftp_key_bruteforce_is_throttled_per_ip(admin, temp_user):
         with _key_conn(uname, valid_pk) as t:
             _ls_root(t)
 
-        # Flood failed key offers from this IP. 40 offers comfortably exceeds the default
-        # budget (30); if a deployment set it far higher we won't trip and skip below.
-        for _ in range(40):
+        # Flood failed key offers from this IP. More offers than the shipped budget, so a
+        # deployment on the default must refuse the authorized key afterwards; one
+        # configured far higher will not, and is skipped below rather than failed.
+        for _ in range(_BAD_OFFERS):
             bad_pk, _ = _gen_rsa()  # never registered
             with contextlib.suppress(*_AUTH_ERR):
                 with _key_conn(uname, bad_pk):
@@ -185,8 +193,21 @@ def test_sftp_key_bruteforce_is_throttled_per_ip(admin, temp_user):
         except _AUTH_ERR:
             throttled = True
         if not throttled:
-            pytest.skip("SSH-key throttle did not engage in 40 offers; "
-                        "rate_limit_sftp_key_attempts is likely configured above that")
+            # Same reasoning as the login throttle: not engaging is correct on a deployment
+            # whose limit is above the offers made, and is the failure itself on one whose
+            # limit is below them. This is the per-IP brute-force bound on key offers, so
+            # reporting its absence as "cannot test here" is the wrong way round.
+            configured = configured_int_setting("RATE_LIMIT_SFTP_KEY_ATTEMPTS")
+            assert configured is None or configured > _BAD_OFFERS, (
+                f"the per-IP SSH-key throttle did not engage after {_BAD_OFFERS} bad offers "
+                f"against a deployment configured to allow {configured}. An authorized key was "
+                "still accepted, so the brute-force bound is not being enforced"
+            )
+            pytest.skip(
+                f"SSH-key throttle did not engage in {_BAD_OFFERS} offers and the configured "
+                f"limit ({'unreadable' if configured is None else configured}) does not say it "
+                "should have; rate_limit_sftp_key_attempts is likely above that"
+            )
     finally:
         _clear_sftp_pk_counters()
 
