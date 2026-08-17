@@ -21,6 +21,12 @@ import pytest
 from conftest import unique
 
 
+# Both are required, and naming them matters: with a queue left in place a second transfer WAITS
+# rather than being refused, which is the correct product behaviour and the opposite of what these
+# assert. The CI job "Exercise the transfer ceiling on a deployment that refuses" sets them up.
+SKIP_REASON = ("needs a deployment configured with MAX_CONCURRENT_TRANSFERS=1 and "
+               "MAX_QUEUED_TRANSFERS=0")
+
 MB = 1024 * 1024
 _OCTET = {"Content-Type": "application/octet-stream"}
 
@@ -161,7 +167,7 @@ def test_a_full_deployment_answers_with_something_a_client_can_act_on(admin, tem
 
 @pytest.mark.skipif(
     os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
-    reason="needs a deployment configured with MAX_CONCURRENT_TRANSFERS=1 and no queue")
+    reason=SKIP_REASON)
 def test_an_upload_is_admitted_on_the_same_ceiling_as_a_download(admin, temp_vault):
     """One ceiling covers both directions.
 
@@ -201,7 +207,7 @@ def test_an_upload_is_admitted_on_the_same_ceiling_as_a_download(admin, temp_vau
 
 @pytest.mark.skipif(
     os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
-    reason="needs a deployment configured with MAX_CONCURRENT_TRANSFERS=1 and no queue")
+    reason=SKIP_REASON)
 def test_the_resumable_path_is_admitted_too(admin, temp_vault):
     """The path the product's own client actually uses.
 
@@ -253,7 +259,7 @@ def test_the_resumable_path_is_admitted_too(admin, temp_vault):
 
 @pytest.mark.skipif(
     os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
-    reason="needs a deployment configured with MAX_CONCURRENT_TRANSFERS=1 and no queue")
+    reason=SKIP_REASON)
 def test_a_download_that_fails_after_admission_gives_its_slot_back(admin, temp_vault):
     """The limb between taking a slot and handing the response off.
 
@@ -281,7 +287,7 @@ def test_a_download_that_fails_after_admission_gives_its_slot_back(admin, temp_v
 
 @pytest.mark.skipif(
     os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
-    reason="needs a deployment configured with MAX_CONCURRENT_TRANSFERS=1 and no queue")
+    reason=SKIP_REASON)
 def test_a_completed_upload_gives_its_slot_back(admin, temp_vault):
     """The upload release limb, which nothing exercised.
 
@@ -372,7 +378,7 @@ def test_the_ceiling_is_visible_to_an_operator(admin):
 
 @pytest.mark.skipif(
     os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
-    reason="needs a deployment configured with MAX_CONCURRENT_TRANSFERS=1 and no queue")
+    reason=SKIP_REASON)
 def test_a_refused_upload_leaves_nothing_behind(admin, temp_vault):
     """A 503 must cost the deployment nothing.
 
@@ -419,7 +425,7 @@ def test_a_refused_upload_leaves_nothing_behind(admin, temp_vault):
 
 @pytest.mark.skipif(
     os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
-    reason="needs a deployment configured with MAX_CONCURRENT_TRANSFERS=1 and no queue")
+    reason=SKIP_REASON)
 def test_a_caller_with_no_access_is_refused_access_not_a_slot(admin, temp_user_client,
                                                              temp_vault):
     """Authorization is answered before the ceiling is consulted.
@@ -523,7 +529,7 @@ def test_a_stored_mime_type_cannot_take_the_deployment_down(admin, temp_vault):
 
 @pytest.mark.skipif(
     os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
-    reason="needs a deployment configured with MAX_CONCURRENT_TRANSFERS=1 and no queue")
+    reason=SKIP_REASON)
 def test_a_refused_upload_does_not_reserve_space_it_never_uses(admin):
     """Being refused must not make the vault look fuller than it is.
 

@@ -184,6 +184,43 @@ jobs:
           python .github/scripts/pytest_result_audit.py pytest-results.xml
           --expected-total "${{ needs.preflight.outputs.test-count }}"
 
+      # Eight tests in tests/test_transfer_admission_live.py are gated on a deployment configured
+      # to refuse rather than queue, and nothing set that up, so they ran nowhere. Same shape as
+      # the throttle step below: reconfigure, recreate, run, put it back.
+      #
+      # BOTH knobs are needed. With a queue, a second transfer WAITS rather than being refused,
+      # which is the correct product behaviour and the opposite of what these tests assert.
+      - name: Exercise the transfer ceiling on a deployment that refuses
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i '/^MAX_CONCURRENT_TRANSFERS=/d;/^MAX_QUEUED_TRANSFERS=/d' .env
+          echo 'MAX_CONCURRENT_TRANSFERS=1' >> .env
+          echo 'MAX_QUEUED_TRANSFERS=0' >> .env
+          docker compose up -d --force-recreate vault-api
+          for attempt in $(seq 1 40); do
+            if curl -fsS --max-time 5 http://127.0.0.1:8200/health >/dev/null 2>&1; then break; fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "::error::vault-api did not come back with the transfer ceiling applied"
+              exit 1
+            fi
+            sleep 3
+          done
+          VAULT_TRANSFER_LIMIT_IS_ONE=1 python -m pytest tests/test_transfer_admission_live.py --maxfail=1
+          # Put the shipped values back before the next step, which recreates the API again and
+          # would otherwise run its own tests against a deployment that refuses every second
+          # transfer.
+          sed -i '/^MAX_CONCURRENT_TRANSFERS=/d;/^MAX_QUEUED_TRANSFERS=/d' .env
+          docker compose up -d --force-recreate vault-api
+          for attempt in $(seq 1 40); do
+            if curl -fsS --max-time 5 http://127.0.0.1:8200/health >/dev/null 2>&1; then break; fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "::error::vault-api did not return after restoring the shipped ceiling"
+              exit 1
+            fi
+            sleep 3
+          done
+
       - name: Exercise login throttling and Redis outage fallback
         shell: bash
         run: |
