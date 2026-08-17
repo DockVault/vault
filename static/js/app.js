@@ -5654,6 +5654,11 @@ function renderUpdateBanner(us) {
             cost = needs.length
                 ? ` Upgrading requires ${needs.join(' and ')}.`
                 : ' Upgrading is a drop-in change.';
+            // Still one command. Said explicitly because "3 stages" otherwise reads as three
+            // things to do, when it is one thing that takes longer.
+            if (hop.stages > 1) {
+                cost += ` It runs in ${hop.stages} stages and will take longer, but it is still a single update.`;
+            }
         }
         text.textContent = `A newer version (v${latest}) is available — you’re on v${current}.${cost}`;
     }

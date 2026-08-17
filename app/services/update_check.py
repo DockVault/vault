@@ -219,6 +219,40 @@ def _walk_edges(matrix, current, target):
     return None
 
 
+def _split_into_legs(matrix, steps):
+    """Group the route's edges into the legs the upgrade must actually be performed in.
+
+    A version marked `must_land_here` cannot be passed through in one recreate: the deployment has
+    to come up ON it, finish its boot, and be verified before continuing. That happens where a
+    migration needs the previous release's data already rewritten, or where a change is staged
+    across two releases and the second assumes the first has run.
+
+    The operator still runs ONE upgrade. The legs are what the tool does underneath, and what the
+    database goes through -- not extra work for the person. A route with no such version is one leg,
+    which is the ordinary case and stays a single recreate.
+    """
+    versions = matrix.get("versions") or {}
+    legs, current = [], []
+    for edge in steps:
+        current.append(edge)
+        if versions.get(edge.get("to"), {}).get("must_land_here"):
+            legs.append(current)
+            current = []
+    if current:
+        legs.append(current)
+    return legs
+
+
+def _leg_summary(leg):
+    return {
+        "to": leg[-1]["to"],
+        "steps": leg,
+        "requires_backup": any(e.get("requires_backup") for e in leg),
+        "irreversible": any(not e.get("reversible", True) for e in leg),
+        "conditions": [c for e in leg for c in (e.get("conditions") or [])],
+    }
+
+
 def describe_hop(matrix, current, target):
     """What moving from `current` to `target` involves, per the matrix.
 
@@ -227,7 +261,7 @@ def describe_hop(matrix, current, target):
     because a gap in the matrix is where nobody has considered the upgrade.
     """
     unknown = {"known": False, "requires_backup": True, "irreversible": True,
-               "blocked": False, "conditions": [], "steps": 0}
+               "blocked": False, "conditions": [], "steps": 0, "stages": 0}
     if not isinstance(matrix, dict):
         return unknown
     versions = matrix.get("versions")
@@ -250,6 +284,9 @@ def describe_hop(matrix, current, target):
 
     return {
         "known": True,
+        # How many times the deployment is recreated on the way. More than one means the upgrade
+        # takes longer, NOT that the operator does more: the tool performs the legs itself.
+        "stages": len(_split_into_legs(matrix, steps)),
         "requires_backup": any(e.get("requires_backup") for e in steps),
         "irreversible": any(not e.get("reversible", True) for e in steps),
         "blocked": any(e.get("kind") == "blocked" for e in steps),

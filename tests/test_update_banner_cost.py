@@ -50,7 +50,7 @@ def test_a_drop_in_update_is_reported_as_one():
     uc = _fresh_module()
     hop = uc.describe_hop(_matrix(), "0.1.0", "0.2.0")
     assert hop == {"known": True, "requires_backup": False, "irreversible": False,
-                   "blocked": False, "conditions": [], "steps": 1}
+                   "blocked": False, "conditions": [], "steps": 1, "stages": 1}
 
 
 def test_an_update_that_needs_a_backup_says_so():
@@ -212,6 +212,16 @@ def test_the_app_and_the_host_tool_agree_about_every_hop():
                   {"from": "0.9.0", "to": "0.9.1", "kind": "direct",
                    "reversible": True, "requires_backup": False}],
     }
+    staged = {
+        "schema_version": 1, "about": "t", "kinds": {"direct": "a", "blocked": "b"},
+        "versions": {"0.1.0": {"released": "2026-01-01", "notes": "a"},
+                     "0.2.0": {"released": "2026-01-02", "notes": "b", "must_land_here": True},
+                     "0.3.0": {"released": "2026-01-03", "notes": "c"}},
+        "edges": [{"from": "0.1.0", "to": "0.2.0", "kind": "direct",
+                   "reversible": True, "requires_backup": True},
+                  {"from": "0.2.0", "to": "0.3.0", "kind": "direct",
+                   "reversible": True, "requires_backup": False}],
+    }
     three = _matrix(backup=True)
     three["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "c"}
     three["edges"].append({"from": "0.2.0", "to": "0.3.0", "kind": "direct",
@@ -234,6 +244,11 @@ def test_the_app_and_the_host_tool_agree_about_every_hop():
         (backport, "0.9.0", "0.10.0"),
         (backport, "0.9.1", "0.10.0"),
         (backport, "0.9.0", "0.9.1"),
+        # A release the upgrade has to land on: both implementations must agree how many stages
+        # that makes, or the banner and the tool describe the same upgrade differently.
+        (staged, "0.1.0", "0.3.0"),
+        (staged, "0.1.0", "0.2.0"),
+        (staged, "0.2.0", "0.3.0"),
     ]
     for matrix, current, target in cases:
         here = uc.describe_hop(matrix, current, target)
@@ -243,3 +258,27 @@ def test_the_app_and_the_host_tool_agree_about_every_hop():
         assert here["irreversible"] == there["irreversible"], (matrix, current, target)
         assert here["blocked"] == (there["blocked"] is not None), (matrix, current, target)
         assert here["steps"] == len(there["steps"]), (matrix, current, target)
+        assert here["stages"] == len(there["legs"]), (matrix, current, target)
+
+
+def test_the_banner_learns_how_many_stages_an_upgrade_runs_in():
+    """So it can say the upgrade takes longer without implying more work for the operator."""
+    uc = _fresh_module()
+    staged = {
+        "schema_version": 1, "about": "t", "kinds": {"direct": "a", "blocked": "b"},
+        "versions": {"0.1.0": {"released": "2026-01-01", "notes": "a"},
+                     "0.2.0": {"released": "2026-01-02", "notes": "b", "must_land_here": True},
+                     "0.3.0": {"released": "2026-01-03", "notes": "c"}},
+        "edges": [{"from": "0.1.0", "to": "0.2.0", "kind": "direct",
+                   "reversible": True, "requires_backup": False},
+                  {"from": "0.2.0", "to": "0.3.0", "kind": "direct",
+                   "reversible": True, "requires_backup": False}],
+    }
+    assert uc.describe_hop(staged, "0.1.0", "0.3.0")["stages"] == 2
+    assert uc.describe_hop(staged, "0.1.0", "0.2.0")["stages"] == 1
+
+
+def test_an_ordinary_upgrade_reports_one_stage():
+    """Non-vacuity: the field must not be 2 for everything."""
+    uc = _fresh_module()
+    assert uc.describe_hop(_matrix(), "0.1.0", "0.2.0")["stages"] == 1

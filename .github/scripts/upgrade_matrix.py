@@ -41,7 +41,7 @@ _DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
 
 KINDS = ("direct", "blocked")
 
-_VERSION_KEYS = {"released", "notes"}
+_VERSION_KEYS = {"released", "notes", "must_land_here"}
 _EDGE_KEYS = {"from", "to", "kind", "reversible", "requires_backup", "reason", "conditions"}
 _CONDITION_KEYS = {"id", "summary", "detect"}
 _WAIVER_KEYS = {"version", "reason"}
@@ -143,6 +143,17 @@ def validate_matrix(data: dict) -> dict:
         _no_unknown_keys(meta, _VERSION_KEYS, f"versions[{version}]")
         _string(meta.get("released"), f"versions[{version}].released", pattern=_DATE_RE)
         _string(meta.get("notes"), f"versions[{version}].notes")
+        if "must_land_here" in meta:
+            # A release an upgrade cannot pass through in one go. The deployment has to come up ON
+            # this version, complete its boot, and be verified healthy before continuing -- for a
+            # migration that needs the previous release's data written in its new shape first, or a
+            # two-stage change where the second stage assumes the first has run everywhere.
+            #
+            # It does NOT mean the operator runs the upgrade twice. The tool walks the legs itself
+            # and presents one upgrade; the stop is about what the DATABASE goes through, not what
+            # the person does.
+            _require(isinstance(meta["must_land_here"], bool),
+                     f"versions[{version}].must_land_here must be a boolean")
 
     edges = data.get("edges")
     _require(isinstance(edges, list), "upgrade matrix needs an 'edges' list")
