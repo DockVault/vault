@@ -27,7 +27,8 @@ import pytest
 
 paramiko = pytest.importorskip("paramiko")
 
-from conftest import ADMIN_USER, ADMIN_PASS, unique, ensure_ecc_keypair, create_zk_vault  # noqa: E402
+from conftest import (ADMIN_USER, ADMIN_PASS, unique, ensure_ecc_keypair,  # noqa: E402
+                      create_zk_vault, skip_if_container_absent)
 
 SFTP_HOST = os.environ.get("VAULT_SFTP_HOST", "127.0.0.1")
 SFTP_PORT = int(os.environ.get("VAULT_SFTP_PORT", "2322"))
@@ -496,17 +497,24 @@ def _backdate_deactivate_at(temp_username):
     import subprocess
     if not shutil.which("docker"):
         return False
-    u = subprocess.run(["docker", "exec", _DB_CONTAINER, "printenv", "POSTGRES_USER"],
-                       capture_output=True, text=True, timeout=10)
-    d = subprocess.run(["docker", "exec", _DB_CONTAINER, "printenv", "POSTGRES_DB"],
-                       capture_output=True, text=True, timeout=10)
-    if u.returncode != 0 or d.returncode != 0:
+    try:
+        u = subprocess.run(["docker", "exec", _DB_CONTAINER, "printenv", "POSTGRES_USER"],
+                           capture_output=True, text=True, timeout=10)
+        d = subprocess.run(["docker", "exec", _DB_CONTAINER, "printenv", "POSTGRES_DB"],
+                           capture_output=True, text=True, timeout=10)
+        if u.returncode != 0 or d.returncode != 0:
+            return False
+        r = subprocess.run(
+            ["docker", "exec", _DB_CONTAINER, "psql", "-U", u.stdout.strip(),
+             "-d", d.stdout.strip(),
+             "-c", "UPDATE temporary_credentials SET deactivate_at = NOW() - INTERVAL '5 minutes' "
+                   f"WHERE temp_username = '{temp_username}';"],
+            capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        # A loaded host, not a refusal. Its neighbour _psql tolerates the same thing, and the
+        # integration job stops at the first failure, so one slow exec must not end the run.
         return False
-    r = subprocess.run(
-        ["docker", "exec", _DB_CONTAINER, "psql", "-U", u.stdout.strip(), "-d", d.stdout.strip(),
-         "-c", "UPDATE temporary_credentials SET deactivate_at = NOW() - INTERVAL '5 minutes' "
-               f"WHERE temp_username = '{temp_username}';"],
-        capture_output=True, text=True, timeout=15)
+    skip_if_container_absent(r, _DB_CONTAINER)
     assert r.returncode == 0 and "UPDATE 1" in r.stdout, (
         "did not close the validity window on exactly one credential, so the session below is "
         f"still inside its window: rc={r.returncode} out={r.stdout.strip()[:120]} "

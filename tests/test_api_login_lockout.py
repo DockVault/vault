@@ -58,6 +58,7 @@ def test_timed_lockout_reports_minutes_and_retry_after(admin):
             )
         except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
             pytest.skip(f"docker/psql unavailable: {exc}")
+        skip_if_container_absent(r, _DB_CONTAINER)
         assert r.returncode == 0 and "UPDATE 1" in (r.stdout + r.stderr), (
             "did not apply a timed lock to exactly one user, so the login below is an ordinary "
             f"login and the 403 assertion would fail for an unrelated reason: {r.stderr[:200]}")

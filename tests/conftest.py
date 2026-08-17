@@ -595,3 +595,14 @@ def temp_user_client(admin, temp_user):
     client = ApiClient()
     client.login(temp_user["_username"], temp_user["_password"])
     return client
+
+
+def skip_if_container_absent(completed, container):
+    """Skip when `docker exec` failed because there is no such container.
+
+    A suite pointed at a remote deployment, or at an externally managed database, has nothing
+    of that name to shell into -- an environment gap. Every other failure means the container
+    was there and refused the command, which is the caller's to assert on rather than skip.
+    """
+    if completed is not None and "No such container" in (completed.stderr or ""):
+        pytest.skip(f"no {container} container on this host to run the setup in")

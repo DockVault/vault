@@ -14,7 +14,7 @@ import hashlib
 
 import pytest
 
-from conftest import unique
+from conftest import skip_if_container_absent, unique
 
 
 _OCTET = {"Content-Type": "application/octet-stream"}
@@ -122,6 +122,7 @@ def test_a_corrupted_stored_file_fails_before_the_body_and_says_nothing_useful(a
         ["docker", "exec", db, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc", query],
         capture_output=True, text=True, timeout=60)
     rel = found.stdout.strip()
+    skip_if_container_absent(found, db)
     assert found.returncode == 0 and rel, (
         "could not locate the stored blob, so the corruption below was never applied and this "
         f"test checked nothing: {found.stderr.strip()[:200]}")
@@ -132,6 +133,7 @@ def test_a_corrupted_stored_file_fails_before_the_body_and_says_nothing_useful(a
          f"f='/app/storage/{rel}'; n=$(wc -c < \"$f\"); truncate -s $((n - 2000)) \"$f\"; "
          f"wc -c < \"$f\""],
         capture_output=True, text=True, timeout=60)
+    skip_if_container_absent(cut, api)
     assert cut.returncode == 0 and cut.stdout.strip().isdigit(), (
         "could not truncate the stored blob, so nothing was corrupted and the assertions below "
         f"would pass against an intact file: {cut.stderr.strip()[:200]}")
@@ -193,6 +195,7 @@ def _blob_path(file_id):
         ["docker", "exec", db, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc",
          f"SELECT storage_path FROM files WHERE id = '{file_id}';"],
         capture_output=True, text=True, timeout=60)
+    skip_if_container_absent(out, db)
     assert out.returncode == 0 and out.stdout.strip(), (
         "could not locate the stored blob, so the caller cannot corrupt it and would check "
         f"nothing: {out.stderr.strip()[:200]}")
@@ -207,9 +210,11 @@ def _break_checksum(file_id):
         ["docker", "exec", db, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc",
          f"UPDATE files SET checksum_sha256 = repeat('d', 64) WHERE id = '{file_id}';"],
         capture_output=True, text=True, timeout=60)
-    assert out.returncode == 0, (
-        "could not alter the stored checksum, so the checksum below still matches and the test "
-        f"proves nothing: {out.stderr.strip()[:200]}")
+    skip_if_container_absent(out, db)
+    assert out.returncode == 0 and "UPDATE 1" in out.stdout, (
+        "did not rewrite the checksum of exactly one row, so the stored checksum still matches "
+        f"the blob and the test proves nothing: rc={out.returncode} "
+        f"out={out.stdout.strip()[:120]} err={out.stderr.strip()[:120]}")
 
 
 def test_an_empty_file_with_a_wrong_checksum_is_not_served_as_a_success(admin, temp_vault):
@@ -279,6 +284,7 @@ def test_an_unreadable_blob_is_an_error_status_not_an_empty_success(admin, temp_
         ["docker", "exec", api, "sh", "-c",
          f"printf 'not any known format at all' > '/app/storage/{rel}'"],
         capture_output=True, text=True, timeout=60)
+    skip_if_container_absent(wrote, api)
     assert wrote.returncode == 0, (
         "could not replace the stored blob, so the file is still readable and the assertion "
         f"below would pass for the wrong reason: {wrote.stderr.strip()[:200]}")

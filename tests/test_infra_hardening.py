@@ -582,7 +582,8 @@ def _compose_render_blocker():
     if probe.returncode != 0:
         return "the docker compose plugin is not installed"
     if not (ROOT / ".env").exists():
-        # The secure stack declares `env_file: .env`, so compose will not render without one.
+        # The secure stack declares `env_file: ../.env` on its services, resolved relative to
+        # deploy/, so compose will not render without a repo-root .env.
         # A fresh clone has none; CI writes one before the suite runs, so this skips on a dev
         # box that has never run setup and runs everywhere it can.
         return "no repo-root .env for compose to render against"
@@ -605,6 +606,11 @@ def _render_secure_compose(**overrides):
                            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
     except subprocess.TimeoutExpired:
         pytest.skip("docker compose config timed out")
+    if "failed to read" in r.stderr and ".env" in r.stderr:
+        # Compose could not parse the developer's own .env, which says nothing about the file
+        # under test. Worth skipping specifically: on Windows `echo x > file` writes UTF-16,
+        # and compose rejects that before it ever looks at the compose file.
+        pytest.skip(f"the repo-root .env is not parseable by compose: {r.stderr.strip()[:160]}")
     assert r.returncode == 0, (
         "docker compose rejected the shipped docker-compose.secure.yml. Every self-hosted "
         "deployment renders this file, so a refusal here breaks `up` for all of them:\n"
