@@ -38,6 +38,10 @@ playwright>=1.62.0
 pytest-playwright>=0.8.0
 websocket-client>=1.9.0
 
+# Static analysis. Pinned exactly: it runs in CI as a gate, so moving it changes what the
+# gate accepts. Only the undefined-name rule is enforced -- see the preflight step.
+ruff==0.15.14
+
 # Preflight regenerates and audits the production lock with these pinned supply-chain tools.
 pip-tools==7.6.1
 pip-audit==2.10.1
