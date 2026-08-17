@@ -597,6 +597,28 @@ def temp_user_client(admin, temp_user):
     return client
 
 
+# Things that mean this machine cannot take another stack right now, as opposed to the stack
+# being broken. Matched against `docker compose up` stderr, lowercased.
+HOST_CANNOT_TAKE_A_STACK = (
+    "port is already allocated",
+    "address already in use",
+    "no space left on device",
+)
+
+
+def host_cannot_take_a_stack(completed):
+    """Whether a failed `docker compose up` failed for a reason about the host, not the images.
+
+    Kept deliberately narrow. Everything outside this list -- an image that will not start, a
+    container that comes up and reports itself unhealthy, a compose file the daemon rejects -- is
+    a result, and a drill that stands down on those proves nothing while staying green.
+    """
+    if completed is None:
+        return True
+    haystack = ((completed.stderr or "") + (completed.stdout or "")).lower()
+    return any(marker in haystack for marker in HOST_CANNOT_TAKE_A_STACK)
+
+
 def configured_int_setting(name, container=None):
     """The integer the RUNNING deployment has configured for `name`, or None if unreadable.
 

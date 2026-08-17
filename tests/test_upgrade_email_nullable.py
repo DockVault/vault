@@ -28,6 +28,8 @@ import time
 import uuid
 
 import pytest
+
+from conftest import host_cannot_take_a_stack
 import requests
 
 pytestmark = [pytest.mark.integration, pytest.mark.docker, pytest.mark.slow,
@@ -178,21 +180,36 @@ def _boot_stack(tmp_path_factory, image, prefix):
         "base_url": f"http://127.0.0.1:{port}",
     }
 
+    def purge():
+        # Stop the project, then remove ONLY the volumes this test created, by exact name.
+        # Never `down -v` and never a prune -- both can reach unrelated volumes on this host.
+        compose("down", timeout=300)
+        listed = _run(["docker", "volume", "ls", "-q"], timeout=60).stdout.split()
+        for name in listed:
+            if name.startswith(project):
+                _run(["docker", "volume", "rm", name], timeout=60)
+
     override(image)
     up = compose("up", "-d")
-    if up.returncode != 0 or not wait_healthy():
-        compose("down", timeout=300)
-        pytest.skip(f"{prefix} stack did not come up: {up.stderr[-400:]}")
+    # As in the other drill: sftp waits on the API's health, so `up` blocks and an image that
+    # comes up sick returns non-zero. Only the host being unable to take another stack is a
+    # reason to skip; an image that will not boot is the thing under test.
+    healthy = wait_healthy() if up.returncode == 0 else False
+    if up.returncode != 0 or not healthy:
+        note = (f"{prefix} stack did not come up (rc={up.returncode}, healthy={healthy}): "
+                f"{(up.stderr or '')[-400:]}")
+        if host_cannot_take_a_stack(up):
+            purge()
+            pytest.skip(f"this host cannot take another stack right now: {note}")
+        logs = compose("logs", "--no-color", "--tail", "60", timeout=120).stdout
+        purge()
+        pytest.fail(f"the {prefix} image does not come up against the shipped compose, so the "
+                    f"nullable-column upgrade below was never exercised.\n{note}\n"
+                    f"  logs:\n{logs[-2000:]}")
 
     yield state
 
-    # Teardown: stop the project, then remove ONLY the volumes this test created, by exact
-    # name. Never `down -v` and never a prune -- both can reach unrelated volumes on this host.
-    compose("down", timeout=300)
-    listed = _run(["docker", "volume", "ls", "-q"], timeout=60).stdout.split()
-    for name in listed:
-        if name.startswith(project):
-            _run(["docker", "volume", "rm", name], timeout=60)
+    purge()
 
 
 def _login(base_url, username, password):
