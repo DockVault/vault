@@ -308,6 +308,20 @@ jobs:
           VAULT_REDIS_OUTAGE_TEST=1 \
           VAULT_REDIS_CONTAINER=vault-redis \
             python -m pytest tests/test_api_rate_limit_classes.py::test_general_api_classes_fail_open_during_redis_outage --maxfail=1
+          # The test unpauses the container and waits for the API to report the connection
+          # back, which is not the same as docker calling it healthy again: a paused
+          # container cannot answer its own healthcheck, so that verdict only clears on the
+          # next successful probe. The step below recreates a service declared
+          # `condition: service_healthy` on redis and fails outright while it is stale.
+          for attempt in $(seq 1 30); do
+            status="$(docker inspect --format '{{.State.Health.Status}}' vault-redis 2>/dev/null || echo unknown)"
+            if [ "$status" = "healthy" ]; then break; fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::vault-redis did not return to healthy after the outage test (last seen: ${status})"
+              exit 1
+            fi
+            sleep 2
+          done
 
       - name: Exercise login throttling and Redis outage fallback
         shell: bash
