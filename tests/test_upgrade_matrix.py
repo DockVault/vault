@@ -69,7 +69,14 @@ def test_every_released_tag_has_an_entry_and_a_way_to_reach_it():
     """
     tags = subprocess.run(
         ["git", "tag", "-l", "v*.*.*"], cwd=ROOT, capture_output=True, text=True, timeout=60)
-    if tags.returncode != 0 or not tags.stdout.strip():
+    # A git that FAILED is not a checkout without tags, and folding them together reproduces the
+    # very mistake this check was written to fix -- one level down. `git tag -l` does not fail on a
+    # repository with no tags; it prints nothing and exits 0. A non-zero exit means something else
+    # is wrong, everywhere, so it fails everywhere.
+    assert tags.returncode == 0, (
+        "git tag -l failed, which is not the same as having no tags: %s"
+        % (tags.stderr or "").strip()[:200])
+    if not tags.stdout.strip():
         # Skipping here is only acceptable on a developer's partial checkout. In CI it means the
         # check did not run in the job that gates publication -- which is exactly how this test
         # spent its first day doing nothing: the default checkout is shallow and tagless, so

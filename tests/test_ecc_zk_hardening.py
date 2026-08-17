@@ -43,6 +43,26 @@ def _psql(sql):
         return None
 
 
+def _psql_must_work(sql, what):
+    """Run a seeding statement and insist it worked.
+
+    `_psql` returns None when docker or the database container is not here, which is a genuine
+    reason to skip, and a CompletedProcess otherwise -- whatever the statement did. Treating those
+    the same is how a test keeps its green while doing nothing: the legacy row below is created by
+    an UPDATE that a column rename would turn into an error, and the assertion that follows would
+    then pass because the condition it is meant to detect was never set up.
+
+    Absence skips. A statement that ran and failed is a failure.
+    """
+    r = _psql(sql)
+    if r is None:
+        pytest.skip("docker/vault-db unavailable")
+    assert r.returncode == 0, (
+        "could not %s, so this test would assert against a state it never created: %s"
+        % (what, (r.stderr or "").strip()[:300]))
+    return r
+
+
 def _psql_scalar(sql):
     r = _psql(sql)
     if r is None or r.returncode != 0:
@@ -127,8 +147,8 @@ def test_ecc_zk_download_serves_neutral_mime(admin):
         fid = zk_chunked_upload(admin, vid, "secret.pdf", b"opaque-ciphertext", dek,
                                 mime="application/pdf", file_id=str(uuid.uuid4()))
         # Simulate a legacy row: a server-readable plaintext mime_type.
-        if _psql(f"UPDATE files SET mime_type='application/pdf' WHERE id='{fid}';") is None:
-            pytest.skip("docker/vault-db unavailable")
+        _psql_must_work(f"UPDATE files SET mime_type='application/pdf' WHERE id='{fid}';",
+                        "write the legacy plaintext mime_type")
         r = admin.get(f"/vaults/{vid}/files/{fid}/download")
         assert r.status_code == 200, r.text
         assert r.headers.get("Content-Type", "").startswith("application/octet-stream"), \
@@ -147,12 +167,11 @@ def test_patch_user_deactivate_blacklists_zk_keys(admin, temp_user):
     vid = vz["id"]
     try:
         # Seed an active ZK member-key row for temp_user on this vault (they are NOT the owner).
-        seeded = _psql(
+        _psql_must_work(
             "INSERT INTO vault_member_keys (id, vault_id, user_id, encrypted_dek, "
             "ephemeral_public_key, key_version, is_active) VALUES "
-            f"(gen_random_uuid(), '{vid}', '{uid}', 'dummy-ct', 'dummy-epk', 1, true);")
-        if seeded is None or seeded.returncode != 0:
-            pytest.skip("cannot seed vault_member_keys (docker/vault-db)")
+            f"(gen_random_uuid(), '{vid}', '{uid}', 'dummy-ct', 'dummy-epk', 1, true);",
+            "seed an active ZK member-key row")
         assert _psql_scalar(
             f"SELECT count(*) FROM vault_member_keys WHERE user_id='{uid}' AND is_active=true;") == "1"
 
@@ -178,12 +197,11 @@ def test_ecc_rekey_manager_cannot_unseat_peer_manager(admin):
         # A ZK vault rejects the standard per-user permission grant (ZK sharing goes through
         # /ecc), so seed the two Manager memberships directly (manage_permission=true).
         for m in (m1, m2):
-            seeded = _psql(
+            _psql_must_work(
                 "INSERT INTO vault_members (vault_id, user_id, read_permission, write_permission, "
                 "delete_permission, manage_permission) VALUES "
-                f"('{vid}', '{m['id']}', true, true, true, true);")
-            if seeded is None or seeded.returncode != 0:
-                pytest.skip("cannot seed vault_members (docker/vault-db)")
+                f"('{vid}', '{m['id']}', true, true, true, true);",
+                "seed a Manager membership")
         c1 = ApiClient(BASE_URL)
         c1.login(m1["_username"], m1["_password"])
         # M1 (a Manager, not owner/admin) tries to strip peer Manager M2 via rekey.
