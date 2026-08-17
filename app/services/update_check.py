@@ -38,7 +38,7 @@ MAX_BODY_BYTES = 512 * 1024  # cap the response we buffer/parse (fail-closed on 
 _USER_AGENT = "DockVault-update-check"
 
 # Process-level cache; re-checks after a restart, which is fine (no persistence needed).
-_cache = {"checked_at": 0.0, "latest": None, "url": None, "notes": None}
+_cache = {"checked_at": 0.0, "latest": None, "url": None, "notes": None, "matrix": None}
 # Serialize the outbound fetch so concurrent admin requests (this runs in FastAPI's sync-endpoint
 # threadpool) coalesce into ONE GitHub call per interval instead of a thundering herd at expiry.
 _fetch_lock = threading.Lock()
@@ -139,15 +139,106 @@ def get_update_status(current_version, enabled, managed, force=False, interval_s
             if _due():
                 latest, url, notes = _fetch_latest()
                 if latest is not None:
-                    _cache.update({"checked_at": time.time(), "latest": latest, "url": url, "notes": notes})
+                    # The matrix is fetched inside the same lock and the same interval as the
+                    # release check, so a polling admin page still costs one round of outbound
+                    # requests however often it polls. A matrix that cannot be fetched is left
+                    # None: the banner then degrades to what it said before this existed, which is
+                    # a worse banner but not a broken one.
+                    _cache.update({"checked_at": time.time(), "latest": latest, "url": url,
+                                   "notes": notes, "matrix": _fetch_matrix(latest)})
     latest = _cache["latest"]
-    return {
+    available = is_newer(latest, current_version)
+    status = {
         "enabled": True,
         "managed": False,
         "current": current_version,
         "latest": latest,
-        "update_available": is_newer(latest, current_version),
+        "update_available": available,
         "url": _cache["url"],
         "notes": _cache["notes"],
         "checked_at": _cache["checked_at"] or None,
     }
+    if available:
+        # Only when there is something to describe. Attaching an "unknown, assume the worst"
+        # verdict to a deployment that is already current would put a warning on the screen about
+        # an upgrade nobody is being offered.
+        status["upgrade"] = describe_hop(_cache.get("matrix"), current_version, latest)
+    return status
+
+
+# --- what the available update would cost -------------------------------------------------------
+#
+# The banner used to say only that a version exists. An operator who reads "0.11.0 available" and
+# presses update has no way to know whether that is a drop-in or a one-way schema change, and the
+# place they find out should not be afterwards.
+#
+# This deliberately mirrors `plan_upgrade_path` in `dockvault.py` rather than importing it. That
+# script is stdlib-only and runs on the host, outside the image, precisely so it keeps working when
+# the app does not; making it import from `app/` would give that up. Two implementations of one
+# rule is a drift risk, so a test feeds both the same matrices and asserts they agree.
+
+MATRIX_URL = "https://raw.githubusercontent.com/DockVault/vault/%s/docs/upgrade-matrix.json"
+
+
+def _semver_key(version):
+    return tuple(int(part) for part in version.split("."))
+
+
+def describe_hop(matrix, current, target):
+    """What moving from `current` to `target` involves, per the matrix.
+
+    Returns {known, requires_backup, irreversible, blocked, conditions, steps}. Unknown resolves to
+    "needs a backup, may be irreversible" -- the banner says so rather than implying a drop-in,
+    because a gap in the matrix is where nobody has considered the upgrade.
+    """
+    unknown = {"known": False, "requires_backup": True, "irreversible": True,
+               "blocked": False, "conditions": [], "steps": 0}
+    if not isinstance(matrix, dict):
+        return unknown
+    versions = matrix.get("versions")
+    if not isinstance(versions, dict):
+        return unknown
+    current = (current or "").lstrip("vV")
+    target = (target or "").lstrip("vV")
+    if current not in versions or target not in versions:
+        return unknown
+    try:
+        ordered = sorted(versions, key=_semver_key)
+    except (TypeError, ValueError):
+        return unknown
+    if _semver_key(target) <= _semver_key(current):
+        return unknown
+
+    edges = {}
+    for edge in (matrix.get("edges") or []):
+        if isinstance(edge, dict):
+            edges[(edge.get("from"), edge.get("to"))] = edge
+    walk = ordered[ordered.index(current):ordered.index(target) + 1]
+    steps = []
+    for a, b in zip(walk, walk[1:]):
+        edge = edges.get((a, b))
+        if edge is None:
+            return unknown
+        steps.append(edge)
+
+    return {
+        "known": True,
+        "requires_backup": any(e.get("requires_backup") for e in steps),
+        "irreversible": any(not e.get("reversible", True) for e in steps),
+        "blocked": any(e.get("kind") == "blocked" for e in steps),
+        "conditions": [c.get("summary", "") for e in steps for c in (e.get("conditions") or [])
+                       if isinstance(c, dict)],
+        "steps": len(steps),
+    }
+
+
+def _fetch_matrix(tag):
+    """The upgrade matrix published with `tag`, or None. NEVER raises.
+
+    Goes through the same capped, timed-out reader as every other outbound call here, so an
+    oversized or slow response cannot become this process's problem.
+    """
+    try:
+        return _http_json(MATRIX_URL % (tag if str(tag).startswith("v") else "v%s" % tag))
+    except Exception:  # noqa: BLE001 — fail-closed-silent, like the rest of this module
+        return None

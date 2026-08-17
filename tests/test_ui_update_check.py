@@ -71,3 +71,59 @@ def test_check_now_issues_a_forced_check(page: Page, admin_creds):
     while forced["n"] == 0 and time.time() < deadline:
         page.wait_for_timeout(150)
     assert forced["n"] >= 1, "clicking Check for updates must issue a force=1 request"
+
+
+def _banner_payload(upgrade):
+    payload = {"enabled": True, "managed": False, "current": "0.6.0", "latest": "0.9.0",
+               "update_available": True, "url": "https://github.com/DockVault/vault/releases",
+               "notes": "x", "checked_at": 1700000000, "interval_minutes": 360}
+    if upgrade is not None:
+        payload["upgrade"] = upgrade
+    return payload
+
+
+def test_the_banner_says_a_drop_in_update_is_a_drop_in(page: Page, admin_creds):
+    """The distinction the banner exists to make.
+
+    Announcing only that a version exists leaves the operator to discover the difference between a
+    drop-in and a one-way schema change after pressing the button.
+    """
+    _mock_status(page, _banner_payload({"known": True, "requires_backup": False,
+                                        "irreversible": False, "blocked": False,
+                                        "conditions": [], "steps": 1}))
+    _open_general(page, admin_creds)
+    expect(page.locator("#update-banner-text")).to_contain_text("drop-in")
+
+
+def test_the_banner_says_when_an_update_needs_a_backup_and_cannot_be_undone(page: Page, admin_creds):
+    _mock_status(page, _banner_payload({"known": True, "requires_backup": True,
+                                        "irreversible": True, "blocked": False,
+                                        "conditions": [], "steps": 2}))
+    _open_general(page, admin_creds)
+    text = page.locator("#update-banner-text")
+    expect(text).to_contain_text("a backup")
+    expect(text).to_contain_text("no rollback")
+    expect(text).not_to_contain_text("drop-in")
+
+
+def test_an_undescribed_update_is_not_presented_as_safe(page: Page, admin_creds):
+    """A gap in the matrix is where nobody has considered the hop, so the banner says so."""
+    _mock_status(page, _banner_payload({"known": False, "requires_backup": True,
+                                        "irreversible": True, "blocked": False,
+                                        "conditions": [], "steps": 0}))
+    _open_general(page, admin_creds)
+    text = page.locator("#update-banner-text")
+    expect(text).to_contain_text("does not describe")
+    expect(text).not_to_contain_text("drop-in")
+
+
+def test_a_server_that_says_nothing_about_the_hop_still_shows_the_banner(page: Page, admin_creds):
+    """Backwards compatibility, and the degrade path.
+
+    An older deployment, or one whose matrix fetch failed, sends no `upgrade` key at all. The
+    banner must still announce the release rather than break on the missing field.
+    """
+    _mock_status(page, _banner_payload(None))
+    _open_general(page, admin_creds)
+    expect(page.locator("#update-banner")).to_be_visible()
+    expect(page.locator("#update-banner-text")).to_contain_text("0.9.0")
