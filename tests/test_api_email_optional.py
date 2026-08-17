@@ -42,6 +42,26 @@ def sweeper(admin):
             pass
 
 
+def _is_an_address_validation_refusal(response):
+    """Whether the server refused the ADDRESS, as opposed to failing for any other reason.
+
+    `email` is declared Optional[EmailStr], so a local part the validator will not accept comes
+    back as a pydantic 422 whose error locations name the email field. Nothing else qualifies:
+    a 400 is a business rule and a 500 is a defect, and reporting either as "this deployment
+    cannot run the check" is how the case this test exists for would go unnoticed.
+    """
+    if response.status_code != 422:
+        return False
+    try:
+        detail = response.json().get("detail")
+    except ValueError:
+        return False
+    if not isinstance(detail, list):
+        return False
+    return any("email" in [str(part) for part in (entry.get("loc") or [])]
+               for entry in detail if isinstance(entry, dict))
+
+
 def _name(prefix="eo"):
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
@@ -343,8 +363,13 @@ def test_a_dotted_capital_i_cannot_create_a_twin_of_an_existing_address(admin, s
         "username": _name(), "email": f"{local}@example.com",
         "password": PASSWORD, "role": "user",
     })
-    if first.status_code >= 400:
+    if _is_an_address_validation_refusal(first):
         pytest.skip(f"the address validator rejects this local part outright: {first.text[:120]}")
+    assert first.status_code < 400, (
+        "creating the first account failed for a reason that is not the address validator "
+        "refusing this local part, so the fold below was never exercised. A 5xx here is the "
+        f"impersonation path erroring out rather than being tested: {first.status_code} "
+        f"{first.text[:200]}")
     sweeper(first.json())
 
     second = admin.post("/users", json={

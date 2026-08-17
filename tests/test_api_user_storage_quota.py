@@ -118,9 +118,9 @@ def test_a_zero_quota_allows_no_allocation_at_all(admin, user):
     assert body["available_bytes"] == 0
 
     client = _client_for(user)
+    # No 403 guard: the request below is what this test asserts on. Creating a vault is granted
+    # to a fresh account in code, not by configuration, so a refusal here is a finding.
     r = client.post("/vaults", json={"name": unique("zero"), "size_limit_gb": 1})
-    if r.status_code == 403:
-        pytest.skip("this deployment's default role can't create vaults")
     assert r.status_code == 400, r.text
 
 
@@ -131,9 +131,8 @@ def test_the_override_bounds_what_the_account_can_allocate(admin, user):
     assert _set_quota(admin, user["id"], 2).status_code == 200   # ...but 2 GB for this account
     client = _client_for(user)
 
+    # As above: the refusal being checked is the quota's, so a different refusal is a finding.
     over = client.post("/vaults", json={"name": unique("cap"), "size_limit_gb": 3})
-    if over.status_code == 403:
-        pytest.skip("this deployment's default role can't create vaults")
     assert over.status_code == 400, over.text
 
     ok = client.post("/vaults", json={"name": unique("cap-ok"), "size_limit_gb": 2})
