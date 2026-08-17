@@ -340,8 +340,10 @@ def test_null_scope_temp_cred_manages_its_own_children(admin):
     pc = ApiClient(BASE_URL)
     pc.login(parent["temp_username"], parent["credential"])
     child_r = pc.post("/auth/temp-credentials", json={"note": unique("child")})
-    if child_r.status_code != 200:
-        pytest.skip(f"a legacy temp cred cannot create children here ({child_r.status_code})")
+    assert child_r.status_code == 200, (
+        "the parent was minted asking to create credentials, so a refusal here is the setup "
+        f"failing rather than a deployment that forbids it: {child_r.status_code} "
+        f"{child_r.text[:200]}")
     child = child_r.json()
     try:
         listed = pc.get("/temp-creds/list")
