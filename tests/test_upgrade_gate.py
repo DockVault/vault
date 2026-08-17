@@ -340,3 +340,42 @@ def test_the_running_version_is_read_from_a_real_container():
     assert dv.parse_semver(reported), (
         f"the container's /app/VERSION is {reported!r}, which is not a version. The tool would "
         "silently fall back to the checkout's file, which is the defect this replaced")
+
+
+def test_a_guessed_origin_is_not_described(tmp_path, monkeypatch, capsys):
+    """When the version came from the file rather than the container, the hop is a guess.
+
+    The pull path never rewrites VERSION, and a container being down is the normal state when you
+    want to change version -- which is exactly when the fallback is used. Planning from that file
+    can find a chain of reversible, no-backup edges while the real operation is a downgrade across
+    a database with no down-migrations. Treating an unknown origin as undescribed costs an accurate
+    description in the one case the tool cannot be sure, and buys back the gate.
+    """
+    backups = []
+    tool = _deployment(tmp_path, matrix=_matrix(backup=False))
+    _stub(monkeypatch, tool, backups=backups)
+    monkeypatch.setattr(tool, "_running_version",
+                        lambda *a, **k: ("0.1.0", "this checkout's VERSION file (nothing is "
+                                                  "running to ask)"))
+    _update(tool)
+
+    out = capsys.readouterr().out
+    assert "NOT DESCRIBED" in out, out
+    assert backups, "a hop planned from a guessed origin proceeded without a backup"
+
+
+def test_a_backup_that_captured_no_data_is_not_a_backup(tmp_path, monkeypatch):
+    """The gate's worst failure would be accepting an empty bundle.
+
+    `_do_backup` skipped a volume that was not found -- right for the optional brand volume, and it
+    used to swallow the case where NONE were found, printing success. An .env whose volume prefix
+    no longer matches the deployment produces exactly that, with no docker fault involved.
+    """
+    monkeypatch.setattr(dv, "volume_exists", lambda name: False)
+    tool = _deployment(tmp_path, matrix=_matrix(backup=True))
+    (tmp_path / ".env").write_text(
+        "COMPOSE_PROFILES=combined\nVAULT_VOLUME_PREFIX=nothing_here\n"
+        "DOCKVAULT_IMAGE=%s\n" % dv.LOCAL_IMAGE, encoding="utf-8", newline="")
+
+    with pytest.raises(SystemExit):
+        tool._do_backup(tool._load_env(), argparse.Namespace(backup_dir=str(tmp_path / "b")))

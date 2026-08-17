@@ -127,3 +127,19 @@ def test_a_server_that_says_nothing_about_the_hop_still_shows_the_banner(page: P
     _open_general(page, admin_creds)
     expect(page.locator("#update-banner")).to_be_visible()
     expect(page.locator("#update-banner-text")).to_contain_text("0.9.0")
+
+
+def test_the_banner_does_not_call_a_blocked_upgrade_a_drop_in(page: Page, admin_creds):
+    """The matrix can say an upgrade must not be taken, and the tool refuses it outright.
+
+    The banner used to branch only on known/backup/reversible, so a blocked hop whose booleans
+    happened to be benign rendered as "Upgrading is a drop-in change" -- the two surfaces
+    contradicting each other, with the banner being the one an operator reads first.
+    """
+    _mock_status(page, _banner_payload({"known": True, "requires_backup": False,
+                                        "irreversible": False, "blocked": True,
+                                        "conditions": [], "steps": 1}))
+    _open_general(page, admin_creds)
+    text = page.locator("#update-banner-text")
+    expect(text).not_to_contain_text("drop-in")
+    expect(text).to_contain_text("advises against")

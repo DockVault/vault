@@ -5642,6 +5642,11 @@ function renderUpdateBanner(us) {
         let cost = '';
         if (hop && hop.known === false) {
             cost = ' This release does not describe what upgrading involves — read its notes and back up first.';
+        } else if (hop && hop.blocked) {
+            // The matrix says this one must not be taken. The tool refuses it outright, so a
+            // banner calling it a drop-in would have the two surfaces contradicting each other --
+            // and the banner is the one an operator reads first.
+            cost = ' The project advises against taking this upgrade directly — read its notes.';
         } else if (hop) {
             const needs = [];
             if (hop.requires_backup) { needs.push('a backup'); }
