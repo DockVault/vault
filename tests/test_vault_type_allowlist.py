@@ -10,11 +10,17 @@ surfacing checks run on any deployment; the forbid-path checks are conditional o
 deployment's own allowlist (green against a PLAN_ALLOWED_VAULT_TYPES-restricted instance,
 skipped on an un-gated one), so the file is committable and non-vacuous either way.
 """
+import os
 from pathlib import Path
 
 from conftest import unique
 
 RECOGNISED = {"standard", "zero_knowledge"}
+
+# Set by the CI step that restricts the allowlist on purpose. On that round the
+# forbid path below MUST be reachable, so a skip there means the setup did not take
+# -- and a check that quietly declines to run is what this whole arrangement is for.
+RESTRICTED_ROUND = os.environ.get("VAULT_TYPE_ALLOWLIST_RESTRICTED") == "1"
 
 
 def test_source_wires_the_allowlist_gate():
@@ -72,6 +78,10 @@ def test_forbidden_type_rejected_with_policy_error(admin):
     allowed = set(_zk_enabled(admin).get("allowed_vault_types") or [])
     forbidden = RECOGNISED - allowed
     if not forbidden:
+        assert not RESTRICTED_ROUND, (
+            "this round restricted the allowlist so that this check could run, and the "
+            f"deployment still permits every type ({sorted(allowed)}). The setting did not "
+            "reach the running container, so the forbid path went unexercised")
         pytest.skip("deployment permits all vault types; run against a "
                     "PLAN_ALLOWED_VAULT_TYPES-restricted instance to exercise the forbid path")
     ftype = sorted(forbidden)[0]

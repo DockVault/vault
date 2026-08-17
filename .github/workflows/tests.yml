@@ -301,6 +301,43 @@ jobs:
       # it. Nothing here needs the lowered limit -- the flag is read by the test, not the
       # server -- so the two are kept apart. The test pauses the container and unpauses it in
       # a finally, waiting for health before it returns.
+      # The allowlist of creatable vault types is a comma-list that ships empty, meaning
+      # everything is permitted, and no workflow has ever set it -- so the check that a
+      # forbidden type is refused, and that nothing is persisted when it is, has never run.
+      #
+      # It cannot be restricted for the whole suite: most of the suite creates
+      # zero-knowledge vaults, which is exactly what gets forbidden here. Hence a step, and
+      # hence putting the shipped default back before the next one.
+      - name: Exercise the vault-type allowlist against a forbidden type
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i '/^PLAN_ALLOWED_VAULT_TYPES=/d' .env
+          echo 'PLAN_ALLOWED_VAULT_TYPES=standard' >> .env
+          docker compose up -d --force-recreate vault-api
+          for attempt in $(seq 1 40); do
+            if curl -fsS --max-time 5 http://127.0.0.1:8200/health >/dev/null 2>&1; then break; fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "::error::vault-api did not come back with the vault-type allowlist applied"
+              exit 1
+            fi
+            sleep 3
+          done
+          # The flag tells the test that this round staged the restriction, so that skipping
+          # the forbid path here is a failure rather than a deployment it cannot exercise.
+          VAULT_TYPE_ALLOWLIST_RESTRICTED=1 \
+            python -m pytest tests/test_vault_type_allowlist.py --maxfail=1
+          sed -i '/^PLAN_ALLOWED_VAULT_TYPES=/d' .env
+          docker compose up -d --force-recreate vault-api
+          for attempt in $(seq 1 40); do
+            if curl -fsS --max-time 5 http://127.0.0.1:8200/health >/dev/null 2>&1; then break; fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "::error::vault-api did not return after restoring the permissive allowlist"
+              exit 1
+            fi
+            sleep 3
+          done
+
       - name: Exercise the general API fail-open during a Redis outage
         shell: bash
         run: |
