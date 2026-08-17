@@ -19,8 +19,8 @@ import pytest
 
 from memory_probe import CgroupSampler
 from conftest import (
-    create_zk_vault, ensure_ecc_keypair, unique, zk_chunked_upload,
-    ZK_WRAPPED_DEK_STUB,
+    create_zk_vault, ensure_ecc_keypair, skip_if_container_absent, unique,
+    zk_chunked_upload, ZK_WRAPPED_DEK_STUB,
 )
 
 
@@ -151,8 +151,12 @@ def test_a_corrupted_zero_knowledge_blob_is_not_served_as_a_success(admin):
                 ["docker", "exec", db, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc",
                  f"UPDATE files SET checksum_sha256 = repeat('d', 64) WHERE id = '{file_id}';"],
                 capture_output=True, text=True, timeout=60)
-            if broke.returncode != 0:
-                pytest.skip(f"could not alter the stored checksum: {broke.stderr.strip()[:120]}")
+            skip_if_container_absent(broke, db)
+            assert broke.returncode == 0 and "UPDATE 1" in broke.stdout, (
+                "did not rewrite the checksum of exactly one row, so the blob below still "
+                f"matches its stored checksum and would be served legitimately: "
+                f"rc={broke.returncode} out={broke.stdout.strip()[:120]} "
+                f"err={broke.stderr.strip()[:120]}")
 
             import requests
             url = f"{admin.base_url}/vaults/{vault['id']}/files/{file_id}/download"
