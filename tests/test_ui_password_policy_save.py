@@ -94,7 +94,13 @@ def policy_absent():
     """
     before = _psql("SELECT value FROM system_settings WHERE key = 'global'")
     if not before:
-        pytest.skip("this deployment has no global settings row")
+        # A deployment that has never saved settings has no row at all -- which is the very state
+        # the bug lived in, so skipping here would have skipped exactly the case worth testing.
+        # Create an empty one instead: absent row and row-without-these-keys are the same thing to
+        # the reader, and this way the test runs on a fresh deployment.
+        _psql("INSERT INTO system_settings (key, value) VALUES ('global', '{}') "
+              "ON CONFLICT (key) DO NOTHING")
+        before = _psql("SELECT value FROM system_settings WHERE key = 'global'") or "{}"
     stripped = json.loads(before)
     for key in POLICY_KEYS:
         stripped.pop(key, None)
@@ -162,3 +168,45 @@ def test_a_policy_that_was_configured_is_still_preserved(page: Page, admin, admi
     after = admin.get("/settings").json()
     assert after.get("require_uppercase") is True and after.get("require_numbers") is True, after
     assert not after.get("require_lowercase"), after
+
+
+def test_saving_without_touching_anything_changes_nothing(page: Page, admin, admin_creds):
+    """The general form of the bug, rather than four named keys.
+
+    Every field the form renders with a fallback is a candidate for the same mistake: show a
+    default the deployment never chose, then persist it on save. The four password toggles were one
+    instance; an audit found `temp_cred_allow_zk_vaults` and `temp_passcode_min_length` use the same
+    idiom and are correct, because there the server's own default points the same way.
+
+    Rather than pin those three relationships and hope the next field added gets it right, this
+    asserts the property they all have to satisfy: opening Settings and pressing Save is a no-op.
+    Anything the page invents shows up as a difference, whatever key it is under.
+
+    Saves TWICE and compares the second pair, which is what makes it deterministic. On a
+    deployment that has never saved, the first save legitimately materialises the form -- and the
+    question worth asking is not whether anything was written, but whether what the page renders
+    round-trips. A field whose rendered default differs from what it just stored will differ here
+    however many times it is saved.
+
+    The fresh-deployment case, where the page invents a value the server was not enforcing, is
+    covered by the targeted tests above; this catches the same mistake in any other field.
+    """
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open_settings(page, admin)
+    _save_all(page)
+
+    before = admin.get("/settings").json()
+    page.reload()
+    _open_settings(page, admin)
+    _save_all(page)
+    after = admin.get("/settings").json()
+
+    invented = {key: (before.get(key), after.get(key))
+                for key in set(before) | set(after)
+                if before.get(key) != after.get(key)}
+    assert not invented, (
+        "a second save with nothing touched changed %d setting(s): %s. Each is a field whose "
+        "rendered value does not round-trip -- the page shows one thing and stores another, so "
+        "every visit to Settings drifts the deployment further."
+        % (len(invented), ", ".join("%s %r -> %r" % (k, v[0], v[1])
+                                    for k, v in sorted(invented.items()))))
