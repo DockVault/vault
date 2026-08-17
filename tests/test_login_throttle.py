@@ -22,7 +22,7 @@ import time
 import pytest
 import requests
 
-from conftest import ApiClient, unique
+from conftest import ApiClient, configured_int_setting, unique
 
 
 def _hammer_until_429(client, username, max_attempts):
@@ -53,14 +53,22 @@ def test_login_throttle_enforced(base_url):
     codes = _hammer_until_429(client, username, max_attempts=max_attempts)
 
     if 429 not in codes:
-        # The login limit is configurable (rate_limit_login_attempts) and a dev
-        # stack often sets it absurdly high (e.g. 2000) so the throttle never
-        # interferes. We can't cheaply hit that over HTTP, so skip rather than
-        # fail — the test still verifies the throttle in a normal-limit deployment.
+        # A dev stack often raises the limit far above anything reachable over HTTP (2000 in
+        # this suite's own environment), and then not tripping is correct. But "the throttle
+        # did not engage" is also exactly what a broken throttle looks like, so skipping on it
+        # unconditionally means the check quietly stops running the moment it starts mattering.
+        # Ask the deployment what limit it is enforcing: below the attempts just made, it should
+        # have tripped, and that is a failure rather than a deployment this cannot exercise.
+        configured = configured_int_setting("RATE_LIMIT_LOGIN_ATTEMPTS")
+        assert configured is None or configured > max_attempts, (
+            f"per-username login throttling did not engage in {max_attempts} failed attempts "
+            f"against a deployment configured to allow {configured}. Every attempt was answered "
+            "as an ordinary auth failure, so the throttle is not being enforced"
+        )
         pytest.skip(
-            f"login throttle did not engage within {max_attempts} attempts; "
-            "rate_limit_login_attempts is likely configured above that. Lower it "
-            "to exercise this test."
+            f"login throttle did not engage within {max_attempts} attempts and the configured "
+            f"limit ({'unreadable' if configured is None else configured}) does not say it "
+            "should have. Lower rate_limit_login_attempts to exercise this test."
         )
     # Everything before the first 429 must be a plain auth failure (401), never a
     # success or a 500 (a 500 would mean the throttle path errored out — e.g. the

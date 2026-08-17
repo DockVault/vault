@@ -91,6 +91,10 @@ jobs:
             echo "RATE_LIMIT_API_AUTH=100000"
             echo "RATE_LIMIT_API_UPLOAD=100000"
             echo "RATE_LIMIT_API_DOWNLOAD=100000"
+            # The shipped default, stated rather than left implicit: the SSH-key throttle
+            # test asks the deployment what budget it is enforcing, so that it can tell a
+            # throttle which should have engaged from a deployment that cannot show one.
+            echo "RATE_LIMIT_SFTP_KEY_ATTEMPTS=30"
             # A real storage ceiling, so the suite exercises the bounded admin limit
             # (the panel offers 0..MAX_STORAGE_GB) rather than only the unlimited default.
             echo "MAX_STORAGE_GB=64"
@@ -286,6 +290,37 @@ jobs:
               exit 1
             fi
             sleep 3
+          done
+
+      # This check gates on VAULT_REDIS_OUTAGE_TEST, which was set only on the command line
+      # of an invocation naming a different file -- so the assertion that the general API
+      # classes stay available while Redis is down was selected nowhere.
+      #
+      # It runs before the step below rather than inside it: that step lowers the login limit
+      # to five on purpose, and the rest of this file logs in often enough to be refused by
+      # it. Nothing here needs the lowered limit -- the flag is read by the test, not the
+      # server -- so the two are kept apart. The test pauses the container and unpauses it in
+      # a finally, waiting for health before it returns.
+      - name: Exercise the general API fail-open during a Redis outage
+        shell: bash
+        run: |
+          set -euo pipefail
+          VAULT_REDIS_OUTAGE_TEST=1 \
+          VAULT_REDIS_CONTAINER=vault-redis \
+            python -m pytest tests/test_api_rate_limit_classes.py::test_general_api_classes_fail_open_during_redis_outage --maxfail=1
+          # The test unpauses the container and waits for the API to report the connection
+          # back, which is not the same as docker calling it healthy again: a paused
+          # container cannot answer its own healthcheck, so that verdict only clears on the
+          # next successful probe. The step below recreates a service declared
+          # `condition: service_healthy` on redis and fails outright while it is stale.
+          for attempt in $(seq 1 30); do
+            status="$(docker inspect --format '{{.State.Health.Status}}' vault-redis 2>/dev/null || echo unknown)"
+            if [ "$status" = "healthy" ]; then break; fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::vault-redis did not return to healthy after the outage test (last seen: ${status})"
+              exit 1
+            fi
+            sleep 2
           done
 
       - name: Exercise login throttling and Redis outage fallback

@@ -597,6 +597,30 @@ def temp_user_client(admin, temp_user):
     return client
 
 
+def configured_int_setting(name, container=None):
+    """The integer the RUNNING deployment has configured for `name`, or None if unreadable.
+
+    Asked of the container, not of the environment the tests run in. A test that floods a
+    surface until a limit trips needs to know whether the limit it is up against is small
+    enough to have tripped -- and only the deployment knows that. Unreadable is a real answer
+    here: an unset variable means the app default applies, and the tests must not guess at it.
+    """
+    import subprocess
+
+    target = container or os.environ.get("VAULT_API_CONTAINER", "vault-api")
+    try:
+        probe = subprocess.run(["docker", "exec", target, "printenv", name],
+                               capture_output=True, text=True, timeout=15)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if probe.returncode != 0:
+        return None
+    try:
+        return int(probe.stdout.strip())
+    except ValueError:
+        return None
+
+
 def skip_if_container_absent(completed, container):
     """Skip when `docker exec` failed because there is no such container.
 
