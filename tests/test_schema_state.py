@@ -24,6 +24,8 @@ import time
 import pytest
 import requests
 
+from conftest import skip_for_older_deployment, skip_if_container_absent
+
 # Marked per test: one of these reads only source and needs nothing running, and the conftest
 # treats a test carrying both unit and integration as a usage error rather than guessing.
 
@@ -56,8 +58,9 @@ def _psql(sql, on_error="fail"):
         capture_output=True, text=True, timeout=60)
     if out.returncode != 0:
         detail = (out.stderr or "").strip()[:300]
-        if on_error == "skip":
-            pytest.skip(f"cannot query the deployment database: {detail}")
+        if on_error == "older":
+            skip_for_older_deployment(
+                f"cannot read schema-step recording from the deployment database: {detail}")
         raise AssertionError(f"query failed: {detail}\n  sql: {sql}")
     return out.stdout.strip()
 
@@ -82,9 +85,13 @@ def test_a_clean_boot_records_every_step_and_reports_a_complete_schema(base_url)
     """
     counts = _psql(
         "SELECT outcome || '=' || count(*) FROM schema_steps GROUP BY outcome",
-        on_error="skip")
+        on_error="older")
     if not counts:
-        pytest.skip("this deployment predates schema-step recording")
+        # This check calls itself the non-vacuity guard for everything below it, and an empty
+        # table is the state that makes those checks pass for the wrong reason. A deployment
+        # built from the commit under test must have recorded steps, so there it is a finding;
+        # an older image genuinely predates the recording and still skips.
+        skip_for_older_deployment("no schema steps are recorded on this deployment")
 
     tallies = dict(part.split("=") for part in counts.split())
     assert int(tallies.get("applied", 0)) > 20, (
@@ -101,8 +108,11 @@ def test_a_clean_boot_records_every_step_and_reports_a_complete_schema(base_url)
 def _restart_api():
     api = os.environ.get("VAULT_API_CONTAINER", "vault-api")
     done = subprocess.run(["docker", "restart", api], capture_output=True, text=True, timeout=180)
-    if done.returncode != 0:
-        pytest.skip(f"cannot restart {api}: {(done.stderr or '').strip()[:200]}")
+    skip_if_container_absent(done, api)
+    assert done.returncode == 0, (
+        f"could not restart {api}. Callers restart it after the destructive half of their check, "
+        "so treating this as untestable would leave the deployment in the state the test built "
+        f"and say nothing ran: {(done.stderr or '').strip()[:200]}")
 
 
 def _wait_for_health(base_url):
