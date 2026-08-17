@@ -933,36 +933,42 @@ def _import_config(env_overrides):
 
 
 @pytest.mark.unit
+@pytest.mark.docker
 def test_production_rejects_sample_admin_password():
     proc = _import_config({"ENVIRONMENT": "production", "ADMIN_PASSWORD": "change_this_secure_password"})
     assert proc.returncode == 1, f"sample admin password should fail-closed in production\n{proc.stdout}\n{proc.stderr}"
 
 
 @pytest.mark.unit
+@pytest.mark.docker
 def test_production_rejects_env_example_placeholder():
     proc = _import_config({"ENVIRONMENT": "production", "ADMIN_PASSWORD": "REPLACE_ME"})
     assert proc.returncode == 1, f"placeholder should fail-closed in production\n{proc.stdout}"
 
 
 @pytest.mark.unit
+@pytest.mark.docker
 def test_production_allows_strong_admin_password():
     proc = _import_config({"ENVIRONMENT": "production", "ADMIN_PASSWORD": "Xq7-strong-Rand-92hf"})
     assert proc.returncode == 0, f"strong admin password should boot\n{proc.stdout}\n{proc.stderr}"
 
 
 @pytest.mark.unit
+@pytest.mark.docker
 def test_development_allows_sample_admin_password():
     proc = _import_config({"ENVIRONMENT": "development", "ADMIN_PASSWORD": "change_this_secure_password"})
     assert proc.returncode == 0, "development must not be gated"
 
 
 @pytest.mark.unit
+@pytest.mark.docker
 def test_production_allows_blank_admin_password_post_bootstrap():
     proc = _import_config({"ENVIRONMENT": "production", "ADMIN_PASSWORD": ""})
     assert proc.returncode == 0, "blank admin password must not fail startup (post-bootstrap)"
 
 
 @pytest.mark.unit
+@pytest.mark.docker
 def test_jwt_algorithm_must_be_canonical_hmac():
     # A non-HMAC or mis-cased JWT_ALGORITHM must fail closed at BOOT (defeats alg-confusion and the
     # PyJWT case-sensitivity 500). Only the exact canonical HMAC names boot.
@@ -973,6 +979,7 @@ def test_jwt_algorithm_must_be_canonical_hmac():
 
 
 @pytest.mark.unit
+@pytest.mark.docker
 def test_development_rejects_env_example_placeholder():
     # The shipped .env.example placeholder is a publicly known credential and must be refused in
     # EVERY environment — a bare `docker compose up` ships ENVIRONMENT=development and previously
@@ -982,6 +989,7 @@ def test_development_rejects_env_example_placeholder():
 
 
 @pytest.mark.unit
+@pytest.mark.docker
 def test_production_rejects_short_admin_password():
     # A weak-but-unlisted value below the 12-char floor must not boot a reachable (production) deploy.
     proc = _import_config({"ENVIRONMENT": "production", "ADMIN_PASSWORD": "weakpass"})
@@ -989,6 +997,7 @@ def test_production_rejects_short_admin_password():
 
 
 @pytest.mark.unit
+@pytest.mark.docker
 def test_nonstandard_env_rejects_weak_admin_password():
     # Fail-safe: any non-development environment ("staging", "prod", a typo) is treated as reachable
     # and gets the strict blocklist + length tier — not only the literal "production".
@@ -997,6 +1006,7 @@ def test_nonstandard_env_rejects_weak_admin_password():
 
 
 @pytest.mark.unit
+@pytest.mark.docker
 def test_development_allows_short_nonplaceholder_password():
     # Dev convenience preserved: only the shipped placeholder is blocked in development; a short,
     # non-placeholder value still boots (the blocklist + length floor apply outside development).
