@@ -11831,7 +11831,14 @@ class _SchemaStepRecorder:
 def _run_lightweight_migrations():
     """Idempotent column additions for existing tables. create_all() only creates
     missing TABLES, not missing COLUMNS, so new columns on existing tables must be
-    added here (Postgres ADD COLUMN IF NOT EXISTS makes this safe to re-run)."""
+    added here (Postgres ADD COLUMN IF NOT EXISTS makes this safe to re-run).
+
+    Returns True when the outcome of every step was recorded, False when the record is
+    untrustworthy. The caller passes that to the health state: rows left from an earlier boot would
+    otherwise let a deployment whose recording failed report a complete schema, which is the exact
+    reassurance this machinery exists to stop giving.
+    """
+    recording_failed = False
     try:
         from app.core.database import get_db_context
         from sqlalchemy import text
@@ -12182,8 +12189,11 @@ def _run_lightweight_migrations():
                 recorder.record(email_index_step, SchemaStep.OUTCOME_FAILED, str(e))
 
             recorder.forget_steps_no_longer_declared()
+            recording_failed = recorder.broken
     except Exception as e:
         print(f"⚠ Lightweight migrations skipped: {e}")
+        # The whole block fell over, so whatever is in schema_steps describes an earlier boot.
+        recording_failed = True
 
     # OUTSIDE that try, deliberately, and this is the whole point of the check.
     #
@@ -12195,6 +12205,8 @@ def _run_lightweight_migrations():
     from app.core.database import get_db_context as _ctx
     with _ctx() as _db:
         _verify_retired_object_id_triggers(_db)
+
+    return not recording_failed
 
 
 def _verify_retired_object_id_triggers(db) -> None:
@@ -12398,10 +12410,10 @@ async def lifespan(app: FastAPI):
     initialize_runtime()
     init_db()
     print("Database initialized")
-    _run_lightweight_migrations()
+    recorded = _run_lightweight_migrations()
     # After the replay, so the remembered value describes what this boot actually achieved.
     from app.core.health import refresh_schema_state
-    print(f"Schema state: {refresh_schema_state()}")
+    print(f"Schema state: {refresh_schema_state(recorded=recorded)}")
     _backfill_encrypted_names()
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
     _seed_admin_user()

@@ -1188,6 +1188,10 @@ def plan_volume_action(choice):
 # only a salted one-way commitment over the .env's two random per-set secrets, so restore can confirm
 # the .env in the bundle really is the one those volumes were created with (a swapped/wrong .env fails).
 BACKUP_ROLES = ("pg", "storage", "keys", "brand")   # order restored in; brand is optional
+# The three that carry data. A bundle without them is not a backup, whatever else it contains,
+# and saying so is load-bearing now that an upgrade takes one on the operator's behalf and
+# proceeds with an irreversible change on the strength of it.
+BACKUP_REQUIRED_ROLES = ("pg", "storage", "keys")
 
 
 def gen_salt():
@@ -1416,6 +1420,41 @@ def _semver_key(version):
     return tuple(int(part) for part in version.split("."))
 
 
+def _walk_edges(matrix, current, target):
+    """The declared edges leading from `current` to `target`, or None if there is no route.
+
+    A breadth-first search over what the file actually declares, rather than a march through
+    version-order neighbours. The difference only shows up once a backport exists, and then it
+    matters: releasing 0.9.1 after 0.10.0 has shipped puts it BETWEEN them by version, so a
+    neighbour march looks for 0.9.1 -> 0.10.0, finds nothing, and calls a hop undescribable that
+    the file describes perfectly well with 0.9.0 -> 0.10.0. The validator already exempts that
+    pair from needing an edge, so the two halves disagreed about what "adjacent" meant.
+
+    Shortest route, and ties broken by version order, so the answer is the same on every run and
+    on both implementations.
+    """
+    edges = {}
+    for edge in (matrix.get("edges") or []):
+        if isinstance(edge, dict) and edge.get("from") and edge.get("to"):
+            edges.setdefault(edge["from"], []).append(edge)
+    for outgoing in edges.values():
+        outgoing.sort(key=lambda e: _semver_key(e["to"]))
+
+    queue = [(current, [])]
+    seen = {current}
+    while queue:
+        node, path = queue.pop(0)
+        if node == target:
+            return path
+        for edge in edges.get(node, []):
+            nxt = edge["to"]
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            queue.append((nxt, path + [edge]))
+    return None
+
+
 def plan_upgrade_path(matrix, current, target):
     """What it takes to get from `current` to `target`, walking one adjacent edge at a time.
 
@@ -1446,14 +1485,9 @@ def plan_upgrade_path(matrix, current, target):
         # claim, so this is deliberately not classified from it.
         return unknown
 
-    edges = {(e.get("from"), e.get("to")): e for e in (matrix.get("edges") or [])}
-    walk = ordered[ordered.index(current):ordered.index(target) + 1]
-    steps = []
-    for a, b in zip(walk, walk[1:]):
-        edge = edges.get((a, b))
-        if edge is None:
-            return unknown
-        steps.append(edge)
+    steps = _walk_edges(matrix, current, target)
+    if steps is None:
+        return unknown
 
     return {
         "steps": steps,
@@ -2508,6 +2542,24 @@ class DockVault:
             if not tar_volume(vol, bundle, archive):
                 self._fail_backup(bundle, "failed to archive volume %s (backup incomplete)" % vol)
             entries.append({"role": role, "name": vol, "archive": archive})
+
+        # Refuse a bundle that captured no data. Skipping a volume that is not there is right for
+        # `brand`, which genuinely may not exist -- but the same `continue` used to swallow the
+        # case where NONE of them were found, and the command still printed "Backup written" in
+        # green. That happens without any docker fault: an .env whose VAULT_VOLUME_PREFIX no longer
+        # names the live volumes produces exactly it. The restore side then reports success too,
+        # because it iterates the manifest's volume list and there is nothing in it. An operator
+        # would be told they were covered at both ends, and an upgrade gate would accept it and go
+        # ahead with a change that cannot be undone.
+        captured = {entry["role"] for entry in entries}
+        missing = [role for role in BACKUP_REQUIRED_ROLES if role not in captured]
+        if missing:
+            self._fail_backup(
+                bundle,
+                "no archive was made for %s -- the volumes named by this .env "
+                "(VAULT_VOLUME_PREFIX=%r) were not found, so this bundle holds no data. Check the "
+                "prefix matches the running deployment." % (", ".join(missing), prefix))
+
         manifest = build_backup_manifest(prefix, env.get("DEPLOYMENT_ID", "default"), entries,
                                           gen_salt(), env, created=ts)
         try:
@@ -2899,6 +2951,22 @@ class DockVault:
 
         matrix, matrix_source = fetch_upgrade_matrix(tag, root=self.root)
         plan = plan_upgrade_path(matrix, current, tag)
+
+        # A hop planned from the FILE is planned from a guess. The pull path never rewrites
+        # VERSION, so a deployment installed from source at 0.6.0 and pull-upgraded since still
+        # reads 0.6.0 -- and its container being down is the normal state when you want to change
+        # version, which is exactly when the fallback is used. Planning 0.6.0 -> 0.9.0 finds a
+        # chain of reversible, no-backup edges and gates nothing, while the real operation is a
+        # downgrade from 0.10.0 across a database with no down-migrations.
+        #
+        # So a hop whose origin is not known is not described. This costs an accurate description
+        # in the one case the tool cannot be sure of the origin, and buys back the gate.
+        if version_source != "the running container":
+            print(pal.paint(
+                "  The running version could not be read from the deployment, so where this "
+                "change starts from is a guess. Treating it as undescribed.", "yellow"))
+            plan = plan_upgrade_path(None, current, tag)
+
         self._describe_hop(plan, matrix_source, current, tag)
 
         if plan["blocked"] is not None:

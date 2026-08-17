@@ -340,3 +340,107 @@ def test_the_running_version_is_read_from_a_real_container():
     assert dv.parse_semver(reported), (
         f"the container's /app/VERSION is {reported!r}, which is not a version. The tool would "
         "silently fall back to the checkout's file, which is the defect this replaced")
+
+
+def test_a_guessed_origin_is_not_described(tmp_path, monkeypatch, capsys):
+    """When the version came from the file rather than the container, the hop is a guess.
+
+    The pull path never rewrites VERSION, and a container being down is the normal state when you
+    want to change version -- which is exactly when the fallback is used. Planning from that file
+    can find a chain of reversible, no-backup edges while the real operation is a downgrade across
+    a database with no down-migrations. Treating an unknown origin as undescribed costs an accurate
+    description in the one case the tool cannot be sure, and buys back the gate.
+    """
+    backups = []
+    tool = _deployment(tmp_path, matrix=_matrix(backup=False))
+    _stub(monkeypatch, tool, backups=backups)
+    monkeypatch.setattr(tool, "_running_version",
+                        lambda *a, **k: ("0.1.0", "this checkout's VERSION file (nothing is "
+                                                  "running to ask)"))
+    _update(tool)
+
+    out = capsys.readouterr().out
+    assert "NOT DESCRIBED" in out, out
+    assert backups, "a hop planned from a guessed origin proceeded without a backup"
+
+
+def test_a_backup_that_captured_no_data_is_not_a_backup(tmp_path, monkeypatch):
+    """The gate's worst failure would be accepting an empty bundle.
+
+    `_do_backup` skipped a volume that was not found -- right for the optional brand volume, and it
+    used to swallow the case where NONE were found, printing success. An .env whose volume prefix
+    no longer matches the deployment produces exactly that, with no docker fault involved.
+    """
+    monkeypatch.setattr(dv, "volume_exists", lambda name: False)
+    tool = _deployment(tmp_path, matrix=_matrix(backup=True))
+    (tmp_path / ".env").write_text(
+        "COMPOSE_PROFILES=combined\nVAULT_VOLUME_PREFIX=nothing_here\n"
+        "DOCKVAULT_IMAGE=%s\n" % dv.LOCAL_IMAGE, encoding="utf-8", newline="")
+
+    with pytest.raises(SystemExit):
+        tool._do_backup(tool._load_env(), argparse.Namespace(backup_dir=str(tmp_path / "b")))
+
+
+def _matrix_with_backport():
+    """The real shape: 0.9.1 released AFTER 0.10.0, so it sorts between two shipped releases.
+
+    The validator exempts (0.9.1, 0.10.0) from needing an edge, because demanding one would force
+    a claim about upgrading from a backport into a release that predates its fix.
+    """
+    return {
+        "schema_version": 1, "about": "t", "kinds": {"direct": "a", "blocked": "b"},
+        "versions": {
+            "0.9.0": {"released": "2026-01-01", "notes": "a"},
+            "0.9.1": {"released": "2026-03-01", "notes": "backport, shipped last"},
+            "0.10.0": {"released": "2026-02-01", "notes": "b"},
+        },
+        "edges": [
+            {"from": "0.9.0", "to": "0.10.0", "kind": "direct",
+             "reversible": True, "requires_backup": False},
+            {"from": "0.9.0", "to": "0.9.1", "kind": "direct",
+             "reversible": True, "requires_backup": False},
+        ],
+    }
+
+
+def test_a_backport_does_not_make_the_hop_it_sits_between_undescribable():
+    """The mismatch this closes: two halves disagreeing about what "adjacent" means.
+
+    Marching through version-order neighbours looked for 0.9.1 -> 0.10.0, found nothing, and
+    called 0.9.0 -> 0.10.0 undescribable -- a hop the file describes perfectly well, and one the
+    validator deliberately does not require an edge for. Following the declared edges asks the
+    file what it says instead of assuming what it should contain.
+
+    It fails safe rather than dangerous, so it is noise rather than risk: the operator is forced
+    through a backup and a typed acknowledgement for a drop-in change. Noise is how a gate gets
+    switched off.
+    """
+    matrix = _matrix_with_backport()
+    plan = dv.plan_upgrade_path(matrix, "0.9.0", "0.10.0")
+    assert plan["known"], "the hop the file declares is still being called undescribable"
+    assert len(plan["steps"]) == 1
+    assert not plan["requires_backup"] and not plan["irreversible"]
+
+
+def test_a_route_that_genuinely_does_not_exist_is_still_unknown():
+    """Non-vacuity for the above: following edges must not invent one.
+
+    0.9.1 has no outgoing edge, so there is no route from it to 0.10.0 -- which is the honest
+    answer, and the reason the validator does not demand that edge in the first place.
+    """
+    assert not dv.plan_upgrade_path(_matrix_with_backport(), "0.9.1", "0.10.0")["known"]
+
+
+def test_the_shortest_declared_route_is_taken():
+    """With two routes to one target, the answer must be the same every run and on both
+    implementations, or the tool and the banner can disagree about the same upgrade."""
+    matrix = _matrix_with_backport()
+    matrix["versions"]["0.11.0"] = {"released": "2026-04-01", "notes": "c"}
+    matrix["edges"].append({"from": "0.10.0", "to": "0.11.0", "kind": "direct",
+                            "reversible": True, "requires_backup": True})
+    matrix["edges"].append({"from": "0.9.0", "to": "0.11.0", "kind": "direct",
+                            "reversible": True, "requires_backup": False})
+    plan = dv.plan_upgrade_path(matrix, "0.9.0", "0.11.0")
+    assert plan["known"] and len(plan["steps"]) == 1, (
+        "expected the one-hop route; a longer walk would report a backup this upgrade does not need")
+    assert not plan["requires_backup"]

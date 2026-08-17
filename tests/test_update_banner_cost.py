@@ -202,6 +202,16 @@ def test_the_app_and_the_host_tool_agree_about_every_hop():
     tool = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tool)
 
+    backport = {
+        "schema_version": 1, "about": "t", "kinds": {"direct": "a", "blocked": "b"},
+        "versions": {"0.9.0": {"released": "2026-01-01", "notes": "a"},
+                     "0.9.1": {"released": "2026-03-01", "notes": "backport"},
+                     "0.10.0": {"released": "2026-02-01", "notes": "b"}},
+        "edges": [{"from": "0.9.0", "to": "0.10.0", "kind": "direct",
+                   "reversible": True, "requires_backup": False},
+                  {"from": "0.9.0", "to": "0.9.1", "kind": "direct",
+                   "reversible": True, "requires_backup": False}],
+    }
     three = _matrix(backup=True)
     three["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "c"}
     three["edges"].append({"from": "0.2.0", "to": "0.3.0", "kind": "direct",
@@ -218,6 +228,12 @@ def test_the_app_and_the_host_tool_agree_about_every_hop():
         (_matrix(), "0.2.0", "0.1.0"),
         (None, "0.1.0", "0.2.0"),
         ({"versions": {"0.1.0": {}, "0.2.0": {}}, "edges": []}, "0.1.0", "0.2.0"),
+        # A backport sorts between two shipped releases, so the hop it sits between has no
+        # neighbour edge and only a declared one. Both implementations must find it, and must
+        # agree that the backport itself leads nowhere.
+        (backport, "0.9.0", "0.10.0"),
+        (backport, "0.9.1", "0.10.0"),
+        (backport, "0.9.0", "0.9.1"),
     ]
     for matrix, current, target in cases:
         here = uc.describe_hop(matrix, current, target)

@@ -93,10 +93,17 @@ def check_storage_status() -> str:
 _SCHEMA_STATE: str | None = None
 
 
-def refresh_schema_state() -> str:
-    """Read the recorded schema state and remember it. Called once at startup."""
+def refresh_schema_state(recorded: bool = True) -> str:
+    """Read the recorded schema state and remember it. Called once at startup.
+
+    `recorded` is False when the boot could not write its outcomes. That has to override what the
+    table says, because rows left by an EARLIER boot would otherwise report a complete schema for a
+    deployment whose current boot recorded nothing -- the reassurance this whole surface exists to
+    stop giving. An earlier version of this claimed to do that and did not: the recorder knew, and
+    nothing carried it out.
+    """
     global _SCHEMA_STATE
-    _SCHEMA_STATE = _read_schema_state()
+    _SCHEMA_STATE = _read_schema_state() if recorded else "unknown"
     return _SCHEMA_STATE
 
 

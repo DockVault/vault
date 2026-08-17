@@ -292,3 +292,34 @@ def test_a_deliberately_skipped_step_is_visible_without_being_fatal(base_url):
     assert _psql(
         "SELECT count(*) FROM pg_indexes WHERE indexname = 'uq_users_email_lower'") == "1", (
         "the index was not rebuilt once the collision was resolved")
+
+
+@pytest.mark.unit
+def test_a_boot_that_could_not_record_reports_unknown_rather_than_complete():
+    """The reassurance this surface exists to stop giving.
+
+    Recording is best-effort and swallowed, deliberately -- a recorder that could abort a boot
+    would make honest health more dangerous than silence. But rows left by an EARLIER boot then
+    describe a deployment whose current boot recorded nothing, and `_read_schema_state` would
+    happily call that complete.
+
+    An earlier version of this claimed to handle it and did not: the recorder set a flag, and
+    nothing carried the flag out to health.
+    """
+    import importlib.util
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "health_recorded_flag", root / "app" / "core" / "health.py")
+    health = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = health
+    spec.loader.exec_module(health)
+
+    # Whatever the table would say, a boot that could not record does not get to claim completeness.
+    health._read_schema_state = lambda: "complete"
+    assert health.refresh_schema_state(recorded=False) == "unknown"
+    assert health.check_schema_state() == "unknown"
+
+    assert health.refresh_schema_state(recorded=True) == "complete", (
+        "the flag now overrides in both directions; a successful boot must still report the table")

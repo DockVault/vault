@@ -1446,7 +1446,12 @@ def test_backup_writes_env_600_and_manifest_without_secret(tmp_path, monkeypatch
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(
         dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-b9", deployment_id="b9"))) + "\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
-    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: name.endswith("_vault_pg_data"))  # only pg present
+    # All three DATA volumes present, brand absent. Compose declares pg/storage/keys and creates
+    # them on the first `up`, so a deployment missing one is not a state that exists -- and a
+    # backup that captured none of them is now refused, because an upgrade takes one on the
+    # operator's behalf and proceeds with an irreversible change on the strength of it.
+    monkeypatch.setattr(dv, "volume_exists",
+                        lambda name, **k: not name.endswith("_vault_brand"))
     monkeypatch.setattr(dv, "tar_volume", lambda *a, **k: True)
     env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
     tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
@@ -1454,7 +1459,9 @@ def test_backup_writes_env_600_and_manifest_without_secret(tmp_path, monkeypatch
     assert len(bundles) == 1
     bundle = bundles[0]
     man = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
-    assert [e["role"] for e in man["volumes"]] == ["pg"]     # only the existing volume recorded
+    # The three data volumes are recorded; brand, which genuinely may not exist, is skipped. That
+    # skip is the behaviour being pinned -- a bundle that skipped ALL of them is now refused.
+    assert [e["role"] for e in man["volumes"]] == ["pg", "storage", "keys"]
     assert env["ENCRYPTION_KEY"] not in json.dumps(man)       # no secret in the manifest
     assert (bundle / "env").exists()                          # the paired .env is copied in
     if os.name != "nt":
@@ -1572,10 +1579,18 @@ def test_update_from_source_checks_out_and_recreates(tmp_path, monkeypatch):
     started = []
     monkeypatch.setattr(tool, "_start_secure_stack", lambda: started.append(1) or True)
     monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    # Record the backup instead of taking one. An update now gates on a backup whenever the hop
+    # cannot be described -- and it cannot be here, because the version comes from the file rather
+    # than a running container. Taking a real one against faked docker fails, correctly: there are
+    # no volumes to archive. These tests are about the checkout and pull paths, so the demand is
+    # asserted and the work is skipped.
+    backups = []
+    monkeypatch.setattr(tool, "_do_backup", lambda env, args: backups.append(True))
     # a downgrade, explicitly confirmed via --yes, built from source
     tool.update(argparse.Namespace(non_interactive=True, tag="v0.5.0", source=True, yes=True))
     assert any(("checkout" in c and "v0.5.0" in c) for c in calls), "must git checkout the chosen tag"
     assert started == [1]
+    assert backups, "a downgrade proceeded without demanding a backup"
 
 
 def test_update_pull_path_sets_image_and_recreates_without_build(tmp_path, monkeypatch):
@@ -1586,6 +1601,13 @@ def test_update_pull_path_sets_image_and_recreates_without_build(tmp_path, monke
     calls = []
     monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _Proc(0, ""))
     monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    # Record the backup instead of taking one. An update now gates on a backup whenever the hop
+    # cannot be described -- and it cannot be here, because the version comes from the file rather
+    # than a running container. Taking a real one against faked docker fails, correctly: there are
+    # no volumes to archive. These tests are about the checkout and pull paths, so the demand is
+    # asserted and the work is skipped.
+    backups = []
+    monkeypatch.setattr(tool, "_do_backup", lambda env, args: backups.append(True))
     tool.update(argparse.Namespace(non_interactive=True, tag="v0.7.0", source=False, yes=True))  # upgrade, pull
     env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
     assert env["DOCKVAULT_IMAGE"] == "ghcr.io/dockvault/vault:v0.7.0"
@@ -1727,9 +1749,15 @@ def test_update_from_source_stops_pointing_at_the_release_it_replaces(tmp_path, 
     monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: _Proc(0, ""))
     monkeypatch.setattr(tool, "_start_secure_stack", lambda: True)
     monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    # This is a downgrade (0.9.0 -> 0.8.0) and the origin comes from the file, so the update gates
+    # on a backup. Recorded rather than taken: against faked docker there are no volumes to
+    # archive, and this test is about the image reference the build inherits.
+    backups = []
+    monkeypatch.setattr(tool, "_do_backup", lambda env, args: backups.append(True))
     tool.update(argparse.Namespace(non_interactive=True, tag="v0.8.0", source=True, yes=True))
     env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
     assert env["DOCKVAULT_IMAGE"] == dv.LOCAL_IMAGE
+    assert backups, "a downgrade proceeded without demanding a backup"
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs host openssl for a BYO pair")
