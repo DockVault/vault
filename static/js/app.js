@@ -5779,10 +5779,17 @@ async function loadSettings() {
 
         // Security
         document.getElementById('setting-password-min-length').value = settings.password_min_length || 8;  // 8 = the enforced floor
-        document.getElementById('setting-require-uppercase').checked = settings.require_uppercase !== false;
-        document.getElementById('setting-require-lowercase').checked = settings.require_lowercase !== false;
-        document.getElementById('setting-require-numbers').checked = settings.require_numbers !== false;
-        document.getElementById('setting-require-special').checked = settings.require_special !== false;
+        // `=== true`, not `!== false`. An unset toggle is undefined, and `undefined !== false` is
+        // true, so a deployment that had never configured a password policy rendered all four of
+        // these CHECKED -- claiming a policy the server was not enforcing, since
+        // password_policy_errors treats a missing toggle as off. Worse, "Save All Changes" then
+        // submitted the rendered state, so an admin who opened Settings to change something else
+        // silently turned the whole policy on. This is the same footgun as the auth limits below,
+        // which were fixed; these four were not.
+        document.getElementById('setting-require-uppercase').checked = settings.require_uppercase === true;
+        document.getElementById('setting-require-lowercase').checked = settings.require_lowercase === true;
+        document.getElementById('setting-require-numbers').checked = settings.require_numbers === true;
+        document.getElementById('setting-require-special').checked = settings.require_special === true;
         // Auth limits: 0/unset means "use the deployment's env value" (JWT_ACCESS_TOKEN_EXPIRE_MINUTES /
         // RATE_LIMIT_LOGIN_ATTEMPTS / ACCOUNT_LOCKOUT_MINUTES — see auth_service._global_setting), so
         // render BLANK, never the shipped default. `|| 5` displayed 5 for a stored 0 and "Save All
