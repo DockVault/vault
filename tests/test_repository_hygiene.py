@@ -131,3 +131,54 @@ def test_tracked_binary_assets_are_explicitly_non_text():
         if attributes.get(path, {}).get("text") != "unset"
     ]
     assert not errors, "\n".join(errors)
+
+
+# --- what the README says about migrations ------------------------------------------------------
+#
+# A security product must not understate what it does to an operator's database. The README used to
+# say the app "does not yet alter existing columns automatically" while it was altering them
+# extensively -- adding columns and indexes, tightening constraints, converting types, and rewriting
+# data -- and to promise that "a release that changes the schema will call out the migration step in
+# its notes", which nothing produced or enforced. Both are retired; these keep them retired.
+
+RETIRED_README_CLAIMS = (
+    "does **not** yet alter",
+    "will call out the migration step",
+)
+
+
+def test_the_readme_no_longer_understates_what_boot_does_to_the_database():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    still_there = [claim for claim in RETIRED_README_CLAIMS if claim in readme]
+    assert not still_there, (
+        "the README has gone back to claiming %s. The app does alter existing columns on boot, and "
+        "the release notes do not describe the migration -- docs/upgrade-matrix.json does, and the "
+        "release gate enforces it." % still_there)
+
+
+def test_the_readme_describes_the_machinery_that_replaced_those_claims():
+    """The other half. Deleting a false claim and saying nothing is not the same as being honest.
+
+    Each of these corresponds to something enforced elsewhere in the suite: the health state, the
+    forward-only contract, the descriptor, and the tool that reads it.
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for promised in ("forward-only", "upgrade-matrix.json", "dockvault.py update", "503"):
+        assert promised in readme, (
+            "the README no longer mentions %r. If that machinery has been removed, the claims it "
+            "replaced need revisiting too; if it is only the wording, restore it." % promised)
+
+
+def test_the_contributor_rules_require_a_schema_change_to_declare_itself():
+    """The rule that keeps the descriptor honest, next to the existing config-sync rule.
+
+    The release gate refuses an undeclared version, so this is not what makes it happen -- it is
+    what stops the description being written weeks later from memory, at release time.
+    """
+    guide = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "docs/upgrade-matrix.json" in guide, (
+        "CLAUDE.md no longer tells a contributor to declare a schema change; the release gate will "
+        "catch it, but only after the fact")
+    assert "ADD COLUMN IF NOT EXISTS` is a no-op" in guide or "no-op where the column already" in guide, (
+        "the note about ADD COLUMN not tightening an existing column is gone. That is the mistake "
+        "that put two columns out of step for several releases")

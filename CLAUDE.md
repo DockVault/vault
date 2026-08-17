@@ -54,6 +54,19 @@ ships inside the built image (`Dockerfile` does `COPY . .`, filtered only by
   env/config field in `app/core/config.py`, update `.env.example` **and** `dockvault.py` (the setup
   flow / any menu that writes it) in the SAME change — a new flag with no `.env.example` entry or
   setup prompt is an incomplete change.
+- **A schema change declares itself.** When you change `app/core/models.py` or the boot DDL list in
+  `app/api/api_server.py`, add the matching entry to `docs/upgrade-matrix.json` in the SAME change:
+  whether the hop is reversible, whether it needs a backup, and any condition an operator should
+  know about. The release gate refuses to cut a tag whose version is undeclared, so this is not
+  optional — but discovering it at release time means writing the description weeks after making
+  the change, from memory.
+- **Adding a column to an existing table takes two statements, not one.** `create_all` only ever
+  creates missing TABLES, so a new column reaches an existing deployment through the DDL list. An
+  `ADD COLUMN` that omits a constraint the model declares leaves fresh and upgraded installs with
+  different physical schemas: `ADD COLUMN IF NOT EXISTS` is a no-op where the column already
+  exists, so tightening it there needs its own `ALTER COLUMN ... SET NOT NULL`, preceded by a
+  backfill for the rows written before the column existed. Two columns diverged this way for
+  several releases before anything compared the two shapes.
 
 ## Tests
 
