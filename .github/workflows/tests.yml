@@ -292,6 +292,23 @@ jobs:
             sleep 3
           done
 
+      # This check gates on VAULT_REDIS_OUTAGE_TEST, which was set only on the command line
+      # of an invocation naming a different file -- so the assertion that the general API
+      # classes stay available while Redis is down was selected nowhere.
+      #
+      # It runs before the step below rather than inside it: that step lowers the login limit
+      # to five on purpose, and the rest of this file logs in often enough to be refused by
+      # it. Nothing here needs the lowered limit -- the flag is read by the test, not the
+      # server -- so the two are kept apart. The test pauses the container and unpauses it in
+      # a finally, waiting for health before it returns.
+      - name: Exercise the general API fail-open during a Redis outage
+        shell: bash
+        run: |
+          set -euo pipefail
+          VAULT_REDIS_OUTAGE_TEST=1 \
+          VAULT_REDIS_CONTAINER=vault-redis \
+            python -m pytest tests/test_api_rate_limit_classes.py::test_general_api_classes_fail_open_during_redis_outage --maxfail=1
+
       - name: Exercise login throttling and Redis outage fallback
         shell: bash
         run: |
@@ -312,14 +329,9 @@ jobs:
             sleep 3
           done
           docker compose exec -T vault-redis redis-cli FLUSHALL
-          # Both files gate work on VAULT_REDIS_OUTAGE_TEST. Setting it on the command line
-          # of an invocation that named only one of them left the other's fail-open check --
-          # that the general API classes stay available while Redis is down -- selected
-          # nowhere at all.
           VAULT_REDIS_OUTAGE_TEST=1 \
           VAULT_REDIS_CONTAINER=vault-redis \
-            python -m pytest tests/test_login_throttle.py \
-              tests/test_api_rate_limit_classes.py --maxfail=1
+            python -m pytest tests/test_login_throttle.py --maxfail=1
 
       - name: Container logs
         if: failure()
