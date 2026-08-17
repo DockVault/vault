@@ -12,8 +12,6 @@ observable from the client:
 
 import hashlib
 
-import pytest
-
 from conftest import skip_if_container_absent, unique
 
 

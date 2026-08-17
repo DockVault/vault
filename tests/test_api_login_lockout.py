@@ -8,15 +8,21 @@ import subprocess
 
 import pytest
 
+from conftest import skip_if_container_absent
+
 
 def _login(client, username, password):
     return client.post("/auth/login", json={"username": username, "password": password})
 
 
+# Env-overridable so the suite can be pointed at a second stack rather than silently
+# targeting whatever "vault-db" happens to be running, matching the other suites.
+_DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
+
+
 def _psql(sql):
-    container = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
     return subprocess.run(
-        ["docker", "exec", container, "psql", "-U", "sftp_user", "-d", "sftp_db", "-c", sql],
+        ["docker", "exec", _DB_CONTAINER, "psql", "-U", "sftp_user", "-d", "sftp_db", "-c", sql],
         capture_output=True, text=True, timeout=15,
     )
 
