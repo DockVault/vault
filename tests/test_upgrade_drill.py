@@ -59,7 +59,21 @@ def _run(cmd, cwd=None, timeout=600):
 
 @pytest.fixture(scope="module")
 def drill():
-    """A deployment installed on the oldest drill release, ready to be walked forward."""
+    """A deployment on the oldest drill release, for the stepped walk."""
+    yield from _install_oldest()
+
+
+@pytest.fixture(scope="module")
+def direct_drill():
+    """A second deployment on the oldest release, for the single-jump upgrade.
+
+    Its own stack, because the two tests cannot share one: the stepped walk ends on the candidate,
+    and a jump has to start from the old release.
+    """
+    yield from _install_oldest()
+
+
+def _install_oldest():
     for tag in DRILL_TAGS:
         image = IMAGE % tag
         if _run(["docker", "image", "inspect", image]).returncode != 0:
@@ -273,3 +287,73 @@ def test_data_written_on_an_old_release_survives_every_upgrade_to_here(drill):
         f"after walking {' -> '.join(DRILL_TAGS)} -> candidate the schema is {final.get('schema')!r}")
     recorded = state["psql"]("SELECT count(*) FROM schema_steps WHERE outcome = 'failed'")
     assert recorded == "0", f"{recorded} boot step(s) are recorded failed after the walk"
+
+
+def test_one_jump_from_the_oldest_release_applies_everything(direct_drill):
+    """The path an operator actually takes, and the one the stepped walk above does not cover.
+
+    `dockvault.py update` does NOT step through intermediate versions. It walks the matrix's edges
+    to work out what the change involves -- unioning the backup and reversibility requirements
+    along the route -- and then makes ONE jump straight to the target. So the common case is a
+    deployment several releases behind moving to latest in a single recreate, and the boot DDL
+    applying everything that accumulated in between at once.
+
+    Applying six releases' worth of statements to one database in one boot is a different thing
+    from applying them one release at a time, and only the second was being tested.
+    """
+    state = direct_drill
+    headers = _token(state)
+    base = state["base_url"]
+
+    user = "jump_%s" % uuid.uuid4().hex[:8]
+    made = requests.post(f"{base}/users", headers=headers, timeout=60, json={
+        "username": user, "email": f"{user}@example.com",
+        "password": "DrillPassw0rd!123", "role": "user"})
+    assert made.status_code < 400, f"could not seed on {DRILL_TAGS[0]}: {made.text[:300]}"
+
+    vault = requests.post(f"{base}/vaults", headers=headers, timeout=60, json={
+        "name": "jump_%s" % uuid.uuid4().hex[:6], "description": "single-jump drill"})
+    assert vault.status_code < 400, vault.text[:300]
+    vault_id = vault.json()["id"]
+
+    sent = requests.post(f"{base}/vaults/{vault_id}/files", headers=headers, timeout=120,
+                         files={"files": ("jump.bin", PAYLOAD, "application/octet-stream")})
+    assert sent.status_code < 400, sent.text[:300]
+    body = sent.json()
+    uploaded = body if isinstance(body, list) else (body.get("files") or body.get("uploaded") or [])
+    file_id = (uploaded[0].get("id") if uploaded and isinstance(uploaded[0], dict)
+               else body.get("id"))
+    assert file_id, sent.text[:300]
+
+    # Straight from the oldest release to the candidate. No intermediate stop.
+    candidate = _candidate_image()
+    state["override"](candidate)
+    up = state["compose"]("up", "-d")
+    assert up.returncode == 0, f"the jump did not start: {up.stderr[-400:]}"
+    assert state["wait_healthy"]() == "healthy", (
+        "a deployment several releases behind did not come back healthy after a single upgrade; "
+        "this is the ordinary path, not an edge case")
+
+    running = _run(["docker", "inspect", f"{state['project']}-api",
+                    "--format", "{{.Config.Image}}"], timeout=60)
+    assert running.stdout.strip() == candidate, "the jump did not take"
+
+    response = requests.get(f"{base}/health", timeout=30)
+    assert response.status_code == 200, (
+        f"/health answered {response.status_code} after the jump: {response.text[:200]}")
+    assert response.json().get("schema") == "complete", (
+        f"skipping the intermediate releases left the schema {response.json().get('schema')!r}; "
+        "the accumulated DDL does not all apply in one boot")
+
+    headers_now = _token(state)
+    users = requests.get(f"{base}/users", headers=headers_now, timeout=60).json()
+    assert any(u["username"] == user for u in users), "the seeded account did not survive the jump"
+    got = requests.get(f"{base}/vaults/{vault_id}/files/{file_id}/download",
+                       headers=headers_now, timeout=120)
+    assert got.status_code == 200, got.text[:200]
+    assert got.content == PAYLOAD, (
+        f"the file's bytes changed across the jump; {len(got.content)} back, {len(PAYLOAD)} written")
+
+    assert state["psql"](
+        "SELECT count(*) FROM schema_steps WHERE outcome = 'failed'") == "0", (
+        "boot steps failed when several releases' worth applied at once")
