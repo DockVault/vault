@@ -5634,7 +5634,23 @@ function renderUpdateBanner(us) {
         // Normalize any leading 'v' so a v-prefixed release tag doesn't render "vv0.6.1".
         const latest = String(us.latest).replace(/^v/i, '');
         const current = String(us.current || '?').replace(/^v/i, '');
-        text.textContent = `A newer version (v${latest}) is available — you’re on v${current}.`;
+        // What the update costs, not only that it exists. An operator reading "available" and
+        // pressing update has no way to tell a drop-in from a one-way schema change, and after
+        // the fact is the wrong time to find out. An upgrade the server could not describe says
+        // so rather than staying quiet, because a gap is where nobody has considered the hop.
+        const hop = us.upgrade;
+        let cost = '';
+        if (hop && hop.known === false) {
+            cost = ' This release does not describe what upgrading involves — read its notes and back up first.';
+        } else if (hop) {
+            const needs = [];
+            if (hop.requires_backup) { needs.push('a backup'); }
+            if (hop.irreversible) { needs.push('no rollback'); }
+            cost = needs.length
+                ? ` Upgrading requires ${needs.join(' and ')}.`
+                : ' Upgrading is a drop-in change.';
+        }
+        text.textContent = `A newer version (v${latest}) is available — you’re on v${current}.${cost}`;
     }
     const link = document.getElementById('update-banner-link');
     if (link) {
