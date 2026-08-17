@@ -237,10 +237,30 @@ it never replaces a published image with a local build. The `build:` path stays 
 files, so you can always build your own (modified) image, which the AGPL license requires you be
 able to do.
 
-> **Database migrations:** the app creates any missing tables on boot but does **not** yet alter
-> existing columns automatically. A release that changes the schema will call out the migration step
-> in its notes — read the release notes before upgrading across a schema change, and back up the
-> database volume first.
+### Database migrations
+
+The app migrates its own schema on boot, and does more than create missing tables: it replays a
+maintained list of idempotent statements that add columns and indexes, tighten constraints, convert
+column types, and in a few cases rewrite data. Each statement is applied independently, so one that
+cannot apply does not stop the rest — and each records its outcome, so a deployment that came up
+with part of its schema missing reports `"schema": "incomplete"` from `/health` and answers 503.
+Docker's healthcheck and `dockvault.py`'s health-wait both see that; a half-migrated deployment does
+not quietly serve.
+
+**Migrations are forward-only. There are no down-migrations.** Moving to an older release across a
+schema change can leave a deployment unable to start, and nothing in the product will undo a
+migration for you.
+
+What a given upgrade involves is declared in [`docs/upgrade-matrix.json`](docs/upgrade-matrix.json)
+and published with each release as an `upgrade.json` asset: whether the hop can be taken directly,
+whether it is reversible, whether it requires a backup, and any conditions worth knowing before
+starting. A release cannot be cut without an entry, so the description is not something a release
+might forget to write.
+
+`dockvault.py update` reads it. It tells you what the hop involves before doing anything, takes a
+backup when one is required, and asks you to type an acknowledgement for a change that cannot be
+rolled back. `--dry-run` reports the plan and changes nothing. An upgrade it cannot find a
+description for is treated as the riskiest case rather than assumed safe.
 
 ## Data volumes
 
