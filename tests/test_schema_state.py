@@ -24,6 +24,8 @@ import time
 import pytest
 import requests
 
+from conftest import skip_if_container_absent
+
 # Marked per test: one of these reads only source and needs nothing running, and the conftest
 # treats a test carrying both unit and integration as a usage error rather than guessing.
 
@@ -101,8 +103,11 @@ def test_a_clean_boot_records_every_step_and_reports_a_complete_schema(base_url)
 def _restart_api():
     api = os.environ.get("VAULT_API_CONTAINER", "vault-api")
     done = subprocess.run(["docker", "restart", api], capture_output=True, text=True, timeout=180)
-    if done.returncode != 0:
-        pytest.skip(f"cannot restart {api}: {(done.stderr or '').strip()[:200]}")
+    skip_if_container_absent(done, api)
+    assert done.returncode == 0, (
+        f"could not restart {api}. Callers restart it after the destructive half of their check, "
+        "so treating this as untestable would leave the deployment in the state the test built "
+        f"and say nothing ran: {(done.stderr or '').strip()[:200]}")
 
 
 def _wait_for_health(base_url):

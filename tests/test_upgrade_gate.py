@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import skip_if_container_absent
+
 pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -331,10 +333,24 @@ def test_the_running_version_is_read_from_a_real_container():
     container = os.environ.get("VAULT_API_CONTAINER")
     if not container:
         pytest.skip("VAULT_API_CONTAINER is unset; no deployment to ask")
+    # Reachability first, on its own, so that the read below can be judged on its merits.
+    try:
+        reachable = sp.run(["docker", "exec", container, "true"],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, sp.SubprocessError) as exc:
+        pytest.skip(f"cannot run docker to reach {container}: {exc}")
+    skip_if_container_absent(reachable, container)
+    if reachable.returncode != 0:
+        pytest.skip(f"cannot reach {container}: {(reachable.stderr or '').strip()[:200]}")
+
     probe = sp.run(["docker", "exec", container, "cat", "/app/VERSION"],
                    capture_output=True, text=True, timeout=60)
-    if probe.returncode != 0:
-        pytest.skip(f"cannot reach {container}")
+    skip_if_container_absent(probe, container)
+    assert probe.returncode == 0, (
+        f"{container} answers, but /app/VERSION cannot be read from it. That is the version file "
+        "being absent from the image -- the single way this can fail, per the description above, "
+        "and the one the tool would paper over by falling back to the checkout's copy: "
+        f"{(probe.stderr or '').strip()[:200]}")
 
     reported = probe.stdout.strip()
     assert dv.parse_semver(reported), (
