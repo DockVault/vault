@@ -83,6 +83,7 @@ def test_failed_login_username_is_sanitized_in_alerts(admin, anon):
         assert "\r" not in uname and "\n" not in uname, f"CRLF survived into alert username: {uname!r}"
 
 
+@pytest.mark.unit
 def test_error_paths_do_not_leak_exception_text():
     # WebSocket frames bypass the HTTP 500-sanitizer, and a non-500 HTTPException renders its detail
     # verbatim -- so neither the /ws auth path nor the ECC register/decompress paths may echo str(e).
@@ -100,6 +101,8 @@ def test_error_paths_do_not_leak_exception_text():
         "the duplicate-register race must map to a generic 409, not a str(e) 400"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_db_throttle_hit_counts_and_denies():
     # The durable DB-fallback throttle (now shared by the password login path AND the SFTP key-offer
     # path) must count attempts and deny over its limit. Also proves it is a reusable @staticmethod
@@ -115,6 +118,8 @@ def test_db_throttle_hit_counts_and_denies():
     assert "RETRY3=0" not in proc.stdout, "an over-limit deny must carry a positive retry-after"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_redis_client_disables_hidden_retries():
     # A socket timeout is not an end-to-end bound if redis-py silently retries it.
     # The application circuit breaker owns retries and must open on the first failure.
@@ -128,6 +133,8 @@ def test_redis_client_disables_hidden_retries():
     assert "RETRIES=0 THRESHOLD=1" in proc.stdout, f"{proc.stdout}\n{proc.stderr}"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_sftp_key_clear_resets_db_fallback_row():
     # A successful SSH key auth must clear the DURABLE DB-fallback counter (not only the Redis one),
     # or a legitimate multi-key client would accumulate offers it never resets and lock itself out
@@ -154,6 +161,7 @@ def test_sftp_key_clear_resets_db_fallback_row():
     assert "BEFORE=1 AFTER=0" in proc.stdout, f"{proc.stdout}\n{proc.stderr}"
 
 
+@pytest.mark.unit
 def test_login_and_sftp_throttles_fail_closed():
     # Both the DB-fallback login throttle and the SFTP key-offer throttle must fail CLOSED on a Redis
     # outage -- they used to fail OPEN (silently disabling throttling while Redis was down).
@@ -170,6 +178,7 @@ def test_login_and_sftp_throttles_fail_closed():
         "the SFTP throttle must not swallow errors to 'not throttled'"
 
 
+@pytest.mark.unit
 def test_toggle_active_enforces_seat_cap_on_reactivation():
     # Re-activating a user consumes a seat, so the toggle-active endpoint must enforce the plan's
     # user cap on the inactive->active transition -- otherwise an admin at the cap could deactivate
@@ -186,6 +195,7 @@ def test_toggle_active_enforces_seat_cap_on_reactivation():
         "the seat-cap check must run BEFORE is_active is flipped (so the active count excludes this user)"
 
 
+@pytest.mark.unit
 def test_sftp_revocation_subscriber_survives_half_open_redis():
     # The SFTP session-termination pub/sub subscriber must bound its socket and actively
     # health-check, so a HALF-OPEN Redis connection (TCP dropped without a clean close) is detected
@@ -224,6 +234,8 @@ def test_security_alerts_are_deduped_under_sustained_attack(admin, anon):
         "the deduped alert should carry a repeat_count > 1 recording the collapsed repeats"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_detection_degraded_signal_fires_and_is_throttled():
     # When the Redis event counter is unavailable the monitor emits a DETECTION_DEGRADED alert so
     # operators know threshold-based detection is blind. A rapid second signal is throttled IN-PROCESS
@@ -350,6 +362,7 @@ def test_folder_delete_raises_bulk_alert(admin, temp_user_client):
         temp_user_client.delete_vault(vid)
 
 
+@pytest.mark.unit
 def test_all_delete_paths_feed_bulk_detector():
     # Bulk-deletion detection must cover every deletion vector, not just single-file web deletes: the
     # folder-delete _purge, SFTP rmdir _purge, and SFTP single-file remove call vault_service.delete_file
@@ -360,6 +373,7 @@ def test_all_delete_paths_feed_bulk_detector():
     assert sftp.count("record_file_deletion(") >= 2, "SFTP remove AND rmdir must record deletions"
 
 
+@pytest.mark.unit
 def test_noisy_dead_recorders_stay_removed():
     # record_vault_access (INFO rapid-vault-access = normal browsing noise on a hot read path) and
     # record_rate_limit_violation (login rate-limits are already recorded via record_failed_login;
@@ -371,6 +385,8 @@ def test_noisy_dead_recorders_stay_removed():
     assert "def record_failed_login" in src and "def record_file_deletion" in src
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_progress_complete_clears_dangling_record():
     # complete_operation must delete the Redis operation:* record. Uploads used to call start_operation
     # but never complete_operation, so every finished/failed upload left a dangling record until TTL.
@@ -395,6 +411,7 @@ def test_progress_complete_clears_dangling_record():
     assert "OK=completed FAIL=failed" in proc.stdout, f"the success flag must drive the operation status\n{proc.stdout}"
 
 
+@pytest.mark.unit
 def test_activity_monitor_dead_code_removed_and_complete_wired():
     # The dead progress/traffic code is gone; the live methods remain; and the upload finalizer now
     # completes the operation record.
@@ -439,6 +456,8 @@ def test_cleanup_old_alerts_prunes_old_resolved(admin):
         admin.delete_user(u["id"])
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_normalize_scope_tolerates_bad_list_fields_and_rotate_key_cap():
     # normalize_scope must not 500 on a null/scalar list field (it should coerce to []), and
     # vault.rotate_key must be a recognized cap (else scoped temp creds can never rotate a vault key).
@@ -453,6 +472,7 @@ def test_normalize_scope_tolerates_bad_list_fields_and_rotate_key_cap():
     assert "OK=True ROTATE=True" in proc.stdout, f"{proc.stdout}\n{proc.stderr}"
 
 
+@pytest.mark.unit
 def test_temp_credential_auth_equalizes_timing():
     # A missing / inactive / used / expired temp credential must not be distinguishable from a live
     # one by response time: authenticate_temporary_credential does a dummy verify on the not-found
@@ -467,6 +487,7 @@ def test_temp_credential_auth_equalizes_timing():
     assert real < state, "the credential must be verified BEFORE the is_active/used/expired state checks"
 
 
+@pytest.mark.unit
 def test_entrypoint_privilege_drop_fails_closed():
     # The container starts as root to chown volumes, then drops to appuser. An initgroups failure must
     # NOT be swallowed (that would keep root's supplementary groups), and the drop must be verified.
@@ -477,6 +498,7 @@ def test_entrypoint_privilege_drop_fails_closed():
     assert "os.getgroups()" in drop and "sys.exit(1)" in drop, "must verify the drop and fail closed"
 
 
+@pytest.mark.unit
 def test_launch_targets_use_module_form():
     # Every live launch site must invoke the packaged servers via `python -m` —
     # a script-path invocation would put the module's own directory (not the app
@@ -507,6 +529,7 @@ def test_static_and_brand_anchor_at_app_root(anon):
         f"brand dir must stay on the mounted volume\n{proc.stdout}\n{proc.stderr}"
 
 
+@pytest.mark.unit
 def test_baked_healthcheck_is_scheme_aware():
     # The baked HEALTHCHECK must honour API_USE_HTTPS, else an HTTPS deploy of the bare image reports
     # perpetually unhealthy.
@@ -514,6 +537,7 @@ def test_baked_healthcheck_is_scheme_aware():
     assert "API_USE_HTTPS" in df, "the baked healthcheck must read API_USE_HTTPS"
 
 
+@pytest.mark.unit
 def test_deploy_scripts_hardened():
     # Deploy-script hardening (owner-validated on-host; here we lock the source):
     smp = _read("scripts/setup_master_password.py")
@@ -528,6 +552,7 @@ def test_deploy_scripts_hardened():
     assert "ALLOWED_HOSTS" in dvtool, "dockvault.py must write ALLOWED_HOSTS"
 
 
+@pytest.mark.unit
 def test_setup_scripts_at_root_and_secure_shim():
     # The two user-facing setup scripts live at the repo ROOT (not deploy/), and the root
     # docker-compose.secure.yml include-shim makes `docker compose -f docker-compose.secure.yml
@@ -629,6 +654,8 @@ def _secure_compose_config(profile):
                                   VAULT_VOLUME_PREFIX="")
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_secure_compose_combined_default_and_split_profile():
     # DEFAULT (combined): ONE 'vault' container runs run_combined.py; the split pair is absent.
     combined = _secure_compose_config("combined")
@@ -645,6 +672,8 @@ def test_secure_compose_combined_default_and_split_profile():
         assert vol in combined and vol in split, f"{vol} must be mounted in both modes"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_secure_compose_labels_volumes_as_bundle():
     # Every named volume carries the DockVault management labels, so the tool can enumerate a
     # deployment's set (docker volume ls --filter label=com.dockvault.managed=true). With no
@@ -656,6 +685,8 @@ def test_secure_compose_labels_volumes_as_bundle():
     assert "com.dockvault.bundle: default" in out, "an unset DEPLOYMENT_ID must default the bundle to 'default'"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_secure_compose_bundle_uses_deployment_id():
     out = _render_secure_compose(COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
                                  RUN_SFTP="", DEPLOYMENT_ID="bundlexyz")
@@ -663,6 +694,7 @@ def test_secure_compose_bundle_uses_deployment_id():
         "DEPLOYMENT_ID must set the bundle label on all five volumes"
 
 
+@pytest.mark.unit
 def test_env_example_documents_deployment_id():
     import re
     envx = _read(".env.example")
@@ -670,6 +702,8 @@ def test_env_example_documents_deployment_id():
     assert re.search(r"^VAULT_VOLUME_PREFIX=", envx, re.M), ".env.example must ship a VAULT_VOLUME_PREFIX key"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_secure_compose_default_volume_names_are_historical():
     # With no VAULT_VOLUME_PREFIX the five volume NAMES must be the historical dockvault-vault_vault_*
     # names, so existing deployments are byte-identical (no data orphaned by the parameterization).
@@ -678,6 +712,8 @@ def test_secure_compose_default_volume_names_are_historical():
         assert "name: dockvault-vault_vault_%s" % base in out, f"default name for {base} must be historical"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_secure_compose_volume_names_honour_prefix():
     out = _render_secure_compose(COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
                                  RUN_SFTP="", VAULT_VOLUME_PREFIX="dockvault-vault-b7")
@@ -688,6 +724,7 @@ def test_secure_compose_volume_names_honour_prefix():
     assert out.count("com.dockvault.managed:") >= 5
 
 
+@pytest.mark.unit
 def test_setup_scripts_are_retired_shims_delegating_to_dockvault():
     # The two setup scripts are now thin shims that launch the management tool; the combined/split
     # profile scheme is written by dockvault.py (build_env_lines), not by the shims.
@@ -704,6 +741,7 @@ def test_setup_scripts_are_retired_shims_delegating_to_dockvault():
         ".env.example must ship COMPOSE_PROFILES=combined and RUN_SFTP"
 
 
+@pytest.mark.unit
 def test_no_stale_setup_secure_command_refs():
     # setup-secure.* survive only as retired shims. No operator-facing file may still PRESENT them as
     # THE way to set up - every remaining mention must flag that they're retired/shims; and the README
@@ -723,6 +761,7 @@ def test_no_stale_setup_secure_command_refs():
     assert "dockvault.py" in _read("setup-secure.sh") and "dockvault.py" in _read("setup-secure.ps1")
 
 
+@pytest.mark.unit
 def test_env_example_documents_every_settings_field():
     # .env.example must document every pydantic Settings field (so a self-hoster can discover
     # each knob) — this lock catches a new config field that never got a .env.example entry.
@@ -742,6 +781,7 @@ def test_env_example_documents_every_settings_field():
         assert k in documented, f".env.example must document {k}"
 
 
+@pytest.mark.unit
 def test_secure_compose_web_port_parameterized():
     # The web host port is configurable via WEB_HOST_PORT (default 443), not hard-coded, in BOTH the
     # combined and split services, so a self-hoster can publish on a different port.
@@ -750,6 +790,8 @@ def test_secure_compose_web_port_parameterized():
     assert '- "443:8000"' not in sc, "the web host port must not be hard-coded"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_secure_compose_honours_web_host_port_override():
     # A WEB_HOST_PORT override must actually take effect in the rendered compose.
     out = _render_secure_compose(COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
@@ -757,6 +799,7 @@ def test_secure_compose_honours_web_host_port_override():
     assert "8443" in out, "WEB_HOST_PORT=8443 override must render as the published host port"
 
 
+@pytest.mark.unit
 def test_claude_md_carries_config_sync_rule():
     # CLAUDE.md must document the rule that a new config field is updated in .env.example AND the
     # setup tooling in the same change (test_env_example_documents_every_settings_field enforces the
@@ -768,6 +811,7 @@ def test_claude_md_carries_config_sync_rule():
         "CLAUDE.md must document keeping config, .env.example, and dockvault.py in sync"
 
 
+@pytest.mark.unit
 def test_app_version_from_version_file_not_hardcoded():
     import re
     # A committed VERSION file (canonical ASCII semver + one LF) is the single source of truth.
@@ -786,6 +830,7 @@ def test_app_version_from_version_file_not_hardcoded():
     assert "version=branding.app_version" in api, "the FastAPI app must use branding.app_version"
 
 
+@pytest.mark.unit
 def test_update_check_admin_gated_and_default_off():
     import re
     api = _read("app/api/api_server.py")
@@ -804,6 +849,7 @@ def test_update_check_admin_gated_and_default_off():
         "SECURITY.md must document the update-check phone-home"
 
 
+@pytest.mark.unit
 def test_release_workflow_and_upgrade_docs():
     import re
     wf = _read(".github/workflows/release.yml")
@@ -839,6 +885,7 @@ def test_release_workflow_and_upgrade_docs():
     assert "migration" in r.lower(), "the DB-migration caveat must be documented"
 
 
+@pytest.mark.unit
 def test_readme_documents_deployment_modes():
     # The README must explain the combined (default) vs split deployment modes and the combined-mode
     # trade-offs a self-hoster needs to know, so the toggle isn't a silent behaviour change.
@@ -850,6 +897,7 @@ def test_readme_documents_deployment_modes():
     assert "healthcheck" in low and "/health" in r, "README must note the healthcheck covers only web"
 
 
+@pytest.mark.unit
 def test_public_docs_reference_only_shipped_windows_scripts():
     # Operator docs MAY reference a Windows helper that actually ships in this repo (e.g.
     # deploy/setup-secure.ps1), but must never point a self-hoster at a .ps1 that isn't part of this repo
@@ -863,6 +911,7 @@ def test_public_docs_reference_only_shipped_windows_scripts():
                 f"{name} references a Windows script that is not shipped here: {script}"
 
 
+@pytest.mark.unit
 def test_user_detail_endpoints_enforce_ownership():
     # The endpoint-permission catalog's requires_ownership flag is display-only and is NOT enforced by
     # require_endpoint_permission, so the user-detail handlers must enforce own-or-admin themselves: a
@@ -883,31 +932,43 @@ def _import_config(env_overrides):
     )
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_production_rejects_sample_admin_password():
     proc = _import_config({"ENVIRONMENT": "production", "ADMIN_PASSWORD": "change_this_secure_password"})
     assert proc.returncode == 1, f"sample admin password should fail-closed in production\n{proc.stdout}\n{proc.stderr}"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_production_rejects_env_example_placeholder():
     proc = _import_config({"ENVIRONMENT": "production", "ADMIN_PASSWORD": "REPLACE_ME"})
     assert proc.returncode == 1, f"placeholder should fail-closed in production\n{proc.stdout}"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_production_allows_strong_admin_password():
     proc = _import_config({"ENVIRONMENT": "production", "ADMIN_PASSWORD": "Xq7-strong-Rand-92hf"})
     assert proc.returncode == 0, f"strong admin password should boot\n{proc.stdout}\n{proc.stderr}"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_development_allows_sample_admin_password():
     proc = _import_config({"ENVIRONMENT": "development", "ADMIN_PASSWORD": "change_this_secure_password"})
     assert proc.returncode == 0, "development must not be gated"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_production_allows_blank_admin_password_post_bootstrap():
     proc = _import_config({"ENVIRONMENT": "production", "ADMIN_PASSWORD": ""})
     assert proc.returncode == 0, "blank admin password must not fail startup (post-bootstrap)"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_jwt_algorithm_must_be_canonical_hmac():
     # A non-HMAC or mis-cased JWT_ALGORITHM must fail closed at BOOT (defeats alg-confusion and the
     # PyJWT case-sensitivity 500). Only the exact canonical HMAC names boot.
@@ -917,6 +978,8 @@ def test_jwt_algorithm_must_be_canonical_hmac():
         assert proc.returncode == 1, f"JWT_ALGORITHM={bad!r} must fail-closed at boot\n{proc.stdout}"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_development_rejects_env_example_placeholder():
     # The shipped .env.example placeholder is a publicly known credential and must be refused in
     # EVERY environment — a bare `docker compose up` ships ENVIRONMENT=development and previously
@@ -925,12 +988,16 @@ def test_development_rejects_env_example_placeholder():
     assert proc.returncode == 1, f"shipped placeholder must fail-closed even in development\n{proc.stdout}\n{proc.stderr}"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_production_rejects_short_admin_password():
     # A weak-but-unlisted value below the 12-char floor must not boot a reachable (production) deploy.
     proc = _import_config({"ENVIRONMENT": "production", "ADMIN_PASSWORD": "weakpass"})
     assert proc.returncode == 1, f"a <12-char admin password should fail-closed in production\n{proc.stdout}\n{proc.stderr}"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_nonstandard_env_rejects_weak_admin_password():
     # Fail-safe: any non-development environment ("staging", "prod", a typo) is treated as reachable
     # and gets the strict blocklist + length tier — not only the literal "production".
@@ -938,6 +1005,8 @@ def test_nonstandard_env_rejects_weak_admin_password():
     assert proc.returncode == 1, f"a weak password must fail-closed in any non-development env\n{proc.stdout}\n{proc.stderr}"
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_development_allows_short_nonplaceholder_password():
     # Dev convenience preserved: only the shipped placeholder is blocked in development; a short,
     # non-placeholder value still boots (the blocklist + length floor apply outside development).
@@ -945,6 +1014,7 @@ def test_development_allows_short_nonplaceholder_password():
     assert proc.returncode == 0, f"development must allow a short non-placeholder password\n{proc.stdout}\n{proc.stderr}"
 
 
+@pytest.mark.unit
 def test_dev_compose_publishes_loopback_only():
     # The plaintext trial must bind to loopback so it isn't reachable off-host.
     dc = _read("deploy/docker-compose.yml")
@@ -964,6 +1034,8 @@ print("PLAINTEXT_WARN_OK")
 '''
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_plaintext_transport_warning_condition():
     # Locks the net-new startup-warning logic (plaintext AND non-development AND no trusted proxy).
     proc = _in_container(args=["python", "-"], stdin=_PLAINTEXT_WARN_SELFTEST)
@@ -1002,6 +1074,8 @@ print("SCHEME_OK")
 '''
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_forwarded_proto_scheme_resolution():
     proc = _in_container(args=["python", "-"], stdin=_SCHEME_SELFTEST)
     assert "SCHEME_OK" in proc.stdout, (
@@ -1040,6 +1114,7 @@ def _at_least(active, package, floor, why):
     )
 
 
+@pytest.mark.unit
 def test_version_floor_helper_orders_numerically():
     """The helper is the whole point of the guard below, so pin its ordering.
 
@@ -1059,6 +1134,7 @@ def test_version_floor_helper_orders_numerically():
         _at_least(["fastapi==0.115.6"], "starlette", "0.40", "a CVE fix")
 
 
+@pytest.mark.unit
 def test_requirements_drop_unused_and_refresh_crypto():
     active = [l.strip() for l in _read("requirements.txt").splitlines()
               if l.strip() and not l.strip().startswith("#")]
@@ -1075,6 +1151,8 @@ def test_requirements_drop_unused_and_refresh_crypto():
     _at_least(active, "starlette", "0.40", "CVE-2024-47874")
 
 
+@pytest.mark.unit
+@pytest.mark.docker
 def test_no_stray_import_of_dropped_libs_in_shipped_code():
     patt = "^import requests|^from jose\\b|^import jose\\b"
     hits = subprocess.run(["git", "grep", "-lE", patt], cwd=str(ROOT),
@@ -1083,17 +1161,20 @@ def test_no_stray_import_of_dropped_libs_in_shipped_code():
     assert not prod, f"dropped libs still imported in shipped code: {prod}"
 
 
+@pytest.mark.unit
 def test_dockerignore_excludes_git_metadata():
     lines = {l.strip() for l in _read(".dockerignore").splitlines()}
     assert ".git" in lines, "VCS metadata should be kept out of the shipped image"
 
 
+@pytest.mark.unit
 def test_master_password_kdf_iterations_raised():
     ss = _read("app/core/startup_security.py")
     assert "iterations=600000" in ss, "master-password KDF should use 600k iterations"
     assert "iterations=100000" not in ss, "the old 100k iteration count should be gone"
 
 
+@pytest.mark.unit
 def test_dead_fail_open_permission_code_stays_removed():
     # Regression guard: two dead, fail-open permission paths were removed because they would
     # silently allow-all if ever wired in. They must not creep back:
@@ -1113,6 +1194,7 @@ def test_dead_fail_open_permission_code_stays_removed():
     assert "def require_endpoint_permission(" in ep, "the live endpoint gate must remain"
 
 
+@pytest.mark.unit
 def test_broken_whole_file_crypto_stays_removed():
     # The whole-file AES-GCM writer had a 9-byte magic vs a 5-byte header field, so every
     # round-trip always failed -- a latent foot-gun if re-wired. It was removed; only the live
@@ -1123,6 +1205,7 @@ def test_broken_whole_file_crypto_stays_removed():
     assert "def secure_delete" in src, "the live secure_delete helper must remain"
 
 
+@pytest.mark.unit
 def test_zk_seal_names_locks_vault_row():
     # Parity: zk_seal_names must serialize its seal-epoch read + writes under the SAME Vault-row lock its
     # siblings (rename_file / create_folder / retire_dek_versions) hold — otherwise a concurrent retire
@@ -1134,6 +1217,7 @@ def test_zk_seal_names_locks_vault_row():
         "zk_seal_names must lock the Vault row before reading the seal epoch (parity with its siblings)"
 
 
+@pytest.mark.unit
 def test_dev_compose_hardening():
     dc = _read("deploy/docker-compose.yml")
     assert "vault_local_dev_pw" not in dc, "the source-controlled default DB password must be dropped"
@@ -1143,6 +1227,7 @@ def test_dev_compose_hardening():
     assert "--requirepass" in dc, "redis requirepass wiring expected"
 
 
+@pytest.mark.unit
 def test_secure_compose_hardening():
     sc = _read("deploy/docker-compose.secure.yml")
     assert sc.count("- ALL") >= 2, "cap_drop [ALL] expected on both app services"
