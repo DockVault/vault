@@ -143,6 +143,18 @@ def _nullability(table, columns):
     return {row["c"]: row["n"] for row in json.loads(rows)}
 
 
+def _table_exists(table):
+    """Whether the table is in this database at all.
+
+    Deliberately separate from reading its columns. A column that has gone missing makes the
+    column query come back empty too, and that is precisely the divergence under test -- so the
+    two cannot share an answer.
+    """
+    found = _psql("SELECT count(*) FROM information_schema.tables "
+                  f"WHERE table_name = '{table}'")
+    return found.strip() not in ("", "0")
+
+
 @pytest.mark.unit
 def test_the_boot_ddl_implements_what_the_model_declares():
     """The source of the old divergence, now the source of its fix.
@@ -233,9 +245,11 @@ def test_this_deployment_holds_the_converged_shape():
     Kept separate from the replay above because it asks a different question: not "do the
     statements converge" but "did they, here".
     """
-    nullability = _nullability(TABLE, CONVERGED)
-    if not nullability:
+    if not _table_exists(TABLE):
         pytest.skip(f"{TABLE} does not exist in this database")
+    # An empty answer from here on means the columns are absent, which is divergence rather than
+    # a reason to stand down -- the assertion below is what says so.
+    nullability = _nullability(TABLE, CONVERGED)
     assert set(nullability) == set(CONVERGED), (
         f"expected both columns to exist, found {sorted(nullability)}")
     assert all(value == "NO" for value in nullability.values()), (
