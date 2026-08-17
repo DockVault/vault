@@ -35,6 +35,8 @@ import time
 import uuid
 
 import pytest
+
+from conftest import host_cannot_take_a_stack
 import requests
 
 pytestmark = [pytest.mark.integration, pytest.mark.docker, pytest.mark.slow,
@@ -146,19 +148,44 @@ def _install_oldest():
     state = {"project": project, "env": env, "compose": compose, "override": override,
              "wait_healthy": wait_healthy, "psql": psql, "base_url": base_url, "port": port}
 
+    def diagnose(note):
+        """Why the stack is not up. Gathered before teardown, which destroys the evidence."""
+        health = _run(["docker", "inspect", f"{project}-api",
+                       "--format", "{{json .State.Health}}"], timeout=30).stdout.strip()
+        logs = compose("logs", "--no-color", "--tail", "60", timeout=120).stdout
+        return f"{note}\n  api health: {health[:600]}\n  logs:\n{logs[-2000:]}"
+
+    def purge():
+        """Stop the project and remove ONLY the volumes it created, by exact name. Never
+        `down -v` and never a prune -- both can reach unrelated volumes on this host."""
+        compose("down", timeout=300)
+        for name in _run(["docker", "volume", "ls", "-q"], timeout=60).stdout.split():
+            if name.startswith(project):
+                _run(["docker", "volume", "rm", name], timeout=60)
+        shutil.rmtree(workdir, ignore_errors=True)
+
     override(IMAGE % DRILL_TAGS[0])
     up = compose("up", "-d")
-    if up.returncode != 0 or wait_healthy() != "healthy":
-        compose("down", timeout=300)
-        pytest.skip(f"the {DRILL_TAGS[0]} stack did not come up: {up.stderr[-400:]}")
+    # vault-sftp waits on the API being healthy, so `up` already blocks on it: a released image
+    # that starts and then reports itself sick returns non-zero here rather than reaching
+    # wait_healthy(). Either way, only the host running out of ports or disk is a reason to
+    # stand down. An image that will not boot against the shipped compose is the breakage this
+    # drill exists to catch, and skipping it leaves the suite green having proved nothing.
+    boot = wait_healthy() if up.returncode == 0 else "never started"
+    if up.returncode != 0 or boot != "healthy":
+        note = (f"the {DRILL_TAGS[0]} stack did not come up (rc={up.returncode}, api={boot}): "
+                f"{(up.stderr or '')[-400:]}")
+        if host_cannot_take_a_stack(up):
+            purge()
+            pytest.skip(f"this host cannot take another stack right now: {note}")
+        detail = diagnose(note)
+        purge()
+        pytest.fail(f"the published {DRILL_TAGS[0]} image does not come up against the shipped "
+                    f"compose, so nothing below it was proved.\n{detail}")
 
     yield state
 
-    compose("down", timeout=300)
-    for name in _run(["docker", "volume", "ls", "-q"], timeout=60).stdout.split():
-        if name.startswith(project):
-            _run(["docker", "volume", "rm", name], timeout=60)
-    shutil.rmtree(workdir, ignore_errors=True)
+    purge()
 
 
 def _token(state):
