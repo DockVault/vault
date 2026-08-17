@@ -564,25 +564,69 @@ def test_setup_scripts_at_root_and_secure_shim():
             f"{name} still references the moved deploy/setup-secure path"
 
 
-def _secure_compose_config(profile):
-    """Render the secure stack via `docker compose config` under COMPOSE_PROFILES=profile;
-    skip cleanly if docker/compose is unavailable or the render fails for an env reason."""
+def _compose_render_blocker():
+    """Why the shipped secure compose file cannot be rendered here at all, or None if it can.
+
+    Only genuine environment gaps belong in here. Compose refusing a file it CAN reach means the
+    file is broken, and catching that is the whole point of the tests below -- so that case is
+    deliberately not a blocker, and reaches the caller as a failure.
+    """
     import shutil
     if shutil.which("docker") is None:
-        pytest.skip("docker not available")
-    # Pin DEPLOYMENT_ID="" so ${DEPLOYMENT_ID:-default} renders 'default' deterministically: `config`
-    # runs with cwd=ROOT and auto-loads the repo-root .env, which (after a real `setup`) may carry a
-    # stamped DEPLOYMENT_ID that would otherwise leak into the render and break the label assertions.
-    env = dict(os.environ, COMPOSE_PROFILES=profile, VAULT_DB_PASSWORD="testpw",
-               RUN_SFTP="", SFTP_HOST_PORT="2322", DEPLOYMENT_ID="", VAULT_VOLUME_PREFIX="")
+        return "docker not available"
+    try:
+        probe = subprocess.run(["docker", "compose", "version"],
+                               capture_output=True, text=True, timeout=60)
+    except Exception as exc:  # noqa: BLE001
+        return f"docker compose unavailable: {exc}"
+    if probe.returncode != 0:
+        return "the docker compose plugin is not installed"
+    if not (ROOT / ".env").exists():
+        # The secure stack declares `env_file: ../.env` on its services, resolved relative to
+        # deploy/, so compose will not render without a repo-root .env.
+        # A fresh clone has none; CI writes one before the suite runs, so this skips on a dev
+        # box that has never run setup and runs everywhere it can.
+        return "no repo-root .env for compose to render against"
+    return None
+
+
+def _render_secure_compose(**overrides):
+    """Render docker-compose.secure.yml with `overrides` on top of the ambient environment.
+
+    Skips only when the environment cannot render at all. Once docker, the compose plugin and a
+    .env are all present, a refusal is a broken compose file: every self-hosted `up` renders this
+    same file, so it fails the test rather than quietly skipping it.
+    """
+    blocker = _compose_render_blocker()
+    if blocker:
+        pytest.skip(blocker)
+    env = dict(os.environ, **overrides)
     try:
         r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
                            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"docker compose unavailable: {exc}")
-    if r.returncode != 0:
-        pytest.skip(f"docker compose config failed: {r.stderr[:200]}")
+    except subprocess.TimeoutExpired:
+        pytest.skip("docker compose config timed out")
+    if "failed to read" in r.stderr and ".env" in r.stderr:
+        # Compose could not parse the developer's own .env, which says nothing about the file
+        # under test. Worth skipping specifically: on Windows `echo x > file` writes UTF-16,
+        # and compose rejects that before it ever looks at the compose file.
+        pytest.skip(f"the repo-root .env is not parseable by compose: {r.stderr.strip()[:160]}")
+    assert r.returncode == 0, (
+        "docker compose rejected the shipped docker-compose.secure.yml. Every self-hosted "
+        "deployment renders this file, so a refusal here breaks `up` for all of them:\n"
+        + r.stderr[:800]
+    )
     return r.stdout
+
+
+def _secure_compose_config(profile):
+    """Render the secure stack under COMPOSE_PROFILES=profile."""
+    # Pin DEPLOYMENT_ID="" so ${DEPLOYMENT_ID:-default} renders 'default' deterministically: `config`
+    # runs with cwd=ROOT and auto-loads the repo-root .env, which (after a real `setup`) may carry a
+    # stamped DEPLOYMENT_ID that would otherwise leak into the render and break the label assertions.
+    return _render_secure_compose(COMPOSE_PROFILES=profile, VAULT_DB_PASSWORD="testpw",
+                                  RUN_SFTP="", SFTP_HOST_PORT="2322", DEPLOYMENT_ID="",
+                                  VAULT_VOLUME_PREFIX="")
 
 
 def test_secure_compose_combined_default_and_split_profile():
@@ -613,19 +657,9 @@ def test_secure_compose_labels_volumes_as_bundle():
 
 
 def test_secure_compose_bundle_uses_deployment_id():
-    import shutil
-    if shutil.which("docker") is None:
-        pytest.skip("docker not available")
-    env = dict(os.environ, COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
-               RUN_SFTP="", DEPLOYMENT_ID="bundlexyz")
-    try:
-        r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
-                           cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"docker compose unavailable: {exc}")
-    if r.returncode != 0:
-        pytest.skip(f"docker compose config failed: {r.stderr[:200]}")
-    assert r.stdout.count("com.dockvault.bundle: bundlexyz") == 5, \
+    out = _render_secure_compose(COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
+                                 RUN_SFTP="", DEPLOYMENT_ID="bundlexyz")
+    assert out.count("com.dockvault.bundle: bundlexyz") == 5, \
         "DEPLOYMENT_ID must set the bundle label on all five volumes"
 
 
@@ -645,23 +679,13 @@ def test_secure_compose_default_volume_names_are_historical():
 
 
 def test_secure_compose_volume_names_honour_prefix():
-    import shutil
-    if shutil.which("docker") is None:
-        pytest.skip("docker not available")
-    env = dict(os.environ, COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
-               RUN_SFTP="", VAULT_VOLUME_PREFIX="dockvault-vault-b7")
-    try:
-        r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
-                           cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"docker compose unavailable: {exc}")
-    if r.returncode != 0:
-        pytest.skip(f"docker compose config failed: {r.stderr[:200]}")
+    out = _render_secure_compose(COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
+                                 RUN_SFTP="", VAULT_VOLUME_PREFIX="dockvault-vault-b7")
     for base in ("pg_data", "storage", "keys", "logs", "brand"):
-        assert "name: dockvault-vault-b7_vault_%s" % base in r.stdout, \
+        assert "name: dockvault-vault-b7_vault_%s" % base in out, \
             f"VAULT_VOLUME_PREFIX must rename the {base} volume"
     # the labels still ride along on the prefixed set
-    assert r.stdout.count("com.dockvault.managed:") >= 5
+    assert out.count("com.dockvault.managed:") >= 5
 
 
 def test_setup_scripts_are_retired_shims_delegating_to_dockvault():
@@ -728,19 +752,9 @@ def test_secure_compose_web_port_parameterized():
 
 def test_secure_compose_honours_web_host_port_override():
     # A WEB_HOST_PORT override must actually take effect in the rendered compose.
-    import shutil
-    if shutil.which("docker") is None:
-        pytest.skip("docker not available")
-    env = dict(os.environ, COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
-               RUN_SFTP="", SFTP_HOST_PORT="2322", WEB_HOST_PORT="8443")
-    try:
-        r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
-                           cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"docker compose unavailable: {exc}")
-    if r.returncode != 0:
-        pytest.skip(f"docker compose config failed: {r.stderr[:200]}")
-    assert "8443" in r.stdout, "WEB_HOST_PORT=8443 override must render as the published host port"
+    out = _render_secure_compose(COMPOSE_PROFILES="combined", VAULT_DB_PASSWORD="testpw",
+                                 RUN_SFTP="", SFTP_HOST_PORT="2322", WEB_HOST_PORT="8443")
+    assert "8443" in out, "WEB_HOST_PORT=8443 override must render as the published host port"
 
 
 def test_claude_md_carries_config_sync_rule():

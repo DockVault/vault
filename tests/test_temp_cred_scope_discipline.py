@@ -21,7 +21,7 @@ import threading
 
 import pytest
 
-from conftest import ApiClient, BASE_URL, unique
+from conftest import ApiClient, BASE_URL, skip_if_container_absent, unique
 
 # The vault's Postgres container. Env-overridable so the suite can be pointed at a second
 # stack instead of silently targeting whatever "vault-db" happens to be running.
@@ -213,16 +213,31 @@ def _pg_ident():
 
 
 def _backdate_deactivate_at(temp_username):
+    """Close a credential's validity window while its hard expiry stays hours out.
+
+    Returns False only when there is no database container to reach, which is the one outcome
+    the callers may skip on. A reachable database that refuses the update fails here: the
+    callers then expect a 401 from a window that never closed, and a 401 arriving for some
+    other reason -- or not arriving -- would otherwise read as a pass.
+    """
     ident = _pg_ident()
     if not ident:
         return False
     user, db = ident
-    r = subprocess.run(
-        ["docker", "exec", _DB_CONTAINER, "psql", "-U", user, "-d", db, "-c",
-         "UPDATE temporary_credentials SET deactivate_at = NOW() - INTERVAL '5 minutes' "
-         f"WHERE temp_username = '{temp_username}';"],
-        capture_output=True, text=True, timeout=15)
-    return r.returncode == 0 and "UPDATE 1" in r.stdout
+    try:
+        r = subprocess.run(
+            ["docker", "exec", _DB_CONTAINER, "psql", "-U", user, "-d", db, "-c",
+             "UPDATE temporary_credentials SET deactivate_at = NOW() - INTERVAL '5 minutes' "
+             f"WHERE temp_username = '{temp_username}';"],
+            capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return False
+    skip_if_container_absent(r, _DB_CONTAINER)
+    assert r.returncode == 0 and "UPDATE 1" in r.stdout, (
+        "did not close the validity window on exactly one credential, so the checks below "
+        f"would be made against a credential still inside its window: rc={r.returncode} "
+        f"out={r.stdout.strip()[:120]} err={r.stderr.strip()[:120]}")
+    return True
 
 
 def test_validity_window_deactivate_at_is_enforced(admin, cleanup):
@@ -231,7 +246,7 @@ def test_validity_window_deactivate_at_is_enforced(admin, cleanup):
     cred = _mint(admin, note=unique("validity-window"), validity_minutes=60, total_lifetime_minutes=1440)
     cleanup.append(cred["temp_username"])
     if not _backdate_deactivate_at(cred["temp_username"]):
-        pytest.skip("cannot backdate deactivate_at (docker/vault-db unavailable)")
+        pytest.skip("no vault-db container to close the validity window in")
 
     c = ApiClient(BASE_URL)
     r = c.session.post(f"{BASE_URL}/auth/login",
@@ -248,5 +263,5 @@ def test_validity_window_enforced_per_request_on_a_live_session(admin, cleanup):
     c = _login_temp(cred)                       # a live session before backdating
     assert c.get("/auth/session").status_code == 200
     if not _backdate_deactivate_at(cred["temp_username"]):
-        pytest.skip("cannot backdate deactivate_at (docker/vault-db unavailable)")
+        pytest.skip("no vault-db container to close the validity window in")
     assert c.get("/auth/session").status_code == 401, "live session must die past deactivate_at"

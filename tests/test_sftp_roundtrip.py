@@ -27,7 +27,8 @@ import pytest
 
 paramiko = pytest.importorskip("paramiko")
 
-from conftest import ADMIN_USER, ADMIN_PASS, unique, ensure_ecc_keypair, create_zk_vault  # noqa: E402
+from conftest import (ADMIN_USER, ADMIN_PASS, unique, ensure_ecc_keypair,  # noqa: E402
+                      create_zk_vault, skip_if_container_absent)
 
 SFTP_HOST = os.environ.get("VAULT_SFTP_HOST", "127.0.0.1")
 SFTP_PORT = int(os.environ.get("VAULT_SFTP_PORT", "2322"))
@@ -487,7 +488,11 @@ def test_sftp_deactivated_temp_cred_is_revoked_mid_session(admin):
 def _backdate_deactivate_at(temp_username):
     """Push a temp credential's validity window (deactivate_at) into the past via the
     vault-db container, so its stated window is closed while the hard expiry is hours out.
-    Returns False if docker/vault-db isn't reachable (test skips)."""
+    Returns False only when there is no vault-db container to talk to, which is the one outcome
+    the caller may skip on. A reachable database that refuses the update fails here instead: the
+    caller then expects a denial from a window that never closed, and a denial arriving for some
+    other reason -- or not arriving at all -- is not something to pass over in silence.
+    """
     import shutil
     import subprocess
     if not shutil.which("docker"):
@@ -500,13 +505,21 @@ def _backdate_deactivate_at(temp_username):
         if u.returncode != 0 or d.returncode != 0:
             return False
         r = subprocess.run(
-            ["docker", "exec", _DB_CONTAINER, "psql", "-U", u.stdout.strip(), "-d", d.stdout.strip(),
+            ["docker", "exec", _DB_CONTAINER, "psql", "-U", u.stdout.strip(),
+             "-d", d.stdout.strip(),
              "-c", "UPDATE temporary_credentials SET deactivate_at = NOW() - INTERVAL '5 minutes' "
                    f"WHERE temp_username = '{temp_username}';"],
             capture_output=True, text=True, timeout=15)
-        return r.returncode == 0 and "UPDATE 1" in r.stdout
-    except Exception:  # noqa: BLE001
+    except subprocess.TimeoutExpired:
+        # A loaded host, not a refusal. Its neighbour _psql tolerates the same thing, and the
+        # integration job stops at the first failure, so one slow exec must not end the run.
         return False
+    skip_if_container_absent(r, _DB_CONTAINER)
+    assert r.returncode == 0 and "UPDATE 1" in r.stdout, (
+        "did not close the validity window on exactly one credential, so the session below is "
+        f"still inside its window: rc={r.returncode} out={r.stdout.strip()[:120]} "
+        f"err={r.stderr.strip()[:120]}")
+    return True
 
 
 def test_sftp_temp_cred_past_validity_window_denied_mid_session(admin):
@@ -520,7 +533,7 @@ def test_sftp_temp_cred_past_validity_window_denied_mid_session(admin):
         with sftp_session(tuser, tcred) as sftp:
             sftp.listdir(f"/{vname}")  # works inside the validity window
             if not _backdate_deactivate_at(tuser):
-                pytest.skip("cannot backdate deactivate_at (docker/vault-db unavailable)")
+                pytest.skip("no vault-db container to backdate deactivate_at in")
             with pytest.raises(_REVOKED_EXC):
                 sftp.listdir(f"/{vname}")  # past the window -> denied on the live session
     finally:
@@ -639,8 +652,13 @@ def test_sftp_session_past_hard_expiry_denied_mid_session(admin):
                 "UPDATE active_sessions SET expires_at = NOW() - INTERVAL '5 minutes' "
                 "WHERE is_active = true AND temp_credential_id = "
                 f"(SELECT id FROM temporary_credentials WHERE temp_username = '{tuser}');")
-            if r is None or r.returncode != 0 or "UPDATE 1" not in (r.stdout or ""):
-                pytest.skip("cannot backdate ActiveSession.expires_at (docker/vault-db)")
+            if r is None:
+                pytest.skip("docker not available, so the session cannot be backdated")
+            assert r.returncode == 0 and "UPDATE 1" in (r.stdout or ""), (
+                "did not backdate exactly one live ActiveSession row. The session below is then "
+                "still within its expiry, so a denial would have to come from somewhere else -- "
+                f"and no denial would look like a pass: rc={r.returncode} "
+                f"out={(r.stdout or '').strip()[:120]} err={(r.stderr or '').strip()[:120]}")
             with pytest.raises(_REVOKED_EXC):
                 sftp.listdir(f"/{vname}")  # past the hard expiry -> denied
     finally:
