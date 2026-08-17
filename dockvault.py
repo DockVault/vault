@@ -1420,6 +1420,41 @@ def _semver_key(version):
     return tuple(int(part) for part in version.split("."))
 
 
+def _walk_edges(matrix, current, target):
+    """The declared edges leading from `current` to `target`, or None if there is no route.
+
+    A breadth-first search over what the file actually declares, rather than a march through
+    version-order neighbours. The difference only shows up once a backport exists, and then it
+    matters: releasing 0.9.1 after 0.10.0 has shipped puts it BETWEEN them by version, so a
+    neighbour march looks for 0.9.1 -> 0.10.0, finds nothing, and calls a hop undescribable that
+    the file describes perfectly well with 0.9.0 -> 0.10.0. The validator already exempts that
+    pair from needing an edge, so the two halves disagreed about what "adjacent" meant.
+
+    Shortest route, and ties broken by version order, so the answer is the same on every run and
+    on both implementations.
+    """
+    edges = {}
+    for edge in (matrix.get("edges") or []):
+        if isinstance(edge, dict) and edge.get("from") and edge.get("to"):
+            edges.setdefault(edge["from"], []).append(edge)
+    for outgoing in edges.values():
+        outgoing.sort(key=lambda e: _semver_key(e["to"]))
+
+    queue = [(current, [])]
+    seen = {current}
+    while queue:
+        node, path = queue.pop(0)
+        if node == target:
+            return path
+        for edge in edges.get(node, []):
+            nxt = edge["to"]
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            queue.append((nxt, path + [edge]))
+    return None
+
+
 def plan_upgrade_path(matrix, current, target):
     """What it takes to get from `current` to `target`, walking one adjacent edge at a time.
 
@@ -1450,14 +1485,9 @@ def plan_upgrade_path(matrix, current, target):
         # claim, so this is deliberately not classified from it.
         return unknown
 
-    edges = {(e.get("from"), e.get("to")): e for e in (matrix.get("edges") or [])}
-    walk = ordered[ordered.index(current):ordered.index(target) + 1]
-    steps = []
-    for a, b in zip(walk, walk[1:]):
-        edge = edges.get((a, b))
-        if edge is None:
-            return unknown
-        steps.append(edge)
+    steps = _walk_edges(matrix, current, target)
+    if steps is None:
+        return unknown
 
     return {
         "steps": steps,
