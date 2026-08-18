@@ -39,12 +39,23 @@ import urllib.request
 MB = 1024 * 1024
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
-# Read from inside the container in a tight loop rather than asked for from outside. The figure
-# that matters is anonymous memory -- what was actually allocated -- so page cache is subtracted
-# rather than argued about. Both cgroup generations are tried, because a deployment does not get
-# to choose which one its host runs.
+# Read from inside the container rather than asked for from outside. The figure that matters is
+# anonymous memory -- what was actually allocated -- so page cache is subtracted rather than
+# argued about. Both cgroup generations are tried, because a deployment does not get to choose
+# which one its host runs.
+#
+# The sleep is not politeness. Without it this loop is a spin: measured at roughly a full core per
+# container, so a four-service stack lost four cores to its own instrument. That inflated the CPU
+# column with the sampler's own work, and slowed the transfer being timed -- on a four-core host
+# the measurement was competing with itself for every core it had. Left running after an
+# interrupted round it also pegs the machine indefinitely, which is how this was found: a stack
+# idling at 100% per container, hours after the run.
+#
+# 20 ms keeps roughly fifty samples a second, which is far finer than the peaks being looked for,
+# at a cost too small to see.
 _SAMPLER_SH = r"""
 while :; do
+  sleep 0.02
   if [ -r /sys/fs/cgroup/memory.current ]; then
     cur=$(cat /sys/fs/cgroup/memory.current 2>/dev/null)
     fil=$(awk '/^inactive_file /{a=$2} /^active_file /{b=$2} END{print a+b}' \
