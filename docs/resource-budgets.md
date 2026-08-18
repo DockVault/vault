@@ -155,6 +155,58 @@ The general lesson, recorded because it will apply to the next harness as well: 
 can outlive its run will, and one that costs a core per container will change the thing it is
 measuring. Both are cheap to prevent and invisible afterwards.
 
+## What an upload costs the browser
+
+Everything above measures containers. This measures the tab, because the claim made for the
+zero-knowledge upload path is about the client: encrypting from a sliced file rather than a
+whole-file buffer was supposed to stop the browser holding three copies.
+
+Chromium, resident memory sampled continuously and split **by process role**, each arm in a fresh
+browser, and each arm's payload built *before* the baseline is taken so what is reported is the
+cost of the operation rather than the cost of having a file to operate on.
+
+| payload | arm | renderer (the tab) | browser process |
+|---|---|---|---|
+| 64 MiB | whole-file path | 306.3% | — |
+| 128 MiB | whole-file path | 303.8% | — |
+| 64 MiB | **shipped path** | 57.1 MiB | 78.3 MiB |
+| 128 MiB | **shipped path** | 66.6 MiB | 162.0 MiB |
+| 256 MiB | **shipped path** | 61.0 MiB | 275.8 MiB |
+
+**The whole-file path really did cost three copies**, and all of them in the renderer — 306% and
+304% of payload at two sizes, which is as close to exactly 3x as this instrument resolves.
+
+**The shipped path's renderer cost does not scale with the file.** 57, 67, 61 MiB across a
+four-fold range of payload. A copy would have tracked the payload and reached ~230 MiB at the top
+row; it stays near 60 MiB. What scales instead is the **browser process**, at roughly one copy
+(1.22x, 1.27x, 1.08x) — the accumulated ciphertext living as Blob parts in the blob store, which is
+exactly where `encryptBlobV2` says it hands them.
+
+So the honest figure is: **about one copy of the file in the browser process, plus a bounded
+working set of roughly 60 MiB in the renderer.** Two earlier statements of this were both wrong in
+the same direction — "peak memory is a chunk rather than three times the file" (the original scope
+line) and "peak JS heap is one chunk, total roughly one copy" (its first correction). The renderer
+working set is not one chunk; it is ~60 MiB of live heap, decoder buffers and not-yet-collected
+slices. It is simply **bounded**, which is the property that matters.
+
+**Why bounded-in-the-renderer is the win, and not merely a smaller number.** The renderer is the
+process an operating system kills first, and the one the mobile ceilings are about. The download
+sink measured in `vault-download-sink-and-policy.md` moved a file *into* the renderer and was
+withdrawn for it. The upload writer moves the file *out* of the renderer and into the blob store.
+Same architecture, opposite direction, and only one of them is an improvement.
+
+### Reading these numbers safely
+
+The control arm holds one copy of the payload deliberately and must read ~100% in the renderer. It
+read 110.6%, 105.3% and 101.2% at 64, 128 and 256 MiB — converging as the fixed overhead amortises.
+An arm that does not calibrate is not evidence, and four memory probes in this project read
+plausibly and wrongly before one did.
+
+These are **resident set** figures, so they include garbage not yet collected. That is deliberate:
+RSS is what an out-of-memory killer counts. A live-heap number would be smaller and less relevant.
+
+Reproduce with `scripts/measure_browser_upload_memory.py --base-url <url> --payload-mb 128`.
+
 ## What a deployment needs
 
 Measured across the whole stack during a 128 MB download, with page cache excluded.
