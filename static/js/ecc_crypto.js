@@ -2038,23 +2038,27 @@ class ECCCryptoLibrary {
      * thing that reveals the cut is the absent terminator. Releasing bytes as they verify would
      * mean handing over attacker-chosen-length output and detecting it afterwards.
      */
-    async decryptFileV2(encryptedContent, vaultDEK, context) {
-        const W = 'decryptFileV2';
-        const bytes = encryptedContent instanceof Uint8Array
-            ? encryptedContent : new Uint8Array(encryptedContent || []);
-        const L = bytes.length;
+    /**
+     * Work out a version-2 file's framing from its header and its stored LENGTH.
+     *
+     * Shared by both readers. The arithmetic decides which bytes are authenticated together, so
+     * two copies of it would be two chances to disagree about that -- and the disagreement would
+     * show up as a file one reader opens and the other calls damaged.
+     *
+     * `header` is the first V2_CONTENT_HEADER_BYTES; `L` the total stored length.
+     */
+    _v2ContentFraming(header, L, W) {
         if (L < this.V2_CONTENT_MIN_BYTES) {
             this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.length');
         }
-
         const H = this.V2_CONTENT_HEADER_BYTES;
         const O = this.V2_CONTENT_CHUNK_OVERHEAD;
-        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
         const chunkSize = view.getUint32(8, false);
         if (chunkSize < this.V2_CONTENT_CHUNK_MIN || chunkSize > this.V2_CONTENT_CHUNK_MAX) {
             this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.chunkSize');
         }
-        const blobId = bytes.slice(12, 28);
+        const blobId = header.slice(12, 28);
 
         const S = chunkSize + O;                 // a full chunk's stored size
         const M = L - H;                         // everything after the header
@@ -2066,7 +2070,36 @@ class ECCCryptoLibrary {
         if (last < O || last > S || (last === O && n !== 1)) {
             this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.framing');
         }
-        const totalPlaintext = (n - 1) * chunkSize + (last - O);
+        return {
+            H, O, S, n, last, chunkSize, blobId,
+            totalPlaintext: (n - 1) * chunkSize + (last - O),
+        };
+    }
+
+    /**
+     * Check the header as it ARRIVED against the header this reader would have written.
+     *
+     * The authenticated header is rebuilt from a constant purpose byte plus the chunk size and
+     * attempt token parsed out of the input, so the AAD says nothing about the magic, the version,
+     * the purpose or the reserved bytes as they actually arrived. This comparison is the only
+     * thing that does, and both readers need it.
+     */
+    _v2ContentHeaderMatches(header, t, H, W) {
+        for (let i = 0; i < H; i++) {
+            if (header[i] !== t.fileHeader[i]) {
+                this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.header');
+            }
+        }
+    }
+
+    async decryptFileV2(encryptedContent, vaultDEK, context) {
+        const W = 'decryptFileV2';
+        const bytes = encryptedContent instanceof Uint8Array
+            ? encryptedContent : new Uint8Array(encryptedContent || []);
+        const L = bytes.length;
+        const f = this._v2ContentFraming(
+            bytes.subarray(0, this.V2_CONTENT_HEADER_BYTES), L, W);
+        const { H, O, S, n, last, chunkSize, blobId, totalPlaintext } = f;
 
         const ctx = context || {};
         const t = this._v2ContentTranscript(
@@ -2080,11 +2113,7 @@ class ECCCryptoLibrary {
         // this loop changes nothing and it reads as redundant. It is not: this method is
         // public, a streaming reader is the caller this grammar exists for, and called
         // directly with the loop gone a file relabelled to any version or purpose decrypts.
-        for (let i = 0; i < H; i++) {
-            if (bytes[i] !== t.fileHeader[i]) {
-                this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.header');
-            }
-        }
+        this._v2ContentHeaderMatches(bytes, t, H, W);
 
         // Once per file. Deriving per chunk would be correct and ruinous.
         const key = await this._deriveV2ContentKey(vaultDEK, t.info);
@@ -2120,6 +2149,79 @@ class ECCCryptoLibrary {
             written += p.length;
         }
         return out.buffer;
+    }
+
+    /**
+     * Read a version-2 file from a Blob, writing plaintext out as it authenticates.
+     *
+     * The buffered reader hands back nothing until the chunk marked final has authenticated,
+     * because releasing records as they verify means handing over output of attacker-chosen
+     * length. That property is kept here, and it is the caller's to honour: `write` is called
+     * with each chunk in order, but this does not RESOLVE until the final record authenticates.
+     * Anything already written must therefore go somewhere the caller can still discard -- a
+     * staging file, not the user's downloads folder. On any failure this throws, and whatever was
+     * written is the caller's to delete.
+     *
+     * Nothing larger than one chunk is read or held. A file of any size costs one slice, one
+     * decrypted chunk, and whatever the sink chooses to keep.
+     */
+    async decryptBlobV2(blob, vaultDEK, context, write) {
+        const W = 'decryptBlobV2';
+        try {
+            if (!blob || typeof blob.slice !== 'function'
+                || !Number.isSafeInteger(blob.size) || blob.size < 0) {
+                this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.blob');
+            }
+            if (typeof blob.arrayBuffer !== 'function') {
+                throw new CryptoError(CRYPTO_ERROR_CODES.CRYPTO_UNAVAILABLE, W + '.arrayBuffer');
+            }
+            if (typeof write !== 'function') {
+                this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.write');
+            }
+
+            const L = blob.size;
+            const HB = this.V2_CONTENT_HEADER_BYTES;
+            const header = new Uint8Array(await blob.slice(0, HB).arrayBuffer());
+            const f = this._v2ContentFraming(header, L, W);
+            const { H, O, S, n, last, chunkSize, blobId, totalPlaintext } = f;
+
+            const ctx = context || {};
+            const t = this._v2ContentTranscript(
+                ctx.vaultId, ctx.objectId, ctx.dekEpoch, chunkSize, blobId);
+            this._v2ContentHeaderMatches(header, t, H, W);
+
+            const key = await this._deriveV2ContentKey(vaultDEK, t.info);
+
+            for (let i = 0; i < n; i++) {
+                const start = H + i * S;
+                const end = (i === n - 1) ? L : start + S;
+                const isFinal = (i === n - 1);
+                const record = new Uint8Array(await blob.slice(start, end).arrayBuffer());
+                let plain;
+                try {
+                    plain = await this._subtle().decrypt(
+                        {
+                            name: this.AES_ALGORITHM,
+                            iv: record.subarray(0, 12),
+                            additionalData: t.aadFor(i, isFinal,
+                                { totalChunks: n, totalPlaintext }),
+                        },
+                        key,
+                        record.subarray(12),
+                    );
+                } catch (e) {
+                    this._fail(CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED, W + '.chunk', e);
+                }
+                const p = new Uint8Array(plain);
+                if (p.length !== (isFinal ? last - O : chunkSize)) {
+                    this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.chunkLength');
+                }
+                await write(p);
+            }
+            return { totalPlaintext };
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED, W);
+        }
     }
 
     async decryptFile(encryptedContent, vaultDEK, context) {
@@ -2600,6 +2702,7 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     // never a passphrase problem and must never be reported as one.
     decryptFile: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
     decryptFileV2: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
+    decryptBlobV2: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
     encryptFileV2: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     encryptBlobV2: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     decryptName: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
