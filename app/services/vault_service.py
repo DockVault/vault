@@ -1615,9 +1615,33 @@ class VaultService:
             # integrity statement the server can make. Plaintext integrity stays the client's own
             # AEAD, unchanged.
             size = storage_path.stat().st_size
+
+            def _raw_range(offset: int, length: int) -> bytes:
+                """Bytes straight out of the stored blob, decrypting nothing.
+
+                This is why zero-knowledge can answer a range at all. `_open_random` refuses the
+                type outright, and rightly: it would build an authenticated reader over a blob the
+                deployment holds no key for, and an attacker-chosen file beginning with the format
+                magic would be handed to it. Nothing here constructs a reader. The server copies
+                bytes it never interprets, which is what it already does for the whole file.
+
+                Offsets mean the same thing to the client as to us: the response body IS the
+                ciphertext, so a byte range names the same bytes at both ends. The client derives
+                record boundaries from the stored length and decrypts what it asked for.
+
+                Safe to seek because the two paths are mutually exclusive within one request: a
+                ranged response never iterates the sequential generator above, and a sequential
+                one never calls this.
+                """
+                if length <= 0 or offset < 0 or offset >= size:
+                    return b''
+                handle.seek(offset)
+                return handle.read(min(length, size - offset))
+
             return BoundedDownload(
                 handle, _primed(_fixed_windows(handle)), size,
-                file.original_name, mime, file.checksum_sha256)
+                file.original_name, mime, file.checksum_sha256,
+                read_range=_raw_range)
 
         # The identification itself can fail, and it must be caught HERE: it used to return False
         # for an unreadable file, which silently routed a healthy object to the wrong reader and

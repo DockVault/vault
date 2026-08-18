@@ -85,6 +85,12 @@ statement, exactly as it is for a whole-file zero-knowledge download today.
 That branch must be written so it cannot become the thing the existing refusal was guarding
 against. The refusal protects a *reader*; a raw range must not acquire one.
 
+**Built, and that is exactly how.** The sequential zero-knowledge opener now carries a
+`read_range` that seeks the stored blob and copies bytes, interpreting none of them --
+`_open_random` and its refusal are untouched, and no reader is constructed on this path. Seeking is
+safe because the two paths are mutually exclusive within a request: a ranged response never
+iterates the sequential generator, and a sequential one never calls the range function.
+
 **Legacy Fernet cannot be ranged cheaply, and quietly is not the same as cannot.** `_open_random`
 falls back to `RandomAccessFile.from_bytes`, which decrypts the entire file into memory — the exact
 cost the class was built to avoid, retained deliberately because padding hides up to sixteen bytes
@@ -108,8 +114,11 @@ Promising a cleanup that cannot happen is worse than admitting the limit.
 
 ## Not established
 
-- Whether `Accept-Ranges` should be advertised for zero-knowledge vaults, where the offsets are
-  ciphertext offsets and mean something different to a generic client than they do to ours.
+- ~~Whether `Accept-Ranges` should be advertised for zero-knowledge vaults~~ -- **settled: yes.**
+  The concern was that ciphertext offsets mean something different to a generic client. They do
+  not: the response body IS the ciphertext, so a byte range names the same bytes at both ends. A
+  generic client reassembling two ranges gets the same blob it would have downloaded whole, and
+  our client additionally knows how to derive record boundaries from the stored length.
 - How a range interacts with the transfer-admission slot. The slot is held for the whole response;
   a resumed download is a second response and would take a second slot, so a client retrying a
   large transfer repeatedly could hold more of the ceiling than one transfer's worth.
