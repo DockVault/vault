@@ -176,17 +176,21 @@ jobs:
         timeout-minutes: 10
         run: |
           set -euo pipefail
-          # apt applies no network timeout by default, which is how one unresponsive mirror
-          # becomes a 43-minute silence rather than an error it could recover from. The runner
-          # has two mirrors configured; bounding each fetch lets it give up on the bad one and
-          # use the other. The deadline above is the backstop for when even that does not help.
-          printf 'Acquire::http::Timeout "20";\n' | sudo tee /etc/apt/apt.conf.d/99-dv-timeouts >/dev/null
-          printf 'Acquire::https::Timeout "20";\n' | sudo tee -a /etc/apt/apt.conf.d/99-dv-timeouts >/dev/null
-          printf 'Acquire::Retries "3";\n' | sudo tee -a /etc/apt/apt.conf.d/99-dv-timeouts >/dev/null
           python -m pip install -r tests/requirements-test.lock
           python -m pip install --force-reinstall --require-hashes -r requirements.lock
           python -m pip check
-          python -m playwright install --with-deps chromium
+          # NOT --with-deps. That flag is the only thing here that invokes apt, and apt is the
+          # only thing here that has ever hung: three times now, each stalling on a mirror
+          # mid-fetch with no error. Bounding it helped only in that the job now fails in ten
+          # minutes instead of consuming forty-five -- the stall itself kept recurring, once
+          # for nine minutes on a single HTTPS GET despite a twenty-second timeout, because
+          # those timeouts bound a connection attempt and not a transfer that trickles.
+          #
+          # The runner image already ships the shared libraries Chromium needs -- which is why
+          # Playwright's browsers come preinstalled on it. Nothing is taken on trust either:
+          # the next step launches Chromium against the running API and fails loudly if a
+          # library really is missing, which is a better signal than a silent apt stall.
+          python -m playwright install chromium
 
       - name: Verify Chromium launches against the API
         run: |
