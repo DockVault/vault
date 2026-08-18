@@ -182,7 +182,16 @@ def test_a_zero_knowledge_file_is_not_ranged(admin):
         assert "Content-Range" not in ranged.headers
         assert len(ranged.content) == len(plain.content)
     finally:
-        admin.delete(f"/vaults/{vid}")
+        # POST /vaults/{id}/delete, not DELETE /vaults/{id} -- the latter is not a route, and the
+        # response went unchecked, so this vault was never removed. A lingering zero-knowledge
+        # vault is not inert: an unrestricted temp-credential mint counts as "zero-knowledge in
+        # scope" whenever the account holds one, so every later mint in the run met an
+        # acknowledge-to-proceed dialog that nothing clicked. Asserted, because a cleanup whose
+        # result is discarded is indistinguishable from no cleanup.
+        gone = admin.delete_vault(vid)
+        assert gone.status_code in (200, 204), (
+            f"the zero-knowledge vault survived this test, and a later temp-credential mint will "
+            f"meet a confirmation dialog because of it: {gone.status_code} {gone.text[:200]}")
 
 
 # --- the share case ------------------------------------------------------------------------
@@ -245,7 +254,9 @@ def test_a_shared_download_ignores_a_range_and_still_costs_exactly_one(admin, te
         assert third.status_code == 403, (
             "the cap did not engage, so a Range header bought downloads that were not counted")
     finally:
-        admin.delete(f"/vaults/{vault['id']}")
+        gone = admin.delete_vault(vault["id"])
+        assert gone.status_code in (200, 204), (
+            f"the shared vault survived this test: {gone.status_code} {gone.text[:200]}")
 
 
 # --- resuming safely across two requests -----------------------------------------------------
@@ -319,7 +330,13 @@ def test_replacing_the_file_invalidates_a_resume_in_flight(admin, temp_vault):
     assert tag
 
     replacement = bytes((i * 5 + 11) & 0xFF for i in range(len(BODY)))
-    admin.delete(f"/vaults/{vid}/files/{fid}")
+    # POST .../delete is the route; DELETE is not one. Unchecked, this test still passed -- but
+    # for the wrong reason, because nothing was replaced and a second file was merely added
+    # alongside the first. Asserted so the scenario is the one the name claims.
+    removed = admin.post(f"/vaults/{vid}/files/{fid}/delete")
+    assert removed.status_code in (200, 204), (
+        f"the original was not removed, so this exercises two coexisting files rather than a "
+        f"replacement: {removed.status_code} {removed.text[:200]}")
     new_fid = _upload(admin, vid, name, replacement)
 
     resumed = admin.get(f"/vaults/{vid}/files/{new_fid}/download",
