@@ -2242,6 +2242,56 @@ class ECCCryptoLibrary {
      * not resolve until the final record authenticates, so what has been written is only safe
      * once it returns.
      */
+    /**
+     * Look at the first `n` bytes of a stream without spending them.
+     *
+     * Choosing a reader means reading the header, and reading a stream consumes it -- so a caller
+     * that peeks the naive way has nothing left to hand to the reader it just chose, and a caller
+     * that avoids peeking has to buffer the whole body to find out what it is. This returns both:
+     * the bytes it looked at, and a stream that begins with those same bytes.
+     *
+     * Private, because it is plumbing rather than part of the crypto surface. It lives here so it
+     * can be tested against the same runtime as the readers it feeds.
+     *
+     * Returns `{ head, stream }`. `head` may be shorter than `n` if the body was, which is itself
+     * the answer for anything too short to be a header.
+     */
+    async _peekStream(stream, n) {
+        const reader = stream.getReader();
+        const buffered = [];
+        let held = 0;
+        while (held < n) {
+            const r = await reader.read();
+            if (r.done) { break; }
+            const piece = r.value instanceof Uint8Array ? r.value : new Uint8Array(r.value);
+            if (piece.length) { buffered.push(piece); held += piece.length; }
+        }
+
+        const head = new Uint8Array(Math.min(held, n));
+        let filled = 0;
+        for (const piece of buffered) {
+            if (filled >= head.length) { break; }
+            const take = Math.min(piece.length, head.length - filled);
+            head.set(piece.subarray(0, take), filled);
+            filled += take;
+        }
+
+        // The replay hands back exactly what was pulled, in order, and then continues from the
+        // same reader -- so the bytes are neither duplicated nor lost, and the producer is never
+        // asked for anything twice.
+        const replay = new ReadableStream({
+            async pull(controller) {
+                if (buffered.length) { controller.enqueue(buffered.shift()); return; }
+                const r = await reader.read();
+                if (r.done) { controller.close(); return; }
+                controller.enqueue(r.value);
+            },
+            cancel(reason) { return reader.cancel(reason); },
+        });
+
+        return { head, stream: replay };
+    }
+
     async decryptStreamV2(stream, totalLength, vaultDEK, context, write) {
         const W = 'decryptStreamV2';
         try {
