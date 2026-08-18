@@ -139,55 +139,56 @@ def test_a_header_we_cannot_honour_serves_the_whole_file(admin, stored_file, hea
     assert "Content-Range" not in r.headers
 
 
-def test_a_zero_knowledge_file_is_not_ranged(admin):
-    """The server stores the client's ciphertext and holds no key for it.
+def test_a_zero_knowledge_file_is_ranged_over_its_ciphertext(admin):
+    """The flagship case, and the one most worth resuming: large client-encrypted files.
 
-    Serving a range would mean building a reader over a blob it cannot authenticate, which is the
-    thing the service layer refuses outright. The endpoint must not offer what that would require.
+    The server holds no key here, so it answers with bytes out of the stored blob and interprets
+    none of them. That is a different safety argument from the standard path, not a weaker one:
+    `_open_random` refuses this type precisely because it would build an authenticated reader over
+    a blob an attacker could have chosen, and nothing on this path constructs one.
+
+    Offsets mean the same at both ends, because the response body IS the ciphertext. The client
+    derives record boundaries from the stored length and decrypts what it asked for.
     """
-    # Enabled and then put back to False, which is what every other zero-knowledge test in this
-    # suite does (`_zk_enabled` in test_api_zk_vault.py restores False unconditionally). My first
-    # version restored whatever it had read instead, on the reasoning that putting a setting back
-    # as you found it is politer. For a setting shared by the whole run it is not politer, it is
-    # a second convention: two tests with different ideas about the resting state leave it
-    # wherever the last one ran, and whatever runs next inherits that.
     admin.put("/settings", json={"zero_knowledge_enabled": True})
     try:
         vault = create_zk_vault(admin, name=unique("zk-range"))
     except Exception as exc:                      # noqa: BLE001 - narrow re-raise below
-        # Only a deployment that refuses the type outright is an environment gap. Anything else
-        # is this test failing to set itself up, and must say so.
-        if "not enabled on this deployment" in str(exc) or "not permitted" in str(exc):
-            admin.put("/settings", json={"zero_knowledge_enabled": False})
-            pytest.skip(f"this deployment forbids zero-knowledge vaults: {str(exc)[:200]}")
         admin.put("/settings", json={"zero_knowledge_enabled": False})
+        if "not enabled on this deployment" in str(exc) or "not permitted" in str(exc):
+            pytest.skip(f"this deployment forbids zero-knowledge vaults: {str(exc)[:200]}")
         raise
     admin.put("/settings", json={"zero_knowledge_enabled": False})
     vid = vault["id"]
     try:
-        # Uploaded the browser way as well: a zero-knowledge vault refuses a file whose name is
-        # not sealed client-side, so the ordinary helper cannot store one. The DEK is random
-        # because the server never sees it -- it exists here only to seal the name.
         fid = zk_chunked_upload(admin, vid, unique("zk") + ".bin", BODY, os.urandom(32),
                                 mime="application/octet-stream")
-        plain = admin.get(f"/vaults/{vid}/files/{fid}/download")
-        assert plain.status_code == 200, plain.text
-        assert "Accept-Ranges" not in plain.headers, (
-            "advertising ranges here would invite a request the server must refuse")
+        whole = admin.get(f"/vaults/{vid}/files/{fid}/download")
+        assert whole.status_code == 200, whole.text
+        cipher = whole.content
+        assert whole.headers.get("Accept-Ranges") == "bytes", (
+            "a client-encrypted blob is the case resuming matters most for -- it must be offered")
 
-        ranged = admin.get(f"/vaults/{vid}/files/{fid}/download",
-                           headers={"Range": "bytes=0-999"})
-        assert ranged.status_code == 200, (
-            f"expected the header to be ignored, got {ranged.status_code}")
-        assert "Content-Range" not in ranged.headers
-        assert len(ranged.content) == len(plain.content)
+        head = admin.get(f"/vaults/{vid}/files/{fid}/download",
+                         headers={"Range": "bytes=0-4095"})
+        assert head.status_code == 206, head.text
+        assert head.content == cipher[:4096], "the range is not the same bytes the whole download "                                              "would have delivered"
+        assert head.headers.get("Content-Range") == f"bytes 0-4095/{len(cipher)}"
+
+        tail = admin.get(f"/vaults/{vid}/files/{fid}/download",
+                         headers={"Range": "bytes=4096-"})
+        assert tail.status_code == 206, tail.text
+        assert head.content + tail.content == cipher, (
+            "two halves of the ciphertext do not reassemble, so a resumed download would decrypt "
+            "into damage")
+
+        # The staleness guard applies here too, and matters more: a replaced blob spliced onto an
+        # earlier half would fail to authenticate as damage rather than as a bug.
+        assert whole.headers.get("ETag"), "without a tag a client cannot resume safely"
+        stale = admin.get(f"/vaults/{vid}/files/{fid}/download",
+                          headers={"Range": "bytes=4096-", "If-Range": '"not-the-stored-sum"'})
+        assert stale.status_code == 200 and stale.content == cipher
     finally:
-        # POST /vaults/{id}/delete, not DELETE /vaults/{id} -- the latter is not a route, and the
-        # response went unchecked, so this vault was never removed. A lingering zero-knowledge
-        # vault is not inert: an unrestricted temp-credential mint counts as "zero-knowledge in
-        # scope" whenever the account holds one, so every later mint in the run met an
-        # acknowledge-to-proceed dialog that nothing clicked. Asserted, because a cleanup whose
-        # result is discarded is indistinguishable from no cleanup.
         gone = admin.delete_vault(vid)
         assert gone.status_code in (200, 204), (
             f"the zero-knowledge vault survived this test, and a later temp-credential mint will "
