@@ -18,9 +18,9 @@ import pytest
 pytestmark = pytest.mark.ui
 
 
-def test_the_worker_is_served_from_the_origin_root(api):
+def test_the_worker_is_served_from_the_origin_root(anon):
     """Not from /static/js/, and with a content type a browser will execute."""
-    r = api.get("/download-sw.js")
+    r = anon.get("/download-sw.js")
     assert r.status_code == 200, r.text
     assert "javascript" in r.headers.get("Content-Type", ""), (
         "a worker served without a JavaScript content type is refused by the browser")

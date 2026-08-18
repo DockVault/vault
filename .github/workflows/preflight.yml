@@ -169,3 +169,13 @@ jobs:
       # is never a matter of taste: the name is either defined or the code raises.
       - name: Reject undefined names
         run: python -m ruff check --select F821 app tests dockvault.py .github/scripts
+
+      # Every fixture every test asks for, resolved without running anything. Collection alone
+      # does NOT do this: a test naming a fixture that does not exist collects cleanly and then
+      # ERRORS at setup -- so the mistake surfaces only in the job that needs a live stack, after
+      # thirteen minutes, and only for tests that lane actually runs.
+      #
+      # Measured at 7 seconds for the whole suite. It has already caught one: a browser test asked
+      # for an `api` fixture, which this repository does not have.
+      - name: Reject tests asking for fixtures that do not exist
+        run: python -m pytest --setup-plan -q
