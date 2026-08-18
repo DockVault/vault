@@ -2323,8 +2323,15 @@ class ECCCryptoLibrary {
         };
     }
 
-    async decryptStreamV2(stream, totalLength, vaultDEK, context, write) {
+    async decryptStreamV2(stream, totalLength, vaultDEK, context, write, options) {
         const W = 'decryptStreamV2';
+        // `options.startRecord` resumes: the stream carries records from that index onward rather
+        // than the whole object, so the header is no longer at the front of it and the caller
+        // supplies the copy it kept. Records are authenticated independently and their AAD is
+        // bound to the record INDEX, so record k verifies without records 0..k-1 ever being
+        // seen -- which is the property that makes resuming possible at all rather than a
+        // convenience. The final record still binds the totals, so a resumed read is checked
+        // against the same statement of size as a whole one.
         try {
             if (!stream || typeof stream.getReader !== 'function') {
                 this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.stream');
@@ -2374,8 +2381,21 @@ class ECCCryptoLibrary {
                 return out;
             };
 
+            const opts = options || {};
+            const startRecord = opts.startRecord || 0;
+            if (!Number.isSafeInteger(startRecord) || startRecord < 0) {
+                this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.startRecord');
+            }
+            if (startRecord > 0 && !(opts.header instanceof Uint8Array)) {
+                // Without it there is nothing to derive the framing from and nothing to check the
+                // transcript against, and guessing either would defeat both.
+                this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.header');
+            }
+
             try {
-                const header = await take(this.V2_CONTENT_HEADER_BYTES);
+                const header = startRecord > 0
+                    ? opts.header
+                    : await take(this.V2_CONTENT_HEADER_BYTES);
                 const f = this._v2ContentFraming(header, totalLength, W);
                 const { H, O, S, n, last, chunkSize, blobId, totalPlaintext } = f;
 
@@ -2386,7 +2406,11 @@ class ECCCryptoLibrary {
 
                 const key = await this._deriveV2ContentKey(vaultDEK, t.info);
 
-                for (let i = 0; i < n; i++) {
+                if (startRecord > n) {
+                    this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.startRecord');
+                }
+
+                for (let i = startRecord; i < n; i++) {
                     const isFinal = (i === n - 1);
                     const record = await take(isFinal ? last : S);
                     let plain;
