@@ -113,6 +113,48 @@ lengths are not derivable from the framing — padding hides up to sixteen bytes
 index cannot be built without decrypting everything anyway. No writer produces that format, so the
 exposure shrinks as those files are replaced and cannot grow.
 
+## Both halves at once
+
+The table above is one transfer at a time, which isolates the cost of each half. This is the case
+a deployment actually meets: a sustained upload and a sustained download together, on a four-core
+host with 4 GB of memory.
+
+| Payload each way | Wall | Simultaneous peak | CPU |
+|---|---|---|---|
+| 128 MB | 5.0 s | **234.0 MB** | 8.1 s |
+| 512 MB | 22.5 s | **291.2 MB** | 40.3 s |
+
+Read the **simultaneous peak**, not the sum of the per-service peaks. The sum is an upper bound
+over figures that need not coincide -- 243.7 MB and 304.8 MB here -- while this is what the machine
+has to hold at once.
+
+Quadrupling both transfers moved the peak by 57 MB, which is the same fixed-window behaviour the
+single-transfer rows show, and it leaves the whole stack inside the 500 MB target with room that is
+not marginal.
+
+The CPU splits the way the work does: of the 40.3 seconds at 512 MB, the API accounts for 19.4 and
+the database, cache and SFTP service for about 7 each.
+
+### These figures replace an earlier set, and the reason is worth keeping
+
+An earlier run of exactly this workload reported 18.0 s and 74.4 s wall, and 257 s of CPU. Those
+numbers were wrong, and not by a little.
+
+The memory sampler was a shell loop with no sleep, injected into each container, and killing
+`docker exec` does not kill what it started -- so a sampler survived every round and accumulated.
+Nine were found on one host. The stack idled at roughly 100% CPU per container before the sleep
+was added and about 31% after, so the measurements were taken on a machine the instrument had
+loaded, and the CPU column was largely the instrument measuring itself. Four services with very
+different jobs reporting CPU within 2% of each other is what gave it away.
+
+**Memory was not affected** -- a sampler costs about a megabyte -- so the single-transfer table
+above stands. Wall time and CPU were, and are re-measured here on a quiet host with the sampler
+bounded and reaped.
+
+The general lesson, recorded because it will apply to the next harness as well: an instrument that
+can outlive its run will, and one that costs a core per container will change the thing it is
+measuring. Both are cheap to prevent and invisible afterwards.
+
 ## What a deployment needs
 
 Measured across the whole stack during a 128 MB download, with page cache excluded.
