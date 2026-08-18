@@ -8391,9 +8391,29 @@ async function zkMaybeDecryptBlob(blob, vault, keyVersion = null, fileId = null)
     }
     const epoch = keyVersion != null ? keyVersion : 1;
     const dek = await zkGetVaultDek(vault.id, epoch);
-    const plain = await eccLib().decryptFile(await blob.arrayBuffer(), dek,
-        { vaultId: vault.id, objectId: fileId, dekEpoch: epoch });
-    return new Blob([plain], { type: blob.type || 'application/octet-stream' });
+    const lib = eccLib();
+    const context = { vaultId: vault.id, objectId: fileId, dekEpoch: epoch };
+    const type = blob.type || 'application/octet-stream';
+
+    // Chunk-framed content can be read a record at a time, so the tab never holds the file. The
+    // older whole-file format cannot: its tag covers everything, so nothing can be released until
+    // all of it has arrived, and that is a property of the file rather than of this code.
+    const head = new Uint8Array(await blob.slice(0, 8).arrayBuffer());
+    if (lib.decryptBlobV2 && lib._inspectV2Header(head) === 'UNSUPPORTED') {
+        // Each decrypted record is handed straight to a Blob part, so what stays in the heap is
+        // one chunk rather than the file, its ciphertext copy and its plaintext copy.
+        //
+        // The reader emits as it goes and only RESOLVES once the final record authenticates, so
+        // these parts are not safe to show anyone until it returns. They are not shown: the
+        // caller builds the object URL from what this function returns, and a failure throws
+        // instead, taking the parts with it.
+        const parts = [];
+        await lib.decryptBlobV2(blob, dek, context, p => { parts.push(new Blob([p])); });
+        return new Blob(parts, { type });
+    }
+
+    const plain = await lib.decryptFile(await blob.arrayBuffer(), dek, context);
+    return new Blob([plain], { type });
 }
 
 // Look up a file's DEK epoch from the loaded listing (state.currentFiles).

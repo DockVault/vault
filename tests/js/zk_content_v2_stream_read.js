@@ -126,6 +126,36 @@ async function main() {
         }
     }
 
+    // A file in the older whole-file format must be refused rather than misread. This is why the
+    // caller checks the header before choosing a reader: the two formats are not interchangeable,
+    // and the older one cannot be streamed at all -- its tag covers everything, so nothing can be
+    // released until all of it has arrived.
+    const legacy = await lib.encryptFile(body, dek, CTX);
+    let legacyResolved = false;
+    let legacyCode = null;
+    try {
+        await lib.decryptBlobV2(new Blob([legacy]), dek, CTX, () => {});
+        legacyResolved = true;
+    } catch (e) {
+        legacyCode = codeOf(e);
+    }
+    if (legacyResolved) {
+        failures += 1;
+        console.error('FAIL a whole-file legacy blob was accepted by the chunked reader');
+    } else {
+        console.log(`ok   a legacy whole-file blob is refused with ${legacyCode}`);
+    }
+
+    // And the same bytes still read correctly through the reader that is meant for them, so the
+    // refusal above is about the wrong reader rather than a damaged file.
+    const backLegacy = new Uint8Array(await lib.decryptFile(legacy, dek, CTX));
+    if (backLegacy.length !== body.length || backLegacy.some((v, i) => v !== body[i])) {
+        failures += 1;
+        console.error('FAIL the legacy blob did not read back through the buffered reader');
+    } else {
+        console.log('ok   the same legacy blob reads back through the buffered reader');
+    }
+
     if (failures) { console.error(`${failures} failure(s)`); process.exit(1); }
     console.log('streamed output matches the buffered reader, and damage never resolves');
 }
