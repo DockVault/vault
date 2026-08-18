@@ -9053,7 +9053,13 @@ async function zkRotateTeamForRevoke(vaultId, revokedUserId, info, fromVersion) 
 }
 
 // Download file
+// Downloads share the page's transfer gate with uploads, so a user who starts a batch of
+// downloads while files are uploading does not run both sets at once.
 async function downloadFile(fileId, fileName) {
+    return transferGate.run(() => _downloadFile(fileId, fileName));
+}
+
+async function _downloadFile(fileId, fileName) {
     try {
         // Zero-knowledge: if we couldn't decrypt this item's NAME we also lack the DEK for
         // its content epoch, so a download can't be decrypted here — say so plainly.
@@ -9855,6 +9861,14 @@ const zkUploadStore = (() => {
     };
 })();
 
+// One gate for every transfer this page runs, uploads and downloads alike. The server cap
+// protects the deployment; this protects the browser, which otherwise starts every queued item
+// the moment it is queued -- twenty dropped files opened twenty concurrent uploads in one tab.
+//
+// Shared deliberately: two gates of five would be a cap of ten, and someone downloading while
+// uploads run is exactly the case worth bounding.
+const transferGate = new TransferGate(5);
+
 const uploadManager = {
     items: new Map(),   // uploadId -> item
     seq: 0,
@@ -10192,6 +10206,14 @@ const uploadManager = {
 
     // Drive an item from wherever it is to completion (honouring pause/cancel).
     async run(id) {
+        const it = this.items.get(id);
+        if (!it || !it.file) return;
+        // Queued rather than started. The slot is held for the whole transfer and given back
+        // however it ends, so a failure cannot cost one permanently.
+        return transferGate.run(() => this._run(id));
+    },
+
+    async _run(id) {
         const it = this.items.get(id);
         if (!it || !it.file) return;
         // Never drive two uploaders against the same server session at once (a duplicate
