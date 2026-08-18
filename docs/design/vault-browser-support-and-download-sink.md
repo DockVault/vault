@@ -176,6 +176,34 @@ Ordered by how likely each is to be the thing that breaks.
 
 ---
 
+## What the buffered path actually costs
+
+Treat iOS as the gate. It is the tightest limit, the least visible, and the only one that kills the
+page rather than failing the operation.
+
+| | Limit | Failure |
+|---|---|---|
+| **iOS Safari** | OS jetsam, device-dependent. A WebContent kill was recorded at exactly **1450 MiB** on iOS 15.6, and an Apple engineer puts it at "over 1.5 GB … we cannot use that much memory on iOS without getting killed" | the page dies; nothing to catch |
+| macOS Safari, foreground | 7 GB + 1 GB per page in the process (15 GB base above 16 GB of RAM) | the process is terminated after a forced shrink fails |
+| Chrome desktop 64-bit | **2 GiB of in-memory blob, browser-wide across every tab**, then paged to disk up to a tenth of the volume | the blob fails to construct |
+| Chrome Android | total physical memory ÷ 100 — tens of megabytes | as above |
+
+Sources: [WebKit `MemoryPressureHandler.cpp`](https://github.com/WebKit/WebKit/blob/main/Source/WTF/wtf/MemoryPressureHandler.cpp),
+[WebKit bug 256703](https://bugs.webkit.org/show_bug.cgi?id=256703) (the jetsam report),
+[WebKit bug 227636](https://bugs.webkit.org/show_bug.cgi?id=227636),
+[Chromium `blob_memory_controller.cc`](https://chromium.googlesource.com/chromium/src/+/HEAD/storage/browser/blob/blob_memory_controller.cc).
+
+Three things follow. The Chrome figure is **not per tab** — it is one budget for the whole browser,
+so a second large download competes with the first. On 64-bit desktop it is a flat 2 GiB that does
+not scale down with installed memory. And WebKit's own 7 GB kill does not apply on iOS at all: that
+monitor is compiled in only on macOS, so what kills an iPhone is the operating system, at a
+footprint that includes everything else the page is using.
+
+The engines' own ArrayBuffer ceilings — 32 GiB in Chrome, 16 GiB in Safari — are far above all of
+this and never the binding constraint.
+
+---
+
 ## Not established
 
 - Whether the pattern behaves correctly on **current** Safari. The evidence that it was fixed in
@@ -184,7 +212,6 @@ Ordered by how likely each is to be the thing that breaks.
 - Whether Safari's reported ~70-second limit on a fetch handler applies to a long-lived streamed
   **body**. The only public reproduction delays before returning the response, so it measures
   promise resolution rather than streaming.
-- Per-tab memory limits on iOS. Developer reports suggest 1.5–3 GB before the page is reloaded;
-  there is no primary source. For the buffered fallback, the documented limits that bind first are
-  Chromium's in-memory blob cap of 2 GB on desktop and, far lower, **total physical memory ÷ 100 on
-  Android** — five megabytes on a 512 MB device.
+- A per-device table for the iOS limit. It is set by the operating system per model and version,
+  WebKit queries it at runtime rather than knowing it at compile time, and it is not exposed to
+  JavaScript at all. See below for what *is* established.
