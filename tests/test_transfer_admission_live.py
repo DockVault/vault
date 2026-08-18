@@ -615,3 +615,44 @@ def test_the_request_teardown_never_masks_the_real_answer(admin, temp_user_clien
     assert stored.status_code == 200, (
         f"an upload after a denied one was answered {stored.status_code}; the denied request kept "
         "its slot or its space reservation")
+
+
+@pytest.mark.skipif(
+    os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
+    reason="needs a deployment configured with MAX_CONCURRENT_TRANSFERS=1 and no queue; "
+           "set VAULT_TRANSFER_LIMIT_IS_ONE=1 on such a round")
+def test_a_ranged_download_gives_its_slot_back(admin, temp_vault):
+    """Serve several ranges in a row on a ceiling of one, and keep being served.
+
+    A ranged response takes a slot like any other and returns it when the generator finishes. The
+    failure this pins is not a crash: the slot is released by a teardown that reads a variable
+    rather than a captured value, so nulling that variable at the point of handoff leaks one slot
+    per ranged download and shrinks the ceiling permanently. On a ceiling of one, the very next
+    request is refused -- which is what makes it observable at all. On the shipped default of
+    sixteen it would look like a deployment that mysteriously stops serving after a while.
+
+    Sequential on purpose. Concurrency is the subject of the tests above; this one is about
+    whether the slot comes back at all.
+    """
+    vid = temp_vault["id"]
+    body = bytes((i * 17 + 3) & 0xFF for i in range(200_000))
+    fid = _upload(admin, vid, unique("slotback") + ".bin", body)
+    url = f"/vaults/{vid}/files/{fid}/download"
+
+    first = admin.get(url, headers={"Range": "bytes=0-999"})
+    if first.status_code != 206:
+        pytest.skip(f"this deployment does not serve ranges for the file under test: "
+                    f"{first.status_code}")
+
+    for attempt in range(2, 6):
+        r = admin.get(url, headers={"Range": f"bytes={attempt * 1000}-{attempt * 1000 + 999}"})
+        assert r.status_code == 206, (
+            f"ranged download {attempt} was refused with {r.status_code} on a ceiling of one, so "
+            f"an earlier ranged response did not return its slot")
+        assert len(r.content) == 1000
+
+    # And a whole-file download still gets in afterwards, which is the same ceiling.
+    whole = admin.get(url)
+    assert whole.status_code == 200, (
+        f"the ceiling was exhausted by the ranged requests: {whole.status_code}")
+    assert whole.content == body

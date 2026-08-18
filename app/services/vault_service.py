@@ -1640,7 +1640,11 @@ class VaultService:
             return BoundedDownload(
                 handle, reader.records(), reader.total_length,
                 file.original_name, mime, file.checksum_sha256,
-                length_is_authenticated=reader.length_is_authenticated)
+                length_is_authenticated=reader.length_is_authenticated,
+                # The same open handle and the same index the walk above already built, so a
+                # ranged response costs no second authorization, no second open and no second
+                # walk. The other two branches leave this None and are therefore not rangeable.
+                read_range=reader.read_range)
 
         # Legacy Fernet chunk stream. Already a generator; the only reason this path was ever
         # unbounded is that its caller joined the output. Its plaintext length is not derivable
