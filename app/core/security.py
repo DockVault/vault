@@ -780,6 +780,18 @@ def is_zk_sealed_name(token) -> bool:
     return bool(token) and str(token).startswith(ZK_NAME_PREFIXES)
 
 
+def is_zk_object_bound_name(token) -> bool:
+    """True only for the v2 ('zk2:') form, whose AAD also binds the object id.
+
+    Readers accept both forms, because rows sealed before v2 exist and must stay readable.
+    WRITERS should require this one: v1 binds vault, field and epoch but not the row, so a v1
+    blob can be moved to another row and still authenticate -- which is the transposition v2 was
+    introduced to prevent. Accepting v1 on write leaves that binding opt-out at the only boundary
+    that could require it.
+    """
+    return bool(token) and str(token).startswith(ZK_NAME_PREFIX_V2)
+
+
 def _name_encryption_root():
     return HKDF(
         algorithm=hashes.SHA256(), length=32,
