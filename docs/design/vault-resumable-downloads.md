@@ -106,6 +106,35 @@ Resume from the last complete record, not from byte zero, and not from the last 
 a partial record is unauthenticated and must be discarded. With the length known, the record
 boundary at or before the resume point is derivable, so the client can name an exact offset.
 
+Both pieces exist now. The offset comes from the count of records the reader has *handed over*,
+which is the only count that means anything: a record is worth keeping exactly when it
+authenticates, and that is the moment it is handed over. The reader accepts a starting record and
+the header the client kept, since a resumed body no longer begins with one.
+
+**Retry only what a retry can fix.** This is the rule the loop has to get right, and it is not
+obvious from either piece on its own:
+
+* A **transport** failure — the socket dropped, the request aborted — is worth resuming. Nothing
+  is known to be wrong with the data.
+* A **cryptographic** failure is not. `CONTENT_AUTH_FAILED` means the bytes that arrived do not
+  authenticate under the key and the record index they claim. Re-requesting the same range gets
+  the same bytes and fails the same way, so a loop that retries on it spins, and each turn looks
+  from the outside like a flaky network rather than a file that is wrong.
+
+So the loop branches on whether the error carries a crypto code. Anything coded stops immediately
+and is reported; only an uncoded transport error is resumed, and only a bounded number of times.
+
+**A `200` where a `206` was asked for means start over.** That is the server saying the entity tag
+no longer matches — the object changed under the resume — so the parts already held are stale and
+must be discarded rather than appended to. Treating it as a successful range would splice two
+versions, which is the failure the tag exists to prevent.
+
+**What cannot be carried across a page reload.** The parts held so far live in the tab. Within one
+session a resumed download continues where it stopped; a reload starts again from zero. Fixing
+that needs a sink the page controls, and the measurements in the download-sink note ruled out the
+one candidate we had. So the honest scope is: resume survives a dropped connection, not a closed
+tab.
+
 **One honest limit, and it is now the normal case rather than a caveat.** The measurements in the
 download-sink note ruled out the staging sink, so the page has no sink it controls. A partial file
 belongs to the browser, and the app cannot delete it. The UX must offer retry or discard and say
