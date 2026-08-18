@@ -19,6 +19,7 @@ an exception to it.
 import base64
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -287,7 +288,28 @@ def test_the_writer_is_registered_with_the_error_boundary():
     """
     source = CRYPTO_JS.read_text(encoding="utf-8")
     table = source.split("const _OPERATION_DEFAULT_CODE", 1)[1].split("});", 1)[0]
+    listed = set(re.findall(r"^\s{4}(\w+):", table, re.M))
     assert "encryptFileV2:" in table
+
+    # Every public method, not just this one. Naming them individually is how the omission this
+    # test describes happened again: a new writer was added beside the one above, the assertion
+    # kept passing because it only ever looked for the old name, and the new method's failures
+    # reached no diagnostic. Comparing the whole surface cannot miss the next one.
+    ignore = {"constructor", "get", "if", "for", "while", "catch", "switch", "return"}
+    getters = set(re.findall(r"^    get (\w+)\(", source, re.M))
+    methods = {
+        m.group(1)
+        for m in re.finditer(r"^    (?:async )?(\w+)\s*\(", source, re.M)
+        if not m.group(1).startswith("_") and m.group(1) not in ignore
+    } - getters
+
+    assert not (methods - listed), (
+        "public method(s) missing from the error boundary, so their failures reach no "
+        f"diagnostic: {sorted(methods - listed)}")
+    # The other direction throws at load, but a name here with no method behind it is still a
+    # table that has stopped describing the class, so say which one.
+    assert not (listed - methods), (
+        f"the boundary lists name(s) that are not methods: {sorted(listed - methods)}")
 
 
 def test_the_writer_is_off_by_default(written):
