@@ -260,7 +260,8 @@ def test_a_resume_quoting_the_current_tag_is_honoured(admin, stored_file):
 
 @pytest.mark.parametrize("if_range", [
     '"sha256-of-some-other-file"',
-    '"”"',
+    '"',                              # a lone quote: malformed, not merely different
+    'not-quoted-at-all',                # an unquoted tag is not the syntax either
     "Wed, 21 Oct 2015 07:28:00 GMT",     # the date form: accepted syntax we cannot answer
 ])
 def test_a_resume_quoting_anything_else_restarts_instead_of_splicing(admin, stored_file, if_range):
