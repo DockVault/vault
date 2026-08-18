@@ -8543,8 +8543,13 @@ async function dvOpenDownloadSink({ filename, size, mime }) {
  *
  * Three outcomes, and the caller must distinguish them:
  *   `true`     - the download is under way; nothing more to do.
- *   `false`    - streaming was not possible and NOTHING was written. Fall back, but note the
- *                response body has been read from, so the caller must re-fetch.
+ *   `false`    - streaming was never entered: no sink was opened and nothing was written. Fall
+ *                back, but note the response body has been read from, so the caller must
+ *                re-fetch. Returned ONLY before the sink exists. Once it does, a failure is
+ *                `'failed'` however few records went out -- the stream has been errored, so a
+ *                failed download entry already exists, and reporting "nothing was written" would
+ *                send the caller off to fetch the whole object again to retry a failure that
+ *                will repeat.
  *   `'failed'` - bytes were written and the transfer then failed. There may be a partial file in
  *                the user's downloads, and the app must say so, because the browser may not.
  *
@@ -8605,7 +8610,7 @@ async function zkTryStreamedDownload(response, vault, keyVersion, fileId, fileNa
             const transport = !isCodedCryptoError(error);
             if (!transport || attempts >= ZK_RESUME_ATTEMPTS || !etag) {
                 sink.abort(error && error.code ? error.code : 'failed');
-                return records > 0 ? 'failed' : false;
+                return 'failed';
             }
 
             attempts += 1;
@@ -8614,7 +8619,7 @@ async function zkTryStreamedDownload(response, vault, keyVersion, fileId, fileNa
                 resume = lib.v2ContentResumeOffset(peeked.head, declared, records);
             } catch (_) {
                 sink.abort('resume-offset');
-                return records > 0 ? 'failed' : false;
+                return 'failed';
             }
             if (resume.done) { sink.done(); return true; }
 
@@ -8626,7 +8631,7 @@ async function zkTryStreamedDownload(response, vault, keyVersion, fileId, fileNa
                                  'If-Range': etag } });
             } catch (_) {
                 sink.abort('reconnect-failed');
-                return records > 0 ? 'failed' : false;
+                return 'failed';
             }
 
             // A 200 where a range was asked for means the entity tag no longer matches: the object
@@ -8635,7 +8640,7 @@ async function zkTryStreamedDownload(response, vault, keyVersion, fileId, fileNa
             // version to the old one is the splice the tag exists to prevent.
             if (next.status !== 206 || !next.body) {
                 sink.abort('object-changed');
-                return records > 0 ? 'failed' : false;
+                return 'failed';
             }
 
             stream = next.body;

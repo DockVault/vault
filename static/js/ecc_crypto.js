@@ -2357,7 +2357,26 @@ class ECCCryptoLibrary {
             // from the record size -- which every real one does -- changes nothing.
             const take = async (want) => {
                 while (held < want && !done) {
-                    const r = await reader.read();
+                    let r;
+                    try {
+                        r = await reader.read();
+                    } catch (streamError) {
+                        // The BODY failed, not the content. A connection reset rejects here with a
+                        // plain TypeError, and without this it would be coerced into
+                        // CONTENT_AUTH_FAILED by the catch at the end of this method -- telling
+                        // the caller the file did not authenticate, when in fact it never
+                        // arrived. That distinction is not cosmetic: a caller deciding whether to
+                        // resume must not retry a genuine authentication failure (the same bytes
+                        // would fail again) and must retry a dropped connection.
+                        //
+                        // `isTransportError` is the flag `_coerceCryptoError` already honours for
+                        // exactly this reason -- so a transport failure passes through uncoded
+                        // instead of acquiring a crypto code it has not earned.
+                        const transport = new Error('the response body failed mid-read');
+                        transport.isTransportError = true;
+                        transport.cause = streamError;
+                        throw transport;
+                    }
                     if (r.done) { done = true; break; }
                     const piece = r.value instanceof Uint8Array
                         ? r.value : new Uint8Array(r.value);
