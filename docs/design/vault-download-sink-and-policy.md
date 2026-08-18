@@ -134,11 +134,21 @@ Established: the two arms differ this way, reproducibly, and the earlier measure
 them as identical could not tell them apart at all — it summed every process, so a cost that merely
 moved looked like no change.
 
-Not established: **why** the renderer holds it. The worker's stream queue does exceed its
-high-water mark — `desiredSize` bottomed at −20, so about 21 MiB was queued beyond the mark, which
-means the writer has no backpressure. But 21 MiB does not account for 116%, so missing backpressure
-is a real defect and not a complete explanation. Slowing the producer by 8 ms per record changed
-nothing, which rules out the simplest version of the theory.
+**Why the renderer holds it, established by controls and then settled.**
+
+The cost is not the harness: allocating the same 128 MiB a record at a time and dropping it grows
+the renderer by **8.9%**, and transferring it into a channel nobody drains grows it by **9.4%**.
+Roughly 107 of the 116 points belong to the sink.
+
+It is not process topology: Chromium ran the service worker in the page's own renderer, and only
+one renderer existed throughout.
+
+And **backpressure does not fix it**. With the writer waiting for `desiredSize` to go positive
+before enqueueing more, it **stalled** - exactly as a full queue should make it - and the renderer
+still grew **114.7%** while the download still completed at the end. Chromium buffers a
+service-worker-generated response in the renderer until it is complete, then hands it over. There
+is no incremental consumer to push back against, so no care on the writing side keeps the tab
+flat.
 
 ### What follows
 
@@ -146,10 +156,15 @@ Nothing ships enabled: the policy defaults to `user_choice` with a per-user defa
 so no deployment gets this path without asking for it. That was chosen for a different reason and
 turns out to matter here.
 
-The streaming mode should not be recommended, and the option-A trade-off should not be presented as
-"flat memory in exchange for a partial file", until either the renderer cost is explained and
-fixed — backpressure first — or the measurement is shown to be wrong. On the evidence today the
-honest summary is that it buys a partial-file risk and no memory saving.
+**The streaming mode should not be recommended, and this line of work should stop.** The option-A
+trade was "flat memory in exchange for a partial file". The first half does not exist on Chromium
+by this route - the file is held either way, and by this route it is held in the *worse* process.
+What remains is the partial-file risk on its own.
+
+That is a conclusion about the service-worker technique, not about the goal. A picker-backed
+writable stream (`showSaveFilePicker`) writes into a real file as it goes, so it has the
+incremental consumer this lacks, and it is what to measure if the goal is revisited. It is
+Chromium-only, which is why it was not the first choice; that trade looks different now.
 
 ## Not established
 
