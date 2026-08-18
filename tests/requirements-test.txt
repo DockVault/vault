@@ -22,7 +22,7 @@ pydantic==2.13.4
 pydantic-settings==2.15.0
 python-dotenv==1.2.2
 email-validator==2.3.0
-sqlalchemy==2.0.51
+sqlalchemy==2.0.52
 psycopg2-binary==2.9.12
 redis==8.1.0
 paramiko==5.0.0
@@ -40,7 +40,7 @@ websocket-client>=1.9.0
 
 # Static analysis. Pinned exactly: it runs in CI as a gate, so moving it changes what the
 # gate accepts. Only the undefined-name rule is enforced -- see the preflight step.
-ruff==0.15.14
+ruff==0.16.3
 
 # Preflight regenerates and audits the production lock with these pinned supply-chain tools.
 pip-tools==7.6.1
