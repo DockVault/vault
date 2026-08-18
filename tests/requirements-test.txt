@@ -35,7 +35,7 @@ PyJWT==2.13.0
 pytest>=9.1.1,<10.0
 requests>=2.34.2
 playwright>=1.62.0
-pytest-playwright>=0.8.0
+pytest-playwright>=0.9.0
 websocket-client>=1.9.0
 
 # Static analysis. Pinned exactly: it runs in CI as a gate, so moving it changes what the
