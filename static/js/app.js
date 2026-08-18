@@ -8367,8 +8367,10 @@ async function zkGetCurrentDekVersion(vaultId) {
 // The vault id, the file's own id and its epoch are passed through: a version-2 content file
 // derives its key from all three and authenticates them, so a reader cannot open one without
 // knowing which object it is reading. The older whole-file format ignores them.
-async function zkMaybeDecryptBlob(blob, vault, keyVersion = null, fileId = null) {
-    if (!isZkVault(vault)) return blob;
+// Work out which key a file was sealed under, and fetch it. Shared by the two decrypt paths
+// below so that the awkward part -- a listing too stale to name the epoch -- has one answer
+// rather than two that drift.
+async function zkResolveKey(vault, keyVersion, fileId) {
     // A caller that named a file but could not say which epoch it used does not know enough to
     // decrypt it. Guessing 1 is what the lookup stopped doing, and coercing the null back into a 1
     // here would put the guess straight back.
@@ -8390,9 +8392,17 @@ async function zkMaybeDecryptBlob(blob, vault, keyVersion = null, fileId = null)
         throw e;
     }
     const epoch = keyVersion != null ? keyVersion : 1;
-    const dek = await zkGetVaultDek(vault.id, epoch);
+    return {
+        dek: await zkGetVaultDek(vault.id, epoch),
+        context: { vaultId: vault.id, objectId: fileId, dekEpoch: epoch },
+    };
+}
+
+// Decrypt a downloaded blob when the given vault is zero-knowledge; else pass through.
+async function zkMaybeDecryptBlob(blob, vault, keyVersion = null, fileId = null) {
+    if (!isZkVault(vault)) return blob;
+    const { dek, context } = await zkResolveKey(vault, keyVersion, fileId);
     const lib = eccLib();
-    const context = { vaultId: vault.id, objectId: fileId, dekEpoch: epoch };
     const type = blob.type || 'application/octet-stream';
 
     // Chunk-framed content can be read a record at a time, so the tab never holds the file. The
@@ -8400,13 +8410,6 @@ async function zkMaybeDecryptBlob(blob, vault, keyVersion = null, fileId = null)
     // all of it has arrived, and that is a property of the file rather than of this code.
     const head = new Uint8Array(await blob.slice(0, 8).arrayBuffer());
     if (lib.decryptBlobV2 && lib._inspectV2Header(head) === 'UNSUPPORTED') {
-        // Each decrypted record is handed straight to a Blob part, so what stays in the heap is
-        // one chunk rather than the file, its ciphertext copy and its plaintext copy.
-        //
-        // The reader emits as it goes and only RESOLVES once the final record authenticates, so
-        // these parts are not safe to show anyone until it returns. They are not shown: the
-        // caller builds the object URL from what this function returns, and a failure throws
-        // instead, taking the parts with it.
         const parts = [];
         await lib.decryptBlobV2(blob, dek, context, p => { parts.push(new Blob([p])); });
         return new Blob(parts, { type });
@@ -8414,6 +8417,45 @@ async function zkMaybeDecryptBlob(blob, vault, keyVersion = null, fileId = null)
 
     const plain = await lib.decryptFile(await blob.arrayBuffer(), dek, context);
     return new Blob([plain], { type });
+}
+
+// Decrypt a download AS IT ARRIVES, so the response is never held whole.
+//
+// The blob form above already avoids keeping the plaintext and the ciphertext copy, but it still
+// needs the whole response to exist first. Reading from the body instead removes the last
+// whole-file object: what stays in the tab is one record, and the accumulated plaintext is Blob
+// parts the browser can place where it likes.
+//
+// Three things have to be true, and any of them missing is a reason to fall back rather than an
+// error: a body to read, a declared length to derive the framing from, and a header that says
+// this is the chunk-framed format. A response served without Content-Length -- a proxy
+// re-encoding it, a compressed transfer -- simply takes the older path.
+//
+// Nothing is shown before it authenticates. The reader resolves only once the final record
+// verifies, and the caller builds the object URL from what this returns, so a failure throws with
+// the parts still unreferenced.
+async function zkMaybeDecryptResponse(response, vault, keyVersion = null, fileId = null) {
+    if (!isZkVault(vault)) return response.blob();
+    const lib = eccLib();
+    const declared = Number(response.headers.get('Content-Length'));
+    const streamable = response.body && typeof lib.decryptStreamV2 === 'function'
+        && Number.isSafeInteger(declared) && declared > 0;
+    if (!streamable) {
+        return zkMaybeDecryptBlob(await response.blob(), vault, keyVersion, fileId);
+    }
+
+    // Peeking would normally cost the bytes it looks at; this hands back a stream that still
+    // begins with them, so a file in the older format loses nothing by having been inspected.
+    const { head, stream } = await lib._peekStream(response.body, 8);
+    if (lib._inspectV2Header(head) !== 'UNSUPPORTED') {
+        return zkMaybeDecryptBlob(await new Response(stream).blob(), vault, keyVersion, fileId);
+    }
+
+    const { dek, context } = await zkResolveKey(vault, keyVersion, fileId);
+    const type = response.headers.get('Content-Type') || 'application/octet-stream';
+    const parts = [];
+    await lib.decryptStreamV2(stream, declared, dek, context, p => { parts.push(new Blob([p])); });
+    return new Blob(parts, { type });
 }
 
 // Look up a file's DEK epoch from the loaded listing (state.currentFiles).
@@ -8805,7 +8847,11 @@ async function downloadFile(fileId, fileName) {
             showError("This file is encrypted under a key version you don't have, so it can't be downloaded here.");
             return;
         }
-        showInfo(`Downloading "${fileName}"…`);   // immediate feedback (blob buffers fully before save)
+        // Immediate feedback, because nothing reports progress between here and the save. That
+        // used to be because the whole response was buffered first; now the records are decrypted
+        // as they arrive and it is the accumulated parts that are held until the end. The reader
+        // does hand over each record, so a byte count is available to whoever wants to show one.
+        showInfo(`Downloading "${fileName}"…`);
         // Build headers with auth + vault password if needed
         const headers = { 'Authorization': `Bearer ${authToken}` };
         if (state.currentVault.has_password && state.vaultPassword) {
@@ -8821,16 +8867,20 @@ async function downloadFile(fileId, fileName) {
             throw new Error('Download failed');
         }
         
-        // Get blob (decrypting in-browser for zero-knowledge vaults) and save it.
-        let blob = await response.blob();
+        // Decrypting in-browser for zero-knowledge vaults, from the body rather than from a
+        // materialised copy of it. A standard vault still takes the blob, which the server has
+        // already decrypted.
+        let blob;
         if (isZkVault(state.currentVault)) {
-            try { blob = await zkMaybeDecryptBlob(blob, state.currentVault,
+            try { blob = await zkMaybeDecryptResponse(response, state.currentVault,
                 zkFileKeyVersion(fileId), fileId); }
             catch (e) {
                 showError(isCodedCryptoError(e) ? safeMessageForCode(e.code, 'unlock')
                     : (e && e.userMessage) || 'Failed to decrypt file.');
                 return;
             }
+        } else {
+            blob = await response.blob();
         }
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -8869,12 +8919,15 @@ async function openFilePreview(fileId, fileName, mime) {
         if (state.currentVault.has_password && state.vaultPassword) headers['X-Vault-Password'] = state.vaultPassword;
         const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, { headers });
         if (!resp.ok) throw new Error('Could not load file (status ' + resp.status + ')');
-        let blob = await resp.blob();
-        // Zero-knowledge vault: decrypt the ciphertext in-browser before rendering.
-        if (isZkVault(state.currentVault)) {
-            blob = await zkMaybeDecryptBlob(blob, state.currentVault,
-                zkFileKeyVersion(fileId), fileId);
-        }
+        // Zero-knowledge vault: decrypt the ciphertext in-browser before rendering, reading from
+        // the body rather than a materialised copy. Preview needs the whole plaintext in the end
+        // -- it becomes an object URL for an image or a video element -- but it does not need the
+        // ciphertext and the plaintext to exist as whole buffers on the way there, and a video is
+        // exactly the size where that matters.
+        let blob = isZkVault(state.currentVault)
+            ? await zkMaybeDecryptResponse(resp, state.currentVault,
+                zkFileKeyVersion(fileId), fileId)
+            : await resp.blob();
 
         if (_previewUrl) { URL.revokeObjectURL(_previewUrl); _previewUrl = null; }
         const type = (mime || blob.type || '').toLowerCase();
