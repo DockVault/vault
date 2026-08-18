@@ -166,6 +166,48 @@ writable stream (`showSaveFilePicker`) writes into a real file as it goes, so it
 incremental consumer this lacks, and it is what to measure if the goal is revisited. It is
 Chromium-only, which is why it was not the first choice; that trade looks different now.
 
+## Independently reproduced, 2026-08-19
+
+The measurement above used the real sinks against a real download. A second look reproduced its
+*mechanism* with a synthetic harness (`scripts/measure_browser_upload_memory.py`, download arms),
+because the conclusion was surprising enough to be worth a second instrument built to different
+mistakes than the first.
+
+Chromium, resident memory split by process role, source records generated and released so the
+renderer holds only what the SINK keeps. A `dl_nothing` arm produces and drops each record and
+retains nothing; it reads ~2-4 MiB, which is the noise floor a real sink is measured against and
+proves the source is not being carried.
+
+| payload | arm | renderer | browser process |
+|---|---|---|---|
+| 64 MiB | nothing-retained (control) | 3.4% | — |
+| 64 MiB | buffered | 69.5% | 102.6% |
+| 64 MiB | streamed | 106.8% | 110.0% |
+| 256 MiB | nothing-retained (control) | 1.6% | — |
+| 256 MiB | buffered | 64.0% | 102.5% |
+| 256 MiB | streamed | 102.0% | 110.2% |
+
+**The direction and the mechanism reproduce exactly.** Streaming holds about one full copy of the
+file in the renderer — the process an OS kills first — and the buffered path holds substantially
+less there while keeping one copy in the browser process's blob store. The streamed arm's consumer
+is `new Response(stream).blob()`, and it accumulates in the renderer even though each record is
+enqueued and released; that is the same behaviour the section above attributes to a
+service-worker-generated response. So the reason the sink does not save renderer memory is not our
+code failing to release — it releases — it is that the browser buffers the consumed stream on the
+renderer side regardless.
+
+**What this run does NOT reproduce is the absolute magnitude of the buffered arm** (64-70% here
+versus 10.3% in the real-path measurement above). The synthetic buffered loop is synchronous and
+piles up collectable garbage — each `new Blob([rec])` leaves an intermediate the GC has no idle
+moment to reclaim — where the real download awaits the network between records and stays far lower.
+So the real-path number remains the one to quote; this run corroborates its conclusion without
+displacing its figures.
+
+**Net:** the recommendation to stop this line of work is now supported by two instruments built
+independently. A faithful absolute re-measurement of the real sinks — real vault, real uploaded
+file, real service-worker registration in a secure context — would settle the magnitude, and is the
+only thing left unmeasured. It is not needed to make the decision.
+
 ## Not established
 
 - Whether the streaming mode should be offered at all below some file size, where buffering costs

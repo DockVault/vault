@@ -182,6 +182,81 @@ ARMS = {
 }
 
 
+# --- download sinks -------------------------------------------------------------------------
+#
+# The question is not "is decryption expensive" but "where do the decrypted bytes go, and does it
+# scale with the file". Both arms consume an identical synthetic record stream and differ only in
+# the sink, which is the thing under test.
+#
+# `dl_buffered` keeps each decrypted record as a Blob part and assembles at the end -- parts the
+# page can still discard if a final record fails to authenticate. `dl_streamed` writes each record
+# into a stream the browser owns, which is the shape the service-worker sink creates and which
+# cannot be undone once a record is enqueued.
+#
+# The service worker itself is deliberately not registered. That needs a secure context and a
+# scope, and it would put the measurement at the mercy of worker lifecycle rather than of the
+# sink. What is reproduced is the part that matters: bytes handed to a browser-owned stream versus
+# bytes held as parts.
+# `prepare` records only the count. The source is generated one record at a time inside `act` and
+# never retained, so the renderer holds only what the SINK keeps -- which is the whole question. An
+# earlier version pre-stored every record and held the array alive, and both arms then read ~100%
+# renderer purely from that retained source: the confound swamped the sink difference. The `nb`
+# arm below is the control for THIS confound -- it produces and drops each record and keeps
+# nothing, so its renderer figure is the noise floor a faithful sink is measured against.
+_DL_PREPARE = "async (mb) => ({records: mb})"
+_RECORD_JS = "const rec = new Uint8Array(1024 * 1024); rec[0] = i & 255;"
+
+DOWNLOAD_ARMS = {
+    # Neither buffered nor streamed: generate each record and drop it. If a sink reads near this,
+    # it retains nothing in that process. This is what "flat" looks like for the download path.
+    "dl_nothing": {
+        "prepare": _DL_PREPARE,
+        "act": """
+            async (mb) => {
+                let checksum = 0;
+                for (let i = 0; i < mb; i++) { %s checksum ^= rec[0]; }
+                await new Promise(r => setTimeout(r, 400));
+                return {checksum};
+            }
+        """ % _RECORD_JS,
+    },
+    # Buffered: each record becomes a Blob part; the source record is released each iteration.
+    # Parts live where the browser puts Blobs (the browser process), not necessarily the renderer.
+    "dl_buffered": {
+        "prepare": _DL_PREPARE,
+        "act": """
+            async (mb) => {
+                const parts = [];
+                for (let i = 0; i < mb; i++) { %s parts.push(new Blob([rec])); }
+                window.__out = new Blob(parts);
+                await new Promise(r => setTimeout(r, 400));
+                return {bytes: window.__out.size};
+            }
+        """ % _RECORD_JS,
+    },
+    # Streamed: each record is enqueued into a browser-owned stream and released; the source is not
+    # retained. What the renderer ends up holding is then the browser's, not the arm's, doing.
+    "dl_streamed": {
+        "prepare": _DL_PREPARE,
+        "act": """
+            async (mb) => {
+                let push;
+                const stream = new ReadableStream({start(c) { push = c; }});
+                const consumed = new Response(stream).blob();
+                for (let i = 0; i < mb; i++) { %s push.enqueue(rec); }
+                push.close();
+                window.__out = await consumed;
+                await new Promise(r => setTimeout(r, 400));
+                return {bytes: window.__out.size};
+            }
+        """ % _RECORD_JS,
+    },
+}
+
+
+ARMS.update(DOWNLOAD_ARMS)
+
+
 def _chromium_pids() -> set[int]:
     import psutil
     found = set()
