@@ -250,10 +250,11 @@ def _zk_chunked_upload(client, vid, content: bytes, zk_key_version=None, expect_
     dek = os.urandom(32)
     name_epoch = zk_key_version if zk_key_version is not None else 1
     name = unique("zk") + ".bin"
+    obj_id = str(_uuid.uuid4())
     init = {"total_size": len(content), "total_chunks": 1, "chunk_size": 5 * 1024 * 1024,
-            "enc_name": zk_encrypt_name(name, dek, vid, "name", name_epoch),
+            "enc_name": zk_encrypt_name(name, dek, vid, "name", name_epoch, obj_id=obj_id),
             "name_bi": zk_name_blind_index(name, dek, vid, name_epoch),
-            "file_id": str(_uuid.uuid4()),
+            "file_id": obj_id,
             "blob_id": _uuid.uuid4().hex}
     if zk_key_version is not None:
         init["zk_key_version"] = zk_key_version
@@ -363,6 +364,7 @@ def test_retire_version_keeps_epoch_used_by_a_folder_name(admin):
     NO epoch-1 file, must NOT retire epoch 1 — else the folder name becomes permanently
     undecryptable for everyone (data loss). Regression for the adversarial-review finding."""
     import os
+    import uuid as _uuid
     ensure_ecc_keypair(admin)
     with _zk_enabled(admin):
         vid = create_zk_vault(admin)["id"]
@@ -370,8 +372,10 @@ def test_retire_version_keeps_epoch_used_by_a_folder_name(admin):
         dek = os.urandom(32)
         nm = unique("dir")
         # ZK folder sealed under epoch 1 (no files reference epoch 1 at all).
+        folder_id = str(_uuid.uuid4())
         admin.post(f"/vaults/{vid}/folders", json={
-            "enc_name": zk_encrypt_name(nm, dek, vid, "name", 1),
+            "id": folder_id,
+            "enc_name": zk_encrypt_name(nm, dek, vid, "name", 1, obj_id=folder_id),
             "name_bi": zk_name_blind_index(nm, dek, vid, 1),
             "name_key_version": 1,
         }).raise_for_status()
@@ -543,7 +547,7 @@ def test_a_session_opened_without_an_epoch_is_still_refused_at_completion(admin)
         fid = str(_uuid.uuid4())
         r = admin.post(f"/vaults/{vid}/uploads", json={
             "total_size": 9, "total_chunks": 1, "chunk_size": 5 * 1024 * 1024,
-            "enc_name": zk_encrypt_name(name, dek, vid, "name", 1),
+            "enc_name": zk_encrypt_name(name, dek, vid, "name", 1, obj_id=fid),
             "name_bi": zk_name_blind_index(name, dek, vid, 1),
             "zk_key_version": 1, "file_id": fid, "blob_id": _uuid.uuid4().hex,
         })

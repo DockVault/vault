@@ -6115,16 +6115,27 @@ def _is_zk_vault(vault) -> bool:
 
 
 def _require_zk_sealed_names(*tokens) -> None:
-    """Reject any client-supplied ZK name blob that is not a sealed 'zk1:' ciphertext.
-    The marker is a SERVER-enforced invariant: the model load events skip ZK blobs by it,
-    the seal no-clobber guard keys on it, and enforcing it stops a buggy/hostile client from
-    parking a plaintext (or otherwise non-conformant) name in the enc_name column."""
-    from app.core.security import is_zk_sealed_name
+    """Reject any client-supplied ZK name blob that is not sealed AND bound to its object.
+
+    The marker is a SERVER-enforced invariant: the model load events skip ZK blobs by it, the
+    seal no-clobber guard keys on it, and enforcing it stops a buggy or hostile client from
+    parking a plaintext name in the enc_name column.
+
+    Writes require the v2 ('zk2:') form specifically. v1 binds vault, field and epoch but NOT the
+    row, so a v1 blob can be lifted onto another row and still authenticate -- the transposition
+    v2 exists to prevent. Accepting v1 here left that binding opt-out at the one boundary that
+    could require it: every shipped client already seals with an object id, so nothing legitimate
+    still produces v1, and a party holding the DEK could choose to.
+
+    READS stay tolerant of v1, deliberately: rows sealed before v2 exist and must remain
+    readable. The asymmetry is the point -- strict on the way in, forgiving on the way out.
+    """
+    from app.core.security import is_zk_object_bound_name
     for t in tokens:
-        if t is not None and not is_zk_sealed_name(t):
+        if t is not None and not is_zk_object_bound_name(t):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Encrypted name must be a sealed zero-knowledge blob.",
+                detail="Encrypted name must be a sealed zero-knowledge blob bound to its object.",
             )
 
 

@@ -113,20 +113,35 @@ def test_zk_v2_folder_name_not_transposable(admin):
 
 
 def test_zk_v1_name_is_transposable_control(admin):
-    """CONTROL: a v1 (legacy, unbound) name IS transposable — the vulnerability v2 closes. Upload
-    two files WITHOUT client ids (v1) and show the swapped blob still decrypts under the wrong id."""
+    """CONTROL: a v1 (legacy, unbound) name IS transposable -- the vulnerability v2 closes.
+
+    Without this, the test above proves only that some blob failed to decrypt, which a typo would
+    also achieve. This shows the same swap succeeding against the older form, so the refusal there
+    is attributable to the binding.
+
+    The v1 rows are written straight to the database, because the API no longer accepts a v1 seal
+    on write -- that is the point of the strict-in rule, and it is also the reason this control
+    cannot be built through the front door any more. Seeding them here is not a workaround: it
+    reproduces the only way a v1 row can exist at all now, which is to have been sealed before v2.
+    """
     ensure_ecc_keypair(admin)
     with _zk_on(admin):
         vid = create_zk_vault(admin, name=unique("zk"))["id"]
     try:
         dek = os.urandom(32)
         name_a, name_b = unique("va"), unique("vb")
-        fid_a = zk_chunked_upload(admin, vid, name_a, b"a" * 16, dek, epoch=1)   # no file_id -> v1
+        fid_a = zk_chunked_upload(admin, vid, name_a, b"a" * 16, dek, epoch=1)
         fid_b = zk_chunked_upload(admin, vid, name_b, b"b" * 16, dek, epoch=1)
+
+        # Age the two rows back to the unbound form (obj_id omitted => v1).
+        for fid, nm in ((fid_a, name_a), (fid_b, name_b)):
+            legacy = zk_encrypt_name(nm, dek, vid, "name", 1)
+            _psql(f"UPDATE files SET enc_name='{legacy}' WHERE id='{fid}'")
+
         enc_a = _psql(f"SELECT enc_name FROM files WHERE id='{fid_a}'")
         enc_b = _psql(f"SELECT enc_name FROM files WHERE id='{fid_b}'")
-        assert enc_a.startswith("zk1:") and enc_b.startswith("zk1:")
-        # v1 ignores obj_id, so B's blob decrypts as B's name regardless of the row it's placed on
+        assert enc_a.startswith("zk1:") and enc_b.startswith("zk1:"), (enc_a[:8], enc_b[:8])
+        # v1 ignores obj_id, so B's blob decrypts as B's name regardless of the row it sits on.
         assert zk_decrypt_name(enc_b, dek, vid, "name", 1, obj_id=fid_a) == name_b
     finally:
         admin.delete_vault(vid)
