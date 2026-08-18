@@ -62,18 +62,36 @@ that has to be kept in agreement with the first.
 
 ## Zero-knowledge and standard vaults differ here
 
-For a zero-knowledge vault the stored blob is the client's ciphertext, kept verbatim; the server
-holds no key and there are no records for it to index. `_open_random` says so directly, and notes
-SFTP never reaches that branch.
-
-That is not an obstacle — it is the easier case. The server serves a byte range of an opaque blob,
-and the client resumes at a v2 content-record boundary and decrypts for itself. The framing is
-derivable from the stored length, and every record authenticates independently, so the client can
-restart at a record boundary without the preceding bytes. What the server must not do is pretend to
-index records it cannot read.
-
-For a standard vault the server decrypts, so the range is taken over plaintext offsets and
+For a standard vault the server decrypts, the range is taken over plaintext offsets, and
 `read_range` already does the work.
+
+**Zero-knowledge is not the easy case, and an earlier draft of this note had it backwards.**
+`_open_random` refuses outright:
+
+    raise FileServiceError("Zero-knowledge files cannot be read by range")
+
+and the reason it gives is worth keeping: failing there is better than routing an attacker-chosen
+blob that happens to begin with the format magic into a reader that would try to authenticate it
+under the deployment key. SFTP never reaches the branch, because it refuses non-standard vaults
+entirely.
+
+So serving zero-knowledge ranges is not a matter of reusing this path. It needs a branch that
+returns raw bytes from the stored blob and never constructs the authenticated reader at all — which
+is safe for a different reason than the standard path is safe: the server holds no key, makes no
+integrity claim about the plaintext, and is a passthrough. The client's own AEAD is the integrity
+statement, exactly as it is for a whole-file zero-knowledge download today.
+
+That branch must be written so it cannot become the thing the existing refusal was guarding
+against. The refusal protects a *reader*; a raw range must not acquire one.
+
+**Legacy Fernet cannot be ranged cheaply, and quietly is not the same as cannot.** `_open_random`
+falls back to `RandomAccessFile.from_bytes`, which decrypts the entire file into memory — the exact
+cost the class was built to avoid, retained deliberately because padding hides up to sixteen bytes
+per token so no index is derivable without decrypting anyway. It is bounded in practice: no writer
+produces the format, so the exposure shrinks and cannot grow. But a `Range` request against such a
+file would load all of it, which is precisely the failure mode resumable downloads exist to avoid.
+Advertising `Accept-Ranges` for these files would be a promise the implementation keeps by doing
+the expensive thing silently.
 
 ## The client half
 
