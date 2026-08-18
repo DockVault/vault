@@ -4608,6 +4608,21 @@ async def update_user(
         user.email = new_email
     
     if user_update.password is not None:
+        # Setting your OWN password here would sidestep the re-proof its sibling requires.
+        # PATCH /users/me demands the current password before a password or email change,
+        # precisely so a hijacked live session cannot take the account over -- and addressing
+        # the same account by id instead of "me" reached the same field with no proof at all.
+        # That is the whole of the control, so the id form refuses and says where to go.
+        #
+        # An admin resetting SOMEONE ELSE's password is a different act and still allowed: it is
+        # a reset, performed by a party who is already trusted with the account, and no password
+        # of the target's exists to re-prove.
+        if is_self:
+            raise HTTPException(
+                status_code=400,
+                detail="Change your own password from account settings, which requires your "
+                       "current password.",
+            )
         _validate_password_policy(db, user_update.password)
         user.password_hash = hash_password(user_update.password)
         changes['password'] = 'changed'
