@@ -46,11 +46,12 @@ one that binds the totals — before it treats the assembled file as complete.
 
 ## The hazard: the obvious entry point is the wrong one
 
-`VaultService.open_random_access` looks like the function to call. It is not.
+`VaultService.open_random_reader` (`app/services/vault_service.py:1468`) looks like the function to call.
+It is not.
 
 It resolves the file through `_resolve_download(..., allow_share=False)`, and the comment says why:
 a share claim confers nothing over SFTP. HTTP downloads **do** honour share claims. Wiring the
-HTTP route to `open_random_access` would therefore compile, pass any test that uses an owner
+HTTP route to `open_random_reader` would therefore compile, pass any test that uses an owner
 account, and silently refuse every share-based download the moment a client sent a `Range` header —
 a regression reachable only through a header most tests do not set.
 
