@@ -2320,6 +2320,10 @@ class ECCCryptoLibrary {
             offset: recordsDone >= f.n ? totalLength : f.H + recordsDone * f.S,
             records: f.n,
             done: recordsDone >= f.n,
+            // The plaintext length, which the framing already knows. A caller opening a download
+            // needs it BEFORE reading anything -- it becomes the Content-Length, and that is what
+            // lets a browser call a short body a failure rather than a complete small file.
+            totalPlaintext: f.totalPlaintext,
         };
     }
 

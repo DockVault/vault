@@ -507,6 +507,30 @@ from app.config.effective import BRAND_SETTINGS_KEY, set_brand_overrides
 from app.api.ecc_router import router as ecc_router
 app.include_router(ecc_router, prefix="/ecc")
 
+@app.get("/download-sw.js", include_in_schema=False)
+async def download_service_worker():
+    """The streaming-download sink, served from the ORIGIN ROOT rather than /static/js/.
+
+    A service worker's default scope is the directory it was served from, so the same file under
+    /static/js/ could only ever intercept /static/js/... and would never see the sink URL. Serving
+    it here gives it the whole origin without needing a Service-Worker-Allowed header, which is the
+    simpler of the two ways to get there.
+
+    Registered by the page only when the resolved download sink is `streaming` -- a worker is an
+    origin-wide, persistent thing, and one should not be installed on everybody's browser to
+    support a mode most deployments will not use.
+    """
+    path = PROJECT_ROOT / "static" / "js" / "download-sw.js"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+    response = FileResponse(str(path), media_type="application/javascript")
+    # A stale worker is worse than no worker: it would keep answering the sink URL with old
+    # framing after the page had moved on. Revalidate every time; the file is small.
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["Service-Worker-Allowed"] = "/"
+    return response
+
+
 @app.get("/")
 async def root():
     """Root endpoint - serve the SPA dashboard."""
