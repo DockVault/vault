@@ -53,7 +53,12 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 #
 # 20 ms keeps roughly fifty samples a second, which is far finer than the peaks being looked for,
 # at a cost too small to see.
+#: Appears in the sampler's command line inside the container so the harness can find and
+#: reap exactly its own loops -- and nothing else -- when a round ends.
+_SAMPLER_TAG = "DV_BUDGET_SAMPLER"
+
 _SAMPLER_SH = r"""
+DV_BUDGET_SAMPLER=1
 while :; do
   sleep 0.02
   if [ -r /sys/fs/cgroup/memory.current ]; then
@@ -157,8 +162,12 @@ class CgroupSampler(threading.Thread):
         self.series = []
 
     def run(self) -> None:
+        # `timeout` inside the container, because killing `docker exec` does NOT kill what it
+        # started: the shell keeps running, orphaned, for as long as the container lives. Every
+        # round used to leave one behind per service. A bound means the worst case is an hour of
+        # a cheap loop rather than forever, even if this process is killed outright.
         self._proc = subprocess.Popen(
-            ["docker", "exec", self.container, "sh", "-c", _SAMPLER_SH],
+            ["docker", "exec", self.container, "timeout", "3600", "sh", "-c", _SAMPLER_SH],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
         )
         try:
@@ -189,6 +198,19 @@ class CgroupSampler(threading.Thread):
                 self._proc.wait(timeout=10)
             except Exception:                      # noqa: BLE001
                 self._proc.kill()
+
+        # Terminating the client above ends the local pipe, not the loop inside the container.
+        # Reaped by its tag so this touches only samplers this harness started. Measured: with
+        # the loops left running a four-service stack idles at ~31% CPU per container, which
+        # silently taxes every later measurement taken on that host -- including someone else's.
+        try:
+            subprocess.run(
+                ["docker", "exec", self.container, "pkill", "-f", _SAMPLER_TAG],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+            )
+        except Exception:                          # noqa: BLE001 - best effort; the timeout caps it
+            pass
+
         self.join(timeout=10)
 
 
