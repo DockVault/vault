@@ -537,11 +537,21 @@ def admin(admin_creds):
     admin call — including the cleanup in `finally` blocks, which then leaked fixtures into the
     next run. See ApiClient._renew_if_stale for why this renews on age rather than on a 401.
 
-    Note a renewal mints a NEW session for this account, and logging in terminates the account's
-    other non-temp sessions — so a test that holds an open SFTP connection authenticated as this
-    same admin account while making admin HTTP calls could see that connection dropped. No test
-    does today (the SFTP suites authenticate as temp credentials or throwaway users), but it is
-    the non-obvious consequence of renewing here.
+    A renewal mints a NEW session for this account and leaves the existing ones alone. Regular
+    sessions coexist: `login` never revokes siblings, only logout, locking, deactivation and
+    temp-credential revocation call `_revoke_sessions`, and there is no concurrent-session cap.
+    This is not a claim to take on trust from a comment — it is pinned by
+    `test_api_session_revocation.py::test_logout_revokes_only_that_token_and_concurrent_sessions_coexist`,
+    whose module docstring says the same thing.
+
+    This paragraph used to say the opposite: that logging in terminates the account's other
+    non-temp sessions. It does not, and the inversion is worth naming because that sentence became
+    the leading theory for a run of intermittent browser failures — browser tests authenticate as
+    this same admin account, so an eviction on renewal would have explained a page that was
+    suddenly logged out. It would have been a day spent giving browser tests their own accounts to
+    fix a mechanism that does not exist. The eviction behaviour is real for TEMPORARY credentials
+    (`auth_service.py` reuses an existing active session for one), which is the likely origin of
+    the confusion.
     """
     client = ApiClient(renew_before_expiry=True)
     client.login(admin_creds["username"], admin_creds["password"])
