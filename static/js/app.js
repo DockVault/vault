@@ -10367,21 +10367,29 @@ async function uploadFiles(files) {
                     // the bytes it names are produced together and cannot drift apart. A resumed
                     // upload replays these same bytes and re-declares this same token; only a fresh
                     // encryption gets a new one, which is exactly what the server refuses to merge.
-                    const buf = await entry.file.arrayBuffer();
                     let enc;
                     if (lib.ZK_CONTENT_WRITE_V2) {
-                        // Chunk-framed content. The token comes back FROM the writer, which is why
-                        // the legacy branch below mints its own instead of both sharing one line:
-                        // under this branch the token is sealed into the file's header, and a
-                        // value minted out here could drift from the one the bytes actually carry.
-                        const written = await lib.encryptFileV2(buf, dek, {
+                        // Chunk-framed content, encrypted FROM THE FILE rather than from a copy of
+                        // it. Reading the file first would put the plaintext in the heap, the
+                        // sealed copy would join it, and a large upload would peak near three
+                        // times the file for no reason -- the writer only ever needs one chunk at
+                        // a time, and everything the header binds is known from the file's size.
+                        //
+                        // The token comes back FROM the writer, which is why the legacy branch
+                        // below mints its own instead of both sharing one line: under this branch
+                        // the token is sealed into the file's header, and a value minted out here
+                        // could drift from the one the bytes actually carry.
+                        const written = await lib.encryptBlobV2(entry.file, dek, {
                             vaultId: vid, objectId: clientFileId, dekEpoch: keyVersion,
                         });
                         entry.blobId = written.blobId;
-                        enc = written.bytes;
+                        enc = written.blob;
                     } else {
+                        // The legacy writer takes the whole plaintext and has no chunked form, so
+                        // this branch still reads the file. Its cost is stated rather than hidden:
+                        // it is the reason the branch above exists.
                         entry.blobId = zkNewBlobId();
-                        enc = await lib.encryptFile(buf, dek);
+                        enc = await lib.encryptFile(await entry.file.arrayBuffer(), dek);
                     }
                     entry.file = new File([enc], entry.name, { type: mime });
                     entry.keyVersion = keyVersion;
