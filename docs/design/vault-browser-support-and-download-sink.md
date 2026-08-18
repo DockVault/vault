@@ -119,14 +119,26 @@ nothing reaches the user.
 
 Source: [browser-compat-data `api/FileSystemSyncAccessHandle.json`](https://github.com/mdn/browser-compat-data/blob/main/api/FileSystemSyncAccessHandle.json).
 
+Two constraints that come with it. Sync access handles are **worker-only**, so the decrypt has to
+run in a dedicated worker rather than on the page — which is where it belongs anyway. And the
+staged file needs free disk of roughly the file's size until it is handed over.
+
+The asynchronous alternative, `createWritable()`, is **not** a substitute: Safari only shipped it in
+version 26, where the sync handle has been available since 15.2.
+
 **Recommendation: B.** It keeps the property the format was designed around, it avoids every service
 worker lifetime hazard listed below, and it is supported on a *lower* Safari version than the
 service-worker path. What it gives up is the save dialog appearing at the start, and it needs free
 disk for one file.
 
-The File System Access API (`showSaveFilePicker`) is not a third option. It is Chromium-desktop only
-— Firefox has declared it harmful, Safari has never shipped it, and it is absent from Chrome on
-Android — so it cannot serve the families that need an alternative.
+The File System Access API (`showSaveFilePicker`) is not a third option, and its absence is
+permanent rather than pending. Mozilla's standards position calls the picker half of that API
+harmful — *"we do not think meaningful end user consent is possible"* for cross-site access to a
+local file system — while being explicit that it likes the storage half, which is why Firefox
+shipped OPFS and not the picker. Safari has never shipped a picker either. Chrome on Android
+nominally gained one in 132 but **cannot create new files with it**, only select existing ones, and
+Android content URIs support no atomic rename. That leaves desktop Chromium, around a quarter of
+traffic.
 
 **This is the decision the design gate reserves for the owner**, because option A changes an
 integrity property that the file format was built to provide.
@@ -157,6 +169,10 @@ Ordered by how likely each is to be the thing that breaks.
 - **No resumability.** The URL-to-stream handle is one-shot, so a range re-request cannot be served.
 - **Safari never cancels a download**, so a stream cancel will not release the server's side.
 - Closing the tab ends the transfer in every engine. This is not a background download.
+- **The buffered fallback fails hostilely, so check the size before allocating.** Chromium
+  configures its allocators to *"prefer crashing rather than returning nullptr"*, so an oversized
+  download tends to produce a dead tab rather than an exception. A size check against the
+  platform's ceiling is worth more than a `try`/`catch` that never runs.
 
 ---
 
