@@ -119,6 +119,19 @@ nothing reaches the user.
 
 Source: [browser-compat-data `api/FileSystemSyncAccessHandle.json`](https://github.com/mdn/browser-compat-data/blob/main/api/FileSystemSyncAccessHandle.json).
 
+**Two of those three are now measured rather than looked up.** A worker stages 64 MiB a mebibyte
+at a time, the size comes back exact, the content is in order, the finished file is handed over as
+an ordinary download, and deleting it reclaims the space. Chromium leaves nothing at all; Firefox
+keeps about 480 kB of its own filesystem bookkeeping with the staged file gone, which is why the
+check measures what was reclaimed rather than demanding a zero. `tests/test_ui_opfs_staging_probe.py`
+runs it, so the assumption is re-checked rather than assumed to hold.
+
+**Safari is still only a compat-table claim, and cannot be checked with the tooling here.** The
+WebKit build used for automation exposes no `navigator.storage` at all -- not merely no
+`getDirectory` -- while shipping Safari has had StorageManager for years. So that build differs
+from the browser materially and says nothing either way. Confirming Safari needs a real device,
+and it is the one row of this table that has not been exercised.
+
 Two constraints that come with it. Sync access handles are **worker-only**, so the decrypt has to
 run in a dedicated worker rather than on the page — which is where it belongs anyway. And the
 staged file needs free disk of roughly the file's size until it is handed over.
