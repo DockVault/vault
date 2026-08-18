@@ -109,8 +109,8 @@ pattern. The cost is that a failure is visible on disk, and the guarantee weaken
 released until it authenticates* to *the user is told afterwards*.
 
 **B. Stage in the origin private file system, then hand over the finished file.** Decrypt one chunk
-at a time into OPFS, verify the terminal, and only then produce a download. Peak memory is one
-chunk; peak disk is one file. The commit is atomic: a failed terminal deletes the staged file and
+at a time into OPFS, verify the terminal, and only then produce a download. Peak disk is one file.
+Peak memory was expected to be one chunk; it is not, and the measurements below are why. The commit is atomic: a failed terminal deletes the staged file and
 nothing reaches the user.
 
 | | Chrome | Edge | Firefox | Safari | Safari iOS |
@@ -201,6 +201,72 @@ footprint that includes everything else the page is using.
 
 The engines' own ArrayBuffer ceilings — 32 GiB in Chrome, 16 GiB in Safari — are far above all of
 this and never the binding constraint.
+
+---
+
+## Measured: what each sink actually costs
+
+Written after building the staging sink as a proof and measuring it against the path already
+merged. The result did not go the way the section above predicted, so the prediction is left
+standing and corrected here rather than quietly edited.
+
+**Method.** Headless Chromium, one payload built as 1 MiB records, three arms:
+
+- **A** — one `Blob` part per record, combined into one `Blob`, handed to `createObjectURL`. This
+  is what the download path does today.
+- **B** — each record appended to a file in OPFS, then handed over as a download.
+- **C** — B, stopping short of the handover. Retains nothing in the tab; the bytes are in a file.
+
+Resident memory summed across the Chromium processes, sampled before and after, with collection
+forced before the reading. Percentages are the increase as a share of the payload.
+
+| payload | A: Blob parts | B: staged | C: staged, no handover |
+|---|---|---|---|
+| 16 MiB | 136.6% | 149.4% | 149.0% |
+| 64 MiB | 111.3% | 112.0% | 111.6% |
+| 128 MiB | 107.2% | 97.7% | 106.6% |
+
+**The three are the same.** The spread at 64 and 128 MiB is under two points, which is smaller
+than the run-to-run noise on this machine. Staging does not beat accumulating parts. Arm C retains
+nothing in JavaScript and still reads about one copy, so the cost is not something the accumulation
+strategy controls.
+
+**One copy of the plaintext is the floor** for any sink that ends by handing the browser a whole
+file. Beating it requires never producing that object -- a service worker streaming the response
+to the download, or a picker-backed writable stream -- which is a different design, not a tuning of
+this one.
+
+**Three instruments were wrong before one was right**, which is worth recording because each failed
+silently and plausibly:
+
+- `Runtime.getHeapUsage` put 64 MiB of live `Uint8Array`s at **0.01 MiB**. ArrayBuffer backing
+  stores are not in the V8 heap it reports.
+- `performance.measureUserAgentSpecificMemory` is gated off in headless Chromium.
+- Resident memory with **uncommitted** buffers put the same arrays at **2.1%**: a fresh
+  `Uint8Array` is zero pages the OS has not backed, so an untouched one costs nothing.
+- Resident memory **without forcing collection** read ~205% for every arm including the one that
+  retains nothing -- it was measuring the loop's garbage.
+
+Each was caught by the same control: hold the payload the most obvious way possible and require the
+instrument to report roughly 100%. An instrument that cannot see a plain array holding a plain
+buffer cannot be trusted about anything subtler.
+
+**What the staging proof did establish**, before it was set aside. The mechanism works: a worker
+stages a 64 MiB file a mebibyte at a time, the size is exact, the content is in order, it hands
+over as a download, and deleting it reclaims the space. That holds on Chromium and on Firefox,
+which leaves about 480 KiB of bookkeeping behind rather than returning to zero. Playwright's WebKit
+exposes no `navigator.storage` at all, so it cannot answer for Safari and a real device is still
+the only way to know.
+
+Two practical notes for anyone probing browser mechanisms against this app: the page's own CSP is
+`script-src 'self'`, so injecting an inline script into it is blocked -- correctly -- and a probe
+needs a served file or a nonce. And a fresh Playwright page is `about:blank`, whose opaque origin
+has no OPFS, so a probe that forgets to navigate reports "unsupported" on every engine and is
+describing the blank page.
+
+**Caveats.** Chromium only, headless, one machine that is not idle, and 16-128 MiB. The 16 MiB row
+is dominated by fixed overheads and should not be read as a per-file cost. Nothing here measures
+Safari or a device under memory pressure, which is where the ceilings in the next section bite.
 
 ---
 
