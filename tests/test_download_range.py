@@ -52,11 +52,21 @@ def _upload(client, vault_id, name, content, chunk_size=None):
 BODY = bytes((i * 31 + 7) & 0xFF for i in range(300_000))
 
 
-@pytest.fixture
-def stored_file(admin, temp_vault):
-    vid = temp_vault["id"]
-    fid = _upload(admin, vid, unique("ranged") + ".bin", BODY)
-    return vid, fid
+@pytest.fixture(scope="module")
+def stored_file(admin):
+    """One vault and one file for the whole module.
+
+    Function scope re-uploaded 300 KB into a fresh vault for every parametrised case -- about
+    twenty times -- which is twenty vaults and six megabytes of writes to answer questions that
+    only ever read. Every test here is read-only, so one file serves them all, and the suite
+    carries less state into whatever runs after it.
+    """
+    vault = admin.create_vault(name=unique("range-src"))
+    try:
+        fid = _upload(admin, vault["id"], unique("ranged") + ".bin", BODY)
+        yield vault["id"], fid
+    finally:
+        admin.delete_vault(vault["id"])
 
 
 def test_a_rangeable_file_says_so(admin, stored_file):
