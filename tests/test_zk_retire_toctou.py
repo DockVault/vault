@@ -1,4 +1,4 @@
-"""Zero-knowledge name-seal writers serialize against DEK-version retire (R6-06 TOCTOU).
+"""Zero-knowledge name-seal writers serialize against DEK-version retire.
 
 retire_dek_versions holds a Vault-row lock while it scans file/folder epochs and deletes the
 member keys below the floor. The ZK name-seal writers (folder-create, rename) read the seal
@@ -16,6 +16,7 @@ import contextlib
 import os
 import subprocess
 import time
+import uuid
 
 import pytest
 
@@ -72,7 +73,9 @@ def test_zk_folder_create_serializes_with_retire(admin):
     try:
         dek = os.urandom(32)
         name = unique("dir")
-        payload = {"enc_name": zk_encrypt_name(name, dek, vid, "name", 1),
+        folder_id = str(uuid.uuid4())
+        payload = {"id": folder_id,
+                   "enc_name": zk_encrypt_name(name, dek, vid, "name", 1, obj_id=folder_id),
                    "name_bi": zk_name_blind_index(name, dek, vid, 1), "name_key_version": 1}
         _assert_blocks_on_vault_lock(vid, lambda: admin.post(f"/vaults/{vid}/folders", json=payload))
     finally:
@@ -89,7 +92,7 @@ def test_zk_rename_serializes_with_retire(admin):
         dek = os.urandom(32)
         fid = zk_chunked_upload(admin, vid, unique("orig") + ".txt", b"x" * 16, dek, epoch=1)
         newname = unique("ren") + ".txt"
-        payload = {"enc_name": zk_encrypt_name(newname, dek, vid, "name", 1),
+        payload = {"enc_name": zk_encrypt_name(newname, dek, vid, "name", 1, obj_id=fid),
                    "name_bi": zk_name_blind_index(newname, dek, vid, 1)}
         _assert_blocks_on_vault_lock(
             vid, lambda: admin.put(f"/vaults/{vid}/files/{fid}/rename", json=payload))

@@ -231,18 +231,19 @@ def zk_chunked_upload(client, vault_id, name, content, dek, epoch=1, mime="text/
     client-side (never sent in the clear) and the content is sent as opaque bytes. Returns the
     completed file id. `dek` is the 32-byte vault DEK the caller uses for the name crypto.
 
-    If `file_id` is given, the name/MIME are sealed BOUND to that id (v2); otherwise the seal is
-    legacy v1 and binds nothing. Either way an id is DECLARED, because an encrypted upload must now
-    say at session-open what its material is bound to -- v1 vs v2 is a property of the seal, not of
-    whether an id exists."""
+    The name/MIME are sealed BOUND to the declared object id (v2), whether that id came from the
+    caller or was minted here. The helper used to seal v1 -- binding nothing -- unless a caller
+    passed `file_id`, which meant most of the suite exercised a form the server no longer accepts
+    on write, and the anti-transposition property went untested on every call site that did not
+    opt in."""
     chunk_size = chunk_size or max(1, len(content))
     total_chunks = max(1, (len(content) + chunk_size - 1) // chunk_size)
     declared_id = file_id or uuid.uuid4()
     init = client.post(f"/vaults/{vault_id}/uploads", json={
         "total_size": len(content), "total_chunks": total_chunks, "chunk_size": chunk_size,
         "zk_key_version": epoch, "folder_id": folder_id,
-        "enc_name": zk_encrypt_name(name, dek, vault_id, "name", epoch, obj_id=file_id),
-        "enc_mime": zk_encrypt_name(mime, dek, vault_id, "mime", epoch, obj_id=file_id) if mime else None,
+        "enc_name": zk_encrypt_name(name, dek, vault_id, "name", epoch, obj_id=declared_id),
+        "enc_mime": zk_encrypt_name(mime, dek, vault_id, "mime", epoch, obj_id=declared_id) if mime else None,
         "name_bi": zk_name_blind_index(name, dek, vault_id, epoch),
         "file_id": str(declared_id),
         # A fresh token per call: two calls are two encryptions and must never share a session.

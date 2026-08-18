@@ -423,8 +423,9 @@ def test_zk_chunked_upload_resumes_and_stores_ciphertext_verbatim(admin):
         r = admin.post(f"/vaults/{vid}/uploads", json={
             "total_size": len(blob), "total_chunks": 2, "chunk_size": len(part0),
             "zk_key_version": 1,
-            "enc_name": zk_encrypt_name(zkname, dek, vid, "name", 1),
-            "enc_mime": zk_encrypt_name("application/octet-stream", dek, vid, "mime", 1),
+            "enc_name": zk_encrypt_name(zkname, dek, vid, "name", 1, obj_id=obj_id),
+            "enc_mime": zk_encrypt_name("application/octet-stream", dek, vid, "mime", 1,
+                                        obj_id=obj_id),
             "name_bi": zk_name_blind_index(zkname, dek, vid, 1),
             # An encrypted upload declares what its material is bound to, and which encryption
             # attempt produced it, when the session opens.
@@ -451,8 +452,8 @@ def test_zk_chunked_upload_resumes_and_stores_ciphertext_verbatim(admin):
         assert admin.get(f"/vaults/{vid}/files/{fid}/download").content == blob
         # The name came back ENCRYPTED (no plaintext) and round-trips with the client DEK.
         assert not listed.get("name"), f"plaintext name leaked into listing: {listed.get('name')!r}"
-        assert listed["enc_name"].startswith(ZK_NAME_PREFIX)
-        assert zk_decrypt_name(listed["enc_name"], dek, vid, "name", 1) == zkname
+        assert listed["enc_name"].startswith(ZK_NAME_PREFIX_V2)
+        assert zk_decrypt_name(listed["enc_name"], dek, vid, "name", 1, obj_id=obj_id) == zkname
     finally:
         admin.delete_vault(vid)
 
@@ -503,12 +504,15 @@ def test_zk_upload_name_not_plaintext_at_rest(admin):
         plain_orig, plain_name, plain_mime, enc_name, has_bi = row.split("|", 4)
         assert plain_orig == "" and plain_name == "" and plain_mime == "", f"plaintext at rest: {row!r}"
         assert sentinel not in row, f"sentinel leaked at rest: {row!r}"
-        assert enc_name.startswith(ZK_NAME_PREFIX) and has_bi == "true", row
+        assert enc_name.startswith(ZK_NAME_PREFIX_V2) and has_bi == "true", row
 
         listed = next(it for it in admin.get(f"/vaults/{vid}/files").json()["items"] if it["id"] == fid)
         assert not listed.get("name")
-        assert zk_decrypt_name(listed["enc_name"], dek, vid, "name", 1) == name
-        assert zk_decrypt_name(listed["enc_mime"], dek, vid, "mime", 1) == "text/plain"
+        # obj_id=fid, and it has to be: the seal binds the row id, so decrypting without it (or
+        # with another row's) fails authentication. That IS the anti-transposition property, so
+        # passing it here is not ceremony -- it is the property under test, exercised.
+        assert zk_decrypt_name(listed["enc_name"], dek, vid, "name", 1, obj_id=fid) == name
+        assert zk_decrypt_name(listed["enc_mime"], dek, vid, "mime", 1, obj_id=fid) == "text/plain"
     finally:
         admin.delete_vault(vid)
 
@@ -560,13 +564,19 @@ def test_zk_folder_name_not_plaintext_at_rest(admin):
     try:
         dek = _os.urandom(32)
         sentinel = unique("ZKDIR")
+        # The folder id is declared by the CLIENT, because the name is sealed against it and a
+        # server-assigned id is not knowable at sealing time.
+        import uuid as _uuid
+        folder_id = str(_uuid.uuid4())
         r = admin.post(f"/vaults/{vid}/folders", json={
-            "enc_name": zk_encrypt_name(sentinel, dek, vid, "name", 1),
+            "id": folder_id,
+            "enc_name": zk_encrypt_name(sentinel, dek, vid, "name", 1, obj_id=folder_id),
             "name_bi": zk_name_blind_index(sentinel, dek, vid, 1),
             "name_key_version": 1,
         })
         assert r.status_code == 200, r.text
-        folder_id = r.json()["folder"]["id"]
+        assert r.json()["folder"]["id"] == folder_id, (
+            "the declared id must become the row id, or the sealed name binds nothing real")
 
         row = _zk_db_scalar(
             "SELECT coalesce(\"name\",'') || '|' || coalesce(enc_name,'') || '|' || "
@@ -574,11 +584,12 @@ def test_zk_folder_name_not_plaintext_at_rest(admin):
         )
         plain_name, enc_name, name_kv = row.split("|", 2)
         assert plain_name == "" and sentinel not in row, f"plaintext folder name at rest: {row!r}"
-        assert enc_name.startswith(ZK_NAME_PREFIX) and name_kv == "1", row
+        assert enc_name.startswith(ZK_NAME_PREFIX_V2) and name_kv == "1", row
 
         listed = next(it for it in admin.get(f"/vaults/{vid}/files").json()["items"] if it["id"] == folder_id)
         assert not listed.get("name")
-        assert zk_decrypt_name(listed["enc_name"], dek, vid, "name", 1) == sentinel
+        assert zk_decrypt_name(listed["enc_name"], dek, vid, "name", 1,
+                               obj_id=folder_id) == sentinel
     finally:
         admin.delete_vault(vid)
 
@@ -606,7 +617,7 @@ def test_zk_rename_keeps_name_encrypted(admin):
         fid = zk_chunked_upload(admin, vid, unique("orig") + ".txt", b"x" * 32, dek, epoch=1)
         newname = unique("ZKRENAME") + ".txt"
         r = admin.put(f"/vaults/{vid}/files/{fid}/rename", json={
-            "enc_name": zk_encrypt_name(newname, dek, vid, "name", 1),
+            "enc_name": zk_encrypt_name(newname, dek, vid, "name", 1, obj_id=fid),
             "name_bi": zk_name_blind_index(newname, dek, vid, 1),
         })
         assert r.status_code == 200, r.text
@@ -617,7 +628,7 @@ def test_zk_rename_keeps_name_encrypted(admin):
         )
         assert row == "|" and "ZKRENAME" not in row, f"plaintext rename at rest: {row!r}"
         listed = next(it for it in admin.get(f"/vaults/{vid}/files").json()["items"] if it["id"] == fid)
-        assert zk_decrypt_name(listed["enc_name"], dek, vid, "name", 1) == newname
+        assert zk_decrypt_name(listed["enc_name"], dek, vid, "name", 1, obj_id=fid) == newname
     finally:
         admin.delete_vault(vid)
 
@@ -762,21 +773,27 @@ def test_zk_folder_rename_rejects_future_epoch(admin):
     try:
         dek = _os.urandom(32)
         nm = unique("dir")
+        import uuid as _uuid
+        folder_id = str(_uuid.uuid4())
         r = admin.post(f"/vaults/{vid}/folders", json={
-            "enc_name": zk_encrypt_name(nm, dek, vid, "name", 1),
+            "id": folder_id,
+            "enc_name": zk_encrypt_name(nm, dek, vid, "name", 1, obj_id=folder_id),
             "name_bi": zk_name_blind_index(nm, dek, vid, 1), "name_key_version": 1,
         })
         r.raise_for_status()
-        folder_id = r.json()["folder"]["id"]
+        assert r.json()["folder"]["id"] == folder_id
         nm2 = unique("ren")
-        # vault is at epoch 1; a rename declaring epoch 9 must be rejected.
+        # vault is at epoch 1; a rename declaring epoch 9 must be rejected. Everything else in
+        # this request is valid -- the seal binds the folder and is the accepted form -- so the
+        # 400 can only be the epoch. Left unsealed, it would still be a 400 and the test would
+        # pass while no longer testing the epoch at all.
         assert admin.put(f"/vaults/{vid}/files/{folder_id}/rename", json={
-            "enc_name": zk_encrypt_name(nm2, dek, vid, "name", 9),
+            "enc_name": zk_encrypt_name(nm2, dek, vid, "name", 9, obj_id=folder_id),
             "name_bi": zk_name_blind_index(nm2, dek, vid, 9), "name_key_version": 9,
         }).status_code == 400
         # the current epoch still works.
         assert admin.put(f"/vaults/{vid}/files/{folder_id}/rename", json={
-            "enc_name": zk_encrypt_name(nm2, dek, vid, "name", 1),
+            "enc_name": zk_encrypt_name(nm2, dek, vid, "name", 1, obj_id=folder_id),
             "name_bi": zk_name_blind_index(nm2, dek, vid, 1), "name_key_version": 1,
         }).status_code == 200
     finally:
@@ -912,7 +929,7 @@ def _zk_pw_upload(client, vid, name, content, dek, pw, epoch=1):
     init = client.post(f"/vaults/{vid}/uploads", headers=PW, json={
         "total_size": len(content), "total_chunks": 1, "chunk_size": max(1, len(content)),
         "zk_key_version": epoch,
-        "enc_name": zk_encrypt_name(name, dek, vid, "name", epoch),
+        "enc_name": zk_encrypt_name(name, dek, vid, "name", epoch, obj_id=obj_id),
         "name_bi": zk_name_blind_index(name, dek, vid, epoch),
         "file_id": obj_id, "blob_id": _uuid.uuid4().hex,
     })

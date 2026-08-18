@@ -502,10 +502,14 @@ def _assert_all_session_caps(
 
 def _create_zk_folder(client, vault_id, name_key: bytes) -> str:
     name = unique("zk_folder")
+    # The folder id is declared here because the sealed name binds it, and a server-assigned id
+    # is not knowable at sealing time.
+    folder_id = str(uuid.uuid4())
     response = client.post(
         f"/vaults/{vault_id}/folders",
         json={
-            "enc_name": zk_encrypt_name(name, name_key, vault_id, "name", 1),
+            "id": folder_id,
+            "enc_name": zk_encrypt_name(name, name_key, vault_id, "name", 1, obj_id=folder_id),
             "name_bi": zk_name_blind_index(name, name_key, vault_id, 1),
             "name_key_version": 1,
         },
