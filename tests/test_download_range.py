@@ -145,33 +145,24 @@ def test_a_zero_knowledge_file_is_not_ranged(admin):
     Serving a range would mean building a reader over a blob it cannot authenticate, which is the
     thing the service layer refuses outright. The endpoint must not offer what that would require.
     """
-    # Asked for explicitly, and restored afterwards. The toggle means "absent is on", so an
-    # earlier test in the run turning it off and not putting it back leaves this one skipping for
-    # the rest of time -- which is how a check quietly stops being a check. The plan ceiling above
-    # it is still authoritative: where the deployment is not entitled to the type at all, this
-    # cannot turn it on, and the skip below is then the honest answer.
-    # Created the way the browser does, through the shared helper: a zero-knowledge vault needs a
-    # DEK generated and wrapped client-side, and a plain POST without one is refused. My first
-    # attempt hand-rolled the request, was refused for exactly that, and reported it as "this
-    # deployment forbids zero-knowledge vaults" -- a setup failure wearing a policy skip.
-    #
-    # The toggle is asked for explicitly and restored, because absent means on and something
-    # earlier in the run turns it off without putting it back.
-    before = admin.get("/settings")
-    was = before.json().get("zero_knowledge_enabled") if before.status_code == 200 else None
+    # Enabled and then put back to False, which is what every other zero-knowledge test in this
+    # suite does (`_zk_enabled` in test_api_zk_vault.py restores False unconditionally). My first
+    # version restored whatever it had read instead, on the reasoning that putting a setting back
+    # as you found it is politer. For a setting shared by the whole run it is not politer, it is
+    # a second convention: two tests with different ideas about the resting state leave it
+    # wherever the last one ran, and whatever runs next inherits that.
     admin.put("/settings", json={"zero_knowledge_enabled": True})
     try:
         vault = create_zk_vault(admin, name=unique("zk-range"))
-    except Exception as exc:                      # noqa: BLE001 - see the narrow re-raise below
-        if was is not None:
-            admin.put("/settings", json={"zero_knowledge_enabled": was})
+    except Exception as exc:                      # noqa: BLE001 - narrow re-raise below
         # Only a deployment that refuses the type outright is an environment gap. Anything else
         # is this test failing to set itself up, and must say so.
         if "not enabled on this deployment" in str(exc) or "not permitted" in str(exc):
+            admin.put("/settings", json={"zero_knowledge_enabled": False})
             pytest.skip(f"this deployment forbids zero-knowledge vaults: {str(exc)[:200]}")
+        admin.put("/settings", json={"zero_knowledge_enabled": False})
         raise
-    if was is not None:
-        admin.put("/settings", json={"zero_knowledge_enabled": was})
+    admin.put("/settings", json={"zero_knowledge_enabled": False})
     vid = vault["id"]
     try:
         # Uploaded the browser way as well: a zero-knowledge vault refuses a file whose name is
