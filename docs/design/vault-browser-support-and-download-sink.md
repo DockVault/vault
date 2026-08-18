@@ -251,6 +251,19 @@ Each was caught by the same control: hold the payload the most obvious way possi
 instrument to report roughly 100%. An instrument that cannot see a plain array holding a plain
 buffer cannot be trusted about anything subtler.
 
+**What the staging proof did establish**, before it was set aside. The mechanism works: a worker
+stages a 64 MiB file a mebibyte at a time, the size is exact, the content is in order, it hands
+over as a download, and deleting it reclaims the space. That holds on Chromium and on Firefox,
+which leaves about 480 KiB of bookkeeping behind rather than returning to zero. Playwright's WebKit
+exposes no `navigator.storage` at all, so it cannot answer for Safari and a real device is still
+the only way to know.
+
+Two practical notes for anyone probing browser mechanisms against this app: the page's own CSP is
+`script-src 'self'`, so injecting an inline script into it is blocked -- correctly -- and a probe
+needs a served file or a nonce. And a fresh Playwright page is `about:blank`, whose opaque origin
+has no OPFS, so a probe that forgets to navigate reports "unsupported" on every engine and is
+describing the blank page.
+
 **Caveats.** Chromium only, headless, one machine that is not idle, and 16-128 MiB. The 16 MiB row
 is dominated by fixed overheads and should not be read as a per-file cost. Nothing here measures
 Safari or a device under memory pressure, which is where the ceilings in the next section bite.
