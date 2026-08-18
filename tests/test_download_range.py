@@ -133,10 +133,22 @@ def test_a_zero_knowledge_file_is_not_ranged(admin):
     Serving a range would mean building a reader over a blob it cannot authenticate, which is the
     thing the service layer refuses outright. The endpoint must not offer what that would require.
     """
-    made = admin.post("/vaults", json={
-        "name": unique("zk-range"), "type": "zero_knowledge",
-        "description": "ranged-download refusal",
-    })
+    # Asked for explicitly, and restored afterwards. The toggle means "absent is on", so an
+    # earlier test in the run turning it off and not putting it back leaves this one skipping for
+    # the rest of time -- which is how a check quietly stops being a check. The plan ceiling above
+    # it is still authoritative: where the deployment is not entitled to the type at all, this
+    # cannot turn it on, and the skip below is then the honest answer.
+    before = admin.get("/settings")
+    was = before.json().get("zero_knowledge_enabled") if before.status_code == 200 else None
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    try:
+        made = admin.post("/vaults", json={
+            "name": unique("zk-range"), "type": "zero_knowledge",
+            "description": "ranged-download refusal",
+        })
+    finally:
+        if was is not None:
+            admin.put("/settings", json={"zero_knowledge_enabled": was})
     if made.status_code in (400, 403):
         # A policy refusal is an environment gap: some deployments disable the type outright, and
         # this test has nothing to say about those. Anything else -- a 5xx above all -- is the
