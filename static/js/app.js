@@ -8444,6 +8444,147 @@ async function zkMaybeDecryptBlob(blob, vault, keyVersion = null, fileId = null)
 // Nothing is shown before it authenticates. The reader resolves only once the final record
 // verifies, and the caller builds the object URL from what this returns, so a failure throws with
 // the parts still unreferenced.
+// --- streaming download sink ------------------------------------------------------------------
+//
+// Writes decrypted records straight into a download instead of accumulating them. Used only when
+// the resolved policy says `streaming` -- see app/core/download_sink.py for who decides, and
+// docs/design/vault-download-sink-and-policy.md for what it costs.
+
+let _sinkWorker = null;
+
+async function dvSinkWorker() {
+    // Registered lazily, never at boot. A service worker is origin-wide and persistent; installing
+    // one on every visitor to support a mode most deployments do not enable would be a large,
+    // invisible change for no benefit.
+    if (_sinkWorker) return _sinkWorker;
+    if (!('serviceWorker' in navigator) || !window.isSecureContext) return null;
+    try {
+        const registration = await navigator.serviceWorker.register('/download-sw.js', { scope: '/' });
+        await navigator.serviceWorker.ready;
+        _sinkWorker = registration.active || navigator.serviceWorker.controller;
+        return _sinkWorker;
+    } catch (_) {
+        // A deployment that cannot register one simply does not stream. The caller falls back.
+        return null;
+    }
+}
+
+/**
+ * Open a download the page can write into. Resolves to null when streaming is unavailable, which
+ * the caller must treat as "use the buffered path" rather than as an error.
+ *
+ * Returns `{ write, done, abort }`. `write` takes a Uint8Array and transfers it, so the caller
+ * must not reuse the buffer afterwards.
+ */
+async function dvOpenDownloadSink({ filename, size, mime }) {
+    const worker = await dvSinkWorker();
+    if (!worker) return null;
+
+    const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    const channel = new MessageChannel();
+
+    const url = await new Promise(resolve => {
+        const timer = setTimeout(() => resolve(null), 5000);
+        channel.port1.onmessage = event => {
+            const data = event.data || {};
+            if (data.type === 'dv-sink-ready') { clearTimeout(timer); resolve(data.url); }
+        };
+        worker.postMessage(
+            { type: 'dv-sink-open', id, filename, size, mime }, [channel.port2]);
+    });
+    if (!url) return null;
+
+    // A hidden same-origin iframe, NOT an anchor, and this is not a style choice. An anchor
+    // navigates the document; if the stream then errors, the browser follows that navigation to
+    // an error page and the application is gone. Measured: Chromium tolerates it, Firefox does
+    // not -- the page was destroyed. An iframe confines a failure to the frame. CSP already
+    // allows it (frame-src 'self').
+    const frame = document.createElement('iframe');
+    frame.style.display = 'none';
+    frame.src = url;
+    document.body.appendChild(frame);
+
+    const cleanup = () => { try { frame.remove(); } catch (_) { /* already gone */ } };
+
+    return {
+        write(bytes) {
+            const copy = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+            channel.port1.postMessage({ type: 'chunk', bytes: copy.buffer }, [copy.buffer]);
+        },
+        done() {
+            channel.port1.postMessage({ type: 'done' });
+            setTimeout(cleanup, 2000);
+        },
+        abort(reason) {
+            // Erroring the stream is what makes the browser mark the download failed rather than
+            // complete-but-short. On Firefox it may surface nothing at all, which is why the
+            // caller must also tell the user itself.
+            channel.port1.postMessage({ type: 'abort', reason: String(reason || 'failed') });
+            setTimeout(cleanup, 2000);
+        },
+    };
+}
+
+/**
+ * Decrypt a zero-knowledge download straight into a browser download.
+ *
+ * Three outcomes, and the caller must distinguish them:
+ *   `true`     - the download is under way; nothing more to do.
+ *   `false`    - streaming was not possible and NOTHING was written. Fall back, but note the
+ *                response body has been read from, so the caller must re-fetch.
+ *   `'failed'` - bytes were written and the transfer then failed. There may be a partial file in
+ *                the user's downloads, and the app must say so, because the browser may not.
+ *
+ * The distinction between `false` and `'failed'` is the whole contract. Collapsing them would
+ * either hide a real failure or re-download a file that is already arriving.
+ */
+async function zkTryStreamedDownload(response, vault, keyVersion, fileId, fileName) {
+    const lib = eccLib();
+    const declared = Number(response.headers.get('Content-Length'));
+    if (!response.body || typeof lib.decryptStreamV2 !== 'function'
+        || !Number.isSafeInteger(declared) || declared <= 0) {
+        return false;
+    }
+
+    // The header tells us both whether this is the chunk-framed format and how long the plaintext
+    // is -- and the length has to be known BEFORE the sink is opened, because it becomes the
+    // download's Content-Length and is what lets the browser call a short body a failure.
+    const peeked = await lib._peekStream(response.body, 28);
+    if (lib._inspectV2Header(peeked.head) !== 'UNSUPPORTED') return false;
+
+    let framing;
+    try {
+        framing = lib.v2ContentResumeOffset(peeked.head, declared, 0);
+    } catch (_) {
+        return false;                      // not framing we can read; the buffered path will say why
+    }
+    const plaintextLength = framing.totalPlaintext;
+    if (!Number.isSafeInteger(plaintextLength) || plaintextLength <= 0) return false;
+
+    const sink = await dvOpenDownloadSink({
+        filename: fileName,
+        size: plaintextLength,
+        mime: response.headers.get('Content-Type') || 'application/octet-stream',
+    });
+    if (!sink) return false;
+
+    let wrote = false;
+    try {
+        const { dek, context } = await zkResolveKey(vault, keyVersion, fileId);
+        await lib.decryptStreamV2(peeked.stream, declared, dek, context, piece => {
+            wrote = true;
+            sink.write(piece);
+        });
+        sink.done();
+        return true;
+    } catch (error) {
+        sink.abort(error && error.code ? error.code : 'failed');
+        // Nothing written means nothing reached the disk, so this is still a clean fallback --
+        // the sink was opened but the download has no bytes and will simply fail empty.
+        return wrote ? 'failed' : false;
+    }
+}
+
 async function zkMaybeDecryptResponse(response, vault, keyVersion = null, fileId = null) {
     if (!isZkVault(vault)) return response.blob();
     const lib = eccLib();
@@ -8868,8 +9009,9 @@ async function downloadFile(fileId, fileName) {
             headers['X-Vault-Password'] = state.vaultPassword;
         }
 
-        // Fetch file
-        const response = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, {
+        // Fetch file. Not const: a streaming attempt that cannot proceed has already consumed
+        // this body, so the buffered fallback replaces it.
+        let response = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, {
             headers
         });
         
@@ -8880,6 +9022,32 @@ async function downloadFile(fileId, fileName) {
         // Decrypting in-browser for zero-knowledge vaults, from the body rather than from a
         // materialised copy of it. A standard vault still takes the blob, which the server has
         // already decrypted.
+        // Streaming writes each decrypted record straight into a download, so nothing
+        // accumulates and size stops being a limit. Attempted only when the resolved policy asks
+        // for it; anything that does not line up falls through to the buffered path rather than
+        // failing, because a download that works is worth more than the mode it used.
+        if (isZkVault(state.currentVault) && state.downloadSink === 'streaming') {
+            const streamed = await zkTryStreamedDownload(
+                response, state.currentVault, zkFileKeyVersion(fileId), fileId, fileName);
+            if (streamed === true) {
+                showSuccess(`Downloading "${fileName}"`);
+                return;
+            }
+            if (streamed === 'failed') {
+                // The browser may show nothing at all for an aborted stream -- measured on
+                // Firefox -- so the app has to say it itself or the user sees silence.
+                showError(`Download of "${fileName}" failed part-way. `
+                          + `Any partial file in your downloads is incomplete.`);
+                return;
+            }
+            // streamed === false: streaming was not possible, and nothing was written. The
+            // response body is spent, so the buffered path below re-fetches.
+            response = await fetch(
+                `${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`,
+                { headers });
+            if (!response.ok) throw new Error('Download failed');
+        }
+
         let blob;
         if (isZkVault(state.currentVault)) {
             try { blob = await zkMaybeDecryptResponse(response, state.currentVault,
@@ -11779,7 +11947,13 @@ async function applyServerPreferences() {
     try {
         const zk = await apiRequest('/zk-enabled', { silent: true });
         setZkIdleLockMinutes(zk && zk.zk_idle_lock_minutes);
-    } catch (_) { /* best-effort; default = no idle lock */ }
+        // Where this account's decrypted downloads go, already resolved server-side: the
+        // organisation's policy, this user's preference when the organisation delegates, and
+        // whether the browser can register a worker here at all. Absent or unreadable means the
+        // buffered path, which is what shipped before any of this existed.
+        state.downloadSink = (zk && zk.download_sink && zk.download_sink.sink === 'streaming')
+            ? 'streaming' : 'buffered';
+    } catch (_) { /* best-effort; default = no idle lock, buffered downloads */ }
 
     const tm = window.themeManager;
     if (!tm) return false;
