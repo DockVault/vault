@@ -17,9 +17,11 @@ Every one of them looks the same from the outside (a `200` carrying the whole fi
 each is asserted separately rather than by one representative case.
 """
 
+import os
+
 import pytest
 
-from conftest import create_zk_vault, unique
+from conftest import create_zk_vault, unique, zk_chunked_upload
 
 
 _OCTET = {"Content-Type": "application/octet-stream"}
@@ -162,7 +164,11 @@ def test_a_zero_knowledge_file_is_not_ranged(admin):
         admin.put("/settings", json={"zero_knowledge_enabled": was})
     vid = vault["id"]
     try:
-        fid = _upload(admin, vid, unique("zk") + ".bin", BODY)
+        # Uploaded the browser way as well: a zero-knowledge vault refuses a file whose name is
+        # not sealed client-side, so the ordinary helper cannot store one. The DEK is random
+        # because the server never sees it -- it exists here only to seal the name.
+        fid = zk_chunked_upload(admin, vid, unique("zk") + ".bin", BODY, os.urandom(32),
+                                mime="application/octet-stream")
         plain = admin.get(f"/vaults/{vid}/files/{fid}/download")
         assert plain.status_code == 200, plain.text
         assert "Accept-Ranges" not in plain.headers, (
