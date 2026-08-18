@@ -379,11 +379,15 @@ the stored team-DEK wrap is rewritten only when a member is REVOKED. So a hierar
 never removes anyone would keep its creation-time wraps unbound forever, and §7.2 and §7.3 would
 never be reached on it at all.
 
-**Prerequisite.** The creating client must choose the vault id and send it, the same way the direct
-path now does. The server side of that already accepts a chosen id for any zero-knowledge vault,
-hierarchical included; only the client half is missing. Until it lands, these two constructions are
-specified but not reachable, and an implementer should treat that as the first task rather than
-discovering it afterwards.
+**Prerequisite — met.** The creating client must choose the vault id and send it, the same way the
+direct path does. Both halves have landed: the server accepts a chosen id for any zero-knowledge
+vault, hierarchical included, and the browser mints one before building the request and binds it
+into both wraps. These two constructions are therefore reachable, not merely specified.
+
+This paragraph previously said the client half was missing and told an implementer to build it
+first. It is left here, corrected rather than deleted, because the natural reading of the old text
+— that the create path does not yet pick an id — invites adding a second id-minting site, and a
+vault whose id is chosen in two places is the bug this binding exists to prevent.
 
 The recipient id has the same shape of problem at creation — the recipient is the creator, and the
 only local source for their account id is session state this design rejects elsewhere (§7.1). The
@@ -501,6 +505,21 @@ bytes onward as each chunk authenticates has therefore already delivered attacke
 output by the time it detects the problem. Today's whole-file reader satisfies this by accident,
 because it buffers; the streaming reader this grammar exists to enable does not, and must hold or
 mark its output until the terminator is in.
+
+**What shipped, measured against that rule.** The streaming reader releases each record to its
+`write` callback as it authenticates, and the callback's contract requires the caller to keep those
+bytes somewhere it can still discard -- which the buffered consumer does, holding them as parts it
+never hands over until the reader resolves. That consumer satisfies this rule.
+
+The service-worker download sink does not. It writes each record into a download the browser owns,
+and a page cannot retract that, so an under-declared length delivers a genuine prefix of the object
+into the user's Downloads before the terminator is reached. Measured on the shipped reader: with a
+length short by exactly one record, two of four records were handed over before the refusal.
+
+That sink is therefore **off by default and recommended against** -- see
+`vault-download-sink-and-policy.md`, which reaches the same conclusion from an unrelated direction
+(it does not reduce memory either). This paragraph is the security half of that case: a consumer
+that cannot discard what it has been given cannot satisfy the rule above, whatever else it buys.
 
 **Framing rules, all normative:**
 
