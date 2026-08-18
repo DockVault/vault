@@ -19,7 +19,7 @@ each is asserted separately rather than by one representative case.
 
 import pytest
 
-from conftest import skip_if_container_absent, unique
+from conftest import unique
 
 
 _OCTET = {"Content-Type": "application/octet-stream"}
@@ -52,7 +52,6 @@ BODY = bytes((i * 31 + 7) & 0xFF for i in range(300_000))
 
 @pytest.fixture
 def stored_file(admin, temp_vault):
-    skip_if_container_absent()
     vid = temp_vault["id"]
     fid = _upload(admin, vid, unique("ranged") + ".bin", BODY)
     return vid, fid
@@ -134,7 +133,6 @@ def test_a_zero_knowledge_file_is_not_ranged(admin):
     Serving a range would mean building a reader over a blob it cannot authenticate, which is the
     thing the service layer refuses outright. The endpoint must not offer what that would require.
     """
-    skip_if_container_absent()
     made = admin.post("/vaults", json={
         "name": unique("zk-range"), "type": "zero_knowledge",
         "description": "ranged-download refusal",
@@ -198,7 +196,6 @@ def _share(admin, vault, tag, **over):
 
 
 def test_a_shared_download_ignores_a_range_and_still_costs_exactly_one(admin, temp_user_client):
-    skip_if_container_absent()
     _enable_sharing(admin, True)
     vault = admin.create_vault(name=unique("share-range"))
     try:
@@ -288,7 +285,6 @@ def test_replacing_the_file_invalidates_a_resume_in_flight(admin, temp_vault):
     Download part of a file, replace it, then resume with the tag from before. The server must
     refuse to serve the range against bytes the client has never seen.
     """
-    skip_if_container_absent()
     vid = temp_vault["id"]
     name = unique("replaced") + ".bin"
     fid = _upload(admin, vid, name, BODY)
