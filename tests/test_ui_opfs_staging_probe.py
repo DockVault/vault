@@ -27,13 +27,19 @@ CHUNK = 1024 * 1024
 
 
 def test_a_worker_can_stage_a_file_chunk_by_chunk_and_throw_it_away(page, browser_name) -> None:
+    # Navigate first, and not incidentally. A fresh page is `about:blank`, whose origin is opaque
+    # and has no origin-private file system to speak of -- so this would report "unsupported" on
+    # every engine and be reporting the blank page, not the browser.
+    page.goto("/")
+
     caps = page.evaluate(
         "() => ({secure: window.isSecureContext,"
         " storage: typeof navigator.storage,"
         " opfs: !!(navigator.storage && navigator.storage.getDirectory),"
         " worker: typeof Worker === 'function'})"
     )
-    assert caps["secure"], "the page is not a secure context, so this proves nothing about the sink"
+    assert caps["secure"], (
+        f"not a secure context at {page.url}, so this proves nothing about the sink")
 
     if browser_name == "webkit" and caps["storage"] == "undefined":
         # Not a statement about Safari, and it must not be read as one. This build has no
