@@ -111,6 +111,9 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Build the image and start the stack
+        # Measured at 42 seconds. Same reasoning as the step below: a stalled pull or build should
+        # say so rather than being read later as a slow test suite.
+        timeout-minutes: 20
         run: docker compose up -d --build
 
       - name: Wait for the API health gate
@@ -155,8 +158,31 @@ jobs:
           exit 1
 
       - name: Install locked test dependencies and Chromium
+        # Measured at 46 seconds on a healthy runner. It has hung for 35+ minutes twice, and with
+        # no deadline of its own it consumes the job's whole budget and reports as a timeout of
+        # the SUITE -- which is where someone then goes looking, and it is the wrong place.
+        #
+        # Established from the log of the second occurrence: it stalls in `apt-get update`, which
+        # `--with-deps` invokes. The Azure mirror answered `Ign:` on every line, apt fell back to
+        # archive.ubuntu.com, and the last output was `Get:5 noble-security InRelease` at
+        # 02:27:10 -- then nothing for 43 minutes. Pip was never reached.
+        #
+        # The signature to recognise: the step's log ends mid-`apt-get update` with no error. That
+        # is the shape a deadline turns into a ten-minute answer instead of a lost hour, and it is
+        # also why the deadline goes on the step rather than being left to the job's.
+        #
+        # Ten minutes is thirteen times the measured cost: generous for a bad day, and a clear
+        # answer instead of a lost hour.
+        timeout-minutes: 10
         run: |
           set -euo pipefail
+          # apt applies no network timeout by default, which is how one unresponsive mirror
+          # becomes a 43-minute silence rather than an error it could recover from. The runner
+          # has two mirrors configured; bounding each fetch lets it give up on the bad one and
+          # use the other. The deadline above is the backstop for when even that does not help.
+          printf 'Acquire::http::Timeout "20";\n' | sudo tee /etc/apt/apt.conf.d/99-dv-timeouts >/dev/null
+          printf 'Acquire::https::Timeout "20";\n' | sudo tee -a /etc/apt/apt.conf.d/99-dv-timeouts >/dev/null
+          printf 'Acquire::Retries "3";\n' | sudo tee -a /etc/apt/apt.conf.d/99-dv-timeouts >/dev/null
           python -m pip install -r tests/requirements-test.lock
           python -m pip install --force-reinstall --require-hashes -r requirements.lock
           python -m pip check
