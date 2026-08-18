@@ -16,7 +16,7 @@
 # Application packages imported by host-side tests. Keep these exact versions synchronized with
 # requirements.txt; tests/test_supply_chain_contract.py enforces the subset and generated lock.
 fastapi==0.141.1
-starlette==1.5.1
+starlette==1.6.0
 python-multipart==0.0.32
 pydantic==2.13.4
 pydantic-settings==2.15.0
