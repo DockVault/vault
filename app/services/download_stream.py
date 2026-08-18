@@ -174,3 +174,115 @@ class RandomAccessFile:
             except Exception:      # noqa: BLE001 - closing is best effort
                 pass
             self._handle = None
+
+
+class ByteRange:
+    """One satisfiable byte range, resolved against a known total length.
+
+    `start` and `last` are both inclusive, matching the wire format rather than Python slicing,
+    because every value that goes into a `Content-Range` header is inclusive and converting in
+    only one direction keeps the off-by-one in one place.
+    """
+
+    __slots__ = ("start", "last", "total")
+
+    def __init__(self, start: int, last: int, total: int):
+        self.start = start
+        self.last = last
+        self.total = total
+
+    @property
+    def length(self) -> int:
+        return self.last - self.start + 1
+
+    def content_range(self) -> str:
+        return f"bytes {self.start}-{self.last}/{self.total}"
+
+    def __eq__(self, other):
+        return (isinstance(other, ByteRange) and other.start == self.start
+                and other.last == self.last and other.total == self.total)
+
+    def __repr__(self):
+        return f"ByteRange({self.start}, {self.last}, {self.total})"
+
+
+#: Returned when the header names a range that cannot be satisfied. Distinct from `None`, which
+#: means "serve the whole thing": the two lead to different status codes, and collapsing them
+#: would turn a 416 into a silent full download of a file the client explicitly did not ask for.
+UNSATISFIABLE = object()
+
+
+def parse_byte_range(header, total_length: int):
+    """Resolve a `Range` request header against a known length.
+
+    Returns a :class:`ByteRange`, or `None` to serve the whole representation, or
+    :data:`UNSATISFIABLE`.
+
+    `None` is the answer for anything malformed, and that is the specified behaviour rather than
+    leniency for its own sake: RFC 7233 says a recipient that cannot understand a Range header
+    MUST ignore it. Rejecting instead would make a client that sends a header we do not parse
+    unable to download at all, which is a worse failure than sending it more bytes than it asked
+    for.
+
+    Deliberately not supported, and ignored rather than half-served:
+
+    * **Multiple ranges.** Answering them means a `multipart/byteranges` body. Serving only the
+      first range while reporting `206` would be a lie a client cannot detect -- it would assemble
+      the parts it asked for out of bytes it did not get -- so the whole representation is safer.
+    * **Anything but `bytes`.** No other unit is registered here, and an unknown unit is exactly
+      the case the ignore rule exists for.
+
+    A suffix range (`bytes=-500`, meaning the last 500 bytes) IS supported, and clamps: asking for
+    more than exists yields the whole representation as a range rather than an error.
+    """
+    if not header or total_length < 0:
+        return None
+
+    text = header.strip()
+    if "=" not in text:
+        return None
+    unit, _, spec = text.partition("=")
+    if unit.strip().lower() != "bytes":
+        return None
+
+    spec = spec.strip()
+    if "," in spec:
+        return None
+    if "-" not in spec:
+        return None
+
+    first, _, last = spec.partition("-")
+    first, last = first.strip(), last.strip()
+
+    # A zero-length representation can satisfy no range at all. Handled before the arithmetic
+    # because `total_length - 1` would otherwise name byte -1 as the last one.
+    if total_length == 0:
+        return UNSATISFIABLE
+
+    if not first:
+        # Suffix: the last N bytes. "bytes=-0" asks for the last nothing, which is unsatisfiable
+        # rather than empty -- an empty 206 would claim to carry a range it does not.
+        if not last.isdigit():
+            return None
+        want = int(last)
+        if want == 0:
+            return UNSATISFIABLE
+        start = max(0, total_length - want)
+        return ByteRange(start, total_length - 1, total_length)
+
+    if not first.isdigit():
+        return None
+    start = int(first)
+    if start >= total_length:
+        return UNSATISFIABLE
+
+    if not last:
+        return ByteRange(start, total_length - 1, total_length)
+    if not last.isdigit():
+        return None
+    end = int(last)
+    if end < start:
+        return None
+    # Clamped, not refused: a client that asks past the end gets what exists, which is what the
+    # reader underneath would have returned anyway.
+    return ByteRange(start, min(end, total_length - 1), total_length)
