@@ -86,7 +86,6 @@ def test_a_rangeable_file_says_so(admin, stored_file):
     ("bytes=-1000", len(BODY) - 1000, len(BODY) - 1),   # suffix
     ("bytes=0-0", 0, 0),                            # exactly one byte
     ("bytes=131070-131074", 131070, 131074),        # straddles a record boundary
-    ("bytes=0-99999999", 0, len(BODY) - 1),         # past the end, clamped not refused
 ])
 def test_a_range_returns_exactly_those_bytes(admin, stored_file, header, start, last):
     vid, fid = stored_file
@@ -96,6 +95,41 @@ def test_a_range_returns_exactly_those_bytes(admin, stored_file, header, start, 
     assert r.headers.get("Content-Length") == str(last - start + 1)
     assert r.content == BODY[start:last + 1], (
         f"{header} returned {len(r.content)} bytes that do not match the whole-file download")
+
+
+def test_a_range_covering_everything_is_served_as_the_whole_file(admin, stored_file):
+    """`bytes=0-` asks for the entire representation, and must not buy a weaker guarantee.
+
+    The ranged path deliberately skips the stored-checksum hold-back, on the reasoning that a
+    range is not the whole file. `bytes=0-` is the ordinary way to write "all of it", so without
+    this the check was one header away from being skippable on every download — and it is not
+    redundant with per-record AEAD for the two formats that have no terminal or no records at all.
+    """
+    vid, fid = stored_file
+    r = admin.get(f"/vaults/{vid}/files/{fid}/download", headers={"Range": "bytes=0-"})
+    assert r.status_code == 200, (
+        f"a range spanning the whole object should be served as the whole object, not as a 206 "
+        f"that skips the checksum: {r.status_code}")
+    assert "Content-Range" not in r.headers
+    assert r.content == BODY
+
+    # An end past the end clamps to the same span, and must land the same way. This is the
+    # likelier spelling in the wild -- a client that does not know the length asks for a big
+    # number rather than for `bytes=0-`. It was previously asserted to be a 206, which is how
+    # this rule was found to be one header away from skippable.
+    clamped = admin.get(f"/vaults/{vid}/files/{fid}/download",
+                        headers={"Range": "bytes=0-99999999"})
+    assert clamped.status_code == 200, (
+        f"a range clamped to the whole object must take the same path as one written that way, "
+        f"not a 206 that skips the checksum: {clamped.status_code}")
+    assert "Content-Range" not in clamped.headers
+    assert clamped.content == BODY, "clamping past the end must not truncate or refuse"
+
+    # A range that stops one byte short is still a real range, so it keeps the 206 path.
+    partial = admin.get(f"/vaults/{vid}/files/{fid}/download",
+                        headers={"Range": f"bytes=0-{len(BODY) - 2}"})
+    assert partial.status_code == 206, partial.text
+    assert partial.content == BODY[:-1]
 
 
 def test_ranges_are_consistent_with_each_other(admin, stored_file):

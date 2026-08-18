@@ -10497,6 +10497,19 @@ async def download_file(
                 headers={'Content-Range': f'bytes */{download.total_length}'},
             )
 
+        # A range that covers the whole representation is not a range in any useful sense, and
+        # taking the ranged path for it costs the stored-checksum check that the whole-file path
+        # runs. `bytes=0-` is the ordinary way to write it, so this is one header away from being
+        # the normal case rather than an exotic one.
+        #
+        # It matters most where the checksum is not redundant with per-record AEAD: the retained
+        # v1 chunk stream has no terminal, so a truncated blob reports its truncated total and
+        # every layer agrees with itself; and a zero-knowledge blob is copied verbatim, where the
+        # stored digest over the ciphertext is the only integrity statement the server can make
+        # at all.
+        if wanted is not None and wanted.start == 0 and wanted.last == download.total_length - 1:
+            wanted = None
+
         if wanted is not None:
             async def range_streamer(span):
                 """Serve one span, a window at a time.
