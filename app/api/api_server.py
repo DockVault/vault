@@ -56,7 +56,14 @@ from app.core.id_scope import id_in_scope
 from sqlalchemy.exc import IntegrityError
 from app.services.audit_logger import AuditLogger
 from app.services.streaming_upload import receive_bounded, ChunkTooLarge, EmptyBody
-from app.services.download_stream import ChecksumMismatch
+from app.services.download_stream import (
+    ChecksumMismatch, UNSATISFIABLE, parse_byte_range,
+)
+
+#: How much of a range to decrypt per yield. Bounded for the same reason the whole-file
+#: path is bounded: a client naming a two-gigabyte range must not turn into a
+#: two-gigabyte allocation. The reader decrypts only the records a window touches.
+_RANGE_WINDOW = 256 * 1024
 from app.services import log_pull  # pure helpers for the authenticated log-pull endpoint
 from app.core.security import (
     create_access_token, verify_access_token, EncryptionError, ObjectChangedDuringRead,
@@ -10116,7 +10123,9 @@ async def download_file(
         # Atomically consume a capped share download before serving bytes. This one stays AFTER
         # admission on purpose: it spends one of the recipient's downloads, and a transfer that was
         # refused for want of a slot must not be charged for.
-        if str(vault_id) in (getattr(current_user, '_share_vault_scope', None) or {}):
+        share_authorized = str(vault_id) in (
+            getattr(current_user, '_share_vault_scope', None) or {})
+        if share_authorized:
             if not permission_service.burn_share_download(
                 current_user,
                 vault,
@@ -10359,17 +10368,192 @@ async def download_file(
         # remember to set in the right place. Building a response can fail -- it encodes the
         # headers -- and a flag set a line too early skipped the teardown entirely, holding the
         # transfer slot, the open blob and the operation entry for the life of the process.
+        # --- ranged response ------------------------------------------------------------------
+        #
+        # Offered only where a range is genuinely cheap: `read_range` is None for the
+        # client-encrypted blob and for the legacy format, so those fall through to the whole-file
+        # path without a special case here.
+        #
+        # It is also withheld from a share-authorized download, and that is not conservatism for
+        # its own sake. A capped share spends one download per request, burned above. Honouring a
+        # range would either charge a resumed transfer a second time -- so a flaky link could
+        # exhaust a three-download share on one file -- or skip the burn for ranged requests,
+        # which makes the cap bypassable by sending a header. Neither is acceptable, and refusing
+        # to resume is the only option that leaves the cap meaning what it says.
+        rangeable = download.read_range is not None and not share_authorized
+
+        # The stored checksum, as an entity tag. Resuming across two requests is only safe if the
+        # second one is reading the same bytes as the first, and nothing else here establishes
+        # that: a same-name replacement between the two would let a client splice two different
+        # files together and notice nothing, because each half authenticates perfectly well on its
+        # own. Per-record AEAD proves a record belongs to this file; it cannot prove both requests
+        # saw the same version of it.
+        etag = f'"{download.checksum}"' if download.checksum else None
+
+        if_range = request.headers.get('if-range')
+        stale_resume = False
+        if if_range is not None:
+            # Only the entity-tag form is honoured. The date form is accepted syntax we cannot
+            # answer accurately -- last-modified is not tracked to the second here -- and guessing
+            # would defeat the check, so it counts as a mismatch and costs the client a restart
+            # rather than risking a splice.
+            stale_resume = etag is None or if_range.strip() != etag
+
+        wanted = (parse_byte_range(request.headers.get('range'), download.total_length)
+                  if rangeable and not stale_resume else None)
+
+        if wanted is UNSATISFIABLE:
+            # Nothing released or closed here on purpose. No response object exists yet, so the
+            # teardown below owns the slot, the open blob and the operation entry -- which is the
+            # same contract every other pre-handoff failure on this path follows.
+            raise HTTPException(
+                status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                detail="Requested range not satisfiable",
+                headers={'Content-Range': f'bytes */{download.total_length}'},
+            )
+
+        if wanted is not None:
+            async def range_streamer(span):
+                """Serve one span, a window at a time.
+
+                No checksum hold-back: it works by leaving the client short of a promised length,
+                and it covers the whole file, which a range by definition is not. Integrity here
+                is the per-record AEAD that `read_range` verifies as it decrypts the records the
+                span touches -- the same guarantee SFTP has always relied on for seeks.
+                """
+                served_bytes = 0
+                cancelled = False
+                try:
+                    at = span.start
+                    while at <= span.last:
+                        # Cancellation is checked here for the same reason the whole-file path
+                        # checks it: an operator can stop a transfer, and a ranged one is still a
+                        # transfer. Without this, Cancel would appear to do nothing.
+                        if tracker_started and tracker.is_cancelled(operation_id):
+                            cancelled = True
+                            break
+                        if await request.is_disconnected():
+                            break
+                        piece = download.read_range(at, min(_RANGE_WINDOW, span.last - at + 1))
+                        if not piece:
+                            # The reader clamps rather than raising, so an empty answer inside the
+                            # span means the file is shorter than the length the walk reported.
+                            # Stopping leaves the client short of Content-Length, which is how
+                            # every other failure on this path announces itself.
+                            break
+                        yield piece
+                        served_bytes += len(piece)
+                        at += len(piece)
+                        await asyncio.sleep(0)
+                finally:
+                    download.close()
+                    transfer_admission.release(transfer_slot)
+
+                    # The operation was started before this branch was chosen, and only the
+                    # whole-file generator's teardown completes one. Without this a ranged
+                    # download leaves an in_progress record in Redis that nothing ever closes,
+                    # and the transfer shows as running for as long as the key survives.
+                    transition = None
+                    if tracker_started and not cancelled:
+                        try:
+                            transition = tracker.complete_operation(
+                                operation_id,
+                                success=(served_bytes == span.length),
+                            )
+                        except Exception:      # noqa: BLE001 - a bookkeeping write, not the body
+                            transition = None
+
+                    # Emitted for the same reason the whole-file path emits one: this is where
+                    # bytes served are counted. Leaving it out would make ranged transfers
+                    # invisible in the activity feed and absent from traffic accounting, so a
+                    # resuming client would move real bytes that nothing added up.
+                    if transition is not None:
+                        try:
+                            broadcast_event({
+                                "event": {
+                                    "type": "download",
+                                    "title": ("File downloaded (range)"
+                                              if served_bytes == span.length
+                                              else "Ranged download interrupted"),
+                                    "description": (
+                                        f"{disp_name} (bytes {span.start}-{span.last} of "
+                                        f"{span.total}, {served_bytes:,} transferred)"
+                                    ),
+                                    "user": current_user.username,
+                                    "ip": request_ip,
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "operation_id": operation_id,
+                                    "completed": served_bytes == span.length,
+                                },
+                                "traffic": {"upload": 0, "download": served_bytes},
+                            })
+                        except Exception:      # noqa: BLE001 - telemetry must not kill a response
+                            pass
+
+                    try:
+                        audit_logger.log_action(
+                            user_id=current_user.id,
+                            action="file.download.range",
+                            resource_type="file",
+                            resource_id=str(file_id),
+                            details=(f"{disp_name}: bytes {span.start}-{span.last} of "
+                                     f"{span.total}, {served_bytes} served"),
+                            ip_address=request_ip,
+                        )
+                    except Exception:      # noqa: BLE001 - an audit write must not kill a response
+                        pass
+                    end_operation(operation_id)
+
+            # Assigned to the name the teardown checks. It keys on whether a response exists,
+            # not on the slot -- so a response held in any other variable would be torn down
+            # while the generator serving it was still running.
+            range_headers = {
+                'Content-Disposition': _content_disposition(disp_name),
+                'Content-Length': str(wanted.length),
+                'Content-Range': wanted.content_range(),
+                'Accept-Ranges': 'bytes',
+                'Cache-Control': 'no-cache',
+                'X-Operation-ID': operation_id,
+            }
+            if etag:
+                # Conditional, because a row stored without a checksum has no tag to send and a
+                # None here would fail header encoding -- turning a served range into a 500. Such
+                # a client simply cannot detect a replacement mid-resume, which is a weaker
+                # position than an ETag buys but not a worse one than it had before ranges.
+                range_headers['ETag'] = etag
+
+            streaming_response = StreamingResponse(
+                range_streamer(wanted),
+                status_code=status.HTTP_206_PARTIAL_CONTENT,
+                media_type=_safe_media_type(mime_type),
+                headers=range_headers,
+            )
+            # `transfer_slot` deliberately NOT cleared. The generator's teardown reads the
+            # variable, not a captured value, so nulling it here would leave the real token
+            # unreleased and shrink the transfer ceiling by one on every ranged download.
+            return streaming_response
+
+        headers = {
+            'Content-Disposition': _content_disposition(disp_name),
+            # From the terminal the walk authenticated, so a stream that stops
+            # early is a short body the client can detect.
+            'Content-Length': str(download.total_length),
+            'Cache-Control': 'no-cache',
+            'X-Operation-ID': operation_id,
+        }
+        if rangeable:
+            # Advertised only where it is true. Claiming it for a file that would answer a range
+            # by decrypting all of itself invites exactly the request that costs the most.
+            headers['Accept-Ranges'] = 'bytes'
+            if etag:
+                # Sent with the whole-file response too, because that is where a client learns
+                # the tag it will quote back in If-Range when it comes to resume.
+                headers['ETag'] = etag
+
         streaming_response = StreamingResponse(
             file_streamer(),
             media_type=_safe_media_type(mime_type),
-            headers={
-                'Content-Disposition': _content_disposition(disp_name),
-                # From the terminal the walk authenticated, so a stream that stops
-                # early is a short body the client can detect.
-                'Content-Length': str(download.total_length),
-                'Cache-Control': 'no-cache',
-                'X-Operation-ID': operation_id,
-            },
+            headers=headers,
         )
         return streaming_response
 

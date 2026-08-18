@@ -87,10 +87,17 @@ class BoundedDownload:
     for the retained formats it is the recorded size, which an adversary able to rewrite the blob
     can usually also rewrite. A caller may use it as a response length either way, but only the
     authenticated one turns a short body into evidence.
+
+    `read_range` is present only for a format whose record boundaries are known, which today means
+    the at-rest chunk stream. It is `None` for the client-encrypted blob and for the retained
+    legacy format -- the first because the server holds no key and must not build a reader for it,
+    the second because answering a range there means decrypting the whole file into memory. A
+    caller decides whether to offer ranges by asking whether this is None, so those two are
+    excluded by construction rather than by a list of special cases someone has to maintain.
     """
 
     def __init__(self, handle, chunks, total_length, name, mime_type, checksum,
-                 length_is_authenticated=False):
+                 length_is_authenticated=False, read_range=None):
         self._handle = handle
         self._chunks = chunks
         self.total_length = total_length
@@ -98,6 +105,7 @@ class BoundedDownload:
         self.mime_type = mime_type
         self.checksum = checksum
         self.length_is_authenticated = length_is_authenticated
+        self.read_range = read_range
 
     def chunks(self):
         """The plaintext, one piece at a time, with the checksum enforced before the last one."""
