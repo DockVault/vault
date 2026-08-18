@@ -1890,9 +1890,11 @@ class ECCCryptoLibrary {
             const n = Math.max(1, Math.ceil(total / chunkSize));
             const totals = { totalChunks: n, totalPlaintext: total };
 
-            const parts = await this._sealV2Chunks(
-                key, t, totals, chunkSize, n,
-                i => plain.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, total)));
+            const parts = [t.fileHeader];
+            await this._sealV2Chunks(
+                key, t, totals, n,
+                i => plain.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, total)),
+                (nonce, sealed) => parts.push(nonce, sealed));
             return {
                 bytes: this._concatBytes(parts),
                 blobId: this._hex(blobId),
@@ -1914,8 +1916,7 @@ class ECCCryptoLibrary {
      *
      * Returns the header followed by (nonce, sealed) for every chunk, in order.
      */
-    async _sealV2Chunks(key, t, totals, chunkSize, n, readChunk) {
-        const parts = [t.fileHeader];
+    async _sealV2Chunks(key, t, totals, n, readChunk, emit) {
         for (let i = 0; i < n; i++) {
             const isFinal = (i === n - 1);
             const nonce = this._randomBytes(12);
@@ -1929,9 +1930,11 @@ class ECCCryptoLibrary {
                 key,
                 await readChunk(i),
             );
-            parts.push(nonce, new Uint8Array(sealed));
+            // Handed over rather than collected here. Accumulating for the caller would decide
+            // its memory profile for it -- which is the whole difference between the two writers
+            // below, and the reason this loop does not keep anything.
+            emit(nonce, new Uint8Array(sealed));
         }
-        return parts;
     }
 
     _hex(bytes) {
@@ -1942,10 +1945,16 @@ class ECCCryptoLibrary {
      * Encrypt a Blob or File to version-2 content WITHOUT reading it whole.
      *
      * Same grammar, same transcript, same framing as encryptFileV2 -- the only difference is where
-     * each chunk's plaintext comes from. That matters for what the tab costs: reading the file
-     * first puts the plaintext in the heap, the sealed copy joins it, and the peak lands near
-     * three times the file. Here the heap holds one slice and one sealed chunk at a time, whatever
-     * the file weighs.
+     * each chunk's plaintext comes from, and where each sealed chunk goes. Reading the file first
+     * puts the plaintext in the heap, the sealed copy joins it, the concatenation joins both, and
+     * the peak lands near three times the file. Here the heap holds one slice and one sealed
+     * chunk: the plaintext is never read whole, and each sealed chunk is handed to a Blob as it
+     * is produced rather than collected in an array.
+     *
+     * What that does NOT promise is a constant-memory upload. The accumulated ciphertext still
+     * exists -- as Blob parts, which the browser may keep in memory or spill to disk as it sees
+     * fit -- and the browser decides. The honest bound is: this code retains one chunk; the
+     * accumulated result is the browser's to place.
      *
      * The header can still be written before any byte is read because everything it binds is
      * known from `blob.size` -- the chunk count and the plaintext total -- so this needs no second
@@ -1959,8 +1968,23 @@ class ECCCryptoLibrary {
     async encryptBlobV2(blob, vaultDEK, context, options) {
         const W = 'encryptBlobV2';
         try {
-            if (!blob || typeof blob.slice !== 'function' || typeof blob.size !== 'number') {
+            // `typeof NaN` is 'number', and NaN is the one size that makes the chunk count NaN,
+            // so the loop below never runs and the header-only file it writes never reaches the
+            // length check that refuses every other bad size. It uploads, it returns a valid id,
+            // and it can never be opened. A safe non-negative integer is the honest test.
+            if (!blob || typeof blob.slice !== 'function'
+                || !Number.isSafeInteger(blob.size) || blob.size < 0) {
                 this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.blob');
+            }
+            // Checked separately, and under a different code, because it is a different kind of
+            // problem. `slice` and `size` have been in every browser since 2012, so their absence
+            // means the caller passed something that is not a Blob. `arrayBuffer` is from 2020 --
+            // Safari 14, iOS 14.5, Chrome 76, Firefox 69 -- so its absence means the BROWSER is
+            // too old, which is the one thing CRYPTO_UNAVAILABLE exists to say. Reported as bad
+            // input it would send someone looking at their file; reported as unavailable it tells
+            // them to upgrade, which is the actionable half.
+            if (typeof blob.arrayBuffer !== 'function') {
+                throw new CryptoError(CRYPTO_ERROR_CODES.CRYPTO_UNAVAILABLE, W + '.arrayBuffer');
             }
             const opts = options || {};
             const blobId = this._randomBytes(16);
@@ -1979,11 +2003,18 @@ class ECCCryptoLibrary {
             const n = Math.max(1, Math.ceil(total / chunkSize));
             const totals = { totalChunks: n, totalPlaintext: total };
 
-            const parts = await this._sealV2Chunks(
-                key, t, totals, chunkSize, n,
+            // Each chunk becomes a Blob the moment it is sealed, and the typed array is dropped.
+            // Collecting them as arrays first -- which an earlier version of this did, while its
+            // comment claimed otherwise -- keeps the whole ciphertext in the heap until the end,
+            // and measuring it showed exactly that: 64 MiB retained for a 64 MiB input. A Blob
+            // part is the browser's to place, in memory or on disk; a Uint8Array is not.
+            const parts = [t.fileHeader];
+            await this._sealV2Chunks(
+                key, t, totals, n,
                 async i => new Uint8Array(await blob
                     .slice(i * chunkSize, Math.min((i + 1) * chunkSize, total))
-                    .arrayBuffer()));
+                    .arrayBuffer()),
+                (nonce, sealed) => parts.push(new Blob([nonce, sealed])));
             return {
                 blob: new Blob(parts),
                 blobId: this._hex(blobId),
@@ -2570,6 +2601,7 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     decryptFile: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
     decryptFileV2: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
     encryptFileV2: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    encryptBlobV2: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     decryptName: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
 
     // Everything else: a primitive rejected for a reason that is not authentication, not policy
