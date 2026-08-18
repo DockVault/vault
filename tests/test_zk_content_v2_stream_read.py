@@ -82,3 +82,15 @@ def test_the_last_record_fails_only_after_earlier_bytes_were_written(streamed: s
     assert written > 0, (
         "the final-record failure wrote nothing, so this run does not demonstrate that a caller "
         f"can be left holding partial output: {line}")
+
+
+def test_the_older_format_is_refused_rather_than_misread(streamed: str) -> None:
+    """Why the caller has to look at the header before choosing a reader.
+
+    The two formats are not interchangeable and the older one cannot be streamed at all — its tag
+    covers the whole file, so nothing can be released until everything has arrived. Handing one to
+    the chunked reader must therefore fail, and the same bytes must still read correctly through
+    the reader meant for them, so the refusal is about the wrong reader rather than a damaged file.
+    """
+    assert "ok   a legacy whole-file blob is refused" in streamed, streamed
+    assert "ok   the same legacy blob reads back through the buffered reader" in streamed, streamed
