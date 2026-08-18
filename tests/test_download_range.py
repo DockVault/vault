@@ -19,7 +19,7 @@ each is asserted separately rather than by one representative case.
 
 import pytest
 
-from conftest import unique
+from conftest import create_zk_vault, unique
 
 
 _OCTET = {"Content-Type": "application/octet-stream"}
@@ -138,26 +138,29 @@ def test_a_zero_knowledge_file_is_not_ranged(admin):
     # the rest of time -- which is how a check quietly stops being a check. The plan ceiling above
     # it is still authoritative: where the deployment is not entitled to the type at all, this
     # cannot turn it on, and the skip below is then the honest answer.
+    # Created the way the browser does, through the shared helper: a zero-knowledge vault needs a
+    # DEK generated and wrapped client-side, and a plain POST without one is refused. My first
+    # attempt hand-rolled the request, was refused for exactly that, and reported it as "this
+    # deployment forbids zero-knowledge vaults" -- a setup failure wearing a policy skip.
+    #
+    # The toggle is asked for explicitly and restored, because absent means on and something
+    # earlier in the run turns it off without putting it back.
     before = admin.get("/settings")
     was = before.json().get("zero_knowledge_enabled") if before.status_code == 200 else None
     admin.put("/settings", json={"zero_knowledge_enabled": True})
     try:
-        made = admin.post("/vaults", json={
-            "name": unique("zk-range"), "type": "zero_knowledge",
-            "description": "ranged-download refusal",
-        })
-    finally:
+        vault = create_zk_vault(admin, name=unique("zk-range"))
+    except Exception as exc:                      # noqa: BLE001 - see the narrow re-raise below
         if was is not None:
             admin.put("/settings", json={"zero_knowledge_enabled": was})
-    if made.status_code in (400, 403):
-        # A policy refusal is an environment gap: some deployments disable the type outright, and
-        # this test has nothing to say about those. Anything else -- a 5xx above all -- is the
-        # setup failing, and skipping on it would quietly retire the check.
-        pytest.skip(f"this deployment forbids zero-knowledge vaults: {made.text[:200]}")
-    assert made.status_code == 200, (
-        f"creating the vault failed for a reason that is not policy, so the refusal this test "
-        f"exists to check was never exercised: {made.status_code} {made.text[:300]}")
-    vid = made.json()["id"]
+        # Only a deployment that refuses the type outright is an environment gap. Anything else
+        # is this test failing to set itself up, and must say so.
+        if "not enabled on this deployment" in str(exc) or "not permitted" in str(exc):
+            pytest.skip(f"this deployment forbids zero-knowledge vaults: {str(exc)[:200]}")
+        raise
+    if was is not None:
+        admin.put("/settings", json={"zero_knowledge_enabled": was})
+    vid = vault["id"]
     try:
         fid = _upload(admin, vid, unique("zk") + ".bin", BODY)
         plain = admin.get(f"/vaults/{vid}/files/{fid}/download")
