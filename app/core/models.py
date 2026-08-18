@@ -1486,9 +1486,10 @@ class VaultMemberIndexKey(Base):
     must never be driven by rekey: rekey is the revocation path, and coupling it to a re-index lets
     one unreadable filename block an urgent removal.
 
-    What this gives up is recorded in `docs/design/vault-zk-name-index-key.md`: a removed member
-    keeps the key, so with database read they can CONFIRM a guessed filename. Not read one -- the
-    name stays sealed under the DEK and the index is one-way.
+    What this gives up: a removed member keeps the key, so with database read they can CONFIRM a
+    guessed filename. Not read one -- the name stays sealed under the DEK and the index is one-way.
+    A held index key plus stored index values (which need database access) is a confirmation
+    oracle over filenames, nothing more.
     """
     __tablename__ = 'vault_member_index_keys'
 
