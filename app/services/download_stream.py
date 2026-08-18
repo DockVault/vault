@@ -262,6 +262,16 @@ def parse_byte_range(header, total_length: int):
     first, _, last = spec.partition("-")
     first, last = first.strip(), last.strip()
 
+    def _digits(text: str) -> bool:
+        """ASCII digits only.
+
+        `str.isdigit()` is true for characters `int()` refuses -- superscripts like "²" among
+        them -- so the obvious pairing of the two raises ValueError on input this function's own
+        contract says to ignore. On the download path that became a 500 and an audit row reading
+        "Download failed", for a header the caller was entitled to send badly.
+        """
+        return text.isascii() and text.isdigit()
+
     # A zero-length representation can satisfy no range at all. Handled before the arithmetic
     # because `total_length - 1` would otherwise name byte -1 as the last one.
     if total_length == 0:
@@ -270,7 +280,7 @@ def parse_byte_range(header, total_length: int):
     if not first:
         # Suffix: the last N bytes. "bytes=-0" asks for the last nothing, which is unsatisfiable
         # rather than empty -- an empty 206 would claim to carry a range it does not.
-        if not last.isdigit():
+        if not _digits(last):
             return None
         want = int(last)
         if want == 0:
@@ -278,7 +288,7 @@ def parse_byte_range(header, total_length: int):
         start = max(0, total_length - want)
         return ByteRange(start, total_length - 1, total_length)
 
-    if not first.isdigit():
+    if not _digits(first):
         return None
     start = int(first)
     if start >= total_length:
@@ -286,7 +296,7 @@ def parse_byte_range(header, total_length: int):
 
     if not last:
         return ByteRange(start, total_length - 1, total_length)
-    if not last.isdigit():
+    if not _digits(last):
         return None
     end = int(last)
     if end < start:
