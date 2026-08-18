@@ -2224,6 +2224,134 @@ class ECCCryptoLibrary {
         }
     }
 
+    /**
+     * Read version-2 content from a byte stream, given the length the transfer declares.
+     *
+     * The Blob reader beside this one still needs the whole response to exist before it starts.
+     * This one does not: records are fixed-size and arrive in order, so it decrypts each as it
+     * lands. What is resident is one record plus whatever the producer over-delivered on the read
+     * that completed it -- bounded by the producer's own chunk size, not by the file's.
+     *
+     * `totalLength` has to come from outside -- a stream does not carry its own size, so in
+     * practice it is the transfer's Content-Length, which the server asserts. That is not a trust
+     * assumption. The chunk count and the plaintext total are derived from it and bound into
+     * every record's AAD, so a length that is wrong by even one byte produces a different total,
+     * and the first record fails to authenticate. A lie shortens nothing; it stops the read.
+     *
+     * The same contract as the Blob reader: `write` receives each chunk in order, and this does
+     * not resolve until the final record authenticates, so what has been written is only safe
+     * once it returns.
+     */
+    async decryptStreamV2(stream, totalLength, vaultDEK, context, write) {
+        const W = 'decryptStreamV2';
+        try {
+            if (!stream || typeof stream.getReader !== 'function') {
+                this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.stream');
+            }
+            if (!Number.isSafeInteger(totalLength) || totalLength < 0) {
+                this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.totalLength');
+            }
+            if (typeof write !== 'function') {
+                this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.write');
+            }
+
+            const reader = stream.getReader();
+            let pending = [];
+            let held = 0;
+            let done = false;
+
+            // Pull until `want` bytes are available, then hand back exactly that many. Anything
+            // over-read stays for the next call, so a producer that chunks the body differently
+            // from the record size -- which every real one does -- changes nothing.
+            const take = async (want) => {
+                while (held < want && !done) {
+                    const r = await reader.read();
+                    if (r.done) { done = true; break; }
+                    const piece = r.value instanceof Uint8Array
+                        ? r.value : new Uint8Array(r.value);
+                    if (piece.length) { pending.push(piece); held += piece.length; }
+                }
+                if (held < want) {
+                    this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.truncated');
+                }
+                const out = new Uint8Array(want);
+                let filled = 0;
+                while (filled < want) {
+                    const head = pending[0];
+                    const need = want - filled;
+                    if (head.length <= need) {
+                        out.set(head, filled);
+                        filled += head.length;
+                        pending.shift();
+                    } else {
+                        out.set(head.subarray(0, need), filled);
+                        pending[0] = head.subarray(need);
+                        filled = want;
+                    }
+                }
+                held -= want;
+                return out;
+            };
+
+            try {
+                const header = await take(this.V2_CONTENT_HEADER_BYTES);
+                const f = this._v2ContentFraming(header, totalLength, W);
+                const { H, O, S, n, last, chunkSize, blobId, totalPlaintext } = f;
+
+                const ctx = context || {};
+                const t = this._v2ContentTranscript(
+                    ctx.vaultId, ctx.objectId, ctx.dekEpoch, chunkSize, blobId);
+                this._v2ContentHeaderMatches(header, t, H, W);
+
+                const key = await this._deriveV2ContentKey(vaultDEK, t.info);
+
+                for (let i = 0; i < n; i++) {
+                    const isFinal = (i === n - 1);
+                    const record = await take(isFinal ? last : S);
+                    let plain;
+                    try {
+                        plain = await this._subtle().decrypt(
+                            {
+                                name: this.AES_ALGORITHM,
+                                iv: record.subarray(0, 12),
+                                additionalData: t.aadFor(i, isFinal,
+                                    { totalChunks: n, totalPlaintext }),
+                            },
+                            key,
+                            record.subarray(12),
+                        );
+                    } catch (e) {
+                        this._fail(CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED, W + '.chunk', e);
+                    }
+                    const p = new Uint8Array(plain);
+                    if (p.length !== (isFinal ? last - O : chunkSize)) {
+                        this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.chunkLength');
+                    }
+                    await write(p);
+                }
+
+                // A body longer than the length it declared is not a file this can vouch for:
+                // the totals every record authenticated were computed from that length. What was
+                // over-read is already in hand, so it answers first and costs nothing.
+                if (held > 0) {
+                    this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.trailing');
+                }
+                while (!done) {
+                    const r = await reader.read();
+                    if (r.done) { done = true; break; }
+                    if (r.value && r.value.length) {
+                        this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.trailing');
+                    }
+                }
+                return { totalPlaintext };
+            } finally {
+                try { reader.releaseLock(); } catch (_) { /* already released on a clean end */ }
+            }
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED, W);
+        }
+    }
+
     async decryptFile(encryptedContent, vaultDEK, context) {
         // Before anything else: is this a format from a newer build? Saying "damaged" about an
         // intact file is the failure this check exists to prevent.
@@ -2703,6 +2831,7 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     decryptFile: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
     decryptFileV2: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
     decryptBlobV2: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
+    decryptStreamV2: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
     encryptFileV2: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     encryptBlobV2: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     decryptName: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
