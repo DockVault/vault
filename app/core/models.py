@@ -1459,6 +1459,72 @@ class ChunkedUploadSession(Base):
     )
 
 
+
+class VaultMemberIndexKey(Base):
+    """Per-member wrapped copy of a vault's NAME INDEX key.
+
+    Same-name matching in a zero-knowledge vault runs on a blind index -- an HMAC of the filename
+    that the server compares but cannot invert. That HMAC needs a key, and where the key comes from
+    decides whether the guard survives a rekey.
+
+    It used to be derived per rotation, from the DEK and the epoch. A rekey therefore changed the
+    index for every name, so an upload of an existing name could no longer match the stored row:
+    replace-on-clash silently stopped applying, and the check that stops an upload-only credential
+    creating a hidden duplicate silently stopped rejecting. A rotation switched off a guard.
+
+    So the index key lives here instead: minted once per vault, wrapped to each member exactly as
+    the DEK is, and NOT rotated by a rekey. One equality on the server, computable by every member
+    including one who joined after a rotation, and nothing to re-index when membership changes.
+
+    Separate from VaultMemberKey on purpose. That table is keyed per DEK epoch because a member
+    holds one wrapped DEK per epoch they still need; this key has no epoch, so sharing that table
+    would store an identical copy against every epoch row and invite someone to rotate it in step
+    with the DEK -- which is the behaviour being removed.
+
+    `index_key_version` exists for the deliberate, opt-in "rotate name index" operation, which an
+    owner runs when they want filenames created after a removal out of an ex-member's reach. It
+    must never be driven by rekey: rekey is the revocation path, and coupling it to a re-index lets
+    one unreadable filename block an urgent removal.
+
+    What this gives up: a removed member keeps the key, so with database read they can CONFIRM a
+    guessed filename. Not read one -- the name stays sealed under the DEK and the index is one-way.
+    A held index key plus stored index values (which need database access) is a confirmation
+    oracle over filenames, nothing more.
+    """
+    __tablename__ = 'vault_member_index_keys'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    vault_id = Column(UUID(as_uuid=True), ForeignKey('vaults.id', ondelete='CASCADE'), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+
+    # The index key, wrapped to this member's public key. Opaque to the server, like the DEK wrap.
+    encrypted_index_key = Column(Text, nullable=False)
+    ephemeral_public_key = Column(Text, nullable=False)
+    wrapping_algorithm = Column(String(50), default='ECDH-AES-256-GCM')
+
+    # Bumped only by an explicit re-index, never by a DEK rekey. Defaults mirror VaultMemberKey's
+    # key_version: NOT NULL with a server default, so a read path matching on it cannot be
+    # silently defeated by a NULL.
+    index_key_version = Column(Integer, nullable=False, default=1, server_default='1')
+
+    granted_at = Column(DateTime, default=datetime.utcnow)
+    granted_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    revoked_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    is_active = Column(Boolean, default=True)
+
+    vault = relationship('Vault', foreign_keys=[vault_id])
+    user = relationship('User', foreign_keys=[user_id])
+    granter = relationship('User', foreign_keys=[granted_by])
+    revoker = relationship('User', foreign_keys=[revoked_by])
+
+    __table_args__ = (
+        UniqueConstraint('vault_id', 'user_id', 'index_key_version',
+                         name='uq_vault_member_index_key_version'),
+        Index('idx_vault_member_index_key_lookup', 'vault_id', 'user_id'),
+    )
+
+
 class RetiredObjectId(Base):
     """Every object id that has been taken out of circulation, so it can never be re-claimed.
 

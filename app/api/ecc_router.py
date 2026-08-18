@@ -15,7 +15,7 @@ import os
 import json
 import uuid
 from app.core.database import get_db
-from app.core.models import User, Vault, UserKeyPair, VaultMemberKey, ZKShareInvite, ECCRegistrationChallenge, ECCKeyUpdateChallenge, vault_members, RoleEnum
+from app.core.models import User, Vault, UserKeyPair, VaultMemberKey, VaultMemberIndexKey, ZKShareInvite, ECCRegistrationChallenge, ECCKeyUpdateChallenge, vault_members, RoleEnum
 from app.services import ecc_pop, ecc_update_pop
 from app.services.ecc_crypto_service import ECCCryptoService
 from app.services.audit_logger import AuditLogger
@@ -908,6 +908,120 @@ def _rekey_owed(db: Session, vault: Vault) -> bool:
         VaultMemberKey.key_version == cur,
         VaultMemberKey.is_active == False,  # noqa: E712
     ).first() is not None
+
+
+class IndexKeyWrap(BaseModel):
+    """One member's wrapped copy of the vault name-index key."""
+    user_id: str
+    encrypted_index_key: str = Field(..., max_length=8192)
+    ephemeral_public_key: str = Field(..., max_length=8192)
+
+
+class IndexKeyPut(BaseModel):
+    wraps: List[IndexKeyWrap] = Field(..., min_length=1, max_length=512)
+
+
+@router.get("/vaults/{vault_id}/index-key")
+async def get_vault_index_key(
+    vault_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The caller's wrapped copy of this vault's name-index key, or `null` if the vault has none.
+
+    A `null` is an ordinary answer, not an error: vaults created before this key existed do not
+    have one, and a client that gets `null` falls back to the legacy per-epoch derivation. Making
+    it a 404 would force every caller to treat the normal migration state as a failure.
+
+    Gated by the same check that releases the DEK. That is deliberate rather than convenient: this
+    key does not decrypt anything, but it does let its holder CONFIRM a guessed filename against
+    stored indices, so releasing it more freely than the DEK would hand out a capability to
+    principals who cannot read the vault at all.
+    """
+    vault = db.query(Vault).filter(Vault.id == vault_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="Vault not found")
+    if not may_release_vault_key(db, current_user, vault):
+        raise HTTPException(status_code=403, detail="No access to this vault's keys")
+
+    row = db.query(VaultMemberIndexKey).filter(
+        VaultMemberIndexKey.vault_id == vault.id,
+        VaultMemberIndexKey.user_id == current_user.id,
+        VaultMemberIndexKey.is_active == True,  # noqa: E712
+    ).order_by(VaultMemberIndexKey.index_key_version.desc()).first()
+
+    if row is None:
+        return {"index_key": None, "index_key_version": None}
+    return {
+        "index_key": row.encrypted_index_key,
+        "ephemeral_public_key": row.ephemeral_public_key,
+        "index_key_version": row.index_key_version,
+    }
+
+
+@router.put("/vaults/{vault_id}/index-key")
+async def put_vault_index_key(
+    vault_id: str,
+    body: IndexKeyPut,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Store the wrapped name-index key for one or more members.
+
+    Minting is lazy: a vault gains this key the first time a client that can read it posts one,
+    which is what lets existing vaults adopt it without a migration that needs plaintext names.
+
+    **Create-once, at a given version.** If the vault already has active wraps at this version the
+    call is refused with 409 rather than overwriting. Two clients can race to mint the key for the
+    same vault, and last-writer-wins would leave half the members holding a wrap of one key and
+    half a wrap of another -- every index computed under the wrong one, and no error anywhere.
+    Refusing means the loser re-reads and adopts the winner's key, which is the only outcome that
+    keeps a vault's members agreeing on what a name hashes to.
+
+    Authorization is the vault-management gate, not mere read access: handing a member a wrap binds
+    who can compute this vault's name indices, which is the same class of decision as granting a
+    DEK.
+    """
+    _ecc_rate_limit(current_user, "mutate")
+    vault = db.query(Vault).filter(Vault.id == vault_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="Vault not found")
+    if not _can_manage_vault(db, vault, current_user):
+        raise HTTPException(status_code=403,
+                            detail="Only the vault owner or a manager can set the name-index key")
+
+    existing = db.query(VaultMemberIndexKey).filter(
+        VaultMemberIndexKey.vault_id == vault.id,
+        VaultMemberIndexKey.index_key_version == 1,
+        VaultMemberIndexKey.is_active == True,  # noqa: E712
+    ).first()
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="This vault already has a name-index key. Read it rather than minting another.")
+
+    for wrap in body.wraps:
+        try:
+            uid = uuid.UUID(str(wrap.user_id))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="user_id must be a UUID")
+        db.add(VaultMemberIndexKey(
+            vault_id=vault.id,
+            user_id=uid,
+            encrypted_index_key=wrap.encrypted_index_key,
+            ephemeral_public_key=wrap.ephemeral_public_key,
+            granted_by=current_user.id,
+        ))
+    try:
+        db.commit()
+    except IntegrityError:
+        # Lost the mint race against another client between the check above and this commit.
+        # Same answer as finding it already there, because it is the same situation.
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="This vault already has a name-index key. Read it rather than minting another.")
+    return {"status": "ok", "wraps": len(body.wraps), "index_key_version": 1}
 
 
 @router.get("/vaults/{vault_id}/keys", response_model=VaultKeysResponse)
