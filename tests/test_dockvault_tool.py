@@ -1298,14 +1298,21 @@ def test_volume_sets_coexist_and_down_v_removes_only_current_live(tmp_path):
     def exists(name):
         return subprocess.run(["docker", "volume", "inspect", name],
                               capture_output=True, timeout=20).returncode == 0
+    pull = subprocess.run(["docker", "pull", "busybox"],
+                          capture_output=True, text=True, timeout=300)
+    if pull.returncode != 0:
+        pytest.skip("cannot pull busybox: %s" % (pull.stderr or "").strip()[:200])
     try:
         try:
             up_a = dc("dvvolsets-a", "up", "-d")
             up_b = dc("dvvolsets-b", "up", "-d")
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker unavailable: %s" % exc)
-        if up_a.returncode != 0 or up_b.returncode != 0:   # daemon/image unavailable -> skip, not fail
-            pytest.skip("docker compose up failed: %s" % ((up_a.stderr or up_b.stderr) or "")[:200])
+        # The image is local by now, so a failure here is compose or the daemon refusing to do
+        # something they can do -- and the volume-set separation below would go unchecked.
+        assert up_a.returncode == 0 and up_b.returncode == 0, (
+            "could not bring up the two prefixed sets, so nothing about keeping them apart was "
+            "checked: %s" % ((up_a.stderr or up_b.stderr) or "").strip()[:300])
         assert exists(volA) and exists(volB), "two prefixed sets must coexist side by side"
         # down -v on set B removes ONLY B's volume; A is untouched (no cross-set data loss)
         dc("dvvolsets-b", "down", "-v")
@@ -2058,12 +2065,20 @@ def test_cert_readability_probe_and_repair_roundtrip(tmp_path):
     d = tmp_path / "certs"
     d.mkdir()
     mount = str(d).replace("\\", "/")
+    pull = subprocess.run(["docker", "pull", "busybox"],
+                          capture_output=True, text=True, timeout=300)
+    if pull.returncode != 0:
+        pytest.skip("cannot pull busybox: %s" % (pull.stderr or "").strip()[:200])
     seed = subprocess.run(
         ["docker", "run", "--rm", "-v", "%s:/c" % mount, "busybox", "sh", "-c",
          "echo c > /c/cert.pem; echo k > /c/key.pem; chmod 644 /c/cert.pem; chmod 600 /c/key.pem; "
          "chown 0:0 /c/cert.pem /c/key.pem"], capture_output=True, text=True, timeout=300)
-    if seed.returncode != 0:
-        pytest.skip("could not seed the cert dir: %s" % seed.stderr.strip()[:120])
+    # The image is local by now. If the seed still fails, the permissions the assertions below
+    # depend on were never set, and each of them would then be reading a directory that does not
+    # reproduce the reported restart loop at all.
+    assert seed.returncode == 0, (
+        "could not seed the cert dir, so the unreadable-key state under test was never created: "
+        "%s" % seed.stderr.strip()[:300])
     assert dv.cert_readable_by_app_uid(str(d)) is False, "a root-owned 0600 key must read as DENIED"
     assert dv._chown_certs_in_container(str(d)) is True
     assert dv.cert_readable_by_app_uid(str(d)) is True, "the container-side chown must fix it"
