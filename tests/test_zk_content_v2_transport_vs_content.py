@@ -62,3 +62,20 @@ def test_the_two_are_told_apart_by_the_test_a_caller_makes(classified: str) -> N
     """
     assert "ok   a dropped body and damaged content are told apart" in classified, classified
     assert "a dropped connection and a bad file are distinguishable" in classified
+
+
+def test_where_a_wrong_declared_length_is_caught(classified: str) -> None:
+    """Not at the first record, which is what the docstring used to claim.
+
+    The totals bind into the FINAL record's AAD only, so a length short by exactly one record's
+    worth is a valid alternate framing: earlier records authenticate and are handed to the caller,
+    and the read fails at the record the reader believes is final. Measured here at two of four
+    handed over before the refusal.
+
+    That is why the contract requires `write` to put bytes somewhere the caller can still discard.
+    A consumer that releases eagerly — into a download the browser owns, say — publishes a genuine
+    prefix of the object before being told anything is wrong. The claim went unchallenged because
+    the docstring asserted the opposite and nothing tested it.
+    """
+    assert "ok   a length short by one record is refused, not accepted" in classified, classified
+    assert "ok   records are handed over BEFORE the refusal" in classified, classified
