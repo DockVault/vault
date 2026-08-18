@@ -77,10 +77,40 @@ that direction is the one the tests must prove.
   stream.
 - The buffered path is unchanged when nothing is configured, which is the shipped default.
 
+## Measured, before anything was wired to it
+
+The sink was driven end to end against a local secure origin -- register the worker, open a slot,
+write records, trigger the download -- at 8 MiB in 256 KiB records.
+
+| | complete transfer | aborted transfer |
+|---|---|---|
+| Chromium | 8388608 bytes, content byte-exact, correct filename | download appears, `failure='canceled'` |
+| Firefox | 8388608 bytes, content byte-exact | **no download event at all** |
+
+Two things came out of that which change the implementation.
+
+**The download must be triggered by a hidden same-origin iframe, not an anchor.** An anchor
+navigates the DOCUMENT. When the stream then errors, the browser follows that navigation to an
+error page and **the application is destroyed** -- confirmed on Firefox, where the probe's own page
+was gone afterwards. Chromium tolerates it. An iframe confines the failure to the frame, and with
+that change the page survives an abort on both engines. CSP already permits it: `frame-src 'self'`.
+
+**The application must report a failed transfer itself.** Firefox surfaces no download event for an
+aborted stream even with `Content-Length` declared, so the browser's own failure report -- the
+entire remedy available once bytes are on disk -- cannot be relied on. On Chromium it is there and
+accurate; on Firefox the user would otherwise see nothing at all. This settles the second open
+question below.
+
+A methodological note, since it nearly produced a wrong conclusion: the first run declared no
+`Content-Length` on the aborted case, so there was nothing for a short body to be short OF. That is
+not the case the app produces -- it always knows the plaintext length -- and the difference looked
+like a browser behaviour until the probe was corrected.
+
 ## Not established
 
 - Whether the streaming mode should be offered at all below some file size, where buffering costs
   little and leaves nothing behind. A threshold is easy to add and easy to get wrong; no measurement
   yet says where it belongs.
-- Whether a failed streamed download should be reported in-app as well as in the browser's download
-  list. The browser's own report is authoritative but easy to miss.
+- ~~Whether a failed streamed download should be reported in-app~~ -- **settled: required.**
+  Firefox surfaces no download event for an aborted stream, so there is no browser report to rely
+  on there.
