@@ -10640,7 +10640,7 @@ async function uploadFiles(files) {
 
     const existing = new Set((state.currentFiles || []).filter(i => i.type !== 'folder').map(i => i.name));
     const idByName = new Map((state.currentFiles || []).filter(i => i.type !== 'folder').map(i => [i.name, i.id]));
-    const toUpload = [];   // {file, name}
+    let toUpload = [];   // {file, name}
     const toDelete = [];   // existing file ids to remove (overwrite)
     let blanket = null;    // {action} once "apply to all" is chosen
 
@@ -10659,7 +10659,9 @@ async function uploadFiles(files) {
         if (choice.action === 'skip') continue;
         if (choice.action === 'overwrite') {
             const id = idByName.get(file.name);
-            if (id) toDelete.push(id);
+            // The name travels with the id: if the delete fails, the replacement that would have
+            // taken this name has to be dropped, and it is identified by name rather than id.
+            if (id) toDelete.push({ id, name: file.name });
             toUpload.push({ file, name: file.name });
         } else {
             let name = (choice.action === 'rename' && choice.name) ? choice.name : autoName;
@@ -10668,15 +10670,6 @@ async function uploadFiles(files) {
             existing.add(name);
         }
     }
-
-    // Remove overwritten files first so the new upload doesn't collide.
-    for (const id of toDelete) {
-        try {
-            await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${id}/delete`,
-                { method: 'POST', headers: uploadManager._vaultHeaders() });
-        } catch (_) { /* best effort */ }
-    }
-    if (toDelete.length) await loadVaultFiles();
 
     if (toUpload.length) {
         // Zero-knowledge vault: encrypt each file in the browser BEFORE it enters
@@ -10741,7 +10734,41 @@ async function uploadFiles(files) {
                 return;
             }
         }
-        uploadManager.enqueueNamed(toUpload);
+        // The originals go LAST, and only for replacements that are ready to send.
+        //
+        // They used to go first, "so the new upload doesn't collide" -- before the replacement was
+        // encrypted, and with the result of the delete discarded. Any failure in between lost the
+        // original with nothing to recover from, and the failure is not exotic: the encryption
+        // above ends in `return`, so one file throwing abandoned the whole batch after every
+        // original had already been deleted.
+        if (toDelete.length) {
+            const survived = [];
+            for (const target of toDelete) {
+                let gone = false;
+                try {
+                    const r = await fetch(
+                        `${API_BASE}/vaults/${state.currentVault.id}/files/${target.id}/delete`,
+                        { method: 'POST', headers: uploadManager._vaultHeaders() });
+                    gone = r.ok;
+                } catch (_) {
+                    gone = false;
+                }
+                if (!gone) survived.push(target);
+            }
+            if (survived.length) {
+                // The original is still there, so uploading its replacement under the same name
+                // would either be refused or produce a duplicate. Better to say so and change
+                // nothing than to guess: the user still has their file.
+                const stuck = new Set(survived.map(t => t.name));
+                toUpload = toUpload.filter(e => !stuck.has(e.name));
+                showError(`Could not replace ${survived.length} existing file`
+                          + `${survived.length === 1 ? '' : 's'}; `
+                          + `the original${survived.length === 1 ? '' : 's'} are unchanged.`);
+            }
+            await loadVaultFiles();
+        }
+
+        if (toUpload.length) uploadManager.enqueueNamed(toUpload);
     }
 }
 

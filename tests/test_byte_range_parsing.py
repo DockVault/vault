@@ -64,6 +64,16 @@ def test_a_satisfiable_range_resolves_to_inclusive_bounds(header, expected):
     "bytes=0-499,600-700",      # multiple ranges: multipart, deliberately unsupported
     "bytes=-abc",               # a suffix that is not a number
     "bytes=+5-10",              # isdigit() rejects the sign, which is the intent
+    # Characters str.isdigit() accepts and int() refuses. Pairing the two raised ValueError out
+    # of a function whose contract is to ignore what it cannot parse -- which on the download
+    # path became a 500 and an audit row reading "Download failed", for a header a client is
+    # entitled to send badly. Found by review, not by the cases above, because every case above
+    # was written by the same person who wrote the guard.
+    "bytes=²-5",           # superscript two
+    "bytes=0-²",
+    "bytes=-²",
+    "bytes=½-1",           # vulgar fraction one half
+    "bytes=٥-9",           # arabic-indic five: a digit int() DOES accept, but not ASCII
 ])
 def test_anything_unparseable_says_serve_the_whole_thing(header):
     # None, not an exception and not UNSATISFIABLE. RFC 7233 requires a recipient that cannot
