@@ -2233,14 +2233,22 @@ class ECCCryptoLibrary {
      * that completed it -- bounded by the producer's own chunk size, not by the file's.
      *
      * `totalLength` has to come from outside -- a stream does not carry its own size, so in
-     * practice it is the transfer's Content-Length, which the server asserts. That is not a trust
-     * assumption. The chunk count and the plaintext total are derived from it and bound into
-     * every record's AAD, so a length that is wrong by even one byte produces a different total,
-     * and the first record fails to authenticate. A lie shortens nothing; it stops the read.
+     * practice it is the transfer's Content-Length, which the server asserts. A wrong length IS
+     * caught, but it is worth being exact about WHEN, because an earlier version of this comment
+     * was not and a consumer was built on the strength of it.
      *
-     * The same contract as the Blob reader: `write` receives each chunk in order, and this does
-     * not resolve until the final record authenticates, so what has been written is only safe
-     * once it returns.
+     * The chunk count and the plaintext total are derived from the length and bound into the
+     * FINAL record's AAD only -- see `aadFor`, which appends them under `isFinal`. So a declared
+     * length that is wrong by a whole record's worth is a valid alternate framing: the records
+     * before the last one authenticate normally, and the read fails at the record this reader
+     * believes is final. Records already handed to `write` by then are genuine plaintext from
+     * this object, but they are a PREFIX, and the caller has been told nothing yet.
+     *
+     * Hence the contract, which is the same as the Blob reader's and matters more than it looks:
+     * `write` receives each chunk in order, and this does not resolve until the final record
+     * authenticates. What has been written is only safe once it returns -- so `write` must put
+     * bytes somewhere the caller can still discard, and must not hand them anywhere it cannot
+     * take them back from.
      */
     /**
      * Look at the first `n` bytes of a stream without spending them.

@@ -120,6 +120,31 @@ async function main() {
     note(classify(caught).kind === 'content',
         `a cleanly truncated body stays content (got ${JSON.stringify(classify(caught))})`);
 
+    // WHERE a wrong declared length is caught, which is not where the docstring used to claim.
+    // The totals bind into the FINAL record's AAD only, so under-declaring by exactly one
+    // record's worth is a valid alternate framing: earlier records authenticate and are handed
+    // over, and the read fails at the record the reader believes is final. A consumer that
+    // releases eagerly therefore releases a genuine PREFIX of the object before hearing that
+    // anything is wrong -- which is why the contract says write must go somewhere discardable.
+    {
+        const CHUNK = 4096;
+        const STORED = CHUNK + 28;                       // one full record on the wire
+        const plain4 = Uint8Array.from({ length: CHUNK * 4 }, (_, i) => i & 0xff);
+        const enc4 = (await lib.encryptFileV2(plain4, dek, CTX, { chunkSize: CHUNK })).bytes;
+
+        const handed = [];
+        let failed = null;
+        try {
+            await lib.decryptStreamV2(shortStream(enc4, enc4.length), enc4.length - STORED,
+                                      dek, CTX, p => handed.push(p.length));
+        } catch (e) { failed = e; }
+
+        note(failed !== null, 'a length short by one record is refused, not accepted');
+        note(handed.length > 0,
+             `records are handed over BEFORE the refusal (${handed.length} of 4) -- the reason ` +
+             `an eager consumer must be able to discard them`);
+    }
+
     if (failures) { console.error(`${failures} failure(s)`); process.exit(1); }
     console.log('a dropped connection and a bad file are distinguishable');
 }

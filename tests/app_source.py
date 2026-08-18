@@ -92,7 +92,8 @@ def bound_value(call: str, field: str) -> str:
         default=len(scope),
     )
     value = " ".join(scope[i:end].split())
-    # F8: an inline comment is the same value written differently, as a redundant paren is.
+    # An inline comment is the same value written differently, exactly as a redundant
+    # paren is, so it is normalised away rather than treated as a difference.
     value = re.sub(r"/\*.*?\*/", " ", value)
     value = " ".join(value.split())
     while value.startswith("(") and value.endswith(")"):
