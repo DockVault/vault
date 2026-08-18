@@ -410,6 +410,20 @@ jobs:
           VAULT_REDIS_CONTAINER=vault-redis \
             python -m pytest tests/test_login_throttle.py --maxfail=1
 
+      # A browser failure here used to leave only the accessibility dump Playwright prints, which
+      # says what the page contained and not why. One such failure cost an hour of hypotheses --
+      # each plausible, each wrong -- that a picture of the page would have settled at once: an
+      # error toast shows in a screenshot and is absent from the tree. Kept only when something
+      # failed, so a green run uploads nothing.
+      - name: Keep the picture of a failed browser test
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ui-failure-screenshots
+          path: test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Container logs
         if: failure()
         run: docker compose logs --no-color --tail=400
