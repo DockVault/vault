@@ -585,7 +585,9 @@ def test_a_refused_upload_does_not_reserve_space_it_never_uses(admin):
         f"a real upload was answered {stored.status_code} after {refused} refused ones; they left "
         f"their space reservations behind: {stored.text[:200]}")
 
-    admin.delete(f"/vaults/{vid}")
+    # POST /vaults/{id}/delete is the route; DELETE /vaults/{id} is not one, so this
+    # teardown never removed anything and every run of this file left a vault behind.
+    admin.delete_vault(vid)
 
 
 def test_the_request_teardown_never_masks_the_real_answer(admin, temp_user_client, temp_vault):
