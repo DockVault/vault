@@ -10381,8 +10381,26 @@ async def download_file(
         # which makes the cap bypassable by sending a header. Neither is acceptable, and refusing
         # to resume is the only option that leaves the cap meaning what it says.
         rangeable = download.read_range is not None and not share_authorized
+
+        # The stored checksum, as an entity tag. Resuming across two requests is only safe if the
+        # second one is reading the same bytes as the first, and nothing else here establishes
+        # that: a same-name replacement between the two would let a client splice two different
+        # files together and notice nothing, because each half authenticates perfectly well on its
+        # own. Per-record AEAD proves a record belongs to this file; it cannot prove both requests
+        # saw the same version of it.
+        etag = f'"{download.checksum}"' if download.checksum else None
+
+        if_range = request.headers.get('if-range')
+        stale_resume = False
+        if if_range is not None:
+            # Only the entity-tag form is honoured. The date form is accepted syntax we cannot
+            # answer accurately -- last-modified is not tracked to the second here -- and guessing
+            # would defeat the check, so it counts as a mismatch and costs the client a restart
+            # rather than risking a splice.
+            stale_resume = etag is None or if_range.strip() != etag
+
         wanted = (parse_byte_range(request.headers.get('range'), download.total_length)
-                  if rangeable else None)
+                  if rangeable and not stale_resume else None)
 
         if wanted is UNSATISFIABLE:
             # Nothing released or closed here on purpose. No response object exists yet, so the
@@ -10404,9 +10422,16 @@ async def download_file(
                 span touches -- the same guarantee SFTP has always relied on for seeks.
                 """
                 served_bytes = 0
+                cancelled = False
                 try:
                     at = span.start
                     while at <= span.last:
+                        # Cancellation is checked here for the same reason the whole-file path
+                        # checks it: an operator can stop a transfer, and a ranged one is still a
+                        # transfer. Without this, Cancel would appear to do nothing.
+                        if tracker_started and tracker.is_cancelled(operation_id):
+                            cancelled = True
+                            break
                         if await request.is_disconnected():
                             break
                         piece = download.read_range(at, min(_RANGE_WINDOW, span.last - at + 1))
@@ -10423,6 +10448,48 @@ async def download_file(
                 finally:
                     download.close()
                     transfer_admission.release(transfer_slot)
+
+                    # The operation was started before this branch was chosen, and only the
+                    # whole-file generator's teardown completes one. Without this a ranged
+                    # download leaves an in_progress record in Redis that nothing ever closes,
+                    # and the transfer shows as running for as long as the key survives.
+                    transition = None
+                    if tracker_started and not cancelled:
+                        try:
+                            transition = tracker.complete_operation(
+                                operation_id,
+                                success=(served_bytes == span.length),
+                            )
+                        except Exception:      # noqa: BLE001 - a bookkeeping write, not the body
+                            transition = None
+
+                    # Emitted for the same reason the whole-file path emits one: this is where
+                    # bytes served are counted. Leaving it out would make ranged transfers
+                    # invisible in the activity feed and absent from traffic accounting, so a
+                    # resuming client would move real bytes that nothing added up.
+                    if transition is not None:
+                        try:
+                            broadcast_event({
+                                "event": {
+                                    "type": "download",
+                                    "title": ("File downloaded (range)"
+                                              if served_bytes == span.length
+                                              else "Ranged download interrupted"),
+                                    "description": (
+                                        f"{disp_name} (bytes {span.start}-{span.last} of "
+                                        f"{span.total}, {served_bytes:,} transferred)"
+                                    ),
+                                    "user": current_user.username,
+                                    "ip": request_ip,
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "operation_id": operation_id,
+                                    "completed": served_bytes == span.length,
+                                },
+                                "traffic": {"upload": 0, "download": served_bytes},
+                            })
+                        except Exception:      # noqa: BLE001 - telemetry must not kill a response
+                            pass
+
                     try:
                         audit_logger.log_action(
                             user_id=current_user.id,
@@ -10440,18 +10507,26 @@ async def download_file(
             # Assigned to the name the teardown checks. It keys on whether a response exists,
             # not on the slot -- so a response held in any other variable would be torn down
             # while the generator serving it was still running.
+            range_headers = {
+                'Content-Disposition': _content_disposition(disp_name),
+                'Content-Length': str(wanted.length),
+                'Content-Range': wanted.content_range(),
+                'Accept-Ranges': 'bytes',
+                'Cache-Control': 'no-cache',
+                'X-Operation-ID': operation_id,
+            }
+            if etag:
+                # Conditional, because a row stored without a checksum has no tag to send and a
+                # None here would fail header encoding -- turning a served range into a 500. Such
+                # a client simply cannot detect a replacement mid-resume, which is a weaker
+                # position than an ETag buys but not a worse one than it had before ranges.
+                range_headers['ETag'] = etag
+
             streaming_response = StreamingResponse(
                 range_streamer(wanted),
                 status_code=status.HTTP_206_PARTIAL_CONTENT,
                 media_type=_safe_media_type(mime_type),
-                headers={
-                    'Content-Disposition': _content_disposition(disp_name),
-                    'Content-Length': str(wanted.length),
-                    'Content-Range': wanted.content_range(),
-                    'Accept-Ranges': 'bytes',
-                    'Cache-Control': 'no-cache',
-                    'X-Operation-ID': operation_id,
-                },
+                headers=range_headers,
             )
             # `transfer_slot` deliberately NOT cleared. The generator's teardown reads the
             # variable, not a captured value, so nulling it here would leave the real token
@@ -10470,6 +10545,10 @@ async def download_file(
             # Advertised only where it is true. Claiming it for a file that would answer a range
             # by decrypting all of itself invites exactly the request that costs the most.
             headers['Accept-Ranges'] = 'bytes'
+            if etag:
+                # Sent with the whole-file response too, because that is where a client learns
+                # the tag it will quote back in If-Range when it comes to resume.
+                headers['ETag'] = etag
 
         streaming_response = StreamingResponse(
             file_streamer(),

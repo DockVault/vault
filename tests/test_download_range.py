@@ -227,3 +227,85 @@ def test_a_shared_download_ignores_a_range_and_still_costs_exactly_one(admin, te
             "the cap did not engage, so a Range header bought downloads that were not counted")
     finally:
         admin.delete(f"/vaults/{vault['id']}")
+
+
+# --- resuming safely across two requests -----------------------------------------------------
+#
+# A range is only safe to splice onto an earlier one if both requests read the same bytes.
+# Nothing else on this path establishes that: a same-name replacement between them would let a
+# client assemble two different files and notice nothing, because each half authenticates
+# perfectly well on its own. Per-record AEAD proves a record belongs to this file; it cannot prove
+# two requests saw the same version of it. That is what the entity tag is for.
+
+def test_a_rangeable_download_offers_a_tag_to_resume_against(admin, stored_file):
+    vid, fid = stored_file
+    whole = admin.get(f"/vaults/{vid}/files/{fid}/download")
+    assert whole.status_code == 200
+    tag = whole.headers.get("ETag")
+    assert tag, "without a tag a client has nothing to quote back, so it cannot resume safely"
+
+    ranged = admin.get(f"/vaults/{vid}/files/{fid}/download",
+                       headers={"Range": "bytes=0-99"})
+    assert ranged.status_code == 206
+    assert ranged.headers.get("ETag") == tag, (
+        "the tag must be the same on both, or a client cannot tell the two responses describe "
+        "one file")
+
+
+def test_a_resume_quoting_the_current_tag_is_honoured(admin, stored_file):
+    vid, fid = stored_file
+    tag = admin.get(f"/vaults/{vid}/files/{fid}/download").headers.get("ETag")
+    r = admin.get(f"/vaults/{vid}/files/{fid}/download",
+                  headers={"Range": "bytes=1000-1999", "If-Range": tag})
+    assert r.status_code == 206, r.text
+    assert r.content == BODY[1000:2000]
+
+
+@pytest.mark.parametrize("if_range", [
+    '"sha256-of-some-other-file"',
+    '"”"',
+    "Wed, 21 Oct 2015 07:28:00 GMT",     # the date form: accepted syntax we cannot answer
+])
+def test_a_resume_quoting_anything_else_restarts_instead_of_splicing(admin, stored_file, if_range):
+    """The whole file, with a 200, rather than a range a client would append to stale bytes.
+
+    Costing a restart is the point. The alternative is a silently corrupt file assembled from two
+    versions, which no checksum the client holds would catch either, since it never had one for
+    the file it ended up with.
+    """
+    vid, fid = stored_file
+    r = admin.get(f"/vaults/{vid}/files/{fid}/download",
+                  headers={"Range": "bytes=1000-1999", "If-Range": if_range})
+    assert r.status_code == 200, (
+        f"If-Range {if_range!r} did not match, so the range must not be honoured")
+    assert "Content-Range" not in r.headers
+    assert r.content == BODY
+
+
+def test_replacing_the_file_invalidates_a_resume_in_flight(admin, temp_vault):
+    """The scenario the tag exists for, driven end to end.
+
+    Download part of a file, replace it, then resume with the tag from before. The server must
+    refuse to serve the range against bytes the client has never seen.
+    """
+    skip_if_container_absent()
+    vid = temp_vault["id"]
+    name = unique("replaced") + ".bin"
+    fid = _upload(admin, vid, name, BODY)
+    url = f"/vaults/{vid}/files/{fid}/download"
+
+    first = admin.get(url, headers={"Range": "bytes=0-999"})
+    assert first.status_code == 206, first.text
+    tag = first.headers.get("ETag")
+    assert tag
+
+    replacement = bytes((i * 5 + 11) & 0xFF for i in range(len(BODY)))
+    admin.delete(f"/vaults/{vid}/files/{fid}")
+    new_fid = _upload(admin, vid, name, replacement)
+
+    resumed = admin.get(f"/vaults/{vid}/files/{new_fid}/download",
+                        headers={"Range": "bytes=1000-1999", "If-Range": tag})
+    assert resumed.status_code == 200, (
+        "the stored bytes changed, so the old tag must not buy a range that would be spliced "
+        "onto the first thousand bytes of a file that no longer exists")
+    assert resumed.content == replacement
