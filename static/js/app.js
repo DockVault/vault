@@ -8444,6 +8444,19 @@ async function zkMaybeDecryptBlob(blob, vault, keyVersion = null, fileId = null)
 // Nothing is shown before it authenticates. The reader resolves only once the final record
 // verifies, and the caller builds the object URL from what this returns, so a failure throws with
 // the parts still unreferenced.
+// How many times a dropped connection is resumed before the transfer is called failed. Small on
+// purpose: each attempt costs a request, and a link that drops four times in one file is not
+// going to deliver it.
+const ZK_RESUME_ATTEMPTS = 3;
+
+function zkDownloadHeaders() {
+    const headers = { 'Authorization': `Bearer ${authToken}` };
+    if (state.currentVault && state.currentVault.has_password && state.vaultPassword) {
+        headers['X-Vault-Password'] = state.vaultPassword;
+    }
+    return headers;
+}
+
 // --- streaming download sink ------------------------------------------------------------------
 //
 // Writes decrypted records straight into a download instead of accumulating them. Used only when
@@ -8530,8 +8543,13 @@ async function dvOpenDownloadSink({ filename, size, mime }) {
  *
  * Three outcomes, and the caller must distinguish them:
  *   `true`     - the download is under way; nothing more to do.
- *   `false`    - streaming was not possible and NOTHING was written. Fall back, but note the
- *                response body has been read from, so the caller must re-fetch.
+ *   `false`    - streaming was never entered: no sink was opened and nothing was written. Fall
+ *                back, but note the response body has been read from, so the caller must
+ *                re-fetch. Returned ONLY before the sink exists. Once it does, a failure is
+ *                `'failed'` however few records went out -- the stream has been errored, so a
+ *                failed download entry already exists, and reporting "nothing was written" would
+ *                send the caller off to fetch the whole object again to retry a failure that
+ *                will repeat.
  *   `'failed'` - bytes were written and the transfer then failed. There may be a partial file in
  *                the user's downloads, and the app must say so, because the browser may not.
  *
@@ -8568,20 +8586,66 @@ async function zkTryStreamedDownload(response, vault, keyVersion, fileId, fileNa
     });
     if (!sink) return false;
 
-    let wrote = false;
-    try {
-        const { dek, context } = await zkResolveKey(vault, keyVersion, fileId);
-        await lib.decryptStreamV2(peeked.stream, declared, dek, context, piece => {
-            wrote = true;
-            sink.write(piece);
-        });
-        sink.done();
-        return true;
-    } catch (error) {
-        sink.abort(error && error.code ? error.code : 'failed');
-        // Nothing written means nothing reached the disk, so this is still a clean fallback --
-        // the sink was opened but the download has no bytes and will simply fail empty.
-        return wrote ? 'failed' : false;
+    const { dek, context } = await zkResolveKey(vault, keyVersion, fileId);
+    const etag = response.headers.get('ETag');
+
+    let records = 0;                       // records HANDED OVER, which is what may be resumed from
+    let stream = peeked.stream;
+    let startRecord = 0;
+    let attempts = 0;
+
+    for (;;) {
+        try {
+            await lib.decryptStreamV2(stream, declared, dek, context, piece => {
+                records += 1;
+                sink.write(piece);
+            }, startRecord > 0 ? { startRecord, header: peeked.head } : undefined);
+            sink.done();
+            return true;
+        } catch (error) {
+            // Retry only what a retry can fix. A coded failure means the bytes that arrived do
+            // not authenticate under the key and index they claim -- re-requesting the same range
+            // returns the same bytes and fails identically, so a loop here would spin while
+            // looking, from outside, like a flaky network.
+            const transport = !isCodedCryptoError(error);
+            if (!transport || attempts >= ZK_RESUME_ATTEMPTS || !etag) {
+                sink.abort(error && error.code ? error.code : 'failed');
+                return 'failed';
+            }
+
+            attempts += 1;
+            let resume;
+            try {
+                resume = lib.v2ContentResumeOffset(peeked.head, declared, records);
+            } catch (_) {
+                sink.abort('resume-offset');
+                return 'failed';
+            }
+            if (resume.done) { sink.done(); return true; }
+
+            let next;
+            try {
+                next = await fetch(
+                    `${API_BASE}/vaults/${vault.id}/files/${fileId}/download`,
+                    { headers: { ...zkDownloadHeaders(), 'Range': `bytes=${resume.offset}-`,
+                                 'If-Range': etag } });
+            } catch (_) {
+                sink.abort('reconnect-failed');
+                return 'failed';
+            }
+
+            // A 200 where a range was asked for means the entity tag no longer matches: the object
+            // changed under the resume. Bytes are already in the download and a stream cannot be
+            // rewound, so this cannot restart -- it can only fail honestly. Appending the new
+            // version to the old one is the splice the tag exists to prevent.
+            if (next.status !== 206 || !next.body) {
+                sink.abort('object-changed');
+                return 'failed';
+            }
+
+            stream = next.body;
+            startRecord = records;
+        }
     }
 }
 
