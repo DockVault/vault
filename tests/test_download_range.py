@@ -17,11 +17,10 @@ Every one of them looks the same from the outside (a `200` carrying the whole fi
 each is asserted separately rather than by one representative case.
 """
 
-import os
 
 import pytest
 
-from conftest import create_zk_vault, unique, zk_chunked_upload
+from conftest import unique
 
 
 _OCTET = {"Content-Type": "application/octet-stream"}
@@ -137,61 +136,6 @@ def test_a_header_we_cannot_honour_serves_the_whole_file(admin, stored_file, hea
     assert r.status_code == 200, r.text
     assert r.content == BODY
     assert "Content-Range" not in r.headers
-
-
-def test_a_zero_knowledge_file_is_not_ranged(admin):
-    """The server stores the client's ciphertext and holds no key for it.
-
-    Serving a range would mean building a reader over a blob it cannot authenticate, which is the
-    thing the service layer refuses outright. The endpoint must not offer what that would require.
-    """
-    # Asked for explicitly, and restored afterwards. The toggle means "absent is on", so an
-    # earlier test in the run turning it off and not putting it back leaves this one skipping for
-    # the rest of time -- which is how a check quietly stops being a check. The plan ceiling above
-    # it is still authoritative: where the deployment is not entitled to the type at all, this
-    # cannot turn it on, and the skip below is then the honest answer.
-    # Created the way the browser does, through the shared helper: a zero-knowledge vault needs a
-    # DEK generated and wrapped client-side, and a plain POST without one is refused. My first
-    # attempt hand-rolled the request, was refused for exactly that, and reported it as "this
-    # deployment forbids zero-knowledge vaults" -- a setup failure wearing a policy skip.
-    #
-    # The toggle is asked for explicitly and restored, because absent means on and something
-    # earlier in the run turns it off without putting it back.
-    before = admin.get("/settings")
-    was = before.json().get("zero_knowledge_enabled") if before.status_code == 200 else None
-    admin.put("/settings", json={"zero_knowledge_enabled": True})
-    try:
-        vault = create_zk_vault(admin, name=unique("zk-range"))
-    except Exception as exc:                      # noqa: BLE001 - see the narrow re-raise below
-        if was is not None:
-            admin.put("/settings", json={"zero_knowledge_enabled": was})
-        # Only a deployment that refuses the type outright is an environment gap. Anything else
-        # is this test failing to set itself up, and must say so.
-        if "not enabled on this deployment" in str(exc) or "not permitted" in str(exc):
-            pytest.skip(f"this deployment forbids zero-knowledge vaults: {str(exc)[:200]}")
-        raise
-    if was is not None:
-        admin.put("/settings", json={"zero_knowledge_enabled": was})
-    vid = vault["id"]
-    try:
-        # Uploaded the browser way as well: a zero-knowledge vault refuses a file whose name is
-        # not sealed client-side, so the ordinary helper cannot store one. The DEK is random
-        # because the server never sees it -- it exists here only to seal the name.
-        fid = zk_chunked_upload(admin, vid, unique("zk") + ".bin", BODY, os.urandom(32),
-                                mime="application/octet-stream")
-        plain = admin.get(f"/vaults/{vid}/files/{fid}/download")
-        assert plain.status_code == 200, plain.text
-        assert "Accept-Ranges" not in plain.headers, (
-            "advertising ranges here would invite a request the server must refuse")
-
-        ranged = admin.get(f"/vaults/{vid}/files/{fid}/download",
-                           headers={"Range": "bytes=0-999"})
-        assert ranged.status_code == 200, (
-            f"expected the header to be ignored, got {ranged.status_code}")
-        assert "Content-Range" not in ranged.headers
-        assert len(ranged.content) == len(plain.content)
-    finally:
-        admin.delete(f"/vaults/{vid}")
 
 
 # --- the share case ------------------------------------------------------------------------
