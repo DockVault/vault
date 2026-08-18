@@ -64,6 +64,7 @@ from app.services.download_stream import (
 #: path is bounded: a client naming a two-gigabyte range must not turn into a
 #: two-gigabyte allocation. The reader decrypts only the records a window touches.
 _RANGE_WINDOW = 256 * 1024
+from app.core import download_sink as _download_sink
 from app.services import log_pull  # pure helpers for the authenticated log-pull endpoint
 from app.core.security import (
     create_access_token, verify_access_token, EncryptionError, ObjectChangedDuringRead,
@@ -2206,6 +2207,18 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
         if bool_key in payload and not isinstance(payload[bool_key], bool):
             raise HTTPException(status_code=400, detail=f"{bool_key} must be true or false")
 
+    # Where a decrypted download is written. Refused here rather than tolerated, because the read
+    # path deliberately falls back on anything it cannot parse -- so a typo would silently mean
+    # "user_choice" and an administrator would believe they had required something.
+    if "download_sink_policy" in payload:
+        value = payload["download_sink_policy"]
+        if not isinstance(value, str) or value not in _download_sink.ORG_POLICIES:
+            raise HTTPException(
+                status_code=400,
+                detail="download_sink_policy must be one of: "
+                       + ", ".join(sorted(_download_sink.ORG_POLICIES)),
+            )
+
     # Brand fields (app_name, tagline, company, support email, key URLs, the 8 theme
     # colours, copyright) are mirrored into the effective-branding override by
     # update_settings, so a bad value would rebrand the shell or inject into :root —
@@ -2986,8 +2999,31 @@ async def reset_brand_asset(
     return {"status": "ok", "slot": slot}
 
 
+def _resolved_download_sink(request: Request, db: Session, user: User) -> dict:
+    """Organisation policy, the user's preference, and what the browser can actually do.
+
+    The secure-context question is answered from the externally-visible scheme, honouring
+    X-Forwarded-Proto from a trusted proxy -- the same helper the security headers use -- because
+    a deployment behind a TLS-terminating proxy IS a secure context to the browser even though
+    uvicorn saw plain HTTP. Loopback counts too: browsers treat it as trustworthy.
+    """
+    from app.core.models import SystemSetting, UserPreference
+
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    org_policy = (row.value or {}).get("download_sink_policy") if row else None
+
+    pref_row = db.query(UserPreference).filter(UserPreference.user_id == user.id).first()
+    user_pref = (pref_row.preferences or {}).get("download_sink") if pref_row else None
+
+    host = (request.url.hostname or "").lower()
+    secure = _external_scheme(request) == "https" or host in ("localhost", "127.0.0.1", "::1")
+
+    return _download_sink.describe_download_sink(org_policy, user_pref, secure_context=secure)
+
+
 @app.get("/zk-enabled")
 async def get_zk_enabled(
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -3023,6 +3059,12 @@ async def get_zk_enabled(
         "allowed_vault_types": sorted(allowed),
         # Idle auto-lock for the in-memory ZK key (minutes; 0 = disabled). Enforced client-side.
         "zk_idle_lock_minutes": _zk_idle_lock_minutes(db),
+        # Where this user's decrypted downloads go, already resolved: organisation policy, the
+        # user's preference when the organisation delegates, and whether the browser can register
+        # a service worker here at all. Resolved server-side so the client has one answer to act
+        # on rather than three inputs to combine -- and so the three ways of arriving at
+        # "buffered" stay distinguishable in the UI.
+        "download_sink": _resolved_download_sink(request, db, current_user),
     }
 
 
@@ -4259,6 +4301,9 @@ _PREF_ALLOWED = {
     "vault_sort": {"name", "size", "files", "created", "viewed"},
     "vault_sort_dir": {"asc", "desc"},
     "vault_fav_group": {"first", "last", "mixed"},
+    # Where this user's decrypted downloads are written, when the organisation delegates the
+    # choice. Consulted only then -- see app/core/download_sink.py for the precedence.
+    "download_sink": {"buffered", "streaming"},
 }
 
 
@@ -4284,6 +4329,7 @@ class PreferencesUpdate(BaseModel):
     vault_sort: Optional[str] = None
     vault_sort_dir: Optional[str] = None
     vault_fav_group: Optional[str] = None
+    download_sink: Optional[str] = None
 
 
 @app.get("/users/me/preferences")
