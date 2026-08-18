@@ -86,7 +86,6 @@ def test_a_rangeable_file_says_so(admin, stored_file):
     ("bytes=-1000", len(BODY) - 1000, len(BODY) - 1),   # suffix
     ("bytes=0-0", 0, 0),                            # exactly one byte
     ("bytes=131070-131074", 131070, 131074),        # straddles a record boundary
-    ("bytes=0-99999999", 0, len(BODY) - 1),         # past the end, clamped not refused
 ])
 def test_a_range_returns_exactly_those_bytes(admin, stored_file, header, start, last):
     vid, fid = stored_file
@@ -113,6 +112,18 @@ def test_a_range_covering_everything_is_served_as_the_whole_file(admin, stored_f
         f"that skips the checksum: {r.status_code}")
     assert "Content-Range" not in r.headers
     assert r.content == BODY
+
+    # An end past the end clamps to the same span, and must land the same way. This is the
+    # likelier spelling in the wild -- a client that does not know the length asks for a big
+    # number rather than for `bytes=0-`. It was previously asserted to be a 206, which is how
+    # this rule was found to be one header away from skippable.
+    clamped = admin.get(f"/vaults/{vid}/files/{fid}/download",
+                        headers={"Range": "bytes=0-99999999"})
+    assert clamped.status_code == 200, (
+        f"a range clamped to the whole object must take the same path as one written that way, "
+        f"not a 206 that skips the checksum: {clamped.status_code}")
+    assert "Content-Range" not in clamped.headers
+    assert clamped.content == BODY, "clamping past the end must not truncate or refuse"
 
     # A range that stops one byte short is still a real range, so it keeps the 206 path.
     partial = admin.get(f"/vaults/{vid}/files/{fid}/download",
