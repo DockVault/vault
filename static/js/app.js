@@ -8405,9 +8405,14 @@ async function zkMaybeDecryptBlob(blob, vault, keyVersion = null, fileId = null)
     const lib = eccLib();
     const type = blob.type || 'application/octet-stream';
 
-    // Chunk-framed content can be read a record at a time, so the tab never holds the file. The
-    // older whole-file format cannot: its tag covers everything, so nothing can be released until
-    // all of it has arrived, and that is a property of the file rather than of this code.
+    // Chunk-framed content can be read a record at a time, so no single buffer ever holds the
+    // whole plaintext. That is worth having, but it is a smaller claim than it sounds: the parts
+    // are real bytes, and measurement puts the tab's resident memory at roughly one copy of the
+    // file regardless. See the download-sink design note for the numbers.
+    //
+    // The older whole-file format cannot even do this much: its tag covers everything, so nothing
+    // can be released until all of it has arrived, and that is a property of the file rather than
+    // of this code.
     const head = new Uint8Array(await blob.slice(0, 8).arrayBuffer());
     if (lib.decryptBlobV2 && lib._inspectV2Header(head) === 'UNSUPPORTED') {
         const parts = [];
@@ -8419,12 +8424,17 @@ async function zkMaybeDecryptBlob(blob, vault, keyVersion = null, fileId = null)
     return new Blob([plain], { type });
 }
 
-// Decrypt a download AS IT ARRIVES, so the response is never held whole.
+// Decrypt a download AS IT ARRIVES, so the ciphertext is never materialised whole.
 //
-// The blob form above already avoids keeping the plaintext and the ciphertext copy, but it still
-// needs the whole response to exist first. Reading from the body instead removes the last
-// whole-file object: what stays in the tab is one record, and the accumulated plaintext is Blob
-// parts the browser can place where it likes.
+// The blob form above still needs the entire response to exist as one object before it can start.
+// Reading from the body removes that object: the ciphertext arrives as records and is consumed as
+// it arrives.
+//
+// What this does NOT do is keep the file out of the tab, and an earlier version of this comment
+// said it did. Measured on Chromium at 16, 64 and 128 MiB, resident memory grows by about one
+// copy of the plaintext whichever way the parts are accumulated -- as Blob parts, or staged in
+// the origin-private file system, which was the alternative built to beat it and did not. One
+// copy of the plaintext is the floor for any sink that ends in an object URL.
 //
 // Three things have to be true, and any of them missing is a reason to fall back rather than an
 // error: a body to read, a declared length to derive the framing from, and a header that says
