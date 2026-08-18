@@ -1890,25 +1890,103 @@ class ECCCryptoLibrary {
             const n = Math.max(1, Math.ceil(total / chunkSize));
             const totals = { totalChunks: n, totalPlaintext: total };
 
-            const parts = [t.fileHeader];
-            for (let i = 0; i < n; i++) {
-                const isFinal = (i === n - 1);
-                const nonce = this._randomBytes(12);
-                const sealed = await this._subtle().encrypt(
-                    {
-                        name: this.AES_ALGORITHM,
-                        iv: nonce,
-                        additionalData: t.aadFor(i, isFinal, totals),
-                        tagLength: this.AES_TAG_LENGTH,
-                    },
-                    key,
-                    plain.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, total)),
-                );
-                parts.push(nonce, new Uint8Array(sealed));
-            }
+            const parts = await this._sealV2Chunks(
+                key, t, totals, chunkSize, n,
+                i => plain.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, total)));
             return {
                 bytes: this._concatBytes(parts),
-                blobId: [...blobId].map(b => b.toString(16).padStart(2, '0')).join(''),
+                blobId: this._hex(blobId),
+            };
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, W);
+        }
+    }
+
+
+    /**
+     * Seal the chunk sequence of a version-2 content file.
+     *
+     * Lifted out of the writer so that the two entry points below cannot drift. `readChunk` is
+     * given a chunk index and returns that chunk's plaintext -- from memory for a caller that
+     * already holds the file, or from a slice for one that does not. Nothing else differs between
+     * them, so the bytes they emit are identical by construction rather than because two loops
+     * were kept in agreement by review.
+     *
+     * Returns the header followed by (nonce, sealed) for every chunk, in order.
+     */
+    async _sealV2Chunks(key, t, totals, chunkSize, n, readChunk) {
+        const parts = [t.fileHeader];
+        for (let i = 0; i < n; i++) {
+            const isFinal = (i === n - 1);
+            const nonce = this._randomBytes(12);
+            const sealed = await this._subtle().encrypt(
+                {
+                    name: this.AES_ALGORITHM,
+                    iv: nonce,
+                    additionalData: t.aadFor(i, isFinal, totals),
+                    tagLength: this.AES_TAG_LENGTH,
+                },
+                key,
+                await readChunk(i),
+            );
+            parts.push(nonce, new Uint8Array(sealed));
+        }
+        return parts;
+    }
+
+    _hex(bytes) {
+        return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    /**
+     * Encrypt a Blob or File to version-2 content WITHOUT reading it whole.
+     *
+     * Same grammar, same transcript, same framing as encryptFileV2 -- the only difference is where
+     * each chunk's plaintext comes from. That matters for what the tab costs: reading the file
+     * first puts the plaintext in the heap, the sealed copy joins it, and the peak lands near
+     * three times the file. Here the heap holds one slice and one sealed chunk at a time, whatever
+     * the file weighs.
+     *
+     * The header can still be written before any byte is read because everything it binds is
+     * known from `blob.size` -- the chunk count and the plaintext total -- so this needs no second
+     * pass and no revision of the bound counts.
+     *
+     * Returns a Blob rather than a Uint8Array, deliberately. Handing back one array would put the
+     * whole ciphertext back in the heap at the last moment and give away what the slicing saved;
+     * a Blob lets the browser keep the accumulated parts wherever it likes, and the uploader
+     * already sends slices.
+     */
+    async encryptBlobV2(blob, vaultDEK, context, options) {
+        const W = 'encryptBlobV2';
+        try {
+            if (!blob || typeof blob.slice !== 'function' || typeof blob.size !== 'number') {
+                this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.blob');
+            }
+            const opts = options || {};
+            const blobId = this._randomBytes(16);
+            const ctx = context || {};
+            const t = this._v2ContentTranscript(
+                ctx.vaultId, ctx.objectId, ctx.dekEpoch,
+                opts.chunkSize === undefined ? this.V2_CONTENT_CHUNK_DEFAULT : opts.chunkSize,
+                blobId);
+            const chunkSize = t.chunkSize;
+            const key = await this._deriveV2ContentKey(vaultDEK, t.info);
+
+            const total = blob.size;
+            // One empty chunk for an empty file, and no trailing empty chunk for an exact
+            // multiple -- the same rule as the buffered writer, for the same reason: a reader has
+            // to find a chunk marked final.
+            const n = Math.max(1, Math.ceil(total / chunkSize));
+            const totals = { totalChunks: n, totalPlaintext: total };
+
+            const parts = await this._sealV2Chunks(
+                key, t, totals, chunkSize, n,
+                async i => new Uint8Array(await blob
+                    .slice(i * chunkSize, Math.min((i + 1) * chunkSize, total))
+                    .arrayBuffer()));
+            return {
+                blob: new Blob(parts),
+                blobId: this._hex(blobId),
             };
         } catch (error) {
             throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, W);
