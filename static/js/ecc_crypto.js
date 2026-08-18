@@ -2292,6 +2292,37 @@ class ECCCryptoLibrary {
         return { head, stream: replay };
     }
 
+    /**
+     * Where a resumed download must ask the server to start.
+     *
+     * Not "how many bytes arrived". Bytes that arrived prove nothing -- a record is worth keeping
+     * only once it has authenticated, and the reader hands each one to `write` at exactly that
+     * moment. So the client counts what it kept, and this converts that count into an offset into
+     * the stored object.
+     *
+     * Every chunk but the last occupies the same stored size, which is what makes the arithmetic
+     * a multiplication rather than a walk: the framing comes from the stored LENGTH, so a resuming
+     * client needs the header and the length and nothing it has to have remembered.
+     *
+     * Returns `{ offset, records, done }`. `offset` is a byte position to put in a Range header;
+     * `done` says the object is already complete and no request is needed.
+     */
+    v2ContentResumeOffset(header, totalLength, recordsDone) {
+        const W = 'resume';
+        const f = this._v2ContentFraming(header, totalLength, W);
+        if (!Number.isSafeInteger(recordsDone) || recordsDone < 0 || recordsDone > f.n) {
+            // Out of range is not clamped. A caller that has lost count must start over rather
+            // than be handed a plausible offset, because resuming at the wrong boundary produces
+            // a file that fails to authenticate and looks like corruption instead of a bug here.
+            this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.recordsDone');
+        }
+        return {
+            offset: recordsDone >= f.n ? totalLength : f.H + recordsDone * f.S,
+            records: f.n,
+            done: recordsDone >= f.n,
+        };
+    }
+
     async decryptStreamV2(stream, totalLength, vaultDEK, context, write) {
         const W = 'decryptStreamV2';
         try {
@@ -2882,6 +2913,7 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     decryptFileV2: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
     decryptBlobV2: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
     decryptStreamV2: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
+    v2ContentResumeOffset: CRYPTO_ERROR_CODES.CONTENT_INVALID,
     encryptFileV2: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     encryptBlobV2: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     decryptName: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
