@@ -8106,16 +8106,32 @@ def _principal_can_replace_file(db, user, vault_id) -> bool:
     return PermissionService(db).can_access_vault(user, vault_id, VaultPermissionEnum.DELETE)
 
 
-def _file_name_match(db, vault, vault_id, filename, name_bi):
+def _file_name_match(db, vault, vault_id, filename, name_bi, name_bi_candidates=None):
     """Build the SQLAlchemy same-name filter for a File in a vault. Zero-knowledge vaults
     match on the CLIENT-supplied blind index (the server has no plaintext to compare);
-    Standard/legacy vaults match on the plaintext name (via the blind index or column)."""
+    Standard/legacy vaults match on the plaintext name (via the blind index or column).
+
+    `name_bi_candidates`, when given, is the SET a zero-knowledge name may match under. A ZK name
+    index is keyed per (DEK, epoch), so a file sealed before a rotation carries an index at an old
+    epoch that the uploader's single current-epoch `name_bi` cannot equal -- and the clash goes
+    unseen. The client therefore sends every epoch's candidate (plus, once the vault has one, the
+    rotation-independent index-key value); this matches the union with `IN`. It is a superset of
+    the single-value match -- `name_bi` itself is expected to be among the candidates -- so it never
+    matches FEWER rows, only the older ones the single value missed. Absent/empty preserves the
+    exact prior behaviour for an old client."""
+    if name_bi_candidates:
+        # De-duplicated, and any stray non-string dropped so a malformed element cannot turn the
+        # IN into a type error on the query.
+        vals = [c for c in dict.fromkeys(name_bi_candidates) if isinstance(c, str)]
+        if vals:
+            return File.name_bi.in_(vals)
     if name_bi is not None:
         return File.name_bi == name_bi
     return _name_match_filter(File, vault, filename)
 
 
-def _reject_unreplaceable_upload(db, vault_id, folder_id, filename, user, name_bi=None):
+def _reject_unreplaceable_upload(db, vault_id, folder_id, filename, user, name_bi=None,
+                                name_bi_candidates=None):
     """Same-name upload policy = REPLACE. Pre-check before the bytes flow: if a
     file with this name already exists in the folder, the uploader must be able to
     delete it. A principal lacking file.delete (a scoped upload-only temp cred) is
@@ -8128,7 +8144,7 @@ def _reject_unreplaceable_upload(db, vault_id, folder_id, filename, user, name_b
     clash = db.query(File).filter(
         File.vault_id == vault_id,
         File.folder_id == folder_id,
-        _file_name_match(db, vault, vault_id, filename, name_bi),
+        _file_name_match(db, vault, vault_id, filename, name_bi, name_bi_candidates),
     ).first()
     if clash is not None and not _principal_can_replace_file(db, user, vault_id):
         shown = f"'{filename}' " if filename else ""
@@ -9086,6 +9102,14 @@ class ChunkedUploadInit(BaseModel):
     enc_name: Optional[str] = None
     enc_mime: Optional[str] = None
     name_bi: Optional[str] = Field(None, max_length=64)  # stored in a VARCHAR(64) column
+    # Zero-knowledge only: extra blind-index values to MATCH this name against, beyond the single
+    # `name_bi` stored on the finished row. A ZK name index is per (DEK, epoch); after a rotation a
+    # pre-existing file's index sits at an old epoch that the uploader's current-epoch `name_bi`
+    # cannot equal, so a same-name clash goes unseen and the replace/reject guard stops firing. The
+    # client sends every epoch's candidate (and the rotation-independent index-key value once the
+    # vault has one). Bounded so a client cannot make the server hold an unbounded list; each is a
+    # 64-char blind index. Absent falls back to matching the single `name_bi`.
+    name_bi_candidates: Optional[List[str]] = Field(None, max_length=64)
 
 
 @app.post("/vaults/{vault_id}/uploads")
@@ -9371,6 +9395,7 @@ async def init_chunked_upload(
             enc_name=body.enc_name,
             enc_mime=body.enc_mime,
             name_bi=body.name_bi,
+            name_bi_candidates=body.name_bi_candidates or None,
             total_size=body.total_size,
             total_chunks=body.total_chunks,
             chunks_received=0,
@@ -9684,10 +9709,15 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
     # name anyway).
     is_zk = _is_zk_vault(vault)
     zk_name_bi = session.name_bi if is_zk else None
+    # The full set a ZK name may match under (all epochs' candidates + the index-key value),
+    # stored at init. Used for BOTH the reject pre-check and the replace at finalize, so an
+    # existing file sealed before a rotation is found and not silently duplicated. NULL for a
+    # Standard upload or an old client that sent none.
+    zk_name_bi_candidates = session.name_bi_candidates if is_zk else None
 
     # Same-name policy = replace; reject up front if the uploader can't replace.
     _reject_unreplaceable_upload(db, vault_id, folder_uuid, session.filename, current_user,
-                                 name_bi=zk_name_bi)
+                                 name_bi=zk_name_bi, name_bi_candidates=zk_name_bi_candidates)
 
     # Zero-knowledge v2 name binding: the client may supply the file id it sealed the name
     # under (so the sealed name binds the final row id and can't be transposed). Optional +
@@ -9842,6 +9872,7 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
             zk_enc_name=session.enc_name if is_zk else None,
             zk_enc_mime=session.enc_mime if is_zk else None,
             zk_name_bi=zk_name_bi,
+            zk_name_bi_candidates=zk_name_bi_candidates,
             # Replace-on-clash, transactionally inside finalize (see the multipart path).
             # Gated on the principal's real DELETE authority (cap + RBAC), not just the
             # temp-cred cap — a write-but-no-delete member must not overwrite via upload.
@@ -12332,6 +12363,11 @@ def _run_lightweight_migrations():
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS enc_name TEXT",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS enc_mime TEXT",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS name_bi VARCHAR(64)",
+            # N2a: the per-epoch/index-key candidate set a ZK upload matches its name against, so a
+            # same-name file sealed before a rotation is found rather than silently duplicated.
+            # create_all adds it on a fresh DB; this backfills it on an in-place upgrade. Additive
+            # and nullable — an old session row simply has none and falls back to single-value match.
+            "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS name_bi_candidates JSON",
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS name_key_version INTEGER",
             # Per-account storage budget (NULL inherits the deployment default, -1 exempts).
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_quota_bytes BIGINT",

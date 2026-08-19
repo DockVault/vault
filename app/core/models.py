@@ -1374,6 +1374,16 @@ class ChunkedUploadSession(Base):
     enc_name = Column(Text, nullable=True)
     enc_mime = Column(Text, nullable=True)
     name_bi = Column(String(64), nullable=True)
+    # Extra blind-index values to MATCH against for same-name detection, beyond the single
+    # `name_bi` that is stored on the finished row. A zero-knowledge name index is keyed per
+    # (DEK, epoch), so after a rotation an existing file's index sits at an OLD epoch that a
+    # new upload's single current-epoch index cannot equal -- the clash goes unseen and the
+    # replace/​reject guard silently stops firing. The client sends every epoch's candidate here
+    # (and, once the vault has one, the rotation-independent index-key value); the server matches
+    # the union. NULL/empty falls back to matching the single `name_bi`, so an old client is
+    # unaffected. Write value vs match set are deliberately separate: this never changes what is
+    # stored, only what a new upload is compared against.
+    name_bi_candidates = Column(JSON, nullable=True)
     
     # Upload progress
     chunks_received = Column(Integer, default=0)
