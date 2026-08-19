@@ -2803,6 +2803,42 @@ class ECCCryptoLibrary {
         return out;
     }
 
+    /**
+     * Blind index of a name under the per-vault NAME INDEX key -- the rotation-independent form.
+     *
+     * Same shape as `nameBlindIndex` (HKDF a per-vault key, then keyed HMAC of the name) but keyed
+     * on `K_index` instead of `(DEK, epoch)`, so it does not change when the vault is rekeyed. That
+     * is the whole point: a file's index computed this way survives every rotation, which is what
+     * lets same-name matching eventually be a single equality again instead of a per-epoch set.
+     *
+     * The salt is DISTINCT from the DEK-derived index's (`dv-zk-name-bi-idxkey-v1` vs
+     * `dv-zk-name-bi-v1`) so the two derivation domains cannot collide. During migration both forms
+     * are matched against at once, and a collision between them would be a false same-name hit --
+     * so the two must be provably different functions of the name, which a different salt gives.
+     *
+     * No epoch in the info: `K_index` has none. It binds only the vault, so a leaked index cannot
+     * be tested against another vault's rows even if that vault's key were somehow the same.
+     *
+     * @param {string} name
+     * @param {CryptoKey} indexKey the 32-byte vault name-index key
+     * @param {string} vaultId
+     * @returns {Promise<string>} hex
+     */
+    async nameIndexKeyBlindIndex(name, indexKey, vaultId) {
+        const raw = await this._subtle().exportKey('raw', indexKey);
+        const hkdf = await this._subtle().importKey('raw', raw, 'HKDF', false, ['deriveBits']);
+        const biKeyBits = await this._subtle().deriveBits(
+            { name: 'HKDF', hash: 'SHA-256',
+              salt: new TextEncoder().encode('dv-zk-name-bi-idxkey-v1'),
+              info: new TextEncoder().encode(`${vaultId}`) },
+            hkdf, 256,
+        );
+        const hmacKey = await this._subtle().importKey(
+            'raw', biKeyBits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+        const sig = await this._subtle().sign('HMAC', hmacKey, new TextEncoder().encode(String(name)));
+        return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
     // =========================================================================
     // UTILITY FUNCTIONS
     // =========================================================================
@@ -3150,6 +3186,7 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     encryptName: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     nameBlindIndex: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     nameBlindIndexCandidates: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    nameIndexKeyBlindIndex: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     wrapNameIndexKeyV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
     unwrapNameIndexKeyV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
     calculateFingerprint: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
