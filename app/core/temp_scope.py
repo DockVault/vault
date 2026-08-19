@@ -270,9 +270,11 @@ def _audit_scope_denial(user, vault_id, action: str, details: dict) -> None:
         from app.core.database import get_db_context
         from app.services.audit_logger import AuditLogger
         from app.core.net_utils import current_client_ip
-        # Populated for a REST request by ClientIPMiddleware; None over SFTP (no ASGI request). None
-        # is a fine best-effort value -- the row still records who and which vault.
-        ip = current_client_ip()
+        # REST resolves the client IP into the ClientIPMiddleware contextvar; SFTP has no ASGI
+        # request, so its principal carries the connection's client address on `_client_ip` (set in
+        # the SFTP _load_principal). Prefer that, then fall back to the contextvar. None is still a
+        # fine best-effort value -- the row always records who and which vault.
+        ip = getattr(user, "_client_ip", None) or current_client_ip()
         with get_db_context() as adb:
             AuditLogger(adb).log_action(
                 action=action,

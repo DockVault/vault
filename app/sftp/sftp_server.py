@@ -303,6 +303,11 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         # _user_requires_temp_cred_for_sftp fails OPEN, so it never wrongly severs a session.
         if not getattr(user, "_is_temp_session", False) and _user_requires_temp_cred_for_sftp(db, user):
             return None
+        # Carry the connection's client address on the principal so a scope-denial audit (which fires
+        # deep in the data layer, with no ASGI request and thus no ClientIPMiddleware contextvar) can
+        # still record WHERE an out-of-scope SFTP act came from -- matching the IP the success-path
+        # _audit already logs from self.server.client_address.
+        user._client_ip = getattr(self.server, "client_address", None)
         return user
 
     def _has_cap(self, user, vault_id, cap: str) -> bool:
