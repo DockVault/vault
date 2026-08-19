@@ -320,6 +320,41 @@ def require_create_vault_type(user, vault_type: str) -> None:
     )
 
 
+def _audit_vault_cap_denial(db, user, vault_id, cap: str, kwargs: dict) -> None:
+    """Record a per-vault capability denial -- a scoped credential reaching for a vault action it was
+    not granted. This gate stacks UNDER the endpoint-group gate, so it is where a credential that
+    could reach the endpoint but not the action is refused, and the endpoint-group audit never sees
+    it. Same contract as that audit: runs only on the denial path, after read-only checks (a clean
+    request session), and swallows any failure so a lost audit row can never turn the 403 into a 500."""
+    if db is None:
+        return
+    try:
+        from app.services.audit_logger import AuditLogger
+        from starlette.requests import Request
+        ip = None
+        req = next((v for v in kwargs.values() if isinstance(v, Request)), None)
+        if req is not None:
+            try:
+                # Lazy import: api_server imports this module, so a top-level import is circular; at
+                # request time it is loaded. get_client_ip honours X-Forwarded-For only from a
+                # trusted proxy, so the logged IP is not attacker-set.
+                from app.api.api_server import get_client_ip
+                ip = get_client_ip(req)
+            except Exception:  # noqa: BLE001
+                ip = None
+        AuditLogger(db).log_action(
+            action="vault_cap_denied",
+            status="failure",
+            user=user,
+            resource_type="vault",
+            resource_id=str(vault_id) if vault_id is not None else None,
+            ip_address=ip,
+            details={"capability": str(cap)},
+        )
+    except Exception:  # noqa: BLE001 — a lost audit row must never mask the 403
+        pass
+
+
 def require_vault_cap(cap: str):
     """Decorator (stacks UNDER @require_endpoint_permission) enforcing a per-vault
     capability for scoped temp sessions. Reads current_user + vault_id from kwargs.
@@ -331,7 +366,12 @@ def require_vault_cap(cap: str):
         async def wrapper(*args, **kwargs):
             user = kwargs.get("current_user")
             if user is not None:
-                require_cap(user, kwargs.get("vault_id"), cap)
+                try:
+                    require_cap(user, kwargs.get("vault_id"), cap)
+                except HTTPException:
+                    _audit_vault_cap_denial(
+                        kwargs.get("db"), user, kwargs.get("vault_id"), cap, kwargs)
+                    raise
             return await func(*args, **kwargs)
         return wrapper
     return decorator
