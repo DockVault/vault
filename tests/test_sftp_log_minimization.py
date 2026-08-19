@@ -28,6 +28,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SFTP_SRC = ROOT / "app" / "sftp" / "sftp_server.py"
 EVENTS_SRC = ROOT / "app" / "core" / "safe_log.py"
 VAULT_SVC = ROOT / "app" / "services" / "vault_service.py"
+STORAGE_SVC = ROOT / "app" / "services" / "encrypted_file_storage.py"
+ACTIVITY_SVC = ROOT / "app" / "services" / "activity_monitor.py"
 
 
 def _call_sites() -> list:
@@ -64,10 +66,12 @@ def test_the_server_prints_only_through_the_event_emitter() -> None:
     vault service prints from the blob-replacement and delete routines that the SFTP
     finalizer and remove path call straight into, so a storage path could still land in the
     same container log next to a clean event line. A rule enforced at one of two doors is
-    not enforced.
+    not enforced. Widened again to the encrypted-file storage layer (whose secure-delete
+    failure printed the file's on-disk PATH via the raw OSError) and the activity monitor
+    (which printed the raw exception from every Redis broadcast/operation failure).
     """
     offenders = []
-    for path in (SFTP_SRC, VAULT_SVC):
+    for path in (SFTP_SRC, VAULT_SVC, STORAGE_SVC, ACTIVITY_SVC):
         for lineno, ln in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             # Any direct write, not only a line that begins with print(.
             if re.search(r"(?<![\w.])print\s*\(|sys\.std(out|err)\.write|traceback\.print_",
@@ -331,7 +335,7 @@ def test_every_event_code_is_a_literal() -> None:
     import ast
 
     checked = 0
-    for path in (SFTP_SRC, VAULT_SVC):
+    for path in (SFTP_SRC, VAULT_SVC, STORAGE_SVC, ACTIVITY_SVC):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):

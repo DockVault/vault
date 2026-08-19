@@ -10,6 +10,7 @@ from typing import Optional, Dict
 from redis import Redis
 
 from app.core.database import redis_client
+from app.core.safe_log import safe_event
 
 
 class ActivityBroadcaster:
@@ -41,7 +42,7 @@ class ActivityBroadcaster:
             event_json = json.dumps(event, default=str)
             self.redis.publish(self.channel, event_json)
         except Exception as e:
-            print(f"Error broadcasting event: {e}")
+            safe_event("activity.broadcast.failed", e)
     
     async def broadcast(self, event: dict):
         """
@@ -142,7 +143,7 @@ class ProgressTracker:
             return operation
             
         except Exception as e:
-            print(f"Error starting operation: {e}")
+            safe_event("activity.op-start.failed", e)
             return None
     
     def complete_operation(
@@ -188,7 +189,7 @@ class ProgressTracker:
             self.broadcaster.broadcast_sync(event)
             return operation
         except Exception as e:
-            print(f"Error completing operation: {e}")
+            safe_event("activity.op-complete.failed", e)
             return None
     def is_cancelled(self, operation_id: str) -> bool:
         """
@@ -211,7 +212,7 @@ class ProgressTracker:
             return operation.get("cancelled", False)
             
         except Exception as e:
-            print(f"Error checking cancellation: {e}")
+            safe_event("activity.cancel-check.failed", e)
             return False
     
     def cancel_operation(
@@ -276,5 +277,5 @@ class ProgressTracker:
             self.broadcaster.broadcast_sync(event)
             return True
         except Exception as e:
-            print(f"Error cancelling operation: {e}")
+            safe_event("activity.cancel.failed", e)
             return False
