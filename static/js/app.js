@@ -2485,6 +2485,10 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
         if (zkPendingDek && created && created.id) {
             zkState.vaultDeks[created.id] = { 1: zkPendingDek };
             if (payload.key_wrapping_mode === 'hierarchical') zkState.pinnedHier[created.id] = true;
+            // Mint the vault's name-index key (rotation-independent same-name matching). Awaited so
+            // the key is in place before the first upload, but non-fatal -- the vault falls back to
+            // legacy indices if it fails.
+            await zkMintOwnIndexKey(created.id);
         }
 
         closeModal();
@@ -7606,8 +7610,8 @@ function eccLib() {
 // first hierarchical /keys read). A server that later serves a DIRECT key for a pinned-hierarchical
 // vault is attempting a mode downgrade — zkGetVaultDek refuses rather than silently fail the
 // (already fail-closed) unwrap. In-session only; the crypto fails closed regardless of the pin.
-const zkState = { privateKey: null, vaultDeks: {}, teamKeys: {}, pinnedHier: {} };
-function zkResetKeys() { zkState.privateKey = null; zkState.vaultDeks = {}; zkState.teamKeys = {}; zkState.pinnedHier = {}; }
+const zkState = { privateKey: null, vaultDeks: {}, teamKeys: {}, pinnedHier: {}, vaultIndexKeys: {} };
+function zkResetKeys() { zkState.privateKey = null; zkState.vaultDeks = {}; zkState.teamKeys = {}; zkState.pinnedHier = {}; zkState.vaultIndexKeys = {}; }
 
 // --- ZK idle auto-lock -------------------------------------------------------------------------
 // Optional org policy (zk_idle_lock_minutes, from /zk-enabled): drop the in-memory ZK key after N
@@ -8362,6 +8366,52 @@ async function zkGetVaultDek(vaultId, keyVersion = null) {
     }
     perVault[version] = dek;
     return dek;
+}
+
+// Mint this vault's NAME INDEX key and wrap it for the current user. Called once at vault
+// creation. The key never rotates, so there is one per vault for its whole life; the server
+// stores only the opaque wrap. BEST-EFFORT: a vault whose index key was not minted simply keeps
+// matching same-name rows on the legacy per-epoch indices, so a failure here must not fail the
+// create -- it is swallowed and the vault works.
+async function zkMintOwnIndexKey(vaultId) {
+    try {
+        const identity = await zkEnsurePublicKeyForCreate();
+        const lib = eccLib();
+        const pub = await lib.importPublicKeyPEM(identity.pem);
+        const K = await lib.generateVaultDEK();            // a fresh 32-byte AES key
+        const w = await lib.wrapNameIndexKeyV2(K, pub, { vaultId, recipientUserId: identity.userId });
+        await apiRequest(`/ecc/vaults/${vaultId}/index-key`, {
+            method: 'PUT', silent: true,
+            body: JSON.stringify({ wraps: [{
+                user_id: identity.userId,
+                encrypted_index_key: w.wrappedKey,
+                ephemeral_public_key: w.ephemeralPublicKey,
+            }] }),
+        });
+        zkState.vaultIndexKeys[vaultId] = K;   // cache so a later write need not round-trip
+        return K;
+    } catch (_) {
+        // Non-fatal by contract. A 409 (another client minted first) or any other hiccup just
+        // means this vault will use legacy indices until a client reads and adopts the key.
+        return null;
+    }
+}
+
+// Get (and cache) the unwrapped name-index key for a vault, or null if the vault has none. Mirrors
+// zkGetVaultDek: the wrap + its ephemeral come from GET /index-key, and the recipient id comes from
+// that same response (the account the server selected the row for), never from local state -- the
+// unwrap transcript binds it, and localStorage identity tolerates corrupt data.
+async function zkGetVaultIndexKey(vaultId) {
+    const cached = zkState.vaultIndexKeys[vaultId];
+    if (cached) return cached;
+    const resp = await apiRequest(`/ecc/vaults/${vaultId}/index-key`, { silent: true });
+    if (!resp || !resp.index_key) return null;   // no key minted for this vault yet
+    const priv = await zkEnsureUnlocked();
+    const K = await eccLib().unwrapNameIndexKeyV2(
+        resp.index_key, resp.ephemeral_public_key, priv,
+        { vaultId, recipientUserId: resp.recipient_user_id });
+    zkState.vaultIndexKeys[vaultId] = K;
+    return K;
 }
 
 // Unwrap (and cache) a hierarchical vault's TEAM PRIVATE key at a given team epoch. The wrapped

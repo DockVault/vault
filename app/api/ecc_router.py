@@ -956,6 +956,10 @@ async def get_vault_index_key(
         "index_key": row.encrypted_index_key,
         "ephemeral_public_key": row.ephemeral_public_key,
         "index_key_version": row.index_key_version,
+        # The account the server selected this row for. The unwrap transcript binds the recipient,
+        # and the client takes it from here rather than local state -- the same choice the DEK
+        # unwrap makes, because localStorage-hydrated identity tolerates corrupt data.
+        "recipient_user_id": str(row.user_id),
     }
 
 
