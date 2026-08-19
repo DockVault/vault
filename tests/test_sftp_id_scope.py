@@ -16,6 +16,26 @@ from conftest import ADMIN_USER, ADMIN_PASS, unique  # noqa: E402
 
 SFTP_HOST = os.environ.get("VAULT_SFTP_HOST", "127.0.0.1")
 SFTP_PORT = int(os.environ.get("VAULT_SFTP_PORT", "2322"))
+import subprocess  # noqa: E402  (audit-row assertions read the DB directly)
+_DB = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
+
+
+def _psql_out(sql):
+    r = subprocess.run(["docker", "exec", _DB, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc", sql],
+                       capture_output=True, text=True, timeout=20)
+    return (r.stdout or "").strip()
+
+
+def _id_denied_count():
+    return int(_psql_out("SELECT count(*) FROM audit_logs WHERE action='id_scope_denied'") or "0")
+
+
+def _file_id(admin, vid, name, folder_id=None):
+    params = {"folder_id": folder_id} if folder_id else {}
+    for it in admin.get(f"/vaults/{vid}/files", params=params).json()["items"]:
+        if it.get("name") == name and it.get("type") == "file":
+            return it["id"]
+    raise AssertionError(f"file {name} not found")
 
 
 pytestmark = pytest.mark.sftp
@@ -207,3 +227,30 @@ def test_sftp_file_scope(admin):
 def _read(sftp, path) -> bytes:
     with sftp.open(path, "rb") as fh:
         return fh.read()
+
+
+def test_sftp_out_of_scope_act_is_audited(admin):
+    """A targeted out-of-scope ACT over SFTP -- opening, by known name, a sibling file the
+    credential's file-scope excludes -- is denied at the _scope_ok_file gate and, like the REST
+    path, writes an id_scope_denied audit row. Locks that the filter-suppression does NOT reach the
+    SFTP single-target act gates (only the REST listing/batch filter loops)."""
+    v = admin.create_vault(name=unique("sftpaudit"))
+    vid, vname = v["id"], v["name"]
+    try:
+        D = _mkfolder(admin, vid, unique("D"))
+        dn = D["name"]
+        _upload(admin, vid, "x.txt", folder_id=D["id"], content=b"in")
+        _upload(admin, vid, "y.txt", folder_id=D["id"], content=b"out")
+        X = _file_id(admin, vid, "x.txt", D["id"])
+        # Scope to file X only: folder D is a navigable ancestor, sibling y.txt is out of scope.
+        user, pw = _mint_scoped(admin, vid, {"folders": [], "files": [X]})
+        with sftp_session(user, pw) as sftp:
+            with sftp.open(f"/{vname}/{dn}/x.txt", "rb") as fh:   # in scope -> ok, no denial row
+                assert fh.read() == b"in"
+            before = _id_denied_count()
+            with pytest.raises(IOError):
+                sftp.open(f"/{vname}/{dn}/y.txt", "rb").read()    # out of scope -> denied at the gate
+        after = _id_denied_count()
+        assert after > before, "a targeted out-of-scope SFTP open must write an id_scope_denied audit row"
+    finally:
+        admin.delete_vault(vid)

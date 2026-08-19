@@ -1292,3 +1292,84 @@ def test_audit_retention_disabled_by_default_keeps_all():
     # The admin dashboard feed must actually invoke the prune (a no-op while disabled).
     api = _read("app/api/api_server.py")
     assert "cleanup_old_audit_logs()" in api, "the /audit/events feed must call cleanup_old_audit_logs"
+
+
+def test_vault_scope_denial_is_audited():
+    # enforce_vault -- the vault-membership gate inside VaultService.get_vault (which also serves
+    # SFTP) -- refuses a scoped credential a vault outside its granted set. That refusal is now
+    # recorded as a vault_scope_denied audit row, written on a FRESH isolated session so it is safe
+    # at this data-layer call site even mid-transaction. Exercise enforce_vault directly with a
+    # mode-'selected' scoped principal that grants no vaults.
+    script = "\n".join([
+        "import uuid",
+        "from app.core.database import get_db_context",
+        "from app.core import temp_scope as ts",
+        "from app.core.models import AuditLog, User",
+        "from app.core.authorization import PermissionDeniedError",
+        "with get_db_context() as db:",
+        "    u = db.query(User).first()",
+        "    u._is_temp_session = True",
+        "    u._temp_scope = {'v':1,'pages':['vaults'],'caps':[],'vault_caps_default':[],'temp':{}}",
+        "    u._temp_vault_mode = 'selected'",
+        "    u._temp_vault_caps = {}",
+        "    u._temp_cred_id = None",
+        "    vid = str(uuid.uuid4())",
+        "    before = db.query(AuditLog).filter(AuditLog.action=='vault_scope_denied').count()",
+        "    denied = False",
+        "    try:",
+        "        ts.enforce_vault(u, vid)",
+        "    except PermissionDeniedError:",
+        "        denied = True",
+        "    after = db.query(AuditLog).filter(AuditLog.action=='vault_scope_denied').count()",
+        "    row = db.query(AuditLog).filter(AuditLog.action=='vault_scope_denied').order_by(AuditLog.timestamp.desc()).first()",
+        "    print('DENIED=%s DELTA=%s STATUS=%s' % (denied, after-before, row.status if row else None))",
+    ])
+    proc = _in_container(args=["python", "-"], stdin=script)
+    assert "DENIED=True" in proc.stdout, f"enforce_vault should deny an ungranted vault\n{proc.stdout}\n{proc.stderr}"
+    assert "DELTA=1" in proc.stdout, f"exactly one vault_scope_denied row expected\n{proc.stdout}\n{proc.stderr}"
+    assert "STATUS=failure" in proc.stdout, f"the denial row status should be 'failure'\n{proc.stdout}"
+
+
+def test_scope_denials_as_filter_suppresses_audit():
+    # A scope-gate denial writes an audit row when it fails a request, but NOT when it is used as a
+    # filter/predicate (SFTP listing, batch loops) -- otherwise routine filtering would flood the log.
+    # scope_denials_as_filter() marks such a context. Prove: same require_scope denial audits outside
+    # the block and is suppressed inside it.
+    script = "\n".join([
+        "import uuid",
+        "from app.core.database import get_db_context",
+        "from app.core import temp_scope as ts",
+        "from app.core.authorization import PermissionDeniedError",
+        "from app.core.models import AuditLog, User",
+        "with get_db_context() as db:",
+        "    u = db.query(User).first()",
+        "    u._is_temp_session = True",
+        "    u._temp_scope = {'v':1,'pages':['vaults'],'caps':[],'vault_caps_default':[],'temp':{}}",
+        "    u._temp_vault_mode = 'selected'",
+        "    u._temp_vault_caps = {}",
+        "    u._temp_cred_id = None",
+        "    u._temp_vault_scope = {}",  # unused for require_scope path; harmless
+        "    vid = str(uuid.uuid4()); tgt = str(uuid.uuid4())",
+        "    # A scoped principal with an id-restriction that excludes everything.",
+        "    u._temp_vault_scope = {vid: {'files': [], 'folders': []}}",
+        "    def q():",
+        "        return db.query(AuditLog).filter(AuditLog.action=='id_scope_denied').count()",
+        "    base = q()",
+        "    # inside the filter context -> suppressed",
+        "    try:",
+        "        with ts.scope_denials_as_filter():",
+        "            ts.require_scope(u, vid, tgt, [])",
+        "    except PermissionDeniedError:",
+        "        pass",
+        "    suppressed = q()",
+        "    # outside -> audited",
+        "    try:",
+        "        ts.require_scope(u, vid, tgt, [])",
+        "    except PermissionDeniedError:",
+        "        pass",
+        "    audited = q()",
+        "    print('SUPPRESSED_DELTA=%s AUDITED_DELTA=%s' % (suppressed-base, audited-suppressed))",
+    ])
+    proc = _in_container(args=["python", "-"], stdin=script)
+    assert "SUPPRESSED_DELTA=0" in proc.stdout, f"a denial inside scope_denials_as_filter must write no row\n{proc.stdout}\n{proc.stderr}"
+    assert "AUDITED_DELTA=1" in proc.stdout, f"the same denial outside the filter context must write one row\n{proc.stdout}\n{proc.stderr}"

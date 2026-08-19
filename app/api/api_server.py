@@ -74,7 +74,7 @@ from app.core.endpoint_permissions import (
     require_endpoint_permission,
     validate_endpoint_permission_contract,
 )
-from app.core.temp_scope import require_vault_cap
+from app.core.temp_scope import require_vault_cap, scope_denials_as_filter
 from app.api.user_management_api import router as user_management_router
 from app.core.paths import PROJECT_ROOT
 from app.core.response_hash_utils import handle_conditional_response, compute_response_hash, check_if_none_match, create_cached_response, create_not_modified_response
@@ -10067,7 +10067,8 @@ async def list_resumable_uploads(
     out = []
     for s in sessions:
         try:
-            require_folder_scope(db, current_user, vault_id, s.folder_id)
+            with scope_denials_as_filter():  # per-session listing filter, not a denial to record
+                require_folder_scope(db, current_user, vault_id, s.folder_id)
         except PermissionDeniedError:
             continue
         received = len(_received_chunk_indices(_upload_session_dir(vault_service, str(s.id))))
@@ -11394,7 +11395,8 @@ async def zk_seal_names(
         # A scoped credential may only seal names of in-scope objects (skip the rest, as with
         # any other non-applicable item). require_item_scope is a no-op for a whole-vault cred.
         try:
-            require_item_scope(db, current_user, vault_id, it.id)
+            with scope_denials_as_filter():  # per-item batch filter, not a denial to record
+                require_item_scope(db, current_user, vault_id, it.id)
         except PermissionDeniedError:
             continue
         if not it.enc_name or not it.name_bi:
