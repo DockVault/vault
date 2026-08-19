@@ -161,6 +161,13 @@ class ECCCryptoLibrary {
         // attempt that produced it.
         this.V2_PURPOSE_CONTENT = 0x04;
         this.V2_INFO_CONTENT = 'dockvault-zk-content-v2';
+        // A per-vault NAME INDEX key, wrapped to a member exactly like the direct DEK (a 32-byte
+        // symmetric key, 68 bytes wrapped) but with its own purpose byte and info string so a DEK
+        // wrap and an index-key wrap for the same (vault, member) can never be swapped for one
+        // another. It carries NO epoch -- the whole point of this key is that it does not rotate --
+        // so its transcript binds only the vault and the recipient.
+        this.V2_PURPOSE_NAME_INDEX_KEY = 0x05;
+        this.V2_INFO_NAME_INDEX_KEY = 'dockvault-zk-name-index-key-v2';
         this.V2_CONTENT_HEADER_BYTES = 28;      // 8 shared + 4 chunk size + 16 attempt token
         this.V2_CONTENT_CHUNK_OVERHEAD = 28;    // 12-byte nonce + 16-byte tag, per chunk
         // The smallest possible file is the header plus one empty chunk. Anything shorter is
@@ -685,6 +692,121 @@ class ECCCryptoLibrary {
                                             true, ['encrypt', 'decrypt']);
         } catch (error) {
             throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'unwrapVaultDEK.v2');
+        }
+    }
+
+    /**
+     * Transcript for a NAME INDEX key wrap. Structurally the direct-DEK transcript with two
+     * changes: purpose 0x05 (so this wrap and a DEK wrap for the same recipient cannot be swapped)
+     * and NO epoch field -- the index key does not rotate, so there is nothing to bind. Both the
+     * writer and this build's reader construct it identically; a mismatch fails authentication.
+     * @private
+     */
+    _v2IndexKeyTranscript(vaultId, recipientUserId) {
+        const enc = new TextEncoder();
+        const header = this._v2Header(this.V2_PURPOSE_NAME_INDEX_KEY);
+        const z = new Uint8Array([0]);
+        const context = this._concatBytes([
+            this._v2Uuid(vaultId, 'v2IndexKeyTranscript.uuid'), z,
+            this._v2Uuid(recipientUserId, 'v2IndexKeyTranscript.uuid'), z,
+        ]);
+        return {
+            header,
+            info: this._concatBytes([enc.encode(this.V2_INFO_NAME_INDEX_KEY), z, context]),
+            aad: this._concatBytes([header, context]),
+        };
+    }
+
+    /**
+     * Wrap a per-vault name-index key to a member's public key. Same ECDH-then-AES-GCM shape and
+     * 68-byte output as the direct DEK wrap; only the transcript (purpose + info, no epoch) differs.
+     * @param {CryptoKey} indexKey the 32-byte AES key
+     * @param {CryptoKey} recipientPublicKey
+     * @param {{vaultId:string, recipientUserId:string}} context
+     * @returns {Promise<{wrappedKey:string, ephemeralPublicKey:string}>} base64
+     */
+    async wrapNameIndexKeyV2(indexKey, recipientPublicKey, context) {
+        const { vaultId, recipientUserId } = context || {};
+        const t = this._v2IndexKeyTranscript(vaultId, recipientUserId);
+        try {
+            const ephemeral = await this._subtle().generateKey(
+                { name: 'ECDH', namedCurve: this.CURVE }, true, ['deriveBits']);
+            const shared = await this._subtle().deriveBits(
+                { name: 'ECDH', public: recipientPublicKey }, ephemeral.privateKey, 384);
+            const key = await this._deriveV2WrappingKey(shared, t.info);
+            const raw = await this._subtle().exportKey('raw', indexKey);
+            if (raw.byteLength !== 32) {
+                this._fail(CRYPTO_ERROR_CODES.WRAP_FAILED, 'wrapNameIndexKeyV2.keylen');
+            }
+            const nonce = this._randomBytes(12);
+            const ct = await this._subtle().encrypt(
+                { name: 'AES-GCM', iv: nonce, additionalData: t.aad, tagLength: 128 }, key, raw);
+            const out = this._concatBytes([t.header, nonce, new Uint8Array(ct)]);
+            if (out.length !== this.V2_DIRECT_WRAP_BYTES) {
+                this._fail(CRYPTO_ERROR_CODES.WRAP_FAILED, 'wrapNameIndexKeyV2.length');
+            }
+            const ephRaw = await this._subtle().exportKey('raw', ephemeral.publicKey);
+            return {
+                wrappedKey: this._arrayBufferToBase64(out.buffer),
+                ephemeralPublicKey: this._arrayBufferToBase64(ephRaw),
+            };
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'wrapNameIndexKeyV2');
+        }
+    }
+
+    /**
+     * Unwrap a name-index key. Self-contained rather than routed through the DEK unwrap: it does
+     * its own structural checks and REQUIRES purpose 0x05, so the DEK path is untouched and a DEK
+     * wrap handed here (or an index-key wrap handed to the DEK unwrap) is rejected -- the purpose
+     * byte is in the header AND the AAD, so a swap fails structurally, not merely at decrypt.
+     * @returns {Promise<CryptoKey>} the 32-byte AES-GCM index key
+     */
+    async unwrapNameIndexKeyV2(wrappedBase64, ephemeralPublicKeyBase64, userPrivateKey, context) {
+        const { vaultId, recipientUserId } = context || {};
+        const wrappedBytes = new Uint8Array(this._base64ToArrayBuffer(wrappedBase64));
+        if (wrappedBytes.length !== this.V2_DIRECT_WRAP_BYTES) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapNameIndexKey.length');
+        }
+        if (wrappedBytes[0] !== 0x44 || wrappedBytes[1] !== 0x56
+            || wrappedBytes[2] !== 0x5A || wrappedBytes[3] !== 0x32) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapNameIndexKey.magic');
+        }
+        if (wrappedBytes[4] !== this.V2_VERSION) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapNameIndexKey.version');
+        }
+        if (wrappedBytes[5] !== this.V2_PURPOSE_NAME_INDEX_KEY) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapNameIndexKey.purpose');
+        }
+        if (wrappedBytes[6] !== 0 || wrappedBytes[7] !== 0) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapNameIndexKey.reserved');
+        }
+        const ephBytes = new Uint8Array(this._base64ToArrayBuffer(ephemeralPublicKeyBase64));
+        if (ephBytes.length !== 97 || ephBytes[0] !== 0x04) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapNameIndexKey.point');
+        }
+        const t = this._v2IndexKeyTranscript(vaultId, recipientUserId);
+        let ephemeralPublicKey;
+        try {
+            ephemeralPublicKey = await this._importRawPublicKey(ephBytes.buffer);
+        } catch (error) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapNameIndexKey.curve');
+        }
+        try {
+            const shared = await this._subtle().deriveBits(
+                { name: 'ECDH', public: ephemeralPublicKey }, userPrivateKey, 384);
+            const key = await this._deriveV2WrappingKey(shared, t.info);
+            const nonce = wrappedBytes.slice(8, 20);
+            const body = wrappedBytes.slice(20);
+            const plain = await this._subtle().decrypt(
+                { name: 'AES-GCM', iv: nonce, additionalData: t.aad, tagLength: 128 }, key, body);
+            if (plain.byteLength !== 32) {
+                this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapNameIndexKey.keylen');
+            }
+            return this._subtle().importKey('raw', plain, { name: 'AES-GCM', length: 256 },
+                                            true, ['encrypt', 'decrypt']);
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'unwrapNameIndexKey');
         }
     }
 
@@ -3028,6 +3150,8 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     encryptName: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     nameBlindIndex: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     nameBlindIndexCandidates: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    wrapNameIndexKeyV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
+    unwrapNameIndexKeyV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
     calculateFingerprint: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     generateVaultDEK: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
 });
