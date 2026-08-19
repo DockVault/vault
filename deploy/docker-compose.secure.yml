@@ -41,7 +41,7 @@ services:
     # makes 18 refuse to start. Beyond the mount, every existing vault_pg_data volume holds 15
     # data files that 18 cannot read without a pg_upgrade — so a major bump is a migration with a
     # documented upgrade path in dockvault.py, not a digest change. 15 is supported to Nov 2027.
-    image: postgres:15-alpine@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
+    image: postgres:15-alpine@sha256:fe0737ba566a2c5b2a28f34433c0a423261900ec17b9bf7ad115e1aae7e57f1b
     container_name: vault-db
     environment:
       POSTGRES_USER: sftp_user
