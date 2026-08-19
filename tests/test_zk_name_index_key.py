@@ -3,7 +3,7 @@
 This key exists so that same-name matching survives a rekey. The blind index used to be derived
 from (DEK, epoch), so a rotation changed every name's index and silently switched off the guard
 that stops an upload-only credential creating a hidden duplicate. The fix is a key that a rekey
-does NOT rotate; this phase (N1) only stores and serves it, and later phases make the index use it.
+does NOT rotate; this increment only stores and serves it, and later work makes the index use it.
 
 The properties worth pinning here, because they are the ones a later phase will rely on:
 
