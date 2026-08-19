@@ -1233,3 +1233,62 @@ def test_secure_compose_hardening():
     assert sc.count("- ALL") >= 2, "cap_drop [ALL] expected on both app services"
     assert "mem_limit:" in sc
     assert "--requirepass" in sc
+
+
+def test_audit_retention_prunes_by_setting():
+    # A positive AUDIT_LOG_RETENTION_DAYS makes cleanup_old_audit_logs() (called with no argument, so
+    # it reads settings) delete audit rows older than the window and keep recent ones -- proving the
+    # setting drives the prune, not just an explicit days= argument. The window is deliberately huge
+    # (3650d -> cutoff ~2016) so the DELETE only ever reaches the year-2000 seed and never purges
+    # real audit history on a persistent dev/VM stack these _in_container tests may run against.
+    script = "\n".join([
+        "import datetime",
+        "from app.core.database import get_db_context",
+        "from app.services import audit_logger as al",
+        "al._last_audit_cleanup_at = None  # allow the once/hour throttle to run",
+        "from app.services.audit_logger import AuditLogger",
+        "from app.core.models import AuditLog",
+        "with get_db_context() as db:",
+        "    old = AuditLog(action='retn_old', status='success', timestamp=datetime.datetime(2000,1,1), details={})",
+        "    recent = AuditLog(action='retn_new', status='success', timestamp=datetime.datetime.utcnow(), details={})",
+        "    db.add(old); db.add(recent); db.commit()",
+        "    old_id=str(old.id); recent_id=str(recent.id)",
+        "    deleted = AuditLogger(db).cleanup_old_audit_logs()",
+        "    old_gone = db.query(AuditLog).filter(AuditLog.id==old_id).first() is None",
+        "    recent_kept = db.query(AuditLog).filter(AuditLog.id==recent_id).first() is not None",
+        "    db.query(AuditLog).filter(AuditLog.id==recent_id).delete(); db.commit()",
+        "    print('OLD_GONE=%s RECENT_KEPT=%s DELETED_POS=%s' % (old_gone, recent_kept, deleted>0))",
+    ])
+    proc = _in_container(env_overrides={"AUDIT_LOG_RETENTION_DAYS": "3650"}, args=["python", "-"], stdin=script)
+    assert "OLD_GONE=True" in proc.stdout, f"old audit row should be pruned\n{proc.stdout}\n{proc.stderr}"
+    assert "RECENT_KEPT=True" in proc.stdout, f"recent audit row should be kept\n{proc.stdout}\n{proc.stderr}"
+    assert "DELETED_POS=True" in proc.stdout, f"cleanup should report a positive delete count\n{proc.stdout}"
+
+
+def test_audit_retention_disabled_by_default_keeps_all():
+    # The default (audit_log_retention_days=0) keeps every audit row: audit rows are compliance
+    # records, so deletion is opt-in. Seeding an ancient row and running cleanup with the default
+    # setting must leave it untouched and report zero deletions.
+    script = "\n".join([
+        "import datetime",
+        "from app.core.config import settings",
+        "from app.core.database import get_db_context",
+        "from app.services import audit_logger as al",
+        "al._last_audit_cleanup_at = None",
+        "from app.services.audit_logger import AuditLogger",
+        "from app.core.models import AuditLog",
+        "with get_db_context() as db:",
+        "    old = AuditLog(action='retn_keep', status='success', timestamp=datetime.datetime(2000,1,1), details={})",
+        "    db.add(old); db.commit(); old_id=str(old.id)",
+        "    deleted = AuditLogger(db).cleanup_old_audit_logs()",
+        "    kept = db.query(AuditLog).filter(AuditLog.id==old_id).first() is not None",
+        "    db.query(AuditLog).filter(AuditLog.id==old_id).delete(); db.commit()",
+        "    print('DEFAULT=%s DELETED=%s KEPT=%s' % (settings.audit_log_retention_days, deleted, kept))",
+    ])
+    proc = _in_container(args=["python", "-"], stdin=script)
+    assert "DEFAULT=0" in proc.stdout, f"audit_log_retention_days must default to 0 (keep forever)\n{proc.stdout}\n{proc.stderr}"
+    assert "DELETED=0" in proc.stdout, f"disabled retention must delete nothing\n{proc.stdout}"
+    assert "KEPT=True" in proc.stdout, f"an ancient audit row must survive when retention is disabled\n{proc.stdout}"
+    # The admin dashboard feed must actually invoke the prune (a no-op while disabled).
+    api = _read("app/api/api_server.py")
+    assert "cleanup_old_audit_logs()" in api, "the /audit/events feed must call cleanup_old_audit_logs"
