@@ -2342,3 +2342,70 @@ def test_zk_invite_prompts_keyless_recipient(browser, admin):
         if vid:
             admin.delete_vault(vid)
         admin.put("/settings", json={"zero_knowledge_enabled": False})
+
+
+def test_zk_upload_sends_name_bi_candidates(page: Page, admin):
+    """A zero-knowledge upload declares the candidate blind-index set (N2b-2 wiring).
+
+    N2a taught the server to match a same-name upload against a set of indices; N2b-1 derives that
+    set; this proves the client actually SENDS it. A library test can show the derivation is right
+    and cannot show the upload forwards it -- the same gap that let an earlier attempt seal one
+    token and send another.
+
+    The multi-epoch behaviour (the actual defect) is covered transitively: the server replaces
+    given the old-epoch candidate (test_zk_name_index_dual_read), the derivation produces every
+    epoch's candidate (test_zk_name_index_candidates), and this shows the wiring sends what the
+    derivation produced. For a never-rotated vault that set is exactly [name_bi] -- one candidate,
+    equal to the single value -- which is precisely what proves the field is wired and not empty.
+    """
+    import json as _json
+    from conftest import ApiClient
+
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    user = admin.create_user(role="admin")
+    owner = ApiClient()
+    owner.login(user["_username"], user["_password"])
+    vid = None
+    try:
+        _login(page, user["_username"], user["_password"])
+        vid = _create_zk_vault_via_ui(page, owner, "zk-cand-pass-1")
+        page.click('.sidebar-item[data-section="vaults"]')
+        page.wait_for_selector(f'.open-vault-btn[data-vault-id="{vid}"]', timeout=10000)
+        page.click(f'.open-vault-btn[data-vault-id="{vid}"]')
+        expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
+
+        inits = []
+        page.on("request", lambda r: (
+            inits.append(r.post_data)
+            if r.method == "POST" and r.url.endswith("/uploads") else None))
+
+        fname = _u("cand") + ".txt"
+        page.set_input_files("#file-upload-input", files=[
+            {"name": fname, "mimeType": "text/plain", "buffer": b"candidate wiring probe\n" * 32}])
+
+        # Wait for the file to land, then read the captured init.
+        for _ in range(40):
+            if owner.get(f"/vaults/{vid}/files").json()["items"]:
+                break
+            page.wait_for_timeout(500)
+        else:
+            raise AssertionError("the upload never completed")
+
+        bodies = [_json.loads(b) for b in inits if b]
+        assert bodies, "no /uploads init request was captured"
+        body = bodies[-1]
+
+        # The field is present and non-empty -- the wiring sent it.
+        cands = body.get("name_bi_candidates")
+        assert cands, f"name_bi_candidates missing or empty in the init: {body!r}"
+        # Never rotated: exactly one candidate, and it is the single value the server also stores.
+        assert isinstance(cands, list) and len(cands) == 1, f"expected one candidate, got {cands!r}"
+        assert cands[0] == body.get("name_bi"), (
+            "the sole candidate must equal name_bi for a never-rotated vault")
+    finally:
+        if vid:
+            admin.delete_vault(vid)
+        b = [u for u in admin.get("/users").json() if u["id"] == user["id"]]
+        if b:
+            admin.delete_user(user["id"])
+        admin.put("/settings", json={"zero_knowledge_enabled": False})
