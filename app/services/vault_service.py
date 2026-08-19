@@ -189,6 +189,37 @@ class DuplicateNameError(FileServiceError):
     pass
 
 
+def is_refundable_serve_failure(exc) -> bool:
+    """Does `exc` mean the server FAILED TO SERVE a file it should have been able to — such that a
+    share download burned against it must be RETURNED?
+
+    True for a server-side integrity failure on stored bytes: a rejected at-rest walk or a record
+    that will not authenticate (``FileServiceError``/``EncryptionError``) and a whole-file checksum
+    mismatch (``ChecksumMismatch``). A client cannot induce any of these, which is exactly why
+    returning the burn cannot be used to uncap a capped share.
+
+    False — deliberately, and each for its own reason — for four things that ARE (or subclass) the
+    above but must never refund here:
+
+    - ``ObjectChangedDuringRead`` — a delete or same-name replacement while the read is open. It
+      subclasses ``EncryptionError`` (so it would slip through a bare isinstance), but it is a race a
+      party with vault write access can trigger on demand; refunding it would turn the download cap
+      into a counter an attacker holds down at will.
+    - ``InvalidPasswordError`` / ``PasswordRequiredError`` — client/auth failures (they subclass
+      ``FileServiceError``). The client caused them, so the burn stays spent.
+    - ``FileNotFoundError`` — a missing blob is refunded, but on its own dedicated 404 path, not
+      here; classifying it as a generic serve failure would double-count it.
+
+    Self-contained (it does not rely on the caller having peeled these off first), so it is safe to
+    reuse and can be unit-tested directly."""
+    from app.core.security import EncryptionError, ObjectChangedDuringRead
+    from app.services.download_stream import ChecksumMismatch
+    if isinstance(exc, (ObjectChangedDuringRead, InvalidPasswordError,
+                        PasswordRequiredError, FileNotFoundError)):
+        return False
+    return isinstance(exc, (FileServiceError, ChecksumMismatch, EncryptionError))
+
+
 def calculate_file_expiration(vault) -> Optional[datetime]:
     """Calculate file expiration datetime based on vault's expiration policy.
     
