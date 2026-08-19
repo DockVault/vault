@@ -117,7 +117,7 @@ def is_pull_enabled(ceiling, flags, component):
 
 def filter_service_lines(lines, service):
     """Keep only sink lines emitted by `service`. Sink lines are stored as `[web] ...` / `[sftp]
-    ...` with the tag at the very START (no docker timestamp — run_combined writes the raw tagged
+    ...` with the tag at the very START (followed by an ISO-8601 timestamp, then the raw child
     line), so the match is an exact line-start prefix and a tag appearing inside a body cannot
     cross-contaminate. Unknown/blank service -> [] (the handler 404s before reaching here)."""
     if not service or service not in KNOWN_COMPONENTS:

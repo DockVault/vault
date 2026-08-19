@@ -13,6 +13,7 @@ Pure stdlib (subprocess/threading/io) — no running vault instance required.
 import io
 import os
 import queue
+import re
 import sys
 import time
 
@@ -129,9 +130,12 @@ def test_sink_writes_tagged_lines_to_file(tmp_path):
         run_combined._SINK_QUEUE.put(None)
         run_combined._sink_writer_loop()
         content = sink.read_text(encoding="utf-8")
-        assert "[web] Uvicorn running" in content, content
-        assert "[sftp] SFTP listening" in content, content
-        # The tag prefix is at line start (so the API can filter per-service), one line each.
+        # The tag is at line start (so the API can filter per-service), then an ISO-8601 timestamp,
+        # then the raw child line.
+        _ts = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z"
+        assert re.search(rf"(?m)^\[web\] {_ts} Uvicorn running$", content), content
+        assert re.search(rf"(?m)^\[sftp\] {_ts} SFTP listening$", content), content
+        # One line each.
         assert content.count("\n") == 2, content
     finally:
         run_combined._SINK_PATH, run_combined._sink_logger = orig_path, orig_logger
@@ -195,3 +199,32 @@ def test_sink_rotates_at_the_size_cap(tmp_path):
          run_combined._SINK_MAX_BYTES, run_combined._SINK_BACKUPS) = (
             orig_path, orig_logger, orig_max, orig_bk)
         _reset_sink()
+
+
+def test_sink_line_stamps_a_time_after_the_tag_and_stays_filterable():
+    """The pulled operational log needs a time on every line (a raw child line usually has none),
+    but the [service] tag has to stay at line start so the log-pull API can filter per-service. The
+    timestamp therefore lands AFTER the tag, and a timestamped line still matches that filter."""
+    from app.services.log_pull import filter_service_lines
+
+    ts = "2026-01-02T03:04:05.678901Z"
+    line = run_combined._sink_line("sftp", "event upload.rejected size=too-large\n", ts)
+    # Tag first (line-start prefix the filter needs), then the timestamp, then the raw line.
+    assert line == "[sftp] 2026-01-02T03:04:05.678901Z event upload.rejected size=too-large"
+    assert line.startswith("[sftp] ")
+    # The per-service filter still keeps it (and does not misroute it to the other service).
+    assert filter_service_lines([line], "sftp") == [line]
+    assert filter_service_lines([line], "web") == []
+
+
+def test_sink_emit_produces_a_parseable_timestamp():
+    """_sink_emit stamps the current time in the ISO-8601 UTC shape the pulled log advertises."""
+    orig_q, orig_logger = run_combined._SINK_QUEUE, run_combined._sink_logger
+    try:
+        run_combined._SINK_QUEUE = queue.Queue(maxsize=10)
+        run_combined._sink_logger = object()  # truthy so the emit enqueues
+        run_combined._sink_emit("web", "GET /health 200\n")
+        stored = run_combined._SINK_QUEUE.get_nowait()
+        assert re.fullmatch(r"\[web\] \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z GET /health 200", stored), stored
+    finally:
+        run_combined._SINK_QUEUE, run_combined._sink_logger = orig_q, orig_logger

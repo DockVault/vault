@@ -2709,7 +2709,8 @@ async def pull_logs(
 
     `service` is optional in the signature (default None) so a missing value returns the same
     404 as an unknown one — no 422 that would reveal the endpoint exists when the ceiling is off.
-    (`since` filtering is deferred to Phase 2 — the sink lines carry no uniform timestamp.)
+    (`since` filtering is not implemented yet — only its parsing/filtering; each sink line now
+    carries a uniform ISO-8601 UTC timestamp right after its [service] tag to key it on.)
     """
     # per-component DB enable (unknown/None service -> 404; no oracle beyond the already-passed ceiling)
     if not service or service not in log_pull.KNOWN_COMPONENTS or not _logs_pull_enabled(db, service):

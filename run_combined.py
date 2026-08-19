@@ -24,6 +24,7 @@ import logging
 import logging.handlers
 import os
 import queue
+from datetime import datetime, timezone
 import signal
 import subprocess
 import sys
@@ -92,13 +93,28 @@ def _sink_writer_loop() -> None:
                 pass
 
 
+# ISO-8601 UTC with millisecond-ish resolution; the trailing Z marks UTC.
+_SINK_TS_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+
+def _sink_line(label: str, line: str, ts: str) -> str:
+    """The stored sink line: the ``[service]`` tag FIRST (so filter_service_lines can match a
+    line-start prefix), then the timestamp, then the child's raw line. The pulled log is a
+    security-operational record, and a child line usually carries no time of its own -- ``docker
+    logs -t`` can add one for the stdout stream, but the pulled file could not -- so the sink
+    stamps each line as it captures it. Kept AFTER the tag on purpose: putting it first would
+    break the per-service prefix match the log-pull API relies on."""
+    return f"[{label}] {ts} " + line.rstrip("\r\n")
+
+
 def _sink_emit(label: str, line: str) -> None:
-    """Enqueue a tagged line for the sink WITHOUT blocking. Drops the line if the queue is full
-    (a slow/failed disk must never stall a pump). No-op when the sink is disabled."""
+    """Enqueue a tagged, timestamped line for the sink WITHOUT blocking. Drops the line if the
+    queue is full (a slow/failed disk must never stall a pump). No-op when the sink is disabled."""
     if _sink_logger is None:
         return
     try:
-        _SINK_QUEUE.put_nowait(f"[{label}] " + line.rstrip("\r\n"))
+        ts = datetime.now(timezone.utc).strftime(_SINK_TS_FMT)
+        _SINK_QUEUE.put_nowait(_sink_line(label, line, ts))
     except queue.Full:
         pass  # drop under sustained pressure rather than block the pump
     except Exception:  # noqa: BLE001
