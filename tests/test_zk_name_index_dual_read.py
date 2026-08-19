@@ -152,3 +152,93 @@ def test_without_candidates_the_pre_rotation_file_is_still_missed(admin, zk_vaul
 
     # Two rows, one per epoch's index — the duplicate the candidate path prevents.
     assert _count_named(vid, [bi1, bi2]) == 2, "without candidates the clash should be missed"
+
+
+# --- N2b-3: rename and folder-create also match against the candidate set --------------------
+
+def _rename(admin, vid, fid, name, dek, epoch, candidates=None, key_version=None):
+    body = {
+        "enc_name": zk_encrypt_name(name, dek, vid, "name", epoch, obj_id=fid),
+        "name_bi": zk_name_blind_index(name, dek, vid, epoch),
+    }
+    if candidates is not None:
+        body["name_bi_candidates"] = candidates
+    if key_version is not None:
+        body["name_key_version"] = key_version
+    return admin.put(f"/vaults/{vid}/files/{fid}/rename", json=body)
+
+
+def test_rename_into_a_pre_rotation_name_is_caught_with_candidates(admin, zk_vault):
+    """Renaming a file INTO a name that exists only at an OLD epoch must be rejected as a clash.
+    Without candidates the old-epoch row is missed and the rename wrongly succeeds -- two files with
+    one visible name. This is the rename counterpart of the upload defect."""
+    vid = zk_vault["id"]
+    dek = os.urandom(32)
+    keep = unique("keep") + ".txt"           # exists from epoch 1
+    other = unique("other") + ".txt"         # uploaded at epoch 2, then renamed to `keep`
+    keep_bi1 = zk_name_blind_index(keep, dek, vid, 1)
+    keep_bi2 = zk_name_blind_index(keep, dek, vid, 2)
+
+    _upload_named(admin, vid, keep, dek, b"the original keep", epoch=1)
+    _rekey_to(admin, vid, 1, 2)
+    other_id = _upload_named(admin, vid, other, dek, b"a second file", epoch=2)
+
+    # With candidates covering epoch 1, renaming `other` -> `keep` is caught (400/409).
+    r = _rename(admin, vid, other_id, keep, dek, epoch=2, candidates=[keep_bi1, keep_bi2])
+    assert r.status_code in (400, 409), f"clash should be rejected, got {r.status_code}: {r.text}"
+
+    # The vault still has exactly one row named `keep` (the rename was refused).
+    assert _count_named(vid, [keep_bi1, keep_bi2]) == 1, "the rename must not have created a duplicate"
+
+
+def test_rename_without_candidates_still_misses_the_pre_rotation_name(admin, zk_vault):
+    """Control: the same rename WITHOUT candidates misses the old-epoch row and succeeds, proving
+    the candidates do the work and that an old client is unchanged."""
+    vid = zk_vault["id"]
+    dek = os.urandom(32)
+    keep = unique("keepc") + ".txt"
+    other = unique("otherc") + ".txt"
+    keep_bi1 = zk_name_blind_index(keep, dek, vid, 1)
+
+    _upload_named(admin, vid, keep, dek, b"original", epoch=1)
+    _rekey_to(admin, vid, 1, 2)
+    other_id = _upload_named(admin, vid, other, dek, b"second", epoch=2)
+
+    r = _rename(admin, vid, other_id, keep, dek, epoch=2)  # no candidates
+    assert r.status_code == 200, r.text
+    # Two rows now answer to `keep` (its epoch-1 and epoch-2 indices) -- the missed clash.
+    assert _count_named(vid, [keep_bi1, zk_name_blind_index(keep, dek, vid, 2)]) == 2
+
+
+def _create_folder(admin, vid, name, dek, epoch, candidates=None):
+    fid = str(uuid.uuid4())
+    body = {
+        "id": fid,
+        "enc_name": zk_encrypt_name(name, dek, vid, "name", epoch, obj_id=fid),
+        "name_bi": zk_name_blind_index(name, dek, vid, epoch),
+        "name_key_version": epoch,
+    }
+    if candidates is not None:
+        body["name_bi_candidates"] = candidates
+    return admin.post(f"/vaults/{vid}/folders", json=body)
+
+
+def test_folder_create_into_a_pre_rotation_name_is_caught_with_candidates(admin, zk_vault):
+    """Creating a folder whose name already exists only at an OLD epoch must be rejected. Without
+    candidates the old-epoch folder is missed and a duplicate-named folder is created."""
+    vid = zk_vault["id"]
+    dek = os.urandom(32)
+    name = unique("docs")
+    bi1 = zk_name_blind_index(name, dek, vid, 1)
+    bi2 = zk_name_blind_index(name, dek, vid, 2)
+
+    assert _create_folder(admin, vid, name, dek, epoch=1).status_code == 200
+    _rekey_to(admin, vid, 1, 2)
+
+    # With candidates: the epoch-1 folder is seen, the duplicate create is rejected.
+    r = _create_folder(admin, vid, name, dek, epoch=2, candidates=[bi1, bi2])
+    assert r.status_code in (400, 409), f"duplicate folder should be rejected, got {r.status_code}: {r.text}"
+
+    # Without candidates: the clash is missed and a second same-name folder is created.
+    r2 = _create_folder(admin, vid, name, dek, epoch=2)
+    assert r2.status_code == 200, r2.text

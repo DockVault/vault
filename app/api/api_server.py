@@ -995,6 +995,10 @@ class FileRename(BaseModel):
     new_name: Optional[str] = Field(None, min_length=1, max_length=255)
     enc_name: Optional[str] = None
     name_bi: Optional[str] = Field(None, max_length=64)  # stored in a VARCHAR(64) column
+    # Extra blind-index values to MATCH the new name against (every epoch's candidate), so a rename
+    # INTO a name that already exists at an OLD epoch is detected as a clash rather than silently
+    # creating a duplicate. Bounded; absent falls back to matching the single name_bi.
+    name_bi_candidates: Optional[List[str]] = Field(None, max_length=64)
     # For ZK FOLDER renames: the DEK epoch the name was encrypted under (folders carry their
     # own name epoch). Ignored for files (a file's name epoch follows its content epoch).
     name_key_version: Optional[int] = None
@@ -10902,6 +10906,7 @@ async def rename_file(
             file_id, rename_data.new_name, current_user, vault_id=vault_id,
             zk_enc_name=rename_data.enc_name,
             zk_name_bi=rename_data.name_bi,
+            zk_name_bi_candidates=rename_data.name_bi_candidates,
             zk_name_key_version=rename_data.name_key_version,
         )
         
@@ -11001,6 +11006,7 @@ async def create_folder(
         is_zk = _is_zk_vault(vault)
         zk_enc_name = folder_data.get('enc_name')
         zk_name_bi = folder_data.get('name_bi')
+        zk_name_bi_candidates = folder_data.get('name_bi_candidates')
         zk_name_kv = folder_data.get('name_key_version')
         folder_client_id = None  # ZK v2: the client-supplied folder id (validated in the ZK branch)
         if is_zk:
@@ -11064,6 +11070,7 @@ async def create_folder(
             parent_folder_id=parent_uuid,
             zk_enc_name=zk_enc_name,
             zk_name_bi=zk_name_bi,
+            zk_name_bi_candidates=zk_name_bi_candidates if isinstance(zk_name_bi_candidates, list) else None,
             zk_name_key_version=zk_name_kv,
             folder_id=folder_client_id,
         )
