@@ -148,3 +148,56 @@ def test_a_bad_user_id_is_a_clean_400(admin, zk_vault):
     r = admin.put(f"/ecc/vaults/{vid}/index-key", json={"wraps": [
         {"user_id": "not-a-uuid", "encrypted_index_key": "k", "ephemeral_public_key": "e"}]})
     assert r.status_code == 400, r.text
+
+
+def test_adding_a_wrap_for_a_new_member_succeeds_and_leaves_the_key(admin, temp_user, temp_user_client, zk_vault):
+    """Share case: once the key is minted, a wrap can be ADDED for a member who has none, without
+    replacing the key. The new member reads their wrap; the original owner's wrap is untouched."""
+    vid = zk_vault["id"]
+    ensure_ecc_keypair(temp_user_client)
+    owner_wrap = _wrap(admin.user["id"])
+    admin.put(f"/ecc/vaults/{vid}/index-key", json={"wraps": [owner_wrap]}).raise_for_status()
+
+    admin.post(f"/vaults/{vid}/permissions",
+               json={"user_id": str(temp_user["id"]), "level": "read"}).raise_for_status()
+    member_wrap = _wrap(temp_user["id"])
+    r = admin.put(f"/ecc/vaults/{vid}/index-key", json={"wraps": [member_wrap]})
+    assert r.status_code == 200, r.text
+
+    # The new member gets THEIR wrap; the owner still gets the original.
+    assert temp_user_client.get(f"/ecc/vaults/{vid}/index-key").json()["index_key"] == member_wrap["encrypted_index_key"]
+    assert admin.get(f"/ecc/vaults/{vid}/index-key").json()["index_key"] == owner_wrap["encrypted_index_key"]
+
+
+def test_re_wrapping_an_existing_member_is_refused(admin, zk_vault):
+    """The key is immutable at a version: a second wrap for a member who already has one is a 409,
+    not an overwrite -- that would swap the key under them. (Replacing the key is a version bump,
+    a separate opt-in operation.)"""
+    vid = zk_vault["id"]
+    first = _wrap(admin.user["id"])
+    admin.put(f"/ecc/vaults/{vid}/index-key", json={"wraps": [first]}).raise_for_status()
+
+    r = admin.put(f"/ecc/vaults/{vid}/index-key", json={"wraps": [_wrap(admin.user["id"])]})
+    assert r.status_code == 409, r.text
+    # Unchanged.
+    assert admin.get(f"/ecc/vaults/{vid}/index-key").json()["index_key"] == first["encrypted_index_key"]
+
+
+def test_a_mixed_body_touching_an_existing_member_is_refused_whole(admin, temp_user, zk_vault):
+    """A body that adds a new member AND re-wraps an existing one is refused entirely -- partial
+    success would leave the caller unsure which wraps landed. Neither is written."""
+    vid = zk_vault["id"]
+    owner_wrap = _wrap(admin.user["id"])
+    admin.put(f"/ecc/vaults/{vid}/index-key", json={"wraps": [owner_wrap]}).raise_for_status()
+    admin.post(f"/vaults/{vid}/permissions",
+               json={"user_id": str(temp_user["id"]), "level": "read"}).raise_for_status()
+
+    # owner (exists) + temp_user (new) in one body -> 409, and the new member is NOT added.
+    r = admin.put(f"/ecc/vaults/{vid}/index-key",
+                  json={"wraps": [_wrap(admin.user["id"]), _wrap(temp_user["id"])]})
+    assert r.status_code == 409, r.text
+    # Nothing was half-written: a follow-up add for ONLY the new member still succeeds, which it
+    # could not if the refused body had already inserted that member's row.
+    # temp_user still has no wrap (the whole body was refused).
+    ok = admin.put(f"/ecc/vaults/{vid}/index-key", json={"wraps": [_wrap(temp_user["id"])]})
+    assert ok.status_code == 200, ok.text
