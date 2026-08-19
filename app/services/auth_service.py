@@ -481,6 +481,21 @@ class AuthService:
         from app.services.vault_service import id_ancestry
         is_delegated = parent_scope is not None
         if scope is None and not is_delegated:
+            # The no-scope path is LEGACY UNRESTRICTED: the credential reaches everything the
+            # minting account can. A caller that also sends a vault restriction list is contradicting
+            # itself -- it asked to limit the credential to those vaults but, honored as-is, the list
+            # is silently dropped (the per-vault resolve below only runs when effective_scope is not
+            # None) and the caller gets a credential far broader than requested. The realistic harm
+            # is a delegation surprise: handing that credential to someone else believing it is
+            # vault-limited. The vault UI never produces this shape (it always sends a scope
+            # alongside selected_vaults), so reject it rather than return an over-broad credential.
+            if selected_vaults:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=("A vault restriction list was sent without a scope. Include a scope to "
+                            "restrict the credential to those vaults, or omit the list for an "
+                            "unrestricted credential."),
+                )
             effective_scope = None
             mode = 'selected'
         else:
@@ -489,6 +504,20 @@ class AuthService:
             mode = 'all' if vault_access_mode == 'all' else 'selected'
             if is_delegated and parent_vault_mode == 'selected':
                 mode = 'selected'  # a child cannot broaden vault access to 'all'
+
+        # The same contradiction as the no-scope case, in its other form: 'all' vault access reaches
+        # every vault the account can, so the per-vault resolve below (gated on mode == 'selected')
+        # drops any supplied restriction list entirely and the credential ends up broader than the
+        # list asks. The vault UI clears selected_vaults whenever the mode is 'all', so this shape
+        # is API-only; reject it rather than silently ignore the restriction. (A delegated child is
+        # forced to 'selected' above, so this only fires on a non-delegated all-mode mint.)
+        if mode == 'all' and selected_vaults:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=("A vault restriction list was sent with all-vault access mode. Use "
+                        "'selected' mode to restrict the credential to those vaults, or omit the "
+                        "list for all-vault access."),
+            )
 
         # Org policy: may a zero-knowledge vault be in a temp credential's scope at all? Read once here
         # and reused below (the selected-mode per-vault loop + the passcode block).
