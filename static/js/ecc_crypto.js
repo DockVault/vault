@@ -2639,6 +2639,48 @@ class ECCCryptoLibrary {
         return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
+    /**
+     * Every blind index a zero-knowledge name could be STORED under, so a same-name upload can be
+     * matched against all of them at once.
+     *
+     * The index is keyed per (DEK, epoch). Rekey is forward-only -- existing files keep their old
+     * epoch -- so after a rotation a file's stored index sits at whatever epoch it was sealed at,
+     * while a naive upload computes only the current epoch's index and misses it. That missed
+     * clash is the bug: the server's replace/reject guard never fires and a second row lands under
+     * a different index with the same visible name. The server matches an incoming name against
+     * the UNION of these, so it finds the pre-rotation row.
+     *
+     * `epochDeks` is `[{epoch, dek}, ...]` -- one entry per epoch the caller can still unwrap a DEK
+     * for, which is exactly the set of epochs whose rows it could be colliding with. For a
+     * never-rotated vault that is a single entry, so this costs one HMAC there and more only on a
+     * vault that actually rotated. Order does not matter; the result is de-duplicated.
+     *
+     * Deliberately NOT the place the rotation-independent index-key value is added -- that belongs
+     * with the write path that starts producing rows under it. This function is the legacy,
+     * per-epoch half that closes the reported defect on its own.
+     *
+     * @param {string} name
+     * @param {string} vaultId
+     * @param {Array<{epoch:number, dek:CryptoKey}>} epochDeks
+     * @returns {Promise<string[]>} de-duplicated hex indices, one per distinct epoch
+     */
+    async nameBlindIndexCandidates(name, vaultId, epochDeks) {
+        if (!Array.isArray(epochDeks) || epochDeks.length === 0) {
+            throw new CryptoError(CRYPTO_ERROR_CODES.INVALID_INPUT, 'nameBlindIndexCandidates.epochDeks');
+        }
+        const out = [];
+        const seen = new Set();
+        for (const entry of epochDeks) {
+            if (!entry || entry.dek == null) {
+                throw new CryptoError(CRYPTO_ERROR_CODES.INVALID_INPUT,
+                                      'nameBlindIndexCandidates.entry');
+            }
+            const idx = await this.nameBlindIndex(name, entry.dek, vaultId, entry.epoch);
+            if (!seen.has(idx)) { seen.add(idx); out.push(idx); }
+        }
+        return out;
+    }
+
     // =========================================================================
     // UTILITY FUNCTIONS
     // =========================================================================
@@ -2985,6 +3027,7 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     encryptFile: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     encryptName: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     nameBlindIndex: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    nameBlindIndexCandidates: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     calculateFingerprint: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     generateVaultDEK: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
 });
