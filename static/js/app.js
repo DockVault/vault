@@ -8296,7 +8296,7 @@ async function restoreFromRecoveryKeyFile(file) {
 //
 // Best-effort by contract: a member who joined after a rotation holds no old-epoch wrap, and any
 // derivation failure here must NOT block the upload -- it falls back to the single current-epoch
-// index, which is exactly the pre-N2 behaviour (the server then does a single-value match). Never
+// index, which is exactly the single-value behaviour (the server then matches that one). Never
 // throws.
 async function zkUploadNameCandidates(lib, name, vaultId, currentEpoch, currentDek) {
     const epoch = Number(currentEpoch) || 1;
@@ -8306,8 +8306,17 @@ async function zkUploadNameCandidates(lib, name, vaultId, currentEpoch, currentD
             const d = (e === epoch) ? currentDek : await zkGetVaultDek(vaultId, e);
             if (d) deks.push({ epoch: e, dek: d });
         }
-        if (deks.length === 0) return null;
-        return await lib.nameBlindIndexCandidates(name, vaultId, deks);
+        const out = deks.length ? (await lib.nameBlindIndexCandidates(name, vaultId, deks)).slice() : [];
+        // The rotation-independent index, if this vault has a name-index key. Added to the match
+        // set so a row written under it is found. Today NOTHING writes one (a later increment does),
+        // so it simply matches nothing. Purely additive: it never removes a legacy candidate, and a vault
+        // with no index key (or an unwrap that fails) sends exactly what it did before.
+        const K = await zkGetVaultIndexKey(vaultId).catch(() => null);
+        if (K) {
+            const idx = await lib.nameIndexKeyBlindIndex(name, K, vaultId);
+            if (!out.includes(idx)) out.push(idx);
+        }
+        return out.length ? out : null;
     } catch (_) {
         // An epoch we cannot unwrap, or any other hiccup: send nothing extra and let the server
         // fall back to the single name_bi. A missed old-epoch clash is the pre-existing behaviour,
@@ -10820,7 +10829,7 @@ async function uploadFiles(files) {
                     // value can't equal). Best-effort: an epoch this member can't unwrap a DEK for
                     // is one whose files they couldn't read anyway, and a derivation failure must
                     // never block the upload -- fall back to the single current value, which is the
-                    // pre-N2 behaviour. The current epoch's DEK is already `dek`; older ones come
+                    // single-value behaviour. The current epoch's DEK is already `dek`; older ones come
                     // from the per-epoch cache.
                     entry.nameBiCandidates = await zkUploadNameCandidates(
                         lib, entry.name, vid, keyVersion, dek);

@@ -2345,9 +2345,9 @@ def test_zk_invite_prompts_keyless_recipient(browser, admin):
 
 
 def test_zk_upload_sends_name_bi_candidates(page: Page, admin):
-    """A zero-knowledge upload declares the candidate blind-index set (N2b-2 wiring).
+    """A zero-knowledge upload declares the candidate blind-index set (client wiring).
 
-    N2a taught the server to match a same-name upload against a set of indices; N2b-1 derives that
+    The server matches a same-name upload against a SET of indices, and the client derives that
     set; this proves the client actually SENDS it. A library test can show the derivation is right
     and cannot show the upload forwards it -- the same gap that let an earlier attempt seal one
     token and send another.
@@ -2398,10 +2398,14 @@ def test_zk_upload_sends_name_bi_candidates(page: Page, admin):
         # The field is present and non-empty -- the wiring sent it.
         cands = body.get("name_bi_candidates")
         assert cands, f"name_bi_candidates missing or empty in the init: {body!r}"
-        # Never rotated: exactly one candidate, and it is the single value the server also stores.
-        assert isinstance(cands, list) and len(cands) == 1, f"expected one candidate, got {cands!r}"
-        assert cands[0] == body.get("name_bi"), (
-            "the sole candidate must equal name_bi for a never-rotated vault")
+        assert isinstance(cands, list)
+        # The single stored value (a legacy per-epoch index) is always among the candidates.
+        assert body.get("name_bi") in cands, f"name_bi not in candidates: {cands!r}"
+        # A vault with a name-index key also sends the rotation-independent index, so a
+        # never-rotated vault sends two: the epoch-1 legacy index and the K_index index. (Before
+        # earlier this was exactly one; the K_index one matches nothing until a row is written under it.)
+        assert len(cands) == 2, f"expected the legacy + K_index candidates, got {cands!r}"
+        assert len(set(cands)) == len(cands), "candidates must be distinct"
     finally:
         if vid:
             admin.delete_vault(vid)
@@ -2412,7 +2416,7 @@ def test_zk_upload_sends_name_bi_candidates(page: Page, admin):
 
 
 def test_zk_vault_create_mints_a_name_index_key(page: Page, admin):
-    """N3a-2a: creating a zero-knowledge vault mints its name-index key, wrapped to the owner.
+    """Creating a zero-knowledge vault mints its name-index key, wrapped to the owner.
 
     Proves the client mint flow end to end: after create, GET /index-key returns a wrap (with the
     server-selected recipient), and the browser unwraps it to a 32-byte AES key via the shipped
@@ -2446,6 +2450,68 @@ def test_zk_vault_create_mints_a_name_index_key(page: Page, admin):
                 return new Uint8Array(raw).length;
             }""", vid)
         assert keylen == 32, f"the owner could not unwrap the minted index key (got {keylen})"
+    finally:
+        if vid:
+            admin.delete_vault(vid)
+        b = [u for u in admin.get("/users").json() if u["id"] == user["id"]]
+        if b:
+            admin.delete_user(user["id"])
+        admin.put("/settings", json={"zero_knowledge_enabled": False})
+
+
+def test_zk_upload_candidate_set_includes_the_index_key_index(page: Page, admin):
+    """An upload's candidate set carries the rotation-independent K_index index too.
+
+    The vault has a name-index key (minted at create). The upload should send, alongside
+    the per-epoch legacy candidates, the index computed under K_index -- so a row written under it
+    (a later increment) would be matched. Verified by capturing the /uploads init and recomputing the
+    expected K_index index in the page from the unwrapped key."""
+    import json as _json
+    from conftest import ApiClient
+
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    user = admin.create_user(role="admin")
+    owner = ApiClient()
+    owner.login(user["_username"], user["_password"])
+    vid = None
+    try:
+        _login(page, user["_username"], user["_password"])
+        vid = _create_zk_vault_via_ui(page, owner, "zk-n3b-pass-1")
+        page.click('.sidebar-item[data-section="vaults"]')
+        page.wait_for_selector(f'.open-vault-btn[data-vault-id="{vid}"]', timeout=10000)
+        page.click(f'.open-vault-btn[data-vault-id="{vid}"]')
+        expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
+
+        inits = []
+        page.on("request", lambda r: (
+            inits.append(r.post_data)
+            if r.method == "POST" and r.url.endswith("/uploads") else None))
+
+        fname = _u("n3b") + ".txt"
+        page.set_input_files("#file-upload-input", files=[
+            {"name": fname, "mimeType": "text/plain", "buffer": b"n3b candidate probe\n" * 16}])
+        for _ in range(40):
+            if owner.get(f"/vaults/{vid}/files").json()["items"]:
+                break
+            page.wait_for_timeout(500)
+        else:
+            raise AssertionError("upload never completed")
+
+        body = [_json.loads(b) for b in inits if b][-1]
+        cands = body.get("name_bi_candidates") or []
+        assert cands, f"no candidates sent: {body!r}"
+
+        # Recompute the expected K_index index in the page and confirm it is among the candidates.
+        expected = page.evaluate(
+            """async ([vid, name]) => {
+                const K = await zkGetVaultIndexKey(vid);
+                if (!K) return null;
+                return await eccLib().nameIndexKeyBlindIndex(name, K, vid);
+            }""", [vid, fname])
+        assert expected, "the vault had no index key (mint-at-create should have made one)"
+        assert expected in cands, "the K_index index was not in the candidate set the upload sent"
+        # It is an ADDITION: the single stored name_bi (a legacy per-epoch index) is still present.
+        assert body.get("name_bi") in cands
     finally:
         if vid:
             admin.delete_vault(vid)
