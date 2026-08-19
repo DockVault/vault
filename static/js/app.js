@@ -8285,6 +8285,33 @@ async function restoreFromRecoveryKeyFile(file) {
     }
 }
 
+// The set of blind indices a name could already be STORED under, sent with an upload so the
+// server matches a same-name file sealed before a rotation (whose index sits at an old epoch the
+// current one can't equal). One entry per epoch 1..currentEpoch, using the current epoch's DEK
+// (already unwrapped for this upload) and the per-epoch cache for the rest.
+//
+// Best-effort by contract: a member who joined after a rotation holds no old-epoch wrap, and any
+// derivation failure here must NOT block the upload -- it falls back to the single current-epoch
+// index, which is exactly the pre-N2 behaviour (the server then does a single-value match). Never
+// throws.
+async function zkUploadNameCandidates(lib, name, vaultId, currentEpoch, currentDek) {
+    const epoch = Number(currentEpoch) || 1;
+    try {
+        const deks = [];
+        for (let e = 1; e <= epoch; e++) {
+            const d = (e === epoch) ? currentDek : await zkGetVaultDek(vaultId, e);
+            if (d) deks.push({ epoch: e, dek: d });
+        }
+        if (deks.length === 0) return null;
+        return await lib.nameBlindIndexCandidates(name, vaultId, deks);
+    } catch (_) {
+        // An epoch we cannot unwrap, or any other hiccup: send nothing extra and let the server
+        // fall back to the single name_bi. A missed old-epoch clash is the pre-existing behaviour,
+        // not a regression, and it is never worth failing an upload over.
+        return null;
+    }
+}
+
 // Get (and cache) the unwrapped AES DEK for a zero-knowledge vault at a given epoch.
 // keyVersion null/undefined => the vault's CURRENT epoch (for upload/encrypt/share). To
 // read an existing file, pass that file's epoch (item.key_version, defaulting to 1) so a
@@ -9933,7 +9960,7 @@ const uploadManager = {
         if (!entries || !entries.length || !state.currentVault) return;
         const vaultId = state.currentVault.id;
         const folderId = state.currentFolderId || null;
-        for (const { file, name, keyVersion, encName, encMime, nameBi, clientFileId, blobId }
+        for (const { file, name, keyVersion, encName, encMime, nameBi, nameBiCandidates, clientFileId, blobId }
                 of entries) {
             const id = this._newId();
             const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
@@ -9948,6 +9975,8 @@ const uploadManager = {
                 // ZK only: the browser-encrypted name/MIME + client blind index. Sent at init
                 // instead of the plaintext name (the server never sees the name).
                 encName: encName || null, encMime: encMime || null, nameBi: nameBi || null,
+                // Per-epoch candidate set, so a same-name file sealed before a rotation is matched.
+                nameBiCandidates: nameBiCandidates || null,
                 // ZK v2: the client-generated file id the name was sealed under. Persisted to
                 // IndexedDB and re-sent at complete so the final row id matches the sealed id.
                 clientFileId: clientFileId || null,
@@ -10028,6 +10057,7 @@ const uploadManager = {
                         zkKeyVersion: rec.keyVersion != null ? rec.keyVersion : null,
                         // Carry the encrypted name/blind index so a 410 re-init re-declares it.
                         encName: rec.encName || null, encMime: rec.encMime || null, nameBi: rec.nameBi || null,
+                        nameBiCandidates: rec.nameBiCandidates || null,
                         // Restore the v2 obj-id binding so complete finishes under the sealed id.
                         clientFileId: rec.clientFileId || null,
                         blobId: rec.blobId || null,
@@ -10093,6 +10123,7 @@ const uploadManager = {
                 enc_name: it.isZk ? it.encName : null,
                 enc_mime: it.isZk ? it.encMime : null,
                 name_bi: it.isZk ? it.nameBi : null,
+                name_bi_candidates: it.isZk ? (it.nameBiCandidates || null) : null,
                 total_size: it.totalSize,
                 total_chunks: it.totalChunks,
                 chunk_size: it.chunkSize,
@@ -10152,6 +10183,9 @@ const uploadManager = {
                 encName: it.encName || null,
                 encMime: it.encMime || null,
                 nameBi: it.nameBi || null,
+                // Persist the candidate set too, or a resumed upload's re-init would lose it and
+                // silently drop back to single-value matching after a reload.
+                nameBiCandidates: it.nameBiCandidates || null,
                 // ZK v2: the id the name was sealed under. Without it, a resumed upload would
                 // complete under a fresh server id and the v2 name would be undecryptable.
                 clientFileId: it.clientFileId || null,
@@ -10725,6 +10759,15 @@ async function uploadFiles(files) {
                     entry.keyVersion = keyVersion;
                     entry.encName = await lib.encryptName(entry.name, dek, vid, 'name', keyVersion, clientFileId);
                     entry.nameBi = await lib.nameBlindIndex(entry.name, dek, vid, keyVersion);
+                    // Every epoch's index for this name, so the server can spot a same-name file
+                    // sealed BEFORE a rotation (whose index sits at an old epoch the current-epoch
+                    // value can't equal). Best-effort: an epoch this member can't unwrap a DEK for
+                    // is one whose files they couldn't read anyway, and a derivation failure must
+                    // never block the upload -- fall back to the single current value, which is the
+                    // pre-N2 behaviour. The current epoch's DEK is already `dek`; older ones come
+                    // from the per-epoch cache.
+                    entry.nameBiCandidates = await zkUploadNameCandidates(
+                        lib, entry.name, vid, keyVersion, dek);
                     entry.encMime = mime ? await lib.encryptName(mime, dek, vid, 'mime', keyVersion, clientFileId) : null;
                 }
             } catch (e) {
