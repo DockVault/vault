@@ -55,7 +55,7 @@ def _user_has_required_groups(db: Session, user_id, group_name: str) -> bool:
     return required <= held
 
 
-def _audit_endpoint_denial(db, user, group_name: str, reason: str, kwargs: dict) -> None:
+def _audit_endpoint_denial(db, user, group_name: str, reason: str) -> None:
     """Record an endpoint-permission denial in the audit log. The deployment audited authorised
     actions but not refused ones, so a defender reviewing the log after an incident saw who got in,
     never who was turned away at a permission gate -- the higher-signal half. This runs only on the
@@ -64,21 +64,10 @@ def _audit_endpoint_denial(db, user, group_name: str, reason: str, kwargs: dict)
     turn the 403 the caller is already getting into a 500, so everything is swallowed."""
     try:
         from app.services.audit_logger import AuditLogger
-        from starlette.requests import Request
-        ip = None
-        # Find the request by TYPE, not by the literal name "request": FastAPI passes it as a keyword
-        # arg under whatever name the endpoint declared it (some use "req"), and keying on one name
-        # would drop the IP on every endpoint that chose another.
-        req = next((v for v in kwargs.values() if isinstance(v, Request)), None)
-        if req is not None:
-            try:
-                # Lazy import: api_server imports this module, so a top-level import would be
-                # circular -- but at REQUEST time api_server is fully loaded. get_client_ip honours
-                # X-Forwarded-For only from a trusted proxy, so the logged IP is not attacker-set.
-                from app.api.api_server import get_client_ip
-                ip = get_client_ip(req)
-            except Exception:  # noqa: BLE001
-                ip = None
+        from app.core.net_utils import current_client_ip
+        # ClientIPMiddleware stamps the trusted-proxy client IP per request into a contextvar, so it
+        # is available even on endpoints that declare no `request` parameter.
+        ip = current_client_ip()
         AuditLogger(db).log_action(
             action="endpoint_permission_denied",
             status="failure",
@@ -118,7 +107,7 @@ def require_endpoint_permission(group_name: str):
                 from app.core.temp_scope import temp_session_allows_group
 
                 if not temp_session_allows_group(current_user, group_name, kwargs):
-                    _audit_endpoint_denial(db, current_user, group_name, "temp_credential_scope", kwargs)
+                    _audit_endpoint_denial(db, current_user, group_name, "temp_credential_scope")
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail=f"Temporary credential scope does not permit this action ({group_name})",
@@ -126,7 +115,7 @@ def require_endpoint_permission(group_name: str):
                 if current_user.role != RoleEnum.ADMIN and not _user_has_required_groups(
                     db, current_user.id, group_name
                 ):
-                    _audit_endpoint_denial(db, current_user, group_name, "missing_required_group", kwargs)
+                    _audit_endpoint_denial(db, current_user, group_name, "missing_required_group")
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail=(
@@ -140,7 +129,7 @@ def require_endpoint_permission(group_name: str):
                 return await func(*args, **kwargs)
 
             if not _user_has_required_groups(db, current_user.id, group_name):
-                _audit_endpoint_denial(db, current_user, group_name, "missing_required_group", kwargs)
+                _audit_endpoint_denial(db, current_user, group_name, "missing_required_group")
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=(
