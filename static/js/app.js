@@ -7534,7 +7534,9 @@ function updateBreadcrumb() {
     if (state.currentPath && state.currentPath.length > 0) {
         state.currentPath.forEach((folder, index) => {
             const isLast = index === state.currentPath.length - 1;
-            html += `<span class="breadcrumb-item ${isLast ? 'active' : ''}" data-folder-id="${folder.id}">${escapeHtml(folder.name)}</span>`;
+            // A ZK breadcrumb restored from storage has no label (names are never persisted); show a
+            // neutral, clickable placeholder rather than an empty span until the user navigates.
+            html += `<span class="breadcrumb-item ${isLast ? 'active' : ''}" data-folder-id="${folder.id}">${escapeHtml(folder.name || '\u2026')}</span>`;
         });
     }
     
@@ -9489,13 +9491,26 @@ async function showAccessRevokedModal() {
 // --- View persistence across page refresh ----------------------------------
 // We remember which section / vault / folder the user is looking at so a refresh
 // (F5) restores them there instead of dumping them on the dashboard.
+// A breadcrumb entry inside a ZERO-KNOWLEDGE vault carries the folder's client-decrypted name.
+// Persisting it to sessionStorage would write that plaintext to disk, defeating the vault's whole
+// promise (the server never sees these names; neither should the disk). Strip the labels from the
+// path we persist for a ZK vault -- the ids still restore the folder and drive the clickable
+// breadcrumb, and the labels repopulate as the user navigates. A standard vault's names are already
+// server-known, so nothing is gained by dropping them and the fuller breadcrumb is kept.
+function navPathForStorage(path, isZeroKnowledge) {
+    if (!Array.isArray(path)) return [];
+    if (!isZeroKnowledge) return path;
+    return path.map(f => ({ id: f && f.id }));
+}
 function saveNavState(override) {
     let nav;
     if (override) {
         nav = override;
     } else if (state.currentVault) {
+        const isZk = !!(state.currentVault && state.currentVault.type === 'zero_knowledge');
         nav = { section: 'vault', vaultId: state.currentVault.id,
-                folderId: state.currentFolderId || null, path: state.currentPath || [] };
+                folderId: state.currentFolderId || null,
+                path: navPathForStorage(state.currentPath || [], isZk) };
     } else {
         return;  // nothing meaningful to save
     }
@@ -9524,6 +9539,10 @@ async function restoreLastView() {
             state.currentPath = Array.isArray(nav.path) ? nav.path : [];
             await loadVaultFiles();
             updateBreadcrumb();
+            // openVault above reset dv_nav to root; re-persist the restored depth so a second
+            // refresh lands in the same folder rather than silently at the vault root. Names stay
+            // stripped for a zero-knowledge vault (saveNavState routes through navPathForStorage).
+            saveNavState();
         }
         return true;
     }
