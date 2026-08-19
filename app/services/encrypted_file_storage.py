@@ -11,6 +11,7 @@ by the live code (``VaultService`` calls it when destroying a blob).
 import os
 from pathlib import Path
 import secrets
+from app.core.safe_log import safe_event
 
 
 class EncryptedFileStorage:
@@ -57,8 +58,9 @@ class EncryptedFileStorage:
             storage_path.unlink()
 
         except Exception as e:
-            # If secure deletion fails, still try to delete normally
-            print(f"Warning: Secure deletion failed: {e}")
+            # If secure deletion fails, still try to delete normally. Log only the event + exception
+            # class -- an OSError here carries the file's on-disk PATH, which must not reach the log.
+            safe_event("storage.secure-delete.failed", e)
             try:
                 storage_path.unlink()
             except Exception:
