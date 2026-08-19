@@ -61,6 +61,33 @@ def test_public_source_references_resolve_to_shipped_files():
     )
 
 
+def test_public_source_has_no_private_control_plane_prose():
+    """The public, self-hostable vault must not describe the private managed-service topology.
+
+    Comments and docs that name the private control plane / container-manager / SaaS / monorepo
+    layout leak internal architecture and confuse a self-hoster who has none of it. The neutral
+    vocabulary ("a managing operator", "a centrally managed deployment", "sized per plan tier by
+    whatever provisions this deployment") carries the same meaning without the disclosure. This
+    guards against the terms creeping back in.
+    """
+    forbidden = re.compile(
+        r"container-manager|control[ -]plane|\bSaaS\b|co-tenant|monorepo|shared-worker"
+        r"|per-customer|single-vault deployment|multi-container bundle|product container",
+        re.IGNORECASE,
+    )
+    hits = []
+    for source in (*_public_source_files(), ROOT / ".dockerignore"):
+        if not source.is_file():
+            continue
+        for lineno, line in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
+            if forbidden.search(line):
+                hits.append(f"{source.relative_to(ROOT)}:{lineno}: {line.strip()}")
+    assert not hits, (
+        "public source describes the private managed-service topology; reword to product-neutral "
+        "phrasing (a managing operator / a centrally managed deployment):\n" + "\n".join(hits)
+    )
+
+
 def test_removed_setup_state_paths_have_no_runtime_consumer_or_mount():
     runtime_files = [
         *ROOT.joinpath("app").rglob("*.py"),

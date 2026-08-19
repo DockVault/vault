@@ -99,7 +99,7 @@ def pepper_ok(pepper):
 
 def effective_ceiling(plan_log_pull, pepper):
     """The REAL ceiling: the plan must allow the endpoint AND a strong pepper must be present.
-    So a control plane that injects PLAN_LOG_PULL without also injecting a pepper (or an
+    So a managing operator that injects PLAN_LOG_PULL without also injecting a pepper (or an
     operator who forgets it) gets a SAFELY-DISABLED endpoint (404), never a dead container."""
     return bool(plan_log_pull) and pepper_ok(pepper)
 

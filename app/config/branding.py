@@ -8,8 +8,8 @@ All branding settings can be overridden via environment variables with the BRAND
 
 Defaults are the DockVault brand: a fresh / self-hosted build with no overrides shows
 DockVault (name, logo, favicon, in-vault title), so the free product keeps the DockVault
-identity. Any deployment can OVERRIDE the brand — at deploy time via BRAND_* env (the SaaS
-injects each customer's brand at provision) or live via the admin Settings editor — so the
+identity. Any deployment can OVERRIDE the brand — at deploy time via BRAND_* env (a managed deployment
+injects each tenant's brand at provision) or live via the admin Settings editor — so the
 same code serves both a DockVault-branded free instance and a per-tenant-branded paid one.
 The one thing that is NOT part of the editable brand set is the "powered by" attribution
 below (a tenant cannot remove it via the editor; only a deploy-level env flag can hide it).
@@ -63,7 +63,7 @@ class BrandingConfig(BaseSettings):
     - Easy rebranding without code changes
     - White-label deployments for resellers
     - Different branding for dev/staging/production
-    - Per-tenant branding (for SaaS multi-tenant)
+    - Per-tenant branding (for multi-tenant deployments)
     """
     
     # ========================================

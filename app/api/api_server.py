@@ -220,7 +220,7 @@ app.add_middleware(
 def _external_scheme(request: StarletteRequest) -> str:
     """The externally-visible request scheme, honouring X-Forwarded-Proto only from a trusted proxy.
 
-    Behind a TLS-terminating reverse proxy (the common SaaS/orchestrator topology, and the dev
+    Behind a TLS-terminating reverse proxy (the common production topology, and the dev
     compose) uvicorn sees plain HTTP even though the client spoke HTTPS, so the in-process
     request.url.scheme is 'http' and the strongest transport-security signals (HSTS +
     upgrade-insecure-requests) would never be emitted. Trust X-Forwarded-Proto ONLY when the
@@ -2598,7 +2598,7 @@ def _set_logs_settings(db, updates: dict) -> None:
 def _log_ceiling_on() -> bool:
     """The EFFECTIVE log-pull ceiling: the plan must allow it (settings.plan_log_pull) AND a
     strong pepper must be configured. A weak/absent pepper DISABLES the endpoint (fail-safe)
-    rather than bricking the vault, so the control plane can inject PLAN_LOG_PULL and the pepper
+    rather than bricking the vault, so a managing operator can inject PLAN_LOG_PULL and the pepper
     in any order without a dead container in between."""
     return log_pull.effective_ceiling(settings.plan_log_pull, settings.log_token_pepper)
 

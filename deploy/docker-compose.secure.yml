@@ -276,7 +276,7 @@ services:
     read_only: true
     tmpfs:
       - /tmp:mode=1777
-    # Resource ceilings so one vault can't exhaust the host (co-tenant DoS). The download path no
+    # Resource ceilings so one vault can't exhaust a shared host. The download path no
     # longer materialises the file in memory -- it is streamed -- so what to size against is
     # MAX_CONCURRENT_TRANSFERS (16 by default) rather than MAX_FILE_SIZE_MB: about 130 MB at rest
     # plus 25 MB per concurrent transfer for this container, so roughly 530 MB at the default

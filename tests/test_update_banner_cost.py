@@ -169,7 +169,7 @@ def test_the_matrix_rides_the_existing_cache_rather_than_adding_a_request(monkey
 
 
 def test_a_managed_deployment_is_still_suppressed(monkeypatch):
-    """A control-plane deployment upgrades by operator promote; it must not be told to press
+    """A centrally managed deployment upgrades by operator promote; it must not be told to press
     anything, and must not spend an outbound request finding out."""
     uc = _fresh_module()
     calls = []

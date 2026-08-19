@@ -1,16 +1,16 @@
 """Combined entrypoint: run the FastAPI web/API server AND (optionally) the SFTP server
 in ONE container.
 
-Used for provisioned single-vault deployments so a customer gets BOTH the web app
+Used to run one container that serves BOTH the web app
 (port 8000) and SFTP (port 2222) backed by the SAME storage/keys volume and the SAME
 database — the two processes interoperate exactly as the split dev-stack containers do
 (shared /app/storage + /app/keys, the same DATABASE_URL, ENCRYPTION_KEY, JWT_SECRET_KEY,
-and Redis). Running them in one process tree avoids the per-component-volume problem that
+and Redis). Running them in one process tree avoids the separate-volume problem that
 would otherwise stop the web and SFTP halves from sharing files.
 
-The SFTP half starts ONLY when RUN_SFTP is truthy in the environment (provisioning sets
-it for single-vault deployments). Without it, this launcher runs the web app alone — so a
-vault image used as a plain web component (e.g. a multi-container bundle's 'app') does not
+The SFTP half starts ONLY when RUN_SFTP is truthy in the environment (a managing operator
+sets it for a combined deployment). Without it, this launcher runs the web app alone — so a
+vault image used as a plain web component (e.g. one service among several) does not
 spin up an unpublished SFTP listener or couple its liveness to one.
 
 If a running child exits, this launcher terminates the other and exits non-zero so the

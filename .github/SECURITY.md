@@ -44,7 +44,7 @@ requests to that rate no matter how often the UI polls) to GitHub's public API (
 `raw.githubusercontent.com`) to learn the latest published version. It sends **no** instance identifier, account data, version,
 or other telemetry — only the request's egress IP reaches GitHub (inherent to any outbound HTTP).
 It is fail-closed-silent (never blocks a request, never errors), the "update available" status is
-admin-only, and it is suppressed on control-plane-managed deployments. Leave `UPDATE_CHECK_ENABLED`
+admin-only, and it is suppressed on centrally managed deployments. Leave `UPDATE_CHECK_ENABLED`
 at its default `false` to make no outbound calls at all; air-gapped installs are unaffected.
 
 ## Credentials and repository history

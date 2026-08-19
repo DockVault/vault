@@ -83,18 +83,18 @@ class Settings(BaseSettings):
     # blocks a request, never errors to the user) and NO telemetry / instance identifier — only
     # the outbound request's egress IP reaches GitHub. See app/services/update_check.py.
     update_check_enabled: bool = Field(default=False)
-    # A control-plane-managed (SaaS) deployment upgrades via operator promote, not self-service,
-    # so the update banner is SUPPRESSED when this is set (the control plane sets it at provision).
+    # A centrally managed deployment upgrades via operator promote, not self-service, so the
+    # update banner is SUPPRESSED when this is set (whatever provisions the deployment sets it).
     managed_deployment: bool = Field(default=False)
     # How often (minutes) an ENABLED update check may make a real outbound request to GitHub. This
     # is the env default; an admin can override it live in Settings. Both are clamped to a
     # rate-limit-safe floor (see app/services/update_check.py: MIN/MAX_INTERVAL_MINUTES).
     update_check_interval_minutes: int = Field(default=360)
 
-    # Plan-imposed feature ceiling. The control plane injects these as PLAN_* env
+    # Plan-imposed feature ceiling. A managing operator injects these as PLAN_* env
     # vars at provision time so a deployment can't use features its plan excludes —
     # a HARD ceiling (a pushed admin /settings value could be toggled back by the
-    # customer's own admin; an env ceiling cannot). Defaults are PERMISSIVE so an
+    # deployment's own admin; an env ceiling cannot). Defaults are PERMISSIVE so an
     # un-gated / local-dev vault (no PLAN_* env) behaves exactly as before.
     plan_zero_knowledge: bool = Field(default=True)         # may zero-knowledge vaults be created at all
     plan_force_zero_knowledge: bool = Field(default=False)  # plan mandates zero-knowledge org-wide (Enterprise)
@@ -102,8 +102,8 @@ class Settings(BaseSettings):
     plan_max_users: int = Field(default=-1)                 # cap on user accounts (-1 unlimited, 0 = block all, N capped)
     # Operator-set allowlist of the vault TYPES this deployment may create (comma-separated,
     # e.g. "standard" to forbid zero-knowledge org-wide, or "zero_knowledge" for ZK-only).
-    # Like the other PLAN_* ceilings it is injected by the control plane and is HARD: the
-    # customer's own admin cannot widen it (there is no local /settings override), so it is
+    # Like the other PLAN_* ceilings it is injected by a managing operator and is HARD: the
+    # deployment's own admin cannot widen it (there is no local /settings override), so it is
     # the admin-irreversible "allowed vault types" policy. EMPTY (the default) means NO
     # restriction — every recognised type is creatable, so an un-gated / local-dev vault
     # behaves exactly as before. Unrecognised entries are ignored; an all-invalid value is
@@ -112,9 +112,9 @@ class Settings(BaseSettings):
     # May this deployment expose the authenticated log-PULL endpoint (GET /logs)?
     # DELIBERATELY default FALSE — unlike the other PLAN_* ceilings (which default permissive so
     # an un-gated vault behaves as before), exposing the log stream is the UNSAFE direction, and
-    # "as before" here means "no log endpoint at all". So the endpoint 404s everywhere until the
-    # control plane injects PLAN_LOG_PULL=1 (Phase 2 plan-tiering) AND an admin enables a
-    # component. Even then it is a HARD ceiling the customer's own admin cannot widen.
+    # "as before" here means "no log endpoint at all". So the endpoint 404s everywhere until
+    # a managing operator injects PLAN_LOG_PULL=1 (plan-tiering) AND an admin enables a
+    # component. Even then it is a HARD ceiling the deployment's own admin cannot widen.
     plan_log_pull: bool = Field(default=False)
 
     # Security Configuration (loaded from credential_manager)
