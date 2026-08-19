@@ -50,7 +50,7 @@ from app.config.branding import branding
 # as a 500 instead of a 429.
 from app.services.auth_service import AuthService, InvalidCredentialsError, AccountLockedError, RateLimitExceededError as AuthRateLimitExceededError
 from app.core.authorization import PermissionService, PermissionDeniedError, ResourceNotFoundError, AuthorizationError
-from app.services.vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, _name_match_filter
+from app.services.vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, _name_match_filter, is_refundable_serve_failure
 from app.services.vault_service import require_file_scope, require_folder_scope, require_item_scope, require_download_scope, folder_ancestry, filter_listing_for_scope
 from app.core.id_scope import id_in_scope
 from sqlalchemy.exc import IntegrityError
@@ -10216,6 +10216,9 @@ async def download_file(
     streaming_response = None
     download = None
     transfer_slot = None
+    # The exact share-claim ids the burn below consumed, so a later server-side failure can return
+    # those and no others. Empty for a non-share or unlimited-share download (nothing was burned).
+    burned_share_claim_ids = []
 
     try:
         # Verify vault access and password. allow_share=True: a recipient with an active
@@ -10257,12 +10260,13 @@ async def download_file(
         share_authorized = str(vault_id) in (
             getattr(current_user, '_share_vault_scope', None) or {})
         if share_authorized:
-            if not permission_service.burn_share_download(
+            allowed, burned_share_claim_ids = permission_service.burn_share_download(
                 current_user,
                 vault,
                 file_record,
                 folder_ancestry(db, vault_id, file_record.folder_id),
-            ):
+            )
+            if not allowed:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="This share has reached its download limit.",
@@ -10440,13 +10444,22 @@ async def download_file(
                         pass
 
                 # A share grant is burned at authorization, because it is a cap on grants
-                # exercised and must be atomic before serving, and it stays burned however the
-                # transfer ends. Refunding a client-abandoned transfer would make a capped share
-                # uncapped for anyone willing to disconnect. Refunding a SERVER-side failure would
-                # be defensible -- a corrupt blob should not spend a recipient's budget for zero
-                # bytes -- but the burn is atomic across every covering claim, so returning it
-                # means returning exactly those and no others, exactly once. That is its own
-                # change; the completion record above at least says which case occurred.
+                # exercised and must be atomic before serving, and it stays burned when the client
+                # abandons or cancels -- refunding those would make a capped share uncapped for
+                # anyone willing to disconnect. A SERVER-side integrity failure discovered here (the
+                # checksum hold-back, or a per-record decrypt failure) is different: the client is
+                # left short of the promised length and received no usable file, and cannot induce
+                # the failure, so the burned downloads are returned -- exactly the claims the burn
+                # consumed, once. Not ObjectChangedDuringRead: a same-name replacement is a race, not
+                # a corrupt blob, and a colluding writer could otherwise trigger refunds at will.
+                if burned_share_claim_ids and is_refundable_serve_failure(failure):
+                    try:
+                        permission_service.refund_share_download(burned_share_claim_ids)
+                    except Exception:      # noqa: BLE001 - a failed refund must not mask the transfer
+                        try:
+                            db.rollback()
+                        except Exception:  # noqa: BLE001
+                            pass
 
                 transition = None
                 if tracker_started and not cancellation_observed:
@@ -10707,6 +10720,15 @@ async def download_file(
             detail=str(e),
         )
     except FileNotFoundError as e:
+        if burned_share_claim_ids:
+            try:
+                permission_service.refund_share_download(burned_share_claim_ids)
+                burned_share_claim_ids = []
+            except Exception:      # noqa: BLE001 - a failed refund must not mask the 404
+                try:
+                    db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
@@ -10716,6 +10738,25 @@ async def download_file(
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
+        # Anything reaching this handler failed BEFORE the response was handed off, so zero bytes
+        # were served -- whether the cause was a stored-byte integrity failure (a rejected walk, a
+        # failed record tag, the zero-length checksum), a blob that vanished in a TOCTOU race, or an
+        # infrastructure hiccup starting the tracker or writing the authorized-access audit row. A
+        # capped recipient who received nothing must not be charged, so the burn is returned
+        # unconditionally here. Client and auth failures never reach this point -- the specific
+        # clauses above answer them (and deliberately keep those burned, so a wrong file password
+        # can't be retried for free). No-op off the share path (empty list). The stricter,
+        # integrity-only classification lives at the mid-stream guard, where a prefix may already
+        # have been served and a delete/replacement race must NOT refund.
+        if burned_share_claim_ids:
+            try:
+                permission_service.refund_share_download(burned_share_claim_ids)
+                burned_share_claim_ids = []
+            except Exception:      # noqa: BLE001 - a failed refund must not mask the download error
+                try:
+                    db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
         try:
             broadcast_event({
                 "event": {

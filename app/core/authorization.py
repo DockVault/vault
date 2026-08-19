@@ -483,10 +483,14 @@ class PermissionService:
             setattr(user, attr, smap)
         smap[str(vault_id)] = scope
 
-    def burn_share_download(self, user: User, vault: Vault, file, ancestor_folder_ids) -> bool:
+    def burn_share_download(self, user: User, vault: Vault, file, ancestor_folder_ids):
         """Consume ONE download against the per-recipient ``max_downloads`` of the SHARE claims that
-        cover this file (each recipient gets their own per-share download budget). Returns True to allow, False to deny
-        (a covering LIMITED claim is exhausted). MUST be called only for a share recipient (the caller
+        cover this file (each recipient gets their own per-share download budget). Returns
+        ``(allowed, burned_claim_ids)``: ``allowed`` is True to allow / False to deny (a covering LIMITED
+        claim is exhausted), and ``burned_claim_ids`` is the exact claims this call incremented -- empty on
+        deny and on the unlimited path -- so a caller that later sees the SERVER fail to serve can hand
+        that list to :meth:`refund_share_download` and return exactly those and no others. MUST be called
+        only for a share recipient (the caller
         gates on the share-scope stamp); it independently re-resolves the covering claims.
 
         Coverage: a claim covers `file` if it is a whole-vault share, a folder share whose target
@@ -544,13 +548,14 @@ class PermissionService:
             # (a revoke/expiry/audience-removal mid-request) — deny rather than serve an un-metered
             # download. A legitimately unlimited share has a covering claim with max_downloads NULL,
             # handled below.
-            return False
+            return False, []
         # An unlimited covering claim ⇒ unlimited downloads for this file (burn nothing).
         if any(max_dl is None for _, max_dl in covering):
-            return True
+            return True, []
         # All covering claims are limited: atomically consume one from EACH; deny (and roll back the
         # whole burn) if any is already at its cap. Consuming every covering limited claim keeps each
         # share's max_downloads a hard ceiling — the multi-claim keying is intentionally strict.
+        burned = []
         for claim_id, max_dl in covering:
             res = self.db.execute(
                 update(ShareClaim)
@@ -559,9 +564,36 @@ class PermissionService:
             )
             if res.rowcount == 0:
                 self.db.rollback()
-                return False
+                return False, []
+            burned.append(claim_id)
         self.db.commit()
-        return True
+        return True, burned
+
+    def refund_share_download(self, claim_ids) -> int:
+        """Return downloads that :meth:`burn_share_download` consumed when the SERVER then failed to
+        serve the file -- a corrupt, truncated or otherwise unreadable stored blob -- so a recipient is
+        not charged a capped download for bytes they never received. Decrements EXACTLY the claims the
+        burn incremented (``claim_ids`` is what the burn returned), once each, floored at zero via the
+        ``download_count > 0`` guard so a double call or a racing delete can never drive the counter
+        negative. Returns the number of rows actually decremented.
+
+        MUST NOT be called for a client cancellation or disconnect. A client cannot induce a server-side
+        integrity failure, and that is the whole reason refunding one is safe: it cannot be used to make
+        a capped share uncapped by disconnecting. Commits the request session (mirroring the burn's
+        transaction ownership); a no-op returning 0 on an empty list (an unlimited share or a non-share
+        download burned nothing)."""
+        if not claim_ids:
+            return 0
+        refunded = 0
+        for claim_id in claim_ids:
+            res = self.db.execute(
+                update(ShareClaim)
+                .where(ShareClaim.id == claim_id, ShareClaim.download_count > 0)
+                .values(download_count=ShareClaim.download_count - 1)
+            )
+            refunded += res.rowcount
+        self.db.commit()
+        return refunded
 
     def _group_vault_permission(self, user: User, vault_id: uuid.UUID) -> Optional[dict]:
         """Highest vault permission the user gets via any group that has been
