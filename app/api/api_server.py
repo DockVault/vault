@@ -11040,6 +11040,22 @@ async def create_folder(
             # — a malformed value must be a clean 400, not a 500 (int()/DB DataError) below.
             if len(str(zk_name_bi)) > 64:
                 raise HTTPException(status_code=400, detail="name_bi too long")
+            # Bound the same-name candidate set here, the way the Pydantic-validated paths (rename,
+            # upload) bound it with max_length=64. This endpoint takes a raw dict, so the cap has to
+            # be applied by hand: without it a client could send tens of thousands of candidates,
+            # which SQLAlchemy expands to one bind parameter each in the `name_bi.in_(...)` clash
+            # query and Postgres rejects past 65535 -- a 500 and a per-request amplification lever
+            # instead of the clean 400 the other paths give. Each element is also a blind index, so
+            # anything longer than the column can never match; drop it rather than store a giant.
+            if zk_name_bi_candidates is not None:
+                if not isinstance(zk_name_bi_candidates, list) or len(zk_name_bi_candidates) > 64:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="name_bi_candidates must be a list of at most 64 blind indices")
+                if any(not isinstance(c, str) or len(c) > 64 for c in zk_name_bi_candidates):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="each name_bi_candidate must be a string of at most 64 characters")
             if zk_name_kv is not None:
                 try:
                     zk_name_kv = int(zk_name_kv)
@@ -12370,7 +12386,7 @@ def _run_lightweight_migrations():
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS enc_name TEXT",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS enc_mime TEXT",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS name_bi VARCHAR(64)",
-            # N2a: the per-epoch/index-key candidate set a ZK upload matches its name against, so a
+            # The per-epoch/index-key candidate set a ZK upload matches its name against, so a
             # same-name file sealed before a rotation is found rather than silently duplicated.
             # create_all adds it on a fresh DB; this backfills it on an in-place upgrade. Additive
             # and nullable — an old session row simply has none and falls back to single-value match.

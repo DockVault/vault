@@ -6,7 +6,7 @@ NEW epoch, which cannot equal the stored one, so the server sees no clash — re
 silently stops applying and `_reject_unreplaceable_upload` stops rejecting, and the vault ends up
 with two rows sharing one visible name.
 
-This is the server half of the fix (N2a): the upload accepts `name_bi_candidates`, a set the name
+This is the server half of the fix: the upload accepts `name_bi_candidates`, a set the name
 may match under, and matches the union at both the reject pre-check and the finalize replace. The
 client half (computing the set from every epoch's DEK) is a separate increment; here the test plays
 the client, sending the old-epoch index alongside the new one, exactly as the client will.
@@ -154,7 +154,7 @@ def test_without_candidates_the_pre_rotation_file_is_still_missed(admin, zk_vaul
     assert _count_named(vid, [bi1, bi2]) == 2, "without candidates the clash should be missed"
 
 
-# --- N2b-3: rename and folder-create also match against the candidate set --------------------
+# --- rename and folder-create also match against the candidate set --------------------------
 
 def _rename(admin, vid, fid, name, dek, epoch, candidates=None, key_version=None):
     body = {
@@ -242,3 +242,32 @@ def test_folder_create_into_a_pre_rotation_name_is_caught_with_candidates(admin,
     # Without candidates: the clash is missed and a second same-name folder is created.
     r2 = _create_folder(admin, vid, name, dek, epoch=2)
     assert r2.status_code == 200, r2.text
+
+
+def test_folder_create_rejects_an_oversized_candidate_list_cleanly(admin, zk_vault):
+    """A candidate list over the 64 cap is a clean 400, not a 500. The rename and upload paths get
+    this from a Pydantic max_length; the folder-create endpoint takes a raw dict, so it enforces
+    the same bound by hand -- without it, an oversized list becomes one SQL bind parameter per
+    element and the clash query fails past Postgres's limit (a 500 and an amplification lever)."""
+    vid = zk_vault["id"]
+    dek = os.urandom(32)
+    name = unique("bounded")
+    fid = str(uuid.uuid4())
+    huge = [zk_name_blind_index(f"{name}-{i}", dek, vid, 1) for i in range(65)]
+    r = admin.post(f"/vaults/{vid}/folders", json={
+        "id": fid,
+        "enc_name": zk_encrypt_name(name, dek, vid, "name", 1, obj_id=fid),
+        "name_bi": zk_name_blind_index(name, dek, vid, 1),
+        "name_bi_candidates": huge,
+        "name_key_version": 1,
+    })
+    assert r.status_code == 400, f"an oversized candidate list must be a clean 400, got {r.status_code}: {r.text}"
+    # And a list at the cap (64) is still accepted.
+    ok = admin.post(f"/vaults/{vid}/folders", json={
+        "id": str(uuid.uuid4()),
+        "enc_name": zk_encrypt_name(unique("okname"), dek, vid, "name", 1, obj_id=fid),
+        "name_bi": zk_name_blind_index(unique("okname2"), dek, vid, 1),
+        "name_bi_candidates": huge[:64],
+        "name_key_version": 1,
+    })
+    assert ok.status_code == 200, ok.text
