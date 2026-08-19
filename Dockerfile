@@ -45,7 +45,7 @@ COPY . .
 # ownership, so the non-root process can write uploads into it.
 RUN mkdir -p storage logs keys certs brand
 
-# The per-customer product container handling untrusted uploads / SFTP / at-rest crypto, so
+# The vault container handles untrusted uploads / SFTP / at-rest crypto, so
 # root-in-container is the most valuable to drop. chown /app so the runtime dirs (storage/
 # logs/keys/certs) are appuser-owned, and a fresh named volume mounted over them inherits it.
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -54,7 +54,7 @@ RUN adduser -D -u 10001 appuser && chown -R appuser:appuser /app
 # NOTE: we deliberately do NOT `USER appuser`. The container starts as root so the entrypoint
 # (docker-entrypoint.py) can chown persistent volumes that an OLDER, root-era image may have
 # created root-owned — otherwise an in-place UPGRADE to this non-root image BRICKS the
-# container (the non-root app can't read its SSH host key, and worse, the customer's
+# container (the non-root app can't read its SSH host key, and worse, its stored
 # /app/storage files). The entrypoint runs as root ONLY for that brief fixup, then DROPS to
 # appuser (uid 10001) before exec'ing the command — so the workload never runs as root
 # (the postgres/redis official-image pattern). SFTP needs no runtime root (paramiko
@@ -90,8 +90,8 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=5 \
 ENTRYPOINT ["python", "/app/docker-entrypoint.py"]
 
 # Default: run BOTH the web/API process (8000) and the SFTP server (2222) in one
-# container, so a provisioned single-vault deployment exposes SFTP without needing a
-# second container or a shared-volume bundle. run_combined.py supervises both and exits
+# container, so a combined deployment exposes SFTP without needing a
+# second container or a shared volume. run_combined.py supervises both and exits
 # if either dies, so the container's restart policy recreates the whole thing.
 # The dev stack and the bundle composer override this with an explicit
 # `command: ["python", "-m", "app.api.api_server"]` / `["python", "-m", "app.sftp.sftp_server"]`.

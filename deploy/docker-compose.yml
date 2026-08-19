@@ -1,7 +1,7 @@
 # Self-contained local stack for the vault service: the web/API process, the
 # SFTP process, and the Postgres + Redis it depends on. The built image is
-# tagged `dockvault-vault:latest` — the same image the container-manager is
-# meant to deploy as a customer container.
+# tagged `dockvault-vault:latest` — the image a deployment runs, whether
+# self-hosted or centrally managed.
 #
 # This file lives in deploy/; the repo-root docker-compose.yml is a thin
 # `include:` pointer to it, so the documented quickstart stays
@@ -154,8 +154,7 @@ services:
     tmpfs:
       - /tmp:mode=1777
       - /app/certs:mode=1777
-    # Resource ceilings so a heavy/compromised vault can't exhaust the shared host (co-tenant DoS
-    # on the shared-worker SaaS topology). Generous dev/standalone defaults; the SaaS control plane
+    # Resource ceilings so a heavy/compromised vault can't exhaust a shared host. Generous dev/standalone defaults; a managed deployment
     # sizes these per plan tier at provision time. A transfer no longer costs a multiple of the
     # file: downloads and uploads are streamed, so each costs a fixed amount whatever the file
     # weighs, and the ceiling that matters is MAX_CONCURRENT_TRANSFERS (16 by default) rather than

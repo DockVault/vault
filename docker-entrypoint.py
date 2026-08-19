@@ -3,11 +3,11 @@
 drop privileges and exec the real command.
 
 The app runs as the non-root 'appuser' (uid 10001) for defense-in-depth (this is the
-per-customer product container handling untrusted uploads / SFTP / at-rest crypto). But a
+vault container handling untrusted uploads / SFTP / at-rest crypto). But a
 persistent volume (/app/keys, /app/storage, ...) that was first created by an OLDER, root-era
 image is owned by root, so after an in-place UPGRADE to this non-root image the appuser can
 neither read its SSH host key nor its stored files, and the container crash-loops
-(PermissionError: 'keys/ssh_host_rsa_key', and — worse — the customer's /app/storage files
+(PermissionError: 'keys/ssh_host_rsa_key', and — worse — its stored /app/storage files
 become unreadable).
 
 This entrypoint runs briefly as root ONLY to chown those volumes back to appuser, then drops

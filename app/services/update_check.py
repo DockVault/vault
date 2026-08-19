@@ -12,7 +12,7 @@ Privacy / safety contract (all HARD requirements):
     version: just a plain unauthenticated GET with a generic User-Agent. The only thing GitHub
     learns is the egress IP, inherent to any outbound HTTP (documented in README.md and
     .github/SECURITY.md).
-  * SUPPRESSED for a control-plane-managed deployment (``managed_deployment``), which upgrades via
+  * SUPPRESSED for a centrally managed deployment (``managed_deployment``), which upgrades via
     operator promote, not self-service — so the banner never shows a CTA the customer can't use.
 """
 import json
