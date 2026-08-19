@@ -1617,6 +1617,14 @@ async def recent_audit_events(
     """Recent audit-log entries for the dashboard activity feed (admin only)."""
     from app.core.models import AuditLog
     limit = max(1, min(limit, 50))
+    # Opportunistically prune audit rows past the retention window (throttled once/hour; a no-op
+    # unless an operator set a positive audit_log_retention_days). Do it BEFORE the fetch: the prune
+    # commits, and a failed DELETE must not leave the shared session aborted and 500 the feed.
+    try:
+        from app.services.audit_logger import AuditLogger
+        AuditLogger(db).cleanup_old_audit_logs()
+    except Exception:
+        db.rollback()
     rows = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).limit(limit).all()
     out = []
     for r in rows:

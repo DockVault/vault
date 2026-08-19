@@ -2,14 +2,24 @@
 Audit logging system for security and compliance.
 Tracks all significant actions in the system.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
+import logging
+import time
 import uuid
 import json
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.models import AuditLog, User
+
+logger = logging.getLogger(__name__)
+
+# Process-wide throttle for opportunistic audit-log pruning (see
+# AuditLogger.cleanup_old_audit_logs): run at most once per hour per process. None = never
+# run yet, so the first eligible cleanup always runs.
+_last_audit_cleanup_at = None
 
 
 class AuditLogger:
@@ -509,3 +519,39 @@ class AuditLogger:
             error_message=error_message,
             details=details
         )
+
+    def cleanup_old_audit_logs(self, days: Optional[int] = None) -> int:
+        """Opportunistically prune audit_logs older than the retention window.
+
+        Retention is OPT-IN: a window of 0 or negative -- the default -- keeps every audit row
+        forever. Audit rows are forensic/compliance records, so silent deletion is the worse failure;
+        an operator must explicitly choose to bound the append-only table. When a positive window is
+        configured (settings.audit_log_retention_days), rows older than it are deleted. Process-wide
+        throttled to at most once per hour, so it can be wired into a frequently-hit admin read path
+        without issuing a DELETE per request. Returns the rows deleted (0 when disabled or throttled).
+        """
+        global _last_audit_cleanup_at
+
+        if days is None:
+            days = getattr(settings, 'audit_log_retention_days', 0)
+        # Disabled (the default): keep everything. Checked BEFORE the throttle so that enabling
+        # retention later takes effect on the next read instead of waiting out a throttle window that
+        # would have been advanced while it was still disabled.
+        if not days or days <= 0:
+            return 0
+
+        now = time.monotonic()
+        if _last_audit_cleanup_at is not None and now - _last_audit_cleanup_at < 3600:
+            return 0
+        _last_audit_cleanup_at = now
+
+        # Naive UTC to match the TIMESTAMP-WITHOUT-TIME-ZONE column, and synchronize_session=False so
+        # the DELETE runs entirely in Postgres (the default 'evaluate' strategy would compare the
+        # naive column value against the cutoff in Python and raise on naive-vs-aware).
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        deleted = self.db.query(AuditLog).filter(
+            AuditLog.timestamp < cutoff
+        ).delete(synchronize_session=False)
+        self.db.commit()
+        logger.info("Pruned %d audit_logs rows older than %dd", deleted, days)
+        return deleted

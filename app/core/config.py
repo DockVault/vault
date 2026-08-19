@@ -231,6 +231,11 @@ class Settings(BaseSettings):
     security_bulk_deletion_threshold: int = Field(default=10)  # Files deleted in time window
     security_bulk_deletion_window: int = Field(default=60)  # Time window in seconds
     security_alert_retention_days: int = Field(default=90)  # How long to keep resolved alerts
+    # Audit-log retention. 0 (the default) keeps audit_logs forever -- the compliance-safe default,
+    # since audit rows are forensic/compliance records and deleting them silently is the worse
+    # failure. A positive value opportunistically prunes rows older than N days (throttled once/hour),
+    # bounding the append-only table's growth for operators who want it.
+    audit_log_retention_days: int = Field(default=0)
     
     # Logging
     log_level: str = Field(default="INFO")
