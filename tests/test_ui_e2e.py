@@ -2409,3 +2409,47 @@ def test_zk_upload_sends_name_bi_candidates(page: Page, admin):
         if b:
             admin.delete_user(user["id"])
         admin.put("/settings", json={"zero_knowledge_enabled": False})
+
+
+def test_zk_vault_create_mints_a_name_index_key(page: Page, admin):
+    """N3a-2a: creating a zero-knowledge vault mints its name-index key, wrapped to the owner.
+
+    Proves the client mint flow end to end: after create, GET /index-key returns a wrap (with the
+    server-selected recipient), and the browser unwraps it to a 32-byte AES key via the shipped
+    zkGetVaultIndexKey. A pure-crypto test proves the wrap round-trips; only this proves the create
+    flow actually mints and stores one."""
+    import base64 as _b64
+    from conftest import ApiClient
+
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    user = admin.create_user(role="admin")
+    owner = ApiClient()
+    owner.login(user["_username"], user["_password"])
+    vid = None
+    try:
+        _login(page, user["_username"], user["_password"])
+        vid = _create_zk_vault_via_ui(page, owner, "zk-idxkey-pass-1")
+
+        # The server has a wrap for the owner, with the recipient it selected.
+        resp = owner.get(f"/ecc/vaults/{vid}/index-key").json()
+        assert resp["index_key"], f"no index key was minted at create: {resp!r}"
+        assert resp["recipient_user_id"] == str(user["id"])
+        # A 68-byte v2 wrap, base64.
+        assert len(_b64.b64decode(resp["index_key"])) == 68
+
+        # The browser unwraps it to a 32-byte key through the real helper.
+        keylen = page.evaluate(
+            """async (vid) => {
+                const k = await zkGetVaultIndexKey(vid);
+                if (!k) return -1;
+                const raw = await crypto.subtle.exportKey('raw', k);
+                return new Uint8Array(raw).length;
+            }""", vid)
+        assert keylen == 32, f"the owner could not unwrap the minted index key (got {keylen})"
+    finally:
+        if vid:
+            admin.delete_vault(vid)
+        b = [u for u in admin.get("/users").json() if u["id"] == user["id"]]
+        if b:
+            admin.delete_user(user["id"])
+        admin.put("/settings", json={"zero_knowledge_enabled": False})
