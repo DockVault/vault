@@ -872,6 +872,7 @@ class VaultService:
         password: Optional[str] = None,
         zk_enc_name: Optional[str] = None,
         zk_name_bi: Optional[str] = None,
+        zk_name_bi_candidates: Optional[list] = None,
         zk_name_key_version: Optional[int] = None,
         folder_id: Optional[uuid.UUID] = None,
     ) -> Folder:
@@ -929,8 +930,14 @@ class VaultService:
         # (vault, parent, name_bi) unique index; the pre-check turns the common case into a
         # clean 409 instead of relying on the IntegrityError path below.
         clash_name = zk_name_bi if is_zk else sanitize_filename(name)
-        clash_match = (Folder.name_bi == zk_name_bi) if is_zk \
-            else _name_match_filter(Folder, vault, clash_name)
+        # ZK: match every epoch's candidate so a folder created before a rotation (whose
+        # index is at an old epoch) is still detected as a duplicate. Superset of the single
+        # value; absent falls back to it. Standard: unchanged plaintext match.
+        _cand = [c for c in dict.fromkeys(zk_name_bi_candidates or []) if isinstance(c, str)]
+        if is_zk:
+            clash_match = Folder.name_bi.in_(_cand) if _cand else (Folder.name_bi == zk_name_bi)
+        else:
+            clash_match = _name_match_filter(Folder, vault, clash_name)
         if self.db.query(Folder).filter(
             Folder.vault_id == vault_id,
             Folder.parent_folder_id == parent_folder_id,
@@ -1756,6 +1763,7 @@ class VaultService:
                     vault_id: Optional[uuid.UUID] = None, *,
                     zk_enc_name: Optional[str] = None,
                     zk_name_bi: Optional[str] = None,
+                    zk_name_bi_candidates: Optional[list] = None,
                     zk_name_key_version: Optional[int] = None):
         """
         Rename a file or folder.
@@ -1794,10 +1802,16 @@ class VaultService:
             if not zk_enc_name or not zk_name_bi:
                 raise ValueError("A zero-knowledge rename requires an encrypted name (enc_name + name_bi).")
             if folder is not None:
+                # Match every epoch's candidate, not just the current one: a folder sealed
+                # before a rotation carries an old-epoch index the single value would miss, so a
+                # rename INTO its name would go undetected and create a second folder with the same
+                # visible name. Superset of the single value; absent falls back to it.
+                _cand = [c for c in dict.fromkeys(zk_name_bi_candidates or []) if isinstance(c, str)]
+                _fmatch = Folder.name_bi.in_(_cand) if _cand else (Folder.name_bi == zk_name_bi)
                 clash = self.db.query(Folder).filter(and_(
                     Folder.vault_id == folder.vault_id,
                     Folder.parent_folder_id == folder.parent_folder_id,
-                    Folder.name_bi == zk_name_bi,
+                    _fmatch,
                     Folder.id != file_id,
                 )).first()
                 if clash:
@@ -1809,10 +1823,12 @@ class VaultService:
                 folder.updated_at = datetime.now(timezone.utc)
                 self.db.commit()
                 return {'old_name': None, 'new_name': None, 'file_type': 'folder'}
+            _candf = [c for c in dict.fromkeys(zk_name_bi_candidates or []) if isinstance(c, str)]
+            _fimatch = File.name_bi.in_(_candf) if _candf else (File.name_bi == zk_name_bi)
             clash = self.db.query(File).filter(and_(
                 File.vault_id == file.vault_id,
                 File.folder_id == file.folder_id,
-                File.name_bi == zk_name_bi,
+                _fimatch,
                 File.id != file_id,
             )).first()
             if clash:

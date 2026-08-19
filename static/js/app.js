@@ -9290,9 +9290,15 @@ async function renameVaultItem(itemId, currentName, type) {
                 const epoch = zkNameEpoch(item);
                 const dek = await zkGetVaultDek(vid, epoch);
                 const lib = eccLib();
+                // Clash detection must consider a same-name row at ANY epoch, not just this
+                // item's: renaming INTO a name sealed before a rotation would otherwise miss it and
+                // create a duplicate. Candidates span 1..current; best-effort (never blocks).
+                const curEpoch = await zkGetCurrentDekVersion(vid);
+                const curDek = (curEpoch === epoch) ? dek : await zkGetVaultDek(vid, curEpoch);
                 body = {
                     enc_name: await lib.encryptName(newName.trim(), dek, vid, 'name', epoch, itemId),
                     name_bi: await lib.nameBlindIndex(newName.trim(), dek, vid, epoch),
+                    name_bi_candidates: await zkUploadNameCandidates(lib, newName.trim(), vid, curEpoch, curDek),
                 };
                 if (type === 'folder') body.name_key_version = epoch;
             } catch (e) {
@@ -10900,6 +10906,9 @@ async function createFolder() {
                 body.id = zkNewObjId();
                 body.enc_name = await lib.encryptName(folderName, dek, vid, 'name', epoch, body.id);
                 body.name_bi = await lib.nameBlindIndex(folderName, dek, vid, epoch);
+                // Same-name folder detection across every epoch, so a folder created before a
+                // rotation is still seen as a duplicate. Best-effort; never blocks the create.
+                body.name_bi_candidates = await zkUploadNameCandidates(lib, folderName, vid, epoch, dek);
                 body.name_key_version = epoch;
             } catch (e) {
                 showError(isCodedCryptoError(e)
