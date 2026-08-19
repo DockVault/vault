@@ -1161,7 +1161,8 @@ class VaultService:
     
     def _stage_same_name_replacement(self, vault, vault_id, folder_id, *,
                                      filename: Optional[str] = None,
-                                     name_bi: Optional[str] = None) -> List[str]:
+                                     name_bi: Optional[str] = None,
+                                     name_bi_candidates: Optional[list] = None) -> List[str]:
         """Mark prior same-name File rows in (vault, folder) for deletion as part of the
         CALLER's open transaction (NO commit here) and return their on-disk blob paths,
         decrementing vault stats for each.
@@ -1172,7 +1173,16 @@ class VaultService:
         file fully intact (its blob is only removed from disk by _remove_blobs AFTER the
         commit succeeds). Zero-knowledge matches on the client blind index; Standard matches
         the per-vault blind index OR the plaintext column (un-backfilled legacy rows)."""
-        if name_bi is not None:
+        candidate_vals = [c for c in dict.fromkeys(name_bi_candidates or []) if isinstance(c, str)]
+        if candidate_vals:
+            # Delete every prior row whose index is in the match set, not just the one at the
+            # uploader's current epoch -- an existing file sealed before a rotation carries an
+            # old-epoch index the single value would miss, leaving both rows under different
+            # name_bi values and the "duplicate" this replace exists to prevent. A superset of the
+            # single-value match (name_bi is expected among the candidates), so it never removes
+            # fewer rows, only the older same-name ones.
+            match = File.name_bi.in_(candidate_vals)
+        elif name_bi is not None:
             match = (File.name_bi == name_bi)
         elif filename is not None:
             match = _name_match_filter(File, vault, filename)
@@ -1237,6 +1247,7 @@ class VaultService:
                                   zk_enc_name: Optional[str] = None,
                                   zk_enc_mime: Optional[str] = None,
                                   zk_name_bi: Optional[str] = None,
+                                  zk_name_bi_candidates: Optional[list] = None,
                                   replace_same_name: bool = False):
         """
         Finalize a streaming upload by creating the File database record.
@@ -1278,6 +1289,7 @@ class VaultService:
                 vault_obj, file_info['vault_id'], file_info['folder_id'],
                 filename=None if is_zk else file_info['original_name'],
                 name_bi=zk_name_bi if is_zk else None,
+                name_bi_candidates=zk_name_bi_candidates if is_zk else None,
             )
 
         # Create file record
