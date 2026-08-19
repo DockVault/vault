@@ -78,3 +78,29 @@ def test_a_permitted_vault_action_writes_no_cap_denial_row(admin):
         assert _count() == before, "a permitted action wrongly wrote a cap-denial row"
     finally:
         admin.delete_vault(v["id"])
+
+
+def test_cap_denial_on_no_request_endpoint_records_client_ip(admin):
+    """The client IP is recorded even when the denied endpoint declares no `request` parameter.
+
+    `GET /vaults/{id}/group-access` (list_vault_group_access) is gated by require_vault_cap
+    ("vault.see_permissions") but takes only (vault_id, current_user, db) -- no `request`. The
+    earlier audit helper hunted for a Request in the decorator's kwargs and so logged a NULL IP on
+    every such endpoint. A pure-ASGI middleware now stamps the trusted-proxy client IP into a
+    contextvar once per request, and the helper reads it from there, so the denial row carries the
+    IP regardless of the endpoint's signature.
+    """
+    v = admin.create_vault(name=unique("vcapip"))
+    try:
+        c = _scoped_client(admin, v["id"], ["vault.see_info"])  # lacks vault.see_permissions
+        before = _count()
+        assert c.get(f"/vaults/{v['id']}/group-access").status_code == 403
+        assert _count() == before + 1, "the no-request endpoint's cap denial was not audited"
+        assert _latest("details->>'capability'") == "vault.see_permissions"
+        assert _latest("resource_id") == v["id"]
+        ip = _latest("ip_address")
+        # psql -tA prints a SQL NULL as the empty string; require a real address, not the empty
+        # string (the pre-change NULL) nor client_ip's "unknown" no-peer fallback.
+        assert ip and ip != "unknown", f"expected a real client IP on the denial row, got {ip!r}"
+    finally:
+        admin.delete_vault(v["id"])

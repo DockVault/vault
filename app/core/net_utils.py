@@ -19,6 +19,7 @@ its own X-Forwarded-For. To get real client IPs behind a genuine reverse proxy t
 list that proxy's network(s) explicitly. settings.trust_all_proxies=true honours XFF from any
 peer (only correct behind a proxy that itself strips/normalises client-supplied XFF).
 """
+import contextvars
 import ipaddress
 from functools import lru_cache
 from typing import List, Optional
@@ -113,3 +114,29 @@ def client_ip(request) -> str:
             return real
     parsed_peer = _parse_ip(peer)
     return str(parsed_peer) if parsed_peer is not None else (peer or "unknown")
+
+
+# The resolved (trusted-proxy-aware) client IP for the CURRENT request, stamped once by the
+# pure-ASGI ClientIPMiddleware. Lets code that has no `request` in hand -- e.g. the permission-
+# denial audit helpers on endpoints that declare no `request` param -- still record the IP.
+_CLIENT_IP: contextvars.ContextVar = contextvars.ContextVar("dv_client_ip", default=None)
+
+
+def set_client_ip(ip):
+    """Stamp the resolved client IP for this request; returns a token for reset_client_ip."""
+    return _CLIENT_IP.set(ip)
+
+
+def reset_client_ip(token) -> None:
+    try:
+        _CLIENT_IP.reset(token)
+    except Exception:  # noqa: BLE001 — resetting a stale token must never surface
+        pass
+
+
+def current_client_ip():
+    """The client IP the middleware stamped for this request, or None outside a request."""
+    try:
+        return _CLIENT_IP.get()
+    except Exception:  # noqa: BLE001
+        return None

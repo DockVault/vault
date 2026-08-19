@@ -472,6 +472,35 @@ class VaultPasscodeMiddleware:
 
 app.add_middleware(VaultPasscodeMiddleware)
 
+
+class ClientIPMiddleware:
+    """Pure-ASGI middleware that resolves the trusted-proxy client IP once per request into a
+    contextvar, so any code -- notably the permission-denial audit helpers -- can record it
+    without the endpoint having to declare a `request` parameter. Pure ASGI (NOT
+    BaseHTTPMiddleware) so the contextvar reliably propagates into the route handler."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        from app.core.net_utils import client_ip, set_client_ip, reset_client_ip
+        from starlette.requests import Request as _Request
+        try:
+            ip = client_ip(_Request(scope))
+        except Exception:  # noqa: BLE001 — never fail a request over IP resolution
+            ip = None
+        token = set_client_ip(ip)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            reset_client_ip(token)
+
+
+app.add_middleware(ClientIPMiddleware)
+
 # Host-header allowlist (opt-in). Empty ALLOWED_HOSTS => permissive ['*'] (a self-hosted vault's
 # served hostname is deployment-specific and unknown at build time), so this is inert unless the
 # operator declares the served name(s) — then a forged Host / X-Forwarded-Host is rejected (a

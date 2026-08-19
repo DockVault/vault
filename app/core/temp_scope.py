@@ -320,7 +320,7 @@ def require_create_vault_type(user, vault_type: str) -> None:
     )
 
 
-def _audit_vault_cap_denial(db, user, vault_id, cap: str, kwargs: dict) -> None:
+def _audit_vault_cap_denial(db, user, vault_id, cap: str) -> None:
     """Record a per-vault capability denial -- a scoped credential reaching for a vault action it was
     not granted. This gate stacks UNDER the endpoint-group gate, so it is where a credential that
     could reach the endpoint but not the action is refused, and the endpoint-group audit never sees
@@ -330,18 +330,10 @@ def _audit_vault_cap_denial(db, user, vault_id, cap: str, kwargs: dict) -> None:
         return
     try:
         from app.services.audit_logger import AuditLogger
-        from starlette.requests import Request
-        ip = None
-        req = next((v for v in kwargs.values() if isinstance(v, Request)), None)
-        if req is not None:
-            try:
-                # Lazy import: api_server imports this module, so a top-level import is circular; at
-                # request time it is loaded. get_client_ip honours X-Forwarded-For only from a
-                # trusted proxy, so the logged IP is not attacker-set.
-                from app.api.api_server import get_client_ip
-                ip = get_client_ip(req)
-            except Exception:  # noqa: BLE001
-                ip = None
+        from app.core.net_utils import current_client_ip
+        # ClientIPMiddleware stamps the trusted-proxy client IP per request into a contextvar, so it
+        # is available even on endpoints that declare no `request` parameter.
+        ip = current_client_ip()
         AuditLogger(db).log_action(
             action="vault_cap_denied",
             status="failure",
@@ -369,8 +361,7 @@ def require_vault_cap(cap: str):
                 try:
                     require_cap(user, kwargs.get("vault_id"), cap)
                 except HTTPException:
-                    _audit_vault_cap_denial(
-                        kwargs.get("db"), user, kwargs.get("vault_id"), cap, kwargs)
+                    _audit_vault_cap_denial(kwargs.get("db"), user, kwargs.get("vault_id"), cap)
                     raise
             return await func(*args, **kwargs)
         return wrapper
