@@ -5,7 +5,26 @@ A credential scoped to folder D (its subtree) must not, via any REST surface:
   - download/act on a file outside D (even by known id),
   - write (upload/create) outside D.
 """
+import os
+import subprocess
 import uuid
+
+_DB = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
+
+
+def _psql_out(sql):
+    r = subprocess.run(["docker", "exec", _DB, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc", sql],
+                       capture_output=True, text=True, timeout=20)
+    return (r.stdout or "").strip()
+
+
+def _id_denied_count():
+    return int(_psql_out("SELECT count(*) FROM audit_logs WHERE action='id_scope_denied'") or "0")
+
+
+def _id_denied_latest(field):
+    return _psql_out(
+        "SELECT %s FROM audit_logs WHERE action='id_scope_denied' ORDER BY timestamp DESC LIMIT 1" % field)
 
 
 def _u(p):
@@ -222,5 +241,39 @@ def test_chunked_resume_is_folder_aware(admin):
         r = init(c, D)                                                      # scoped cred, SAME name/size, into D
         assert r.status_code == 200                                        # not spuriously denied
         assert r.json()["session_id"] != admin_sid                         # a fresh D-session, not the OTHER one
+    finally:
+        admin.delete_vault(vid)
+
+
+def test_id_scope_denial_is_audited(admin):
+    """A scoped credential reaching for a file OUTSIDE its id-scope is a high-signal probe and is now
+    recorded. Downloading a file the credential's folder-scope excludes is refused at require_scope,
+    which writes exactly one id_scope_denied audit row naming the vault and target; an in-scope
+    download writes none. (Runs on a fresh, isolated session, so the audit is safe at this data-layer
+    gate mid-request.)"""
+    v = admin.create_vault(name=_u("scopeaudit"))
+    try:
+        vid = v["id"]
+        D = _mkfolder(admin, vid, _u("D"))
+        OTHER = _mkfolder(admin, vid, _u("OTHER"))
+        _upload(admin, vid, "x.txt", folder_id=D)
+        _upload(admin, vid, "y.txt", folder_id=OTHER)
+        X = _file_id(admin, vid, "x.txt", folder_id=D)
+        Y = _file_id(admin, vid, "y.txt", folder_id=OTHER)
+        c = _scoped_client(admin, vid, ["vault.see_info", "vault.see_files", "file.download"],
+                           {"folders": [D], "files": []})
+        before = _id_denied_count()
+        assert c.get(f"/vaults/{vid}/files/{Y}/download").status_code == 403     # out of scope
+        after = _id_denied_count()
+        assert after == before + 1, f"expected exactly one id_scope_denied row, got {after - before}"
+        assert _id_denied_latest("status") == "failure"
+        assert _id_denied_latest("resource_id") == vid
+        assert _id_denied_latest("details->>'target_id'") == Y
+        # Attribution is the whole point: the row must name the specific temp credential, not just
+        # the account it belongs to.
+        assert _id_denied_latest("temp_credential_id"), "the denial row must carry the temp credential id"
+        # An in-scope download is permitted and must NOT write a denial row (denial-path only).
+        assert c.get(f"/vaults/{vid}/files/{X}/download").status_code == 200
+        assert _id_denied_count() == after, "an in-scope download wrongly wrote an id_scope_denied row"
     finally:
         admin.delete_vault(vid)

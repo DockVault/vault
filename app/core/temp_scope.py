@@ -21,7 +21,9 @@ get_current_user) with these transient attributes:
     _temp_vault_caps : { str(vault_id): [cap, ...] }   (only for mode 'selected')
 """
 from typing import Optional, List, Dict
+import contextvars
 import uuid
+from contextlib import contextmanager
 
 from fastapi import HTTPException, status
 
@@ -228,6 +230,63 @@ def temp_session_allows_group(user, group_name: str, kwargs: dict) -> bool:
     return True
 
 
+# When True in the current context, the scope gates below record NO audit row. Set it around code
+# that uses require_*_scope / enforce_vault as a FILTER or PREDICATE (catch PermissionDeniedError to
+# skip an out-of-scope item, or turn it into a boolean) rather than as a request-failing gate --
+# e.g. SFTP listing predicates and batch loops. Without this, routine filtering would write an
+# id_scope_denied row per skipped item and drown the high-signal "the caller was actually denied"
+# meaning the audit exists to capture. contextvar (not a plain global) so it is task/request-local.
+_SUPPRESS_SCOPE_AUDIT: contextvars.ContextVar = contextvars.ContextVar(
+    "dv_suppress_scope_audit", default=False)
+
+
+@contextmanager
+def scope_denials_as_filter():
+    """Within this block a scope-gate denial is a routine filter/predicate result, not a request
+    failure, so it writes NO audit row. Wrap loops/predicates that catch PermissionDeniedError to
+    skip out-of-scope items (listings, batch ops) with it, so those don't flood the audit log."""
+    token = _SUPPRESS_SCOPE_AUDIT.set(True)
+    try:
+        yield
+    finally:
+        try:
+            _SUPPRESS_SCOPE_AUDIT.reset(token)
+        except Exception:  # noqa: BLE001 -- resetting a stale token must never surface
+            pass
+
+
+def _audit_scope_denial(user, vault_id, action: str, details: dict) -> None:
+    """Record a scoped-credential access denial (vault-membership or per-file/folder id-scope).
+
+    These gates fire in the DATA layer -- enforce_vault runs inside VaultService.get_vault (which
+    also serves SFTP), and require_scope runs mid-operation while resolving a file/folder -- so,
+    unlike the endpoint/cap decorator audits, the caller's request session here may be mid-transaction.
+    Write on a FRESH, isolated session so this can never commit the caller's pending work nor leave
+    its transaction aborted. Best-effort by contract: a lost audit row must never turn the 403 the
+    caller is already getting into a 500, so everything is swallowed. Runs only on the denial path."""
+    if _SUPPRESS_SCOPE_AUDIT.get():
+        return  # a filter/predicate context: this denial is routine, not a probe worth recording
+    try:
+        from app.core.database import get_db_context
+        from app.services.audit_logger import AuditLogger
+        from app.core.net_utils import current_client_ip
+        # Populated for a REST request by ClientIPMiddleware; None over SFTP (no ASGI request). None
+        # is a fine best-effort value -- the row still records who and which vault.
+        ip = current_client_ip()
+        with get_db_context() as adb:
+            AuditLogger(adb).log_action(
+                action=action,
+                status="failure",
+                user=user,
+                resource_type="vault",
+                resource_id=str(vault_id) if vault_id is not None else None,
+                ip_address=ip,
+                details=details,
+            )
+    except Exception:  # noqa: BLE001 -- a lost audit row must never mask the 403
+        pass
+
+
 def enforce_vault(user, vault_id) -> None:
     """Vault-membership gate (called inside VaultService.get_vault, so it also
     covers SFTP). For mode 'selected', the vault must be in the credential's
@@ -238,6 +297,7 @@ def enforce_vault(user, vault_id) -> None:
         return  # any vault the creator can already reach is allowed
     granted = getattr(user, "_temp_vault_caps", {}) or {}
     if str(vault_id) not in granted:
+        _audit_scope_denial(user, vault_id, "vault_scope_denied", {"reason": "vault_not_in_scope"})
         raise PermissionDeniedError("Temporary credential has no access to this vault")
 
 
@@ -301,6 +361,10 @@ def require_scope(user, vault_id, target_id, ancestor_folder_ids, kind: str = "r
     if scope is None:
         return  # non-scoped principal OR a whole-vault grant — no per-file limit
     if not id_in_scope(scope, target_id, ancestor_folder_ids):
+        _audit_scope_denial(
+            user, vault_id, "id_scope_denied",
+            {"reason": "target_out_of_scope", "kind": kind,
+             "target_id": str(target_id) if target_id is not None else None})
         raise PermissionDeniedError("Scope does not permit this file or folder")
 
 
