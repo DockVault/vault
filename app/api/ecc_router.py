@@ -966,21 +966,26 @@ async def put_vault_index_key(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Store the wrapped name-index key for one or more members.
+    """Store the wrapped name-index key: mint it, or add a wrap for a NEW member.
 
     Minting is lazy: a vault gains this key the first time a client that can read it posts one,
     which is what lets existing vaults adopt it without a migration that needs plaintext names.
 
-    **Create-once, at a given version.** If the vault already has active wraps at this version the
-    call is refused with 409 rather than overwriting. Two clients can race to mint the key for the
-    same vault, and last-writer-wins would leave half the members holding a wrap of one key and
-    half a wrap of another -- every index computed under the wrong one, and no error anywhere.
-    Refusing means the loser re-reads and adopts the winner's key, which is the only outcome that
-    keeps a vault's members agreeing on what a name hashes to.
+    **Two shapes, one endpoint.** If the vault has no active wrap at this version, this mints the
+    key (adds every wrap in the body). If it already has wraps, this ADDS a wrap for each member in
+    the body who does not yet have one -- the share case, where a new member must receive the SAME
+    key the others hold, or they compute indices under a key nobody else uses.
+
+    **The key itself is immutable at a version.** A wrap that targets a member who already has one
+    is refused with 409: overwriting it would swap the key under that member (a mint race, or a
+    manager handing out a different key), and last-writer-wins would leave members disagreeing about
+    what a name hashes to. Replacing the key is the explicit, opt-in "rotate name index" operation
+    (a new version), never a side effect of this call.
 
     Authorization is the vault-management gate, not mere read access: handing a member a wrap binds
     who can compute this vault's name indices, which is the same class of decision as granting a
-    DEK.
+    DEK. Adding a wrap of the RIGHT key is trusted to the manager, exactly as a DEK re-wrap on share
+    is -- the server holds only opaque wraps and cannot check the plaintext key.
     """
     _ecc_rate_limit(current_user, "mutate")
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
@@ -990,21 +995,33 @@ async def put_vault_index_key(
         raise HTTPException(status_code=403,
                             detail="Only the vault owner or a manager can set the name-index key")
 
-    existing = db.query(VaultMemberIndexKey).filter(
-        VaultMemberIndexKey.vault_id == vault.id,
-        VaultMemberIndexKey.index_key_version == 1,
-        VaultMemberIndexKey.is_active == True,  # noqa: E712
-    ).first()
-    if existing is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="This vault already has a name-index key. Read it rather than minting another.")
-
+    # Validate every user_id up front so a malformed one is a clean 400, not a partial write.
+    incoming = []
     for wrap in body.wraps:
         try:
             uid = uuid.UUID(str(wrap.user_id))
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="user_id must be a UUID")
+        incoming.append((uid, wrap))
+
+    # Members who already hold a wrap at this version. Their wrap is immutable here: overwriting it
+    # would swap the key under them. A body that targets any of them is refused whole -- partial
+    # success would leave the caller unsure which wraps landed.
+    existing_uids = {
+        r.user_id for r in db.query(VaultMemberIndexKey.user_id).filter(
+            VaultMemberIndexKey.vault_id == vault.id,
+            VaultMemberIndexKey.index_key_version == 1,
+            VaultMemberIndexKey.is_active == True,  # noqa: E712
+        ).all()
+    }
+    overwrites = [str(uid) for uid, _ in incoming if uid in existing_uids]
+    if overwrites:
+        raise HTTPException(
+            status_code=409,
+            detail=("A name-index-key wrap already exists for a member in this request; the key "
+                    "cannot be replaced for an existing member. Add only new members."))
+
+    for uid, wrap in incoming:
         db.add(VaultMemberIndexKey(
             vault_id=vault.id,
             user_id=uid,
@@ -1015,13 +1032,13 @@ async def put_vault_index_key(
     try:
         db.commit()
     except IntegrityError:
-        # Lost the mint race against another client between the check above and this commit.
-        # Same answer as finding it already there, because it is the same situation.
+        # A concurrent call added a wrap for one of these members between the check and the commit
+        # (the unique (vault, user, version) index). Same situation as finding it already there.
         db.rollback()
         raise HTTPException(
             status_code=409,
-            detail="This vault already has a name-index key. Read it rather than minting another.")
-    return {"status": "ok", "wraps": len(body.wraps), "index_key_version": 1}
+            detail="A name-index-key wrap for a member in this request was just created; re-read.")
+    return {"status": "ok", "wraps": len(incoming), "index_key_version": 1}
 
 
 @router.get("/vaults/{vault_id}/keys", response_model=VaultKeysResponse)
