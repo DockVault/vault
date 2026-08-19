@@ -1,0 +1,53 @@
+name: CodeQL
+
+# Static analysis (SAST) of the Python source on every PR and push to main, plus a weekly full
+# scan so a rule added to CodeQL later still runs against unchanged code. Findings surface in the
+# repository's Security > Code scanning tab. This is free for public repositories.
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+  schedule:
+    # Weekly, so newly published CodeQL queries run against code that has not changed.
+    - cron: "23 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Only this job needs to write scanning results; the workflow default stays read-only.
+      security-events: write
+      contents: read
+      actions: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@d6317709a54fd87078d323eeb0e48ec331c8e621 # v3
+        with:
+          languages: python
+          # The extended suite adds security queries beyond the default set; this is a security
+          # product, so the extra coverage is worth the modest extra runtime.
+          queries: security-extended
+
+      # Python is interpreted, so CodeQL builds its database directly from the source tree with no
+      # build step. (No autobuild is needed or run for Python.)
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@d6317709a54fd87078d323eeb0e48ec331c8e621 # v3
+        with:
+          category: "/language:python"
