@@ -7784,6 +7784,7 @@ async def revoke_vault_group_access(
 @require_vault_cap("vault.rotate_key")
 async def rotate_vault_encryption_key(
     vault_id: uuid.UUID,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -7808,6 +7809,7 @@ async def rotate_vault_encryption_key(
     """
     try:
         from app.core.models import Vault
+        audit_logger = AuditLogger(db)
         
         # Get vault
         vault = db.query(Vault).filter(Vault.id == vault_id).first()
@@ -7820,6 +7822,12 @@ async def rotate_vault_encryption_key(
         
         # Only owner can rotate keys
         if vault.owner_id != current_user.id:
+            # A non-owner reaching for another account's key rotation is worth recording:
+            # it is both an access denial and a possible probe of someone else's vault.
+            audit_logger.log_access_denied(
+                user=current_user, resource_type='vault', resource_id=str(vault_id),
+                ip_address=get_client_ip(request), reason='rotate-key: not vault owner',
+            )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only vault owner can rotate encryption keys"
@@ -7829,6 +7837,11 @@ async def rotate_vault_encryption_key(
         # vault's content key is client-side (the server never holds it), so rotating the
         # server key here would touch an unused key and falsely report success — reject it.
         if getattr(vault, "type", "standard") == "zero_knowledge":
+            audit_logger.log_action(
+                action='vault_key_rotation', status='refused', user=current_user,
+                resource_type='vault', resource_id=str(vault_id),
+                ip_address=get_client_ip(request), details={'reason': 'zero_knowledge'},
+            )
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Key rotation does not apply to zero-knowledge vaults; their keys are managed client-side (use the zero-knowledge rekey endpoint).",
@@ -7845,7 +7858,16 @@ async def rotate_vault_encryption_key(
         # depends on the old response -- no frontend, tool or documented flow calls this route;
         # only this repository's own tests did.
         #
-        # This does not touch the database. The reads above are reads.
+        # Record the attempt before refusing. An operator reaches for key rotation when they
+        # believe a key is compromised -- one of the highest-signal events the product can
+        # capture -- and until now a defender reviewing the log after an incident saw nothing.
+        # This writes ONE audit row; it still changes no vault key state (nothing is archived,
+        # minted or version-bumped), so the refuse-before-any-key-mutation property holds.
+        audit_logger.log_action(
+            action='vault_key_rotation', status='refused', user=current_user,
+            resource_type='vault', resource_id=str(vault_id),
+            ip_address=get_client_ip(request), details={'reason': 'standard_not_supported'},
+        )
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail=(
@@ -7926,7 +7948,13 @@ async def get_vault_key_history(
                 }
                 for entry in history
             ],
-            "total_rotations": len(history)
+            "total_rotations": len(history),
+            # The server-side key rotation this history would record is not supported: a
+            # Standard vault's content is encrypted under a key derived from the deployment
+            # secret, which this version never rotates, so the list cannot become non-empty.
+            # Stated so a reader does not mistake a permanently-empty history for a fault.
+            "rotation_supported": False,
+            "note": ("Server-side key rotation is not supported; this history tracks a key version no read path uses. Zero-knowledge vaults rotate their content key by a separate client-side mechanism."),
         }
         
     except HTTPException:
