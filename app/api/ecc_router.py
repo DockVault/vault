@@ -964,6 +964,8 @@ async def get_vault_index_key(
 
 
 @router.put("/vaults/{vault_id}/index-key")
+@require_endpoint_permission("VAULT_PERMISSIONS")
+@require_vault_cap("vault.change_permissions")
 async def put_vault_index_key(
     vault_id: str,
     body: IndexKeyPut,
