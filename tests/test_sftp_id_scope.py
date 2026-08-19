@@ -30,6 +30,11 @@ def _id_denied_count():
     return int(_psql_out("SELECT count(*) FROM audit_logs WHERE action='id_scope_denied'") or "0")
 
 
+def _id_denied_latest(field):
+    return _psql_out(
+        "SELECT %s FROM audit_logs WHERE action='id_scope_denied' ORDER BY timestamp DESC LIMIT 1" % field)
+
+
 def _file_id(admin, vid, name, folder_id=None):
     params = {"folder_id": folder_id} if folder_id else {}
     for it in admin.get(f"/vaults/{vid}/files", params=params).json()["items"]:
@@ -252,5 +257,9 @@ def test_sftp_out_of_scope_act_is_audited(admin):
                 sftp.open(f"/{vname}/{dn}/y.txt", "rb").read()    # out of scope -> denied at the gate
         after = _id_denied_count()
         assert after > before, "a targeted out-of-scope SFTP open must write an id_scope_denied audit row"
+        # SFTP has no ASGI request, so the denial audit takes the client IP from the principal
+        # (set in _load_principal) -- the row must record where the probe came from, like the
+        # success-path audit does.
+        assert _id_denied_latest("ip_address"), "the SFTP denial row must record the client IP"
     finally:
         admin.delete_vault(vid)
