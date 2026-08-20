@@ -199,6 +199,52 @@ def test_chunked_upload_into_folder(admin, temp_vault):
     assert any(it["id"] == file_id for it in items)
 
 
+def test_chunked_upload_rejects_a_whole_file_declared_as_one_chunk(admin, temp_vault):
+    """A single chunk may not be the whole file. Each chunk request stages to the transient
+    _uploads/ buffer before the per-session counter commits, so an unbounded chunk is the
+    transient-disk-exhaustion loophole (K concurrent requests could each stage the whole file).
+    A 200 MB upload declared as one 200 MB chunk is refused at session creation -- this fires
+    before the vault-size / quota checks, so it is independent of the vault's limit. Declaring
+    enough <= 64 MB chunks is accepted (the resume roundtrip test above covers a real upload).
+    """
+    vid = temp_vault["id"]
+    big = 200 * 1024 * 1024  # 200 MB, more than 3x the 64 MB per-chunk cap
+    r = admin.post(f"/vaults/{vid}/uploads", json={
+        "file_name": unique("big") + ".bin", "total_size": big,
+        "total_chunks": 1, "chunk_size": big,
+    })
+    assert r.status_code == 400, r.text
+    assert "chunk" in r.text.lower()
+    # ceil(200 MB / 64 MB) = 4 chunks is enough for each to stay within the cap -> the session opens.
+    ok = admin.post(f"/vaults/{vid}/uploads", json={
+        "file_name": unique("big") + ".bin", "total_size": big,
+        "total_chunks": 4, "chunk_size": 50 * 1024 * 1024,
+    })
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["received_chunks"] == []
+
+
+def test_chunked_upload_rejects_an_oversized_chunk_at_runtime(admin, temp_vault):
+    """The load-bearing bound. A session that PASSED init (declared enough chunks) still may not
+    PUT a chunk larger than the 64 MiB per-request cap: chunk_size at init is advisory, so only the
+    runtime min(remaining, cap) -- the line that actually closes the concurrent-stale-read DoS --
+    stops an oversized chunk body. Reverting that min() to the whole-file bound while keeping the
+    init check would leave this test the only thing that fails."""
+    import requests as _rq
+    vid = temp_vault["id"]
+    big = 200 * 1024 * 1024
+    sid = admin.post(f"/vaults/{vid}/uploads", json={
+        "file_name": unique("big") + ".bin", "total_size": big,
+        "total_chunks": 4, "chunk_size": 50 * 1024 * 1024,
+    }).json()["session_id"]
+    oversized = b"\0" * (64 * 1024 * 1024 + 4096)  # 64 MiB + 4 KiB, just over the per-chunk cap
+    try:
+        r = admin.put(f"/vaults/{vid}/uploads/{sid}/chunks/0", data=oversized, headers=_OCTET)
+        assert r.status_code == 413, r.text
+    except _rq.exceptions.ConnectionError:
+        pass  # the server refused before draining the body and reset the connection -- a rejection
+
+
 def test_chunked_upload_rejects_oversized_chunk(admin, temp_vault):
     """Transient-disk-pressure guard: a chunk that would push the buffered bytes past
     the size declared (and quota-checked) at init is rejected (413), so a client can't

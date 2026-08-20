@@ -670,7 +670,7 @@ def test_sftp_upload_over_max_file_size_is_rejected(admin, temp_vault):
     discarded — so a client can't fill the shared .sftp_tmp volume before the close-time size
     check. A 1-byte write at a 1 TiB offset exceeds ANY sane deployment max deterministically
     (the server rejects on offset+len > max_bytes, before it ever touches disk), so this exercises
-    the in-stream bound regardless of the configured max_file_size (prod default is 1 GiB)."""
+    the in-stream bound regardless of the configured max_file_size (prod default is 10 GiB)."""
     vname = temp_vault["name"]
     huge_offset = 1024 ** 4  # 1 TiB — beyond any realistic max_file_size
     rejected = False

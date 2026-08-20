@@ -240,11 +240,21 @@ def _external_scheme(request: StarletteRequest) -> str:
 
 
 # Comprehensive security headers middleware
-# Absolute ceiling on a single request body (defense-in-depth vs a multipart/JSON DoS, on top of the
-# starlette >=0.40 multipart-parser fix). Generous: it must exceed the largest legitimate direct upload
-# (max_file_size_mb) plus multipart overhead, so it only trips on abusive multi-GB bodies — the
-# per-endpoint upload checks still enforce the real file-size limit.
-_MAX_REQUEST_BODY_BYTES = (settings.max_file_size_mb + 256) * 1024 * 1024
+# The largest a single resumable chunk may be. A chunk request stages to the transient _uploads/
+# buffer BEFORE the per-session counter is committed, so without a per-request size bound K
+# concurrent requests could each stage the whole file (K x total_size) -- uncounted transient disk,
+# a cross-tenant DoS. Bounding each request to one chunk makes that transient independent of the
+# file size (it no longer scales with max_file_size_mb). This is a SIZE cap per piece, not a rate
+# limit: a client uploads as fast as its link allows, just in <= this-many-byte pieces.
+_MAX_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024  # 64 MiB
+
+# Absolute ceiling on a single NON-MULTIPART request body (defense-in-depth vs a JSON/octet-stream
+# in-memory DoS, on top of the starlette >=0.40 multipart-parser fix). MULTIPART uploads are EXEMPT
+# (metered per-file in-stream and bounded by the vault size limit), so this ceiling is DECOUPLED
+# from max_file_size_mb: the largest legitimate non-multipart body is one resumable chunk PUT, so a
+# few multiples of the chunk cap covers every real request while still tripping on an abusive body.
+# Decoupling it keeps a large file cap (e.g. 10 GB) from widening this in-memory backstop.
+_MAX_REQUEST_BODY_BYTES = 4 * _MAX_UPLOAD_CHUNK_BYTES  # 256 MiB
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -9253,6 +9263,18 @@ async def init_chunked_upload(
     # count can't exceed total_size; also cap it absolutely.
     if body.total_chunks > body.total_size or body.total_chunks > 200_000:
         raise HTTPException(status_code=400, detail="Invalid chunk count for the declared size")
+    # Each chunk must fit within _MAX_UPLOAD_CHUNK_BYTES so a single chunk request cannot stage more
+    # than one piece to the transient buffer (see the constant). Require enough chunks that each
+    # stays within the cap; the per-chunk write enforces it as a backstop. Reject here for a clean
+    # error at session creation rather than a mid-upload 413.
+    _min_chunks = (body.total_size + _MAX_UPLOAD_CHUNK_BYTES - 1) // _MAX_UPLOAD_CHUNK_BYTES
+    if body.total_chunks < _min_chunks:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Too few chunks: each chunk may be at most "
+                    f"{_MAX_UPLOAD_CHUNK_BYTES // (1024 * 1024)} MB, so declare at least "
+                    f"{_min_chunks} chunk(s) for a {body.total_size}-byte upload."),
+        )
 
     # Zero-knowledge name handling. ZK uploads must carry a browser-encrypted name + blind
     # index and MUST NOT carry a plaintext name/MIME (that would defeat zero-knowledge).
@@ -9606,7 +9628,12 @@ async def upload_chunk(
     # 0: a crash between writing a chunk and committing the counter can leave bytes_received
     # undercounted, and base_bytes must never go negative (that would loosen the bound).
     base_bytes = max(0, (session.bytes_received or 0) - existing_size)
-    remaining = session.total_size - base_bytes  # how many more bytes this index may add
+    # Bound each request to ONE chunk, not the whole remaining file. base_bytes is read before the
+    # per-session row lock, so a stale (low) read would otherwise let K concurrent requests each
+    # stage up to total_size into the _uploads/ buffer -- uncounted transient disk, a cross-tenant
+    # DoS. min() caps the stream to the smaller of "bytes left in the file" and one chunk; a body
+    # larger than that is refused (413 below). This is a size cap per piece, not a rate limit.
+    remaining = min(session.total_size - base_bytes, _MAX_UPLOAD_CHUNK_BYTES)  # bytes this index may add
 
     # Transient-disk-pressure guard. Raw chunks buffer on the persistent storage volume
     # until /complete streams them through the encryption pipeline. Bound the buffered
