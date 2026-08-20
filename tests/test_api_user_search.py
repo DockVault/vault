@@ -67,6 +67,18 @@ def test_search_escapes_like_wildcards(admin):
         admin.delete_user(u["id"])
 
 
+def test_activity_action_filter_escapes_like_wildcards(admin):
+    # The audit-activity action filter must treat a LIKE metacharacter literally, not sweep every
+    # action. Without escaping, action_filter="%" matches every row; with it, "%" matches only an
+    # action that literally contains a percent sign -- of which the real actions have none.
+    uid = admin.user["id"]
+    base = f"/api/user-management/users/{uid}/activity"
+    all_rows = admin.get(base).json()
+    assert isinstance(all_rows, list) and all_rows, "admin should have activity rows (non-vacuous control)"
+    filtered = admin.get(base, params={"action_filter": "%"}).json()
+    assert filtered == [], "a '%' action filter must not sweep every action (LIKE wildcard escaped)"
+
+
 def test_directory_search_scope_validation(admin):
     """The policy only accepts the two known values; anything else is rejected (fail-safe)."""
     try:

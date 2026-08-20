@@ -11,7 +11,7 @@ import hashlib
 import uuid
 import json
 
-from fastapi import FastAPI, Depends, HTTPException, status, Request, File as FastAPIFile, UploadFile, Header, WebSocket, WebSocketDisconnect, Response
+from fastapi import FastAPI, Depends, HTTPException, status, Request, File as FastAPIFile, UploadFile, Header, WebSocket, WebSocketDisconnect, Response, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
@@ -1644,6 +1644,14 @@ async def recent_audit_events(
 # Audit log search + export (admin Audit page)
 # ---------------------------------------------------------------------------
 
+def _like_escape(value: str) -> str:
+    r"""Escape LIKE/ILIKE wildcards so a user-supplied filter matches its characters
+    literally (use with ``.ilike(pattern, escape="\")``). Without it, ``%`` and ``_`` in
+    the input silently become pattern metacharacters -- e.g. the ``_`` in a filter like
+    "file_download" matches ANY character, returning actions the caller never asked for."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _build_audit_query(db: Session, user_id=None, action=None, from_date=None, to_date=None):
     """Build the filtered AuditLog query shared by search + export."""
     from app.core.models import AuditLog
@@ -1654,7 +1662,7 @@ def _build_audit_query(db: Session, user_id=None, action=None, from_date=None, t
         except (ValueError, AttributeError, TypeError):
             pass  # ignore an unparseable user id rather than 500
     if action:
-        q = q.filter(AuditLog.action.ilike(f"%{action}%"))
+        q = q.filter(AuditLog.action.ilike(f"%{_like_escape(action)}%", escape="\\"))
     if from_date:
         try:
             q = q.filter(AuditLog.timestamp >= datetime.fromisoformat(from_date))
@@ -1689,7 +1697,7 @@ def _audit_row_to_dict(r):
 @app.get("/audit/log")
 async def search_audit_log(
     user_id: Optional[str] = None,
-    action: Optional[str] = None,
+    action: Optional[str] = Query(None, max_length=128),
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
     limit: int = 500,
