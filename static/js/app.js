@@ -86,7 +86,12 @@ const state = {
     // Per-vault remembered passwords so re-opening a vault within its configured
     // window doesn't re-prompt. Persisted to sessionStorage ONLY (per-tab, gone
     // when the tab closes) and only for the unlock window, so a refresh keeps you
-    // in the vault. The password never leaves the browser / never hits the server.
+    // in the vault. NOTE: this is a Standard-vault ACCESS password, not a
+    // zero-knowledge secret -- it IS sent to the server (as the X-Vault-Password
+    // header) to unlock the vault on each request, and it is held here in the
+    // clear, so sessionStorage is trusted. Exposure is bounded by the unlock
+    // window, the per-user opt-out, and the admin org floor, and it is wiped on
+    // logout.
     rememberedVaults: {},
     // Per-user preference: when on, the browser never remembers a vault password (always re-ask),
     // regardless of the vault's unlock window. Loaded from server preferences on boot.
