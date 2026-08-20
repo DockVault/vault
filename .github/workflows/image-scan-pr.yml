@@ -19,6 +19,11 @@ name: Image scan (PR)
 on:
   pull_request:
     branches: ["main"]
+    # These paths mirror what the Dockerfile bakes into the image's scannable package set: the
+    # pinned base (Dockerfile), the hash-locked pip install (requirements.lock / requirements.txt),
+    # the CPython backports and the reviewed VEX (security/**), and what COPY . . excludes
+    # (.dockerignore). Keep this list in sync with the Dockerfile's install inputs -- a new
+    # dependency-source file added there but not here would silently skip this gate.
     paths:
       - "Dockerfile"
       - ".dockerignore"
@@ -33,7 +38,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: image-scan-pr-${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
