@@ -1241,6 +1241,28 @@ async def grant_member_key(
             detail="Target user has not set up an encryption key",
         )
 
+    # A Manager must not overwrite (or mint) the wrap of the OWNER or a PEER MANAGER. The server
+    # holds only opaque wraps and cannot tell a correct DEK from an attacker's, so swapping the
+    # wrap under a guaranteed key-holder or a peer would feed them a key of the caller's choosing:
+    # they lose access to existing content and their new uploads become readable only to the
+    # caller's pick. grant had NEITHER guard, unlike revoke (the owner-guard + peer-manager guard
+    # below mirror it) and the index-key PUT (which 409s an overwrite for the same reason). Uses
+    # the resolved target.id (canonical) so a non-canonical user_id string can't slip past. Keep
+    # this ABOVE the direct/hierarchical split below so it protects both wrapping modes -- a
+    # hierarchical vault's owner/peer TEAMPRIV wrap is overwritten by the same upsert.
+    if str(target.id) == str(vault.owner_id) and str(current_user.id) != str(vault.owner_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the vault owner can set the owner's own key wrap",
+        )
+    if not _is_owner_or_admin(vault, current_user) and str(target.id) != str(current_user.id):
+        peer = _member_row(db, vault.id, target.id)
+        if peer and peer.manage_permission:
+            raise HTTPException(
+                status_code=403,
+                detail="Only the vault owner or an admin can re-wrap a manager's key",
+            )
+
     # HIERARCHICAL: store the recipient's wrap of the TEAM PRIVATE key at the current TEAM
     # epoch — O(1), the DEK is not touched. DIRECT: store the DEK wrapped to the recipient at
     # the current DEK epoch. Either way, upsert keyed by (vault, user, key_version) (the
