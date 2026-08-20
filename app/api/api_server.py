@@ -240,12 +240,6 @@ def _external_scheme(request: StarletteRequest) -> str:
 
 
 # Comprehensive security headers middleware
-# Absolute ceiling on a single request body (defense-in-depth vs a multipart/JSON DoS, on top of the
-# starlette >=0.40 multipart-parser fix). Generous: it must exceed the largest legitimate direct upload
-# (max_file_size_mb) plus multipart overhead, so it only trips on abusive multi-GB bodies — the
-# per-endpoint upload checks still enforce the real file-size limit.
-_MAX_REQUEST_BODY_BYTES = (settings.max_file_size_mb + 256) * 1024 * 1024
-
 # The largest a single resumable chunk may be. A chunk request stages to the transient _uploads/
 # buffer BEFORE the per-session counter is committed, so without a per-request size bound K
 # concurrent requests could each stage the whole file (K x total_size) -- uncounted transient disk,
@@ -253,6 +247,14 @@ _MAX_REQUEST_BODY_BYTES = (settings.max_file_size_mb + 256) * 1024 * 1024
 # file size (it no longer scales with max_file_size_mb). This is a SIZE cap per piece, not a rate
 # limit: a client uploads as fast as its link allows, just in <= this-many-byte pieces.
 _MAX_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024  # 64 MiB
+
+# Absolute ceiling on a single NON-MULTIPART request body (defense-in-depth vs a JSON/octet-stream
+# in-memory DoS, on top of the starlette >=0.40 multipart-parser fix). MULTIPART uploads are EXEMPT
+# (metered per-file in-stream and bounded by the vault size limit), so this ceiling is DECOUPLED
+# from max_file_size_mb: the largest legitimate non-multipart body is one resumable chunk PUT, so a
+# few multiples of the chunk cap covers every real request while still tripping on an abusive body.
+# Decoupling it keeps a large file cap (e.g. 10 GB) from widening this in-memory backstop.
+_MAX_REQUEST_BODY_BYTES = 4 * _MAX_UPLOAD_CHUNK_BYTES  # 256 MiB
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
