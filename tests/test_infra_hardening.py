@@ -102,6 +102,21 @@ def test_error_paths_do_not_leak_exception_text():
 
 
 @pytest.mark.unit
+def test_security_monitor_fallback_log_sanitizes_user_controlled_values():
+    # _windowed_count's redis_key embeds the RAW "username:ip" (see its callers), and the
+    # Redis-unavailable warning logs that key -- so it must sanitize it, or a CRLF-carrying
+    # username forges log lines (CWE-117) on the fallback path, the same defence
+    # record_failed_login already applies to its own log output. Likewise the alert-resolved log.
+    src = _read("app/services/security_monitor.py")
+    assert "_sanitize_for_log(redis_key)" in src, \
+        "the Redis-fallback warning must sanitize redis_key before logging it"
+    assert "({redis_key})" not in src, "redis_key must not be interpolated into the log raw"
+    assert "_sanitize_for_log(resolved_by)" in src, \
+        "the alert-resolved log must sanitize resolved_by"
+    assert "resolved by {resolved_by}" not in src, "resolved_by must not be logged raw"
+
+
+@pytest.mark.unit
 @pytest.mark.docker
 def test_db_throttle_hit_counts_and_denies():
     # The durable DB-fallback throttle (now shared by the password login path AND the SFTP key-offer

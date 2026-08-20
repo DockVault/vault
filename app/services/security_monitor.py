@@ -241,7 +241,12 @@ class SecurityMonitor:
                 self.redis.expire(redis_key, window_seconds)
             return int(count)
         except Exception as e:
-            logger.warning(f"Security monitor Redis counter unavailable ({redis_key}): {e}; using in-memory fallback")
+            # redis_key embeds the raw username:ip (see _windowed_count callers), so sanitize it
+            # before it reaches the log -- a CRLF-carrying username must not forge log lines here,
+            # the same defence record_failed_login already applies to its own log output.
+            logger.warning(
+                f"Security monitor Redis counter unavailable "
+                f"({_sanitize_for_log(redis_key)}): {e}; using in-memory fallback")
             # The in-memory deque only holds THIS request's events (the monitor is per-request), so
             # thresholds can no longer trip -> detection is effectively blind. Surface that to operators.
             self._signal_detection_degraded()
@@ -596,7 +601,7 @@ class SecurityMonitor:
             
             self.db.commit()
             
-            logger.info(f"Security alert {alert_id} resolved by {resolved_by}")
+            logger.info(f"Security alert {alert_id} resolved by {_sanitize_for_log(resolved_by)}")
     
     # ========================================================================
     # Cleanup
