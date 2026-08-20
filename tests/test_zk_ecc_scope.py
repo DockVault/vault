@@ -156,3 +156,23 @@ def test_ecc_public_key_scope_all_mode(admin):
         assert _all_mode(["vault.change_permissions"]).get(f"/ecc/users/{target}/public-key").status_code == 200
     finally:
         admin.delete_vault(vid)
+
+
+def test_rekey_member_keys_are_bounded(admin):
+    # The rekey member_keys list and each wrap field are attacker-controlled; bound them like the
+    # sibling index-key wraps so a request cannot pin memory with a huge list or huge blobs. The
+    # bound is enforced at validation (422), before the handler runs.
+    with _zk_enabled(admin):
+        v = create_zk_vault(admin)
+    vid = v["id"]
+    try:
+        base = {"from_version": 1, "to_version": 2, "revoke_user_id": None}
+        too_many = [{"user_id": str(uuid.uuid4()), "wrapped_dek": "x", "ephemeral_public_key": "y"}
+                    for _ in range(513)]
+        r1 = admin.post(f"/ecc/vaults/{vid}/rekey", json={**base, "member_keys": too_many})
+        assert r1.status_code == 422, f"an over-long member_keys list should be rejected: {r1.status_code}"
+        huge = [{"user_id": str(uuid.uuid4()), "wrapped_dek": "x" * 9000, "ephemeral_public_key": "y"}]
+        r2 = admin.post(f"/ecc/vaults/{vid}/rekey", json={**base, "member_keys": huge})
+        assert r2.status_code == 422, f"an over-long wrap field should be rejected: {r2.status_code}"
+    finally:
+        admin.delete_vault(vid)
