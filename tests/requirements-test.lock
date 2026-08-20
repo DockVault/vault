@@ -139,7 +139,7 @@ pytest==9.1.1
     #   pytest-playwright
 pytest-base-url==2.1.0
     # via pytest-playwright
-pytest-playwright==0.8.0
+pytest-playwright==0.9.0
     # via -r tests/requirements-test.txt
 python-dotenv==1.2.2
     # via
@@ -159,13 +159,13 @@ requests==2.34.2
     #   pytest-base-url
 rich==15.0.0
     # via pip-audit
-ruff==0.15.14
+ruff==0.16.3
     # via -r tests/requirements-test.txt
 sortedcontainers==2.4.0
     # via cyclonedx-python-lib
-sqlalchemy==2.0.51
+sqlalchemy==2.0.52
     # via -r tests/requirements-test.txt
-starlette==1.5.1
+starlette==1.6.0
     # via
     #   -r tests/requirements-test.txt
     #   fastapi
