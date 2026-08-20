@@ -10313,7 +10313,7 @@ async def download_file(
     vault_id: uuid.UUID,
     file_id: uuid.UUID,
     request: Request,
-    file_password: Optional[str] = None,
+    file_password: Optional[str] = Header(None, alias="X-File-Password"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     x_vault_password: Optional[str] = Header(None)

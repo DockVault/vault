@@ -521,3 +521,15 @@ def test_upload_to_password_vault(admin, temp_vault_pw):
                   headers={"X-Vault-Password": pw})
     assert r.status_code == 200
     assert r.content == b"secret"
+
+
+def test_file_password_is_a_header_not_a_url_query(base_url):
+    # A per-file password is a secret. It must be sent as a header (X-File-Password), never as a URL
+    # query parameter, where it would be captured in access logs, browser history and Referer -- the
+    # same treatment the vault password already gets on this endpoint.
+    import requests as _rq
+    schema = _rq.get(f"{base_url}/openapi.json", timeout=10).json()
+    dl = schema["paths"]["/vaults/{vault_id}/files/{file_id}/download"]["get"]
+    locs = {p["name"]: p["in"] for p in dl.get("parameters", [])}
+    assert "file_password" not in locs, f"a file password must not ride in the query string: {locs}"
+    assert locs.get("X-File-Password") == "header", f"expected an X-File-Password header param: {locs}"
