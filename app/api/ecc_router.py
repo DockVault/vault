@@ -1247,7 +1247,9 @@ async def grant_member_key(
     # they lose access to existing content and their new uploads become readable only to the
     # caller's pick. grant had NEITHER guard, unlike revoke (the owner-guard + peer-manager guard
     # below mirror it) and the index-key PUT (which 409s an overwrite for the same reason). Uses
-    # the resolved target.id (canonical) so a non-canonical user_id string can't slip past.
+    # the resolved target.id (canonical) so a non-canonical user_id string can't slip past. Keep
+    # this ABOVE the direct/hierarchical split below so it protects both wrapping modes -- a
+    # hierarchical vault's owner/peer TEAMPRIV wrap is overwritten by the same upsert.
     if str(target.id) == str(vault.owner_id) and str(current_user.id) != str(vault.owner_id):
         raise HTTPException(
             status_code=403,

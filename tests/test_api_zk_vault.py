@@ -294,23 +294,32 @@ def test_manager_cannot_overwrite_owner_or_peer_manager_wrap(admin):
             assert admin.post(f"/vaults/{vid}/permissions",
                               json={"user_id": u["id"], "level": "manage"}).status_code == 200
 
+        # Capture the victims' current wraps so a blocked attack can be proven to change nothing.
+        owner_before = admin.get(f"/ecc/vaults/{vid}/keys").json().get("wrapped_dek")
+        m2_before = m2c.get(f"/ecc/vaults/{vid}/keys").json().get("wrapped_dek")
+        assert owner_before and m2_before  # both hold a real wrap going in
+
         # (1) Manager m1 CANNOT overwrite the OWNER's wrap; the owner's stored wrap is untouched.
         r = m1c.post(f"/ecc/vaults/{vid}/members",
                      json={"user_id": owner_id, "wrapped_dek": ATTACK, "ephemeral_public_key": ATTACK})
         assert r.status_code == 403, r.text
-        assert admin.get(f"/ecc/vaults/{vid}/keys").json().get("wrapped_dek") != ATTACK
+        assert admin.get(f"/ecc/vaults/{vid}/keys").json().get("wrapped_dek") == owner_before
 
-        # (2) Manager m1 CANNOT overwrite a PEER Manager (m2)'s wrap.
+        # (2) Manager m1 CANNOT overwrite a PEER Manager (m2)'s wrap; m2's wrap is untouched.
         r = m1c.post(f"/ecc/vaults/{vid}/members",
                      json={"user_id": m2["id"], "wrapped_dek": ATTACK, "ephemeral_public_key": ATTACK})
         assert r.status_code == 403, r.text
-        assert m2c.get(f"/ecc/vaults/{vid}/keys").json().get("wrapped_dek") != ATTACK
+        assert m2c.get(f"/ecc/vaults/{vid}/keys").json().get("wrapped_dek") == m2_before
 
         # (3) Positive controls: the owner may refresh their OWN wrap...
         assert admin.post(f"/ecc/vaults/{vid}/members",
                           json={"user_id": owner_id, "wrapped_dek": "T0s=",
                                 "ephemeral_public_key": "T0s="}).status_code == 200
-        # ...and a Manager may grant a NEW regular member (no existing wrap, not a manager).
+        # ...and a Manager may grant/refresh a REGULAR MEMBER's wrap. reg is made a member
+        # (read, NOT manage) FIRST, so this exercises the peer-exists-but-not-a-manager ALLOW
+        # path -- a regression narrowing the peer check to `if peer:` would wrongly 403 here.
+        assert admin.post(f"/vaults/{vid}/permissions",
+                          json={"user_id": reg["id"], "level": "read"}).status_code == 200
         assert m1c.post(f"/ecc/vaults/{vid}/members",
                         json={"user_id": reg["id"], "wrapped_dek": "UkVH",
                               "ephemeral_public_key": "UkVH"}).status_code == 200
