@@ -37,6 +37,10 @@
     "0.11.0": {
       "released": "2026-08-20",
       "notes": "First release to change the physical schema: adds the vault_storage_grants table and a nullable users.storage_quota_bytes column, applied automatically and idempotently at boot. The additions are unused by 0.10.0, so a rollback is clean; take a backup before upgrading."
+    },
+    "0.11.1": {
+      "released": "2026-08-21",
+      "notes": "No schema change; same physical schema as 0.11.0. Security patch: user-controlled values (the failed-login redis key and the alert resolver) are sanitized before they reach the security-monitor logs (log-injection hardening). A rollback is clean and needs no backup."
     }
   },
   "edges": [
@@ -46,7 +50,8 @@
     { "from": "0.7.2", "to": "0.8.0", "kind": "direct", "reversible": true, "requires_backup": false },
     { "from": "0.8.0", "to": "0.9.0", "kind": "direct", "reversible": true, "requires_backup": false },
     { "from": "0.9.0", "to": "0.10.0", "kind": "direct", "reversible": true, "requires_backup": false },
-    { "from": "0.10.0", "to": "0.11.0", "kind": "direct", "reversible": true, "requires_backup": true }
+    { "from": "0.10.0", "to": "0.11.0", "kind": "direct", "reversible": true, "requires_backup": true },
+    { "from": "0.11.0", "to": "0.11.1", "kind": "direct", "reversible": true, "requires_backup": false }
   ],
   "waivers": []
 }

@@ -5,10 +5,11 @@ operator does: installs an old release, puts real data in it, and upgrades forwa
 release to the code under test, checking after every step that the data is still there and that the
 deployment is telling the truth about itself.
 
-It matters because the tagged-release upgrade path carries its FIRST schema change in 0.11.0 (the
-code under test): every published version through 0.10.0 was schema-identical, and 0.11.0 adds the
-vault_storage_grants table and a nullable users.storage_quota_bytes column. So the boot-DDL
-machinery is being leaned on for the first time exactly here -- the candidate hop below carries it.
+It matters because the tagged-release upgrade path took its FIRST schema change in 0.11.0: every
+published version through 0.10.0 was schema-identical, and 0.11.0 added the vault_storage_grants
+table and a nullable users.storage_quota_bytes column. The code under test (0.11.1) inherits that
+same schema, so the boot-DDL machinery introduced in 0.11.0 is exactly what the candidate hop below
+leans on.
 A drill is the only way to find out whether the boot DDL applies cleanly on a database that has been
 through several releases rather than one built fresh.
 
@@ -298,8 +299,8 @@ def test_data_written_on_an_old_release_survives_every_upgrade_to_here(drill):
         # the recreate silently did nothing, every check below would pass against the release we
         # started on, and the drill would report that upgrading is safe without having upgraded.
         # The IMAGE the container runs, not the version it reports. Relying on a version string to
-        # prove the hop is fragile -- a build can misreport it, and the candidate's 0.11.0 differs
-        # from the last released tag (0.10.0) only because main was just bumped for this release.
+        # prove the hop is fragile -- a build can misreport it, and the candidate (0.11.1) differs
+        # from the last released tag (0.11.0) by this release's log-injection fix and the bump.
         # The image reference is unambiguous, and it is what "did the upgrade take" actually means.
         running = _run(["docker", "inspect", f"{state['project']}-api",
                         "--format", "{{.Config.Image}}"], timeout=60)
