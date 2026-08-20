@@ -1095,6 +1095,13 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             except Exception as e:  # noqa: BLE001
                 safe_event('rename.failed', e, vault=vault.id)
                 return paramiko.SFTP_FAILURE
+            # Attribute the rename like every other SFTP mutation (download/upload/delete/mkdir/
+            # rmdir) and the REST rename twin. Without it a temp credential holding file.rename
+            # could rename in-scope items untracked over SFTP -- the contractor-facing surface the
+            # audit trail exists to cover. Names are omitted, matching the sibling SFTP audits (the
+            # logger redacts old_name/new_name from stored details anyway).
+            self._audit(user, "file_rename" if f is not None else "folder_rename",
+                        str(target_id), {"vault_id": str(vault.id), "via": "sftp"})
             return paramiko.SFTP_OK
 
     # -- mkdir / rmdir ------------------------------------------------------
