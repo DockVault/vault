@@ -41,7 +41,11 @@ node_modules/
 **/*.py[cod]
 **/.pytest_cache/
 # Local virtualenvs (routinely created to run tests/) + dev/build/IDE artifacts
+# `.venv*/` also catches named test venvs like `.venv-offline/` — a bare `.venv/` misses those,
+# and `COPY . .` would otherwise bake a host venv (Windows binaries, a bundled libpq, etc.) into
+# the image when building from a working tree.
 .venv/
+.venv*/
 venv/
 env/
 ENV/

@@ -1,0 +1,92 @@
+name: Image scan (PR)
+
+# Vulnerability-scan the container image on the pull requests that can actually change its
+# vulnerability surface -- the base image, the locked dependencies, or the CPython backports --
+# so a High/Critical CVE introduced by a bump is caught before merge rather than at release time.
+# The release workflow still scans both published platform images at publish time; this is the
+# earlier, cheaper gate. It is path-filtered, so app-only PRs (which cannot introduce a new
+# dependency CVE) do not pay for it.
+#
+# amd64 only: the runner builds it natively, so this stays fast. arm64 would need QEMU emulation
+# for little added signal on a pre-merge gate; the release scans arm64 at publish time.
+#
+# Policy: only-fixed. This gate fails only on High/Critical findings that have an available fix --
+# the ones a pull-request author can actually remediate by bumping. A base-image or dependency CVE
+# with no upstream fix yet is not something a PR can resolve, so it does not block here; the
+# release-time scan, with its reviewed OpenVEX, is the backstop that decides such findings
+# consciously. The reviewed VEX is still applied here so already-accepted findings never block.
+
+on:
+  pull_request:
+    branches: ["main"]
+    # These paths mirror what the Dockerfile bakes into the image's scannable package set: the
+    # pinned base (Dockerfile), the hash-locked pip install (requirements.lock / requirements.txt),
+    # the CPython backports and the reviewed VEX (security/**), and what COPY . . excludes
+    # (.dockerignore). Keep this list in sync with the Dockerfile's install inputs -- a new
+    # dependency-source file added there but not here would silently skip this gate.
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "requirements.lock"
+      - "requirements.txt"
+      - "security/**"
+      - ".github/workflows/image-scan-pr.yml"
+      - ".github/scripts/render_release_vex.py"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Build and scan (amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Plain `docker build` loads the image straight into the runner's daemon, so no buildx or
+      # QEMU is needed for the single native platform. The tag is the versioned ghcr reference the
+      # VEX renderer requires; nothing is pushed, so the sentinel v0.0.0 never leaves the runner.
+      - name: Build the image (amd64, local)
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg "OCI_REVISION=${SOURCE_REVISION}" \
+            --tag ghcr.io/dockvault/vault:v0.0.0-amd64 \
+            .
+
+      # The reviewed OpenVEX marks the accepted CPython findings not_affected. Without it the scan
+      # would fail on findings the release has already reviewed, so the PR gate reuses the exact
+      # same document the release renders -- bound to this locally built image's config digest and
+      # the commit under test. It is a denylist of accepted CVEs only; it cannot mask a new one.
+      - name: Render the scan VEX
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          local_digest="$(docker image inspect --format '{{.Id}}' ghcr.io/dockvault/vault:v0.0.0-amd64)"
+          python3 .github/scripts/render_release_vex.py \
+            --template security/vex.openvex.json \
+            --output pr-scan-amd64.openvex.json \
+            --image-digest "$local_digest" \
+            --image-reference ghcr.io/dockvault/vault:v0.0.0-amd64 \
+            --source-revision "$SOURCE_REVISION"
+
+      - name: Scan the built image (amd64)
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: ghcr.io/dockvault/vault:v0.0.0-amd64
+          grype-version: v0.112.0
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true
+          vex: pr-scan-amd64.openvex.json
