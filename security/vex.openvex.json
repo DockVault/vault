@@ -55,6 +55,29 @@
       "justification": "vulnerable_code_not_present",
       "impact_statement": "The release image replaces Lib/html/parser.py with the CPython 3.14 security-backport snapshot at 07efb08123ba9367a7107325adb9d5626dca1ca9, verified during the image build for source revision __SOURCE_REVISION__.",
       "timestamp": "__GENERATED_AT__"
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-14456"},
+      "products": [
+        {
+          "@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
+          "subcomponents": [
+            {"@id": "pkg:apk/alpine/libssl3@3.5.7-r0"},
+            {"@id": "pkg:apk/alpine/libcrypto3@3.5.7-r0"}
+          ]
+        },
+        {
+          "@id": "__IMAGE_REFERENCE__",
+          "subcomponents": [
+            {"@id": "pkg:apk/alpine/libssl3@3.5.7-r0"},
+            {"@id": "pkg:apk/alpine/libcrypto3@3.5.7-r0"}
+          ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "CVE-2026-14456 is a resource-exhaustion defect in OpenSSL's QUIC server Listener (unbounded incoming-channel queueing for unknown destination connection IDs). DockVault serves HTTP/HTTPS with uvicorn over Python's ssl module (OpenSSL TLS) and ships no QUIC listener, aioquic, or HTTP/3 stack, so OpenSSL's QUIC Listener is never instantiated and the vulnerable code is not in the execute path. Verified for source revision __SOURCE_REVISION__.",
+      "timestamp": "__GENERATED_AT__"
     }
   ]
 }
