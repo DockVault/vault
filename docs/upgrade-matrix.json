@@ -33,6 +33,10 @@
     "0.10.0": {
       "released": "2026-08-02",
       "notes": "No schema change. Every release up to here shares one physical schema: the set of boot DDL statements is byte-identical across all of them, and the model differs only in comment text."
+    },
+    "0.11.0": {
+      "released": "2026-08-20",
+      "notes": "First release to change the physical schema: adds the vault_storage_grants table and a nullable users.storage_quota_bytes column, applied automatically and idempotently at boot. The additions are unused by 0.10.0, so a rollback is clean; take a backup before upgrading."
     }
   },
   "edges": [
@@ -41,7 +45,8 @@
     { "from": "0.7.1", "to": "0.7.2", "kind": "direct", "reversible": true, "requires_backup": false },
     { "from": "0.7.2", "to": "0.8.0", "kind": "direct", "reversible": true, "requires_backup": false },
     { "from": "0.8.0", "to": "0.9.0", "kind": "direct", "reversible": true, "requires_backup": false },
-    { "from": "0.9.0", "to": "0.10.0", "kind": "direct", "reversible": true, "requires_backup": false }
+    { "from": "0.9.0", "to": "0.10.0", "kind": "direct", "reversible": true, "requires_backup": false },
+    { "from": "0.10.0", "to": "0.11.0", "kind": "direct", "reversible": true, "requires_backup": true }
   ],
   "waivers": []
 }
