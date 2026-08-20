@@ -48,6 +48,11 @@ def test_ecc_mutators_enforce_temp_credential_scope(admin):
         assert ro.post(f"/ecc/vaults/{vid}/rekey",
                        json={"from_version": 1, "to_version": 2, "member_keys": []}).status_code == 403
         assert ro.post(f"/ecc/vaults/{vid}/retire-version").status_code == 403
+        # The index-key PUT mints/extends the ZK name-index key -- the same class of vault-
+        # management mutation as the others, and it must honour the same per-vault scope.
+        assert ro.put(f"/ecc/vaults/{vid}/index-key",
+                      json={"wraps": [{"user_id": uid, "encrypted_index_key": "x",
+                                       "ephemeral_public_key": "y"}]}).status_code == 403
 
         # In-scope: same vault WITH vault.change_permissions -> the scope gate passes (retire is a
         # safe no-op on an empty vault). Isolates the capability as the deciding factor.
@@ -61,6 +66,13 @@ def test_ecc_mutators_enforce_temp_credential_scope(admin):
                              "wrapped_dek": ZK_WRAPPED_DEK_STUB, "ephemeral_public_key": ZK_EPHEMERAL_STUB}],
         })
         assert r.status_code == 200, r.text
+        # ...and the index-key PUT still works for the unrestricted manager (the new gate
+        # confines a scoped cred without breaking the normal management path).
+        ik = admin.put(f"/ecc/vaults/{vid}/index-key", json={
+            "wraps": [{"user_id": str(admin.user["id"]),
+                       "encrypted_index_key": ZK_WRAPPED_DEK_STUB,
+                       "ephemeral_public_key": ZK_EPHEMERAL_STUB}]})
+        assert ik.status_code == 200, ik.text
     finally:
         admin.delete_vault(vid)
 
