@@ -47,13 +47,22 @@ fails the build loudly rather than quietly if a future base does not carry the f
 vendored snapshot and the VEX statements below is a separate decision, and wants a release scan
 against 3.14.7 as its evidence rather than this reasoning.
 
-The reviewed OpenVEX template uses `vulnerable_code_not_present` for exactly those three
+The reviewed OpenVEX template uses `vulnerable_code_not_present` for those three CPython
 findings and the `pkg:generic/python@3.14.7` subcomponent. Before the local scan, the workflow
 renders it for the tested source revision, the versioned image reference, and the local image
 content ID. After push, it overwrites the release asset with the exact registry manifest digest.
 Every statement contains both the immutable OCI digest PURL and versioned image reference; the
 GitHub Release publishes that rendered VEX beside the SBOM. Any additional exception requires a
 source-reviewed template change.
+
+One further exception is reviewed with the `vulnerable_code_not_in_execute_path` justification:
+`CVE-2026-14456`, an OpenSSL QUIC-server-listener resource-exhaustion defect in the base image's
+`libssl3`/`libcrypto3`. There is no upstream fix yet, but DockVault serves HTTP/HTTPS with uvicorn
+over Python's `ssl` module (OpenSSL TLS) and ships no QUIC listener, `aioquic`, or HTTP/3 stack, so
+OpenSSL's QUIC Listener is never instantiated and the vulnerable code is not reachable. The
+statement binds the `pkg:apk/alpine/libssl3` and `pkg:apk/alpine/libcrypto3` subcomponents; if a
+future base image changes those package versions, the pin stops matching and the exception is
+re-reviewed rather than silently carried forward.
 ## Hosted settings evidence
 
 | Control | Evidence on 2026-07-24 | Status |

@@ -404,12 +404,15 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
     vex = json.loads(
         (_ROOT / "security" / "vex.openvex.json").read_text(encoding="utf-8")
     )
-    assert {statement["vulnerability"]["name"] for statement in vex["statements"]} == {
-        "CVE-2026-11940",
-        "CVE-2026-11972",
-        "CVE-2026-15308",
-    }
-    for statement in vex["statements"]:
+    # The three CPython findings the vendored backport removes, plus the one OpenSSL QUIC-listener
+    # finding DockVault never reaches. Any OTHER exception must be a deliberate, reviewed addition.
+    cpython_cves = {"CVE-2026-11940", "CVE-2026-11972", "CVE-2026-15308"}
+    openssl_cve = "CVE-2026-14456"
+    by_name = {s["vulnerability"]["name"]: s for s in vex["statements"]}
+    assert set(by_name) == cpython_cves | {openssl_cve}
+
+    for name in cpython_cves:
+        statement = by_name[name]
         assert statement["status"] == "not_affected"
         assert statement["justification"] == "vulnerable_code_not_present"
         assert statement["products"] == [
@@ -428,11 +431,37 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
         assert _CPYTHON_SNAPSHOT in statement["impact_statement"]
         assert "__SOURCE_REVISION__" in statement["impact_statement"]
 
+    # The OpenSSL finding (CVE-2026-14456) is a QUIC-server-listener defect; DockVault serves TLS
+    # via uvicorn + Python's ssl only and never instantiates an OpenSSL QUIC listener, so the
+    # vulnerable code is not in the execute path. Distinct justification + apk (not python)
+    # subcomponents, kept as strict as the CPython entries so a bogus addition still fails.
+    openssl = by_name[openssl_cve]
+    assert openssl["status"] == "not_affected"
+    assert openssl["justification"] == "vulnerable_code_not_in_execute_path"
+    openssl_subs = [
+        {"@id": "pkg:apk/alpine/libssl3@3.5.7-r0"},
+        {"@id": "pkg:apk/alpine/libcrypto3@3.5.7-r0"},
+    ]
+    assert openssl["products"] == [
+        {
+            "@id": (
+                "pkg:oci/vault@__IMAGE_DIGEST__"
+                "?repository_url=ghcr.io/dockvault/vault"
+            ),
+            "subcomponents": openssl_subs,
+        },
+        {"@id": "__IMAGE_REFERENCE__", "subcomponents": openssl_subs},
+    ]
+    assert "__SOURCE_REVISION__" in openssl["impact_statement"]
+    assert "QUIC" in openssl["impact_statement"]
+
     evidence = (_ROOT / "docs" / "supply-chain-controls.md").read_text(encoding="utf-8")
     assert "There is no blanket `only-fixed` bypass" in evidence
     assert "fails for every unexcepted vulnerability" in evidence
     assert _CPYTHON_SNAPSHOT in evidence
     assert "vulnerable_code_not_present" in evidence
+    assert "vulnerable_code_not_in_execute_path" in evidence
+    assert "CVE-2026-14456" in evidence
     assert "exact registry manifest digest" in evidence
     assert (
         "both push responses and both immediate tag resolutions must agree" in evidence
