@@ -268,11 +268,19 @@ async def get_user_metrics(
         total_sessions=total_sessions or 0
     )
 
+def _like_escape(value: str) -> str:
+    r"""Escape LIKE/ILIKE wildcards so a user-supplied filter matches its characters
+    literally (use with ``.ilike(pattern, escape="\")``). Without it, ``%`` and ``_`` in
+    the input silently become pattern metacharacters -- e.g. the ``_`` in a filter like
+    "file_download" matches ANY character, returning actions the caller never asked for."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @router.get("/users", response_model=List[UserListItem])
 @require_endpoint_permission("USER_VIEW")
 async def list_users(
     request: Request,
-    search: Optional[str] = Query(None, description="Search by username or email"),
+    search: Optional[str] = Query(None, description="Search by username or email", max_length=128),
     role: Optional[RoleEnum] = Query(None, description="Filter by role"),
     is_active: Optional[bool] = Query(None, description="Filter by active status"),
     is_locked: Optional[bool] = Query(None, description="Filter by locked status"),
@@ -293,11 +301,11 @@ async def list_users(
     
     # Apply filters
     if search:
-        search_pattern = f"%{search}%"
+        search_pattern = f"%{_like_escape(search)}%"
         query = query.filter(
             or_(
-                User.username.ilike(search_pattern),
-                User.email.ilike(search_pattern)
+                User.username.ilike(search_pattern, escape="\\"),
+                User.email.ilike(search_pattern, escape="\\")
             )
         )
     
@@ -855,7 +863,7 @@ async def delete_temp_credential_by_id(
 async def get_user_activity(
     user_id: uuid.UUID,
     request: Request,
-    action_filter: Optional[str] = Query(None, description="Filter by action type"),
+    action_filter: Optional[str] = Query(None, description="Filter by action type", max_length=128),
     days: int = Query(30, ge=1, le=365, description="Number of days to look back"),
     limit: int = Query(100, ge=1, le=1000),
     current_user: User = Depends(get_current_user),
@@ -880,7 +888,7 @@ async def get_user_activity(
     
     # Apply action filter if provided
     if action_filter:
-        query = query.filter(AuditLog.action.ilike(f"%{action_filter}%"))
+        query = query.filter(AuditLog.action.ilike(f"%{_like_escape(action_filter)}%", escape="\\"))
     
     # Order by timestamp (newest first)
     query = query.order_by(AuditLog.timestamp.desc())
