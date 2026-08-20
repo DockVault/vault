@@ -9,12 +9,19 @@ name: Image scan (PR)
 #
 # amd64 only: the runner builds it natively, so this stays fast. arm64 would need QEMU emulation
 # for little added signal on a pre-merge gate; the release scans arm64 at publish time.
+#
+# Policy: only-fixed. This gate fails only on High/Critical findings that have an available fix --
+# the ones a pull-request author can actually remediate by bumping. A base-image or dependency CVE
+# with no upstream fix yet is not something a PR can resolve, so it does not block here; the
+# release-time scan, with its reviewed OpenVEX, is the backstop that decides such findings
+# consciously. The reviewed VEX is still applied here so already-accepted findings never block.
 
 on:
   pull_request:
     branches: ["main"]
     paths:
       - "Dockerfile"
+      - ".dockerignore"
       - "requirements.lock"
       - "requirements.txt"
       - "security/**"
@@ -76,4 +83,5 @@ jobs:
           grype-version: v0.112.0
           fail-build: true
           severity-cutoff: high
+          only-fixed: true
           vex: pr-scan-amd64.openvex.json
