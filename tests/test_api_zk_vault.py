@@ -265,6 +265,62 @@ def test_revoke_member_key(admin, temp_user, temp_user_client):
         admin.delete_vault(vid)
 
 
+def test_manager_cannot_overwrite_owner_or_peer_manager_wrap(admin):
+    """grant_member_key must not let a Manager overwrite the wrapped DEK of the owner or a peer
+    Manager. The server holds only opaque wraps, so swapping the wrap under a guaranteed
+    key-holder / peer would feed them a key of the Manager's choosing -- locking them out of
+    existing content and making their new uploads readable only to the Manager's pick. grant had
+    no owner/peer guard (revoke and the index-key PUT both do). The guard must still allow the
+    owner to refresh their OWN wrap and a Manager to grant a NEW regular member.
+    """
+    from conftest import ApiClient
+    ensure_ecc_keypair(admin)
+    owner_id = admin.user["id"]
+    m1 = admin.create_user(role="user")   # a Manager
+    m2 = admin.create_user(role="user")   # a peer Manager
+    reg = admin.create_user(role="user")  # a fresh regular recipient
+    m1c = ApiClient(); m1c.login(m1["_username"], m1["_password"]); ensure_ecc_keypair(m1c)
+    m2c = ApiClient(); m2c.login(m2["_username"], m2["_password"]); ensure_ecc_keypair(m2c)
+    regc = ApiClient(); regc.login(reg["_username"], reg["_password"]); ensure_ecc_keypair(regc)
+    with _zk_enabled(admin):
+        vid = create_zk_vault(admin)["id"]
+    ATTACK = "QVRUQUNLRVI="  # an attacker-chosen blob the Manager tries to plant
+    try:
+        # Owner gives m1 and m2 a DEK wrap, then promotes both to Manager.
+        for u in (m1, m2):
+            assert admin.post(f"/ecc/vaults/{vid}/members",
+                              json={"user_id": u["id"], "wrapped_dek": "QQ==",
+                                    "ephemeral_public_key": "QQ=="}).status_code == 200
+            assert admin.post(f"/vaults/{vid}/permissions",
+                              json={"user_id": u["id"], "level": "manage"}).status_code == 200
+
+        # (1) Manager m1 CANNOT overwrite the OWNER's wrap; the owner's stored wrap is untouched.
+        r = m1c.post(f"/ecc/vaults/{vid}/members",
+                     json={"user_id": owner_id, "wrapped_dek": ATTACK, "ephemeral_public_key": ATTACK})
+        assert r.status_code == 403, r.text
+        assert admin.get(f"/ecc/vaults/{vid}/keys").json().get("wrapped_dek") != ATTACK
+
+        # (2) Manager m1 CANNOT overwrite a PEER Manager (m2)'s wrap.
+        r = m1c.post(f"/ecc/vaults/{vid}/members",
+                     json={"user_id": m2["id"], "wrapped_dek": ATTACK, "ephemeral_public_key": ATTACK})
+        assert r.status_code == 403, r.text
+        assert m2c.get(f"/ecc/vaults/{vid}/keys").json().get("wrapped_dek") != ATTACK
+
+        # (3) Positive controls: the owner may refresh their OWN wrap...
+        assert admin.post(f"/ecc/vaults/{vid}/members",
+                          json={"user_id": owner_id, "wrapped_dek": "T0s=",
+                                "ephemeral_public_key": "T0s="}).status_code == 200
+        # ...and a Manager may grant a NEW regular member (no existing wrap, not a manager).
+        assert m1c.post(f"/ecc/vaults/{vid}/members",
+                        json={"user_id": reg["id"], "wrapped_dek": "UkVH",
+                              "ephemeral_public_key": "UkVH"}).status_code == 200
+        assert regc.get(f"/ecc/vaults/{vid}/keys").json()["has_access"] is True
+    finally:
+        admin.delete_vault(vid)
+        for u in (m1, m2, reg):
+            admin.delete_user(u["id"])
+
+
 # --- Confidentiality org-policy: force zero-knowledge + Standard whitelist (§5) -
 
 def test_force_zk_blocks_standard_for_non_whitelisted(admin):
