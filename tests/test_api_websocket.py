@@ -164,3 +164,91 @@ def test_ws_revoked_token_closed(base_url, admin):
                 pass
     finally:
         admin.delete_user(user["id"])
+
+
+@pytest.mark.websocket
+def test_ws_revoked_temp_cred_closed(base_url, admin):
+    # A temp credential whose session was force-closed by INVALIDATING the credential must be
+    # rejected at the /ws/monitor handshake. Invalidation flips its ActiveSession.is_active to False
+    # (see _revoke_sessions) but does NOT denylist the token, so the handshake must apply the same
+    # still-active-session check get_current_user does for temp sessions -- otherwise a revoked temp
+    # credential's JWT keeps opening the live-monitor socket until its natural expiry.
+    from conftest import unique, ApiClient
+
+    tc = admin.post("/auth/temp-credentials", json={"note": unique("ws-rev")}).json()
+    tclient = ApiClient()
+    tclient.login(tc["temp_username"], tc["credential"])
+    token = tclient.token
+
+    # Control: while the session is live the temp token authenticates (a "connected" frame),
+    # proving the token is otherwise valid (so the rejection below is due to revocation).
+    live = websocket.create_connection(_ws_url(base_url), timeout=10)
+    try:
+        live.send(json.dumps({"type": "auth", "token": token}))
+        live.settimeout(8)
+        first = json.loads(live.recv())
+        assert first.get("type") == "connected", \
+            "control: a live temp-credential token should authenticate onto /ws/monitor"
+    finally:
+        try:
+            live.close()
+        except Exception:
+            pass
+
+    # Invalidate the credential: _revoke_sessions flips its ActiveSession.is_active to False.
+    assert admin.post(f"/temp-creds/{tc['temp_username']}/deactivate").status_code == 200
+
+    # The now-revoked temp token must be rejected (an error frame) and the socket closed.
+    ws = websocket.create_connection(_ws_url(base_url), timeout=10)
+    try:
+        ws.send(json.dumps({"type": "auth", "token": token}))
+        ws.settimeout(8)
+        first = json.loads(ws.recv())
+        assert first.get("type") == "error", \
+            "a revoked temp credential must be rejected at the handshake, not authenticated"
+        with pytest.raises(Exception):
+            while True:
+                ws.recv()
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+@pytest.mark.websocket
+def test_ws_temp_cred_past_validity_window_closed(base_url, admin):
+    # Parity with get_current_user: a temp credential PAST its own validity window (deactivate_at)
+    # must be refused at the handshake even though its ActiveSession row is still nominally active
+    # and the token is not denylisted. Temp JWTs keep a fixed life decoupled from validity_minutes,
+    # so a credential minted with a short validity has a window where HTTP already rejects it but the
+    # socket would otherwise still open. Backdate deactivate_at directly (leaving the session row
+    # active) to land squarely in that window.
+    import os
+    import subprocess
+    from conftest import unique, ApiClient
+
+    _DB = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
+    tc = admin.post("/auth/temp-credentials", json={"note": unique("ws-window")}).json()
+    tclient = ApiClient()
+    tclient.login(tc["temp_username"], tc["credential"])
+    token = tclient.token
+
+    subprocess.run(
+        ["docker", "exec", _DB, "psql", "-U", "sftp_user", "-d", "sftp_db", "-c",
+         "UPDATE temporary_credentials SET deactivate_at = NOW() - INTERVAL '1 hour' "
+         "WHERE temp_username = '%s'" % tc["temp_username"]],
+        check=True, capture_output=True, text=True, timeout=20)
+
+    ws = websocket.create_connection(_ws_url(base_url), timeout=10)
+    try:
+        ws.send(json.dumps({"type": "auth", "token": token}))
+        ws.settimeout(8)
+        first = json.loads(ws.recv())
+        assert first.get("type") == "error", \
+            "a temp credential past its validity window must be refused at the handshake"
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass

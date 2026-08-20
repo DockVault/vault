@@ -4061,6 +4061,45 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                     ).first()
                     if _rev is not None and _rev[0]:
                         raise ValueError("Session terminated")
+                else:
+                    # Temp sessions: full parity with get_current_user, which bounds a temp session
+                    # by an ACTIVE session row, the inactivity grace window, AND the credential's own
+                    # deactivate_at/expires_at lifetime -- and fails CLOSED if the backing credential
+                    # row is gone. Invalidating/deleting the credential flips ActiveSession.is_active
+                    # to False (see _revoke_sessions); a credential minted with a validity window
+                    # shorter than the token's life is refused past deactivate_at even while its
+                    # session row is still nominally active. None of this denylists the token, so the
+                    # handshake must re-derive it here rather than trust signature+exp alone.
+                    from app.core.models import TemporaryCredential as _WsTC
+                    from datetime import timedelta as _wstd
+                    _sess = _wsdb.query(_WsAS.last_activity, _WsAS.temp_credential_id).filter(
+                        _WsAS.session_token == session_token,
+                        _WsAS.is_active == True,  # noqa: E712
+                    ).first()
+                    if _sess is None:
+                        raise ValueError("Session terminated")
+                    _grace = int(os.getenv("TEMP_CRED_SESSION_GRACE_MINUTES", "65"))
+                    _cutoff = datetime.now(timezone.utc) - _wstd(minutes=_grace)
+                    _la = _sess[0]
+                    if _la is not None and _la.tzinfo is None:
+                        _la = _la.replace(tzinfo=timezone.utc)
+                    if _la is not None and _la < _cutoff:
+                        raise ValueError("Session terminated")
+                    # Fail closed: an active session whose backing credential row is gone must not
+                    # authorize (it would otherwise run unscoped).
+                    _tc = _wsdb.query(_WsTC.deactivate_at, _WsTC.expires_at).filter(
+                        _WsTC.id == _sess[1]
+                    ).first()
+                    if _tc is None:
+                        raise ValueError("Session terminated")
+                    _now = datetime.now(timezone.utc)
+                    for _lim in (_tc[0], _tc[1]):
+                        if _lim is None:
+                            continue
+                        if _lim.tzinfo is None:
+                            _lim = _lim.replace(tzinfo=timezone.utc)
+                        if _now > _lim:
+                            raise ValueError("Session terminated")
                 _wsuser = _wsdb.query(_WsUser).filter(_WsUser.id == uuid.UUID(user_id)).first()
                 if not _wsuser or not _wsuser.is_active or account_locked(_wsuser):
                     raise ValueError("Account inactive or locked")
