@@ -1492,8 +1492,8 @@ class MemberKeyWrap(BaseModel):
     DIRECT rekey: wrapped_dek is the new DEK. HIERARCHICAL team rotation: wrapped_dek is the new
     TEAM PRIVATE key (the field is generic)."""
     user_id: str
-    wrapped_dek: str
-    ephemeral_public_key: str
+    wrapped_dek: str = Field(..., max_length=8192)
+    ephemeral_public_key: str = Field(..., max_length=8192)
 
 
 class RekeyRequest(BaseModel):
@@ -1512,7 +1512,7 @@ class RekeyRequest(BaseModel):
     # non-canonical form can't slip past `str(revoke_user_id) == str(owner_id)` while the
     # DB still normalizes it and deactivates the owner's rows.
     revoke_user_id: Optional[uuid.UUID] = Field(None, description="member being removed, if any")
-    member_keys: List[MemberKeyWrap] = Field(..., description="per-remaining-member wraps (empty for a routine hierarchical rotation)")
+    member_keys: List[MemberKeyWrap] = Field(..., max_length=512, description="per-remaining-member wraps (empty for a routine hierarchical rotation)")
     # Hierarchical only:
     team_dek_wrapped: Optional[str] = Field(None, description="the new DEK wrapped to a team public key")
     team_dek_ephemeral_public_key: Optional[str] = None
