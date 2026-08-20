@@ -5,10 +5,12 @@ operator does: installs an old release, puts real data in it, and upgrades forwa
 release to the code under test, checking after every step that the data is still there and that the
 deployment is telling the truth about itself.
 
-It matters because the tagged-release upgrade path has never actually carried a schema change. Every
-published version so far has been schema-identical, so the machinery is unexercised precisely where
-it is about to be leaned on. A drill is the only way to find out whether the boot DDL applies
-cleanly on a database that has been through several releases rather than one built fresh.
+It matters because the tagged-release upgrade path carries its FIRST schema change in 0.11.0 (the
+code under test): every published version through 0.10.0 was schema-identical, and 0.11.0 adds the
+vault_storage_grants table and a nullable users.storage_quota_bytes column. So the boot-DDL
+machinery is being leaned on for the first time exactly here -- the candidate hop below carries it.
+A drill is the only way to find out whether the boot DDL applies cleanly on a database that has been
+through several releases rather than one built fresh.
 
 Two properties, checked at every step rather than only at the end:
 
@@ -295,10 +297,10 @@ def test_data_written_on_an_old_release_survives_every_upgrade_to_here(drill):
         # Prove the hop actually happened. Without this the walk is assumed: if the override or
         # the recreate silently did nothing, every check below would pass against the release we
         # started on, and the drill would report that upgrading is safe without having upgraded.
-        # The IMAGE the container runs, not the version it reports. The candidate is built from a
-        # tree whose VERSION still reads 0.10.0, because main has not been bumped since that
-        # release -- so a version string cannot tell the last released hop from the candidate,
-        # while the image reference can, and it is what "did the upgrade take" actually means.
+        # The IMAGE the container runs, not the version it reports. Relying on a version string to
+        # prove the hop is fragile -- a build can misreport it, and the candidate's 0.11.0 differs
+        # from the last released tag (0.10.0) only because main was just bumped for this release.
+        # The image reference is unambiguous, and it is what "did the upgrade take" actually means.
         running = _run(["docker", "inspect", f"{state['project']}-api",
                         "--format", "{{.Config.Image}}"], timeout=60)
         assert running.returncode == 0, f"cannot inspect the container after {where}"
