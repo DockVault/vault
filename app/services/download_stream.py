@@ -219,6 +219,12 @@ class ByteRange:
 #: would turn a 416 into a silent full download of a file the client explicitly did not ask for.
 UNSATISFIABLE = object()
 
+#: The most decimal digits a satisfiable byte offset can have: a signed 64-bit maximum
+#: (`size_limit` is a BigInteger column) is 19 digits. It also keeps every `int()` below the
+#: default `sys.get_int_max_str_digits()` ceiling of 4300, past which `int()` raises on a string
+#: `str.isdigit()` still accepts -- a raise the parser's contract says to turn into "ignore it".
+_MAX_RANGE_DIGITS = 19
+
 
 def parse_byte_range(header, total_length: int):
     """Resolve a `Range` request header against a known length.
@@ -263,14 +269,19 @@ def parse_byte_range(header, total_length: int):
     first, last = first.strip(), last.strip()
 
     def _digits(text: str) -> bool:
-        """ASCII digits only.
+        """ASCII digits only, and few enough that `int()` will accept them.
 
         `str.isdigit()` is true for characters `int()` refuses -- superscripts like "²" among
         them -- so the obvious pairing of the two raises ValueError on input this function's own
-        contract says to ignore. On the download path that became a 500 and an audit row reading
-        "Download failed", for a header the caller was entitled to send badly.
+        contract says to ignore. CPython additionally refuses to parse a decimal string longer
+        than `sys.get_int_max_str_digits()` (4300 by default), which an isdigit-only guard lets
+        straight through: a Range value of a few thousand nines passes it and then raises out of
+        `int()` below. No satisfiable byte offset needs more than the 19 digits of a signed
+        64-bit maximum, so a longer run is not a range this can serve and is ignored like any
+        other unparseable input. On the download path the unguarded raise became a 500 and an
+        audit row reading "Download failed", for a header the caller was entitled to send badly.
         """
-        return text.isascii() and text.isdigit()
+        return text.isascii() and text.isdigit() and len(text) <= _MAX_RANGE_DIGITS
 
     # A zero-length representation can satisfy no range at all. Handled before the arithmetic
     # because `total_length - 1` would otherwise name byte -1 as the last one.

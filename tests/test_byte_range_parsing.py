@@ -74,6 +74,13 @@ def test_a_satisfiable_range_resolves_to_inclusive_bounds(header, expected):
     "bytes=-²",
     "bytes=½-1",           # vulgar fraction one half
     "bytes=٥-9",           # arabic-indic five: a digit int() DOES accept, but not ASCII
+    # ASCII digits int() also refuses: a run longer than sys.get_int_max_str_digits() (4300).
+    # isdigit() is true for these too, so the same isdigit-only guard let them raise ValueError
+    # out of int() -- a 500 an unauthenticated-shaped Range header could trigger at will. No real
+    # byte offset is this long, so RFC 7233 says ignore it and serve the whole thing.
+    "bytes=0-" + "9" * 5000,     # over-long end
+    "bytes=" + "9" * 5000 + "-10000",  # over-long start
+    "bytes=-" + "9" * 5000,      # over-long suffix
 ])
 def test_anything_unparseable_says_serve_the_whole_thing(header):
     # None, not an exception and not UNSATISFIABLE. RFC 7233 requires a recipient that cannot
@@ -94,6 +101,20 @@ def test_anything_unparseable_says_serve_the_whole_thing(header):
 ])
 def test_a_range_that_cannot_be_served_is_not_the_same_as_no_range(header, total):
     assert parse_byte_range(header, total) is UNSATISFIABLE
+
+
+@pytest.mark.unit
+def test_the_offset_length_bound_is_exactly_the_int64_width():
+    """Pin the digit cap at 19 from both sides, so an off-by-one edit is caught.
+
+    Nineteen digits is the width of a signed 64-bit maximum: it must still PARSE (here into
+    UNSATISFIABLE, since it is past the end -- not be dropped to None as if unparseable). Twenty
+    digits is past any real offset and is ignored (None). If the cap drifts to 18 the first
+    assertion breaks; if it drifts to 20 the second does.
+    """
+    nineteen = "9" * 19  # 9999999999999999999 > int64 max, still a clean int() parse
+    assert parse_byte_range(f"bytes={nineteen}-", 1000) is UNSATISFIABLE
+    assert parse_byte_range("bytes=0-" + "9" * 20, 1000) is None
 
 
 @pytest.mark.unit
