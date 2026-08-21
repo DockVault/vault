@@ -37,6 +37,13 @@ APP_ROOT = os.environ.get("DOCKVAULT_ROOT") or os.path.dirname(os.path.abspath(_
 # Windows console (the same reason the .ps1 setup scripts are ASCII-only).
 MENU = [
     ("setup",   "Setup - configure + start the vault"),
+    ("start",   "Start - bring the deployment up (health-checked)"),
+    ("stop",    "Stop - stop the deployment (data volumes kept)"),
+    ("restart", "Restart - stop then start (health-checked)"),
+    ("status",  "Status - containers, health, ports, lock state"),
+    ("lock",    "Lock - seal .env into an encrypted .env.enc"),
+    ("unlock",  "Unlock - open .env.enc back into .env"),
+    ("change-passphrase", "Change passphrase - re-key .env.enc (recovery key unchanged)"),
     ("backup",  "Backup & Restore - snapshot / restore volumes + .env"),
     ("volumes", "Volumes - inspect / reuse / repoint DockVault volume sets"),
     ("storage", "Limits - storage the deployment may hold, transfers it may carry"),
@@ -230,6 +237,7 @@ import hashlib  # noqa: E402
 import json     # noqa: E402
 import math     # noqa: E402
 import re       # noqa: E402
+import tempfile # noqa: E402
 
 # The three secrets the compose file demands (an existing .env must carry these to be reusable).
 REQUIRED_SECRET_KEYS = ("ENCRYPTION_KEY", "JWT_SECRET_KEY", "VAULT_DB_PASSWORD")
@@ -1695,6 +1703,152 @@ def db_guard_decision(volume_exists_flag, probe_result):
     return "proceed" if probe_result == "ok" else "refuse"
 
 
+# --- credential lock: seal .env <-> .env.enc (envelope encryption) ---------------------------
+# .env holds every deployment secret (ENCRYPTION_KEY, VAULT_DB_PASSWORD, ...). `lock` seals it into
+# an encrypted .env.enc and removes the plaintext; `unlock` restores it. TWO credentials can open it:
+# the unlock PASSPHRASE and a high-entropy RECOVERY KEY (which is the file's data key). Envelope model
+# (the LUKS / age multi-recipient pattern, with vetted primitives): one random DEK encrypts .env once
+# with Fernet (authenticated AES-128-CBC + HMAC); the DEK is wrapped under a scrypt-derived key from
+# the passphrase, and the DEK itself is the recovery key. Full rationale + threat model:
+# docs/design/credential-lock-and-lifecycle.md. This protects .env only while sealed/off - a RUNNING
+# stack needs plaintext .env; host full-disk encryption is the control for a running box.
+ENV_LOCK_MAGIC = "DOCKVAULT-ENV-LOCK v1"
+ENV_LOCK_KDF = {"algo": "scrypt", "n": 1 << 15, "r": 8, "p": 1}
+
+
+class EnvLockError(Exception):
+    """A .env.enc could not be parsed or decrypted (wrong passphrase/recovery key, or tampering)."""
+
+
+def load_fernet():
+    """Return the Fernet class, or None if the `cryptography` package is not installed. Imported
+    LAZILY so every OTHER dockvault.py command stays stdlib-only; only lock/unlock need it."""
+    try:
+        from cryptography.fernet import Fernet
+        return Fernet
+    except Exception:  # noqa: BLE001 - not installed / broken install
+        return None
+
+
+def _scrypt_maxmem(n, r):
+    """A maxmem for hashlib.scrypt big enough that the given (n, r) reliably succeeds on any host -
+    the default (~32 MiB) REJECTS our params, which would otherwise force a silent KDF downgrade.
+    scrypt's OUTPUT does not depend on maxmem, so a generous value keeps derivation identical across
+    machines (only the allocation ceiling changes)."""
+    return max(64 * 1024 * 1024, 128 * int(r) * int(n) * 2)
+
+
+def _scrypt_ok():
+    """True if this host's hashlib.scrypt can run the sealing params (a few Python builds omit it)."""
+    try:
+        hashlib.scrypt(b"probe", salt=b"\x00" * 16, n=ENV_LOCK_KDF["n"], r=ENV_LOCK_KDF["r"],
+                       p=ENV_LOCK_KDF["p"],
+                       maxmem=_scrypt_maxmem(ENV_LOCK_KDF["n"], ENV_LOCK_KDF["r"]), dklen=32)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _seal_kdf():
+    """The KDF descriptor to seal a NEW .env.enc with: memory-hard scrypt where the host supports it,
+    else strong PBKDF2. The descriptor (algo + params) is written into the header so env_lock_open
+    reproduces the EXACT derivation on ANY host - never a runtime scrypt-vs-pbkdf2 guess that could
+    diverge between the sealing host and a restore host (which silently broke the passphrase before)."""
+    if _scrypt_ok():
+        return {"algo": "scrypt", "n": ENV_LOCK_KDF["n"], "r": ENV_LOCK_KDF["r"], "p": ENV_LOCK_KDF["p"]}
+    return {"algo": "pbkdf2", "iterations": 600000}
+
+
+def _derive_kek(passphrase, salt, kdf):
+    """Derive the 32-byte key-encryption-key EXACTLY as the recorded `kdf` (algo + params) specifies,
+    returned as a url-safe-base64 Fernet key. Deterministic: the same kdf + passphrase + salt yields
+    the same key on every host. Raises EnvLockError if the recorded algo cannot run here (loud, never
+    a silent switch to a different KDF that would compute the wrong key)."""
+    pw = passphrase.encode("utf-8")
+    algo = kdf.get("algo")
+    if algo == "scrypt":
+        try:
+            raw = hashlib.scrypt(pw, salt=salt, n=int(kdf["n"]), r=int(kdf["r"]), p=int(kdf["p"]),
+                                 maxmem=_scrypt_maxmem(int(kdf["n"]), int(kdf["r"])), dklen=32)
+        except (ValueError, MemoryError, KeyError) as exc:
+            raise EnvLockError("this host cannot run the lock file's scrypt parameters (%s)" % exc)
+    elif algo == "pbkdf2":
+        try:
+            raw = hashlib.pbkdf2_hmac("sha256", pw, salt, int(kdf["iterations"]), dklen=32)
+        except (ValueError, KeyError) as exc:
+            raise EnvLockError("invalid pbkdf2 parameters in the lock file (%s)" % exc)
+    else:
+        raise EnvLockError("unknown KDF %r in the lock file" % algo)
+    return base64.urlsafe_b64encode(raw)
+
+
+def env_lock_seal(fernet, env_bytes, passphrase, dek=None, hint=None, now_iso=None):
+    """Encrypt the raw .env bytes into the .env.enc text (magic header + JSON). If dek is None a fresh
+    one is generated (its value IS the recovery key). The KDF descriptor actually used is recorded in
+    the header. Returns (enc_text, dek). env_bytes is bytes so lock/unlock are byte-exact."""
+    if dek is None:
+        dek = fernet.generate_key()
+    salt = os.urandom(16)
+    kdf = _seal_kdf()
+    kek = _derive_kek(passphrase, salt, kdf)
+    body = {
+        "version": 1,
+        "kdf": dict(kdf, salt=base64.b64encode(salt).decode()),
+        "cipher": "fernet",
+        "wrapped_dek": base64.b64encode(fernet(kek).encrypt(dek)).decode(),
+        "payload": base64.b64encode(fernet(dek).encrypt(env_bytes)).decode(),
+    }
+    if now_iso:
+        body["created_at"] = now_iso
+    if hint:
+        body["hint"] = str(hint)[:200]
+    return ENV_LOCK_MAGIC + "\n" + json.dumps(body, indent=2) + "\n", dek
+
+
+def _parse_env_lock(enc_text):
+    """Validate the magic header + JSON body of a .env.enc. Raises EnvLockError on anything off."""
+    parts = enc_text.split("\n", 1)
+    if not parts or parts[0].strip() != ENV_LOCK_MAGIC:
+        raise EnvLockError("not a DockVault credential lock file (bad header)")
+    try:
+        body = json.loads(parts[1]) if len(parts) > 1 else {}
+    except ValueError:
+        raise EnvLockError("the lock file body is not valid JSON (corrupt)")
+    if body.get("version") != 1 or "payload" not in body:
+        raise EnvLockError("unsupported or incomplete lock file (version %r)" % body.get("version"))
+    return body
+
+
+def env_lock_open(fernet, enc_text, passphrase=None, recovery_key=None):
+    """Decrypt a .env.enc. Provide EITHER passphrase OR recovery_key. Returns (env_bytes, dek).
+    Raises EnvLockError on a wrong credential, tampering, or a malformed file."""
+    from cryptography.fernet import InvalidToken
+    body = _parse_env_lock(enc_text)
+    if recovery_key is not None:
+        rk = recovery_key.strip() if isinstance(recovery_key, str) else recovery_key
+        try:
+            dek = rk.encode("ascii") if isinstance(rk, str) else rk
+        except UnicodeEncodeError:
+            raise EnvLockError("the recovery key contains invalid characters")
+    elif passphrase is not None:
+        try:
+            salt = base64.b64decode(body["kdf"]["salt"])
+        except Exception:  # noqa: BLE001
+            raise EnvLockError("the lock file key parameters are corrupt")
+        kek = _derive_kek(passphrase, salt, body["kdf"])
+        try:
+            dek = fernet(kek).decrypt(base64.b64decode(body["wrapped_dek"]))
+        except (InvalidToken, KeyError, ValueError):
+            raise EnvLockError("wrong passphrase")
+    else:
+        raise EnvLockError("no passphrase or recovery key supplied")
+    try:
+        env_bytes = fernet(dek).decrypt(base64.b64decode(body["payload"]))
+    except (InvalidToken, ValueError):
+        raise EnvLockError("could not decrypt (wrong recovery key, or the file is corrupt/tampered)")
+    return env_bytes, dek
+
+
 # --- app -------------------------------------------------------------------------------------
 class DockVault:
     """The management app: holds the palette + repo root and dispatches menu/arg commands to the
@@ -1723,6 +1877,321 @@ class DockVault:
 
     def _certs_dir(self):
         return os.path.join(self.root, "certs")
+
+    def _env_lock_path(self):
+        return os.path.join(self.root, ".env.enc")
+
+    def _is_locked(self):
+        """True when .env is sealed: no plaintext .env, but a .env.enc is present."""
+        return (not os.path.exists(self._env_path())) and os.path.exists(self._env_lock_path())
+
+    def _atomic_write_secret(self, path, data):
+        """Write `data` to `path` atomically (temp in the same dir -> fsync -> os.replace) and tighten
+        perms to owner-only. The temp file is created mode-600 on POSIX so a secret is never briefly
+        world-readable before the rename. `data` may be str (written UTF-8, LF) or bytes (written
+        verbatim - used for .env so a lock/unlock round-trip is byte-for-byte identical)."""
+        is_bytes = isinstance(data, (bytes, bytearray))
+        d = os.path.dirname(path) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".dvtmp-", dir=d)
+        try:
+            if os.name != "nt":
+                os.fchmod(fd, 0o600)
+            if is_bytes:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+            else:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+            os.replace(tmp, path)
+            tmp = None
+        finally:
+            if tmp is not None and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        tighten_secret_file(path)
+
+    # --- credential lock / unlock -----------------------------------------------------------
+    def _require_fernet(self):
+        fernet = load_fernet()
+        if fernet is None:
+            print(self.pal.paint(
+                "  Locking/unlocking needs the 'cryptography' package (not installed).\n"
+                "  Install it, then retry:   pip install cryptography", "red"))
+            raise SystemExit(2)
+        return fernet
+
+    def _read_passphrase(self, args, confirm, prefix="passphrase", label="Unlock passphrase"):
+        """A passphrase, from --<prefix>-file / --<prefix>-stdin, else an interactive prompt. `confirm`
+        asks twice + enforces a minimum length (used only when SETTING one). `prefix`/`label` let this
+        serve both the current passphrase and a NEW one (change-passphrase)."""
+        pf = getattr(args, prefix + "_file", None)
+        flag = prefix.replace("_", "-")
+        if pf:
+            try:
+                with open(pf, encoding="utf-8") as f:
+                    return f.readline().rstrip("\r\n")
+            except OSError as exc:
+                print(self.pal.paint("  Cannot read --%s-file %s: %s" % (flag, pf, exc), "red"))
+                raise SystemExit(2)
+        if getattr(args, prefix + "_stdin", False):
+            return sys.stdin.readline().rstrip("\r\n")
+        while True:
+            pw = ask_secret(label, self.pal)
+            if not confirm:
+                return pw
+            if len(pw) < 8:
+                print(self.pal.paint("  Use at least 8 characters.", "red"))
+                continue
+            if ask_secret("Confirm " + label.lower(), self.pal) != pw:
+                print(self.pal.paint("  Passphrases do not match.", "red"))
+                continue
+            return pw
+
+    def _read_recovery_key(self, args):
+        rf = getattr(args, "recovery_key_file", None)
+        if rf:
+            try:
+                with open(rf, encoding="utf-8") as f:
+                    return f.read().strip()
+            except OSError as exc:
+                print(self.pal.paint("  Cannot read --recovery-key-file %s: %s" % (rf, exc), "red"))
+                raise SystemExit(2)
+        return ask_secret("Credential recovery key", self.pal).strip()
+
+    def _emit_secret(self, text):
+        """Write a one-time secret to the controlling TERMINAL (/dev/tty, or CON on Windows), NOT
+        stdout - so a redirected or tee'd stdout (a setup log, CI output) can't capture it. Falls
+        back to stdout when there is no controlling terminal (then --recovery-out is the safe
+        channel)."""
+        dev = "CON" if os.name == "nt" else "/dev/tty"
+        try:
+            with open(dev, "w", encoding="utf-8") as tty:
+                tty.write(text + "\n")
+                return
+        except OSError:
+            print(text)
+
+    def _show_recovery_key(self, dek, args):
+        key = dek.decode("ascii") if isinstance(dek, (bytes, bytearray)) else str(dek)
+        pal = self.pal
+        # Show the key + its guidance on the controlling terminal only (see _emit_secret).
+        self._emit_secret("\n".join([
+            pal.paint("\n  ===== CREDENTIAL RECOVERY KEY (shown once) =====", "bold", "yellow"),
+            "    " + pal.paint(key, "bold"),
+            pal.paint("  Save this in a password manager. It unlocks .env if you forget the passphrase.\n"
+                      "  It does NOT recover vault files or deployments. If you lose BOTH this key and the\n"
+                      "  passphrase, every stored file becomes permanently unrecoverable.", "yellow"),
+        ]))
+        out = getattr(args, "recovery_out", None)
+        if out:
+            self._atomic_write_secret(out, key + "\n")
+            print(pal.paint("  Also written to %s - move it OFF this host, then delete it here." % out,
+                            "yellow"))
+
+    def lock(self, args=None):
+        """Seal .env into an encrypted .env.enc (verify-before-destroy), then remove the plaintext .env."""
+        pal = self.pal
+        fernet = self._require_fernet()
+        env_path, enc_path = self._env_path(), self._env_lock_path()
+        if not os.path.exists(env_path):
+            if os.path.exists(enc_path):
+                print(pal.paint("  .env is already locked (only .env.enc is present).", "yellow"))
+                return
+            print(pal.paint("  No .env to lock - run 'setup' first.", "red"))
+            raise SystemExit(2)
+        with open(env_path, "rb") as f:
+            env_bytes = f.read()
+        reuse = os.path.exists(enc_path)
+        dek = None
+        if reuse:
+            # Re-locking an edited .env: unwrap the EXISTING data key with the passphrase so the
+            # recovery key stays stable across locks.
+            passphrase = self._read_passphrase(args, confirm=False)
+            try:
+                with open(enc_path, encoding="utf-8") as f:
+                    _, dek = env_lock_open(fernet, f.read(), passphrase=passphrase)
+            except EnvLockError as exc:
+                print(pal.paint("  Cannot re-lock: %s." % exc, "red"))
+                raise SystemExit(2)
+        else:
+            print(pal.paint(
+                "\n  Set an unlock passphrase for .env. You will also get a one-time recovery key.\n"
+                "  Lose BOTH and every stored file is permanently unrecoverable - back them up.",
+                "yellow"))
+            passphrase = self._read_passphrase(args, confirm=True)
+        import datetime as _dt
+        now_iso = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
+        enc_text, dek = env_lock_seal(fernet, env_bytes, passphrase, dek=dek,
+                                      hint=getattr(args, "hint", None), now_iso=now_iso)
+        self._atomic_write_secret(enc_path, enc_text)
+        # Verify-before-destroy: the freshly written .env.enc must unlock (by passphrase) back to the
+        # exact bytes we started with, or we leave BOTH files intact and abort loud.
+        try:
+            with open(enc_path, encoding="utf-8") as f:
+                check_bytes, _ = env_lock_open(fernet, f.read(), passphrase=passphrase)
+        except EnvLockError as exc:
+            print(pal.paint("  Verification of the new .env.enc FAILED (%s); .env left intact." % exc, "red"))
+            raise SystemExit(1)
+        if check_bytes != env_bytes:
+            print(pal.paint("  Verification mismatch; .env left intact, nothing removed.", "red"))
+            raise SystemExit(1)
+        os.remove(env_path)
+        print(pal.paint("  Locked: .env -> .env.enc (plaintext .env removed).", "green"))
+        if not reuse:
+            self._show_recovery_key(dek, args)
+
+    def unlock(self, args=None):
+        """Open .env.enc back into a plaintext .env."""
+        pal = self.pal
+        fernet = self._require_fernet()
+        enc_path, env_path = self._env_lock_path(), self._env_path()
+        if not os.path.exists(enc_path):
+            print(pal.paint("  No .env.enc to unlock.", "red"))
+            raise SystemExit(2)
+        with open(enc_path, encoding="utf-8") as f:
+            enc_text = f.read()
+        use_recovery = getattr(args, "recovery_key", False) or getattr(args, "recovery_key_file", None)
+        try:
+            if use_recovery:
+                env_bytes, dek = env_lock_open(fernet, enc_text, recovery_key=self._read_recovery_key(args))
+            else:
+                env_bytes, dek = env_lock_open(fernet, enc_text,
+                                               passphrase=self._read_passphrase(args, confirm=False))
+        except EnvLockError as exc:
+            print(pal.paint("  Unlock failed: %s." % exc, "red"))
+            raise SystemExit(2)
+        if getattr(args, "show_recovery_key", False):
+            self._show_recovery_key(dek, args)
+            return
+        if os.path.exists(env_path) and not getattr(args, "force", False):
+            print(pal.paint("  .env already exists; refusing to overwrite. Re-run with --force to replace it.",
+                            "red"))
+            raise SystemExit(2)
+        self._atomic_write_secret(env_path, env_bytes)
+        print(pal.paint("  Unlocked: .env.enc -> .env.", "green"))
+
+    def change_passphrase(self, args=None):
+        """Set a NEW unlock passphrase for .env.enc, keeping the same data key and recovery key.
+        Authenticate with the CURRENT passphrase OR the recovery key (so a forgotten passphrase can be
+        replaced with the recovery key without ever exposing a new recovery key)."""
+        pal = self.pal
+        fernet = self._require_fernet()
+        enc_path = self._env_lock_path()
+        if not os.path.exists(enc_path):
+            print(pal.paint("  No .env.enc to re-key - run 'lock' first.", "red"))
+            raise SystemExit(2)
+        with open(enc_path, encoding="utf-8") as f:
+            enc_text = f.read()
+        use_recovery = getattr(args, "recovery_key", False) or getattr(args, "recovery_key_file", None)
+        try:
+            if use_recovery:
+                env_bytes, dek = env_lock_open(fernet, enc_text, recovery_key=self._read_recovery_key(args))
+            else:
+                env_bytes, dek = env_lock_open(fernet, enc_text,
+                                               passphrase=self._read_passphrase(args, confirm=False))
+        except EnvLockError as exc:
+            print(pal.paint("  Cannot change the passphrase: %s." % exc, "red"))
+            raise SystemExit(2)
+        new_pass = self._read_passphrase(args, confirm=True, prefix="new_passphrase",
+                                         label="New unlock passphrase")
+        # Re-seal the SAME data key (and thus the same recovery key) under the new passphrase; the
+        # payload is re-encrypted under that data key (harmless - the recovery key still opens it).
+        new_enc, _ = env_lock_seal(fernet, env_bytes, new_pass, dek=dek)
+        # Verify the new file opens with the NEW passphrase before it replaces the old one.
+        try:
+            check, _ = env_lock_open(fernet, new_enc, passphrase=new_pass)
+        except EnvLockError as exc:
+            print(pal.paint("  Verification failed (%s); .env.enc left unchanged." % exc, "red"))
+            raise SystemExit(1)
+        if check != env_bytes:
+            print(pal.paint("  Verification mismatch; .env.enc left unchanged.", "red"))
+            raise SystemExit(1)
+        self._atomic_write_secret(enc_path, new_enc)
+        print(pal.paint("  Passphrase changed. The recovery key is unchanged.", "green"))
+
+    # --- deployment lifecycle ---------------------------------------------------------------
+    def start(self, args=None):
+        """Bring the deployment up (health-checked). If .env is sealed, unlock it inline first."""
+        pal = self.pal
+        if self._is_locked():
+            print(pal.paint("  .env is locked; unlock it to start.", "yellow"))
+            self.unlock(args)
+        if not os.path.exists(self._env_path()):
+            print(pal.paint("  No .env - run 'setup' first (or 'unlock' if it is sealed).", "red"))
+            raise SystemExit(2)
+        ok, msg = docker_available()
+        if not ok:
+            print(pal.paint("  Docker is not available: %s" % msg, "red"))
+            raise SystemExit(2)
+        profiles = self._load_env().get("COMPOSE_PROFILES", "combined")
+        print(pal.paint("  Starting the deployment ...", "cyan"))
+        if not self._start_secure_stack():
+            self._tail_logs(self._web_service(profiles))
+            print(pal.paint("  Start failed - the last log lines are above.", "red"))
+            raise SystemExit(1)
+        if not self._wait_secure_healthy(profiles):
+            self._tail_logs(self._web_service(profiles))
+            print(pal.paint("  Started, but the vault did NOT report healthy - logs above.", "red"))
+            raise SystemExit(1)
+        print(pal.paint("  Up and healthy.", "green"))
+        self._print_status(profiles)
+
+    def stop(self, args=None):
+        """Stop the deployment's containers. Data volumes are untouched (never `down -v`)."""
+        pal = self.pal
+        ok, _ = docker_available()
+        if not ok:
+            print(pal.paint("  Docker is not available.", "red"))
+            raise SystemExit(2)
+        if not os.path.exists(self._env_path()):
+            # compose needs .env for the ${VAR:?} interpolation even to address the stack.
+            print(pal.paint("  .env is not present (locked?); nothing to stop by this tool.", "yellow"))
+        else:
+            print(pal.paint("  Stopping the deployment (data volumes are kept) ...", "cyan"))
+            try:
+                self._run_dc("stop", capture=False, timeout=120)
+            except (OSError, subprocess.SubprocessError) as exc:
+                print(pal.paint("  Stop failed: %s" % exc, "red"))
+                raise SystemExit(1)
+            print(pal.paint("  Stopped.", "green"))
+        if getattr(args, "lock", False) and os.path.exists(self._env_path()):
+            self.lock(args)
+
+    def restart(self, args=None):
+        """Stop, then start (health-checked). Data volumes are untouched."""
+        self.stop(args)
+        self.start(args)
+
+    def status(self, args=None):
+        """Show credential lock state + container/health/port status (read-only)."""
+        self._print_status(self._load_env().get("COMPOSE_PROFILES", "combined"))
+
+    def _print_status(self, profiles):
+        pal = self.pal
+        if self._is_locked():
+            print(pal.paint("  Credentials: LOCKED (.env.enc present; run 'unlock' to open)", "yellow"))
+        elif os.path.exists(self._env_lock_path()):
+            print(pal.paint("  Credentials: unlocked (.env present; a sealed .env.enc is also on disk)",
+                            "green"))
+        else:
+            print(pal.paint("  Credentials: plaintext .env (not locked)", "grey"))
+        ok, _ = docker_available()
+        if not ok:
+            print(pal.paint("  Docker is not available.", "yellow"))
+            return
+        if not os.path.exists(self._env_path()):
+            print(pal.paint("  (containers not listed while .env is locked - unlock first)", "yellow"))
+            return
+        try:
+            self._run_dc("ps", capture=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            print(pal.paint("  (could not list containers)", "yellow"))
 
     def setup(self, args=None):
         """Configure + start the standalone HTTPS vault: author (or reuse) .env, provision a TLS
@@ -3303,9 +3772,10 @@ class DockVault:
         print(pal.paint("  Applied.\n", "green"))
 
     def handler(self, key):
-        """Resolve a menu/command key to its bound handler, or None if unknown."""
+        """Resolve a menu/command key to its bound handler, or None if unknown. A hyphenated command
+        (e.g. change-passphrase) maps to the underscore method name."""
         keys = {k for k, _ in MENU}
-        return getattr(self, key) if key in keys else None
+        return getattr(self, key.replace("-", "_")) if key in keys else None
 
     def run_menu(self):
         """The interactive top menu loop. Returns on Quit / EOF."""
@@ -3415,6 +3885,34 @@ def build_parser():
     lp = parsers["logs"]
     lp.add_argument("--enable", dest="enable", action="store_true", help="enable authenticated log pull (opt-in)")
     lp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
+
+    lk = parsers["lock"]
+    lk.add_argument("--passphrase-file", dest="passphrase_file", help="read the passphrase from this file (first line)")
+    lk.add_argument("--passphrase-stdin", dest="passphrase_stdin", action="store_true", help="read the passphrase from stdin")
+    lk.add_argument("--hint", dest="hint", help="store a NON-secret passphrase hint in .env.enc")
+    lk.add_argument("--recovery-out", dest="recovery_out", help="also write the recovery key to this file (move it off-host)")
+
+    ul = parsers["unlock"]
+    ul.add_argument("--passphrase-file", dest="passphrase_file", help="read the passphrase from this file (first line)")
+    ul.add_argument("--passphrase-stdin", dest="passphrase_stdin", action="store_true", help="read the passphrase from stdin")
+    ul.add_argument("--recovery-key", dest="recovery_key", action="store_true",
+                    help="unlock with the credential recovery key instead of the passphrase")
+    ul.add_argument("--recovery-key-file", dest="recovery_key_file", help="read the recovery key from this file")
+    ul.add_argument("--show-recovery-key", dest="show_recovery_key", action="store_true",
+                    help="display the recovery key (needs the passphrase); does not write .env")
+    ul.add_argument("--force", dest="force", action="store_true", help="overwrite an existing .env")
+
+    cp = parsers["change-passphrase"]
+    cp.add_argument("--passphrase-file", dest="passphrase_file", help="current passphrase file (first line)")
+    cp.add_argument("--passphrase-stdin", dest="passphrase_stdin", action="store_true", help="read the current passphrase from stdin")
+    cp.add_argument("--recovery-key", dest="recovery_key", action="store_true",
+                    help="authenticate with the recovery key instead of the current passphrase")
+    cp.add_argument("--recovery-key-file", dest="recovery_key_file", help="read the recovery key from this file")
+    cp.add_argument("--new-passphrase-file", dest="new_passphrase_file", help="new passphrase file (first line)")
+    cp.add_argument("--new-passphrase-stdin", dest="new_passphrase_stdin", action="store_true", help="read the new passphrase from stdin")
+
+    parsers["stop"].add_argument("--lock", dest="lock", action="store_true",
+                                 help="also seal .env into .env.enc after stopping")
     return p
 
 
