@@ -5,6 +5,8 @@ server backed by one PostgreSQL + Redis. Store files in encrypted "vaults," shar
 with temporary scoped credentials, and (optionally) run **zero-knowledge** vaults where the
 server only ever holds ciphertext it cannot read.
 
+![](static/assets/dockvault-hero.webp)
+
 Licensed under **AGPL-3.0** — self-host it freely.
 
 ## Features
