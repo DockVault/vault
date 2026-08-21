@@ -132,6 +132,33 @@ jobs:
             || { echo "::error::the marker vault was not created"; exit 1; }
           echo "planted: $(cat /tmp/state-planted.json)"
 
+      - name: Scenario A3 — lifecycle commands (status, stop, start, restart)
+        # The new operator lifecycle commands, against the real deployment. Data volumes must be
+        # untouched (the planted marker vault survives stop+start), and each command must land the
+        # stack in the state it claims. Leaves the deployment running for the continuity scenarios.
+        run: |
+          set -euo pipefail
+          python3 dockvault.py status                        # read-only; must simply run
+          python3 dockvault.py stop
+          for attempt in $(seq 1 10); do
+            if ! curl -sS -m 5 --cacert certs/cert.pem "$BASE/" -o /dev/null 2>/dev/null; then
+              echo "A3: stopped answering after ${attempt} attempt(s)"; break
+            fi
+            if [ "$attempt" = 10 ]; then echo "::error::still answering after stop"; exit 1; fi
+            sleep 2
+          done
+          python3 dockvault.py start                          # dockvault's own health gate; set -e catches a non-healthy start
+          python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS" > /dev/null
+          token="$(curl -sS --cacert certs/cert.pem -X POST "$BASE/auth/login" -H 'Content-Type: application/json' \
+            -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+          echo "::add-mask::${token}"
+          grep -q matrix-marker <(curl -sS --cacert certs/cert.pem "$BASE/vaults" -H "Authorization: Bearer $token") \
+            || { echo "::error::the marker vault did not survive stop+start"; exit 1; }
+          python3 dockvault.py restart
+          python3 .github/scripts/deployment_state.py "$BASE" "$ADMIN_USER" "$ADMIN_PASS" > /dev/null
+          echo "A3: status/stop/start/restart OK, data intact"
+
       - name: Scenario B — re-run over existing data keeps it
         # The upgrade path. Re-running setup must adopt the existing .env and leave the deployment
         # identical; regenerating secrets here would strand the data behind a password Postgres

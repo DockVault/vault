@@ -190,6 +190,42 @@ data volumes.
 The **local HTTP trial** (`docker compose up`) always runs the simple two-container dev stack; the
 combined/split choice applies to the production `docker compose.secure.yml` stack.
 
+## Everyday commands
+
+Once set up, drive the deployment through `dockvault.py` instead of raw `docker compose`:
+
+```bash
+python dockvault.py start      # bring it up (waits for health; shows the failing logs if not)
+python dockvault.py status     # containers, health, ports, and whether .env is sealed
+python dockvault.py stop       # stop the containers — data volumes are never touched
+python dockvault.py restart    # stop then start, health-checked
+```
+
+### Sealing credentials at rest (optional)
+
+`.env` holds every secret (including `ENCRYPTION_KEY`). You can seal it while the deployment is off:
+
+```bash
+python dockvault.py lock       # encrypts .env -> .env.enc, removes the plaintext .env
+python dockvault.py unlock     # restores .env from .env.enc (needed before start)
+```
+
+Forgot the passphrase? `python dockvault.py change-passphrase --recovery-key` sets a new one using the
+recovery key (the recovery key itself stays the same).
+
+`lock` asks for an **unlock passphrase** and shows a one-time **credential recovery key** (save it in a
+password manager — it opens `.env` if you forget the passphrase). `start` will offer to unlock inline.
+Requires the `cryptography` package (`pip install cryptography`).
+
+**What this protects — and what it does not.** Sealing guards `.env` only while it is **locked/off**
+(a stolen disk, a backup, a snapshot). A **running** stack always uses the plaintext `.env`, so for a
+box that stays up, **host full-disk encryption is the real control**. There is deliberately **no
+unattended auto-unlock** — that would put the key on the same host a thief already has. Full rationale
+and threat model: [`docs/design/credential-lock-and-lifecycle.md`](docs/design/credential-lock-and-lifecycle.md).
+
+> ⚠️ Lose **both** the passphrase and the recovery key and `.env.enc` — hence `ENCRYPTION_KEY` — is
+> gone, and every stored file becomes permanently unrecoverable. Back them up.
+
 ## Update notifications (opt-in)
 
 DockVault can tell an admin when a newer release is available. It is **off by default**; set
@@ -318,7 +354,7 @@ its volumes, and won't overwrite existing volumes unless you pass `--force`.
 | Path | What lives there |
 |------|------------------|
 | `app/` | The Python application — `app/api/` (web/API server + the user-management/dashboard/ECC routers), `app/sftp/` (SFTP server), `app/core/` (config, models, security primitives), `app/services/` (vault/auth/domain services), `app/config/` (branding), `app/routers/` (info endpoints) |
-| `dockvault.py` | The management tool (Setup / Backup & Restore / Volumes / Storage limit / Reset / Update / Logs) — run from the repo root |
+| `dockvault.py` | The management tool (Setup / Start / Stop / Restart / Status / Lock / Unlock / Change-passphrase / Backup & Restore / Volumes / Storage limit / Reset / Update / Logs) — run from the repo root |
 | `setup-secure.sh`, `setup-secure.ps1` | Retired shims that launch `dockvault.py setup` (kept for compatibility) |
 | `.env.example` | Config template — copy to `.env` and fill in (documents every key) |
 | `deploy/` | The real Compose stacks — `deploy/docker-compose.yml` (local trial), `deploy/docker-compose.secure.yml` (production HTTPS) |
