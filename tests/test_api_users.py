@@ -153,10 +153,11 @@ def test_user_management_activity(admin, temp_user):
 def test_etag_conditional_on_users_list(admin):
     r1 = admin.get("/api/user-management/users")
     etag = r1.headers.get("ETag")
-    if not etag:
-        return  # endpoint may not emit an ETag in all builds
+    assert etag, "the users-list endpoint must emit an ETag (conditional GET)"
     r2 = admin.get("/api/user-management/users", headers={"If-None-Match": etag})
-    assert r2.status_code in (200, 304)
+    # An unchanged resource with a matching ETag MUST 304 -- accepting 200 too would let the whole
+    # conditional-GET path regress off silently.
+    assert r2.status_code == 304, "a matching ETag must yield 304, not a full 200"
 
 
 def test_etag_star_and_weak_match_304(admin):
@@ -164,11 +165,8 @@ def test_etag_star_and_weak_match_304(admin):
     # resource, and a comma-list where one tag matches must too.
     r1 = admin.get("/api/user-management/users")
     etag = r1.headers.get("ETag")
-    if not etag:
-        return
-    # Only meaningful if this build actually 304s on an exact match.
-    if admin.get("/api/user-management/users", headers={"If-None-Match": etag}).status_code != 304:
-        return
+    assert etag, "the users-list endpoint must emit an ETag (conditional GET)"
+    assert admin.get("/api/user-management/users", headers={"If-None-Match": etag}).status_code == 304
     assert admin.get("/api/user-management/users", headers={"If-None-Match": "*"}).status_code == 304
     assert admin.get("/api/user-management/users", headers={"If-None-Match": f"W/{etag}"}).status_code == 304
     assert admin.get("/api/user-management/users",

@@ -55,8 +55,7 @@ def test_recovery_export_and_restore_crypto_roundtrip():
     """Real ecc_crypto.js under Node: export -> restore preserves the exact private key, the
     recovery blob needs the recovery passphrase, and the restored blob needs the new main one."""
     node = shutil.which("node")
-    if not node:
-        pytest.skip("node unavailable")
+    assert node, "Node is required: this crypto round-trip must not be skipped into passing"
     ecc_js = str((Path(__file__).resolve().parent.parent / "static" / "js" / "ecc_crypto.js")).replace("\\", "/")
     proc = subprocess.run([node, "-"], input=_NODE_RECOVERY, capture_output=True, text=True,
                           encoding="utf-8", env={**os.environ, "ECC_JS": ecc_js}, timeout=30)
@@ -94,8 +93,7 @@ def test_derive_public_key_matches_own_and_not_another():
     matching public key and does NOT match a different keypair — so restore can refuse a recovery
     kit whose private key doesn't belong to the account (which would orphan every wrapped DEK)."""
     node = shutil.which("node")
-    if not node:
-        pytest.skip("node unavailable")
+    assert node, "Node is required: this crypto round-trip must not be skipped into passing"
     ecc_js = str((Path(__file__).resolve().parent.parent / "static" / "js" / "ecc_crypto.js")).replace("\\", "/")
     proc = subprocess.run([node, "-"], input=_NODE_DERIVE_MATCH, capture_output=True, text=True,
                           encoding="utf-8", env={**os.environ, "ECC_JS": ecc_js}, timeout=30)

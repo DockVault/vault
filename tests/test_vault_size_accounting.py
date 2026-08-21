@@ -14,16 +14,58 @@ asymmetry is the whole bug.
 
 from __future__ import annotations
 
+import http.client
 import threading
+import uuid
+from urllib.parse import urlparse
 
 import pytest
 
-from conftest import unique
+from conftest import ApiClient, unique
 
 pytestmark = pytest.mark.integration
 
 MB = 1024 * 1024
 _OCTET = {"Content-Type": "application/octet-stream"}
+
+
+def _chunked_multipart_upload(client, vault_id, name, body):
+    """POST a multipart file with NO Content-Length, forcing Transfer-Encoding: chunked.
+
+    This is the path the atomic completion-time reservation cannot cover: the reservation is only
+    taken when a Content-Length declares the size up front, so a streaming client that omits it
+    (which any chunked client does by default) reaches the completion check defended only by the
+    freshly-read total. `requests` cannot emit a chunked body for a multipart form -- a generator
+    body raises -- so it is hand-rolled on http.client, whose generator body produces exactly the
+    chunked transfer the reservation path skips. Returns the HTTP status (or "error").
+    """
+    boundary = "----dvchunk" + uuid.uuid4().hex
+    head = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="files"; filename="{name}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    ).encode()
+    payload = head + body + f"\r\n--{boundary}--\r\n".encode()
+    # This @pytest.mark.integration suite runs against the local/staged http instance
+    # (VAULT_BASE_URL default http://localhost:8200); it never targets an https endpoint.
+    parsed = urlparse(client.base_url)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=600)
+    try:
+        conn.request(
+            "POST", f"/vaults/{vault_id}/files",
+            body=iter([payload]),          # a generator body => no Content-Length => chunked
+            headers={
+                "Authorization": f"Bearer {client.token}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+        resp = conn.getresponse()
+        resp.read()
+        return resp.status
+    except Exception:                      # noqa: BLE001
+        return "error"
+    finally:
+        conn.close()
 
 
 def _upload_one(client, vault_id, name, body):
@@ -247,26 +289,24 @@ def test_the_limit_holds_when_separate_accounts_upload_into_one_vault(admin):
             admin.delete_user(user["id"])
 
 
-@pytest.mark.skip(reason=(
-    "STILL DOES NOT REPRODUCE, and the reason is now specific rather than vague. With "
-    "Content-Length present the atomic reservation IS taken and does hold the line -- eight "
-    "concurrent requests, each on its own client and connection, stay inside the ceiling even with "
-    "the fix reverted. The breach review demonstrated needs a CHUNKED request, which is what skips "
-    "the reservation and leaves only the stale read; requests' multipart encoder will not produce "
-    "one (a generator body raises). Reproducing it needs urllib3 or a hand-rolled multipart body. "
-    "The production re-gate for it is in place; this is the test that has not caught up."))
 def test_the_direct_multipart_path_cannot_exceed_the_ceiling_either(admin, admin_creds):
-    """The path the first fix missed, attacked the way it was actually broken.
+    """The chunked multipart path, driven the way the reservation was actually bypassed.
 
-    The resumable path was fixed and this one was not, which made the fix look complete while a
-    single ordinary account could still put four times a vault's ceiling into it. Two holes, both
-    on this path: the size the guards check against is read once before the stream starts and is
-    stale by the time the bytes land, and the atomic reservation is only taken when Content-Length
-    supplied a size -- so a client that omits that header, which any streaming client does by
-    default, had no reservation and only the stale number.
+    The resumable path took an atomic reservation and held; this direct multipart path only takes
+    one when Content-Length declares the size up front. A streaming client that omits that header --
+    which any chunked client does by default -- had no reservation and was defended only by a total
+    read once before the bytes landed and stale by the time they did. `requests` cannot emit a
+    chunked multipart body (a generator body raises), which is exactly why the earlier version of
+    this test could not reproduce the hole and sat skipped: it was sending Content-Length requests
+    against a path whose weakness is the absence of that header. This drives the real chunked path
+    on http.client and pins the in-stream re-gate that now closes it.
 
-    No barrier and no second account here. Concurrency alone is enough, which is what made this the
-    serious one.
+    (1) A single chunked request whose body alone exceeds the ceiling must be refused (413) and
+        store nothing -- with no reservation, only the in-stream re-gate stands between it and a
+        breach.
+    (2) Eight concurrent 16 MB chunked uploads into a 64 MB vault (128 MB offered), each on its own
+        client and connection so they genuinely overlap: some succeed (non-vacuous) but the stored
+        total never crosses the ceiling.
     """
     made = admin.post("/vaults", json={
         "name": unique("multipart-ceiling"), "vault_type": "standard",
@@ -278,36 +318,41 @@ def test_the_direct_multipart_path_cannot_exceed_the_ceiling_either(admin, admin
         limit = admin.get(f"/vaults/{vault_id}").json().get("size_limit") or 0
         assert limit > 0
 
+        # (1) single over-ceiling chunked upload -> refused, stores nothing
+        over = _chunked_multipart_upload(admin, vault_id, "over.bin", b"D" * (limit + MB))
+        assert over == 413, f"a single over-ceiling chunked upload was not refused (got {over})"
+        assert (admin.get(f"/vaults/{vault_id}").json().get("total_size_bytes") or 0) == 0, \
+            "the refused over-ceiling upload still stored bytes"
+
+        # (2) concurrent chunked uploads must not breach the ceiling
         each = 16 * MB
         count = 8                                     # 128 MB into a 64 MB vault
         body = b"D" * each
         statuses = []
         lock = threading.Lock()
 
-        def _run(index, client):
-            # Its OWN client. Sharing one meant sharing one pooled connection, which serialised
-            # the requests and made this test unable to fail -- confirmed by restoring the defect
-            # and watching it pass anyway.
-            files = {"files": (f"mp-{index}.bin", body, "application/octet-stream")}
-            try:
-                status = client.post(f"/vaults/{vault_id}/files", files=files).status_code
-            except Exception:                         # noqa: BLE001
-                status = "error"
-            with lock:
-                statuses.append(status)
-
-        from conftest import ApiClient
+        # Each thread gets its OWN client. Sharing one meant sharing one pooled connection, which
+        # serialised the requests and made this test unable to fail -- confirmed on the resumable
+        # variant by restoring the defect and watching it pass anyway.
         clients = []
         for _ in range(count):
             one = ApiClient()
             one.login(admin_creds["username"], admin_creds["password"])
             clients.append(one)
 
-        threads = [threading.Thread(target=_run, args=(i, clients[i])) for i in range(count)]
+        def _run(index):
+            status = _chunked_multipart_upload(clients[index], vault_id, f"mp-{index}.bin", body)
+            with lock:
+                statuses.append(status)
+
+        # daemon threads: if one ever wedged on a socket, join() times out but the thread can't
+        # keep pytest alive at exit (and can't outlive teardown deleting the vault under it).
+        threads = [threading.Thread(target=_run, args=(i,), daemon=True) for i in range(count)]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join(timeout=600)
+        assert all(not t.is_alive() for t in threads), "a chunked upload thread did not finish in time"
 
         reported = admin.get(f"/vaults/{vault_id}").json().get("total_size_bytes") or 0
         # Non-vacuity first. `reported <= limit` is trivially true when every upload failed, and
@@ -318,7 +363,7 @@ def test_the_direct_multipart_path_cannot_exceed_the_ceiling_either(admin, admin
         assert reported > 0, "nothing was stored, so this test proved nothing"
         assert reported <= limit, (
             f"{reported / MB:.0f} MB was stored in a {limit / MB:.0f} MB vault "
-            f"({sorted(map(str, statuses))}); the direct multipart path does not enforce the "
+            f"({sorted(map(str, statuses))}); the chunked multipart path does not enforce the "
             "ceiling under concurrency")
     finally:
         admin.post(f"/vaults/{vault_id}/delete")

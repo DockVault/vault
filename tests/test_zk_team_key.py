@@ -355,8 +355,7 @@ def test_hierarchical_browser_crypto_roundtrip():
     import shutil as _shutil
     from pathlib import Path as _Path
     node = _shutil.which("node")
-    if not node:
-        pytest.skip("node unavailable for hierarchical crypto round-trip")
+    assert node, "Node is required: this crypto round-trip must not be skipped into passing"
     ecc_js = str((_Path(__file__).resolve().parent.parent / "static" / "js" / "ecc_crypto.js")).replace("\\", "/")
     proc = subprocess.run([node, "-"], input=_NODE_HIER, capture_output=True, text=True,
                           encoding="utf-8", env={**os.environ, "ECC_JS": ecc_js}, timeout=30)
