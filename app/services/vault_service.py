@@ -950,7 +950,10 @@ class VaultService:
                     Folder.id == ancestor.parent_folder_id
                 ).first()
 
-        # Hash password if provided
+        # Hash password if provided. NOTE: folder passwords are an UNIMPLEMENTED feature — the
+        # create_folder HTTP endpoint never forwards a `password`, so this is always None in
+        # practice, and no access path enforces a folder password even if one were set. See
+        # get_folder() for the full state and what a real implementation must cover.
         password_hash = hash_password(password) if password else None
 
         vault = self.db.query(Vault).filter(Vault.id == vault_id).first()
@@ -1026,7 +1029,25 @@ class VaultService:
         user: User,
         folder_password: Optional[str] = None
     ) -> Folder:
-        """Get a folder with access verification."""
+        """Get a folder with access verification.
+
+        UNIMPLEMENTED FEATURE — folder passwords are NOT wired end-to-end yet, and this method
+        is currently the ONLY reader of ``Folder.password_hash`` and has no callers. Folder
+        passwords are a planned, not-yet-shipped feature: today no endpoint SETS one (the
+        ``create_folder`` HTTP endpoint never forwards a password to ``create_folder`` below, and
+        there is no set/clear-password endpoint), and no access path ENFORCES one — file listing,
+        download, delete, rename and upload all authorize on the VAULT (and any file's own
+        password), never on a containing folder's password, on both the REST and SFTP surfaces.
+        The ``has_password`` flag emitted for folders in listings is therefore cosmetic today.
+
+        When this feature is implemented it must be enforced as a nearest-protected-ANCESTOR walk
+        at every file/folder access path (listing, download, delete, rename, upload) on BOTH REST
+        and SFTP, plus a share-time ancestor check — not merely on a single folder via this method
+        — otherwise a file inside a protected folder would stay reachable with only the vault
+        password. Until then a folder cannot obtain a ``password_hash`` through the shipped API, so
+        there is no live bypass; the gap is latent (a legacy DB row with a folder password set
+        out-of-band would NOT be enforced).
+        """
         folder = self.db.query(Folder).filter(Folder.id == folder_id).first()
         
         if not folder:

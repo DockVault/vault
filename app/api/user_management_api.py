@@ -86,9 +86,17 @@ async def get_current_user(
     return await _hardened_get_current_user(credentials, db)
 
 
-async def require_admin(current_user: User = Depends(get_current_user)) -> User:
+async def require_admin(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
     """Dependency to require admin role."""
     if current_user.role != RoleEnum.ADMIN:
+        # Audit the denial via the single shared helper in api_server (lazy import avoids an
+        # import cycle, matching this module's get_current_user delegation above), so the
+        # /api/user-management/* admin routes are not audit-blind like the api_server ones were.
+        from app.api.api_server import _audit_admin_denial
+        _audit_admin_denial(db, current_user, "admin role required")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required"
@@ -96,7 +104,10 @@ async def require_admin(current_user: User = Depends(get_current_user)) -> User:
     return current_user
 
 
-async def require_interactive_admin(current_user: User = Depends(require_admin)) -> User:
+async def require_interactive_admin(
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> User:
     """Admin dependency that ALSO rejects temporary-credential sessions.
 
     An admin-minted temp credential keeps the admin ROLE (get_current_user returns the real
@@ -104,6 +115,9 @@ async def require_interactive_admin(current_user: User = Depends(require_admin))
     tightly-scoped temp credential perform privilege-escalating admin-plane writes such as a
     role change. Those must come from a real interactive admin session."""
     if getattr(current_user, "_is_temp_session", False):
+        from app.api.api_server import _audit_admin_denial
+        _audit_admin_denial(db, current_user,
+                            "interactive admin session required (temp credential rejected)")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This action requires an interactive admin session, not a temporary credential.",

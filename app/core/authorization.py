@@ -688,6 +688,22 @@ class PermissionService:
             raise ResourceNotFoundError(f"Vault not found: {vault_id}")
 
         if not self.can_access_vault(user, vault_id, required_permission, allow_share=allow_share):
+            # Audit the cross-tenant / membership read (or write) denial. This is the single
+            # chokepoint behind every get_vault caller, so a non-member probing another tenant's
+            # vault is recorded here (with IP when in an HTTP request; None over SFTP). Best-effort
+            # — a lost audit row must never turn the 403 into a 500; runs only on the denial path.
+            try:
+                from app.services.audit_logger import AuditLogger
+                from app.core.net_utils import current_client_ip
+                AuditLogger(self.db).log_access_denied(
+                    user=user,
+                    resource_type='vault',
+                    resource_id=str(vault_id),
+                    ip_address=current_client_ip(),
+                    reason=f"lacks {required_permission.value} permission for vault",
+                )
+            except Exception:  # noqa: BLE001 — a lost audit row must never mask the 403
+                pass
             raise PermissionDeniedError(
                 f"User lacks {required_permission.value} permission for vault {vault_id}"
             )

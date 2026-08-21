@@ -533,6 +533,16 @@ class AuthService:
         # persistence decision consumes this canonical plan.
         selected_access_plans = []
         if effective_scope is not None and mode == 'selected':
+            # A minter may only grant temporary access to a vault the OWNING account can itself
+            # READ. Enforced per selected vault below, BEFORE the password-proof loop, so a
+            # non-member can never turn that proof into a vault-password oracle (a correct password
+            # would mint 200, a wrong one 400 — a boolean oracle for any vault's password, by id).
+            # Resolve the owning account + a permission service once. Local import avoids an
+            # import cycle with app.core.authorization.
+            from app.core.authorization import PermissionService as _PermissionService
+            from app.core.models import VaultPermissionEnum as _VaultPermissionEnum
+            _mint_perm = _PermissionService(self.db)
+            minting_user = self.db.query(User).filter(User.id == user_id).first()
             parent_ids = {str(v) for v in (parent_vault_ids or [])}
             if parent_vault_scope is not None and not isinstance(parent_vault_scope, dict):
                 raise HTTPException(
@@ -553,6 +563,17 @@ class AuthService:
                     continue
                 vault = self.db.query(Vault).filter(Vault.id == vault_uuid).first()
                 if vault is None:
+                    continue
+                # Membership pre-check: the owning account must be able to READ this vault. A vault
+                # the account cannot read is SKIPPED — treated exactly like a nonexistent id above —
+                # so this closes BOTH the mint-time vault-password oracle (for a non-member a wrong
+                # OR right password never reaches the proof loop, so the response never depends on
+                # it) AND any vault-existence differential (existing-but-forbidden and nonexistent
+                # both simply drop out of the selection identically). allow_share stays False — a
+                # read-only share is not a basis to mint SFTP/delegation credentials for the vault.
+                if (minting_user is None
+                        or not _mint_perm.can_access_vault(
+                            minting_user, vault_uuid, _VaultPermissionEnum.READ)):
                     continue
                 # Org policy may forbid a zero-knowledge vault in a temp credential's scope
                 # entirely (a scoped ZK cred still forces the holder to enter the account master
@@ -710,8 +731,26 @@ class AuthService:
                 vault = plan['vault']
                 if not vault.password_hash:
                     continue  # not password-protected — nothing to prove
+                # Throttle wrong mint-password attempts on the SAME failure-only, fixed-window
+                # (vault, account) counter get_vault uses, so the mint proof is not an unthrottled
+                # brute-force surface (reachable only by a member, after the pre-check above).
+                _rl_key = f"rate_limit:vault:{plan['vault_id']}:{user_id}"
+                _rl_limit = (settings.rate_limit_vault_attempts_admin
+                             if (minting_user and minting_user.role == RoleEnum.ADMIN)
+                             else settings.rate_limit_vault_attempts)
+                _rl_attempts = redis_client.get(_rl_key)
+                if _rl_attempts and int(_rl_attempts) >= _rl_limit:
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail="Too many vault password attempts. Please try again later.",
+                    )
                 supplied = plan['request'].get('password')
                 if not supplied or not verify_password(supplied, vault.password_hash):
+                    # Burn one failed attempt on the shared (vault, account) counter.
+                    _pipe = redis_client.pipeline()
+                    _pipe.incr(_rl_key)
+                    _pipe.expire(_rl_key, settings.rate_limit_vault_window_seconds)
+                    _pipe.execute()
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=(f"Vault '{vault.name}' is password-protected — its correct "
