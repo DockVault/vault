@@ -149,8 +149,7 @@ def test_passphrase_rewrap_crypto_roundtrip():
     blob that decrypts to the SAME key with the new passphrase, and the OLD passphrase fails."""
     import shutil
     node = shutil.which("node")
-    if not node:
-        pytest.skip("node unavailable")
+    assert node, "Node is required: this crypto round-trip must not be skipped into passing"
     ecc_js = str((Path(__file__).resolve().parent.parent / "static" / "js" / "ecc_crypto.js")).replace("\\", "/")
     proc = subprocess.run([node, "-"], input=_NODE_REWRAP, capture_output=True, text=True,
                           encoding="utf-8", env={**os.environ, "ECC_JS": ecc_js}, timeout=30)

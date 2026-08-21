@@ -961,8 +961,7 @@ def test_zk_name_crypto_parity_with_browser_lib():
     import uuid as _uuid
     from pathlib import Path as _Path
     node = _shutil.which("node")
-    if not node:
-        pytest.skip("node unavailable for crypto-parity test")
+    assert node, "Node is required: this crypto round-trip must not be skipped into passing"
     ecc_js = str((_Path(__file__).resolve().parent.parent / "static" / "js" / "ecc_crypto.js")).replace("\\", "/")
     dek = _os.urandom(32)
     vid = str(_uuid.uuid4())
