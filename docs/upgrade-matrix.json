@@ -45,6 +45,10 @@
     "0.11.2": {
       "released": "2026-08-21",
       "notes": "No schema change; same physical schema as 0.11.0/0.11.1. Security hardening: closes a temporary-credential mint vault-password oracle (vault membership is now verified before the password proof), audits admin-plane and cross-tenant access denials, bounds client-supplied encrypted-name metadata, orders the user-update authorization check before the existence lookup, and re-checks temporary-credential deactivation on the web path every request. A rollback is clean and needs no backup."
+    },
+    "0.12.0": {
+      "released": "2026-08-22",
+      "notes": "No schema change; same physical schema as 0.11.0/0.11.1/0.11.2. Adds credential lock/unlock/change-passphrase plus start/stop/restart/status lifecycle commands to the dockvault.py host management tool, so an operator can seal the .env secrets file into an encrypted .env.enc while a deployment is off (envelope encryption: a Fernet data key wrapped under a scrypt-derived passphrase key, with a stable recovery key). This is a host-tool change only; the container image is functionally unchanged from 0.11.2. Also hardens the test suite. A rollback is clean and needs no backup."
     }
   },
   "edges": [
@@ -56,7 +60,8 @@
     { "from": "0.9.0", "to": "0.10.0", "kind": "direct", "reversible": true, "requires_backup": false },
     { "from": "0.10.0", "to": "0.11.0", "kind": "direct", "reversible": true, "requires_backup": true },
     { "from": "0.11.0", "to": "0.11.1", "kind": "direct", "reversible": true, "requires_backup": false },
-    { "from": "0.11.1", "to": "0.11.2", "kind": "direct", "reversible": true, "requires_backup": false }
+    { "from": "0.11.1", "to": "0.11.2", "kind": "direct", "reversible": true, "requires_backup": false },
+    { "from": "0.11.2", "to": "0.12.0", "kind": "direct", "reversible": true, "requires_backup": false }
   ],
   "waivers": []
 }
