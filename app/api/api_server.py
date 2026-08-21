@@ -1032,7 +1032,10 @@ class FileRename(BaseModel):
     # the browser supplies the encrypted name + blind index instead (the server never sees
     # the new name). One of new_name (Standard) / enc_name+name_bi (ZK) must be present.
     new_name: Optional[str] = Field(None, min_length=1, max_length=255)
-    enc_name: Optional[str] = None
+    # Bound the client-supplied sealed name (ZK). A sealed 255-char filename is ~1.4 KB, so 8 KB is
+    # generous headroom while stopping unbounded metadata from being parked in a Text column that
+    # the storage quota does not count. (Standard-vault at-rest enc_name is set server-side, not here.)
+    enc_name: Optional[str] = Field(None, max_length=8192)
     name_bi: Optional[str] = Field(None, max_length=64)  # stored in a VARCHAR(64) column
     # Extra blind-index values to MATCH the new name against (every epoch's candidate), so a rename
     # INTO a name that already exists at an OLD epoch is detected as a clash rather than silently
@@ -1276,6 +1279,20 @@ async def get_current_user(
                 headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
             )
 
+        # A DEACTIVATED credential must stop authorizing IMMEDIATELY, even while its session row is
+        # still nominally active. Deactivation (admin or self revoke) flips the credential's
+        # is_active flag but does not necessarily revoke every backing session row in the same
+        # commit, so the session-level checks above are not sufficient on their own. Re-read
+        # is_active here every request — mirroring the SFTP path, which does the same on every
+        # operation for exactly this case — so a revoke takes effect on the very next request
+        # instead of surviving until the session's inactivity/hard-expiry window closes.
+        if not temp_cred.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Temporary credential has been deactivated. Please login again.",
+                headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
+            )
+
         # Bound the session by the credential's OWN stated lifetime, not just the
         # inactivity grace window above: a temp cred past its validity window
         # (deactivate_at) or hard expiry (expires_at) must stop authorizing requests
@@ -1334,9 +1351,37 @@ async def get_current_user(
     return user
 
 
-async def require_admin(current_user: User = Depends(get_current_user)) -> User:
+def _audit_admin_denial(db, user, reason: str) -> None:
+    """Record an admin-plane access denial in the audit log. require_admin /
+    require_interactive_admin are resolved by FastAPI as dependencies BEFORE the
+    @require_endpoint_permission decorator on the handler runs, so a non-admin (or an
+    admin-minted temp-credential session) turned away here otherwise leaves NO audit trail —
+    the highest-signal probe (a non-admin reaching for an admin function) went unrecorded, while
+    endpoint-permission and vault-capability denials already are. Mirrors _audit_endpoint_denial.
+    Best-effort by contract: a failure here must never turn the 403 the caller is already getting
+    into a 500, so everything is swallowed."""
+    try:
+        from app.core.net_utils import current_client_ip
+        AuditLogger(db).log_action(
+            action="admin_access_denied",
+            status="failure",
+            user=user,
+            resource_type="admin_function",
+            resource_id="admin_plane",
+            ip_address=current_client_ip(),
+            details={"reason": reason},
+        )
+    except Exception:  # noqa: BLE001 — a lost audit row must never mask the 403
+        pass
+
+
+async def require_admin(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
     """Dependency to require admin role."""
     if current_user.role != RoleEnum.ADMIN:
+        _audit_admin_denial(db, current_user, "admin role required")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required"
@@ -1344,7 +1389,10 @@ async def require_admin(current_user: User = Depends(get_current_user)) -> User:
     return current_user
 
 
-async def require_interactive_admin(current_user: User = Depends(require_admin)) -> User:
+async def require_interactive_admin(
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> User:
     """Admin dependency that ALSO rejects temporary-credential sessions.
 
     Org-policy writes — e.g. PUT /settings, which sets zero_knowledge_enabled /
@@ -1354,6 +1402,8 @@ async def require_interactive_admin(current_user: User = Depends(require_admin))
     real admin User and attach_scope does not downgrade role), so require_admin alone would
     let a tightly-scoped temp credential flip that boundary. Reject temp sessions here."""
     if getattr(current_user, "_is_temp_session", False):
+        _audit_admin_denial(db, current_user,
+                            "interactive admin session required (temp credential rejected)")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This action requires an interactive admin session, not a temporary credential.",
@@ -4670,19 +4720,13 @@ async def update_user(
     Update user (admin or self for limited fields).
     """
     from app.core.security import hash_password
-    
-    user = db.query(User).filter(User.id == user_id).first()
-    
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
-    
-    # Check permissions. A TEMP session keeps role==ADMIN but must not wield admin power here:
-    # treat it as non-admin so the admin-only branch (role/is_active/is_locked) AND any
-    # cross-user password reset are unreachable by a temp credential — a temp admin acting on
-    # ANOTHER user then fails the is_admin/is_self gate below and gets 403.
+
+    # Own-or-admin, checked BEFORE the existence lookup to avoid a user-enumeration oracle (mirrors
+    # get_user / user_management.get_user_detail — a non-admin granted USER_MANAGE must not be able
+    # to distinguish an existing user id from a nonexistent one via a 403-vs-404 split). A TEMP
+    # session keeps role==ADMIN but must not wield admin power here: treat it as non-admin so the
+    # admin-only branch (role/is_active/is_locked) AND any cross-user password reset are unreachable
+    # by a temp credential — a temp admin acting on ANOTHER user fails this gate and gets 403.
     is_admin = current_user.role == RoleEnum.ADMIN and not getattr(current_user, "_is_temp_session", False)
     is_self = current_user.id == user_id
 
@@ -4691,7 +4735,15 @@ async def update_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied"
         )
-    
+
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
     # Track changes for audit log
     changes = {}
     
@@ -8144,6 +8196,9 @@ async def list_vault_files(
                 'type': 'folder',
                 'size': 0,
                 'modified': folder.updated_at.isoformat(),
+                # UNIMPLEMENTED: folder passwords are not wired end-to-end — no endpoint sets one
+                # and no access path enforces one — so this flag is cosmetic today (always False in
+                # practice). See VaultService.get_folder for the full state.
                 'has_password': folder.password_hash is not None
             }
             if is_zk:
@@ -9226,8 +9281,8 @@ class ChunkedUploadInit(BaseModel):
     # DEK (security ZK marker + base64) and the client-computed blind index for same-name
     # matching. Required for ZK uploads; rejected for Standard ones. The server stores them
     # verbatim and never decrypts.
-    enc_name: Optional[str] = None
-    enc_mime: Optional[str] = None
+    enc_name: Optional[str] = Field(None, max_length=8192)   # bound sealed metadata (see FileRename)
+    enc_mime: Optional[str] = Field(None, max_length=8192)
     name_bi: Optional[str] = Field(None, max_length=64)  # stored in a VARCHAR(64) column
     # Zero-knowledge only: extra blind-index values to MATCH this name against, beyond the single
     # `name_bi` stored on the finished row. A ZK name index is per (DEK, epoch); after a rotation a
@@ -11167,6 +11222,13 @@ async def create_folder(
     """
     Create a folder in a vault.
     Requires vault password if vault is password-protected (via X-Vault-Password header).
+
+    NOTE: folder passwords are an UNIMPLEMENTED feature. This endpoint intentionally does not
+    read or forward a folder `password` (the VaultService.create_folder `password` parameter
+    stays None), because no access path enforces a folder password yet. Wiring a setter here
+    WITHOUT first implementing nearest-protected-ancestor enforcement on every file/folder
+    access path (REST + SFTP) and at share time would ship folders that appear protected but are
+    not. See VaultService.get_folder for the full state and requirements.
     """
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
@@ -11202,6 +11264,11 @@ async def create_folder(
                     status_code=400,
                     detail="A zero-knowledge folder must not send a plaintext name.",
                 )
+            # Bound the sealed name — this endpoint takes a raw dict, so the cap the Pydantic paths
+            # (upload/rename) apply must be applied by hand; stops unbounded metadata in a Text
+            # column the storage quota does not count. A sealed 255-char name is ~1.4 KB.
+            if len(str(zk_enc_name)) > 8192:
+                raise HTTPException(status_code=400, detail="enc_name too long")
             _require_zk_sealed_names(zk_enc_name)
             # Zero-knowledge v2 name binding: the client supplies the folder id it sealed the
             # name under (so the sealed name binds the final row id). Optional + backward-compat;
@@ -11421,9 +11488,9 @@ async def delete_folder(
 class ZkSealItem(BaseModel):
     id: uuid.UUID
     kind: str                         # 'file' | 'folder'
-    enc_name: str                     # browser-encrypted name (ZK marker + base64)
+    enc_name: str = Field(..., max_length=8192)  # browser-encrypted name (ZK marker + base64)
     name_bi: str = Field(..., max_length=64)  # client blind index (stored in a VARCHAR(64))
-    enc_mime: Optional[str] = None    # files only
+    enc_mime: Optional[str] = Field(None, max_length=8192)    # files only
     name_key_version: Optional[int] = None  # folders: the DEK epoch the name is sealed under
 
 
