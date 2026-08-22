@@ -198,6 +198,12 @@ def mark_sink_active() -> bool:
     Must run BEFORE the first _spawn, which snapshots os.environ per child. Returns whether a sink
     was marked active.
     """
+    # Unambiguous "the launcher owns log capture" marker, set whenever run_combined runs (even if its
+    # own sink file failed to init — the launcher still captures stdout via _pump). The API child
+    # reads this to STAND DOWN from self-writing its own [web] sink, so the two shapes never both
+    # write. Distinct from VAULT_LOG_SINK_ACTIVE (which a stale .env could forge); this one is only
+    # ever set here, in-process, right before the children are spawned.
+    os.environ["VAULT_LOG_SINK_OWNER"] = "run_combined"
     if _sink_logger is None:
         os.environ.pop("VAULT_LOG_SINK_ACTIVE", None)
         os.environ.pop("VAULT_LOG_SINK_COMPONENTS", None)
