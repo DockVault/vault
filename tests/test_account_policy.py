@@ -157,7 +157,7 @@ def test_email_requirement_invalid():
 
 @pytest.mark.parametrize("value", ["username", "email", "either"])
 def test_login_identifier_valid_when_no_lockout(value):
-    validate_account_policy({"login_identifier": value}, email_login_locks_out_admin=False)
+    validate_account_policy({"login_identifier": value}, email_login_locks_out_all_admins=False)
 
 
 def test_login_identifier_invalid():
@@ -197,21 +197,23 @@ def test_invite_ttl_invalid(value):
         validate_account_policy({"invite_ttl_hours": value})
 
 
-# ---- the email-only-login lockout guard -------------------------------------------------------
-def test_email_login_refused_when_it_would_lock_out_an_admin():
+# ---- the email-only-login lockout guard (blocks ONLY on TOTAL admin lockout) ------------------
+def test_email_login_refused_only_when_every_admin_would_be_locked_out():
     with pytest.raises(AccountPolicyError):
-        validate_account_policy({"login_identifier": "email"}, email_login_locks_out_admin=True)
+        validate_account_policy({"login_identifier": "email"}, email_login_locks_out_all_admins=True)
 
 
-def test_email_login_allowed_when_no_admin_would_be_locked_out():
-    out = validate_account_policy({"login_identifier": "email"}, email_login_locks_out_admin=False)
+def test_email_login_allowed_when_at_least_one_admin_has_email():
+    # A PARTIAL lockout (some admins lack email but one has it) is now ALLOWED — the caller warns
+    # about the individuals rather than blocking the save.
+    out = validate_account_policy({"login_identifier": "email"}, email_login_locks_out_all_admins=False)
     assert out == {}          # login_identifier is validated but not among the normalized returns
 
 
 def test_lockout_guard_only_gates_email_not_either_or_username():
     # 'either' and 'username' keep a username path, so a mail-less admin is not stranded.
-    validate_account_policy({"login_identifier": "either"}, email_login_locks_out_admin=True)
-    validate_account_policy({"login_identifier": "username"}, email_login_locks_out_admin=True)
+    validate_account_policy({"login_identifier": "either"}, email_login_locks_out_all_admins=True)
+    validate_account_policy({"login_identifier": "username"}, email_login_locks_out_all_admins=True)
 
 
 # ---- the username<->email collision guard (only 'either' is vulnerable) -----------------------

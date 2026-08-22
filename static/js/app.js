@@ -6197,7 +6197,58 @@ function refreshAccountsPolicyUI() {
             ? "A user changing their own email must confirm a one-time code sent to the new address; administrators setting an email are exempt."
             : "A user changing their own email must confirm a one-time code sent to the new address; administrators setting an email are exempt. Configure email (SMTP) on the Email tab to enable this.";
     }
+    renderLoginIdentifierWarning();
     updateAccountsSummary();
+}
+
+// Live warning under the Sign-in method select: when "Email only" is chosen, show WHO would lose
+// access. Admins are few -> the complete list, in red (serious), with a stronger note if the current
+// user is among them. Users can be many -> a generic count, in orange. Fed by the readiness endpoint.
+let _loginWarnSeq = 0;
+async function renderLoginIdentifierWarning() {
+    const box = document.getElementById('login-identifier-warning');
+    const sel = document.getElementById('setting-login-identifier');
+    if (!box || !sel) return;
+    // Bump the token on EVERY call (before the early return too) so switching away — or a late
+    // settings reload — cancels any in-flight email render that would otherwise resolve and re-show
+    // a stale panel.
+    const seq = ++_loginWarnSeq;
+    if (sel.value !== 'email') { box.style.display = 'none'; box.replaceChildren(); return; }
+    let data;
+    try {
+        data = await apiRequest('/settings/login-identifier-readiness', { silent: true });
+    } catch (_) { return; }            // leave whatever is shown; the save is still server-guarded
+    if (seq !== _loginWarnSeq || sel.value !== 'email') return;   // superseded by a newer change
+    box.replaceChildren();
+    if (data.blocks) {
+        // Hard stop: no admin has an email, so email-only login would lock everyone out (server 400s).
+        box.appendChild(_el('div', 'alert alert-error',
+            'Email-only sign-in can’t be enabled: no administrator has an email address, so everyone '
+            + 'would be locked out. Give at least one admin an email first — this save will be refused.'));
+        box.style.display = '';
+        return;
+    }
+    const admins = Array.isArray(data.admins_without_email) ? data.admins_without_email : [];
+    if (admins.length) {
+        const panel = _el('div', 'alert alert-error');   // serious (red): admins losing access
+        panel.appendChild(_el('strong', null,
+            admins.length === 1 ? 'This administrator will not be able to sign in (no email):'
+                                : 'These administrators will not be able to sign in (no email):'));
+        panel.appendChild(_el('div', 'text-sm mt-sm', admins.join(', ')));
+        if (data.current_user_without_email) {
+            const self = _el('div', 'text-sm mt-sm');
+            self.appendChild(_el('strong', null, '⚠️ This includes your account — you will lose the ability to sign in. '));
+            self.appendChild(document.createTextNode('Add your email before saving.'));
+            panel.appendChild(self);
+        }
+        box.appendChild(panel);
+    }
+    const n = data.users_without_email_count || 0;
+    if (n > 0) {
+        box.appendChild(_el('div', 'alert alert-warning' + (admins.length ? ' mt-sm' : ''),
+            `${n} user account${n === 1 ? '' : 's'} without an email will not be able to sign in.`));
+    }
+    box.style.display = (admins.length || n > 0) ? '' : 'none';
 }
 
 function updateAccountsSummary() {

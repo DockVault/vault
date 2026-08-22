@@ -159,7 +159,7 @@ def normalize_domains_lenient(value) -> list[str]:
     return out[:MAX_SIGNUP_DOMAINS]
 
 
-def validate_account_policy(payload: dict, *, email_login_locks_out_admin: bool = False,
+def validate_account_policy(payload: dict, *, email_login_locks_out_all_admins: bool = False,
                             smtp_configured: bool = False,
                             username_email_collision: tuple | None = None) -> dict:
     """Validate only the account-policy keys PRESENT in `payload`; pass everything else through.
@@ -169,8 +169,10 @@ def validate_account_policy(payload: dict, *, email_login_locks_out_admin: bool 
     admin-safe message on the first invalid value.
 
     Two DB-derived facts the pure validator cannot know are supplied by the caller:
-    - `email_login_locks_out_admin`: refuse login_identifier='email' when an active admin has no
-      email, or they could never log in again.
+    - `email_login_locks_out_all_admins`: refuse login_identifier='email' ONLY when it would strand
+      EVERY admin (no active admin has an email) — a total lockout with no way back in. If at least
+      one admin can still sign in by email the save is allowed; the caller warns (out of band) about
+      the individual admins/users who lack an email.
     - `smtp_configured`: refuse turning ON email-change verification unless the deployment can send
       the one-time code (email-change verification is gated behind email-client setup).
     - `username_email_collision`: a sample (username, email) pair where one account's username equals
@@ -210,10 +212,11 @@ def validate_account_policy(payload: dict, *, email_login_locks_out_admin: bool 
         v = payload["login_identifier"]
         if v not in LOGIN_IDENTIFIER_VALUES:
             raise AccountPolicyError("login_identifier must be 'username', 'email', or 'either'")
-        if v == "email" and email_login_locks_out_admin:
+        if v == "email" and email_login_locks_out_all_admins:
             raise AccountPolicyError(
-                "Refusing to set email-only login: an active administrator has no email address and "
-                "would be locked out. Give every admin an email first, or use 'either'.")
+                "Refusing to set email-only login: no administrator has an email address, so every "
+                "admin would be locked out with no way back in. Give at least one admin an email "
+                "first, or use 'either'.")
         # 'either' tries the username first, so a username equal to another account's email would
         # shadow that email owner's login and lock them out. Refuse the switch until the collision is
         # resolved. (Only 'either' is affected — 'email' never consults the username.)

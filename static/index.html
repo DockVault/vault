@@ -1708,7 +1708,8 @@
                                         <option value="email">Email only</option>
                                         <option value="either">Username or email</option>
                                     </select>
-                                    <p class="text-secondary text-sm mt-sm">What people type to sign in. “Email only” is refused if any active administrator has no email address.</p>
+                                    <p class="text-secondary text-sm mt-sm">What people type to sign in. “Email only” is refused only if it would lock out every administrator; anyone without an email is warned below.</p>
+                                    <div id="login-identifier-warning" class="mt-sm" style="display:none;"></div>
                                 </div>
                                 <label class="flex items-center gap-sm mt-md">
                                     <input type="checkbox" id="setting-email-change-verification">
@@ -2739,7 +2740,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260822e"></script>
+    <script src="/static/js/app.js?v=20260822g"></script>
 </body>
 </html>
 
