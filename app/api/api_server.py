@@ -3390,7 +3390,8 @@ async def get_invite(token: str, request: Request, db: Session = Depends(get_db)
     client_ip = get_client_ip(request)
     try:
         allowed, _, reset = _rl.check_rate_limit(
-            identifier=client_ip, limit=30, window=60, prefix="invite_lookup", fail_open=False)
+            identifier=client_ip, limit=settings.rate_limit_api_auth,
+            window=settings.rate_limit_api_auth_window, prefix="invite_lookup", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
     if not allowed:
@@ -3434,7 +3435,8 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
 
     # (a) Rate limit — per IP AND per token prefix, both fail-closed (this is an unauthenticated
     # account-creation surface; it must throttle even during a Redis outage).
-    for ident, pfx, lim in ((client_ip, "invite_accept_ip", 10), (prefix, "invite_accept_prefix", 5)):
+    for ident, pfx, lim in ((client_ip, "invite_accept_ip", settings.rate_limit_api_auth),
+                            (prefix, "invite_accept_prefix", 5)):
         try:
             allowed, _, reset = _rl.check_rate_limit(identifier=ident, limit=lim, window=60,
                                                      prefix=pfx, fail_open=False)
