@@ -940,6 +940,7 @@
                         <button class="tab-btn" data-tab="email">Email</button>
                         <button class="tab-btn" data-tab="sftp">SFTP &amp; Encryption</button>
                         <button class="tab-btn" data-tab="sharing">Sharing</button>
+                        <button class="tab-btn" data-tab="accounts">Accounts &amp; Access</button>
                         <button class="tab-btn" data-tab="logs">Log access</button>
                         <button class="tab-btn" data-tab="audit">Audit Log</button>
                     </div>
@@ -1612,6 +1613,95 @@
                                         </div>
                                     </div>
                                 </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Accounts & Access Tab -->
+                    <div id="settings-tab-accounts" class="settings-tab-content">
+                        <div class="card">
+                            <div class="card-header"><h3>Account onboarding</h3></div>
+                            <div class="p-lg">
+                                <label class="flex items-center gap-sm">
+                                    <input type="checkbox" id="setting-invite-enabled">
+                                    <span>Let admins invite people by link</span>
+                                </label>
+                                <p class="text-secondary text-sm mt-sm">When on, an administrator can generate an invitation link for a new account. No email is sent — you copy the link and share it. Off by default.</p>
+                                <label class="flex items-center gap-sm mt-md">
+                                    <input type="checkbox" id="setting-signup-enabled">
+                                    <span>Let people sign themselves up</span>
+                                </label>
+                                <p class="text-secondary text-sm mt-sm">When on, a visitor can create their own account from the login screen. Off by default.</p>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg" id="accounts-invite-card">
+                            <div class="card-header"><h3>Invitations</h3></div>
+                            <div class="p-lg">
+                                <div class="form-group">
+                                    <label for="setting-invite-ttl-hours">Invitation link lifetime (hours)</label>
+                                    <input type="number" id="setting-invite-ttl-hours" class="form-control" min="1" max="720" step="1">
+                                    <p class="text-secondary text-sm mt-sm">How long an invitation link stays valid — from 1 hour to 720 (30 days).</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg" id="accounts-signup-card">
+                            <div class="card-header"><h3>Self-signup</h3></div>
+                            <div class="p-lg">
+                                <div class="form-group">
+                                    <label for="setting-signup-domain-mode">Email domain gate</label>
+                                    <select id="setting-signup-domain-mode" class="form-control">
+                                        <option value="off">Off — any email domain</option>
+                                        <option value="allowlist">Allowlist — only these domains</option>
+                                        <option value="denylist">Denylist — any except these domains</option>
+                                    </select>
+                                    <p class="text-secondary text-sm mt-sm">Restrict which email domains may sign up or accept an invitation.</p>
+                                </div>
+                                <div class="form-group" id="accounts-domains-group">
+                                    <label for="setting-signup-domain-input">Domains</label>
+                                    <div class="flex gap-sm">
+                                        <input type="text" id="setting-signup-domain-input" class="form-control" placeholder="example.com" autocomplete="off" aria-describedby="accounts-domain-help">
+                                        <button type="button" id="setting-signup-domain-add" class="btn btn-secondary">Add</button>
+                                    </div>
+                                    <p id="accounts-domain-help" class="text-secondary text-sm mt-sm">Type a domain (without the “@”) and press Add. Domains are lowercased and de-duplicated.</p>
+                                    <div id="setting-signup-domains-list" class="chip-row mt-sm" role="list" aria-label="Signup domains"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header"><h3>Identity &amp; email</h3></div>
+                            <div class="p-lg">
+                                <div class="form-group">
+                                    <label for="setting-email-requirement">Email address</label>
+                                    <select id="setting-email-requirement" class="form-control">
+                                        <option value="required">Required for every account</option>
+                                        <option value="optional">Optional</option>
+                                    </select>
+                                    <p class="text-secondary text-sm mt-sm">Applies the same way to admin-created accounts, invitations, and self-signup.</p>
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-login-identifier">Sign in with</label>
+                                    <select id="setting-login-identifier" class="form-control">
+                                        <option value="username">Username only</option>
+                                        <option value="email">Email only</option>
+                                        <option value="either">Username or email</option>
+                                    </select>
+                                    <p class="text-secondary text-sm mt-sm">What people type to sign in. “Email only” is refused if any active administrator has no email address.</p>
+                                </div>
+                                <label class="flex items-center gap-sm mt-md">
+                                    <input type="checkbox" id="setting-email-change-verification">
+                                    <span>Require a verification code to change one’s own email</span>
+                                </label>
+                                <p class="text-secondary text-sm mt-sm" id="accounts-email-verify-help">A user changing their own email must confirm a one-time code sent to the new address; administrators setting an email are exempt. Requires email (SMTP) to be configured — set it up on the Email tab first.</p>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header"><h3>What this means right now</h3></div>
+                            <div class="p-lg">
+                                <p class="text-secondary text-sm" id="accounts-policy-summary" aria-live="polite">—</p>
                             </div>
                         </div>
                     </div>
