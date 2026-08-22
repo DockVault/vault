@@ -2310,6 +2310,75 @@ def _smtp_configured(db: Session) -> bool:
     return bool((cfg.get("smtp_server") or "").strip() and (cfg.get("from_email") or "").strip())
 
 
+def _email_change_requires_verification(db: Session) -> bool:
+    """Effective org policy: does a self-service email change require an emailed one-time code?"""
+    from app.core.models import SystemSetting
+    from app.core.account_policy import effective_account_policy
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    return bool(effective_account_policy(row.value if row else None)["email_change_requires_verification"])
+
+
+def _send_email(db: Session, *, to_addr: str, subject: str, body: str) -> None:
+    """Send one plaintext email using the stored SMTP settings, raising a CLEAN HTTPException
+    (400/502) on any failure — never a 500, never surfacing the SMTP password. Mirrors the
+    connect / STARTTLS-strip-defense / login / send sequence of /settings/test-email (its sibling);
+    keep the two in step if either changes."""
+    import smtplib
+    from email.message import EmailMessage
+    from app.core.models import SystemSetting
+
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    cfg = dict(row.value) if row and row.value else {}
+    host = (cfg.get("smtp_server") or "").strip()
+    from_email = (cfg.get("from_email") or "").strip()
+    if not host or not from_email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="SMTP is not configured. Set the SMTP server and From address in Settings → Email first.")
+    try:
+        port = int(cfg.get("smtp_port") or 587)
+    except (TypeError, ValueError):
+        port = 587
+    username = (cfg.get("smtp_username") or "").strip()
+    password = cfg.get("smtp_password") or ""
+    from_name = (cfg.get("from_name") or "").strip()
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = f"{from_name} <{from_email}>" if from_name else from_email
+        msg["To"] = to_addr
+        msg.set_content(body)
+        if port == 465:
+            server = smtplib.SMTP_SSL(host, port, timeout=15)
+        else:
+            server = smtplib.SMTP(host, port, timeout=15)
+        with server:
+            server.ehlo()
+            encrypted = port == 465
+            if port != 465 and server.has_extn("starttls"):
+                server.starttls()
+                server.ehlo()
+                encrypted = True
+            if username and not encrypted:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="The SMTP server does not offer STARTTLS; refusing to send credentials over an unencrypted connection.")
+            if username:
+                server.login(username, password)
+            server.send_message(msg)
+    except smtplib.SMTPAuthenticationError:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail="SMTP authentication failed — check the username and password.")
+    except (ValueError, UnicodeError) as e:
+        print(f"email send config invalid: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="The SMTP configuration is invalid — check the server address and the From name/address.")
+    except (smtplib.SMTPException, OSError) as e:
+        print(f"email send failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail="Could not send the email — check the SMTP server, port, and TLS settings.")
+
+
 def _validate_settings_payload(payload: dict, db: Session) -> None:
     """Validate the few settings keys that drive real enforcement so the admin UI
     can't silently persist values that later fail open. The store is otherwise
@@ -4469,6 +4538,15 @@ async def update_own_account(
         user.password_hash = hash_password(body.new_password)
         changes.append("password")
     if changing_email:
+        # When the organization requires it, a self email CHANGE must be proved with a code sent to
+        # the new address (request-email-change / confirm-email-change below). A direct change here is
+        # refused so the verification can't be bypassed. Clearing the address (new_email is None) has
+        # nothing to verify and still goes direct.
+        if new_email is not None and _email_change_requires_verification(db):
+            raise HTTPException(
+                status_code=400,
+                detail="Changing your email requires verification. Request a code sent to the new "
+                       "address from account settings.")
         # Case-insensitive, so a clash cannot be slipped through by changing only the case. The
         # previous check compared against str(body.email), which would have matched the literal
         # string "None" once an address could legitimately be absent.
@@ -4493,6 +4571,135 @@ async def update_own_account(
     try:
         audit_logger.log_action(action="self_account_update", status="success", user=user,
                                 ip_address=get_client_ip(request), details={"fields": changes})
+    except Exception:  # noqa: BLE001
+        pass
+    return UserResponse.model_validate(user)
+
+
+# -- Verified self-service email change (request a code, then confirm it) -------
+# When the org policy requires it, changing your OWN email is proved by a one-time code sent to the
+# NEW address, so an account is never moved to an address the requester does not control. The
+# current-password re-auth still applies (a hijacked live session cannot start the flow); admin
+# create/set of an email is a separate, already-trusted act and is exempt.
+class EmailChangeRequest(BaseModel):
+    new_email: EmailStr
+    current_password: str
+
+
+class EmailChangeConfirm(BaseModel):
+    code: str
+
+
+@app.post("/users/me/request-email-change")
+async def request_email_change(
+    body: EmailChangeRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Start a verified change of the caller's OWN email: re-prove the current password, then send a
+    one-time code to the NEW address. The account email is not touched until the code is confirmed.
+    Enumeration-safe: an address already in use (or unchanged) gets the same 202 and no usable code."""
+    from app.core.security import verify_password
+    from app.core.email_change import generate_code, hash_code, CODE_TTL_MINUTES
+    from app.core.rate_limiter import rate_limiter as _rl
+    from app.core.models import EmailChangeCode
+
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot change account settings.")
+    user = db.query(User).filter(User.id == current_user.id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not _email_change_requires_verification(db):
+        raise HTTPException(status_code=400, detail="Email-change verification is not enabled for this deployment.")
+    if not _smtp_configured(db):
+        raise HTTPException(status_code=400, detail="Email is not configured, so a verification code cannot be sent.")
+    # Re-prove the current password before starting the flow (a hijacked live session must not be
+    # able to move the account to an attacker's address).
+    if not user.password_hash or not verify_password(body.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
+    # Cap the outbound-email request per user — the code lands in a requester-chosen inbox.
+    allowed, _, reset = _rl.check_rate_limit(identifier=str(user.id), limit=3, window=300,
+                                             prefix="email_change_code")
+    if not allowed:
+        import time as _t
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many email-change requests; please wait a few minutes.",
+                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    new_email = normalize_email(body.new_email)
+    # Mint + send only for a genuinely new, unused address; otherwise return the same 202 with no
+    # usable code, so this endpoint can't be used to probe which addresses are registered.
+    if new_email and new_email != user.email and not email_in_use(db, new_email, exclude_user_id=user.id):
+        # One pending change at a time: drop any prior unconsumed codes for this user.
+        db.query(EmailChangeCode).filter(
+            EmailChangeCode.user_id == user.id,
+            EmailChangeCode.consumed_at.is_(None),
+        ).delete()
+        code = generate_code()
+        db.add(EmailChangeCode(
+            user_id=user.id, new_email=new_email,
+            code_hash=hash_code(code, settings.jwt_secret_key),
+            expires_at=datetime.utcnow() + timedelta(minutes=CODE_TTL_MINUTES)))
+        db.commit()
+        _send_email(db, to_addr=new_email, subject="Confirm your new email address",
+                    body=(f"Enter this code to confirm your new email address:\n\n    {code}\n\n"
+                          f"The code expires in {CODE_TTL_MINUTES} minutes. "
+                          f"If you didn't request this change, you can ignore this email."))
+    try:
+        AuditLogger(db).log_action(action="email_change_requested", status="success", user=user,
+                                   ip_address=get_client_ip(request), details={})
+    except Exception:  # noqa: BLE001
+        pass
+    return JSONResponse(status_code=202, content={
+        "message": "If that address can receive mail, a verification code has been sent to it."})
+
+
+@app.post("/users/me/confirm-email-change", response_model=UserResponse)
+async def confirm_email_change(
+    body: EmailChangeConfirm,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Complete a verified email change by presenting the code sent to the new address. On success
+    the account's email becomes the new address and the code is consumed (single-use)."""
+    from app.core.email_change import code_matches
+    from app.core.rate_limiter import rate_limiter as _rl
+    from app.core.models import EmailChangeCode
+
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot change account settings.")
+    user = db.query(User).filter(User.id == current_user.id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    # Cap confirm attempts — a brute-force guard on the code space.
+    allowed, _, reset = _rl.check_rate_limit(identifier=str(user.id), limit=10, window=300,
+                                             prefix="email_change_confirm")
+    if not allowed:
+        import time as _t
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many attempts; please wait a few minutes.",
+                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    now = datetime.utcnow()
+    rec = db.query(EmailChangeCode).filter(
+        EmailChangeCode.user_id == user.id,
+        EmailChangeCode.consumed_at.is_(None),
+        EmailChangeCode.expires_at > now,
+    ).order_by(EmailChangeCode.created_at.desc()).first()
+    if rec is None or not code_matches(body.code, settings.jwt_secret_key, rec.code_hash):
+        raise HTTPException(status_code=400, detail="That code is invalid or has expired.")
+    # Re-check uniqueness at apply time — the address may have been taken since the request.
+    if email_in_use(db, rec.new_email, exclude_user_id=user.id):
+        raise HTTPException(status_code=400, detail="That email address is now in use.")
+    old_email = user.email
+    user.email = rec.new_email
+    rec.consumed_at = now
+    db.commit()
+    db.refresh(user)
+    try:
+        AuditLogger(db).log_action(action="email_change_confirmed", status="success", user=user,
+                                   ip_address=get_client_ip(request),
+                                   details={"old": old_email, "new": rec.new_email})
     except Exception:  # noqa: BLE001
         pass
     return UserResponse.model_validate(user)
@@ -4795,6 +5002,17 @@ async def update_user(
     # "email" omitted leaves the address alone; sent as an explicit null clears it.
     if "email" in user_update.model_fields_set:
         new_email = normalize_email(user_update.email)
+        # Changing your OWN email here would sidestep the re-proof its sibling requires. Exactly like
+        # the password field just below, the id form refuses a self change and points at /users/me,
+        # which demands the current password (and, when the org requires it, an emailed verification
+        # code). An admin changing SOMEONE ELSE's email is a different, already-trusted act and still
+        # allowed. A no-op resave of one's own address is not a change and falls through.
+        if is_self and new_email != user.email:
+            raise HTTPException(
+                status_code=400,
+                detail="Change your own email from account settings, which requires your "
+                       "current password.",
+            )
         # This path previously assigned the address with NO uniqueness check at all, so an exact
         # duplicate reached the database and surfaced as an uncaught IntegrityError 500.
         if new_email is not None and email_in_use(db, new_email, exclude_user_id=user.id):

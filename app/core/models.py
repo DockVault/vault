@@ -1082,6 +1082,29 @@ class LogPullToken(Base):
     )
 
 
+class EmailChangeCode(Base):
+    """Single-use, short-lived proof that a user controls a NEW email address.
+
+    Only a peppered HMAC-SHA256 hash of the emailed code is stored; the plaintext reaches only the
+    new address, by email. The account's email is not touched until the code is confirmed. A whole
+    new table — created by create_all(), so it needs no lightweight-migration entry.
+    """
+    __tablename__ = 'email_change_codes'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'),
+                     nullable=False, index=True)
+    new_email = Column(String(255), nullable=False)                        # the pending address
+    code_hash = Column(String(64), unique=True, nullable=False, index=True)  # HMAC-SHA256 hex
+    expires_at = Column(DateTime, nullable=False)                          # short-lived
+    consumed_at = Column(DateTime, nullable=True)                          # single-use: set on redeem
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_emailchangecode_user', 'user_id'),
+    )
+
+
 class RateLimitRecord(Base):
     """Track rate limiting for login attempts."""
     __tablename__ = 'rate_limit_records'
