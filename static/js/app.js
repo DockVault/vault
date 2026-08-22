@@ -3655,14 +3655,13 @@ async function loadUsers() {
         usersView.groups = Array.isArray(groups) ? groups : [];
         populateUsersGroupFilter();
         renderUsersTable();
-        // The Invite affordances key off the org policy, which rides admin-only GET /settings and is
-        // otherwise unpopulated until the Settings tab opens. Fetch it once here if we don't have it,
-        // then re-gate the button and load the pending list.
-        if (currentSettings.invite_enabled === undefined) {
-            try {
-                currentSettings = await apiRequest('/settings', { silent: true });
-            } catch (_) { /* leave currentSettings as-is; the button stays hidden (fail closed) */ }
-        }
+        // The Invite affordances key off the org policy, which rides admin-only GET /settings.
+        // Refetch it on every Users view so an admin who just enabled invitations (here or in another
+        // session) sees the button without having to open the Settings tab first. On a failed fetch
+        // the prior value is kept, and the button gate is fail-closed (=== true) either way.
+        try {
+            currentSettings = await apiRequest('/settings', { silent: true });
+        } catch (_) { /* keep the prior currentSettings */ }
         updateActionButtonPermissions();
         loadInvites();
     } catch (error) {

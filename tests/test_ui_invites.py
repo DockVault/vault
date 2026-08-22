@@ -60,7 +60,7 @@ def test_invite_modal_shows_link_once_and_lists_pending(page: Page, admin, admin
     # the show-once panel reveals a link with the "shown only once" warning
     expect(page.locator("#invite-link-result")).to_be_visible(timeout=10000)
     link = page.locator("#invite-link-value").inner_text()
-    assert "invite=" in link or link, "no invite link revealed"
+    assert "invite=" in link, f"expected an ?invite= link, got {link!r}"
     expect(page.locator("#invite-link-result .alert-warning")).to_contain_text("only once")
     # the fields step is gone (link is not re-shown on a re-open of the fields)
     expect(page.locator("#invite-user-fields")).to_be_hidden()

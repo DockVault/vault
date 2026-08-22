@@ -60,6 +60,18 @@ def invites_on(admin):
     admin.put("/settings", json=snap)
 
 
+@pytest.fixture
+def invites_off(admin):
+    """Explicitly DISABLE invitations, restoring afterward — so the negative test controls its own
+    precondition instead of relying on the ambient deployment default (which another test or admin
+    action could have flipped)."""
+    before = admin.get("/settings").json()
+    snap = {k: before.get(k) for k in ACCOUNT_KEYS}
+    admin.put("/settings", json={"invite_enabled": False})
+    yield
+    admin.put("/settings", json=snap)
+
+
 def _mint(admin, **body):
     return admin.post("/invites", json=body)
 
@@ -79,12 +91,12 @@ def test_mint_returns_token_once_and_stores_only_the_hash(admin, invites_on):
     row = _psql(f"SELECT token_hash FROM account_invitations WHERE username={_q(uname)}")
     assert row and row != plaintext
     assert row == invitations.hash_invite_token(plaintext, _invite_pepper())
-    dump = _psql(f"SELECT coalesce(token_prefix,'')||'|'||coalesce(email,'') FROM account_invitations WHERE username={_q(uname)}")
-    assert plaintext not in dump
+    # the plaintext appears NOWHERE in the persisted row (dump the whole row as text)
+    whole = _psql(f"SELECT to_jsonb(account_invitations)::text FROM account_invitations WHERE username={_q(uname)}")
+    assert plaintext not in whole
 
 
-def test_mint_refused_when_invitations_disabled(admin):
-    # do not enable invites; the default is off
+def test_mint_refused_when_invitations_disabled(admin, invites_off):
     r = _mint(admin, username=unique("off"), role="user")
     assert r.status_code == 400, r.text
     assert "disabled" in r.json()["detail"].lower()
@@ -128,6 +140,19 @@ def test_live_invite_blocks_second_but_revoked_does_not(admin, invites_on):
     # revoke the live one -> the username is free to invite again
     assert admin.delete(f"/invites/{first.json()['id']}").status_code == 200
     third = _mint(admin, username=uname, role="user")
+    assert third.status_code == 200, third.text
+
+
+def test_live_invite_blocks_second_for_the_same_email(admin, invites_on):
+    # Symmetric with the username guard: one live invitation per email (case-insensitive).
+    email = f"{unique('shared')}@example.com"
+    first = _mint(admin, username=unique("e1"), role="user", email=email)
+    assert first.status_code == 200, first.text
+    dup = _mint(admin, username=unique("e2"), role="user", email=email.upper())
+    assert dup.status_code == 400 and "email" in dup.json()["detail"].lower()
+    # once the first is revoked, the address is free again
+    assert admin.delete(f"/invites/{first.json()['id']}").status_code == 200
+    third = _mint(admin, username=unique("e3"), role="user", email=email)
     assert third.status_code == 200, third.text
 
 

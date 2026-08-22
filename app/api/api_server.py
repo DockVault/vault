@@ -3219,8 +3219,20 @@ async def create_invite(
             raise HTTPException(status_code=400, detail="That email domain is not permitted.")
         if email_in_use(db, email):
             raise HTTPException(status_code=400, detail="That email address is already in use.")
+        # Symmetric with the username guard: don't let two LIVE invitations claim one address (the
+        # "two accounts, one email" impersonation risk email_identity.py exists to prevent). Folded
+        # case-insensitively, the same way email_in_use decides "same address".
+        from sqlalchemy import func as _func
+        if db.query(AccountInvitation.id).filter(
+                _func.lower(AccountInvitation.email) == email.lower(),
+                AccountInvitation.revoked_at.is_(None),
+                AccountInvitation.accepted_at.is_(None),
+                AccountInvitation.expires_at > now).first():
+            raise HTTPException(status_code=400, detail="That email address already has a pending invitation.")
 
-    expires_at = now + timedelta(hours=int(pol.get("invite_ttl_hours") or 72))
+    # effective_account_policy always fills invite_ttl_hours (validated 1..720); the fallback mirrors
+    # the policy DEFAULT (24) only for the pathological empty-blob case, never the shipped 72.
+    expires_at = now + timedelta(hours=int(pol.get("invite_ttl_hours") or 24))
     plaintext, prefix = invitations.mint_invite()
     inv = AccountInvitation(
         username=username, email=email, role=role,
