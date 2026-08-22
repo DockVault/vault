@@ -17,6 +17,13 @@
 (function () {
     'use strict';
     try {
+        // An invitation-acceptance link takes precedence over any cached session: an anonymous
+        // visitor opening /?invite=... must land on the accept screen, never the app shell or a
+        // stale login. Set data-invite pre-paint (CSS hides login/boot, shows #invite-screen).
+        if (/[?&]invite=/.test(location.search)) {
+            document.documentElement.setAttribute('data-invite', '1');
+            return;
+        }
         var t = localStorage.getItem('authToken') || sessionStorage.getItem('authToken');
         if (t) document.documentElement.setAttribute('data-auth', 'pending');
     } catch (e) { /* storage blocked -> treat as logged out (login screen shows) */ }

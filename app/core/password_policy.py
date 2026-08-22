@@ -35,3 +35,25 @@ def password_policy_errors(password, cfg):
     if cfg.get("require_special") and not any((not c.isalnum()) and (not c.isspace()) for c in pw):
         errors.append("include a special character")
     return errors
+
+
+def password_policy_view(cfg):
+    """The enforced policy in a shape safe to show an UNAUTHENTICATED client (the invite-acceptance
+    form), so the displayed requirements can never drift from what `password_policy_errors` enforces.
+
+    Reads the SAME keys with the SAME clamps/coercions: min_length floored at HARD_FLOOR, and each
+    complexity flag reported as a real bool (a missing/false/odd toggle is `False`, matching the
+    `cfg.get(...)` truthiness the enforcer uses — see the settings-save `undefined !== false` lesson).
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    try:
+        min_len = int(cfg.get("password_min_length"))
+    except (TypeError, ValueError):
+        min_len = HARD_FLOOR
+    return {
+        "min_length": max(HARD_FLOOR, min_len),
+        "require_uppercase": cfg.get("require_uppercase") is True,
+        "require_lowercase": cfg.get("require_lowercase") is True,
+        "require_numbers": cfg.get("require_numbers") is True,
+        "require_special": cfg.get("require_special") is True,
+    }

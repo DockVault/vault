@@ -205,8 +205,13 @@ def grant_default_permissions_for_role(
     user_id: str,
     role: str,
     db: Session,
+    commit: bool = True,
 ) -> List[str]:
-    """Atomically grant every grantable role default and its prerequisites."""
+    """Atomically grant every grantable role default and its prerequisites.
+
+    `commit=False` lets a caller fold the grant into a surrounding transaction (e.g. invitation
+    acceptance, which claims the invite and creates the user in one commit); the default keeps the
+    self-committing behaviour every existing caller relies on."""
     role_str = str(role).lower().replace("roleenum.", "").replace("role.", "")
     defaults = [
         group_name
@@ -216,7 +221,8 @@ def grant_default_permissions_for_role(
     groups = _ordered_with_dependencies(defaults)
     try:
         _insert_permission_groups(uuid_module.UUID(user_id), groups, db, None)
-        db.commit()
+        if commit:
+            db.commit()
     except Exception:
         db.rollback()
         raise
