@@ -10,6 +10,7 @@ from typing import List, Optional
 import hashlib
 import uuid
 import json
+import re
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request, File as FastAPIFile, UploadFile, Header, WebSocket, WebSocketDisconnect, Response, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
