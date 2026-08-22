@@ -2300,6 +2300,16 @@ def _email_login_would_lock_out_admin(db: Session) -> bool:
     ).first() is not None
 
 
+def _smtp_configured(db: Session) -> bool:
+    """True when the deployment can send mail — an SMTP server and a From address are set in the
+    stored settings (same signal send_test_email checks). Gates turning ON email-change
+    verification, which relies on emailing a one-time code."""
+    from app.core.models import SystemSetting
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    cfg = dict(row.value) if row and row.value else {}
+    return bool((cfg.get("smtp_server") or "").strip() and (cfg.get("from_email") or "").strip())
+
+
 def _validate_settings_payload(payload: dict, db: Session) -> None:
     """Validate the few settings keys that drive real enforcement so the admin UI
     can't silently persist values that later fail open. The store is otherwise
@@ -2456,7 +2466,9 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     if any(k in payload for k in ACCOUNT_POLICY_KEYS):
         try:
             normalized = validate_account_policy(
-                payload, email_login_locks_out_admin=_email_login_would_lock_out_admin(db))
+                payload,
+                email_login_locks_out_admin=_email_login_would_lock_out_admin(db),
+                smtp_configured=_smtp_configured(db))
         except AccountPolicyError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         # Persist the canonical form (deduped/lowercased domains), not the raw input. Mutating the

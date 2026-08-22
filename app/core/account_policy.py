@@ -32,6 +32,10 @@ DEFAULTS = {
     "signup_email_domain_mode": "off",
     "signup_email_domains": [],
     "login_identifier": "username",
+    # A self-service email change proves ownership of the NEW address with a one-time code emailed
+    # to it. That needs SMTP, so this can only be turned on once email sending is configured (the
+    # PUT /settings handler supplies that fact). Off by default. Admin-set emails are exempt.
+    "email_change_requires_verification": False,
 }
 ACCOUNT_POLICY_KEYS = tuple(DEFAULTS.keys())
 
@@ -92,15 +96,19 @@ def normalize_domains(value) -> list[str]:
     return out
 
 
-def validate_account_policy(payload: dict, *, email_login_locks_out_admin: bool = False) -> dict:
+def validate_account_policy(payload: dict, *, email_login_locks_out_admin: bool = False,
+                            smtp_configured: bool = False) -> dict:
     """Validate only the account-policy keys PRESENT in `payload`; pass everything else through.
 
     Returns a dict of the NORMALIZED values for the keys it handled (e.g. deduped/lowercased
     domains), so the caller can persist the canonical form. Raises AccountPolicyError with an
     admin-safe message on the first invalid value.
 
-    `email_login_locks_out_admin` is the DB-derived fact for owner decision 4: refuse
-    login_identifier='email' when an active admin has no email, or they can never log in again.
+    Two DB-derived facts the pure validator cannot know are supplied by the caller:
+    - `email_login_locks_out_admin` (owner decision 4): refuse login_identifier='email' when an
+      active admin has no email, or they can never log in again.
+    - `smtp_configured`: refuse turning ON email-change verification unless the deployment can send
+      the one-time code (email-change verification is gated behind email-client setup).
     """
     if not isinstance(payload, dict):
         raise AccountPolicyError("Settings payload must be an object")
@@ -139,5 +147,14 @@ def validate_account_policy(payload: dict, *, email_login_locks_out_admin: bool 
             raise AccountPolicyError(
                 "Refusing to set email-only login: an active administrator has no email address and "
                 "would be locked out. Give every admin an email first, or use 'either'.")
+
+    if "email_change_requires_verification" in payload:
+        v = payload["email_change_requires_verification"]
+        if not isinstance(v, bool):
+            raise AccountPolicyError("email_change_requires_verification must be true or false")
+        if v and not smtp_configured:
+            raise AccountPolicyError(
+                "Cannot require email-change verification until SMTP is configured: the deployment "
+                "must be able to send the one-time code. Set up Settings -> Email first.")
 
     return normalized

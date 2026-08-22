@@ -199,3 +199,34 @@ def test_partial_payload_validates_only_present_keys():
 def test_non_dict_payload_rejected():
     with pytest.raises(AccountPolicyError):
         validate_account_policy(["not", "a", "dict"])
+
+
+# ---- email-change verification: gated behind SMTP being configured ----------------------------
+def test_email_change_verification_in_defaults_and_effective():
+    assert DEFAULTS["email_change_requires_verification"] is False
+    assert effective_account_policy(None)["email_change_requires_verification"] is False
+    assert effective_account_policy(
+        {"email_change_requires_verification": True})["email_change_requires_verification"] is True
+
+
+def test_email_change_verification_must_be_bool():
+    validate_account_policy({"email_change_requires_verification": False})
+    with pytest.raises(AccountPolicyError):
+        validate_account_policy({"email_change_requires_verification": "yes"})
+
+
+def test_enabling_verification_requires_smtp_configured():
+    # turning it ON without SMTP is refused...
+    with pytest.raises(AccountPolicyError):
+        validate_account_policy(
+            {"email_change_requires_verification": True}, smtp_configured=False)
+    # ...and permitted once SMTP is configured
+    validate_account_policy(
+        {"email_change_requires_verification": True}, smtp_configured=True)
+
+
+def test_disabling_verification_never_needs_smtp():
+    # turning it OFF must always be allowed, even with no SMTP, so a deployment that loses SMTP can
+    # still relax the policy rather than being stuck unable to save.
+    validate_account_policy(
+        {"email_change_requires_verification": False}, smtp_configured=False)
