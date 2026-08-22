@@ -502,6 +502,15 @@ async def update_user(
     # never removed.
     if "email" in update_data.model_fields_set:
         new_email = normalize_email(update_data.email)
+        # Changing your OWN email is a self-service act that must re-prove the current password (and,
+        # when the org requires it, an emailed code) — even for an admin. This management route only
+        # sets another user's email; an admin editing their own address is redirected to account
+        # settings, matching PATCH /users/{id}. A no-op resave of one's own address is not a change.
+        if current_user.id == user_id and new_email != user.email:
+            raise HTTPException(
+                status_code=400,
+                detail="Change your own email from account settings, which requires your "
+                       "current password.")
         # Case-insensitive: the previous `==` let an admin store BOB@x.com beside bob@x.com.
         if new_email is not None and email_in_use(db, new_email, exclude_user_id=user_id):
             raise HTTPException(status_code=400, detail="Email already in use")

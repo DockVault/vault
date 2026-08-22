@@ -87,6 +87,23 @@ def test_admin_setting_another_users_email_is_exempt(admin):
         admin.delete_user(u["id"])
 
 
+def test_admin_cannot_change_own_email_via_user_management(admin, restore_settings):
+    # the parallel management route must refuse a self email change too (not just PATCH /users/{id})
+    me = admin.get("/users/me").json()
+    r = admin.put(f"/api/user-management/users/{me['id']}", json={"email": unique("um") + "@example.com"})
+    assert r.status_code == 400, r.text
+    assert "account settings" in r.json()["detail"].lower()
+
+
+def test_admin_can_set_another_users_email_via_user_management(admin):
+    u = admin.create_user(role="user")
+    try:
+        r = admin.put(f"/api/user-management/users/{u['id']}", json={"email": unique("umset") + "@example.com"})
+        assert r.status_code == 200, r.text
+    finally:
+        admin.delete_user(u["id"])
+
+
 # ---- policy gate on the direct PATCH /users/me path -------------------------------------------
 def test_direct_email_change_refused_when_policy_on(admin, restore_settings):
     _enable(admin)
