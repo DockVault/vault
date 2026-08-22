@@ -10,6 +10,7 @@ from typing import List, Optional
 import hashlib
 import uuid
 import json
+import re
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request, File as FastAPIFile, UploadFile, Header, WebSocket, WebSocketDisconnect, Response, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -257,6 +258,24 @@ _MAX_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024  # 64 MiB
 _MAX_REQUEST_BODY_BYTES = 4 * _MAX_UPLOAD_CHUNK_BYTES  # 256 MiB
 
 
+# Path segments that are replayable SECRETS, not identifiers: the invitation token and the share-claim
+# secret both travel in the URL PATH. The web log-pull serves request paths to a `web`-scoped token
+# holder (a less-privileged consumer), and redact_log_text does not catch these (no key= separator,
+# not JWT-shaped), so mask them at the source before they reach the sink. Add any new secret-in-path
+# route here.
+_LOG_PATH_SECRET_SUBS = [
+    (re.compile(r"^(/invites/)[^/]+"), r"\1<redacted>"),           # GET/POST /invites/{token}[/accept]
+    (re.compile(r"^(/shares/)[^/]+(/claim)"), r"\1<redacted>\2"),  # /shares/{claim-secret}/claim
+]
+
+
+def _redact_log_path(path: str) -> str:
+    """Mask replayable secrets carried in a URL path before it is written to the log-pull sink."""
+    for rx, repl in _LOG_PATH_SECRET_SUBS:
+        path = rx.sub(repl, path)
+    return path
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """
     Security headers middleware addressing multiple OWASP findings:
@@ -275,6 +294,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # reject a legitimate multi-file batch. A missing/chunked Content-Length is metered downstream.
         # The rejection is assigned to `response` (not returned early) so it still flows through the
         # hardening-header code below.
+        import time as _t
+        _req_started = _t.monotonic()
         _oversize_response = None
         _cl = request.headers.get("content-length")
         _ctype = request.headers.get("content-type", "").lower()
@@ -379,7 +400,20 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # reverse proxy too, not only for in-process TLS).
         if external_scheme == 'https':
             response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-        
+
+        # Web log-pull access line. Only when the in-app sink is active (split/direct shape — under
+        # run_combined it stays inactive and the launcher captures stdout instead, so no double-write).
+        # Method + path + status + client IP + duration ONLY — never bodies, headers, or query strings
+        # (the pull path also redacts on read, but we avoid logging secrets at the source).
+        try:
+            from app.services import log_sink
+            if log_sink.is_active():
+                _dur_ms = int((_t.monotonic() - _req_started) * 1000)
+                log_sink.emit("web", f"{request.method} {_redact_log_path(request.url.path)} -> "
+                                     f"{response.status_code} {get_client_ip(request)} {_dur_ms}ms")
+        except Exception:  # noqa: BLE001 — logging must never affect the response
+            pass
+
         return response
 
 _RATE_LIMIT_API_CATEGORIES = ("default", "auth", "upload", "download")
@@ -13840,7 +13874,24 @@ async def lifespan(app: FastAPI):
     # Start background task for session cleanup
     cleanup_task = asyncio.create_task(cleanup_expired_sessions())
     print("[OK] Session cleanup task started")
-    
+
+    # Web log-pull sink: when NOT running under run_combined (i.e. the API was started directly — the
+    # split-container / dev shape), self-write the [web] access lines so GET /logs?service=web works
+    # in every run shape. Under run_combined the launcher already captures this child's stdout as
+    # [web]; its VAULT_LOG_SINK_OWNER marker makes us stand down here so we never double-write.
+    if not str(os.environ.get("VAULT_LOG_SINK_OWNER", "")).strip():
+        from app.services import log_sink
+        if log_sink.init_sink():
+            os.environ["VAULT_LOG_SINK_ACTIVE"] = "1"
+            os.environ["VAULT_LOG_SINK_COMPONENTS"] = "web"
+            print("[OK] Web log sink active (in-app)")
+        else:
+            # Sink couldn't init (e.g. read-only logs dir). CLEAR any stale markers a hand-edited
+            # .env may carry, so the admin panel reports web log-pull as unavailable rather than
+            # advertising it and then serving an empty list (mirrors run_combined.mark_sink_active).
+            os.environ.pop("VAULT_LOG_SINK_ACTIVE", None)
+            os.environ.pop("VAULT_LOG_SINK_COMPONENTS", None)
+
     yield
     
     # Shutdown - cancel background tasks

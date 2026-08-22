@@ -5915,13 +5915,13 @@ function revealLogToken(res) {
     warn.className = 'text-secondary mb-sm';
     warn.textContent = 'Copy this token now — it is shown only once and cannot be retrieved later.';
     const box = document.createElement('div');
-    box.className = 'flex items-center gap-sm';
-    const code = document.createElement('code');
+    box.className = 'cred-field-row';                 // shrinks the long code (min-width:0) so it can't
+    const code = document.createElement('code');      // push the sidebar; house pattern, both skins
     code.id = 'log-token-value';
+    code.className = 'cred-code mono';
     code.textContent = res.token;
-    code.style.wordBreak = 'break-all';
     const copy = document.createElement('button');
-    copy.className = 'btn btn-outline btn-sm';
+    copy.className = 'btn btn-sm btn-secondary cred-copy-btn';
     copy.type = 'button';
     copy.textContent = 'Copy';
     copy.addEventListener('click', () => {
@@ -5947,12 +5947,12 @@ function revealLogToken(res) {
     scopes.forEach(svc => {
         const cmd = `curl -H "Authorization: Bearer ${res.token}" "${origin}/logs?service=${svc}"`;
         const row = document.createElement('div');
-        row.className = 'flex items-center gap-sm mb-sm';
+        row.className = 'cred-field-row mb-sm';
         const c = document.createElement('code');
+        c.className = 'cred-code mono';
         c.textContent = cmd;
-        c.style.wordBreak = 'break-all';
         const b = document.createElement('button');
-        b.className = 'btn btn-outline btn-sm';
+        b.className = 'btn btn-sm btn-secondary cred-copy-btn';
         b.type = 'button';
         b.textContent = 'Copy';
         b.addEventListener('click', () => { navigator.clipboard.writeText(cmd).then(() => showSuccess('Copied')).catch(() => {}); });
