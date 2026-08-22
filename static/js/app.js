@@ -431,6 +431,11 @@ function updateActionButtonPermissions() {
     setBtn(document.getElementById('create-user-btn'),
            !scoped && hasPermission('USER_MANAGE'));
 
+    // Invite User — same admin surface, additionally gated on the org policy switch. `=== true`
+    // fails closed while currentSettings is unpopulated (it rides admin-only GET /settings).
+    setBtn(document.getElementById('invite-user-btn'),
+           !scoped && hasPermission('USER_MANAGE') && currentSettings.invite_enabled === true);
+
     // Create Vault — the global vault.create cap.
     setBtn(document.getElementById('create-vault-btn'),
            scoped ? scopeCaps.includes('vault.create') : hasPermission('VAULT_CREATE'));
@@ -3650,9 +3655,146 @@ async function loadUsers() {
         usersView.groups = Array.isArray(groups) ? groups : [];
         populateUsersGroupFilter();
         renderUsersTable();
+        // The Invite affordances key off the org policy, which rides admin-only GET /settings and is
+        // otherwise unpopulated until the Settings tab opens. Fetch it once here if we don't have it,
+        // then re-gate the button and load the pending list.
+        if (currentSettings.invite_enabled === undefined) {
+            try {
+                currentSettings = await apiRequest('/settings', { silent: true });
+            } catch (_) { /* leave currentSettings as-is; the button stays hidden (fail closed) */ }
+        }
+        updateActionButtonPermissions();
+        loadInvites();
     } catch (error) {
         console.error('Failed to load users:', error);
         container.innerHTML = `<div class="alert alert-error">Failed to load users: ${escapeHtml(error.message)}</div>`;
+    }
+}
+
+// ---- Account invitations (admin) -------------------------------------------
+// Built with DOM APIs (no innerHTML); the plaintext invite link is shown once and copied from a
+// stored variable, never re-read from the DOM.
+let _lastInviteLink = null;
+let _inviteFormWired = false;
+
+function openInviteModal() {
+    const fields = document.getElementById('invite-user-fields');
+    const result = document.getElementById('invite-link-result');
+    const footer = document.getElementById('invite-user-footer');
+    const doneFooter = document.getElementById('invite-done-footer');
+    // Reset to the fields step on OPEN — closeModal only scrubs password inputs.
+    if (fields) fields.style.display = '';
+    if (result) result.style.display = 'none';
+    if (footer) footer.style.display = '';
+    if (doneFooter) doneFooter.style.display = 'none';
+    document.getElementById('invite-username').value = '';
+    document.getElementById('invite-email').value = '';
+    document.getElementById('invite-role').value = 'user';
+    _lastInviteLink = null;
+    // Email requiredness follows the org policy.
+    const req = currentSettings.email_requirement === 'required';
+    const emailInput = document.getElementById('invite-email');
+    const emailLabel = document.getElementById('invite-email-label');
+    if (emailInput) emailInput.required = req;
+    if (emailLabel) emailLabel.textContent = req ? 'Email' : 'Email (optional)';
+    if (!_inviteFormWired) {
+        _inviteFormWired = true;
+        document.getElementById('invite-user-form').addEventListener('submit', submitInvite);
+        document.getElementById('invite-link-copy').addEventListener('click', copyInviteLink);
+    }
+    openModal('invite-user-modal');
+}
+
+async function submitInvite(e) {
+    e.preventDefault();
+    const btn = document.getElementById('invite-submit-btn');
+    const payload = {
+        username: document.getElementById('invite-username').value.trim(),
+        role: document.getElementById('invite-role').value,
+    };
+    const email = document.getElementById('invite-email').value.trim();
+    if (email) payload.email = email;
+    try {
+        btn.disabled = true;
+        const res = await apiRequest('/invites', { method: 'POST', body: JSON.stringify(payload) });
+        _lastInviteLink = res.invite_url || res.token;
+        document.getElementById('invite-link-value').textContent = _lastInviteLink;
+        document.getElementById('invite-link-expiry').textContent =
+            'This link expires ' + formatServerTime(res.expires_at) + '.';
+        document.getElementById('invite-user-fields').style.display = 'none';
+        document.getElementById('invite-user-footer').style.display = 'none';
+        document.getElementById('invite-link-result').style.display = '';
+        document.getElementById('invite-done-footer').style.display = '';
+        loadInvites();
+    } catch (err) {
+        showError('Could not create the invitation: ' + err.message);
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+function copyInviteLink() {
+    // Copy the STORED link, not the element text — the button swaps its own label to a confirmation,
+    // and re-reading the DOM could copy the wrong thing.
+    if (!_lastInviteLink) return;
+    navigator.clipboard.writeText(_lastInviteLink).then(() => {
+        const b = document.getElementById('invite-link-copy');
+        const orig = b.textContent;
+        b.textContent = '✓ Copied';
+        setTimeout(() => { b.textContent = orig; }, 2000);
+    });
+}
+
+async function loadInvites() {
+    const block = document.getElementById('invites-block');
+    const list = document.getElementById('invites-list');
+    if (!block || !list) return;
+    if (currentSettings.invite_enabled !== true || !hasPermission('USER_VIEW')) {
+        block.style.display = 'none';
+        return;
+    }
+    try {
+        const invites = await apiRequest('/invites', { silent: true });
+        renderInvites(Array.isArray(invites) ? invites : []);
+    } catch (_) {
+        block.style.display = 'none';
+    }
+}
+
+function renderInvites(invites) {
+    const block = document.getElementById('invites-block');
+    const list = document.getElementById('invites-list');
+    list.replaceChildren();
+    if (!invites.length) {
+        block.style.display = 'none';
+        return;
+    }
+    block.style.display = '';
+    const canManage = hasPermission('USER_MANAGE') && !isScopedTemp;
+    invites.forEach(inv => {
+        const row = _el('div', 'invite-row');
+        row.setAttribute('data-invite-id', inv.id);
+        row.setAttribute('style', 'display:flex; gap:var(--space-md); align-items:center; padding:var(--space-sm) 0; border-bottom:1px solid var(--border);');
+        row.appendChild(_el('strong', null, inv.username));
+        if (inv.email) row.appendChild(_el('span', 'text-muted', inv.email));
+        row.appendChild(_el('span', 'invite-status', inv.status));
+        row.appendChild(_el('span', 'text-muted', 'expires ' + formatServerTime(inv.expires_at)));
+        if (canManage && inv.status === 'pending') {
+            const revoke = _el('button', 'btn btn-sm btn-secondary', 'Revoke');
+            revoke.style.marginLeft = 'auto';
+            revoke.addEventListener('click', () => revokeInvite(inv.id));
+            row.appendChild(revoke);
+        }
+        list.appendChild(row);
+    });
+}
+
+async function revokeInvite(id) {
+    try {
+        await apiRequest('/invites/' + encodeURIComponent(id), { method: 'DELETE' });
+        loadInvites();
+    } catch (err) {
+        showError('Could not revoke the invitation: ' + err.message);
     }
 }
 
@@ -12828,6 +12970,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const createUserBtn = document.getElementById('create-user-btn');
     if (createUserBtn) {
         createUserBtn.addEventListener('click', showCreateUser);
+    }
+
+    // Invite user button
+    const inviteUserBtn = document.getElementById('invite-user-btn');
+    if (inviteUserBtn) {
+        inviteUserBtn.addEventListener('click', openInviteModal);
     }
     
     // Close modal buttons
