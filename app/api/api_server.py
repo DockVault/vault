@@ -257,6 +257,24 @@ _MAX_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024  # 64 MiB
 _MAX_REQUEST_BODY_BYTES = 4 * _MAX_UPLOAD_CHUNK_BYTES  # 256 MiB
 
 
+# Path segments that are replayable SECRETS, not identifiers: the invitation token and the share-claim
+# secret both travel in the URL PATH. The web log-pull serves request paths to a `web`-scoped token
+# holder (a less-privileged consumer), and redact_log_text does not catch these (no key= separator,
+# not JWT-shaped), so mask them at the source before they reach the sink. Add any new secret-in-path
+# route here.
+_LOG_PATH_SECRET_SUBS = [
+    (re.compile(r"^(/invites/)[^/]+"), r"\1<redacted>"),           # GET/POST /invites/{token}[/accept]
+    (re.compile(r"^(/shares/)[^/]+(/claim)"), r"\1<redacted>\2"),  # /shares/{claim-secret}/claim
+]
+
+
+def _redact_log_path(path: str) -> str:
+    """Mask replayable secrets carried in a URL path before it is written to the log-pull sink."""
+    for rx, repl in _LOG_PATH_SECRET_SUBS:
+        path = rx.sub(repl, path)
+    return path
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """
     Security headers middleware addressing multiple OWASP findings:
@@ -390,7 +408,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             from app.services import log_sink
             if log_sink.is_active():
                 _dur_ms = int((_t.monotonic() - _req_started) * 1000)
-                log_sink.emit("web", f"{request.method} {request.url.path} -> "
+                log_sink.emit("web", f"{request.method} {_redact_log_path(request.url.path)} -> "
                                      f"{response.status_code} {get_client_ip(request)} {_dur_ms}ms")
         except Exception:  # noqa: BLE001 — logging must never affect the response
             pass
@@ -13866,6 +13884,12 @@ async def lifespan(app: FastAPI):
             os.environ["VAULT_LOG_SINK_ACTIVE"] = "1"
             os.environ["VAULT_LOG_SINK_COMPONENTS"] = "web"
             print("[OK] Web log sink active (in-app)")
+        else:
+            # Sink couldn't init (e.g. read-only logs dir). CLEAR any stale markers a hand-edited
+            # .env may carry, so the admin panel reports web log-pull as unavailable rather than
+            # advertising it and then serving an empty list (mirrors run_combined.mark_sink_active).
+            os.environ.pop("VAULT_LOG_SINK_ACTIVE", None)
+            os.environ.pop("VAULT_LOG_SINK_COMPONENTS", None)
 
     yield
     

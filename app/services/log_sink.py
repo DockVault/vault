@@ -7,9 +7,9 @@ writes it and `/logs?service=web` comes back empty. This module lets the API sel
 `[web]` access lines when it is NOT running under `run_combined`, so web log-pull works in every shape.
 
 The line format is byte-identical to `run_combined._sink_line` (tag FIRST so the log-pull
-`filter_service_lines` prefix match works; then the UTC timestamp; then the raw line, `\\r\\n`-stripped).
-Writing is best-effort and never blocks the event loop: `emit()` only `put_nowait`s onto a bounded
-queue and a daemon thread does the disk write, exactly like the launcher's pump.
+`filter_service_lines` prefix match works; then the UTC timestamp; then the raw line). Writing is
+best-effort and never blocks the event loop: `emit()` only `put_nowait`s onto a bounded queue and a
+daemon thread does the disk write, exactly like the launcher's pump.
 """
 import logging
 import logging.handlers
@@ -25,6 +25,12 @@ _SINK_BACKUPS = 2
 _SINK_QUEUE: "queue.Queue" = queue.Queue(maxsize=20000)
 _SINK_TS_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"  # ISO-8601 UTC, trailing Z
 
+# Every character a log consumer (or _read_sink_lines, which splits on '\n') could treat as a line
+# break. This writer builds its line from request fields, so scrub ALL of these to a space: an
+# embedded separator must not be able to split one record into a second forged [tag] line or smuggle
+# a fake entry (the same hazard _read_sink_lines guards against on read).
+_LINE_SEPARATORS = str.maketrans({c: " " for c in "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"})
+
 _sink_logger = None
 _active = False
 _writer_started = False
@@ -32,8 +38,9 @@ _writer_started = False
 
 def _sink_line(label: str, line: str, ts: str) -> str:
     """The stored line: `[label]` tag FIRST (line-start prefix the pull filter matches), then the
-    timestamp, then the raw line. Byte-identical to run_combined._sink_line — do not reorder."""
-    return f"[{label}] {ts} " + line.rstrip("\r\n")
+    timestamp, then the raw line with every line-separator neutralised. Prefix/timestamp layout is
+    byte-identical to run_combined._sink_line — do not reorder."""
+    return f"[{label}] {ts} " + line.translate(_LINE_SEPARATORS).rstrip()
 
 
 def _writer_loop() -> None:
