@@ -2288,6 +2288,18 @@ def _zk_idle_lock_minutes(db: Session) -> int:
     return max(0, min(v, 1440))
 
 
+def _email_login_would_lock_out_admin(db: Session) -> bool:
+    """True if switching to email-only login would strand an admin (owner decision 4): any active
+    ADMIN account has no email address, so it could present no valid login identifier."""
+    from app.core.models import User, RoleEnum
+    from sqlalchemy import or_, func
+    return db.query(User.id).filter(
+        User.role == RoleEnum.ADMIN,
+        User.is_active.isnot(False),
+        or_(User.email.is_(None), func.length(func.trim(User.email)) == 0),
+    ).first() is not None
+
+
 def _validate_settings_payload(payload: dict, db: Session) -> None:
     """Validate the few settings keys that drive real enforcement so the admin UI
     can't silently persist values that later fail open. The store is otherwise
@@ -2436,6 +2448,21 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             if isinstance(v, bool) or not isinstance(v, int) or v < 0:
                 raise HTTPException(status_code=400, detail=f"{int_key} must be a non-negative integer")
 
+    # Account-onboarding policy (email requirement, invitation/signup switches, invite TTL, domain
+    # gate, login identifier). Validated by a pure helper so the same rules are unit-testable; the one
+    # DB-derived fact it can't know is whether email-only login would lock out an admin (decision 4).
+    from app.core.account_policy import (
+        ACCOUNT_POLICY_KEYS, validate_account_policy, AccountPolicyError)
+    if any(k in payload for k in ACCOUNT_POLICY_KEYS):
+        try:
+            normalized = validate_account_policy(
+                payload, email_login_locks_out_admin=_email_login_would_lock_out_admin(db))
+        except AccountPolicyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        # Persist the canonical form (deduped/lowercased domains), not the raw input. Mutating the
+        # payload here carries the normalized value into the merge in update_settings.
+        payload.update(normalized)
+
 
 @app.get("/settings")
 async def get_settings(
@@ -2473,6 +2500,11 @@ async def get_settings(
     data["zk_idle_lock_minutes"] = _zk_idle_lock_minutes(db)
     # Effective Sharing master switch (default OFF) so the Settings -> Sharing toggle reflects reality.
     data["sharing_enabled"] = _sharing_enabled(db)
+    # Effective account-onboarding policy (email requirement, invitation + signup switches, domain
+    # gate, login identifier) with defaults filled in, so the Accounts & Access tab renders the real
+    # posture and a whole-object save can't persist an unchecked default.
+    from app.core.account_policy import effective_account_policy
+    data.update(effective_account_policy(row.value if row else None))
     # Stored zero means "use deployment default"; expose those defaults separately so the UI
     # can explain the effective fallback without persisting it on an unrelated save.
     for key in _RATE_LIMIT_API_SETTING_KEYS:
