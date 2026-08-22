@@ -16,6 +16,7 @@ from app.core.account_policy import (
     AccountPolicyError,
     effective_account_policy,
     normalize_domains,
+    normalize_domains_lenient,
     validate_account_policy,
 )
 
@@ -106,6 +107,31 @@ def test_normalize_count_bound_counts_after_dedup():
     # MAX distinct domains plus duplicates of them must PASS (dedup happens before the count check)
     exactly_max = [f"d{i}.example.com" for i in range(MAX_SIGNUP_DOMAINS)]
     assert normalize_domains(exactly_max + exactly_max) == exactly_max
+
+
+def test_strict_normalize_rejects_an_oversized_raw_list_up_front():
+    # a pathologically large raw list is refused before the per-entry loop walks it
+    with pytest.raises(AccountPolicyError):
+        normalize_domains(["a.io"] * (10 * MAX_SIGNUP_DOMAINS + 1))
+
+
+# ---- read path is LENIENT: malformed stored data renders clean, never raises ------------------
+def test_effective_drops_malformed_stored_domains_instead_of_raising():
+    eff = effective_account_policy({"signup_email_domains":
+                                    ["Good.com", "not a domain", "@Also.io", 123, "good.com", "*.x.com"]})
+    assert eff["signup_email_domains"] == ["good.com", "also.io"]   # valid kept+normalized, junk dropped
+
+
+def test_effective_coerces_non_list_or_none_domains_to_empty():
+    assert effective_account_policy({"signup_email_domains": "example.com"})["signup_email_domains"] == []
+    assert effective_account_policy({"signup_email_domains": None})["signup_email_domains"] == []
+    assert effective_account_policy({"signup_email_domains": ["localhost"]})["signup_email_domains"] == []
+
+
+def test_normalize_domains_lenient_drops_invalid_and_dedupes():
+    assert normalize_domains_lenient(["A.com", "a.com", "bad domain", "@b.io"]) == ["a.com", "b.io"]
+    assert normalize_domains_lenient("nope") == []
+    assert normalize_domains_lenient([123, None, "x.io"]) == ["x.io"]
 
 
 # ---- validate_account_policy: enums -----------------------------------------------------------

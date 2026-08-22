@@ -22,6 +22,10 @@ MIN_INVITE_TTL_HOURS = 1
 MAX_INVITE_TTL_HOURS = 720          # 30 days
 MAX_SIGNUP_DOMAINS = 100
 MAX_DOMAIN_LENGTH = 253             # RFC 1035 total length ceiling
+# Hard ceiling on the RAW list length, checked before the per-entry loop so a pathologically large
+# input can't be fully walked. Generous vs MAX_SIGNUP_DOMAINS so a list padded with duplicates
+# (which dedup below) still passes.
+_MAX_RAW_DOMAINS = 10 * MAX_SIGNUP_DOMAINS
 
 # Defaults chosen so an install that never opens this tab behaves exactly as it did before it existed.
 DEFAULTS = {
@@ -59,7 +63,9 @@ def effective_account_policy(stored: dict | None) -> dict:
     out = {}
     for key, default in DEFAULTS.items():
         out[key] = stored[key] if key in stored else default
-    out["signup_email_domains"] = normalize_domains(out.get("signup_email_domains") or [])
+    # Read path: LENIENT. A legacy or hand-edited stored row may hold invalid entries; drop them and
+    # render clean rather than 500 the whole settings page. The write path stays strict.
+    out["signup_email_domains"] = normalize_domains_lenient(out.get("signup_email_domains"))
     return out
 
 
@@ -72,6 +78,8 @@ def normalize_domains(value) -> list[str]:
     """
     if not isinstance(value, list):
         raise AccountPolicyError("signup_email_domains must be a list of domain strings")
+    if len(value) > _MAX_RAW_DOMAINS:
+        raise AccountPolicyError(f"at most {MAX_SIGNUP_DOMAINS} signup domains are allowed")
     seen: set[str] = set()
     out: list[str] = []
     for raw in value:
@@ -94,6 +102,32 @@ def normalize_domains(value) -> list[str]:
     if len(out) > MAX_SIGNUP_DOMAINS:
         raise AccountPolicyError(f"at most {MAX_SIGNUP_DOMAINS} signup domains are allowed")
     return out
+
+
+def normalize_domains_lenient(value) -> list[str]:
+    """Read-path normalization: keep the valid domains and DROP anything malformed, never raising.
+
+    A legacy or hand-edited stored row (a non-list, a bad domain, a non-string entry) must render
+    clean rather than 500 the settings page on load; the write path (normalize_domains /
+    validate_account_policy) stays strict and rejects the same input. Bounded and deduped.
+    """
+    if not isinstance(value, list):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in value[:_MAX_RAW_DOMAINS]:
+        if not isinstance(raw, str):
+            continue
+        d = raw.strip()
+        if d.startswith("@"):
+            d = d[1:]
+        d = d.strip().lower()
+        if not d or len(d) > MAX_DOMAIN_LENGTH or not _DOMAIN_RE.match(d):
+            continue
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out[:MAX_SIGNUP_DOMAINS]
 
 
 def validate_account_policy(payload: dict, *, email_login_locks_out_admin: bool = False,
