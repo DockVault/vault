@@ -105,8 +105,8 @@ def validate_account_policy(payload: dict, *, email_login_locks_out_admin: bool 
     admin-safe message on the first invalid value.
 
     Two DB-derived facts the pure validator cannot know are supplied by the caller:
-    - `email_login_locks_out_admin` (owner decision 4): refuse login_identifier='email' when an
-      active admin has no email, or they can never log in again.
+    - `email_login_locks_out_admin`: refuse login_identifier='email' when an active admin has no
+      email, or they could never log in again.
     - `smtp_configured`: refuse turning ON email-change verification unless the deployment can send
       the one-time code (email-change verification is gated behind email-client setup).
     """

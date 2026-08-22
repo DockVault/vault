@@ -2289,8 +2289,8 @@ def _zk_idle_lock_minutes(db: Session) -> int:
 
 
 def _email_login_would_lock_out_admin(db: Session) -> bool:
-    """True if switching to email-only login would strand an admin (owner decision 4): any active
-    ADMIN account has no email address, so it could present no valid login identifier."""
+    """True if switching to email-only login would strand an admin: any active ADMIN account has no
+    email address, so it could present no valid login identifier."""
     from app.core.models import User, RoleEnum
     from sqlalchemy import or_, func
     return db.query(User.id).filter(
@@ -2460,7 +2460,7 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
 
     # Account-onboarding policy (email requirement, invitation/signup switches, invite TTL, domain
     # gate, login identifier). Validated by a pure helper so the same rules are unit-testable; the one
-    # DB-derived fact it can't know is whether email-only login would lock out an admin (decision 4).
+    # DB-derived fact it can't know is whether email-only login would lock out an admin.
     from app.core.account_policy import (
         ACCOUNT_POLICY_KEYS, validate_account_policy, AccountPolicyError)
     if any(k in payload for k in ACCOUNT_POLICY_KEYS):

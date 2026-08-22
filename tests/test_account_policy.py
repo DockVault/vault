@@ -161,7 +161,7 @@ def test_invite_ttl_invalid(value):
         validate_account_policy({"invite_ttl_hours": value})
 
 
-# ---- the email-only-login lockout guard (owner decision 4) ------------------------------------
+# ---- the email-only-login lockout guard -------------------------------------------------------
 def test_email_login_refused_when_it_would_lock_out_an_admin():
     with pytest.raises(AccountPolicyError):
         validate_account_policy({"login_identifier": "email"}, email_login_locks_out_admin=True)
