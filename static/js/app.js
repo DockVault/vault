@@ -5306,6 +5306,7 @@ function setupSettingsTabs() {
             }
             if (tabId === 'logs') { loadLogSettings(); }  // refresh on tab open
             if (tabId === 'sharing') { setupShareTagsUI(); loadShareTags(); }  // wire (idempotent) + refresh
+            if (tabId === 'accounts') { setupAccountsPolicyUI(); refreshAccountsPolicyUI(); }  // wire + reflect deps
         });
     });
 }
@@ -5760,6 +5761,153 @@ function setupUpdateControls() {
     if (save && !save.dataset.wired) { save.dataset.wired = '1'; save.addEventListener('click', saveUpdateInterval); }
 }
 
+// ---- Accounts & Access policy (Settings tab) --------------------------------------
+// Mirrors the effective org-onboarding policy from GET /settings and keeps dependent
+// controls honest. The server (PUT /settings) is authoritative and re-validates everything.
+let accountsDomains = [];
+let accountsSmtpConfigured = false;
+let _accountsPolicyWired = false;
+
+function setupAccountsPolicyUI() {
+    if (_accountsPolicyWired) return;
+    _accountsPolicyWired = true;
+    ['setting-invite-enabled', 'setting-signup-enabled', 'setting-signup-domain-mode',
+     'setting-email-requirement', 'setting-login-identifier', 'setting-email-change-verification']
+        .forEach(id => { const el = document.getElementById(id); if (el) el.addEventListener('change', refreshAccountsPolicyUI); });
+    const ttl = document.getElementById('setting-invite-ttl-hours');
+    if (ttl) ttl.addEventListener('input', updateAccountsSummary);
+    const addBtn = document.getElementById('setting-signup-domain-add');
+    if (addBtn) addBtn.addEventListener('click', addAccountsDomain);
+    const input = document.getElementById('setting-signup-domain-input');
+    if (input) input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addAccountsDomain(); } });
+}
+
+function addAccountsDomain() {
+    const input = document.getElementById('setting-signup-domain-input');
+    if (!input) return;
+    let d = (input.value || '').trim();
+    if (d.startsWith('@')) d = d.slice(1);
+    d = d.trim().toLowerCase();
+    if (!d) return;
+    // Light client-side shape check; PUT /settings is authoritative and rejects anything else.
+    if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(d)) {
+        showError(`"${input.value.trim()}" is not a valid domain`);
+        return;
+    }
+    if (!accountsDomains.includes(d)) accountsDomains.push(d);
+    input.value = '';
+    renderAccountsDomains();
+    updateAccountsSummary();
+    input.focus();
+}
+
+function renderAccountsDomains() {
+    const list = document.getElementById('setting-signup-domains-list');
+    if (!list) return;
+    if (!accountsDomains.length) {
+        list.replaceChildren(_el('span', 'text-secondary text-sm', 'No domains added.'));
+        return;
+    }
+    list.replaceChildren(...accountsDomains.map(d => {
+        const chip = _el('span', 'chip', d);
+        chip.setAttribute('role', 'listitem');
+        const x = _el('button', 'chip-remove'); x.type = 'button'; x.setAttribute('aria-label', `Remove ${d}`);
+        x.appendChild(_svgIcon('x', 'icon-sm'));
+        x.addEventListener('click', () => { accountsDomains = accountsDomains.filter(v => v !== d); renderAccountsDomains(); updateAccountsSummary(); });
+        chip.appendChild(x);
+        return chip;
+    }));
+}
+
+function refreshAccountsPolicyUI() {
+    const on = id => { const el = document.getElementById(id); return !!(el && el.checked); };
+    const setDisabled = (id, disabled) => { const el = document.getElementById(id); if (el) el.disabled = disabled; };
+    const dim = (id, active) => { const el = document.getElementById(id); if (el) el.style.opacity = active ? '' : '0.6'; };
+
+    const inviteOn = on('setting-invite-enabled');
+    setDisabled('setting-invite-ttl-hours', !inviteOn);
+    dim('accounts-invite-card', inviteOn);
+
+    const signupOn = on('setting-signup-enabled');
+    setDisabled('setting-signup-domain-mode', !signupOn);
+    dim('accounts-signup-card', signupOn);
+    const modeEl = document.getElementById('setting-signup-domain-mode');
+    const domainsActive = signupOn && modeEl && modeEl.value !== 'off';
+    setDisabled('setting-signup-domain-input', !domainsActive);
+    setDisabled('setting-signup-domain-add', !domainsActive);
+
+    // Email-change verification can only be toggled when SMTP is configured (server-enforced too).
+    const ecv = document.getElementById('setting-email-change-verification');
+    if (ecv) ecv.disabled = !accountsSmtpConfigured;
+    const help = document.getElementById('accounts-email-verify-help');
+    if (help) {
+        help.textContent = accountsSmtpConfigured
+            ? "A user changing their own email must confirm a one-time code sent to the new address; administrators setting an email are exempt."
+            : "A user changing their own email must confirm a one-time code sent to the new address; administrators setting an email are exempt. Configure email (SMTP) on the Email tab to enable this.";
+    }
+    updateAccountsSummary();
+}
+
+function updateAccountsSummary() {
+    const el = document.getElementById('accounts-policy-summary');
+    if (!el) return;
+    const val = id => { const e = document.getElementById(id); return e ? e.value : ''; };
+    const on = id => { const e = document.getElementById(id); return !!(e && e.checked); };
+    const parts = [];
+    parts.push(val('setting-email-requirement') === 'required'
+        ? 'Every account must have an email address.' : 'An email address is optional.');
+    const lid = val('setting-login-identifier');
+    parts.push(lid === 'email' ? 'People sign in with their email.'
+        : lid === 'either' ? 'People sign in with their username or email.'
+        : 'People sign in with their username.');
+    parts.push(on('setting-invite-enabled') ? 'Admins can invite people by link.' : 'Invitations are off.');
+    parts.push(on('setting-signup-enabled') ? 'Anyone can sign themselves up.' : 'Self-signup is off.');
+    if (on('setting-signup-enabled') && val('setting-signup-domain-mode') !== 'off') {
+        const verb = val('setting-signup-domain-mode') === 'allowlist' ? 'restricted to' : 'blocked for';
+        parts.push(`Signup email is ${verb} ${accountsDomains.length} listed domain(s).`);
+    }
+    if (on('setting-email-change-verification')) {
+        parts.push('Changing one’s own email requires a code sent to the new address.');
+    }
+    el.textContent = parts.join(' ');
+}
+
+function populateAccountsPolicy(settings) {
+    const setChk = (id, v) => { const el = document.getElementById(id); if (el) el.checked = v === true; };
+    const setVal = (id, v) => { const el = document.getElementById(id); if (el && v != null) el.value = v; };
+    setChk('setting-invite-enabled', settings.invite_enabled);
+    setChk('setting-signup-enabled', settings.signup_enabled);
+    setVal('setting-invite-ttl-hours', settings.invite_ttl_hours != null ? settings.invite_ttl_hours : 24);
+    setVal('setting-signup-domain-mode', settings.signup_email_domain_mode || 'off');
+    setVal('setting-email-requirement', settings.email_requirement || 'required');
+    setVal('setting-login-identifier', settings.login_identifier || 'username');
+    setChk('setting-email-change-verification', settings.email_change_requires_verification);
+    accountsDomains = Array.isArray(settings.signup_email_domains) ? settings.signup_email_domains.slice() : [];
+    accountsSmtpConfigured = !!((settings.smtp_server || '').trim() && (settings.from_email || '').trim());
+    setupAccountsPolicyUI();
+    renderAccountsDomains();
+    refreshAccountsPolicyUI();
+}
+
+function collectAccountsPolicy(settings) {
+    const val = id => { const el = document.getElementById(id); return el ? el.value : undefined; };
+    const on = id => { const el = document.getElementById(id); return el ? el.checked : undefined; };
+    settings.invite_enabled = on('setting-invite-enabled');
+    settings.signup_enabled = on('setting-signup-enabled');
+    const ttl = parseInt(val('setting-invite-ttl-hours'), 10);
+    if (!Number.isNaN(ttl)) settings.invite_ttl_hours = ttl;
+    settings.signup_email_domain_mode = val('setting-signup-domain-mode');
+    settings.email_requirement = val('setting-email-requirement');
+    settings.login_identifier = val('setting-login-identifier');
+    settings.signup_email_domains = accountsDomains.slice();
+    // Only send the verification flag when SMTP is configured (the only state in which it's
+    // settable). Otherwise omit it so a whole-object save can't trip the server's SMTP gate and
+    // can't silently flip a stored value.
+    if (accountsSmtpConfigured) {
+        settings.email_change_requires_verification = on('setting-email-change-verification');
+    }
+}
+
 async function loadSettings() {
     try {
         const settings = await apiRequest('/settings', { silent: true });
@@ -5908,6 +6056,9 @@ async function loadSettings() {
         setupShareTagsUI();
         loadShareTags();
 
+        // Accounts & Access: the org-onboarding policy block.
+        populateAccountsPolicy(settings);
+
         console.log('✓ Settings loaded');
     } catch (error) {
         console.log('Settings endpoint not available');
@@ -6013,6 +6164,9 @@ async function saveAllSettings() {
         // Sharing master switch (the per-tag policy lives in the Share Tags manager, not here)
         const shEnEl = document.getElementById('setting-sharing-enabled');
         if (shEnEl) settings.sharing_enabled = shEnEl.checked;
+
+        // Accounts & Access: the org-onboarding policy block.
+        collectAccountsPolicy(settings);
 
         // Only include password if provided
         const smtpPassword = document.getElementById('setting-smtp-password').value;
