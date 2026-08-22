@@ -3446,6 +3446,12 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
             raise HTTPException(status_code=429, detail="Too many requests.",
                                 headers={"Retry-After": str(max(1, reset - int(_t.time())))})
 
+    # A global config error (pepper unset) is a 503 on BOTH public endpoints, consistent with GET —
+    # not a per-token oracle (same answer for every token).
+    if not invitations.pepper_ok(_invite_pepper()):
+        raise HTTPException(status_code=503,
+                            detail="Invitations are unavailable: the invite-token secret is not configured.")
+
     generic_miss = HTTPException(status_code=404, detail="Invitation not found.")
 
     # (b) Resolve (also re-checks invite_enabled + pepper). A disabled-after-mint token is no longer
@@ -3455,8 +3461,15 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
         _audit_accept_failure(db, prefix, client_ip, reason="unresolved")
         raise generic_miss
 
-    # (c) Password policy (beyond the model's 8-char floor).
-    _validate_password_policy(db, payload.password)
+    # (c)-(e) Post-resolution validation. A rejection here is a legitimate-but-invalid submission on an
+    # already-valid token; audit each outcome (the accept contract logs EVERY outcome) with a distinct
+    # reason, then re-raise unchanged. Nothing is written to the session yet, so the audit commit is
+    # clean. (c) Password policy (beyond the model's 8-char floor):
+    try:
+        _validate_password_policy(db, payload.password)
+    except HTTPException:
+        _audit_accept_failure(db, prefix, client_ip, reason="weak_password")
+        raise
 
     # (d) Email: the invite's address if it has one (validated + reserved at mint); otherwise per
     # current policy, domain-gated and unique.
@@ -3466,17 +3479,24 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
     else:
         body_email = normalize_email(payload.email)
         if pol.get("email_requirement") == "required" and not body_email:
+            _audit_accept_failure(db, prefix, client_ip, reason="email_required")
             raise HTTPException(status_code=400, detail="An email address is required.")
         if body_email:
             if not email_allowed_by_domain_gate(body_email, pol.get("signup_email_domain_mode"),
                                                 pol.get("signup_email_domains")):
+                _audit_accept_failure(db, prefix, client_ip, reason="email_domain")
                 raise HTTPException(status_code=400, detail="That email domain is not permitted.")
             if email_in_use(db, body_email):
+                _audit_accept_failure(db, prefix, client_ip, reason="email_in_use")
                 raise HTTPException(status_code=400, detail="That email address is already in use.")
         acct_email = body_email
 
     # (e) Plan cap — invited accounts count too.
-    _enforce_user_cap(db)
+    try:
+        _enforce_user_cap(db)
+    except HTTPException:
+        _audit_accept_failure(db, prefix, client_ip, reason="user_cap")
+        raise
 
     # (f) Build the user inline + flush (NO commit) so it lives in the same transaction as the claim.
     # The username==existing-email impersonation guard has no DB backstop, so re-run it here; the

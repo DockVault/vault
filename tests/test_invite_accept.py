@@ -259,3 +259,24 @@ def test_accept_success_and_failure_are_audited(admin, invites_on):
         assert int(leak) == 0
     finally:
         _cleanup_user(admin, ok["username"])
+
+
+def test_post_resolution_validation_failure_is_audited(admin, invites_on):
+    # A rejection AFTER the token resolves (here: a weak password) must still leave an audit trail,
+    # tagged with the reason, and must NOT consume the single-use invite.
+    admin.put("/settings", json={"password_min_length": 14, "require_special": True})
+    inv = _mint(admin, username=unique("audfail"), role="user")
+    try:
+        before = int(_psql("SELECT count(*) FROM audit_logs WHERE action='account_invitation_accept_failed' "
+                           f"AND details::text LIKE {_q('%weak_password%')}"))
+        # >=8 chars (passes the model floor) but <14 and no special (fails the org policy) -> 400
+        r = _anon().post(f"/invites/{inv['token']}/accept", json={"password": "abcdefghij"})
+        assert r.status_code == 400, r.text
+        after = int(_psql("SELECT count(*) FROM audit_logs WHERE action='account_invitation_accept_failed' "
+                          f"AND details::text LIKE {_q('%weak_password%')}"))
+        assert after == before + 1, "weak-password accept was not audited"
+        # the single-use invite is NOT consumed by a validation failure — still claimable
+        assert _anon().get(f"/invites/{inv['token']}").status_code == 200
+    finally:
+        admin.put("/settings", json={"password_min_length": None, "require_special": False})
+        _cleanup_user(admin, inv["username"])

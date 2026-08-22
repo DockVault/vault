@@ -227,7 +227,6 @@ def grant_default_permissions_for_role(
         db.rollback()
         raise
     return groups
-    return groups
 
 
 def revoke_endpoint_permission(
