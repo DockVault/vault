@@ -286,3 +286,30 @@ def test_login_throttle_fires_with_finite_limit(admin, restore_login_policy):
             break
         assert r.status_code == 401, r.text  # until the limit, a plain miss
     assert saw_429, "login throttle never fired despite a finite max_login_attempts"
+
+
+# --- login-identifier readiness: resolution-based, catches the broken-index collision ----------
+def test_readiness_flags_admin_whose_email_cannot_resolve(admin):
+    """The lockout guard must judge "can sign in by email" by RESOLUTION, not mere presence of a
+    non-blank address. On a legacy install that couldn't build the lower(email) unique index, an
+    admin's email can collide case-insensitively and fail closed at login — so email-only would be a
+    total lockout the guard must still see. Seed that collision and assert the admin is flagged."""
+    b = admin.create_user(role="admin", email=f"{unique('dupadm')}@example.com")   # stored lowercased
+    c = admin.create_user(role="user", email=f"{unique('other')}@example.com")
+    dropped = False
+    try:
+        # sanity: with a clean index, b resolves and is NOT flagged
+        assert b["_username"] not in admin.get("/settings/login-identifier-readiness").json()["admins_without_email"]
+        _psql(f"DROP INDEX IF EXISTS {INDEX}", fetch=False)
+        dropped = True
+        # point c at a case-variant of b's address -> two rows share lower(email) -> b can't resolve
+        variant = b["email"][:1].upper() + b["email"][1:]
+        _psql(f"UPDATE users SET email={_q(variant)} WHERE id={_q(c['id'])}", fetch=False)
+        flagged = admin.get("/settings/login-identifier-readiness").json()["admins_without_email"]
+        assert b["_username"] in flagged, "an admin with an unresolvable colliding email must be flagged"
+    finally:
+        _psql(f"UPDATE users SET email={_q(unique('restored') + '@example.com')} WHERE id={_q(c['id'])}", fetch=False)
+        if dropped:
+            _psql(f"CREATE UNIQUE INDEX IF NOT EXISTS {INDEX} ON users (lower(email))", fetch=False)
+        admin.delete_user(b["id"])
+        admin.delete_user(c["id"])

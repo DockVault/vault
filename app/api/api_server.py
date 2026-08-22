@@ -2331,16 +2331,71 @@ def _zk_idle_lock_minutes(db: Session) -> int:
     return max(0, min(v, 1440))
 
 
-def _email_login_would_lock_out_admin(db: Session) -> bool:
-    """True if switching to email-only login would strand an admin: any active ADMIN account has no
-    email address, so it could present no valid login identifier."""
+def _admin_can_email_login(db: Session, admin) -> bool:
+    """Whether this admin could actually sign in under email-only login. Judged by RESOLUTION, not
+    just "has a non-blank email": email login goes through find_user_by_email, which fails closed on
+    a case-insensitive duplicate (the legacy broken-index install), so a colliding email that can't
+    resolve to exactly this account does NOT count — otherwise the lockout guard would wave through a
+    total lockout it exists to prevent."""
+    from app.core.email_identity import find_user_by_email
+    if not (admin.email or "").strip():
+        return False
+    resolved = find_user_by_email(db, admin.email)
+    return resolved is not None and resolved.id == admin.id
+
+
+def _active_admins(db: Session):
+    """Active ADMIN accounts, ordered for a stable display list."""
+    from app.core.models import User, RoleEnum
+    return db.query(User).filter(
+        User.role == RoleEnum.ADMIN, User.is_active.isnot(False),
+    ).order_by(User.username).all()
+
+
+def _admins_without_email(db: Session):
+    """Usernames of every active ADMIN who could NOT sign in under email-only login — no email, or an
+    email that doesn't resolve uniquely to them (a case-insensitive duplicate). The complete list for
+    the warning, and the basis for the total-lockout check."""
+    return [a.username for a in _active_admins(db) if not _admin_can_email_login(db, a)]
+
+
+def _active_admin_with_email_exists(db: Session) -> bool:
+    """True if at least one active ADMIN could actually sign in by email — i.e. someone can still get
+    in under email-only login (resolution, not mere presence of a non-blank address)."""
+    return any(_admin_can_email_login(db, a) for a in _active_admins(db))
+
+
+def _email_login_would_lock_out_all_admins(db: Session) -> bool:
+    """True only if email-only login would strand EVERY admin: no active ADMIN has an email, so no
+    administrator could present a valid identifier and there would be no way back in. (A partial
+    lockout — some admins lack email but at least one has one — is allowed and only warned about.)"""
+    return not _active_admin_with_email_exists(db)
+
+
+def _users_without_email_count(db: Session) -> int:
+    """How many active NON-admin accounts have no email — the population that would lose access under
+    email-only login. Returned as a count only (there can be many)."""
     from app.core.models import User, RoleEnum
     from sqlalchemy import or_, func
     return db.query(User.id).filter(
-        User.role == RoleEnum.ADMIN,
+        User.role != RoleEnum.ADMIN,
         User.is_active.isnot(False),
         or_(User.email.is_(None), func.length(func.trim(User.email)) == 0),
-    ).first() is not None
+    ).count()
+
+
+def _login_identifier_readiness(db: Session, current_user) -> dict:
+    """What the admin needs to see before switching Sign-in method to 'email': who would be locked
+    out. Admins are few, so the COMPLETE list is returned (serious); users can be many, so only a
+    COUNT. `blocks` is the hard-stop condition (no admin has an email — the save will be refused)."""
+    admins_no_email = _admins_without_email(db)
+    cur = getattr(current_user, "username", None)
+    return {
+        "blocks": not _active_admin_with_email_exists(db),
+        "admins_without_email": admins_no_email,
+        "current_user_without_email": cur in admins_no_email,
+        "users_without_email_count": _users_without_email_count(db),
+    }
 
 
 def _username_email_collision(db: Session):
@@ -2631,7 +2686,7 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
         try:
             normalized = validate_account_policy(
                 payload,
-                email_login_locks_out_admin=_email_login_would_lock_out_admin(db),
+                email_login_locks_out_all_admins=_email_login_would_lock_out_all_admins(db),
                 smtp_configured=_smtp_configured(db),
                 username_email_collision=_username_email_collision(db))
         except AccountPolicyError as exc:
@@ -2639,6 +2694,18 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
         # Persist the canonical form (deduped/lowercased domains), not the raw input. Mutating the
         # payload here carries the normalized value into the merge in update_settings.
         payload.update(normalized)
+
+
+@app.get("/settings/login-identifier-readiness")
+async def get_login_identifier_readiness(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Who would lose access if Sign-in method were switched to 'email', so the settings UI can warn
+    BEFORE the save. Admin-only (the same surface as the settings it informs). Returns the hard-block
+    flag, the complete list of admins with no email, whether the requesting admin is one of them, and
+    a count of non-admin users with no email."""
+    return _login_identifier_readiness(db, current_user)
 
 
 @app.get("/settings")

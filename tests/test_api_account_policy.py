@@ -141,6 +141,47 @@ def test_email_only_login_allowed_when_admin_has_email(admin, restore_settings):
     assert _s(admin)["login_identifier"] == "email"
 
 
+def test_email_only_allowed_under_a_partial_admin_lockout(admin, restore_settings):
+    # A SECOND admin without email would be locked out, but the acting admin has one — a partial
+    # lockout. This is now ALLOWED (it used to be refused when ANY admin lacked email); the UI warns.
+    me = admin.get("/users/me").json()
+    if not (me.get("email") or "").strip():
+        pytest.skip("acting admin has no email")
+    other = admin.create_user(role="admin", email=None)
+    try:
+        r = admin.put("/settings", json={"login_identifier": "email"})
+        assert r.status_code == 200, r.text
+        assert _s(admin)["login_identifier"] == "email"
+    finally:
+        admin.delete_user(other["id"])
+
+
+def test_login_identifier_readiness_reports_who_would_be_locked_out(admin, restore_settings):
+    other_admin = admin.create_user(role="admin", email=None)
+    a_user = admin.create_user(role="user", email=None)
+    try:
+        r = admin.get("/settings/login-identifier-readiness")
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert other_admin["_username"] in data["admins_without_email"]   # complete admin list
+        assert data["users_without_email_count"] >= 1                     # generic user count
+        assert data["blocks"] is False                                    # the acting admin has email
+        assert data["current_user_without_email"] is False
+    finally:
+        admin.delete_user(other_admin["id"])
+        admin.delete_user(a_user["id"])
+
+
+def test_login_identifier_readiness_is_admin_only(admin):
+    u = admin.create_user(role="user")
+    c = admin.clone_anonymous()
+    c.login(u["_username"], u["_password"])
+    try:
+        assert c.get("/settings/login-identifier-readiness").status_code == 403
+    finally:
+        admin.delete_user(u["id"])
+
+
 def test_settings_save_is_audited(admin, restore_settings):
     admin.put("/settings", json={"invite_ttl_hours": 72})
     r = admin.get("/audit/events", params={"limit": 50})
