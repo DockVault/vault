@@ -6971,11 +6971,27 @@ async function testEmail() {
         btn.disabled = true;
         btn.textContent = 'Sending...';
         resultSpan.textContent = '';
-        
+
+        // Save the Email-tab fields FIRST. The test endpoint reads the STORED settings, so an unsaved
+        // form would otherwise report "SMTP is not configured" even though the fields are filled in.
+        // This is a targeted PUT of just the SMTP keys — it merges server-side and leaves any other
+        // unsaved settings on the page untouched. The password is sent only when entered, so testing
+        // never blanks a stored password.
+        const emailSettings = {
+            smtp_server: document.getElementById('setting-smtp-server').value,
+            smtp_port: parseInt(document.getElementById('setting-smtp-port').value) || 587,
+            smtp_username: document.getElementById('setting-smtp-username').value,
+            from_email: document.getElementById('setting-from-email').value,
+            from_name: document.getElementById('setting-from-name').value,
+        };
+        const smtpPassword = document.getElementById('setting-smtp-password').value;
+        if (smtpPassword) emailSettings.smtp_password = smtpPassword;
+        await apiRequest('/settings', { method: 'PUT', body: JSON.stringify(emailSettings) });
+
         await apiRequest('/settings/test-email', {
             method: 'POST'
         });
-        
+
         showSuccess('Test email sent successfully');
         resultSpan.textContent = '✓ Email sent';
         resultSpan.style.color = 'var(--success)';
