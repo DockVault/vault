@@ -4795,6 +4795,17 @@ async def update_user(
     # "email" omitted leaves the address alone; sent as an explicit null clears it.
     if "email" in user_update.model_fields_set:
         new_email = normalize_email(user_update.email)
+        # Changing your OWN email here would sidestep the re-proof its sibling requires. Exactly like
+        # the password field just below, the id form refuses a self change and points at /users/me,
+        # which demands the current password (and, when the org requires it, an emailed verification
+        # code). An admin changing SOMEONE ELSE's email is a different, already-trusted act and still
+        # allowed. A no-op resave of one's own address is not a change and falls through.
+        if is_self and new_email != user.email:
+            raise HTTPException(
+                status_code=400,
+                detail="Change your own email from account settings, which requires your "
+                       "current password.",
+            )
         # This path previously assigned the address with NO uniqueness check at all, so an exact
         # duplicate reached the database and surfaced as an uncaught IntegrityError 500.
         if new_email is not None and email_in_use(db, new_email, exclude_user_id=user.id):
