@@ -692,6 +692,14 @@ class InviteCreate(BaseModel):
         return _validate_new_username(v)
 
 
+class InviteAccept(BaseModel):
+    # Mass-assignment defense: the ONLY fields an invitee may supply. Username and role come from the
+    # invitation ROW, never the request body — so role/is_active/is_locked/quota are structurally
+    # unrepresentable here. `email` is used only when the invitation carries no address.
+    password: str = Field(..., min_length=8)
+    email: Optional[EmailStr] = None
+
+
 class UserUpdate(BaseModel):
     email: Optional[EmailStr] = None
     password: Optional[str] = Field(None, min_length=8)
@@ -2250,6 +2258,17 @@ def _validate_password_policy(db: Session, password: str) -> None:
         raise HTTPException(status_code=400, detail="Password must " + "; ".join(errs) + ".")
 
 
+def _password_policy_view(db: Session) -> dict:
+    """The enforced password policy in a shape safe to hand an unauthenticated client (the invite
+    acceptance form) so it can show the requirements. Same source + clamps as _validate_password_policy,
+    so the displayed rules can never drift from the enforced ones."""
+    from app.core import password_policy
+    from app.core.models import SystemSetting
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    cfg = (row.value or {}) if (row and row.value) else {}
+    return password_policy.password_policy_view(cfg)
+
+
 # ---------------------------------------------------------------------------
 # Temporary Vault Passcode policy. The effective values are resolved by the pure,
 # unit-tested app/core/temp_passcode_policy module (mirrors password_policy.py);
@@ -3312,6 +3331,210 @@ async def revoke_invite(
         except Exception:
             pass
     return {"ok": True, "id": str(inv.id), "status": "revoked"}
+
+
+# ---------------------------------------------------------------------------
+# Public invitation acceptance (UNAUTHENTICATED). GET renders the form's inputs;
+# POST creates the account. Both fail closed and non-enumerating: an invalid,
+# expired, revoked, or already-accepted token — and a globally disabled feature —
+# all return the SAME generic 404, so the surface can't be probed for valid tokens.
+# ---------------------------------------------------------------------------
+def _resolve_valid_invite(db: Session, token: str):
+    """Return the AccountInvitation iff it is presently claimable (pending — not revoked, not
+    accepted, not expired), else None. Fail CLOSED: any exception, disabled feature, unusable pepper,
+    wrong prefix, no match, or non-pending lifecycle -> None, so callers have ONE generic branch and
+    the surface is not an enumeration oracle. Mirrors require_log_pull_token: match the hash FIRST
+    (constant-time), evaluate lifecycle in Python AFTER — never filter lifecycle in SQL (an expired
+    row's absence would otherwise be distinguishable from a never-existed token)."""
+    from app.core.models import AccountInvitation
+    from app.core import invitations
+    try:
+        if not _account_policy(db).get("invite_enabled"):
+            return None
+        pepper = _invite_pepper()
+        if not invitations.pepper_ok(pepper):
+            return None
+        now = datetime.utcnow()
+        rows = db.query(AccountInvitation).filter(
+            AccountInvitation.token_prefix == invitations.token_prefix(token)
+        ).all()
+        for r in rows:
+            if invitations.invite_tokens_match(token, pepper, r.token_hash):
+                if r.revoked_at is not None or r.accepted_at is not None or r.expires_at <= now:
+                    return None
+                return r
+        return None
+    except Exception:  # noqa: BLE001 — fail closed, like require_log_pull_token
+        return None
+
+
+def _audit_accept_failure(db: Session, prefix: str, ip: str, reason: str) -> None:
+    """Record a failed acceptance attempt (anonymous — no user yet). Never carries the raw token,
+    only its public prefix; never raises."""
+    try:
+        AuditLogger(db).log_action(
+            action="account_invitation_accept_failed", status="failure", user=None,
+            ip_address=ip, resource_type="account_invitation",
+            details={"token_prefix": prefix, "reason": reason})
+    except Exception:
+        pass
+
+
+@app.get("/invites/{token}")
+async def get_invite(token: str, request: Request, db: Session = Depends(get_db)):
+    """PUBLIC: what the acceptance form needs for a claimable token (the claimed username, whether an
+    email is still required, the password policy). Every non-usable state returns the same 404."""
+    import time as _t
+    from app.core import invitations
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    client_ip = get_client_ip(request)
+    try:
+        allowed, _, reset = _rl.check_rate_limit(
+            identifier=client_ip, limit=30, window=60, prefix="invite_lookup", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Too many requests.",
+                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    if not invitations.pepper_ok(_invite_pepper()):
+        raise HTTPException(status_code=503,
+                            detail="Invitations are unavailable: the invite-token secret is not configured.")
+    inv = _resolve_valid_invite(db, token)
+    if inv is None:
+        raise HTTPException(status_code=404, detail="Invitation not found.")
+    pol = _account_policy(db)
+    return {
+        "username": inv.username,
+        "email": inv.email,
+        "email_required": (pol.get("email_requirement") == "required") and not inv.email,
+        "password_policy": _password_policy_view(db),
+        "expires_at": inv.expires_at.isoformat(),
+    }
+
+
+@app.post("/invites/{token}/accept")
+async def accept_invite(token: str, payload: InviteAccept, request: Request,
+                        db: Session = Depends(get_db)):
+    """PUBLIC: redeem an invitation into a new account. Single-use under concurrency, mass-assignment
+    proof (identity comes from the invite row, never the body), rate-limited per IP and per token
+    prefix, audited on every outcome. The account is NOT signed in — success lands at the login page."""
+    import time as _t
+    from app.core.models import AccountInvitation, RoleEnum, User
+    from app.core import invitations
+    from app.core.email_identity import normalize_email, email_in_use
+    from app.core.account_policy import email_allowed_by_domain_gate
+    from app.core.security import hash_password
+    from app.core.endpoint_permissions import grant_default_permissions_for_role
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    from sqlalchemy import update as _sa_update
+    from sqlalchemy.exc import IntegrityError
+
+    client_ip = get_client_ip(request)
+    prefix = invitations.token_prefix(token)
+
+    # (a) Rate limit — per IP AND per token prefix, both fail-closed (this is an unauthenticated
+    # account-creation surface; it must throttle even during a Redis outage).
+    for ident, pfx, lim in ((client_ip, "invite_accept_ip", 10), (prefix, "invite_accept_prefix", 5)):
+        try:
+            allowed, _, reset = _rl.check_rate_limit(identifier=ident, limit=lim, window=60,
+                                                     prefix=pfx, fail_open=False)
+        except RateLimiterUnavailable:
+            raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+        if not allowed:
+            raise HTTPException(status_code=429, detail="Too many requests.",
+                                headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+
+    generic_miss = HTTPException(status_code=404, detail="Invitation not found.")
+
+    # (b) Resolve (also re-checks invite_enabled + pepper). A disabled-after-mint token is no longer
+    # acceptable — the master switch is the org's current intent.
+    inv = _resolve_valid_invite(db, token)
+    if inv is None:
+        _audit_accept_failure(db, prefix, client_ip, reason="unresolved")
+        raise generic_miss
+
+    # (c) Password policy (beyond the model's 8-char floor).
+    _validate_password_policy(db, payload.password)
+
+    # (d) Email: the invite's address if it has one (validated + reserved at mint); otherwise per
+    # current policy, domain-gated and unique.
+    pol = _account_policy(db)
+    if inv.email:
+        acct_email = inv.email
+    else:
+        body_email = normalize_email(payload.email)
+        if pol.get("email_requirement") == "required" and not body_email:
+            raise HTTPException(status_code=400, detail="An email address is required.")
+        if body_email:
+            if not email_allowed_by_domain_gate(body_email, pol.get("signup_email_domain_mode"),
+                                                pol.get("signup_email_domains")):
+                raise HTTPException(status_code=400, detail="That email domain is not permitted.")
+            if email_in_use(db, body_email):
+                raise HTTPException(status_code=400, detail="That email address is already in use.")
+        acct_email = body_email
+
+    # (e) Plan cap — invited accounts count too.
+    _enforce_user_cap(db)
+
+    # (f) Build the user inline + flush (NO commit) so it lives in the same transaction as the claim.
+    # The username==existing-email impersonation guard has no DB backstop, so re-run it here; the
+    # username/email UNIQUE constraints cover the other collisions via IntegrityError on flush.
+    if email_in_use(db, inv.username):
+        _audit_accept_failure(db, prefix, client_ip, reason="username_email_conflict")
+        raise HTTPException(status_code=409, detail="This invitation cannot be completed.")
+    try:
+        role = RoleEnum(inv.role)
+    except ValueError:
+        _audit_accept_failure(db, prefix, client_ip, reason="bad_role")
+        raise HTTPException(status_code=400, detail="This invitation cannot be completed.")
+    user = User(username=inv.username, email=acct_email,
+                password_hash=hash_password(payload.password),
+                role=role, created_by=inv.created_by)
+    db.add(user)
+    try:
+        db.flush()  # surfaces users.username/email UNIQUE conflicts before we claim the invite
+    except IntegrityError:
+        db.rollback()
+        _audit_accept_failure(db, prefix, client_ip, reason="race_conflict")
+        raise HTTPException(status_code=409, detail="This invitation cannot be completed.")
+
+    # (g) Atomic single-use claim: the invite must still be pending. rowcount==1, or nothing happened
+    # and the flushed user is discarded — so a lost race or a mid-window revoke leaves NO half-account.
+    now = datetime.utcnow()
+    res = db.execute(
+        _sa_update(AccountInvitation)
+        .where(AccountInvitation.id == inv.id,
+               AccountInvitation.accepted_at.is_(None),
+               AccountInvitation.revoked_at.is_(None),
+               AccountInvitation.expires_at > now)
+        .values(accepted_at=now, accepted_user_id=user.id))
+    if res.rowcount != 1:
+        db.rollback()
+        _audit_accept_failure(db, prefix, client_ip, reason="claim_lost")
+        raise generic_miss
+
+    # (h) Grant the role's default permissions inside this same transaction (commit=False).
+    grant_default_permissions_for_role(str(user.id), user.role, db, commit=False)
+
+    # (i) One commit for the whole accept.
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        _audit_accept_failure(db, prefix, client_ip, reason="commit_conflict")
+        raise HTTPException(status_code=409, detail="This invitation cannot be completed.")
+
+    try:
+        AuditLogger(db).log_action(
+            action="account_invitation_accepted", status="success", user=user, ip_address=client_ip,
+            resource_type="account_invitation", resource_id=str(inv.id),
+            details={"username": inv.username, "role": str(user.role), "token_prefix": prefix})
+    except Exception:
+        pass
+
+    # Deliberately NOT auto-logged-in and NO token returned: an invitation link sitting in a mail
+    # client's history must not become a live session.
+    return {"ok": True, "username": inv.username}
 
 
 # ---------------------------------------------------------------------------

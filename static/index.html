@@ -9,7 +9,7 @@
     <title>DockVault</title>
     <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
     <link rel="apple-touch-icon" href="/static/assets/logo.png?v=1">
-    <link rel="stylesheet" href="/static/css/theme.css?v=20251015c">
+    <link rel="stylesheet" href="/static/css/theme.css?v=20260822a">
     <link rel="stylesheet" href="/static/css/components.css?v=20251015c">
     <link rel="stylesheet" href="/static/css/utilities.css?v=20251015c">
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-sans-500.woff2" crossorigin>
@@ -28,7 +28,7 @@
     <!-- Auth boot: picks the first-paint screen from whether a session token is
          cached, so an expired/logged-out load never flashes the app shell. See
          static/js/auth-boot.js. -->
-    <script src="/static/js/auth-boot.js?v=20260713a"></script>
+    <script src="/static/js/auth-boot.js?v=20260822a"></script>
     <!-- Branding boot: applies effective /branding (name, logo, favicon, theme colours)
          to the shell, pre-paint after the skin boot. See static/js/brand.js. -->
     <script src="/static/js/brand.js?v=20260703a"></script>
@@ -133,6 +133,17 @@
             <div class="text-center">
                 <img src="/static/assets/logo-small.png" data-brand-logo alt="" style="height: 44px; opacity: 0.9;">
                 <div class="loading-spinner" style="margin: var(--space-lg) auto 0;" aria-hidden="true"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Invitation acceptance screen (shown pre-paint for /?invite=... links; app.js fills the body) -->
+    <div id="invite-screen" class="screen">
+        <div class="flex items-center justify-center" style="min-height: 100vh; width: 100%; padding: var(--space-lg);">
+            <div class="card" style="max-width: 420px; width: 100%;">
+                <div class="card-body" id="invite-card-body">
+                    <div class="loading-spinner" style="margin: var(--space-lg) auto;" aria-hidden="true"></div>
+                </div>
             </div>
         </div>
     </div>
@@ -2728,7 +2739,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260822d"></script>
+    <script src="/static/js/app.js?v=20260822e"></script>
 </body>
 </html>
 

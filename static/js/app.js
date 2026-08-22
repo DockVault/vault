@@ -967,6 +967,141 @@ async function applyLoginPolicyLabel() {
 }
 applyLoginPolicyLabel();
 
+// ---- Invitation acceptance (public, unauthenticated) -----------------------
+// Reached via /?invite=<token>. Bare fetch only (never apiRequest — it would attach a stale Bearer
+// token to an unauth endpoint); DOM built with _el/textContent (no innerHTML); no token is ever
+// stored (success routes to the login screen, it does NOT sign the visitor in). Every failure shows
+// ONE generic message so the page can't be used to probe which tokens are valid.
+const _INVITE_GENERIC_ERROR = 'This invitation link is invalid or has expired.';
+
+function _inviteCard() {
+    return document.getElementById('invite-card-body');
+}
+
+function _inviteMessage(text, kind) {
+    const body = _inviteCard();
+    if (!body) return;
+    body.replaceChildren();
+    body.appendChild(_el('div', 'alert alert-' + (kind || 'error'), text));
+}
+
+async function initInviteFlow(token) {
+    showScreen('invite-screen');
+    let info;
+    try {
+        const res = await fetch(`${API_BASE}/invites/${encodeURIComponent(token)}`,
+                                { headers: { Accept: 'application/json' } });
+        if (!res.ok) { _inviteMessage(_INVITE_GENERIC_ERROR); return; }
+        info = await res.json();
+    } catch (_) {
+        _inviteMessage(_INVITE_GENERIC_ERROR);
+        return;
+    }
+    _renderInviteForm(token, info);
+}
+
+function _renderInviteForm(token, info) {
+    const body = _inviteCard();
+    if (!body) return;
+    body.replaceChildren();
+    body.appendChild(_el('h2', 'text-xl font-bold mb-sm', 'Accept your invitation'));
+    const sub = _el('p', 'text-secondary mb-lg');
+    sub.appendChild(document.createTextNode('You are claiming the username '));
+    sub.appendChild(_el('strong', null, info.username || ''));
+    sub.appendChild(document.createTextNode('. Set a password to finish.'));
+    body.appendChild(sub);
+
+    const form = _el('form');
+    // email only when the org requires one and the invite didn't carry it
+    let emailInput = null;
+    if (info.email_required) {
+        const g = _el('div', 'form-group');
+        g.appendChild(_el('label', null, 'Email'));
+        emailInput = _el('input', 'form-control');
+        emailInput.type = 'email';
+        emailInput.required = true;
+        emailInput.setAttribute('autocomplete', 'email');
+        g.appendChild(emailInput);
+        form.appendChild(g);
+    }
+    const pg = _el('div', 'form-group');
+    pg.appendChild(_el('label', null, 'Password'));
+    const pw = _el('input', 'form-control');
+    pw.type = 'password';
+    pw.required = true;
+    pw.setAttribute('autocomplete', 'new-password');
+    const pol = info.password_policy || {};
+    if (pol.min_length) pw.minLength = pol.min_length;
+    pg.appendChild(pw);
+    // requirement hints, mirroring the enforced policy
+    const hints = [];
+    if (pol.min_length) hints.push(`at least ${pol.min_length} characters`);
+    if (pol.require_uppercase) hints.push('an uppercase letter');
+    if (pol.require_lowercase) hints.push('a lowercase letter');
+    if (pol.require_numbers) hints.push('a number');
+    if (pol.require_special) hints.push('a special character');
+    if (hints.length) pg.appendChild(_el('small', 'form-help', 'Must include ' + hints.join(', ') + '.'));
+    form.appendChild(pg);
+
+    const err = _el('div', 'alert alert-error mt-md');
+    err.style.display = 'none';
+    form.appendChild(err);
+
+    const btn = _el('button', 'btn btn-primary btn-block', 'Create account');
+    btn.type = 'submit';
+    form.appendChild(btn);
+
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        err.style.display = 'none';
+        btn.disabled = true;
+        btn.textContent = 'Creating…';
+        try {
+            const payload = { password: pw.value };
+            if (emailInput) payload.email = emailInput.value.trim();
+            const res = await fetch(`${API_BASE}/invites/${encodeURIComponent(token)}/accept`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                err.textContent = data.detail || _INVITE_GENERIC_ERROR;
+                err.style.display = 'block';
+                btn.disabled = false;
+                btn.textContent = 'Create account';
+                return;
+            }
+            _inviteAccepted(info.username);
+        } catch (_) {
+            err.textContent = _INVITE_GENERIC_ERROR;
+            err.style.display = 'block';
+            btn.disabled = false;
+            btn.textContent = 'Create account';
+        }
+    });
+    body.appendChild(form);
+    if (emailInput) emailInput.focus(); else pw.focus();
+}
+
+function _inviteAccepted(username) {
+    // Strip the token from the URL so a reload of a now-consumed link doesn't show "invalid",
+    // release the invite screen gate, and route to login — the visitor is NOT auto-signed-in.
+    try { history.replaceState(null, '', location.pathname); } catch (_) {}
+    document.documentElement.removeAttribute('data-invite');
+    const body = _inviteCard();
+    if (body) {
+        body.replaceChildren();
+        body.appendChild(_el('h2', 'text-xl font-bold mb-sm', 'Account created'));
+        body.appendChild(_el('p', 'text-secondary mb-lg',
+            'Your account is ready. Sign in with your new password to continue.'));
+        const go = _el('button', 'btn btn-primary btn-block', 'Go to sign in');
+        go.addEventListener('click', () => showScreen('login-screen'));
+        body.appendChild(go);
+    }
+    setTimeout(() => { showScreen('login-screen'); }, 2500);
+}
+
 // Login
 document.getElementById('login-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -12633,6 +12768,16 @@ document.addEventListener('DOMContentLoaded', () => {
     // Drop any saved zero-knowledge upload ciphertext older than the server's 24h
     // session TTL (+1h slack) so abandoned uploads can't accumulate in IndexedDB.
     try { zkUploadStore.pruneOlderThan(25 * 60 * 60 * 1000); } catch (_) {}
+
+    // An /?invite=... link is the invitation-acceptance flow: an anonymous visitor sets a password
+    // and claims a pre-created account. It takes precedence over any cached session and never enters
+    // the app — run it and stop here so the login/session bootstrap below is skipped.
+    const inviteToken = new URLSearchParams(location.search).get('invite');
+    if (inviteToken) {
+        document.documentElement.removeAttribute('data-auth');
+        initInviteFlow(inviteToken);
+        return;
+    }
 
     // Check for existing session BEFORE showing any screen.
     const hasSession = authToken && currentUser;

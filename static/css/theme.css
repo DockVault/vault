@@ -304,6 +304,13 @@ code {
 html[data-auth="pending"] #login-screen.active { display: none !important; }
 html[data-auth="pending"] #boot-screen { display: flex !important; }
 
+/* Invitation acceptance: an /?invite=... link (auth-boot.js sets data-invite pre-paint) shows the
+   dedicated #invite-screen instead of the default-active login screen or the app shell — so an
+   anonymous invitee never sees a flash of either. */
+html[data-invite] #login-screen.active { display: none !important; }
+html[data-invite] #boot-screen { display: none !important; }
+html[data-invite] #invite-screen { display: flex !important; }
+
 /* ============================================================================
    CONTINUED IN NEXT MESSAGE...
    ============================================================================ */
