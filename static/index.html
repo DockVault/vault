@@ -2305,6 +2305,16 @@
                                     <input type="password" id="us-email-cur-pw" class="form-control" autocomplete="current-password">
                                 </div>
                                 <button type="submit" class="btn btn-primary">Update email</button>
+                                <!-- Shown only when the organization requires a verification code for an
+                                     email change: the code is sent to the new address; entering it confirms. -->
+                                <div class="form-group mt-md" id="us-email-code-row" style="display:none;">
+                                    <label for="us-email-code">Verification code</label>
+                                    <p class="text-secondary text-sm mb-sm" id="us-email-code-hint">Enter the code sent to your new address to confirm the change.</p>
+                                    <div class="flex gap-sm">
+                                        <input type="text" id="us-email-code" class="form-control" autocomplete="one-time-code" inputmode="text">
+                                        <button type="button" id="us-email-confirm-btn" class="btn btn-primary">Confirm</button>
+                                    </div>
+                                </div>
                             </form>
 
                             <div class="us-section us-credential">

@@ -3933,6 +3933,20 @@ function _usHideError() {
     const box = document.getElementById('us-error');
     if (box) { box.style.display = 'none'; box.textContent = ''; }
 }
+function _usShowEmailCodeRow(email) {
+    const row = document.getElementById('us-email-code-row');
+    if (row) row.style.display = '';
+    const hint = document.getElementById('us-email-code-hint');
+    if (hint) hint.textContent = 'Enter the code sent to ' + email + ' to confirm the change.';
+    const inp = document.getElementById('us-email-code');
+    if (inp) { inp.value = ''; inp.focus(); }
+}
+function _usHideEmailCodeRow() {
+    const row = document.getElementById('us-email-code-row');
+    if (row) row.style.display = 'none';
+    const inp = document.getElementById('us-email-code');
+    if (inp) inp.value = '';
+}
 
 // Open the account modal for the CURRENT user. Credential-write sections are hidden for a temporary
 // credential (the server rejects those writes too — this is UX, not the security boundary).
@@ -4024,7 +4038,39 @@ function wireUserSettingsModal() {
             }
             showSuccess('Email updated');
             document.getElementById('us-email-cur-pw').value = '';
-        } catch (err) { _usShowError(err.message || 'Could not update email.'); }
+            _usHideEmailCodeRow();
+        } catch (err) {
+            // When the organization requires it, CHANGING (not clearing) the address must be proved
+            // with a code sent to the new address. A regular user can't read that org policy, so the
+            // server refuses the direct change and says so — switch to the code flow here.
+            if (email && /verification/i.test(err.message || '')) {
+                try {
+                    await apiRequest('/users/me/request-email-change', {
+                        method: 'POST', body: JSON.stringify({ new_email: email, current_password: cur }) });
+                    _usShowEmailCodeRow(email);
+                    showSuccess('We sent a verification code to ' + email + '.');
+                } catch (e2) { _usShowError(e2.message || 'Could not send a verification code.'); }
+                return;
+            }
+            _usShowError(err.message || 'Could not update email.');
+        }
+    });
+    document.getElementById('us-email-confirm-btn')?.addEventListener('click', async () => {
+        _usHideError();
+        const code = document.getElementById('us-email-code').value.trim();
+        if (!code) { _usShowError('Enter the verification code.'); return; }
+        try {
+            const updated = await apiRequest('/users/me/confirm-email-change', {
+                method: 'POST', body: JSON.stringify({ code }) });
+            if (updated) {
+                currentUser.email = updated.email || null;
+                document.getElementById('us-email-display').textContent = updated.email || 'Not set';
+                document.getElementById('us-new-email').value = '';
+            }
+            document.getElementById('us-email-cur-pw').value = '';
+            _usHideEmailCodeRow();
+            showSuccess('Email updated');
+        } catch (err) { _usShowError(err.message || 'That code was not accepted.'); }
     });
     document.getElementById('us-sftp-save')?.addEventListener('click', async () => {
         _usHideError();
