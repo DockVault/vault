@@ -665,7 +665,15 @@ class UserCreate(BaseModel):
     @field_validator('username')
     @classmethod
     def _clean_username(cls, v):
-        return _reject_markup_chars(v, 'username')
+        v = _reject_markup_chars(v, 'username')
+        # A username must never look like an email. If it did, then under a `login_identifier` of
+        # 'either' (username tried first, then email) it could shadow the real owner of that address
+        # at the login form. Reject '@' here on CREATE only — NOT on LoginRequest, where an email is
+        # a legitimate identifier in email/either mode. This is the syntactic half of the guard; the
+        # DB-state half (username == an existing account's email) lives in create_user.
+        if v is not None and '@' in v:
+            raise ValueError("username may not contain '@'")
+        return v
 
 
 class UserUpdate(BaseModel):
@@ -2300,6 +2308,31 @@ def _email_login_would_lock_out_admin(db: Session) -> bool:
     ).first() is not None
 
 
+def _username_email_collision(db: Session):
+    """A sample (username, email) pair where one account's username equals another account's email,
+    case-insensitively, or None.
+
+    This is the legacy-data hazard behind 'either' login: email-as-username was historically allowed
+    (only NEW usernames are barred from containing '@' now), so a pre-existing username can equal a
+    different account's email. Under 'either' the username is tried first, so that username shadows
+    the real email owner's login identifier and locks them out. Pure 'email' mode is unaffected (the
+    username is never consulted), so this only gates switching TO 'either'. Mirrors
+    find_email_collisions: raw lower() on both sides, the same fold the resolver uses.
+    """
+    from sqlalchemy import text
+    row = db.execute(text(
+        """
+        SELECT u.username, v.email
+          FROM users u
+          JOIN users v ON lower(u.username) = lower(v.email)
+         WHERE u.id <> v.id AND v.email IS NOT NULL AND v.email <> ''
+         ORDER BY u.username
+         LIMIT 1
+        """
+    )).fetchone()
+    return (row[0], row[1]) if row else None
+
+
 def _smtp_configured(db: Session) -> bool:
     """True when the deployment can send mail — an SMTP server and a From address are set in the
     stored settings (same signal send_test_email checks). Gates turning ON email-change
@@ -2316,6 +2349,16 @@ def _email_change_requires_verification(db: Session) -> bool:
     from app.core.account_policy import effective_account_policy
     row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
     return bool(effective_account_policy(row.value if row else None)["email_change_requires_verification"])
+
+
+def _login_identifier(db: Session) -> str:
+    """Effective org policy: which identifier the login form accepts — 'username', 'email', or
+    'either'. Always resolved through effective_account_policy so a settings hiccup or a hand-edited
+    blob fails safe to 'username' and never breaks login or silently switches modes."""
+    from app.core.models import SystemSetting
+    from app.core.account_policy import effective_account_policy
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    return effective_account_policy(row.value if row else None)["login_identifier"]
 
 
 def _send_email(db: Session, *, to_addr: str, subject: str, body: str) -> None:
@@ -2537,7 +2580,8 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             normalized = validate_account_policy(
                 payload,
                 email_login_locks_out_admin=_email_login_would_lock_out_admin(db),
-                smtp_configured=_smtp_configured(db))
+                smtp_configured=_smtp_configured(db),
+                username_email_collision=_username_email_collision(db))
         except AccountPolicyError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         # Persist the canonical form (deduped/lowercased domains), not the raw input. Mutating the
@@ -3419,11 +3463,14 @@ async def login(
             )
             is_temporary = True
         else:
-            # Regular user authentication
+            # Regular user authentication. The org policy decides whether the submitted value is
+            # resolved as a username, an email, or either — the temp_ branch above stays first and
+            # policy-independent (temp usernames are their own namespace, never an email).
             user, session_token = auth_service.authenticate_user(
                 login_request.username,
                 login_request.password,
-                client_ip
+                client_ip,
+                login_identifier=_login_identifier(db),
             )
             is_temporary = False
         

@@ -21,7 +21,7 @@ from app.core.security import (
     hash_password, verify_password, generate_temporary_credentials,
     verify_temporary_credential, generate_session_token, vault_password_fingerprint
 )
-from app.core.email_identity import email_in_use, normalize_email
+from app.core.email_identity import email_in_use, normalize_email, find_user_by_email
 from app.core.session_hash_utils import hash_session_token
 from app.core.database import redis_client, get_db_context
 from app.core.config import settings
@@ -177,6 +177,17 @@ class AuthService:
         if self.db.query(User.id).filter(User.username == username).first():
             raise ValueError(f"Username '{username}' already exists")
 
+        # A username that equals some account's email would be an impersonation vector the moment
+        # the org sets login_identifier to 'either' (username tried first, then email). Reject it at
+        # creation, unconditionally — the policy can be flipped on later, and a pre-existing
+        # ambiguous username would silently become live. `email_in_use` folds both sides with the
+        # database and treats an absent address as no-collision, so the raw username is the right
+        # thing to pass. (The '@'-in-username reject at the schema edge already blocks a real email
+        # shape; this also catches a legacy no-`@` address and is the guard that survives if that
+        # edge check is ever removed.)
+        if email_in_use(self.db, username):
+            raise ValueError(f"Username '{username}' conflicts with an existing account's email")
+
         # Case-insensitive, so `BOB@x.com` cannot be registered alongside `bob@x.com`. An absent
         # address never collides: Postgres treats NULLs as distinct under UNIQUE, and the
         # application check has to agree or email-less accounts would exclude one another.
@@ -205,31 +216,52 @@ class AuthService:
         self,
         username: str,
         password: str,
-        ip_address: str
+        ip_address: str,
+        *,
+        login_identifier: str = "username"
     ) -> Tuple[User, str]:
         """
-        Authenticate a user with username and password.
-        
+        Authenticate a user with an identifier and password.
+
         Args:
-            username: Username
+            username: The submitted identifier. Despite the name it is a username, an email, or
+                either, depending on `login_identifier` — the wire field is still called `username`.
             password: Plain text password
             ip_address: Client IP address
-            
+            login_identifier: Org policy for how to resolve the identifier — "username" (default,
+                exact username), "email" (case-insensitive email), or "either" (username first,
+                then email). Defaulted so the SFTP caller and existing tests are unaffected.
+
         Returns:
             Tuple of (User object, session_token)
-            
+
         Raises:
             InvalidCredentialsError: If credentials are invalid
             AccountLockedError: If account is locked
             RateLimitExceededError: If rate limit exceeded
             SessionLimitExceededError: If max sessions reached
         """
-        # Check rate limit
+        # Check rate limit. Keyed on the RAW submitted identifier (login:{identifier}), NOT the
+        # resolved username — the limiter must throttle a junk/never-resolving identifier too, and
+        # keying on the resolved username would let an attacker spread attempts across the two
+        # forms (username and email) of one account.
         self._check_rate_limit(username, ip_address)
-        
-        # Find user
-        user = self.db.query(User).filter(User.username == username).first()
-        
+
+        # Resolve the submitted identifier to AT MOST ONE account per org policy. This MUST return a
+        # User or None and never raise or early-return: every no-match outcome — username miss,
+        # email miss, ambiguous `lower(email)` collision, blank/normalized-away, or a cross-user
+        # legacy ambiguity — has to fall through to the dummy-verify block below so response timing
+        # and the generic 401 stay identical (the username-enumeration oracle stays closed). Exactly
+        # one verify_password() fires per attempt in every mode.
+        if login_identifier == "email":
+            user = find_user_by_email(self.db, username)  # None on blank/miss/collision
+        elif login_identifier == "either":
+            user = self.db.query(User).filter(User.username == username).first()
+            if user is None:
+                user = find_user_by_email(self.db, username)
+        else:  # "username" — exact, case-sensitive; unchanged behaviour
+            user = self.db.query(User).filter(User.username == username).first()
+
         if not user:
             # Equalize timing with the real path so a non-existent username isn't
             # distinguishable by response time (username-enumeration oracle).

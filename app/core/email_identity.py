@@ -86,6 +86,36 @@ def email_in_use(db, email, exclude_user_id=None) -> bool:
     return query.first() is not None
 
 
+def find_user_by_email(db, email):
+    """Resolve an address to the single account that owns it, case-insensitively, or None.
+
+    Uses the database's `lower()` on BOTH sides — the exact expression the unique index and
+    `email_in_use` use — so "the same address" has one definition everywhere (see `_fold_ascii`).
+
+    Returns None for every ambiguous input, because this feeds login and an arbitrary pick is
+    impersonation:
+
+    * a blank/absent candidate (`normalize_email` -> None) — a NULL-email account is never
+      reachable by email, and a `None` candidate must not compile to `email IS NULL` and match
+      every email-less row;
+    * no match; and
+    * MORE THAN ONE match — a deployment that already held `Bob@x.com` and `bob@x.com` could not
+      build the `lower(email)` unique index and boots anyway (see the module note), so one address
+      can own two rows. Authenticating an arbitrary one is the impersonation case this module
+      exists to prevent, so >1 rows is treated as no match: fail closed.
+    """
+    normalized = normalize_email(email)
+    if normalized is None:
+        return None
+    rows = (
+        db.query(User)
+        .filter(func.lower(User.email) == func.lower(normalized))
+        .limit(2)
+        .all()
+    )
+    return rows[0] if len(rows) == 1 else None
+
+
 def find_email_collisions(db):
     """Groups of existing accounts whose emails differ only in case.
 
