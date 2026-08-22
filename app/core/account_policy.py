@@ -58,8 +58,13 @@ def effective_account_policy(stored: dict | None) -> dict:
     GET /settings must report EFFECTIVE values so a whole-object save cannot silently persist an
     unchecked default (the same reason zero_knowledge_enabled / directory_search_scope are overlaid).
     The domain list is normalized on read too, so a legacy or hand-edited raw value renders clean.
+
+    A non-dict stored value (a corrupted or hand-edited row holding a list/scalar) is treated as
+    absent and falls back to defaults, rather than raising: this reader is on the pre-auth login path
+    (which identifier the login form resolves) and the unauthenticated login-policy read, so it must
+    fail safe to the defaults, never 500 login. Every other settings reader coerces the same way.
     """
-    stored = stored or {}
+    stored = stored if isinstance(stored, dict) else {}
     out = {}
     for key, default in DEFAULTS.items():
         out[key] = stored[key] if key in stored else default
@@ -131,7 +136,8 @@ def normalize_domains_lenient(value) -> list[str]:
 
 
 def validate_account_policy(payload: dict, *, email_login_locks_out_admin: bool = False,
-                            smtp_configured: bool = False) -> dict:
+                            smtp_configured: bool = False,
+                            username_email_collision: tuple | None = None) -> dict:
     """Validate only the account-policy keys PRESENT in `payload`; pass everything else through.
 
     Returns a dict of the NORMALIZED values for the keys it handled (e.g. deduped/lowercased
@@ -143,6 +149,9 @@ def validate_account_policy(payload: dict, *, email_login_locks_out_admin: bool 
       email, or they could never log in again.
     - `smtp_configured`: refuse turning ON email-change verification unless the deployment can send
       the one-time code (email-change verification is gated behind email-client setup).
+    - `username_email_collision`: a sample (username, email) pair where one account's username equals
+      another's email. Refuse switching to 'either' login when one exists, or that username would
+      shadow the real email owner (username is tried first). Pure 'email' mode is unaffected.
     """
     if not isinstance(payload, dict):
         raise AccountPolicyError("Settings payload must be an object")
@@ -181,6 +190,14 @@ def validate_account_policy(payload: dict, *, email_login_locks_out_admin: bool 
             raise AccountPolicyError(
                 "Refusing to set email-only login: an active administrator has no email address and "
                 "would be locked out. Give every admin an email first, or use 'either'.")
+        # 'either' tries the username first, so a username equal to another account's email would
+        # shadow that email owner's login and lock them out. Refuse the switch until the collision is
+        # resolved. (Only 'either' is affected — 'email' never consults the username.)
+        if v == "either" and username_email_collision:
+            uname, email = username_email_collision
+            raise AccountPolicyError(
+                f"Refusing to enable 'either' login: the username {uname!r} matches another account's "
+                f"email {email!r} and would shadow that owner's email login. Rename the username first.")
 
     if "email_change_requires_verification" in payload:
         v = payload["email_change_requires_verification"]

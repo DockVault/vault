@@ -932,6 +932,36 @@ function updateProfileUI(user) {
     applyDashboardAdminGating();
 }
 
+// Label the identifier field to match the org's login policy. The login page is pre-auth and
+// cannot read the admin-only /settings, so a tiny public endpoint exposes only which identifier
+// to ask for. textContent only (no innerHTML — house XSS rule); the value comes from a fixed
+// vocabulary regardless. Not cached: the policy can be flipped by an admin, and a stale label
+// would mislabel the form. On any failure the static "Username" fallback stays.
+async function applyLoginPolicyLabel() {
+    try {
+        const res = await fetch(`${API_BASE}/auth/login-policy`, { headers: { Accept: 'application/json' } });
+        if (!res.ok) return;
+        const { login_identifier: mode } = await res.json();
+        const label = document.getElementById('username-label');
+        const input = document.getElementById('username');
+        if (!input) return;
+        if (mode === 'email') {
+            if (label) label.textContent = 'Email';
+            input.setAttribute('autocomplete', 'email');
+            input.setAttribute('inputmode', 'email');
+        } else if (mode === 'either') {
+            if (label) label.textContent = 'Username or email';
+            input.setAttribute('autocomplete', 'username');
+            input.removeAttribute('inputmode');
+        } else {
+            if (label) label.textContent = 'Username';
+            input.setAttribute('autocomplete', 'username');
+            input.removeAttribute('inputmode');
+        }
+    } catch (_) { /* keep the static fallback */ }
+}
+applyLoginPolicyLabel();
+
 // Login
 document.getElementById('login-form').addEventListener('submit', async (e) => {
     e.preventDefault();

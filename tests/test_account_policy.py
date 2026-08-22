@@ -34,6 +34,15 @@ def test_effective_all_defaults_when_empty():
     assert eff["login_identifier"] == "username"
 
 
+@pytest.mark.parametrize("bad", [["a", "list"], "a string", 5, 3.14])
+def test_effective_non_dict_stored_falls_back_to_defaults(bad):
+    # A corrupted/hand-edited row holding a non-dict must degrade to defaults, never raise: this
+    # reader is on the pre-auth login path, so a TypeError here would 500 login entirely.
+    eff = effective_account_policy(bad)
+    assert eff == {**DEFAULTS, "signup_email_domains": []}
+    assert eff["login_identifier"] == "username"
+
+
 def test_effective_partial_stored_fills_the_rest():
     eff = effective_account_policy({"invite_enabled": True, "invite_ttl_hours": 48})
     assert eff["invite_enabled"] is True and eff["invite_ttl_hours"] == 48
@@ -202,6 +211,25 @@ def test_lockout_guard_only_gates_email_not_either_or_username():
     # 'either' and 'username' keep a username path, so a mail-less admin is not stranded.
     validate_account_policy({"login_identifier": "either"}, email_login_locks_out_admin=True)
     validate_account_policy({"login_identifier": "username"}, email_login_locks_out_admin=True)
+
+
+# ---- the username<->email collision guard (only 'either' is vulnerable) -----------------------
+def test_either_refused_when_a_username_collides_with_an_email():
+    with pytest.raises(AccountPolicyError):
+        validate_account_policy({"login_identifier": "either"},
+                                username_email_collision=("carol@x.com", "carol@x.com"))
+
+
+def test_either_allowed_when_no_collision():
+    validate_account_policy({"login_identifier": "either"}, username_email_collision=None)
+
+
+def test_collision_guard_only_gates_either_not_email_or_username():
+    # 'email' never consults the username, and 'username' never consults the email — neither can be
+    # hijacked by a colliding username, so the collision must not block them.
+    collision = ("carol@x.com", "carol@x.com")
+    validate_account_policy({"login_identifier": "email"}, username_email_collision=collision)
+    validate_account_policy({"login_identifier": "username"}, username_email_collision=collision)
 
 
 # ---- validate returns normalized values + ignores absent keys --------------------------------

@@ -18,7 +18,9 @@ from typing import Dict, Any
 
 from app.config.branding import branding
 from app.config.effective import get_effective_branding, branding_public_payload
+from app.core.account_policy import effective_account_policy
 from app.core.database import get_db
+from app.core.models import SystemSetting
 
 router = APIRouter(tags=["Information"])
 
@@ -127,6 +129,23 @@ async def get_features():
             "sftp_enabled": branding.enable_sftp,
         },
     }
+
+
+@router.get("/auth/login-policy", response_model=Dict[str, str])
+async def get_login_policy(db: Session = Depends(get_db)):
+    """Which identifier the login form should ask for: ``username``, ``email``, or ``either``.
+
+    The login page is pre-auth, so it cannot read the admin-only ``GET /settings`` to learn the
+    org policy that drives its field label. This exposes ONLY the fixed-vocabulary
+    ``login_identifier`` value (resolved through ``effective_account_policy``, so it always returns
+    a valid value even from an unset or hand-edited settings row) — nothing else about the account
+    posture leaks.
+
+    **No authentication required** — the label the login form shows is not sensitive.
+    """
+    row = db.query(SystemSetting).filter(SystemSetting.key == "global").first()
+    policy = effective_account_policy(row.value if row else None)
+    return {"login_identifier": policy["login_identifier"]}
 
 
 @router.get("/theme", response_model=Dict[str, Any])
