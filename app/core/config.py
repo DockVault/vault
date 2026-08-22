@@ -135,6 +135,12 @@ class Settings(BaseSettings):
     # log-pull ceiling is on, and its weakness is caught by a startup refusal below.
     log_token_pepper: str = Field(default="")
 
+    # Dedicated HMAC pepper for hashing account-invitation tokens at rest (same rationale as
+    # log_token_pepper — a distinct secret). Plain env (reads INVITE_TOKEN_PEPPER). When left unset
+    # the code falls back to jwt_secret_key so invitations work out of the box; set this to decouple
+    # invitation hashes from the JWT secret.
+    invite_token_pepper: str = Field(default="")
+
     # Temporary Credentials Configuration
     temp_cred_validity_minutes: int = Field(default=65)
     temp_cred_session_grace_minutes: int = Field(default=65)

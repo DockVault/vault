@@ -15,6 +15,7 @@ from app.core.account_policy import (
     MAX_DOMAIN_LENGTH,
     AccountPolicyError,
     effective_account_policy,
+    email_allowed_by_domain_gate,
     normalize_domains,
     normalize_domains_lenient,
     validate_account_policy,
@@ -230,6 +231,36 @@ def test_collision_guard_only_gates_either_not_email_or_username():
     collision = ("carol@x.com", "carol@x.com")
     validate_account_policy({"login_identifier": "email"}, username_email_collision=collision)
     validate_account_policy({"login_identifier": "username"}, username_email_collision=collision)
+
+
+# ---- the signup/invite domain gate (allowlist EXACT, denylist COVERS subdomains) ---------------
+def test_domain_gate_off_allows_everything():
+    assert email_allowed_by_domain_gate("anyone@wherever.com", "off", []) is True
+    assert email_allowed_by_domain_gate("anyone@wherever.com", "off", ["acme.com"]) is True
+
+
+def test_domain_gate_allowlist_is_exact_no_subdomains():
+    doms = ["acme.com"]
+    assert email_allowed_by_domain_gate("a@acme.com", "allowlist", doms) is True
+    assert email_allowed_by_domain_gate("a@ACME.com", "allowlist", doms) is True       # case-insensitive
+    assert email_allowed_by_domain_gate("a@sub.acme.com", "allowlist", doms) is False  # subdomain NOT covered
+    assert email_allowed_by_domain_gate("a@evil.com", "allowlist", doms) is False
+
+
+def test_domain_gate_denylist_covers_subdomains():
+    doms = ["evil.com"]
+    assert email_allowed_by_domain_gate("a@evil.com", "denylist", doms) is False
+    assert email_allowed_by_domain_gate("a@x.evil.com", "denylist", doms) is False     # subdomain blocked
+    assert email_allowed_by_domain_gate("a@notevil.com", "denylist", doms) is True     # not a subdomain
+    assert email_allowed_by_domain_gate("a@acme.com", "denylist", doms) is True
+
+
+def test_domain_gate_missing_domain_leans_per_mode():
+    # No '@' / empty candidate has no domain: allowlist denies (nothing matches), denylist allows.
+    assert email_allowed_by_domain_gate("no-at-sign", "allowlist", ["acme.com"]) is False
+    assert email_allowed_by_domain_gate("no-at-sign", "denylist", ["evil.com"]) is True
+    assert email_allowed_by_domain_gate("", "allowlist", ["acme.com"]) is False
+    assert email_allowed_by_domain_gate(None, "denylist", ["evil.com"]) is True
 
 
 # ---- validate returns normalized values + ignores absent keys --------------------------------

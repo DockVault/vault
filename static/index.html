@@ -770,7 +770,10 @@
                 <div id="users-section" class="content-section">
                     <div class="flex justify-between items-center mb-lg">
                         <h2 class="text-2xl font-bold">User Management</h2>
-                        <button id="create-user-btn" class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg> Create User</button>
+                        <div class="flex gap-sm">
+                            <button id="invite-user-btn" class="btn btn-secondary" style="display: none;"><svg class="icon"><use href="#i-plus"/></svg> Invite User</button>
+                            <button id="create-user-btn" class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg> Create User</button>
+                        </div>
                     </div>
 
                     <div class="toolbar mb-md">
@@ -797,6 +800,12 @@
                     </div>
 
                     <div id="users-list"></div>
+
+                    <!-- Pending invitations (only when invitations are enabled) -->
+                    <div id="invites-block" style="display: none; margin-top: var(--space-xl);">
+                        <h3 class="text-lg font-bold mb-md">Pending invitations</h3>
+                        <div id="invites-list"></div>
+                    </div>
                 </div>
 
                 <!-- Groups & Roles Section -->
@@ -2177,6 +2186,55 @@
                     </div>
                 </div>
 
+                <!-- Invite User Modal -->
+                <div id="invite-user-modal" class="modal">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3>Invite a user</h3>
+                            <button class="close-modal-btn modal-close" aria-label="Close">×</button>
+                        </div>
+                        <form id="invite-user-form">
+                            <div class="modal-body" id="invite-user-fields">
+                                <div class="form-group">
+                                    <label for="invite-username">Username</label>
+                                    <input type="text" id="invite-username" class="form-control" required>
+                                    <small class="form-help">The invitee claims this username; they set their own password.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="invite-email" id="invite-email-label">Email <span class="text-muted">(optional)</span></label>
+                                    <input type="email" id="invite-email" class="form-control">
+                                </div>
+                                <div class="form-group">
+                                    <label for="invite-role">Role</label>
+                                    <select id="invite-role" class="form-control" required>
+                                        <option value="user">User</option>
+                                        <option value="external">External</option>
+                                        <option value="admin">Admin</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="modal-body" id="invite-link-result" style="display: none;">
+                                <p class="alert alert-warning">Copy this link now — it is shown only once and cannot be retrieved later. Send it to the invitee through a channel you trust.</p>
+                                <div class="form-group">
+                                    <label for="invite-link-value">Invitation link</label>
+                                    <div class="flex gap-sm items-center">
+                                        <code id="invite-link-value" class="form-control" style="word-break: break-all;"></code>
+                                        <button type="button" id="invite-link-copy" class="btn btn-secondary">Copy</button>
+                                    </div>
+                                </div>
+                                <p class="form-help" id="invite-link-expiry"></p>
+                            </div>
+                            <div class="modal-footer" id="invite-user-footer">
+                                <button type="button" class="close-modal-btn btn btn-secondary">Cancel</button>
+                                <button type="submit" class="btn btn-primary" id="invite-submit-btn">Create invitation</button>
+                            </div>
+                            <div class="modal-footer" id="invite-done-footer" style="display: none;">
+                                <button type="button" class="close-modal-btn btn btn-primary">Done</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
                 <!-- Edit User Modal -->
                 <div id="edit-user-modal" class="modal">
                     <div class="modal-content">
@@ -2670,7 +2728,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260822b"></script>
+    <script src="/static/js/app.js?v=20260822d"></script>
 </body>
 </html>
 
