@@ -367,7 +367,8 @@ def build_env_lines(cfg):
     (it does NOT generate secrets; the caller passes them in). Values are single-quoted, matching
     the setup scripts' dotenv quoting. `cfg` keys: server_name, encryption_key, jwt_secret_key,
     vault_db_password, redis_password, admin_username, admin_email, admin_password, compose_profiles,
-    run_sftp (bool), update_check_enabled (bool), plan_log_pull (bool), log_token_pepper (str)."""
+    run_sftp (bool), update_check_enabled (bool), plan_log_pull (bool), log_token_pepper (str),
+    invite_token_pepper (str)."""
     lines = []
 
     def q(k):
@@ -430,6 +431,10 @@ def build_env_lines(cfg):
         # strong pepper before it will serve (then an admin still ticks a component in the UI).
         bare("PLAN_LOG_PULL", "true")
         bare("LOG_TOKEN_PEPPER", "'%s'" % cfg["log_token_pepper"])
+    # A dedicated pepper for account-invitation token hashes. Always written so invitation hashes are
+    # decoupled from the JWT secret (the app falls back to the JWT secret only when this is absent).
+    if cfg.get("invite_token_pepper"):
+        bare("INVITE_TOKEN_PEPPER", "'%s'" % cfg["invite_token_pepper"])
     return lines
 
 
@@ -1162,6 +1167,7 @@ def new_set_config(current_env, new_prefix, new_id):
         "update_check_enabled": truthy("UPDATE_CHECK_ENABLED"),
         "plan_log_pull": truthy("PLAN_LOG_PULL"),
         "log_token_pepper": gen_hex(32) if truthy("PLAN_LOG_PULL") else "",
+        "invite_token_pepper": (current_env.get("INVITE_TOKEN_PEPPER") or "").strip() or gen_hex(32),
         # A fresh volume set is still the same deployment: keep whatever storage ceiling the
         # operator had configured rather than silently reverting it to unlimited.
         "max_storage_gb": parse_max_storage_gb(
@@ -2473,6 +2479,7 @@ class DockVault:
             "update_check_enabled": update_check,
             "plan_log_pull": log_pull,
             "log_token_pepper": gen_hex(32) if log_pull else "",
+            "invite_token_pepper": gen_hex(32),
             "max_storage_gb": (getattr(args, "max_storage_gb", None) if args else None),
             # Flags only at install time, as the storage ceiling beside them is. The Limits menu
             # is where these are shown and changed, with the memory each one implies.

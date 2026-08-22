@@ -634,6 +634,17 @@ def _reject_markup_chars(value: Optional[str], field: str) -> Optional[str]:
     return value
 
 
+def _validate_new_username(v):
+    """The rules a newly-created username must satisfy, shared by account creation and invitations so
+    they cannot drift. Rejects '<'/'>' markup and '@' — a username that looked like an email would,
+    under an 'either' login policy (username tried first), shadow the real owner of that address.
+    NOT applied to LoginRequest, where an email is a legitimate identifier in email/either mode."""
+    v = _reject_markup_chars(v, 'username')
+    if v is not None and '@' in v:
+        raise ValueError("username may not contain '@'")
+    return v
+
+
 # Group chip colours are interpolated into a CSS custom property on the client. Accept only a strict
 # #hex or one of the fixed palette preset names (the swatches in index.html); anything else (a
 # quote-carrying value, a CSS breakout) is rejected. Mirrors brand.js's colour validator.
@@ -665,15 +676,20 @@ class UserCreate(BaseModel):
     @field_validator('username')
     @classmethod
     def _clean_username(cls, v):
-        v = _reject_markup_chars(v, 'username')
-        # A username must never look like an email. If it did, then under a `login_identifier` of
-        # 'either' (username tried first, then email) it could shadow the real owner of that address
-        # at the login form. Reject '@' here on CREATE only — NOT on LoginRequest, where an email is
-        # a legitimate identifier in email/either mode. This is the syntactic half of the guard; the
-        # DB-state half (username == an existing account's email) lives in create_user.
-        if v is not None and '@' in v:
-            raise ValueError("username may not contain '@'")
-        return v
+        return _validate_new_username(v)
+
+
+class InviteCreate(BaseModel):
+    # Mirrors UserCreate's username/email rules (an invitation pre-assigns the account's username);
+    # there is no password here — the invitee sets it at acceptance.
+    username: str = Field(..., min_length=3, max_length=50)
+    email: Optional[EmailStr] = None
+    role: RoleEnum = RoleEnum.USER
+
+    @field_validator('username')
+    @classmethod
+    def _clean_username(cls, v):
+        return _validate_new_username(v)
 
 
 class UserUpdate(BaseModel):
@@ -2361,6 +2377,23 @@ def _login_identifier(db: Session) -> str:
     return effective_account_policy(row.value if row else None)["login_identifier"]
 
 
+def _account_policy(db: Session) -> dict:
+    """The full effective account-onboarding policy block. Always read through
+    effective_account_policy so defaults fill in and the domain list is leniently normalized — never
+    read the raw stored blob."""
+    from app.core.models import SystemSetting
+    from app.core.account_policy import effective_account_policy
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    return effective_account_policy(row.value if row else None)
+
+
+def _invite_pepper() -> str:
+    """The HMAC pepper for invitation tokens: the dedicated INVITE_TOKEN_PEPPER when set, else the
+    JWT secret so invitations work with no extra configuration. Either way it is a strong secret
+    (the JWT secret is required and long), so pepper_ok holds in a normal deployment."""
+    return (settings.invite_token_pepper or "").strip() or settings.jwt_secret_key
+
+
 def _send_email(db: Session, *, to_addr: str, subject: str, body: str) -> None:
     """Send one plaintext email using the stored SMTP settings, raising a CLEAN HTTPException
     (400/502) on any failure — never a 500, never surfacing the SMTP password. Mirrors the
@@ -3117,6 +3150,156 @@ async def disable_log_token(
     except Exception:
         pass
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Account invitations (admin-minted). Mint / list / revoke; acceptance is a
+# separate, unauthenticated flow (a later phase). Only the peppered HMAC of the
+# token is stored; the plaintext invite link is returned exactly ONCE at mint.
+# ---------------------------------------------------------------------------
+def _invite_status(inv, now):
+    """Status derived from the lifecycle timestamps, in precedence order."""
+    if inv.revoked_at:
+        return "revoked"
+    if inv.accepted_at:
+        return "accepted"
+    if inv.expires_at <= now:
+        return "expired"
+    return "pending"
+
+
+@app.post("/invites")
+@require_endpoint_permission("USER_MANAGE")
+async def create_invite(
+    payload: InviteCreate,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
+    """Mint an account invitation (interactive admin only — a temp-cred admin is refused). The
+    plaintext invite link is returned ONCE; only its peppered HMAC is stored."""
+    from app.core.models import AccountInvitation
+    from app.core.account_policy import email_allowed_by_domain_gate
+    from app.core import invitations
+    from sqlalchemy.exc import IntegrityError
+
+    pol = _account_policy(db)
+    if not pol.get("invite_enabled"):
+        raise HTTPException(status_code=400, detail="Invitations are disabled for this deployment.")
+    pepper = _invite_pepper()
+    if not invitations.pepper_ok(pepper):
+        raise HTTPException(status_code=503,
+                            detail="Invitations are unavailable: the invite-token secret is not configured.")
+
+    username = payload.username  # markup/@-validated by the schema
+    role = payload.role.value if hasattr(payload.role, "value") else str(payload.role)
+    now = datetime.utcnow()
+
+    # The username must be free the same way account creation requires: no existing account, no
+    # account whose EMAIL equals it (an 'either'-login impersonation vector), and no live invite.
+    if db.query(User.id).filter(User.username == username).first():
+        raise HTTPException(status_code=400, detail=f"Username '{username}' already exists.")
+    if email_in_use(db, username):
+        raise HTTPException(status_code=400,
+                            detail=f"Username '{username}' conflicts with an existing account's email.")
+    if db.query(AccountInvitation.id).filter(
+            AccountInvitation.username == username,
+            AccountInvitation.revoked_at.is_(None),
+            AccountInvitation.accepted_at.is_(None),
+            AccountInvitation.expires_at > now).first():
+        raise HTTPException(status_code=400, detail=f"Username '{username}' already has a pending invitation.")
+
+    # Email: optional or required per policy, domain-gated, unique.
+    email = normalize_email(payload.email)
+    if pol.get("email_requirement") == "required" and not email:
+        raise HTTPException(status_code=400, detail="An email address is required for new accounts.")
+    if email:
+        if not email_allowed_by_domain_gate(email, pol.get("signup_email_domain_mode"),
+                                            pol.get("signup_email_domains")):
+            raise HTTPException(status_code=400, detail="That email domain is not permitted.")
+        if email_in_use(db, email):
+            raise HTTPException(status_code=400, detail="That email address is already in use.")
+
+    expires_at = now + timedelta(hours=int(pol.get("invite_ttl_hours") or 72))
+    plaintext, prefix = invitations.mint_invite()
+    inv = AccountInvitation(
+        username=username, email=email, role=role,
+        token_prefix=prefix, token_hash=invitations.hash_invite_token(plaintext, pepper),
+        expires_at=expires_at, created_by=current_user.id)
+    db.add(inv)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Could not create the invitation; please try again.")
+    db.refresh(inv)
+
+    try:
+        AuditLogger(db).log_action(
+            action="account_invitation_created", status="success", user=current_user,
+            ip_address=get_client_ip(request) if request is not None else None,
+            details={"username": username, "email": email, "role": role, "token_prefix": prefix})
+    except Exception:
+        pass
+
+    base = str(request.base_url).rstrip("/") if request is not None else ""
+    return {
+        "id": str(inv.id), "username": username, "email": email, "role": role,
+        "status": "pending", "expires_at": inv.expires_at.isoformat(), "token_prefix": prefix,
+        "token": plaintext,                       # shown ONCE — never stored, never re-returned
+        "invite_url": f"{base}/?invite={plaintext}",
+    }
+
+
+@app.get("/invites")
+@require_endpoint_permission("USER_VIEW")
+async def list_invites(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """List invitations with server-derived status. Never returns the token hash or plaintext."""
+    from app.core.models import AccountInvitation
+    now = datetime.utcnow()
+    rows = db.query(AccountInvitation).order_by(AccountInvitation.created_at.desc()).all()
+    return [{
+        "id": str(i.id), "username": i.username, "email": i.email, "role": i.role,
+        "token_prefix": i.token_prefix, "status": _invite_status(i, now),
+        "expires_at": i.expires_at.isoformat(),
+        "accepted_at": i.accepted_at.isoformat() if i.accepted_at else None,
+        "revoked_at": i.revoked_at.isoformat() if i.revoked_at else None,
+        "created_at": i.created_at.isoformat() if i.created_at else None,
+    } for i in rows]
+
+
+@app.delete("/invites/{invite_id}")
+@require_endpoint_permission("USER_MANAGE")
+async def revoke_invite(
+    invite_id: str,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
+    """Revoke an invitation (soft — a revoked invite can never be accepted). Idempotent: a second
+    revoke is a no-op success."""
+    from app.core.models import AccountInvitation
+    try:
+        iid = uuid.UUID(str(invite_id))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Invitation not found.")
+    inv = db.query(AccountInvitation).filter(AccountInvitation.id == iid).first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invitation not found.")
+    if inv.revoked_at is None:
+        inv.revoked_at = datetime.utcnow()
+        db.commit()
+        try:
+            AuditLogger(db).log_action(
+                action="account_invitation_revoked", status="success", user=current_user,
+                ip_address=get_client_ip(request) if request is not None else None,
+                details={"username": inv.username, "email": inv.email, "token_prefix": inv.token_prefix})
+        except Exception:
+            pass
+    return {"ok": True, "id": str(inv.id), "status": "revoked"}
 
 
 # ---------------------------------------------------------------------------

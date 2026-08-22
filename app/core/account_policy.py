@@ -74,6 +74,30 @@ def effective_account_policy(stored: dict | None) -> dict:
     return out
 
 
+def email_allowed_by_domain_gate(email, mode, domains) -> bool:
+    """Is this email's domain permitted by the signup-domain policy?
+
+    The two modes are DELIBERATELY asymmetric, both failing toward more restriction:
+
+    * ``allowlist`` — the domain must EXACTLY equal a listed domain. A subdomain of a listed domain is
+      NOT allowed (``sub.acme.com`` is not covered by ``acme.com``).
+    * ``denylist`` — the domain is blocked if it equals a listed domain OR is a subdomain of one
+      (``x.evil.com`` is blocked by ``evil.com``).
+
+    ``off`` allows everything. A blank/`@`-less candidate has no domain: allowlist denies it (nothing
+    to match), denylist allows it (nothing blocks it) — consistent with each mode's default lean. The
+    ``domains`` list is assumed already normalized (lowercased, ``@``-stripped) by the settings write
+    path; the candidate's domain is lowercased here to match.
+    """
+    domain = (email or "").rsplit("@", 1)[-1].strip().lower() if "@" in (email or "") else ""
+    listed = {d.strip().lower() for d in (domains or [])}
+    if mode == "allowlist":
+        return domain in listed
+    if mode == "denylist":
+        return not any(domain == d or domain.endswith("." + d) for d in listed)
+    return True  # "off" or any unknown mode: no domain restriction
+
+
 def normalize_domains(value) -> list[str]:
     """Validate and normalize a signup-domain list; raise AccountPolicyError on any bad entry.
 

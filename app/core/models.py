@@ -1105,6 +1105,43 @@ class EmailChangeCode(Base):
     )
 
 
+class AccountInvitation(Base):
+    """Admin-minted account invitation.
+
+    An admin invites someone by username (email optional per org policy); the plaintext invite link
+    is shown ONCE at mint and only its peppered HMAC-SHA256 hash is stored — the log-pull token
+    discipline. A whole new table — created by create_all(), so it needs no lightweight-migration
+    entry. Status is DERIVED from the three lifecycle timestamps (revoked / accepted / expired /
+    pending), so there is no redundant status column to keep in sync. Acceptance (stamping
+    accepted_at / accepted_user_id) is a later phase; the columns exist here so it needs no schema
+    change.
+    """
+    __tablename__ = 'account_invitations'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username = Column(String(50), nullable=False)                        # pre-assigned; schema validates 3..50
+    email = Column(String(255), nullable=True)                           # required only when policy demands it
+    role = Column(String(20), nullable=False, default='user')            # a validated RoleEnum value
+
+    token_prefix = Column(String(16), nullable=False, index=True)        # public lookup handle (plaintext[:12])
+    token_hash = Column(String(64), unique=True, nullable=False, index=True)  # HMAC-SHA256 hex
+
+    expires_at = Column(DateTime, nullable=False)                        # naive UTC
+    accepted_at = Column(DateTime, nullable=True)                        # set at acceptance (later phase)
+    accepted_user_id = Column(UUID(as_uuid=True),
+                              ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    revoked_at = Column(DateTime, nullable=True)                         # soft revoke
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    created_by = Column(UUID(as_uuid=True),
+                        ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+
+    __table_args__ = (
+        Index('idx_account_invitation_prefix', 'token_prefix'),
+        Index('idx_account_invitation_username', 'username'),
+    )
+
+
 class RateLimitRecord(Base):
     """Track rate limiting for login attempts."""
     __tablename__ = 'rate_limit_records'
