@@ -805,6 +805,31 @@ button.vault-sort-dir {
     color: var(--text-tertiary); font-size: var(--text-sm);
 }
 
+/* Dashboard personal lanes (What's waiting / Favourites / Most recent). Shared by both skins. */
+.dashboard-lane .card-body.dashboard-lane-body { padding: var(--space-xs) 0; }
+.dashboard-lane-list { display: flex; flex-direction: column; }
+.dashboard-lane-item {
+    display: flex; align-items: center; gap: var(--space-sm); width: 100%; text-align: left;
+    padding: var(--space-sm) var(--space-md); background: none; border: none; cursor: pointer;
+    color: inherit; font: inherit; border-radius: 0;
+    transition: background var(--transition-base);
+}
+.dashboard-lane-item:hover { background: var(--surface-2); }
+.dashboard-lane-item.unread { background: color-mix(in srgb, var(--brand-accent) 8%, transparent); }
+.dashboard-lane-icon { flex: 0 0 auto; display: inline-flex; color: var(--text-tertiary); }
+.dashboard-lane-main { flex: 1; min-width: 0; }
+.dashboard-lane-title {
+    font-weight: 600; color: var(--text-primary); font-size: var(--text-sm);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dashboard-lane-sub {
+    font-size: var(--text-xs); margin-top: 2px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dashboard-lane-empty {
+    padding: var(--space-lg) var(--space-md); text-align: center; font-size: var(--text-sm);
+}
+
 .profile-dropdown-header {
     padding: var(--space-md);
     display: flex;

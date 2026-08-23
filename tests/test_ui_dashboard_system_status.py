@@ -1,8 +1,10 @@
-"""The dashboard's System Status card is administrator-only.
+"""The dashboard's System Status card, Active Users tile, and Recent-Events/System-Status row are
+administrator-only. A non-admin sees the personal lanes instead.
 
 This is presentation, not confidentiality: GET /health is deliberately unauthenticated and answers
-from a fixed vocabulary. The card is hidden from people who cannot act on it, and the row it sits
-in collapses to a single full-width column so the Recent Events card does not sit next to a hole.
+from a fixed vocabulary. The ops cards are hidden from people who cannot act on them; a non-admin's
+lower row is hidden entirely (they get the lanes), and an admin keeps the two-column events + status
+layout.
 
 The case worth pinning is the scoped temporary credential: it authenticates AS its owning account,
 so one minted from an admin reports role 'admin'. A naive role check would show it the card.
@@ -17,6 +19,9 @@ from playwright.sync_api import Page, expect
 pytestmark = pytest.mark.ui
 
 CARD = "#dashboard-system-status"
+LANES = "#dashboard-lanes"
+LOWER = "#dashboard-lower-grid"
+USERS_CARD = "#dashboard-users-card"
 
 
 def _login(page: Page, username: str, password: str):
@@ -38,6 +43,16 @@ def _logout(page: Page):
 def _expect_card_hidden(page: Page):
     expect(page.locator(CARD)).to_be_attached()  # missing != hidden
     expect(page.locator(CARD)).to_be_hidden()
+
+
+def _expect_non_admin_dashboard(page: Page):
+    """A non-admin sees the personal lanes; the ops cards and their whole row are hidden."""
+    expect(page.locator(LANES)).to_be_visible(timeout=10000)  # anchor: dashboard really rendered
+    expect(page.locator(LOWER)).to_be_attached()
+    expect(page.locator(LOWER)).to_be_hidden()
+    expect(page.locator(USERS_CARD)).to_be_attached()
+    expect(page.locator(USERS_CARD)).to_be_hidden()
+    _expect_card_hidden(page)
 
 
 def _grid_track_count(page: Page) -> int:
@@ -78,6 +93,9 @@ def test_admin_sees_system_status_populated(page: Page, admin_creds):
     expect(page.locator("#status-sessions")).to_have_text("Healthy", timeout=10000)
     assert reqs, "admin dashboard should have requested /health"
     assert _grid_track_count(page) == 2, "admin keeps the two-column events + status layout"
+    # The lanes are shown to everyone, and the admin ops tile is present for an admin.
+    expect(page.locator(LANES)).to_be_visible()
+    expect(page.locator(USERS_CARD)).to_be_visible()
 
 
 @pytest.mark.parametrize("role", ["user", "external"])
@@ -86,13 +104,9 @@ def test_non_admin_does_not_see_system_status(page: Page, admin, role):
     try:
         reqs = _health_requests(page)
         _login(page, u["_username"], u["_password"])
-        _expect_card_hidden(page)
-        # The events card is the anchor proving the dashboard actually rendered, so a hidden
-        # status card cannot be passing merely because the page failed to load.
-        expect(page.locator("#events-feed")).to_be_visible()
+        _expect_non_admin_dashboard(page)
         page.wait_for_timeout(1500)  # let any stray fetch fire before asserting absence
         assert not reqs, f"non-admin should not request /health, got {reqs}"
-        assert _grid_track_count(page) == 1, "the row collapses to one full-width column"
     finally:
         admin.delete_user(u["id"])
 
@@ -110,11 +124,9 @@ def test_scoped_temp_credential_of_an_admin_does_not_see_system_status(page: Pag
         # Non-vacuous anchor: prove this really is the scoped-temp shape (admin nav suppressed)
         # before asserting the card is hidden — a plain login failure would otherwise satisfy it.
         expect(page.locator('.sidebar-item[data-section="settings"]')).to_be_hidden()
-        expect(page.locator("#events-feed")).to_be_visible()
-        _expect_card_hidden(page)
+        _expect_non_admin_dashboard(page)
         page.wait_for_timeout(1500)
         assert not reqs, f"a temp session should not request /health, got {reqs}"
-        assert _grid_track_count(page) == 1
     finally:
         admin.post(f"/temp-creds/{body['temp_username']}/delete")
 
@@ -127,16 +139,16 @@ def test_account_switch_in_one_tab_does_not_strand_the_card(page: Page, admin, a
         expect(page.locator(CARD)).to_be_visible()
         assert _grid_track_count(page) == 2
 
-        # admin -> user: the card must go away, and the row must reflow with it
+        # admin -> user: the ops cards must go away, and the lanes take over
         _logout(page)
         _login(page, u["_username"], u["_password"])
-        _expect_card_hidden(page)
-        assert _grid_track_count(page) == 1
+        _expect_non_admin_dashboard(page)
 
-        # user -> admin: and it must come back, not stay hidden from the previous account
+        # user -> admin: and they must come back, not stay hidden from the previous account
         _logout(page)
         _login(page, admin_creds["username"], admin_creds["password"])
         expect(page.locator(CARD)).to_be_visible()
+        expect(page.locator(USERS_CARD)).to_be_visible()
         assert _grid_track_count(page) == 2
     finally:
         admin.delete_user(u["id"])
@@ -147,13 +159,11 @@ def test_dashboard_re_entry_keeps_the_card_hidden_for_a_non_admin(page: Page, ad
     u = admin.create_user(role="user")
     try:
         _login(page, u["_username"], u["_password"])
-        _expect_card_hidden(page)
+        _expect_non_admin_dashboard(page)
         page.click('.sidebar-item[data-section="vaults"]')
         expect(page.locator("#vaults-section")).to_be_visible(timeout=10000)
         page.click('.sidebar-item[data-section="dashboard"]')
-        expect(page.locator("#events-feed")).to_be_visible(timeout=10000)
-        _expect_card_hidden(page)
-        assert _grid_track_count(page) == 1
+        _expect_non_admin_dashboard(page)
     finally:
         admin.delete_user(u["id"])
 
@@ -165,7 +175,7 @@ def test_no_console_errors_on_a_non_admin_dashboard(page: Page, admin):
     page.on("pageerror", lambda e: errors.append(str(e)))
     try:
         _login(page, u["_username"], u["_password"])
-        _expect_card_hidden(page)
+        _expect_non_admin_dashboard(page)
         page.wait_for_timeout(1500)
         assert not errors, f"non-admin dashboard produced console errors: {errors}"
     finally:

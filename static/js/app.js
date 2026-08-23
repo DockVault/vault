@@ -1467,14 +1467,141 @@ async function loadDashboardStats() {
             }
         }
         
+        // Personal lanes (shown to every account). The vault list is already in hand; pull the
+        // shared-with-me list too (silent — the endpoint is fine for any account). Notifications
+        // come from the global bell state loaded at login. A failure here must not blank the rest
+        // of the dashboard, so it is caught inside renderDashboardLanes.
+        let sharedWithMe = [];
+        try {
+            sharedWithMe = await apiRequest('/shares/shared-with-me', { silent: true }) || [];
+        } catch (error) {
+            console.log('Shared-with-me not available:', error);
+        }
+        renderDashboardLanes(vaults, sharedWithMe);
+
         // Update system status (the gating also runs at profile-render time, before first paint;
         // repeating it here keeps the card correct if the dashboard is re-entered later.)
         applyDashboardAdminGating();
         updateSystemStatus();
-        
+
     } catch (error) {
         console.error('Failed to load dashboard stats:', error);
     }
+}
+
+// ---- Dashboard personal lanes ----------------------------------------------------------------
+// Three at-a-glance lists for the signed-in account: what has been shared with you and still needs
+// action, your favourite vaults, and the vaults you opened most recently. All rows are built with
+// createElement + textContent (via _el), so a vault name or another user's name is never HTML.
+// Notes join these lanes when the Notes feature ships.
+const _DASHBOARD_LANE_LIMIT = 6;
+
+function renderDashboardLanes(vaults, sharedWithMe) {
+    try {
+        const list = Array.isArray(vaults) ? vaults.slice() : [];
+        // Last-opened first; a vault never opened (no last_viewed_at) sorts to the end.
+        const byViewed = (a, b) => {
+            const ta = parseServerTime(a.last_viewed_at);
+            const tb = parseServerTime(b.last_viewed_at);
+            return (tb ? tb.getTime() : 0) - (ta ? ta.getTime() : 0);
+        };
+        const favourites = list.filter(v => v.is_favorite).sort(byViewed);
+        const recent = list.filter(v => !v.is_favorite).sort(byViewed).slice(0, _DASHBOARD_LANE_LIMIT);
+
+        _fillLane('lane-favourites', favourites.slice(0, _DASHBOARD_LANE_LIMIT).map(_laneVaultRow),
+                  'No favourites yet. Tap the star on a vault to pin it here.');
+        _fillLane('lane-recent', recent.map(_laneVaultRow),
+                  'Vaults you open will show up here.');
+        renderWaitingLane(sharedWithMe);
+    } catch (error) {
+        console.error('Failed to render dashboard lanes:', error);
+    }
+}
+
+// "What's waiting for you": unread notifications (who shared with you), then any items pushed to you
+// that still need claiming, then items already shared with you that you can open — capped together.
+function renderWaitingLane(sharedWithMe) {
+    const rows = [];
+    const unread = (typeof notifItems !== 'undefined' && Array.isArray(notifItems))
+        ? notifItems.filter(n => !n.is_read) : [];
+    unread.slice(0, _DASHBOARD_LANE_LIMIT).forEach(n => rows.push(_laneNotifRow(n)));
+
+    const shared = Array.isArray(sharedWithMe) ? sharedWithMe : [];
+    const remaining = () => _DASHBOARD_LANE_LIMIT - rows.length;
+    if (remaining() > 0) {
+        shared.filter(s => s.status === 'available').slice(0, remaining())
+              .forEach(s => rows.push(_laneSharedRow(s)));
+    }
+    if (remaining() > 0) {
+        shared.filter(s => s.status === 'active').slice(0, remaining())
+              .forEach(s => rows.push(_laneSharedRow(s)));
+    }
+    _fillLane('lane-waiting', rows, "You're all caught up.");
+}
+
+function _fillLane(id, rows, emptyText) {
+    const box = document.getElementById(id);
+    if (!box) return;
+    if (!rows.length) { box.replaceChildren(_laneEmpty(emptyText)); return; }
+    box.replaceChildren(...rows);
+}
+
+function _laneEmpty(text) {
+    return _el('p', 'dashboard-lane-empty text-secondary', text);
+}
+
+// A clickable vault row (favourites / most-recent lanes) — opens the vault browser.
+function _laneVaultRow(v) {
+    const row = _el('button', 'dashboard-lane-item');
+    row.type = 'button';
+    const icon = _el('span', 'dashboard-lane-icon');
+    icon.appendChild(_svgIcon('vault', 'icon-sm'));
+    row.appendChild(icon);
+    const main = _el('div', 'dashboard-lane-main');
+    main.appendChild(_el('div', 'dashboard-lane-title', v.name || 'Vault'));
+    const t = parseServerTime(v.last_viewed_at);
+    main.appendChild(_el('div', 'dashboard-lane-sub text-secondary',
+        t ? ('Last opened ' + formatTimeAgo(v.last_viewed_at)) : 'Not opened yet'));
+    row.appendChild(main);
+    row.addEventListener('click', () => openVault(v.id));
+    return row;
+}
+
+// A notification row — opens the target section (mirrors the bell panel's onNotifClick).
+function _laneNotifRow(n) {
+    const row = _el('button', 'dashboard-lane-item' + (n.is_read ? '' : ' unread'));
+    row.type = 'button';
+    const icon = _el('span', 'dashboard-lane-icon');
+    icon.appendChild(_svgIcon('bell', 'icon-sm'));
+    row.appendChild(icon);
+    const main = _el('div', 'dashboard-lane-main');
+    main.appendChild(_el('div', 'dashboard-lane-title', n.title || ''));
+    if (n.body) main.appendChild(_el('div', 'dashboard-lane-sub text-secondary', n.body));
+    row.appendChild(main);
+    row.addEventListener('click', () => onNotifClick(n));
+    return row;
+}
+
+// A shared-with-me row — Open (active) or lands you in the Shared section to claim (available).
+function _laneSharedRow(s) {
+    const row = _el('button', 'dashboard-lane-item');
+    row.type = 'button';
+    const icon = _el('span', 'dashboard-lane-icon');
+    icon.appendChild(_svgIcon(s.target_type === 'file' ? 'file' : (s.target_type === 'folder' ? 'folder' : 'vault'), 'icon-sm'));
+    row.appendChild(icon);
+    const main = _el('div', 'dashboard-lane-main');
+    const title = s.target_type === 'vault' ? (s.vault_name || 'Shared vault')
+        : (s.target_name || 'Shared item');
+    main.appendChild(_el('div', 'dashboard-lane-title', title));
+    main.appendChild(_el('div', 'dashboard-lane-sub text-secondary',
+        s.status === 'available' ? 'Shared with you — claim to open' : 'Shared with you'));
+    row.appendChild(main);
+    if (s.status === 'available') {
+        row.addEventListener('click', () => { const el = document.querySelector('.sidebar-item[data-section="shared"]'); if (el) el.click(); });
+    } else {
+        row.addEventListener('click', () => openSharedItem(s.vault_id, s.target_folder_id || ''));
+    }
+    return row;
 }
 
 // Pick an icon for a dashboard audit event. Audit action strings vary
@@ -1572,9 +1699,18 @@ function canSeeSystemStatus() {
 function applyDashboardAdminGating() {
     const card = document.getElementById('dashboard-system-status');
     const grid = document.getElementById('dashboard-lower-grid');
+    const usersCard = document.getElementById('dashboard-users-card');
     const show = canSeeSystemStatus();
+    // The Active Users tile and the whole Recent-Events/System-Status row are administrator ops
+    // content. Reveal them only for an interactive admin; a non-admin (or a scoped temp session
+    // reading as its admin owner) sees the personal lanes instead. Both branches set display
+    // explicitly so the same tab moving between accounts never strands the previous layout.
+    if (usersCard) usersCard.style.display = show ? '' : 'none';
     if (card) card.style.display = show ? '' : 'none';
-    if (grid) grid.style.gridTemplateColumns = show ? '2fr 1fr' : '1fr';
+    if (grid) {
+        grid.style.display = show ? '' : 'none';
+        grid.style.gridTemplateColumns = show ? '2fr 1fr' : '1fr';
+    }
 }
 
 // Update system status indicators

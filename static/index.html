@@ -10,7 +10,7 @@
     <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
     <link rel="apple-touch-icon" href="/static/assets/logo.png?v=1">
     <link rel="stylesheet" href="/static/css/theme.css?v=20260822a">
-    <link rel="stylesheet" href="/static/css/components.css?v=20260823b">
+    <link rel="stylesheet" href="/static/css/components.css?v=20260824a">
     <link rel="stylesheet" href="/static/css/utilities.css?v=20251015c">
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-sans-500.woff2" crossorigin>
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-mono-500.woff2" crossorigin>
@@ -337,7 +337,10 @@
                                 </div>
                             </div>
                         </div>
-                        <div class="card stat-card">
+                        <!-- Active Users is an administrator metric. It starts hidden so a non-admin
+                             never sees it even for one frame; applyDashboardAdminGating() reveals it
+                             for an administrator (and re-hides it if the tab moves to a non-admin). -->
+                        <div class="card stat-card" id="dashboard-users-card" style="display: none;">
                             <div class="card-body">
                                 <div class="flex items-center gap-md">
                                     <div class="stat-tile is-success"><svg class="icon"><use href="#i-users"/></svg></div>
@@ -372,13 +375,45 @@
                         </div>
                     </div>
 
+                    <!-- Personal lanes: what has been shared with you and awaits action, your
+                         favourite vaults, and the vaults you opened most recently. Shown to every
+                         signed-in account (the data is naturally scoped to what you can see). Notes
+                         join these lanes when the Notes feature ships. Rows are rendered by
+                         renderDashboardLanes() with textContent, so names are never HTML. -->
+                    <div id="dashboard-lanes" class="grid" style="grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--space-md); margin-bottom: var(--space-xl);">
+                        <div class="card dashboard-lane">
+                            <div class="card-header">
+                                <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-bell"/></svg> What's waiting for you</h3>
+                            </div>
+                            <div class="card-body dashboard-lane-body">
+                                <div id="lane-waiting" class="dashboard-lane-list"></div>
+                            </div>
+                        </div>
+                        <div class="card dashboard-lane">
+                            <div class="card-header">
+                                <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-star"/></svg> Favourites</h3>
+                            </div>
+                            <div class="card-body dashboard-lane-body">
+                                <div id="lane-favourites" class="dashboard-lane-list"></div>
+                            </div>
+                        </div>
+                        <div class="card dashboard-lane">
+                            <div class="card-header">
+                                <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-clock"/></svg> Most recent</h3>
+                            </div>
+                            <div class="card-body dashboard-lane-body">
+                                <div id="lane-recent" class="dashboard-lane-list"></div>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Recent Events and System Status.
-                         System Status is administrator-only. It starts hidden and the grid starts
+                         Both are administrator-only. The whole row starts hidden and the grid starts
                          as a single full-width column, so a non-admin never sees it even for one
-                         frame; applyDashboardAdminGating() restores the two-column layout for an
-                         administrator. Failing closed here means a JS error leaves the card hidden
+                         frame; applyDashboardAdminGating() reveals it (two-column) for an
+                         administrator. Failing closed here means a JS error leaves the row hidden
                          rather than exposed. -->
-                    <div id="dashboard-lower-grid" class="grid" style="grid-template-columns: 1fr; gap: var(--space-md);">
+                    <div id="dashboard-lower-grid" class="grid" style="display: none; grid-template-columns: 1fr; gap: var(--space-md);">
                         <!-- Recent Events -->
                         <div class="card">
                             <div class="card-header">
@@ -2921,7 +2956,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260824a"></script>
+    <script src="/static/js/app.js?v=20260824b"></script>
 </body>
 </html>
 
