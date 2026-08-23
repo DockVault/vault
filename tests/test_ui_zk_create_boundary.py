@@ -371,7 +371,13 @@ def test_keyless_first_create_refuses_and_guides_without_registering(
         # key" modal opens as guidance. Nothing is registered, no vault is created, the private
         # identity key is never touched, and no vault-password / registration confirm ever appears.
         expect(page.locator("#encryption-key-modal")).to_be_visible(timeout=8_000)
-        assert requests_seen == [("GET", "/ecc/keys/public")], requests_seen
+        # Only public-key READS happened (the create helper's lookup, plus the guide modal refreshing
+        # its status) — crucially NO key registration and NO vault creation. The private identity key
+        # is never touched.
+        assert requests_seen and all(path == "/ecc/keys/public" for _, path in requests_seen), requests_seen
+        assert ("POST", "/ecc/keys/register/challenge") not in requests_seen
+        assert ("POST", "/ecc/keys/register") not in requests_seen
+        assert ("POST", "/vaults") not in requests_seen
         assert not any(path == "/ecc/keys/private" for _, path in requests_seen)
         assert page.evaluate("() => zkState.privateKey === null") is True
 

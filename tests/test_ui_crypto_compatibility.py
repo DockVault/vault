@@ -272,6 +272,10 @@ def _set_up_account_key(page: Page, passphrase: str) -> None:
     expect(page.locator("#encryption-key-status")).to_contain_text(
         "set up and active", timeout=15_000
     )
+    # Close the modal so its overlay doesn't intercept the caller's next clicks (the caller
+    # typically navigates to create a vault right after).
+    page.locator("#encryption-key-modal .close-modal-btn").first.click()
+    expect(page.locator("#encryption-key-modal")).to_be_hidden(timeout=5_000)
 
 
 def _open_create_vault(page: Page) -> None:
