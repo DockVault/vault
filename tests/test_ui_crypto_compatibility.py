@@ -272,6 +272,10 @@ def _set_up_account_key(page: Page, passphrase: str) -> None:
     expect(page.locator("#encryption-key-status")).to_contain_text(
         "set up and active", timeout=15_000
     )
+    # Close the modal so its overlay doesn't intercept the caller's next clicks (the caller
+    # typically navigates to create a vault right after).
+    page.locator("#encryption-key-modal .close-modal-btn").first.click()
+    expect(page.locator("#encryption-key-modal")).to_be_hidden(timeout=5_000)
 
 
 def _open_create_vault(page: Page) -> None:
@@ -586,6 +590,10 @@ def test_hierarchical_zero_knowledge_upload_download_survives_fresh_login(
         contexts["hierarchical writer"] = writer_context
         writer = writer_context.new_page()
         _login(writer, user["_username"], user["_password"])
+        # The account encryption key must be set up deliberately BEFORE creating a zero-knowledge
+        # vault — the app no longer registers it inline mid-create (users confused that passphrase
+        # prompt with a vault password). Set it up via the standalone flow, then create directly.
+        _set_up_account_key(writer, passphrase)
         _open_create_vault(writer)
         writer.fill("#vault-name", vault_name)
         expect(writer.locator("#vault-type-group")).to_be_visible(timeout=5_000)
@@ -593,7 +601,6 @@ def test_hierarchical_zero_knowledge_upload_download_survives_fresh_login(
         expect(writer.locator("#vault-hierarchical-wrap")).to_be_visible(timeout=5_000)
         writer.check("#vault-hierarchical")
         writer.click("#create-vault-form button[type=submit]")
-        _complete_first_key_prompts(writer, passphrase)
         expect(writer.locator("#create-vault-modal")).to_be_hidden(timeout=20_000)
 
         matches = [v for v in owner.get("/vaults").json() if v["name"] == vault_name]

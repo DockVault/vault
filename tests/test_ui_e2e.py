@@ -713,25 +713,35 @@ def test_zero_knowledge_vault_end_to_end(page: Page, admin):
     vid = None
     try:
         _login(page, user["_username"], user["_password"])
+
+        # Set up the account encryption key FIRST, via the standalone flow — creating a
+        # zero-knowledge vault now requires an existing key (the app no longer registers it inline
+        # mid-create, which users mistook for the vault's password). Acknowledge the irrecoverability
+        # warning, then enter+confirm the passphrase.
+        page.click("#profile-btn")
+        page.click("#encryption-key-btn")
+        expect(page.locator("#encryption-key-modal")).to_be_visible(timeout=5000)
+        page.click("#encryption-key-setup-btn")
+        expect(page.locator("#confirm-modal")).to_be_visible(timeout=5000)
+        page.click("#confirm-modal-confirm-btn")
+        for _ in range(2):
+            expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=5000)
+            page.fill("#confirm-modal-input", passphrase)
+            page.click("#confirm-modal-confirm-btn")
+        expect(page.locator("#encryption-key-status")).to_contain_text(
+            "set up and active", timeout=15000
+        )
+        page.locator("#encryption-key-modal .close-modal-btn").first.click()
+        expect(page.locator("#encryption-key-modal")).to_be_hidden(timeout=5000)
+
+        # Now create the zero-knowledge vault — the key exists, so create proceeds directly (no prompt).
         page.click('.sidebar-item[data-section="vaults"]')
         page.click("#create-vault-btn")
         expect(page.locator("#create-vault-modal")).to_be_visible()
         page.fill("#vault-name", vname)
-        # ZK is enabled, so the type selector is offered.
         expect(page.locator("#vault-type-group")).to_be_visible(timeout=5000)
         page.select_option("#vault-type", "zero_knowledge")
         page.click("#create-vault-form button[type=submit]")
-
-        # First-time key setup: acknowledge the "passphrase cannot be recovered" warning
-        # (a plain confirm, no input), then enter the passphrase and confirm it (same modal).
-        expect(page.locator("#confirm-modal")).to_be_visible(timeout=5000)
-        page.click("#confirm-modal-confirm-btn")
-        expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=5000)
-        page.fill("#confirm-modal-input", passphrase)
-        page.click("#confirm-modal-confirm-btn")
-        page.fill("#confirm-modal-input", passphrase)
-        page.click("#confirm-modal-confirm-btn")
-
         expect(page.locator("#create-vault-modal")).to_be_hidden(timeout=15000)
 
         match = [v for v in owner.get("/vaults").json() if v["name"] == vname]
@@ -836,6 +846,11 @@ def test_zero_knowledge_upload_resumes_across_reload(page: Page, admin):
         page.click('.sidebar-item[data-section="vaults"]')
         page.wait_for_selector(f'.open-vault-btn[data-vault-id="{vid}"]', timeout=10000)
         page.click(f'.open-vault-btn[data-vault-id="{vid}"]')
+        # Opening a ZK vault requires unlocking first, and the reload wiped the in-memory key — so
+        # supply the passphrase before the vault view (and the auto-resume behind it) appears.
+        expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=10000)
+        page.fill("#confirm-modal-input", passphrase)
+        page.click("#confirm-modal-confirm-btn")
         expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
 
         # The resumed upload finishes and the file lands.
@@ -1366,6 +1381,10 @@ def test_zero_knowledge_upload_not_resumable_without_local_ciphertext(page: Page
         page.click('.sidebar-item[data-section="vaults"]')
         page.wait_for_selector(f'.open-vault-btn[data-vault-id="{vid}"]', timeout=10000)
         page.click(f'.open-vault-btn[data-vault-id="{vid}"]')
+        # Opening a ZK vault requires unlocking first, and the reload wiped the in-memory key.
+        expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=10000)
+        page.fill("#confirm-modal-input", "zk-nolocal-pass-1")
+        page.click("#confirm-modal-confirm-btn")
         expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
 
         # The tray surfaces it as not-resumable here (no auto-resume, honest message).
@@ -1770,9 +1789,30 @@ def test_zero_knowledge_upload_quota_fallback_completes_and_warns(page: Page, ad
 
 
 def _create_zk_vault_via_ui(page: Page, owner_client, passphrase: str) -> str:
-    """Create a zero-knowledge vault through the UI (generating/using the browser
-    keypair via the passphrase prompts) and return its id. Assumes the page is
-    logged in and ZK is enabled."""
+    """Create a zero-knowledge vault through the UI and return its id. The account encryption key must
+    be set up BEFORE creating a ZK vault — the app no longer registers it inline mid-create (users
+    mistook that passphrase prompt for the vault's password). So when the user has no keypair yet, set
+    it up first via the standalone flow (under `passphrase`), then create the vault directly. Assumes
+    the page is logged in and ZK is enabled."""
+    if not owner_client.get("/ecc/keys/public").json().get("has_keypair"):
+        # Standalone "Set up encryption key": acknowledge irrecoverability, then enter+confirm the
+        # passphrase (this leaves the key registered AND unlocked in the browser for the create).
+        page.click("#profile-btn")
+        page.click("#encryption-key-btn")
+        expect(page.locator("#encryption-key-modal")).to_be_visible(timeout=5000)
+        page.click("#encryption-key-setup-btn")
+        expect(page.locator("#confirm-modal")).to_be_visible(timeout=5000)
+        page.click("#confirm-modal-confirm-btn")
+        for _ in range(2):
+            expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=5000)
+            page.fill("#confirm-modal-input", passphrase)
+            page.click("#confirm-modal-confirm-btn")
+        expect(page.locator("#encryption-key-status")).to_contain_text(
+            "set up and active", timeout=15000
+        )
+        page.locator("#encryption-key-modal .close-modal-btn").first.click()
+        expect(page.locator("#encryption-key-modal")).to_be_hidden(timeout=5000)
+
     vname = _u("zk")
     page.click('.sidebar-item[data-section="vaults"]')
     page.click("#create-vault-btn")
@@ -1781,15 +1821,6 @@ def _create_zk_vault_via_ui(page: Page, owner_client, passphrase: str) -> str:
     expect(page.locator("#vault-type-group")).to_be_visible(timeout=5000)
     page.select_option("#vault-type", "zero_knowledge")
     page.click("#create-vault-form button[type=submit]")
-    # Acknowledge the "passphrase cannot be recovered" warning (a plain confirm, no input),
-    # then enter the passphrase and confirm it (same modal).
-    expect(page.locator("#confirm-modal")).to_be_visible(timeout=5000)
-    page.click("#confirm-modal-confirm-btn")
-    expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=5000)
-    page.fill("#confirm-modal-input", passphrase)
-    page.click("#confirm-modal-confirm-btn")
-    page.fill("#confirm-modal-input", passphrase)
-    page.click("#confirm-modal-confirm-btn")
     expect(page.locator("#create-vault-modal")).to_be_hidden(timeout=15000)
     m = [v for v in owner_client.get("/vaults").json() if v["name"] == vname]
     assert m, "ZK vault was not created via the UI"

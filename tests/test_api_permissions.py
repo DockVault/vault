@@ -4,7 +4,7 @@ import os
 import subprocess
 import uuid
 
-from conftest import ApiClient, unique
+from conftest import ApiClient, unique, create_zk_vault
 
 
 _DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
@@ -252,3 +252,57 @@ def test_permission_change_rolls_back_when_audit_insert_fails(admin, temp_user):
         assert "DASHBOARD_VIEW" in _granted(admin, user_id)
     finally:
         _db(remove_failure)
+
+
+def test_zk_permissions_report_member_encryption_key_status(admin):
+    """A4: GET /vaults/{id}/permissions surfaces each ZK member's encryption-key status so the UI can
+    flag 'Pending encryption key setup'. Also pins A2's server premise — a KEYLESS member CAN be
+    granted a zero-knowledge vault via POST /vaults/{id}/permissions (the authz row is created without
+    a wrapped key; the key follows once they set one up)."""
+    from conftest import ensure_ecc_keypair
+    zk_before = admin.get("/settings").json().get("zero_knowledge_enabled")
+    admin.put("/settings", json={"zero_knowledge_enabled": True})  # create_zk_vault needs it enabled
+    vz = create_zk_vault(admin)                   # owner (admin) already holds an encryption keypair
+    keyless = admin.create_user(role="user")      # a fresh account has no ECC keypair
+    keyed = admin.create_user(role="user")
+    keyed_client = ApiClient()
+    keyed_client.login(keyed["_username"], keyed["_password"])
+    ensure_ecc_keypair(keyed_client)              # this member has a keypair (no wrapped DEK needed)
+    try:
+        # A2 server premise: granting a KEYLESS user a ZK vault succeeds (authz row, no key).
+        g1 = admin.post(f"/vaults/{vz['id']}/permissions",
+                        json={"user_id": keyless["id"], "level": "read"})
+        assert g1.status_code in (200, 201), g1.text
+        g2 = admin.post(f"/vaults/{vz['id']}/permissions",
+                        json={"user_id": keyed["id"], "level": "read"})
+        assert g2.status_code in (200, 201), g2.text
+
+        rows = admin.get(f"/vaults/{vz['id']}/permissions").json()
+        by_id = {str(r["user_id"]): r for r in rows}
+        km = by_id[str(keyless["id"])]
+        assert km["pending_key_setup"] is True and km["has_encryption_key"] is False, km
+        ky = by_id[str(keyed["id"])]
+        assert ky["pending_key_setup"] is False and ky["has_encryption_key"] is True, ky
+    finally:
+        admin.delete_user(keyless["id"])
+        admin.delete_user(keyed["id"])
+        admin.post(f"/vaults/{vz['id']}/delete")
+        admin.put("/settings", json={"zero_knowledge_enabled": bool(zk_before)})
+
+
+def test_standard_vault_permissions_have_null_key_status(admin):
+    """A4: a standard (non-ZK) vault reports has_encryption_key=null / pending_key_setup=false — the
+    key-status flag is not applicable when there are no per-member encryption keys."""
+    v = admin.create_vault()
+    member = admin.create_user(role="user")
+    try:
+        g = admin.post(f"/vaults/{v['id']}/permissions",
+                       json={"user_id": member["id"], "level": "read"})
+        assert g.status_code in (200, 201), g.text
+        rows = admin.get(f"/vaults/{v['id']}/permissions").json()
+        km = next(r for r in rows if str(r["user_id"]) == str(member["id"]))
+        assert km["has_encryption_key"] is None
+        assert km["pending_key_setup"] is False
+    finally:
+        admin.delete_user(member["id"])
+        admin.post(f"/vaults/{v['id']}/delete")
