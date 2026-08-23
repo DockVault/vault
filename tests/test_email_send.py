@@ -28,6 +28,8 @@ class _FakeSMTP:
         self.extns = {"starttls"}          # advertise STARTTLS by default
         self.login_exc = None
         self.send_exc = None
+        self._send_n = 0
+        self.fail_send_indices = set()     # 0-based send_message calls that should fail
         _FakeSMTP.last = self
 
     def __enter__(self):
@@ -51,8 +53,12 @@ class _FakeSMTP:
         self.logged_in = (user, password)
 
     def send_message(self, msg):
+        i = self._send_n
+        self._send_n += 1
         if self.send_exc:
             raise self.send_exc
+        if i in self.fail_send_indices:
+            raise smtplib.SMTPRecipientsRefused({})
         self.sent.append(msg)
 
 
@@ -160,6 +166,37 @@ def test_build_message_text_only_shape():
     assert msg["To"] == "r@x.example"
     assert "Ops" in msg["From"] and "from@example.com" in msg["From"]
     assert "Body" in msg.get_content()
+
+
+def test_batch_sends_all_over_one_connection(fake_smtp):
+    cfg = _cfg(smtp_port=465, smtp_username="u", smtp_password="p")
+    msgs = [_msg(cfg, to=f"r{i}@x.example") for i in range(3)]
+    out = es.smtp_send_batch(cfg, msgs)
+    assert [o["ok"] for o in out] == [True, True, True]
+    assert len(fake_smtp.last.sent) == 3            # one connection, three messages
+    assert fake_smtp.last.logged_in == ("u", "p")   # authenticated once
+
+
+def test_batch_per_message_failure_is_isolated(fake_smtp):
+    cfg = _cfg(smtp_port=465)
+    def _mk(host, port, timeout=None):
+        inst = _FakeSMTP(host, port, timeout)
+        inst.fail_send_indices = {1}                # only the 2nd recipient fails
+        return inst
+    smtplib.SMTP_SSL = _mk
+    out = es.smtp_send_batch(cfg, [_msg(cfg, to=f"r{i}@x.example") for i in range(3)])
+    assert out[0]["ok"] is True and out[2]["ok"] is True
+    assert out[1]["ok"] is False and out[1]["error"] == "delivery failed"   # generic, no detail
+
+
+def test_batch_connect_failure_raises(fake_smtp):
+    cfg = _cfg(smtp_port=465)
+    def _mk(host, port, timeout=None):
+        raise ConnectionRefusedError("nope")
+    smtplib.SMTP_SSL = _mk
+    with pytest.raises(es.EmailSendError) as ei:
+        es.smtp_send_batch(cfg, [_msg(cfg)])
+    assert ei.value.category == "transport"
 
 
 def test_build_message_html_with_inline_image():

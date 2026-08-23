@@ -185,3 +185,58 @@ def smtp_send(cfg: dict, msg: EmailMessage) -> None:
         print(f"[email] send failed: {type(e).__name__}: {e}")
         raise EmailSendError(
             "transport", "Could not send the email — check the SMTP server, port, and TLS settings.")
+
+
+def smtp_send_batch(cfg: dict, messages: list) -> list:
+    """Send several pre-built messages over ONE connection. Returns a list of
+    ``{"ok": bool, "error": str|None}`` aligned with ``messages``.
+
+    A connect/login/STARTTLS-strip failure raises EmailSendError (the whole batch cannot start). Once
+    connected, a per-message failure marks only that message failed (with a GENERIC 'delivery failed'
+    — never a leaked detail) and the loop continues, so one bad recipient doesn't sink the rest."""
+    host = (cfg.get("smtp_server") or "").strip()
+    from_email = (cfg.get("from_email") or "").strip()
+    if not host or not from_email:
+        raise EmailSendError("config", "SMTP is not configured")
+    try:
+        port = int(cfg.get("smtp_port") or 587)
+    except (TypeError, ValueError):
+        port = 587
+    username = (cfg.get("smtp_username") or "").strip()
+    password = cfg.get("smtp_password") or ""
+    results = [{"ok": False, "error": "not attempted"} for _ in messages]
+    try:
+        server = smtplib.SMTP_SSL(host, port, timeout=30) if port == 465 else smtplib.SMTP(host, port, timeout=30)
+        with server:
+            server.ehlo()
+            encrypted = port == 465
+            if port != 465 and server.has_extn("starttls"):
+                server.starttls()
+                server.ehlo()
+                encrypted = True
+            if username and not encrypted:
+                raise EmailSendError(
+                    "transport",
+                    "The SMTP server does not offer STARTTLS; refusing to send credentials over an unencrypted connection.")
+            if username:
+                server.login(username, password)
+            for i, msg in enumerate(messages):
+                try:
+                    server.send_message(msg)
+                    results[i] = {"ok": True, "error": None}
+                except (smtplib.SMTPException, OSError, ValueError, UnicodeError) as e:
+                    print(f"[email] per-recipient send failed: {type(e).__name__}: {e}")
+                    results[i] = {"ok": False, "error": "delivery failed"}
+    except EmailSendError:
+        raise
+    except smtplib.SMTPAuthenticationError:
+        raise EmailSendError("auth", "SMTP authentication failed — check the username and password.")
+    except (ValueError, UnicodeError) as e:
+        print(f"[email] batch config invalid: {type(e).__name__}: {e}")
+        raise EmailSendError(
+            "config", "The SMTP configuration is invalid — check the server address and the From name/address.")
+    except (smtplib.SMTPException, OSError) as e:
+        print(f"[email] batch connect failed: {type(e).__name__}: {e}")
+        raise EmailSendError(
+            "transport", "Could not connect to the SMTP server — check the server, port, and TLS settings.")
+    return results

@@ -16,6 +16,7 @@ import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
@@ -24,7 +25,7 @@ from sqlalchemy.orm import Session, defer, joinedload
 from app.core.database import get_db
 from app.core.models import EmailProfile, EmailResource, EmailTemplate, RoleEnum, User
 from app.core import email_sanitize, email_send
-from app.core.rate_limiter import rate_limiter as _rate_limiter
+from app.core.rate_limiter import rate_limiter as _rate_limiter, RateLimiterUnavailable
 from app.services.audit_logger import AuditLogger
 
 security_scheme = HTTPBearer()
@@ -177,6 +178,22 @@ def _audit(db: Session, request: Request, user: User, action: str, **details) ->
         pass  # never fail the operation because the audit write did
 
 
+def _rate_limit(admin_id, *, limit: int, window: int, prefix: str, detail: str) -> None:
+    """Fail-closed rate limit for the outbound/side-effecting Email Studio routes. Raises 429 when
+    the limit is hit, and a CLEAN 503 (not a 500) when the limiter itself is unavailable — matching
+    the auth routes, so a Redis outage never proceeds AND never surfaces a stack."""
+    try:
+        allowed, _, reset = _rate_limiter.check_rate_limit(
+            identifier=str(admin_id), limit=limit, window=window, prefix=prefix, fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="The rate limiter is temporarily unavailable; please try again shortly.")
+    if not allowed:
+        import time as _t
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=detail,
+                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+
+
 @router.get("/profiles")
 async def list_profiles(db: Session = Depends(get_db)):
     """All sending profiles, default first then newest, passwords stripped."""
@@ -286,13 +303,8 @@ async def test_profile(payload: ProfileTestIn, request: Request,
                        admin: User = Depends(require_interactive_admin),
                        db: Session = Depends(get_db)):
     """Send a one-off test email through a profile's config WITHOUT saving anything."""
-    allowed, _, reset = _rate_limiter.check_rate_limit(
-        identifier=str(admin.id), limit=5, window=60, prefix="email_profile_test", fail_open=False)
-    if not allowed:
-        import time as _t
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                            detail="Too many test emails; please wait a moment.",
-                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    _rate_limit(admin.id, limit=5, window=60, prefix="email_profile_test",
+                detail="Too many test emails; please wait a moment.")
 
     if payload.profile_id is not None:
         p = db.get(EmailProfile, payload.profile_id)
@@ -578,13 +590,8 @@ async def upload_resource(request: Request, file: UploadFile = File(...),
     # total count so it can't grow without bound. (The multipart body is buffered by Starlette
     # before this handler runs — a pre-auth over-cap body is a known app-wide characteristic shared
     # with the brand-asset uploader; bounding it before parsing is deferred to a middleware change.)
-    allowed, _, reset = _rate_limiter.check_rate_limit(
-        identifier=str(admin.id), limit=60, window=60, prefix="email_resource_upload", fail_open=False)
-    if not allowed:
-        import time as _t
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                            detail="Too many uploads; please wait a moment.",
-                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    _rate_limit(admin.id, limit=60, window=60, prefix="email_resource_upload",
+                detail="Too many uploads; please wait a moment.")
     if db.query(EmailResource.id).count() >= _MAX_RESOURCE_COUNT:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail=f"Resource limit reached ({_MAX_RESOURCE_COUNT}); delete some images first.")
@@ -646,3 +653,143 @@ async def delete_resource(resource_id: uuid.UUID, request: Request,
     db.delete(r)   # templates keep the data-resource-id; it simply stops resolving (dangling -> dropped)
     db.commit()
     _audit(db, request, admin, "email_resource_deleted", resource_id=str(resource_id), filename=fn)
+
+
+# --------------------------------------------------------------------------------------------------
+# Sending a template
+# --------------------------------------------------------------------------------------------------
+
+_MAX_RECIPIENTS = 100
+# Exclude commas too: send_message derives envelope RCPTs from the To header via getaddresses,
+# which splits on commas — so a comma would let the delivered address differ from what was typed.
+_EMAIL_RE = re.compile(r"^[^@\s,]+@[^@\s,]+\.[^@\s,]+$")
+
+
+class SendIn(BaseModel):
+    user_ids: list[uuid.UUID] = Field(default_factory=list, max_length=_MAX_RECIPIENTS)
+    addresses: list[str] = Field(default_factory=list, max_length=_MAX_RECIPIENTS)
+
+
+def _profile_cfg(p: EmailProfile) -> dict:
+    return {"smtp_server": p.smtp_server, "smtp_port": p.smtp_port,
+            "smtp_username": p.smtp_username or "", "smtp_password": p.smtp_password or "",
+            "from_email": p.from_email, "from_name": p.from_name or ""}
+
+
+@router.post("/templates/{template_id}/send")
+async def send_template(template_id: uuid.UUID, payload: SendIn, request: Request,
+                        admin: User = Depends(require_interactive_admin),
+                        db: Session = Depends(get_db)):
+    """Render + send a template to vault users and/or free-form addresses, one personalized message
+    per recipient, images inlined as cid: parts. Refuses (and raises a security event) if the STORED
+    body is hostile — the before-send tamper check."""
+    _rate_limit(admin.id, limit=30, window=60, prefix="email_template_send",
+                detail="Too many sends; please wait a moment.")
+
+    t = db.get(EmailTemplate, template_id)
+    if t is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found.")
+
+    # BEFORE-SEND tamper defense: the stored body is normally already sanitized, so hostile content
+    # here means the row was tampered with directly. Refuse the whole send and raise a security event.
+    reasons = email_sanitize.hostile_reasons(t.body_html or "")
+    if reasons:
+        from app.services.security_monitor import get_security_monitor
+        get_security_monitor(db).record_malicious_email_content(
+            user_id=admin.id, username=admin.username, ip_address=_client_ip(request),
+            surface="email_template_send", reasons=sorted(set(reasons)))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This template contains content that is not allowed and cannot be sent; re-save it first.")
+
+    # Resolve the sending config: the template's profile (only if it has a usable server+From), else
+    # the default profile. A blank/dangling profile falls through rather than erroring at send time.
+    cfg = None
+    if t.profile_id:
+        p = db.get(EmailProfile, t.profile_id)
+        if p is not None:
+            candidate = _profile_cfg(p)
+            if (candidate.get("smtp_server") or "").strip() and (candidate.get("from_email") or "").strip():
+                cfg = candidate
+    if cfg is None:
+        cfg = email_send.resolve_default_config(db)
+    if cfg is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="No sending profile is configured. Assign one to the template or set a default.")
+
+    # Build the recipient list; unresolvable recipients become error rows, not failures of the batch.
+    recipients: list[dict] = []
+    errors: list[dict] = []
+    seen_emails: set = set()
+    if payload.user_ids:
+        found = {u.id: u for u in db.query(User).filter(User.id.in_(payload.user_ids)).all()}
+        for uid in payload.user_ids:
+            u = found.get(uid)
+            if u is None:
+                errors.append({"recipient": str(uid), "ok": False, "error": "user not found"})
+            elif not (u.email or "").strip():
+                errors.append({"recipient": u.username, "ok": False, "error": "user has no email"})
+            elif u.email.strip().lower() not in seen_emails:      # dedupe: one message per address
+                seen_emails.add(u.email.strip().lower())
+                recipients.append({"email": u.email.strip(), "username": u.username})
+    for addr in payload.addresses:
+        a = (addr or "").strip()
+        if not _EMAIL_RE.match(a) or _CTRL_RE.search(a):
+            errors.append({"recipient": a[:120], "ok": False, "error": "invalid address"})
+        elif a.lower() not in seen_emails:
+            seen_emails.add(a.lower())
+            recipients.append({"email": a, "username": ""})
+    if not recipients:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="No valid recipients to send to.")
+    if len(recipients) > _MAX_RECIPIENTS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Too many recipients (max {_MAX_RECIPIENTS} per send).")
+
+    # Memoized resource loader so a shared image loads from the DB once, not once per recipient.
+    _rc: dict = {}
+
+    def load_resource(rid: str):
+        if rid not in _rc:
+            try:
+                row = (db.query(EmailResource.content_type, EmailResource.data)
+                       .filter(EmailResource.id == uuid.UUID(str(rid))).first())
+            except (ValueError, TypeError):
+                row = None
+            _rc[rid] = (row[0], row[1]) if row else None
+        return _rc[rid]
+
+    brand = _brand_name(db)
+    messages, prepared = [], []
+    for rec in recipients:
+        ctx = email_sanitize.token_context(recipient=rec, brand_name=brand)
+        subject = email_sanitize.render_subject(t.subject, ctx)
+        html, inline = email_sanitize.render_for_send(t.body_html, context=ctx, load_resource=load_resource)
+        text = email_sanitize.render_plaintext_fallback(html)
+        try:
+            msg = email_send.build_message(cfg, to_addr=rec["email"], subject=subject,
+                                           text_body=text, html_body=html, inline_images=inline)
+        except email_send.EmailSendError:
+            errors.append({"recipient": rec["email"], "ok": False, "error": "message build failed"})
+            continue
+        messages.append(msg)
+        prepared.append(rec)
+
+    try:
+        # Offload the BLOCKING smtplib conversation to a worker thread so a bulk send doesn't stall
+        # the async event loop for the whole worker.
+        outcomes = await run_in_threadpool(email_send.smtp_send_batch, cfg, messages) if messages else []
+    except email_send.EmailSendError as e:
+        code = status.HTTP_400_BAD_REQUEST if e.category == "config" else status.HTTP_502_BAD_GATEWAY
+        raise HTTPException(status_code=code, detail=e.message)
+
+    results = list(errors)
+    sent = 0
+    for rec, out in zip(prepared, outcomes):
+        results.append({"recipient": rec["email"], "ok": out["ok"], "error": out["error"]})
+        sent += 1 if out["ok"] else 0
+    _audit(db, request, admin, "email_template_sent", template_id=str(t.id),
+           sent=sent, failed=len(messages) - sent, errors=len(errors),
+           attempted=len(messages), recipients=len(recipients))
+    return {"template_id": str(t.id), "sent": sent, "attempted": len(messages),
+            "recipients": len(recipients), "results": results}
