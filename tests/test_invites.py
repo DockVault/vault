@@ -130,6 +130,16 @@ def test_mint_rejects_username_equal_to_existing_email(admin, invites_on):
         admin.delete_user(victim["id"])
 
 
+def test_mint_rejects_non_ascii_email(admin, invites_on):
+    # ASCII-only email at invite creation, uniform with self-signup. The domain-gate config is
+    # ASCII/punycode, so a unicode IDN domain would otherwise slip a denylist stored in punycode
+    # (evasion). Prove it's rejected 400 BEFORE the gate even with that denylist configured.
+    admin.put("/settings", json={"signup_email_domain_mode": "denylist",
+                                 "signup_email_domains": ["xn--mnchen-3ya.de"]})
+    r = _mint(admin, username=unique("idn"), email="user@münchen.de", role="user")
+    assert r.status_code == 400, r.text
+
+
 # --- live-invite dedup -------------------------------------------------------
 def test_live_invite_blocks_second_but_revoked_does_not(admin, invites_on):
     uname = unique("dup")

@@ -734,6 +734,23 @@ class InviteAccept(BaseModel):
     email: Optional[EmailStr] = None
 
 
+class SignupRequest(BaseModel):
+    # Public self-signup. Mass-assignment defense: the ONLY fields a visitor may supply. Any
+    # role/is_active/is_locked/storage_quota/created_by key in the body is IGNORED by the schema
+    # (pydantic's default extra='ignore') and the handler forces the safe values itself
+    # (role=user, created_by=NULL, active/unlocked column defaults) — it never reads those keys.
+    # `email` is EmailStr so a multiple-'@' address is rejected at the schema edge (the domain gate
+    # rsplit('@')s and would otherwise treat everything after the last '@' as the domain).
+    username: str = Field(..., min_length=3, max_length=50)
+    email: Optional[EmailStr] = None
+    password: str = Field(..., min_length=8)
+
+    @field_validator('username')
+    @classmethod
+    def _clean_username(cls, v):
+        return _validate_new_username(v)
+
+
 class UserUpdate(BaseModel):
     email: Optional[EmailStr] = None
     password: Optional[str] = Field(None, min_length=8)
@@ -3299,7 +3316,7 @@ async def create_invite(
     """Mint an account invitation (interactive admin only — a temp-cred admin is refused). The
     plaintext invite link is returned ONCE; only its peppered HMAC is stored."""
     from app.core.models import AccountInvitation
-    from app.core.account_policy import email_allowed_by_domain_gate
+    from app.core.account_policy import email_allowed_by_domain_gate, signup_email_is_ascii
     from app.core import invitations
     from sqlalchemy.exc import IntegrityError
 
@@ -3334,6 +3351,10 @@ async def create_invite(
     if pol.get("email_requirement") == "required" and not email:
         raise HTTPException(status_code=400, detail="An email address is required for new accounts.")
     if email:
+        # ASCII-only, same as self-signup: the domain-gate config is ASCII/punycode, so a unicode IDN
+        # domain (or a homograph of a denylisted one) would otherwise slip the allow/deny check.
+        if not signup_email_is_ascii(email):
+            raise HTTPException(status_code=400, detail="That email domain is not permitted.")
         if not email_allowed_by_domain_gate(email, pol.get("signup_email_domain_mode"),
                                             pol.get("signup_email_domains")):
             raise HTTPException(status_code=400, detail="That email domain is not permitted.")
@@ -3524,7 +3545,7 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
     from app.core.models import AccountInvitation, RoleEnum, User
     from app.core import invitations
     from app.core.email_identity import normalize_email, email_in_use
-    from app.core.account_policy import email_allowed_by_domain_gate
+    from app.core.account_policy import email_allowed_by_domain_gate, signup_email_is_ascii
     from app.core.security import hash_password
     from app.core.endpoint_permissions import grant_default_permissions_for_role
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
@@ -3583,6 +3604,11 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
             _audit_accept_failure(db, prefix, client_ip, reason="email_required")
             raise HTTPException(status_code=400, detail="An email address is required.")
         if body_email:
+            # ASCII-only, same as self-signup (uniform across all three account-creation surfaces):
+            # a unicode IDN domain would otherwise slip the ASCII/punycode allow/deny gate.
+            if not signup_email_is_ascii(body_email):
+                _audit_accept_failure(db, prefix, client_ip, reason="email_non_ascii")
+                raise HTTPException(status_code=400, detail="That email domain is not permitted.")
             if not email_allowed_by_domain_gate(body_email, pol.get("signup_email_domain_mode"),
                                                 pol.get("signup_email_domains")):
                 _audit_accept_failure(db, prefix, client_ip, reason="email_domain")
@@ -3658,6 +3684,157 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
     # Deliberately NOT auto-logged-in and NO token returned: an invitation link sitting in a mail
     # client's history must not become a live session.
     return {"ok": True, "username": inv.username}
+
+
+@app.get("/auth/policy")
+async def auth_policy(db: Session = Depends(get_db)):
+    """PUBLIC, unauthenticated: the MINIMAL policy the login screen needs to render itself and to
+    decide whether to offer self-signup. Deliberately a small allowlist of keys — it must NOT leak the
+    signup domain lists, invite settings, email-change policy, SMTP/brand config, or anything else
+    from the settings blob (PUT /settings merges freely, so a future key could otherwise ride along;
+    test_api_signup pins the absent keys). Reuses the fail-safe helpers, so it never 500s the login
+    page even on a corrupted settings row."""
+    pol = _account_policy(db)
+    return {
+        "signup_enabled": bool(pol.get("signup_enabled")),
+        "login_identifier": pol.get("login_identifier"),
+        "email_requirement": pol.get("email_requirement"),
+        "password_policy": _password_policy_view(db),
+    }
+
+
+def _audit_signup_failure(db: Session, username: str, ip: str, reason: str) -> None:
+    """Record a failed self-signup attempt (anonymous — no account yet). Never carries the password;
+    the attempted username is truncated. Never raises."""
+    try:
+        AuditLogger(db).log_action(
+            action="account_self_signup_failed", status="failure", user=None,
+            ip_address=ip, resource_type="user",
+            details={"username": (username or "")[:64], "reason": reason})
+    except Exception:
+        pass
+
+
+@app.post("/auth/signup")
+async def self_signup(payload: SignupRequest, request: Request, db: Session = Depends(get_db)):
+    """PUBLIC: create an account from the login screen when self-signup is enabled. Mass-assignment
+    proof (role forced to 'user', created_by NULL — neither is representable in the body),
+    rate-limited per IP AND per attempted username (both fail-closed), email domain-gated + ASCII-only,
+    audited on every processed outcome (throttle 429/503 rejections are deliberately not audited, to
+    avoid audit-row amplification during an attack). The account is NOT signed in — success returns to
+    the login page (mirrors invitation accept)."""
+    import time as _t
+    from app.core.models import RoleEnum, User
+    from app.core.email_identity import normalize_email, email_in_use
+    from app.core.account_policy import email_allowed_by_domain_gate, signup_email_is_ascii
+    from app.core.security import hash_password
+    from app.core.endpoint_permissions import grant_default_permissions_for_role
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    from sqlalchemy.exc import IntegrityError
+
+    client_ip = get_client_ip(request)
+    uname = payload.username
+
+    # (a) Rate limit — per IP AND per attempted username, both fail-closed (unauthenticated
+    # account-creation surface; it must throttle even during a Redis outage). Distinct prefixes so the
+    # budgets don't collide with login (rate_limit:login:*) or invites (invite_accept_*). The username
+    # key is the raw submitted value (lowered), so even a never-existing name is throttled.
+    for ident, pfx, lim in ((client_ip, "signup_ip", settings.rate_limit_api_auth),
+                            (uname.strip().lower(), "signup_identifier", 5)):
+        try:
+            allowed, _, reset = _rl.check_rate_limit(identifier=ident, limit=lim, window=60,
+                                                     prefix=pfx, fail_open=False)
+        except RateLimiterUnavailable:
+            raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+        if not allowed:
+            raise HTTPException(status_code=429, detail="Too many requests.",
+                                headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+
+    pol = _account_policy(db)
+
+    # (b) Master switch. When self-signup is off the endpoint does not exist as far as a caller can
+    # tell — a 404 (not 403), matching the stealth of GET /invites/{token} on a disabled feature.
+    if not pol.get("signup_enabled"):
+        _audit_signup_failure(db, uname, client_ip, reason="disabled")
+        raise HTTPException(status_code=404, detail="Not found.")
+
+    # (c) Password policy (beyond the model's 8-char floor).
+    try:
+        _validate_password_policy(db, payload.password)
+    except HTTPException:
+        _audit_signup_failure(db, uname, client_ip, reason="weak_password")
+        raise
+
+    # (d) Email per policy. Required when the org requires it OR when login is by email/either (an
+    # account with no email could never sign in under those identifiers). ASCII-only: the domain-gate
+    # config is ASCII/punycode, so a unicode IDN domain would silently slip the allow/deny check.
+    body_email = normalize_email(payload.email)
+    email_required = (pol.get("email_requirement") == "required"
+                      or pol.get("login_identifier") in ("email", "either"))
+    if email_required and not body_email:
+        _audit_signup_failure(db, uname, client_ip, reason="email_required")
+        raise HTTPException(status_code=400, detail="An email address is required.")
+    if body_email:
+        if not signup_email_is_ascii(body_email):
+            _audit_signup_failure(db, uname, client_ip, reason="email_non_ascii")
+            raise HTTPException(status_code=400, detail="This email provider is not allowed to sign up.")
+        if not email_allowed_by_domain_gate(body_email, pol.get("signup_email_domain_mode"),
+                                            pol.get("signup_email_domains")):
+            _audit_signup_failure(db, uname, client_ip, reason="email_domain")
+            raise HTTPException(status_code=400, detail="This email provider is not allowed to sign up.")
+        if email_in_use(db, body_email):
+            _audit_signup_failure(db, uname, client_ip, reason="email_in_use")
+            raise HTTPException(status_code=400, detail="That email address is already in use.")
+
+    # (e) Plan cap. _enforce_user_cap's message names the exact user count and plan cap — fine for an
+    # authenticated admin, but on this PUBLIC surface it would hand anonymous visitors a recon oracle.
+    # Swap it for a generic answer.
+    try:
+        _enforce_user_cap(db)
+    except HTTPException:
+        _audit_signup_failure(db, uname, client_ip, reason="user_cap")
+        raise HTTPException(status_code=503, detail="Sign-ups are not available right now.")
+
+    # (f) Uniqueness + impersonation guard, then build the account in ONE transaction. Role is FORCED
+    # to USER and created_by is NULL — a self-signed account can never be an admin or claim a creator.
+    if db.query(User.id).filter(User.username == uname).first():
+        _audit_signup_failure(db, uname, client_ip, reason="username_taken")
+        raise HTTPException(status_code=400, detail="That username is already taken.")
+    # A username that equals an existing account's email would, under 'either' login (username tried
+    # first), shadow that owner. The model already bans '@' in a username, so this is belt-and-braces.
+    if email_in_use(db, uname):
+        _audit_signup_failure(db, uname, client_ip, reason="username_email_conflict")
+        raise HTTPException(status_code=400, detail="That username is already taken.")
+
+    user = User(username=uname, email=body_email,
+                password_hash=hash_password(payload.password),
+                role=RoleEnum.USER, created_by=None)
+    db.add(user)
+    try:
+        db.flush()  # surfaces users.username/email UNIQUE conflicts (a race with a concurrent signup)
+    except IntegrityError:
+        db.rollback()
+        _audit_signup_failure(db, uname, client_ip, reason="race_conflict")
+        raise HTTPException(status_code=400, detail="That username or email is already in use.")
+
+    grant_default_permissions_for_role(str(user.id), user.role, db, commit=False)
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        _audit_signup_failure(db, uname, client_ip, reason="commit_conflict")
+        raise HTTPException(status_code=409, detail="Account could not be created. Please try again.")
+
+    try:
+        AuditLogger(db).log_action(
+            action="account_self_signup", status="success", user=user, ip_address=client_ip,
+            resource_type="user", resource_id=str(user.id), details={"username": uname})
+    except Exception:
+        pass
+
+    # Not auto-logged-in and no token returned — success returns the visitor to the sign-in form.
+    return {"ok": True, "username": uname}
 
 
 # ---------------------------------------------------------------------------

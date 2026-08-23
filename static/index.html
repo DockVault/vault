@@ -113,6 +113,36 @@
                     
                     <div id="login-error" class="alert alert-error mt-md" style="display: none;"></div>
 
+                    <!-- Self-signup: the toggle link and the form are BOTH hidden until the pre-auth
+                         policy fetch (app.js applyLoginPolicyLabel -> /auth/policy) confirms signup is
+                         enabled. The email group's presence/required state is driven by the same policy
+                         (required / optional / absent). No signup markup renders when signup is off. -->
+                    <div id="signup-toggle" class="mt-md" style="display: none;">
+                        <span class="text-secondary" style="font-size: 0.9em;">New here?</span>
+                        <a href="#" id="show-signup-link" role="button">Create an account</a>
+                    </div>
+
+                    <form id="signup-form" style="display: none;">
+                        <div class="form-group">
+                            <label for="signup-username" id="signup-username-label">Username</label>
+                            <input type="text" id="signup-username" name="username" class="form-control" autocomplete="username" minlength="3" maxlength="50">
+                        </div>
+                        <div class="form-group" id="signup-email-group" style="display: none;">
+                            <label for="signup-email" id="signup-email-label">Email</label>
+                            <input type="email" id="signup-email" name="email" class="form-control" autocomplete="email">
+                        </div>
+                        <div class="form-group">
+                            <label for="signup-password">Password</label>
+                            <input type="password" id="signup-password" name="password" class="form-control" autocomplete="new-password" minlength="8">
+                            <small id="signup-password-hint" class="form-help"></small>
+                        </div>
+                        <button type="submit" class="btn btn-primary btn-block">Create account</button>
+                        <div id="signup-error" class="alert alert-error mt-md" style="display: none;"></div>
+                        <div class="mt-md">
+                            <a href="#" id="show-login-link" role="button">&larr; Back to sign in</a>
+                        </div>
+                    </form>
+
                     <!-- Persistent product attribution. Visible by default so it survives even
                          if JS/branding fails; brand.js updates the name/link and only hides it
                          when a deploy sets BRAND_SHOW_POWERED_BY=false. NOT tenant-editable. -->
@@ -2740,7 +2770,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260823a"></script>
+    <script src="/static/js/app.js?v=20260823b"></script>
 </body>
 </html>
 

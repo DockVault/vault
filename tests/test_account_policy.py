@@ -16,6 +16,7 @@ from app.core.account_policy import (
     AccountPolicyError,
     effective_account_policy,
     email_allowed_by_domain_gate,
+    signup_email_is_ascii,
     normalize_domains,
     normalize_domains_lenient,
     validate_account_policy,
@@ -263,6 +264,29 @@ def test_domain_gate_missing_domain_leans_per_mode():
     assert email_allowed_by_domain_gate("no-at-sign", "denylist", ["evil.com"]) is True
     assert email_allowed_by_domain_gate("", "allowlist", ["acme.com"]) is False
     assert email_allowed_by_domain_gate(None, "denylist", ["evil.com"]) is True
+
+
+# ---- signup ASCII-email gate (closes the IDN/homograph domain-gate mismatch) ------------------
+def test_signup_ascii_gate_accepts_plain_ascii():
+    assert signup_email_is_ascii("bob@example.com") is True
+    assert signup_email_is_ascii("Bob.Smith+tag@sub.example.co.uk") is True
+    # punycode is ASCII, so an already-encoded IDN passes (matches the ASCII/punycode domain config)
+    assert signup_email_is_ascii("bob@xn--bcher-kva.de") is True
+
+
+@pytest.mark.parametrize("bad", [
+    "bob@bücher.de",        # unicode IDN domain — would slip an ASCII allow/deny gate
+    "bob@evіl.com",         # Cyrillic-i homograph of evil.com — denylist would NOT catch it
+    "bücher@example.com",   # non-ASCII local part (SMTPUTF8) — no ASCII form exists
+])
+def test_signup_ascii_gate_rejects_non_ascii(bad):
+    assert signup_email_is_ascii(bad) is False
+
+
+def test_signup_ascii_gate_treats_blank_as_acceptable():
+    # absence is handled by the email-requirement check, not by this ASCII gate
+    assert signup_email_is_ascii("") is True
+    assert signup_email_is_ascii(None) is True
 
 
 # ---- validate returns normalized values + ignores absent keys --------------------------------
