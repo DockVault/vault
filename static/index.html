@@ -1296,12 +1296,28 @@
                                         <input type="number" id="setting-rate-limit-api-upload-window" class="form-control" min="0" max="86400">
                                     </div>
                                     <div class="form-group">
+                                        <label for="setting-rate-limit-api-upload-chunk">Upload chunk requests</label>
+                                        <input type="number" id="setting-rate-limit-api-upload-chunk" class="form-control" min="0" max="1000000">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-rate-limit-api-upload-chunk-window">Upload chunk window (seconds)</label>
+                                        <input type="number" id="setting-rate-limit-api-upload-chunk-window" class="form-control" min="0" max="86400">
+                                    </div>
+                                    <div class="form-group">
                                         <label for="setting-rate-limit-api-download">Download requests</label>
                                         <input type="number" id="setting-rate-limit-api-download" class="form-control" min="0" max="1000000">
                                     </div>
                                     <div class="form-group">
                                         <label for="setting-rate-limit-api-download-window">Download window (seconds)</label>
                                         <input type="number" id="setting-rate-limit-api-download-window" class="form-control" min="0" max="86400">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-rate-limit-api-poll">Poll requests (security events, notifications)</label>
+                                        <input type="number" id="setting-rate-limit-api-poll" class="form-control" min="0" max="1000000">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="setting-rate-limit-api-poll-window">Poll window (seconds)</label>
+                                        <input type="number" id="setting-rate-limit-api-poll-window" class="form-control" min="0" max="86400">
                                     </div>
                                 </div>
                             </div>
@@ -2905,7 +2921,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260823g"></script>
+    <script src="/static/js/app.js?v=20260824a"></script>
 </body>
 </html>
 

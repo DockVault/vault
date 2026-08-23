@@ -211,10 +211,19 @@ class Settings(BaseSettings):
     rate_limit_api_default_window: int = Field(default=60)  # 1 minute window
     rate_limit_api_auth: int = Field(default=10)  # Auth endpoints (more restrictive)
     rate_limit_api_auth_window: int = Field(default=60)
-    rate_limit_api_upload: int = Field(default=20)  # File uploads
+    rate_limit_api_upload: int = Field(default=60)  # Upload OPERATIONS (init + complete) per minute
     rate_limit_api_upload_window: int = Field(default=60)
-    rate_limit_api_download: int = Field(default=50)  # File downloads
+    # Per-CHUNK upload PUTs. One resumable upload is many chunk PUTs, so this must be high enough that
+    # a large file never trips it mid-transfer (at the 5 MiB client chunk size, ~15 GB/min ceiling;
+    # still bounded against a runaway).
+    rate_limit_api_upload_chunk: int = Field(default=3000)
+    rate_limit_api_upload_chunk_window: int = Field(default=60)
+    rate_limit_api_download: int = Field(default=300)  # File downloads (headroom for many files/ranges)
     rate_limit_api_download_window: int = Field(default=60)
+    # Timer-polled read endpoints (security events, notifications, audit, monitor). Lenient so normal
+    # polling plus a browsing burst never trips the shared default bucket.
+    rate_limit_api_poll: int = Field(default=600)
+    rate_limit_api_poll_window: int = Field(default=60)
 
     # How many file transfers the deployment carries at once, and what happens to the rest.
     #

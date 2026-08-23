@@ -26,12 +26,21 @@ pytestmark = pytest.mark.unit
         ("POST", "/api/logout", "auth"),
         ("POST", "/vaults/v/files", "upload"),
         ("POST", "/vaults/v/uploads", "upload"),
-        ("PUT", "/vaults/v/uploads/s/chunks/0", "upload"),
+        # A per-chunk PUT is its own high-volume class, NOT the operation-level 'upload' bucket —
+        # otherwise a large multi-chunk upload throttles itself mid-transfer.
+        ("PUT", "/vaults/v/uploads/s/chunks/0", "upload_chunk"),
         ("POST", "/vaults/v/uploads/s/complete", "upload"),
         ("GET", "/vaults/v/files/f/download", "download"),
+        # Polled reads (security metrics, notifications, audit, monitor) draw their own budget.
+        ("GET", "/notifications", "poll"),
+        ("GET", "/notifications/unread-count", "poll"),
+        ("GET", "/api/security/metrics", "poll"),
+        ("GET", "/audit/events", "poll"),
         ("GET", "/vaults/v/files", "default"),
         ("DELETE", "/vaults/v/uploads/s", "default"),
         ("GET", "/api/dashboard/stats", "default"),
+        # poll is GET-only; a POST to a poll path is still 'default'.
+        ("POST", "/notifications", "default"),
     ],
 )
 def test_classifier_has_one_deterministic_class(method, path, expected):
@@ -49,7 +58,9 @@ def _defaults():
         "default": RateLimitRule(100, 60),
         "auth": RateLimitRule(10, 60),
         "upload": RateLimitRule(20, 60),
+        "upload_chunk": RateLimitRule(3000, 60),
         "download": RateLimitRule(50, 60),
+        "poll": RateLimitRule(600, 60),
     }
 
 

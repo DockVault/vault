@@ -6899,8 +6899,12 @@ async function loadSettings() {
             ['rate_limit_api_auth_window', 'setting-rate-limit-api-auth-window'],
             ['rate_limit_api_upload', 'setting-rate-limit-api-upload'],
             ['rate_limit_api_upload_window', 'setting-rate-limit-api-upload-window'],
+            ['rate_limit_api_upload_chunk', 'setting-rate-limit-api-upload-chunk'],
+            ['rate_limit_api_upload_chunk_window', 'setting-rate-limit-api-upload-chunk-window'],
             ['rate_limit_api_download', 'setting-rate-limit-api-download'],
             ['rate_limit_api_download_window', 'setting-rate-limit-api-download-window'],
+            ['rate_limit_api_poll', 'setting-rate-limit-api-poll'],
+            ['rate_limit_api_poll_window', 'setting-rate-limit-api-poll-window'],
         ];
         for (const [key, id] of apiRateFields) {
             const el = document.getElementById(id);
@@ -7030,8 +7034,12 @@ async function saveAllSettings() {
             rate_limit_api_auth_window: parseInt(document.getElementById('setting-rate-limit-api-auth-window').value) || 0,
             rate_limit_api_upload: parseInt(document.getElementById('setting-rate-limit-api-upload').value) || 0,
             rate_limit_api_upload_window: parseInt(document.getElementById('setting-rate-limit-api-upload-window').value) || 0,
+            rate_limit_api_upload_chunk: parseInt(document.getElementById('setting-rate-limit-api-upload-chunk').value) || 0,
+            rate_limit_api_upload_chunk_window: parseInt(document.getElementById('setting-rate-limit-api-upload-chunk-window').value) || 0,
             rate_limit_api_download: parseInt(document.getElementById('setting-rate-limit-api-download').value) || 0,
             rate_limit_api_download_window: parseInt(document.getElementById('setting-rate-limit-api-download-window').value) || 0,
+            rate_limit_api_poll: parseInt(document.getElementById('setting-rate-limit-api-poll').value) || 0,
+            rate_limit_api_poll_window: parseInt(document.getElementById('setting-rate-limit-api-poll-window').value) || 0,
             
             // Storage
             // Blank -> 0 (unlimited); the backend enforces a positive value and ignores 0.

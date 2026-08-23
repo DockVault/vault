@@ -458,7 +458,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
         return response
 
-_RATE_LIMIT_API_CATEGORIES = ("default", "auth", "upload", "download")
+_RATE_LIMIT_API_CATEGORIES = ("default", "auth", "upload", "upload_chunk", "download", "poll")
 _RATE_LIMIT_API_SETTING_KEYS = tuple(
     key
     for category in _RATE_LIMIT_API_CATEGORIES
@@ -516,8 +516,12 @@ if getattr(settings, 'rate_limit_api_enabled', True):
         auth_window=settings.rate_limit_api_auth_window,
         upload_limit=settings.rate_limit_api_upload,
         upload_window=settings.rate_limit_api_upload_window,
+        upload_chunk_limit=settings.rate_limit_api_upload_chunk,
+        upload_chunk_window=settings.rate_limit_api_upload_chunk_window,
         download_limit=settings.rate_limit_api_download,
         download_window=settings.rate_limit_api_download_window,
+        poll_limit=settings.rate_limit_api_poll,
+        poll_window=settings.rate_limit_api_poll_window,
         policy_provider=_api_rate_limit_policy_cache.get,
         exclude_paths=["/health", "/static", "/favicon.ico", "/brand-assets",
                        "/docs", "/redoc", "/openapi.json"],
@@ -14124,6 +14128,13 @@ def _run_lightweight_migrations():
                            ADD CONSTRAINT uq_vault_members_vault_user UNIQUE (vault_id, user_id);
                    END IF;
                END $$;""",
+            # Email Studio: the per-profile "allow insecure TLS" opt-out. email_profiles is a whole
+            # new table (create_all builds it with this column on a fresh DB), but a deployment that
+            # created email_profiles on an INTERMEDIATE build before the column was added would not
+            # get it from create_all (which never ALTERs) — so back it in here on upgrade. Additive +
+            # idempotent; the table always exists by now because init_db()/create_all ran first.
+            "ALTER TABLE email_profiles ADD COLUMN IF NOT EXISTS "
+            "smtp_allow_insecure_tls BOOLEAN NOT NULL DEFAULT FALSE",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)

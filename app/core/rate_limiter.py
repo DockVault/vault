@@ -28,7 +28,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-API_RATE_LIMIT_CLASSES = ("default", "auth", "upload", "download")
+API_RATE_LIMIT_CLASSES = ("default", "auth", "upload", "upload_chunk", "download", "poll")
 API_RATE_LIMIT_MAX_REQUESTS = 1_000_000
 API_RATE_LIMIT_MAX_WINDOW_SECONDS = 86_400
 
@@ -39,12 +39,25 @@ class RateLimitRule:
     window: int
 
 
-def classify_api_rate_limit(method: str, path: str) -> str:
-    """Return one general-API class with auth > upload > download > default precedence.
+# GET endpoints the UI POLLS on a timer (or fetches in bursts) — security events, notifications,
+# audit, monitor stats. They get their own lenient bucket so normal polling + browsing never trips
+# the shared "default" bucket. Matched exactly (path already stripped of any trailing slash).
+POLL_GET_PATHS = frozenset({
+    "/audit/events", "/audit/log",
+    "/notifications", "/notifications/unread-count",
+    "/monitor/stats",
+    "/api/security/metrics", "/api/security/alerts", "/api/monitoring/metrics",
+})
 
-    Auth covers every /auth route plus logout. Upload covers direct file POSTs and
-    chunk-init/chunk-write/complete routes. Download covers the file-content GET route.
-    Everything else is default; method checks prevent lookalike paths changing class.
+
+def classify_api_rate_limit(method: str, path: str) -> str:
+    """Return one general-API class with auth > upload(_chunk) > download > poll > default precedence.
+
+    Auth covers every /auth route plus logout. A resumable upload's per-CHUNK PUTs go to their own
+    high-limit `upload_chunk` bucket (one upload is dozens–thousands of requests, so they must NOT
+    share the small operation-level `upload` bucket used for init/complete — that throttled large
+    files mid-transfer). Download covers the file-content GET. Poll covers the timer-polled read
+    endpoints. Everything else is default; method checks prevent lookalike paths changing class.
     """
     method = (method or "").upper()
     path = (path or "/").rstrip("/") or "/"
@@ -61,7 +74,7 @@ def classify_api_rate_limit(method: str, path: str) -> str:
             and parts[2] == "uploads"
             and parts[4] == "chunks"
         ):
-            return "upload"
+            return "upload_chunk"   # each chunk PUT — high-volume, its own bucket
         if (
             method == "POST"
             and len(parts) == 5
@@ -76,6 +89,8 @@ def classify_api_rate_limit(method: str, path: str) -> str:
             and parts[4] == "download"
         ):
             return "download"
+    if method == "GET" and path in POLL_GET_PATHS:
+        return "poll"
     return "default"
 
 
@@ -415,8 +430,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         auth_window: Optional[int] = None,
         upload_limit: Optional[int] = None,
         upload_window: Optional[int] = None,
+        upload_chunk_limit: Optional[int] = None,
+        upload_chunk_window: Optional[int] = None,
         download_limit: Optional[int] = None,
         download_window: Optional[int] = None,
+        poll_limit: Optional[int] = None,
+        poll_window: Optional[int] = None,
         policy_provider: Optional[Callable[[], Mapping[str, RateLimitRule]]] = None,
         exclude_paths: Optional[list] = None,
     ):
@@ -435,9 +454,17 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 upload_limit if upload_limit is not None else default_limit,
                 upload_window if upload_window is not None else default_window,
             ),
+            "upload_chunk": RateLimitRule(
+                upload_chunk_limit if upload_chunk_limit is not None else default_limit,
+                upload_chunk_window if upload_chunk_window is not None else default_window,
+            ),
             "download": RateLimitRule(
                 download_limit if download_limit is not None else default_limit,
                 download_window if download_window is not None else default_window,
+            ),
+            "poll": RateLimitRule(
+                poll_limit if poll_limit is not None else default_limit,
+                poll_window if poll_window is not None else default_window,
             ),
         })
         self.exclude_paths = exclude_paths or ["/docs", "/openapi.json", "/redoc", "/health"]
