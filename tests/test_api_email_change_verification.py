@@ -265,6 +265,30 @@ def test_confirm_rejects_wrong_expired_and_consumed_codes(admin, restore_setting
         admin.delete_user(u["id"])
 
 
+def test_confirm_rejects_a_wrong_code_against_a_valid_pending_row(admin, restore_settings):
+    # The proof-of-control invariant: with a VALID (unexpired, unconsumed) pending row for THIS user,
+    # a wrong code must still be refused and the email left unchanged. (The other confirm tests only
+    # present a wrong code when NO row matches, so dropping the code_matches() call would slip past
+    # them — this pins the actual comparison at the endpoint.)
+    _enable(admin)
+    pepper = _pepper()
+    assert pepper
+    u = admin.create_user(role="user")
+    new = unique("valrow") + "@example.com"
+    try:
+        _seed_code(u["id"], new, "correctcode123", pepper)   # valid, unexpired, unconsumed
+        c = _client_for(admin, u)
+        r = c.post("/users/me/confirm-email-change", json={"code": "wrongcode99999"})
+        assert r.status_code == 400, r.text
+        assert (c.get("/users/me").json().get("email") or "").lower() == (u["email"] or "").lower()
+        # the pending row is still unconsumed → the CORRECT code still applies after the wrong attempt
+        assert c.post("/users/me/confirm-email-change", json={"code": "correctcode123"}).status_code == 200
+        assert (c.get("/users/me").json().get("email") or "").lower() == new
+    finally:
+        _psql(f"DELETE FROM email_change_codes WHERE user_id='{u['id']}'")
+        admin.delete_user(u["id"])
+
+
 def test_confirm_will_not_accept_another_users_code(admin, restore_settings):
     _enable(admin)
     pepper = _pepper()

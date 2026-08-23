@@ -137,6 +137,31 @@ def test_accept_ignores_privileged_body_fields(admin, invites_on):
         _cleanup_user(admin, uname)
 
 
+# --- accept-path body email is ASCII + domain gated (same as signup / mint) -------------------
+def test_accept_body_email_is_ascii_and_domain_gated(admin, invites_on):
+    # An email-less invite lets the invitee supply an address at accept time; it must pass the SAME
+    # ASCII + domain allow/deny gates as self-signup and admin-mint (an independent re-impl on this
+    # path). A rejection happens before the single-use claim, so the invite survives for the good one.
+    admin.put("/settings", json={"signup_email_domain_mode": "denylist",
+                                  "signup_email_domains": ["evil.com"]})
+    inv = _mint(admin, username=unique("ag"), role="user")   # no email -> invitee supplies it
+    try:
+        for bad in ("x@evil.com", "x@sub.evil.com"):        # denylisted domain + subdomain
+            r = _anon().post(f"/invites/{inv['token']}/accept",
+                             json={"password": STRONG_PW, "email": bad})
+            assert r.status_code == 400, (bad, r.text)
+        # unicode IDN: EmailStr accepts it, so the 400 must come from the ASCII gate on this path
+        r = _anon().post(f"/invites/{inv['token']}/accept",
+                         json={"password": STRONG_PW, "email": "x@bücher.de"})
+        assert r.status_code == 400, r.text
+        # a permitted address still completes (the gate isn't just rejecting everything)
+        ok = _anon().post(f"/invites/{inv['token']}/accept",
+                          json={"password": STRONG_PW, "email": f"{unique('ok')}@good.example"})
+        assert ok.status_code == 200, ok.text
+    finally:
+        _cleanup_user(admin, inv["username"])
+
+
 # --- single-use: replay + REAL concurrency ----------------------------------
 def test_accept_is_single_use_on_replay(admin, invites_on):
     uname = unique("replay")

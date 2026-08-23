@@ -11,6 +11,7 @@ import hashlib
 import uuid
 import json
 import re
+import logging
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request, File as FastAPIFile, UploadFile, Header, WebSocket, WebSocketDisconnect, Response, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -274,6 +275,47 @@ def _redact_log_path(path: str) -> str:
     for rx, repl in _LOG_PATH_SECRET_SUBS:
         path = rx.sub(repl, path)
     return path
+
+
+_INVITE_QUERY_RE = re.compile(r"(?i)([?&]invite=)[^&#]+")
+
+
+def _redact_access_path(full_path: str) -> str:
+    """Redact secrets from a full request target (path + optional query) for the uvicorn access log:
+    mask the invite/share token in the PATH and the ?invite=<token> QUERY the landing page carries."""
+    path, sep, query = full_path.partition("?")
+    path = _redact_log_path(path)
+    if not sep:
+        return path
+    query = _INVITE_QUERY_RE.sub(r"\1<redacted>", "?" + query)[1:]
+    return path + "?" + query
+
+
+class _AccessLogRedactFilter(logging.Filter):
+    """Scrub the invite/share tokens out of uvicorn's access log. Those single-use tokens travel in the
+    URL (a path segment on the invite endpoints, the ?invite= query on the landing page), so uvicorn's
+    default access log would otherwise write the raw token on every request — the leak the app's other
+    bearer tokens avoid by being header-only. Rewrites the request-target arg in place; never raises,
+    never drops a line."""
+    def filter(self, record):  # noqa: A003
+        try:
+            args = record.args
+            if (isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str)
+                    and ("/invites/" in args[2] or "/shares/" in args[2] or "invite=" in args[2])):
+                lst = list(args)
+                lst[2] = _redact_access_path(args[2])
+                record.args = tuple(lst)
+        except Exception:  # noqa: BLE001 — logging must never raise
+            pass
+        return True
+
+
+def _install_access_log_redaction() -> None:
+    """Attach the access-log redaction filter once (idempotent), covering both run modes:
+    `python -m app.api.api_server` and an ASGI server importing `app`."""
+    lg = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, _AccessLogRedactFilter) for f in lg.filters):
+        lg.addFilter(_AccessLogRedactFilter())
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -2423,6 +2465,19 @@ def _email_login_would_lock_out_all_admins(db: Session) -> bool:
     return not _active_admin_with_email_exists(db)
 
 
+def _clearing_email_locks_out_all_admins(db: Session, target_user) -> bool:
+    """True if REMOVING target_user's email would leave no active admin able to sign in by email — a
+    total, unrecoverable lockout. The switch-time guard (_email_login_would_lock_out_all_admins) only
+    fires when the policy is set to 'email'; this covers the other half — an admin's email being
+    cleared AFTER the switch. Only meaningful under login_identifier='email' (under 'username'/'either'
+    a username still resolves). Computed as-if-applied: an admin can email-login afterward only if it
+    isn't the target (whose email is going away) and it currently resolves by email."""
+    if _login_identifier(db) != "email":
+        return False
+    tid = getattr(target_user, "id", None)
+    return not any(a.id != tid and _admin_can_email_login(db, a) for a in _active_admins(db))
+
+
 def _users_without_email_count(db: Session) -> int:
     """How many active NON-admin accounts have no email — the population that would lose access under
     email-only login. Returned as a count only (there can be many)."""
@@ -3597,6 +3652,13 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
     # current policy, domain-gated and unique.
     pol = _account_policy(db)
     if inv.email:
+        # The invite's address was validated + reserved at mint. Re-run the application-level
+        # uniqueness guard anyway (defense-in-depth for a legacy install lacking the lower(email)
+        # unique index, where the flush below would NOT catch a duplicate) so a collision surfaces as
+        # a clear audited reason rather than a raw IntegrityError — mirroring the body-email branch.
+        if email_in_use(db, inv.email):
+            _audit_accept_failure(db, prefix, client_ip, reason="email_in_use")
+            raise HTTPException(status_code=409, detail="This invitation cannot be completed.")
         acct_email = inv.email
     else:
         body_email = normalize_email(payload.email)
@@ -3618,12 +3680,13 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
                 raise HTTPException(status_code=400, detail="That email address is already in use.")
         acct_email = body_email
 
-    # (e) Plan cap — invited accounts count too.
+    # (e) Plan cap — invited accounts count too. Genericize the count-bearing cap message the same way
+    # self_signup does: this is a public surface and an invitee has no need for the exact cap/count.
     try:
         _enforce_user_cap(db)
     except HTTPException:
         _audit_accept_failure(db, prefix, client_ip, reason="user_cap")
-        raise
+        raise HTTPException(status_code=503, detail="This invitation cannot be completed right now.")
 
     # (f) Build the user inline + flush (NO commit) so it lives in the same transaction as the claim.
     # The username==existing-email impersonation guard has no DB backstop, so re-run it here; the
@@ -3701,6 +3764,25 @@ async def auth_policy(db: Session = Depends(get_db)):
         "email_requirement": pol.get("email_requirement"),
         "password_policy": _password_policy_view(db),
     }
+
+
+def _email_has_pending_invite(db: Session, email: str) -> bool:
+    """Is this email reserved by a LIVE (pending, unrevoked, unexpired) account invitation?
+
+    create_invite reserves an invited address against existing users AND other live invites to avoid
+    the 'two accounts, one email' impersonation risk. The other creation paths must honor the same
+    reservation, or a squatter could claim an invited address before the invitee accepts. Folded the
+    same way email_in_use decides 'same address'. Blank/None never matches."""
+    if not email:
+        return False
+    from app.core.models import AccountInvitation
+    from sqlalchemy import func as _func
+    now = datetime.utcnow()
+    return db.query(AccountInvitation.id).filter(
+        _func.lower(AccountInvitation.email) == email.strip().lower(),
+        AccountInvitation.revoked_at.is_(None),
+        AccountInvitation.accepted_at.is_(None),
+        AccountInvitation.expires_at > now).first() is not None
 
 
 def _audit_signup_failure(db: Session, username: str, ip: str, reason: str) -> None:
@@ -3782,9 +3864,18 @@ async def self_signup(payload: SignupRequest, request: Request, db: Session = De
                                             pol.get("signup_email_domains")):
             _audit_signup_failure(db, uname, client_ip, reason="email_domain")
             raise HTTPException(status_code=400, detail="This email provider is not allowed to sign up.")
+        # An already-registered address, OR one reserved by a live invitation, cannot self-sign-up.
+        # BOTH return the SAME generic message as the domain gate above — on this anonymous surface a
+        # distinct "already in use" would confirm whether a given address holds an account (an
+        # enumeration oracle), and rejecting an invited address stops a squatter from claiming the
+        # identity an admin reserved for someone else (the invitee's later accept would 409). Distinct
+        # audit reasons keep operator visibility; the HTTP response is uniform.
         if email_in_use(db, body_email):
             _audit_signup_failure(db, uname, client_ip, reason="email_in_use")
-            raise HTTPException(status_code=400, detail="That email address is already in use.")
+            raise HTTPException(status_code=400, detail="This email provider is not allowed to sign up.")
+        if _email_has_pending_invite(db, body_email):
+            _audit_signup_failure(db, uname, client_ip, reason="email_invited")
+            raise HTTPException(status_code=400, detail="This email provider is not allowed to sign up.")
 
     # (e) Plan cap. _enforce_user_cap's message names the exact user count and plan cap — fine for an
     # authenticated admin, but on this PUBLIC surface it would hand anonymous visitors a recon oracle.
@@ -5317,9 +5408,20 @@ async def update_own_account(
         # string "None" once an address could legitimately be absent.
         if new_email is not None and email_in_use(db, new_email, exclude_user_id=user.id):
             raise HTTPException(status_code=400, detail="That email address is already in use.")
-        # Clearing an address is allowed here because a username still identifies the account. Once
-        # an organization can require an address to BE the login identifier, clearing it under that
-        # policy has to be refused instead — that check belongs right here, where the policy lands.
+        # An address reserved by a live invitation belongs to whoever was invited — don't let a
+        # different account claim it via an email change (generic message: don't reveal it's invited).
+        if new_email is not None and _email_has_pending_invite(db, new_email):
+            raise HTTPException(status_code=400, detail="That email address is already in use.")
+        # Under email-only login the address IS the sign-in identifier. Clearing it used to be allowed
+        # unconditionally (a username still identified the account) — but that let an admin remove the
+        # last email-resolvable admin's address AFTER the policy switch, reaching the exact total
+        # lockout the switch-time guard prevents. Refuse the clear in that case.
+        if new_email is None and _clearing_email_locks_out_all_admins(db, user):
+            raise HTTPException(
+                status_code=400,
+                detail="Your email is the sign-in identifier for this deployment and can't be removed: "
+                       "it would lock every administrator out. Give another admin an email, or change "
+                       "the sign-in method first.")
         user.email = new_email
         changes.append("email")
     if body.sftp_enabled is not None and body.sftp_enabled != user.sftp_enabled:
@@ -5782,6 +5884,16 @@ async def update_user(
         # duplicate reached the database and surfaced as an uncaught IntegrityError 500.
         if new_email is not None and email_in_use(db, new_email, exclude_user_id=user.id):
             raise HTTPException(status_code=400, detail="That email address is already in use.")
+        # Don't let an admin assign an address a live invitation already reserved for someone else.
+        if new_email is not None and _email_has_pending_invite(db, new_email):
+            raise HTTPException(status_code=400, detail="That email address is already in use.")
+        # Removing an admin's email under email-only login can strand every admin — the total lockout
+        # the policy-switch guard prevents, reachable here by clearing an email afterward. Refuse it.
+        if new_email is None and _clearing_email_locks_out_all_admins(db, user):
+            raise HTTPException(
+                status_code=400,
+                detail="This admin's email is the sign-in identifier for the deployment and can't be "
+                       "removed: it would lock every administrator out.")
         changes['email'] = {'old': user.email, 'new': new_email}
         user.email = new_email
     
@@ -14051,6 +14163,10 @@ async def lifespan(app: FastAPI):
     # Start background task for session cleanup
     cleanup_task = asyncio.create_task(cleanup_expired_sessions())
     print("[OK] Session cleanup task started")
+
+    # Keep the single-use invite/share tokens (which ride the URL) out of uvicorn's access log — they
+    # would otherwise be written on every invite lookup/accept and the ?invite= landing hit.
+    _install_access_log_redaction()
 
     # Web log-pull sink: when NOT running under run_combined (i.e. the API was started directly — the
     # split-container / dev shape), self-write the [web] access lines so GET /logs?service=web works
