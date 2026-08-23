@@ -660,9 +660,20 @@ async def delete_resource(resource_id: uuid.UUID, request: Request,
 # --------------------------------------------------------------------------------------------------
 
 _MAX_RECIPIENTS = 100
-# Exclude commas too: send_message derives envelope RCPTs from the To header via getaddresses,
-# which splits on commas — so a comma would let the delivered address differ from what was typed.
-_EMAIL_RE = re.compile(r"^[^@\s,]+@[^@\s,]+\.[^@\s,]+$")
+
+
+def _valid_address(a: str) -> bool:
+    """A LINEAR (no-backtracking) syntactic address check — deliberately not a regex, to avoid a
+    polynomial-ReDoS on adversarial free-form input. Requires exactly one '@', a non-empty local
+    part, and a dotted domain; rejects whitespace, control chars, and commas (send_message derives
+    envelope RCPTs from the To header via getaddresses, which splits on commas). Real deliverability
+    is decided by the SMTP server, which turns a bad address into a per-recipient error row."""
+    if not a or len(a) > 254 or a.count("@") != 1:
+        return False
+    if _CTRL_RE.search(a) or any(c in a for c in (" ", "\t", ",")):
+        return False
+    local, _, domain = a.partition("@")
+    return bool(local) and "." in domain and not domain.startswith(".") and not domain.endswith(".")
 
 
 class SendIn(BaseModel):
@@ -734,7 +745,7 @@ async def send_template(template_id: uuid.UUID, payload: SendIn, request: Reques
                 recipients.append({"email": u.email.strip(), "username": u.username})
     for addr in payload.addresses:
         a = (addr or "").strip()
-        if not _EMAIL_RE.match(a) or _CTRL_RE.search(a):
+        if not _valid_address(a):
             errors.append({"recipient": a[:120], "ok": False, "error": "invalid address"})
         elif a.lower() not in seen_emails:
             seen_emails.add(a.lower())
