@@ -2284,6 +2284,14 @@ async function openCreateShareModal(targetType, targetId, targetName) {
     ['share-lifetime-days', 'share-max-recipients', 'share-max-downloads', 'share-user-search'].forEach(id => {
         const el = document.getElementById(id); if (el) el.value = '';
     });
+    // Clear any red flag / hint left from a prior share so it doesn't briefly show on the emptied
+    // inputs while /share-policy loads (the tag load then re-derives the baseline hints).
+    ['share-lifetime-days', 'share-max-recipients', 'share-max-downloads'].forEach(id => {
+        const el = document.getElementById(id); if (el) el.classList.remove('is-invalid');
+    });
+    ['share-lifetime-hint', 'share-recipients-hint', 'share-downloads-hint'].forEach(id => {
+        const h = document.getElementById(id); if (h) { h.textContent = ''; h.classList.remove('form-error'); }
+    });
     const results = document.getElementById('share-user-results'); if (results) results.replaceChildren();
     _shareSetError('');
     openModal('create-share-modal');
@@ -2345,6 +2353,7 @@ function onShareTagChange() {
         voInput.disabled = !t.allow_custom;
     }
     document.getElementById('share-limits-group').style.display = t.allow_custom ? '' : 'none';
+    if (t.allow_custom) _shareRefreshLimitHints(); else _shareLimitSpec = null;
     _shareCreate.userIds = []; _shareCreate.deptIds = [];
     onShareAudienceChange();
 }
@@ -2406,6 +2415,85 @@ function _shareSetError(msg) {
     if (msg) { e.textContent = msg; e.style.display = ''; } else { e.textContent = ''; e.style.display = 'none'; }
 }
 
+// The server's hard integer ceiling for share limits (ShareCreate: ge=1, le=_INT4_MAX). Mirror it so
+// the client flags an over-cap value BEFORE the round-trip instead of surfacing a 400 after Create.
+const _SHARE_INT4_MAX = 2147483647;
+// Per-field validation spec for the currently-selected tag; rebuilt on each tag change.
+let _shareLimitSpec = null;
+
+// Effective caps for a tag. The /share-policy payload already carries these per tag
+// (tag_effective_limits): max_lifetime_minutes, and max_recipients_cap / max_downloads_cap where
+// null means "unlimited" (only the hard INT4 ceiling applies). Return the caps the create-share
+// inputs must respect — lifetime expressed in whole DAYS, to match the day-based input.
+function _shareEffectiveCaps(t) {
+    const maxLifetimeMin = Math.min(Number(t && t.max_lifetime_minutes) || _SHARE_INT4_MAX, _SHARE_INT4_MAX);
+    const recCap = (t && t.max_recipients_cap != null) ? Number(t.max_recipients_cap) : _SHARE_INT4_MAX;
+    const dlCap = (t && t.max_downloads_cap != null) ? Number(t.max_downloads_cap) : _SHARE_INT4_MAX;
+    return {
+        maxDays: Math.floor(maxLifetimeMin / 1440),   // server compares days*1440 to max_lifetime_minutes
+        maxRecipients: Math.min(recCap, _SHARE_INT4_MAX),
+        maxDownloads: Math.min(dlCap, _SHARE_INT4_MAX),
+    };
+}
+
+// Validate one optional positive-integer limit field against [1, cap]. Empty is valid (the tag
+// default applies server-side). Toggles the .is-invalid border + the hint message; returns validity.
+function _shareValidateLimitField(spec) {
+    const input = document.getElementById(spec.input);
+    const hint = document.getElementById(spec.hint);
+    if (!input) return true;
+    const raw = (input.value || '').trim();
+    let valid = true, msg = spec.base;
+    if (raw !== '') {
+        if (!/^\d+$/.test(raw)) { valid = false; msg = 'Enter a whole number.'; }
+        else if (parseInt(raw, 10) < 1) { valid = false; msg = 'Must be at least 1.'; }
+        else if (parseInt(raw, 10) > spec.cap) { valid = false; msg = spec.over; }
+    }
+    input.classList.toggle('is-invalid', !valid);
+    if (hint) { hint.textContent = msg; hint.classList.toggle('form-error', !valid); }
+    return valid;
+}
+
+// Rebuild the limit specs + baseline hints for the current tag, and clear any prior invalid state.
+function _shareRefreshLimitHints() {
+    const t = currentShareTag();
+    if (!t) { _shareLimitSpec = null; return; }
+    const caps = _shareEffectiveCaps(t);
+    const noDayExpiry = 'Custom day-based expiry is not available for this tag.';
+    _shareLimitSpec = [
+        {
+            input: 'share-lifetime-days', hint: 'share-lifetime-hint', cap: caps.maxDays,
+            base: caps.maxDays >= 1 ? `Up to ${caps.maxDays.toLocaleString()} day${caps.maxDays === 1 ? '' : 's'} (optional).` : noDayExpiry,
+            over: caps.maxDays >= 1 ? `Maximum ${caps.maxDays.toLocaleString()} days.` : noDayExpiry,
+        },
+        {
+            input: 'share-max-recipients', hint: 'share-recipients-hint', cap: caps.maxRecipients,
+            base: caps.maxRecipients < _SHARE_INT4_MAX ? `1–${caps.maxRecipients.toLocaleString()} recipients (optional).` : 'Any number of recipients (optional).',
+            over: `Maximum ${caps.maxRecipients.toLocaleString()} recipients.`,
+        },
+        {
+            input: 'share-max-downloads', hint: 'share-downloads-hint', cap: caps.maxDownloads,
+            base: caps.maxDownloads < _SHARE_INT4_MAX ? `1–${caps.maxDownloads.toLocaleString()} downloads per recipient (optional).` : 'Any number of downloads per recipient (optional).',
+            over: `Maximum ${caps.maxDownloads.toLocaleString()} downloads per recipient.`,
+        },
+    ];
+    _shareLimitSpec.forEach(s => {
+        const hint = document.getElementById(s.hint);
+        const input = document.getElementById(s.input);
+        if (hint) { hint.textContent = s.base; hint.classList.remove('form-error'); }
+        if (input) input.classList.remove('is-invalid');
+    });
+    // Re-flag any value carried over from a previous tag against the NEW tag's caps, so switching to
+    // a stricter tag flags a now-over-cap value immediately rather than only on the next keystroke.
+    _shareValidateAllLimits();
+}
+
+// Validate all limit fields for the current tag; returns true when every field is within its cap.
+function _shareValidateAllLimits() {
+    if (!_shareLimitSpec) return true;
+    return _shareLimitSpec.reduce((ok, s) => _shareValidateLimitField(s) && ok, true);
+}
+
 let _shareCreateWired = false;
 function setupShareCreateModalOnce() {
     if (_shareCreateWired) return;
@@ -2416,6 +2504,15 @@ function setupShareCreateModalOnce() {
     search.addEventListener('input', () => {
         clearTimeout(_shareUserSearchTimer);
         _shareUserSearchTimer = setTimeout(() => shareUserSearch(search.value), 250);
+    });
+    // Live-validate each optional limit field against the current tag's effective cap as the user
+    // types, so an over-cap value shows a red flag before Create instead of a 400 after the round-trip.
+    ['share-lifetime-days', 'share-max-recipients', 'share-max-downloads'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('input', () => {
+            const s = _shareLimitSpec && _shareLimitSpec.find(x => x.input === id);
+            if (s) _shareValidateLimitField(s);
+        });
     });
     document.getElementById('share-create-submit').addEventListener('click', submitCreateShare);
     // Copy from the STORED token, not the element text (copyToClipboard swaps the element to a
@@ -2449,6 +2546,9 @@ async function submitCreateShare() {
     // is forced); only send it then, matching the UI's read-only state for non-custom tags.
     if (t.allow_view_only && t.allow_custom) payload.view_only = document.getElementById('share-view-only').checked;
     if (t.allow_custom) {
+        // Block submit on an over-cap / malformed limit so the user gets an immediate red flag
+        // instead of a server 400 after the round-trip (mirrors ShareCreate + resolve_share_limits).
+        if (!_shareValidateAllLimits()) { _shareSetError('Please fix the highlighted limits.'); return; }
         const days = parseInt(document.getElementById('share-lifetime-days').value, 10);
         const mr = parseInt(document.getElementById('share-max-recipients').value, 10);
         const md = parseInt(document.getElementById('share-max-downloads').value, 10);
