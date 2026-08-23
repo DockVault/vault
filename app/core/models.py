@@ -1142,6 +1142,41 @@ class AccountInvitation(Base):
     )
 
 
+class Notification(Base):
+    """Per-user in-app notification (the bell + the Dashboard "What's waiting for you" lane).
+
+    A WHOLE NEW TABLE (not columns on an existing one) so init_db()'s create_all() builds it cleanly
+    on already-deployed vaults (create_all never ALTERs) — needs no lightweight-migration entry. Rows
+    are personal data about ONE user; every read/write MUST be filtered to the requesting user, and
+    the user_id FK cascades so deleting a user takes their notifications with it.
+
+    `dedup_key` is an optional idempotency handle: Postgres treats NULLs as DISTINCT under a UNIQUE
+    constraint, so un-keyed notifications (e.g. each temp-credential login) coexist freely while keyed
+    ones (e.g. one 'share_received' per share per recipient) are deduplicated — a retry can't double
+    a notification. `target` is an optional in-app deep link the bell/lane row navigates to.
+    """
+    __tablename__ = 'notifications'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # No standalone index=True here: the composite idx_notification_user_created below leads with
+    # user_id, so a separate single-column index would be redundant write overhead.
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    type = Column(String(50), nullable=False)          # e.g. 'share_received', 'temp_login'
+    title = Column(String(255), nullable=False)
+    body = Column(Text, nullable=True)
+    target = Column(String(500), nullable=True)         # optional in-app deep link (NULL = none)
+    is_read = Column(Boolean, nullable=False, default=False)
+    dedup_key = Column(String(255), nullable=True)      # optional idempotency handle (NULLs distinct)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    read_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'dedup_key', name='uq_notification_user_dedup'),
+        Index('idx_notification_user_created', 'user_id', 'created_at'),
+        Index('idx_notification_user_unread', 'user_id', 'is_read'),
+    )
+
+
 class RateLimitRecord(Base):
     """Track rate limiting for login attempts."""
     __tablename__ = 'rate_limit_records'

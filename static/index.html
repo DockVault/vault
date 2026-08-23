@@ -10,7 +10,7 @@
     <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
     <link rel="apple-touch-icon" href="/static/assets/logo.png?v=1">
     <link rel="stylesheet" href="/static/css/theme.css?v=20260822a">
-    <link rel="stylesheet" href="/static/css/components.css?v=20260823a">
+    <link rel="stylesheet" href="/static/css/components.css?v=20260823b">
     <link rel="stylesheet" href="/static/css/utilities.css?v=20251015c">
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-sans-500.woff2" crossorigin>
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-mono-500.woff2" crossorigin>
@@ -84,6 +84,7 @@
         <symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
         <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
         <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></symbol>
+        <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></symbol>
     </svg>
 
     <!-- Login Screen -->
@@ -191,7 +192,22 @@
                         <span class="theme-toggle-icon"><svg class="icon icon-sm"><use href="#i-sun"/></svg></span>
                     </span>
                 </button>
-                
+
+                <div class="notif-menu" id="notif-menu">
+                    <button id="notif-btn" class="notif-btn" aria-label="Notifications" aria-haspopup="true" aria-expanded="false">
+                        <svg class="icon"><use href="#i-bell"/></svg>
+                        <span id="notif-badge" class="notif-badge" hidden>0</span>
+                    </button>
+                    <div id="notif-dropdown" class="notif-dropdown" role="menu" aria-label="Notifications">
+                        <div class="notif-dropdown-header">
+                            <span class="notif-dropdown-title">Notifications</span>
+                            <button id="notif-mark-all" class="notif-mark-all" type="button">Mark all read</button>
+                        </div>
+                        <div id="notif-list" class="notif-list"></div>
+                        <div id="notif-empty" class="notif-empty">You're all caught up.</div>
+                    </div>
+                </div>
+
                 <div class="profile-menu">
                     <button id="profile-btn" class="profile-btn">
                         <div class="profile-avatar" id="profile-avatar">AD</div>
@@ -2769,7 +2785,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260823f"></script>
+    <script src="/static/js/app.js?v=20260823g"></script>
 </body>
 </html>
 

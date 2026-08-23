@@ -4342,7 +4342,18 @@ async def login(
             login_event["temp_username"] = login_request.username
             login_event["owner_user_id"] = str(user.id)
         broadcast_event({"event": login_event})
-        
+
+        # Persist the owner-facing "your temporary credential just signed in" as an in-app
+        # notification too (the WS toast is transient; this is the durable bell/history record). No
+        # dedup key — every temp-credential sign-in is a distinct, notable event. Best-effort.
+        if is_temporary:
+            _notify_users(
+                [str(user.id)], "temp_login",
+                title="Temporary credential signed in",
+                body=f"{login_request.username} signed in" + (f" from {client_ip}" if client_ip else ""),
+                target="#temp-creds",
+            )
+
         from app.core.temp_scope import is_scoped as _is_scoped
         return LoginResponse(
             access_token=access_token,
@@ -6933,6 +6944,28 @@ async def create_share(
     except Exception:
         pass  # never fail the create on an audit-write error
     out = _share_dict(db, share)
+    # Notify the concrete recipients of a directly-addressed share (users / departments) that
+    # something is now waiting for them. anyone_internal has no recipients at create time. Fail-soft
+    # (each write in its own session) so a notification failure never fails the share create.
+    try:
+        recipient_ids = list(aud_users)  # "users" audience: concrete user-ids (already validated)
+        if aud_depts:                    # "departments": expand to member user-ids
+            recipient_ids += [
+                str(r[0]) for r in db.query(user_groups.c.user_id)
+                .filter(user_groups.c.group_id.in_([str(d) for d in aud_depts])).all()
+            ]
+        recipient_ids = [u for u in recipient_ids if str(u) != str(current_user.id)]  # not myself
+        if recipient_ids:
+            item = out.get("target_name") or out.get("vault_name") or "an item"
+            _notify_users(
+                recipient_ids, "share_received",
+                title=f"{current_user.username} shared a {tt} with you",
+                body=f'"{item}" in {out.get("vault_name") or "a vault"}',
+                target="#shared",
+                dedup_prefix=f"share:{share.id}",
+            )
+    except Exception as e:
+        print(f"⚠ share notification skipped: {e}")
     out["link_token"] = link_token  # SHOW ONCE — only the hash is stored; this is never returned again
     return out
 
@@ -7331,6 +7364,146 @@ async def list_shared_with_me(
             if d is not None:
                 out.append(d)
     return out
+
+
+# ---------------------------------------------------------------------------
+# In-app notifications — the bell (every page) + the Dashboard "What's waiting
+# for you" lane. Personal data: every query is scoped to the requesting user,
+# and a temporary-credential session owns none (it must never see or touch the
+# owner account's notifications).
+# ---------------------------------------------------------------------------
+
+def _notify_users(user_ids, ntype: str, title: str, body: str = None,
+                  target: str = None, dedup_prefix: str = None) -> None:
+    """Best-effort: create an in-app notification for each user in a SEPARATE session, so a failure
+    or a dedup collision can never affect the caller's request/transaction. When dedup_prefix is
+    given, each row's dedup_key is f"{dedup_prefix}:{user_id}" and a UNIQUE(user_id, dedup_key)
+    collision is silently skipped (that user was already notified for this event)."""
+    from app.core.database import get_db_context
+    from app.core.models import Notification
+    ids = [str(u) for u in dict.fromkeys(user_ids) if u]  # de-dup + drop falsy, preserve order
+    if not ids:
+        return
+    try:
+        with get_db_context() as db:
+            for uid in ids:
+                dedup = f"{dedup_prefix}:{uid}" if dedup_prefix else None
+                try:
+                    with db.begin_nested():
+                        db.add(Notification(user_id=uid, type=ntype, title=title, body=body,
+                                            target=target, dedup_key=dedup))
+                except IntegrityError:
+                    pass  # dedup collision -> this user was already notified for this event
+    except Exception as e:
+        print(f"⚠ notification write skipped: {e}")
+
+
+def _notification_dict(n) -> dict:
+    return {
+        "id": str(n.id),
+        "type": n.type,
+        "title": n.title,
+        "body": n.body,
+        "target": n.target,
+        "is_read": n.is_read,
+        "created_at": n.created_at.isoformat() if n.created_at else None,
+    }
+
+
+def _notifications_denied_for_temp(current_user) -> bool:
+    return bool(getattr(current_user, "_is_temp_session", False))
+
+
+@app.get("/notifications")
+async def list_notifications(
+    limit: int = 30,
+    unread_only: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The caller's in-app notifications, newest first, plus their unread count. Scoped to the
+    requesting user; a temp session owns none (must not see the owner account's notifications)."""
+    from app.core.models import Notification
+    if _notifications_denied_for_temp(current_user):
+        return {"notifications": [], "unread_count": 0}
+    limit = max(1, min(limit, 100))
+    base = db.query(Notification).filter(Notification.user_id == current_user.id)
+    q = base.filter(Notification.is_read.is_(False)) if unread_only else base
+    rows = q.order_by(Notification.created_at.desc()).limit(limit).all()
+    unread = (db.query(Notification)
+              .filter(Notification.user_id == current_user.id, Notification.is_read.is_(False))
+              .count())
+    return {"notifications": [_notification_dict(n) for n in rows], "unread_count": unread}
+
+
+@app.get("/notifications/unread-count")
+async def notifications_unread_count(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from app.core.models import Notification
+    if _notifications_denied_for_temp(current_user):
+        return {"count": 0}
+    count = (db.query(Notification)
+             .filter(Notification.user_id == current_user.id, Notification.is_read.is_(False))
+             .count())
+    return {"count": count}
+
+
+@app.post("/notifications/{notification_id}/read")
+async def mark_notification_read(
+    notification_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from app.core.models import Notification
+    if _notifications_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Not available for temporary sessions")
+    n = (db.query(Notification)
+         .filter(Notification.id == notification_id, Notification.user_id == current_user.id)
+         .first())
+    if not n:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    if not n.is_read:
+        n.is_read = True
+        n.read_at = datetime.utcnow()
+        db.commit()
+    return {"ok": True}
+
+
+@app.post("/notifications/read-all")
+async def mark_all_notifications_read(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from app.core.models import Notification
+    if _notifications_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Not available for temporary sessions")
+    updated = (db.query(Notification)
+               .filter(Notification.user_id == current_user.id, Notification.is_read.is_(False))
+               .update({Notification.is_read: True, Notification.read_at: datetime.utcnow()},
+                       synchronize_session=False))
+    db.commit()
+    return {"ok": True, "updated": updated}
+
+
+@app.delete("/notifications/{notification_id}")
+async def dismiss_notification(
+    notification_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from app.core.models import Notification
+    if _notifications_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Not available for temporary sessions")
+    n = (db.query(Notification)
+         .filter(Notification.id == notification_id, Notification.user_id == current_user.id)
+         .first())
+    if not n:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    db.delete(n)
+    db.commit()
+    return {"ok": True}
 
 
 @app.post("/groups/{group_id}/members")
