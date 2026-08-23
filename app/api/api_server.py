@@ -12543,6 +12543,231 @@ async def rename_file(
         )
 
 
+class ItemMoveCopy(BaseModel):
+    """Destination for a file move/copy. dest_folder_id None means the destination vault root."""
+    dest_vault_id: uuid.UUID
+    dest_folder_id: Optional[uuid.UUID] = None
+    replace_same_name: bool = False
+
+
+class FolderMoveCopy(BaseModel):
+    """Destination for a folder move/copy. dest_parent_folder_id None means the vault root."""
+    dest_vault_id: uuid.UUID
+    dest_parent_folder_id: Optional[uuid.UUID] = None
+
+
+def _gate_move_copy_destination(db, vault_service, current_user, dest_vault_id, dest_folder_id,
+                                dest_password, caps):
+    """Shared destination gate for move/copy: prove access + password to the destination vault, the
+    scoped-temp caps hold on the destination, and (for a scoped temp) the destination folder — INCLUDING
+    the vault root — is in scope. Returns the destination vault."""
+    from app.core.temp_scope import require_cap
+    dest_vault = vault_service.get_vault(dest_vault_id, current_user, dest_password,
+                                         require_password=True)
+    for cap in caps:
+        require_cap(current_user, dest_vault_id, cap)
+    # Unconditional (NOT `if dest_folder_id is not None`): require_folder_scope denies the vault ROOT
+    # (folder_id None) for an id-scoped principal — a scoped temp must not deposit an item at the root,
+    # outside its granted subtree — and is a no-op for a non-scoped / whole-vault principal.
+    require_folder_scope(db, current_user, dest_vault_id, dest_folder_id)
+    return dest_vault
+
+
+@app.post("/vaults/{vault_id}/files/{file_id}/copy")
+@require_endpoint_permission("FILE_DOWNLOAD")
+@require_vault_cap("file.download")
+async def copy_file_endpoint(
+    vault_id: uuid.UUID,
+    file_id: uuid.UUID,
+    body: ItemMoveCopy,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    x_vault_password: Optional[str] = Header(None),
+    x_dest_vault_password: Optional[str] = Header(None),
+    x_file_password: Optional[str] = Header(None),
+):
+    """Copy a file to another folder/vault, leaving the original. Standard vaults only (the server
+    cannot re-encrypt a zero-knowledge blob). Requires read on the source and write on the
+    destination; each vault's password is gated when it is password-protected."""
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    audit_logger = AuditLogger(db)
+    try:
+        # Source: access + password on the path vault, the file belongs to it, item in scope.
+        vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+        if not db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id).first():
+            raise HTTPException(status_code=404, detail="File not found in this vault")
+        require_item_scope(db, current_user, vault_id, file_id)
+        # Destination: access + password + the write cap + folder scope.
+        _gate_move_copy_destination(db, vault_service, current_user, body.dest_vault_id,
+                                    body.dest_folder_id, x_dest_vault_password, ["file.upload"])
+        # Overwriting a same-name file in the destination DELETES it, so it needs delete authority on
+        # the DESTINATION vault — the client flag alone must not let an upload-only principal destroy
+        # another user's file (same rule as every other replace path, _principal_can_replace_file).
+        replace = body.replace_same_name and _principal_can_replace_file(db, current_user, body.dest_vault_id)
+        new_file = vault_service.copy_file(
+            file_id, current_user, body.dest_vault_id, body.dest_folder_id,
+            source_file_password=x_file_password, replace_same_name=replace)
+        audit_logger.log_action(
+            action='file_copy', status='success', user=current_user, resource_type='file',
+            resource_id=str(file_id),
+            details={'source_vault_id': str(vault_id), 'dest_vault_id': str(body.dest_vault_id),
+                     'dest_folder_id': str(body.dest_folder_id) if body.dest_folder_id else None,
+                     'new_file_id': str(new_file.id)},
+            ip_address=get_client_ip(request))
+        return {'message': 'File copied', 'id': str(new_file.id)}
+    except DuplicateNameError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except HTTPException:
+        raise
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="A file with that name already exists in the destination")
+
+
+@app.post("/vaults/{vault_id}/files/{file_id}/move")
+@require_endpoint_permission("FILE_DELETE")
+@require_vault_cap("file.delete")
+async def move_file_endpoint(
+    vault_id: uuid.UUID,
+    file_id: uuid.UUID,
+    body: ItemMoveCopy,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    x_vault_password: Optional[str] = Header(None),
+    x_dest_vault_password: Optional[str] = Header(None),
+    x_file_password: Optional[str] = Header(None),
+):
+    """Move a file. Within one vault this is a reparent (no re-encryption); across vaults it
+    re-encrypts into the destination (Standard↔Standard) and deletes the source. Requires the delete
+    capability on the source and the upload capability on the destination."""
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    audit_logger = AuditLogger(db)
+    try:
+        vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+        if not db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id).first():
+            raise HTTPException(status_code=404, detail="File not found in this vault")
+        require_item_scope(db, current_user, vault_id, file_id)
+        _gate_move_copy_destination(db, vault_service, current_user, body.dest_vault_id,
+                                    body.dest_folder_id, x_dest_vault_password, ["file.upload"])
+        # Same rule as copy: overwriting a same-name file in the destination needs delete authority
+        # there, not just the client flag.
+        replace = body.replace_same_name and _principal_can_replace_file(db, current_user, body.dest_vault_id)
+        new_file = vault_service.move_file(
+            file_id, current_user, body.dest_vault_id, body.dest_folder_id,
+            source_file_password=x_file_password, replace_same_name=replace)
+        audit_logger.log_action(
+            action='file_move', status='success', user=current_user, resource_type='file',
+            resource_id=str(file_id),
+            details={'source_vault_id': str(vault_id), 'dest_vault_id': str(body.dest_vault_id),
+                     'dest_folder_id': str(body.dest_folder_id) if body.dest_folder_id else None,
+                     'new_file_id': str(new_file.id)},
+            ip_address=get_client_ip(request))
+        return {'message': 'File moved', 'id': str(new_file.id)}
+    except DuplicateNameError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except HTTPException:
+        raise
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="A file with that name already exists in the destination")
+
+
+@app.post("/vaults/{vault_id}/folders/{folder_id}/move")
+@require_endpoint_permission("FOLDER_MANAGE")
+@require_vault_cap("folder.create")
+async def move_folder_endpoint(
+    vault_id: uuid.UUID,
+    folder_id: uuid.UUID,
+    body: FolderMoveCopy,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    x_vault_password: Optional[str] = Header(None),
+):
+    """Move a folder within its vault (a reparent). Cross-vault folder moves are not supported yet."""
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    audit_logger = AuditLogger(db)
+    try:
+        vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+        if not db.query(Folder.id).filter(Folder.id == folder_id, Folder.vault_id == vault_id).first():
+            raise HTTPException(status_code=404, detail="Folder not found in this vault")
+        require_item_scope(db, current_user, vault_id, folder_id)
+        # Unconditional: denies the vault ROOT for an id-scoped temp (a no-op otherwise).
+        require_folder_scope(db, current_user, vault_id, body.dest_parent_folder_id)
+        folder = vault_service.move_folder(
+            folder_id, current_user, body.dest_vault_id, body.dest_parent_folder_id)
+        audit_logger.log_action(
+            action='folder_move', status='success', user=current_user, resource_type='folder',
+            resource_id=str(folder_id),
+            details={'vault_id': str(vault_id),
+                     'dest_parent_folder_id': str(body.dest_parent_folder_id) if body.dest_parent_folder_id else None},
+            ip_address=get_client_ip(request))
+        return {'message': 'Folder moved', 'id': str(folder.id)}
+    except DuplicateNameError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except HTTPException:
+        raise
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="A folder with that name already exists in the destination")
+
+
+@app.post("/vaults/{vault_id}/folders/{folder_id}/copy")
+@require_endpoint_permission("FOLDER_MANAGE")
+@require_vault_cap("folder.create")
+async def copy_folder_endpoint(
+    vault_id: uuid.UUID,
+    folder_id: uuid.UUID,
+    body: FolderMoveCopy,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    x_vault_password: Optional[str] = Header(None),
+):
+    """Recursively copy a folder (its files + subfolders) within its vault. Standard vaults only;
+    cross-vault folder copies are not supported yet."""
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    audit_logger = AuditLogger(db)
+    try:
+        from app.core.temp_scope import require_cap
+        vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+        if not db.query(Folder.id).filter(Folder.id == folder_id, Folder.vault_id == vault_id).first():
+            raise HTTPException(status_code=404, detail="Folder not found in this vault")
+        require_item_scope(db, current_user, vault_id, folder_id)
+        # Unconditional: denies the vault ROOT for an id-scoped temp (a no-op otherwise).
+        require_folder_scope(db, current_user, vault_id, body.dest_parent_folder_id)
+        # A recursive copy reads every descendant file and writes a duplicate, so a scoped temp needs
+        # the read + write caps too (all within the one vault).
+        require_cap(current_user, vault_id, "file.download")
+        require_cap(current_user, vault_id, "file.upload")
+        folder = vault_service.copy_folder(
+            folder_id, current_user, body.dest_vault_id, body.dest_parent_folder_id)
+        audit_logger.log_action(
+            action='folder_copy', status='success', user=current_user, resource_type='folder',
+            resource_id=str(folder_id),
+            details={'vault_id': str(vault_id), 'new_folder_id': str(folder.id),
+                     'dest_parent_folder_id': str(body.dest_parent_folder_id) if body.dest_parent_folder_id else None},
+            ip_address=get_client_ip(request))
+        return {'message': 'Folder copied', 'id': str(folder.id)}
+    except DuplicateNameError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except HTTPException:
+        raise
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="A folder with that name already exists in the destination")
+
+
 @app.post("/vaults/{vault_id}/folders")
 @require_endpoint_permission("FOLDER_MANAGE")
 @require_vault_cap("folder.create")

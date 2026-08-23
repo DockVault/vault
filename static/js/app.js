@@ -9054,6 +9054,7 @@ function renderVaultFiles() {
 
     setupFilesViewControls();
     updateFilesBulkBar();
+    updateMoveCopyBar();
 }
 
 function filesEmptyStateHtml(grid) {
@@ -9088,8 +9089,13 @@ function fileActionButtons(item, canWrite, opts) {
     if (isFolder) {
         const canRename = canWrite && vaultCapAllowed('file.rename');
         const canDelete = canWrite && vaultCapAllowed('folder.delete');
+        // Copy/Move a folder needs folder.create (the structural cap); a recursive copy also
+        // reads + writes files, gated server-side. Mirrors require_vault_cap on the endpoints.
+        const canStructure = canWrite && vaultCapAllowed('folder.create');
         if (slot !== 'primary') {  // folders have no download -> primary (left) is empty
             if (canRename) out.push(btn('rename-folder', 'edit', 'Rename'));
+            if (canStructure) out.push(btn('copy-folder', 'copy', 'Copy'));
+            if (canStructure) out.push(btn('move-folder', 'move', 'Move'));
             if (canDelete) out.push(btn('delete-folder', 'trash', 'Delete', true));
             if (vaultShareable()) out.push(btn('share-folder', 'link', 'Share'));
         }
@@ -9100,6 +9106,10 @@ function fileActionButtons(item, canWrite, opts) {
         const canDelete = canWrite && vaultCapAllowed('file.delete');
         if (slot !== 'primary') {
             if (canRename) out.push(btn('rename-file', 'edit', 'Rename'));
+            // Copy needs read (file.download); Move removes from the source (file.delete). The
+            // destination write is authorized at paste time, matching the endpoints.
+            if (canDownload) out.push(btn('copy-file', 'copy', 'Copy'));
+            if (canDelete) out.push(btn('move-file', 'move', 'Move'));
             if (canDelete) out.push(btn('delete-file', 'trash', 'Delete', true));
             if (vaultShareable()) out.push(btn('share-file', 'link', 'Share'));
             // Download last so it renders on the far RIGHT of the action cluster (grid + table).
@@ -9213,6 +9223,10 @@ function wireFileItemHandlers(container) {
             else if (action === 'rename-file' || action === 'rename-folder') renameVaultItem(id, name, action === 'rename-folder' ? 'folder' : 'file');
             else if (action === 'delete-file' || action === 'delete-folder') deleteVaultItem(id, name, action === 'delete-folder' ? 'folder' : 'file');
             else if (action === 'share-file' || action === 'share-folder') openCreateShareModal(action === 'share-folder' ? 'folder' : 'file', id, name);
+            else if (action === 'copy-file' || action === 'move-file')
+                stageForMoveCopy(id, name, 'file', action === 'move-file' ? 'move' : 'copy');
+            else if (action === 'copy-folder' || action === 'move-folder')
+                stageForMoveCopy(id, name, 'folder', action === 'move-folder' ? 'move' : 'copy');
         });
     });
     container.querySelectorAll('.file-check').forEach(cb => {
@@ -9252,6 +9266,90 @@ function updateFilesBulkBar() {
     }
 }
 
+// ---- Move / Copy clipboard --------------------------------------------------------------------
+// A small staging list: Copy/Move on an item adds it here (remembering which vault it came from);
+// "Paste here" drops the staged items into the vault + folder currently open. Copies stay staged so
+// they can be pasted in several places; moves leave once relocated. The source and destination vault
+// passwords are pulled from the per-vault remembered-unlock cache, so a paste into or out of a
+// password-protected vault works while it is unlocked (and fails cleanly with a prompt otherwise).
+function _moveCopyClip() {
+    if (!Array.isArray(state.moveCopyClip)) state.moveCopyClip = [];
+    return state.moveCopyClip;
+}
+
+function stageForMoveCopy(id, name, type, action) {
+    const clip = _moveCopyClip();
+    // Re-staging the same item replaces its pending action (Copy then Move, or vice-versa).
+    const existing = clip.find(e => e.id === id);
+    if (existing) { existing.action = action; existing.name = name; existing.type = type; }
+    else clip.push({ id, name, type, action, sourceVaultId: state.currentVaultId });
+    updateMoveCopyBar();
+    showToast(`${action === 'move' ? 'Moving' : 'Copying'}: ${name}. Open a folder or vault and Paste here.`, 'info');
+}
+
+function clearMoveCopy() {
+    state.moveCopyClip = [];
+    updateMoveCopyBar();
+}
+
+function updateMoveCopyBar() {
+    const clip = _moveCopyClip();
+    const bar = document.getElementById('move-copy-bar');
+    const countEl = document.getElementById('move-copy-count');
+    if (countEl) countEl.textContent = clip.length;
+    if (bar) bar.hidden = clip.length === 0;
+}
+
+function _vaultPasswordFor(vaultId) {
+    // The current vault's live password, else any per-vault remembered unlock (null if neither).
+    if (vaultId && state.currentVaultId && String(vaultId) === String(state.currentVaultId)) {
+        return state.vaultPassword || state.getRememberedVaultPassword(vaultId) || null;
+    }
+    return state.getRememberedVaultPassword(vaultId) || null;
+}
+
+async function pasteMoveCopy() {
+    const clip = _moveCopyClip();
+    if (!clip.length) return;
+    const destVaultId = state.currentVaultId;
+    if (!destVaultId) { showError('Open a vault to paste into.'); return; }
+    const destFolderId = state.currentFolderId || null;
+    const destPassword = _vaultPasswordFor(destVaultId);
+    const pasteBtn = document.getElementById('move-copy-paste');
+    if (pasteBtn) pasteBtn.disabled = true;
+
+    let ok = 0;
+    const failures = [];
+    const relocated = new Set();  // moved items that succeeded (leave the clipboard)
+    for (const entry of clip) {
+        const isFolder = entry.type === 'folder';
+        const verb = entry.action;  // 'copy' | 'move'
+        const base = `/vaults/${entry.sourceVaultId}/${isFolder ? 'folders' : 'files'}/${entry.id}/${verb}`;
+        const body = isFolder
+            ? { dest_vault_id: destVaultId, dest_parent_folder_id: destFolderId }
+            : { dest_vault_id: destVaultId, dest_folder_id: destFolderId };
+        const headers = {};
+        const srcPw = _vaultPasswordFor(entry.sourceVaultId);
+        if (srcPw) headers['X-Vault-Password'] = srcPw;
+        if (destPassword) headers['X-Dest-Vault-Password'] = destPassword;
+        try {
+            await apiRequest(base, { method: 'POST', body: JSON.stringify(body), headers, silent: true });
+            ok++;
+            if (verb === 'move') relocated.add(entry.id);
+        } catch (e) {
+            failures.push(`${entry.name}: ${(e && e.message) || 'failed'}`);
+        }
+    }
+
+    // Copies stay staged (paste again elsewhere); successful moves leave; failures stay.
+    state.moveCopyClip = clip.filter(e => !relocated.has(e.id));
+    updateMoveCopyBar();
+    if (pasteBtn) pasteBtn.disabled = false;
+    if (ok) showSuccess(`Pasted ${ok} item${ok > 1 ? 's' : ''}`);
+    if (failures.length) showError(`Could not paste ${failures.length}: ${failures.slice(0, 3).join('; ')}`);
+    await loadVaultFiles();
+}
+
 // Wire the view-switch, select-all and bulk-bar controls exactly once.
 function setupFilesViewControls() {
     if (state._filesCtrlWired) return;
@@ -9277,6 +9375,10 @@ function setupFilesViewControls() {
     if (del) del.addEventListener('click', bulkDeleteFiles);
     const clear = document.getElementById('files-bulk-clear');
     if (clear) clear.addEventListener('click', () => { if (state.selectedFileIds) state.selectedFileIds.clear(); renderVaultFiles(); });
+    const paste = document.getElementById('move-copy-paste');
+    if (paste) paste.addEventListener('click', pasteMoveCopy);
+    const clipClear = document.getElementById('move-copy-clear');
+    if (clipClear) clipClear.addEventListener('click', clearMoveCopy);
 }
 
 async function bulkDownloadFiles() {
