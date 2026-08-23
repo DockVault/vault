@@ -441,8 +441,18 @@ def test_dynamic_action_groups_cover_every_token_in_order():
 def test_token_context_has_every_catalog_key_and_never_none():
     ctx = es.token_context()          # all inputs omitted
     for a in es.DYNAMIC_ACTIONS:
-        assert a.token in ctx and ctx[a.token] == "" or ctx[a.token]  # present; empty string, never None
-        assert ctx[a.token] is not None
+        assert a.token in ctx                     # every catalog key is present
+        assert isinstance(ctx[a.token], str)      # a string (empty when the input was omitted), never None
+
+
+def test_substitute_escapes_attribute_breakout_at_substitution_time():
+    # Pin the substitute-TIME escape (quote=True) independently of the later re-sanitize: a token value
+    # in a quoted attribute cannot break out and add an event handler.
+    out = es.substitute_tokens('<a title="{{sender.from_name}}">x</a>',
+                               {"sender.from_name": 'a" onmouseover="alert(1)'})
+    assert "&quot;" in out                        # the quote was HTML-escaped at substitution time
+    assert 'onmouseover="alert' not in out        # so it never became a real quoted attribute
+    assert '" onmouseover' not in out             # no literal quote closes the title attribute
 
 
 def test_token_context_populates_new_groups():

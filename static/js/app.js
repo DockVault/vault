@@ -8754,8 +8754,10 @@ function attachSettingsListeners() {
                 closeDynMenu();
             }
         });
-        // Keep the flyout submenu glued to its row on scroll/resize while the menu is open.
+        // The flyout submenu is position:fixed, so a scroll/resize would detach it from its row —
+        // close it (the admin reopens with one click). Capture-phase catches scrolls in any container.
         window.addEventListener('resize', _closeDynSubmenu);
+        window.addEventListener('scroll', _closeDynSubmenu, true);
     }
     
     // Audit log buttons

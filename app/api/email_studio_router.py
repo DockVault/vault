@@ -688,6 +688,7 @@ async def list_actions(_admin: User = Depends(require_interactive_admin), db: Se
     delete): a ``system`` action always sends and keeps a non-removable template; an ``optional`` one
     is opt-in via ``enabled``."""
     rows = (db.query(EmailAction)
+            .options(joinedload(EmailAction.template))   # avoid a lazy load per action for the card
             .order_by(EmailAction.category, EmailAction.name).all())
     return {"actions": [_action_out(a) for a in rows]}
 
@@ -696,9 +697,9 @@ async def list_actions(_admin: User = Depends(require_interactive_admin), db: Se
 async def update_action(key: str, payload: ActionUpdateIn, request: Request,
                         admin: User = Depends(require_interactive_admin),
                         db: Session = Depends(get_db)):
-    """Bind a template to an action and (for optional actions) toggle it on/off. A system action must
-    always keep a valid template — its ``template_id`` can be changed but not cleared, and it stays
-    enabled. Delivery for the action then flows through the central send helper."""
+    """Bind a template to an action and (for optional actions) toggle it on/off. A system action can
+    change its template or reset it to the built-in default (explicit null), and stays enabled either
+    way. Delivery for the action then flows through the central send helper."""
     action = db.get(EmailAction, key)
     if action is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown email action.")

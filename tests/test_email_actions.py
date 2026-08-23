@@ -45,6 +45,10 @@ def _clean(admin):
                       json={"template_id": None, "enabled": (a["category"] == "system")})
         for t in admin.get("/email/templates").json().get("templates", []):
             admin.delete(f"/email/templates/{t['id']}")
+        # also drop any (Mailpit) profile a send test created, so a leftover default profile doesn't
+        # make _smtp_configured true for the email-change tests that expect no SMTP.
+        for p in admin.get("/email/profiles").json().get("profiles", []):
+            admin.delete(f"/email/profiles/{p['id']}")
     reset()
     yield
     reset()
@@ -66,11 +70,14 @@ def test_seed_catalog_is_present_and_shaped(admin):
     assert admin.get("/email/templates").json()["templates"] == []
 
 
-def test_seed_is_idempotent(admin):
-    before = _actions(admin)
-    # a second GET (the seed ran once at boot) still shows exactly the same keys, no duplicates
-    after = _actions(admin)
-    assert set(before) == set(after)
+def test_seed_created_exactly_the_catalog_no_duplicates(admin):
+    # The seed runs on every boot (and this round has restarted many times). A non-idempotent seed
+    # would accumulate duplicate rows; assert the count equals the catalog's distinct keys.
+    from app.core.email_actions import ACTION_CATALOG
+    rows = admin.get("/email/actions").json()["actions"]
+    expected = {a["key"] for a in ACTION_CATALOG}
+    assert {r["key"] for r in rows} == expected
+    assert len(rows) == len(expected)                # no duplicate rows accreted across restarts
 
 
 # -- association -------------------------------------------------------------------------------
@@ -172,9 +179,27 @@ def test_action_test_send_delivers_rendered_default(admin):
 
 
 @_mailpit
-def test_disabled_optional_action_is_not_sent_by_helper_but_test_forces(admin):
-    # A disabled optional action is skipped by the helper in normal flow, but the admin test-send
-    # force-sends it (so an admin can preview before enabling).
+def test_disabled_optional_action_test_send_force_delivers(admin):
+    # An admin can preview a DISABLED optional action via the test-send (force): it must actually
+    # deliver even though the action is off. (The normal-flow skip — send_action_email with
+    # force=False returning False — has no wired trigger to exercise over HTTP; it's covered by the
+    # helper's gate logic + the security review.)
+    requests.delete(f"{MAILPIT_URL}/api/v1/messages", timeout=10)
+    for p in admin.get("/email/profiles").json()["profiles"]:
+        admin.delete(f"/email/profiles/{p['id']}")
+    admin.post("/email/profiles", json={"name": "MP", "smtp_server": MAILPIT_SMTP_HOST,
+                                        "smtp_port": int(MAILPIT_SMTP_PORT), "smtp_username": "",
+                                        "from_email": "sender@example.com", "is_default": True})
     admin.put(f"/email/actions/{_OPTIONAL_SAMPLE}", json={"template_id": None, "enabled": False})
-    r = admin.post(f"/email/actions/{_OPTIONAL_SAMPLE}/test", json={"to_addr": "x@example.com"})
-    assert r.status_code in (200, 502)   # forced send attempted (200 delivered, or 502 if no SMTP)
+    to = "forced-rcpt@example.com"
+    r = admin.post(f"/email/actions/{_OPTIONAL_SAMPLE}/test", json={"to_addr": to})
+    assert r.status_code == 200, r.text
+    deadline, seen = time.time() + 15, False
+    while time.time() < deadline and not seen:
+        for m in requests.get(f"{MAILPIT_URL}/api/v1/messages", timeout=10).json().get("messages", []):
+            if to in [a.get("Address", "").lower() for a in m.get("To", [])]:
+                seen = True
+                break
+        if not seen:
+            time.sleep(0.5)
+    assert seen, "the forced test send of a disabled optional action was not delivered"

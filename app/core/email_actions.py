@@ -221,7 +221,11 @@ def send_action_email(db: Session, key: str, *, recipient: dict,
     spec = SPEC_BY_KEY.get(key, {})
     if action is None and not spec:
         return False
-    if action is not None and action.category == OPTIONAL and not action.enabled and not force:
+    # An OPTIONAL action is off unless explicitly enabled — including the brief pre-seed window where
+    # its DB row doesn't exist yet (default to the catalog category, disabled). System actions are on.
+    category = action.category if action is not None else spec.get("category", OPTIONAL)
+    enabled = action.enabled if action is not None else (category == SYSTEM)
+    if category == OPTIONAL and not enabled and not force:
         return False
 
     template = action.template if action is not None else None
@@ -250,15 +254,17 @@ def send_action_email(db: Session, key: str, *, recipient: dict,
                 "config", "Email is not configured. Add a sending profile in Settings → Email first.")
         return False
 
-    ctx = email_sanitize.token_context(
-        recipient=recipient, brand_name=brand_name(db), vault_url=vault_url(),
-        sender={"from_name": cfg.get("from_name") or "", "from_email": cfg.get("from_email") or ""},
-        action=action_context or {})
-    subject = email_sanitize.render_subject(subject_tpl, ctx)
-    html, inline = email_sanitize.render_for_send(
-        body_tpl, context=ctx, load_resource=lambda rid: _load_resource(db, rid))
-    text = email_sanitize.render_plaintext_fallback(html)
+    # Render AND send inside one try so a rendering error maps the same clean way as a send error
+    # (a raw exception would otherwise become a 500 on the email-change flow instead of a 400/502).
     try:
+        ctx = email_sanitize.token_context(
+            recipient=recipient, brand_name=brand_name(db), vault_url=vault_url(),
+            sender={"from_name": cfg.get("from_name") or "", "from_email": cfg.get("from_email") or ""},
+            action=action_context or {})
+        subject = email_sanitize.render_subject(subject_tpl, ctx)
+        html, inline = email_sanitize.render_for_send(
+            body_tpl, context=ctx, load_resource=lambda rid: _load_resource(db, rid))
+        text = email_sanitize.render_plaintext_fallback(html)
         msg = email_send.build_message(cfg, to_addr=to_addr, subject=subject,
                                        text_body=text, html_body=html, inline_images=inline)
         email_send.smtp_send(cfg, msg)
@@ -269,5 +275,7 @@ def send_action_email(db: Session, key: str, *, recipient: dict,
         return False
     except Exception as e:                                  # never let mail trouble break a caller flow
         print(f"[email] action '{key}' unexpected error: {type(e).__name__}")
+        if raise_errors:
+            raise email_send.EmailSendError("transport", "The email could not be prepared or sent.")
         return False
     return True
