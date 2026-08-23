@@ -1752,9 +1752,13 @@ class EmailProfile(Base):
     smtp_server = Column(String(255), nullable=False, default='')
     smtp_port = Column(Integer, nullable=False, default=587)
     smtp_username = Column(String(255), nullable=True)
-    # Stored server-side; stripped from every read. Not the crown-jewel secret the deployment key
-    # protects, but it is never emitted to a client.
+    # Write-only at the API boundary (never emitted to a client) AND encrypted at rest with the
+    # deployment Fernet key (security.encrypt_secret/decrypt_secret); a legacy plaintext value is read
+    # transparently and re-encrypted on the next save.
     smtp_password = Column(Text, nullable=True)
+    # Opt out of SMTP TLS certificate verification for THIS profile only (e.g. an internal relay with
+    # a self-signed cert). Default False = verify. When True, SMTP_SSL/STARTTLS accept any server cert.
+    smtp_allow_insecure_tls = Column(Boolean, nullable=False, default=False)
     from_email = Column(String(255), nullable=False, default='')
     from_name = Column(String(120), nullable=True)
     is_default = Column(Boolean, nullable=False, default=False)

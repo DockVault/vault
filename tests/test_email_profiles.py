@@ -123,6 +123,34 @@ def test_test_send_wont_pair_stored_password_with_a_new_host(admin, clean_profil
     assert "re-enter" not in (r2.json().get("detail") or "").lower()
 
 
+def test_smtp_password_is_encrypted_at_rest(admin, clean_profiles):
+    """The stored SMTP password must be encrypted in the database, not plaintext."""
+    import os
+    import subprocess
+    secret = "Encrypt-Me-At-Rest-77"
+    p = admin.post("/email/profiles", json=_valid_profile(smtp_password=secret)).json()
+    db = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
+    stored = subprocess.run(
+        ["docker", "exec", db, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc",
+         "SELECT smtp_password FROM email_profiles WHERE id = '%s'" % p["id"]],
+        check=True, capture_output=True, text=True, timeout=20).stdout.strip()
+    assert stored, "expected a stored password value"
+    assert secret not in stored, "the SMTP password must NOT be stored in plaintext"
+    assert stored.startswith("gAAAAA"), "the stored password should be a Fernet token (encrypted)"
+
+
+def test_allow_insecure_tls_round_trips(admin, clean_profiles):
+    """The per-profile insecure-TLS opt-out persists and defaults to secure (False)."""
+    on = admin.post("/email/profiles", json=_valid_profile(name="Insecure", smtp_allow_insecure_tls=True)).json()
+    assert on["smtp_allow_insecure_tls"] is True
+    off = admin.post("/email/profiles", json=_valid_profile(name="Secure")).json()
+    assert off["smtp_allow_insecure_tls"] is False, "verification must be ON by default"
+    # An update can toggle it back off.
+    r = admin.put("/email/profiles/%s" % on["id"],
+                  json=_valid_profile(name="Insecure", smtp_allow_insecure_tls=False))
+    assert r.status_code == 200 and r.json()["smtp_allow_insecure_tls"] is False
+
+
 def test_single_default_is_enforced(admin, clean_profiles):
     a = admin.post("/email/profiles", json=_valid_profile(name="A")).json()
     b = admin.post("/email/profiles", json=_valid_profile(name="B", is_default=True)).json()

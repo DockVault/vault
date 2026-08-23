@@ -16,7 +16,7 @@ import uuid
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHash
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -44,6 +44,26 @@ def _runtime_settings():
 def _fernet():
     """Resolve file encryption only when a cryptographic operation is requested."""
     return Fernet(_runtime_settings().encryption_key.encode())
+
+
+def encrypt_secret(plaintext: str) -> str:
+    """Encrypt a short reversible secret (e.g. a stored SMTP password) at rest with the deployment
+    Fernet key. Returns a Fernet token string. Empty/None -> "" (nothing to encrypt)."""
+    if not plaintext:
+        return ""
+    return _fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+
+def decrypt_secret(stored: str) -> str:
+    """Decrypt a value written by encrypt_secret. Back-compat: a value that is not a valid Fernet
+    token (a LEGACY plaintext credential written before at-rest encryption) is returned unchanged, so
+    existing profiles keep working and are transparently re-encrypted the next time they are saved."""
+    if not stored:
+        return ""
+    try:
+        return _fernet().decrypt(stored.encode("ascii")).decode("utf-8")
+    except (InvalidToken, ValueError, UnicodeDecodeError):
+        return stored  # legacy plaintext (pre-encryption) — used as-is until re-saved
 
 # --- AES-256-GCM chunked at-rest stream (format version 0x10) ---------------
 # The legacy at-rest format is a global-key Fernet chunk stream (encrypt_chunk /

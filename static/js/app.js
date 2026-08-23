@@ -7500,6 +7500,7 @@ function openEmailProfileModal(profile) {
     val('ep-from-email', profile ? (profile.from_email || '') : '');
     val('ep-from-name', profile ? (profile.from_name || '') : '');
     document.getElementById('ep-default').checked = profile ? !!profile.is_default : false;
+    document.getElementById('ep-insecure-tls').checked = profile ? !!profile.smtp_allow_insecure_tls : false;
     document.getElementById('ep-password-hint').textContent =
         (profile && profile.has_password) ? 'Password is set — leave blank to keep it'
                                           : 'Enter a password if your server requires authentication';
@@ -7525,6 +7526,7 @@ function _collectEmailProfileForm() {
         from_email: g('ep-from-email').trim(),
         from_name: g('ep-from-name').trim() || null,
         is_default: document.getElementById('ep-default').checked,
+        smtp_allow_insecure_tls: document.getElementById('ep-insecure-tls').checked,
     };
     const pw = g('ep-password');
     if (pw) body.smtp_password = pw;

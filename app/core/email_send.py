@@ -141,6 +141,18 @@ def build_message(cfg: dict, *, to_addr: str, subject: str, text_body: str,
             "config", "The email could not be built — check the From name and address.")
 
 
+def _smtp_tls_context(cfg: dict) -> "ssl.SSLContext":
+    """The SSL context for the SMTP connection. Verifies the server certificate by default
+    (check_hostname + CERT_REQUIRED). When the profile opts into insecure TLS
+    (``smtp_allow_insecure_tls`` — e.g. an internal relay with a self-signed cert) the connection is
+    still encrypted but the certificate is NOT verified."""
+    ctx = ssl.create_default_context()
+    if cfg.get("smtp_allow_insecure_tls"):
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def smtp_send(cfg: dict, msg: EmailMessage) -> None:
     """Send ``msg`` using ``cfg`` (server/port/username/password). Connect over SSL (465) or STARTTLS,
     NEVER send credentials over an unencrypted connection (STARTTLS-strip defense), and translate
@@ -156,10 +168,10 @@ def smtp_send(cfg: dict, msg: EmailMessage) -> None:
     username = (cfg.get("smtp_username") or "").strip()
     password = cfg.get("smtp_password") or ""
     try:
-        # Verify the server's TLS certificate (create_default_context => check_hostname + CERT_REQUIRED)
-        # on BOTH implicit-TLS (465) and STARTTLS, so an active on-path attacker can't present a forged
-        # cert and capture the SMTP credentials / mail. smtplib's default context does NOT verify.
-        tls_ctx = ssl.create_default_context()
+        # Verify the server's TLS certificate on BOTH implicit-TLS (465) and STARTTLS (default), so an
+        # active on-path attacker can't present a forged cert and capture the SMTP credentials / mail.
+        # smtplib's default context does NOT verify; a profile may opt out via smtp_allow_insecure_tls.
+        tls_ctx = _smtp_tls_context(cfg)
         server = (smtplib.SMTP_SSL(host, port, timeout=15, context=tls_ctx)
                   if port == 465 else smtplib.SMTP(host, port, timeout=15))
         with server:
@@ -212,8 +224,9 @@ def smtp_send_batch(cfg: dict, messages: list) -> list:
     password = cfg.get("smtp_password") or ""
     results = [{"ok": False, "error": "not attempted"} for _ in messages]
     try:
-        # Verify the server's TLS certificate on both implicit-TLS (465) and STARTTLS (see smtp_send).
-        tls_ctx = ssl.create_default_context()
+        # Verify the server's TLS certificate on both implicit-TLS (465) and STARTTLS (see smtp_send);
+        # a profile may opt out via smtp_allow_insecure_tls.
+        tls_ctx = _smtp_tls_context(cfg)
         server = (smtplib.SMTP_SSL(host, port, timeout=30, context=tls_ctx)
                   if port == 465 else smtplib.SMTP(host, port, timeout=30))
         with server:

@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session, defer, joinedload
 from app.core.database import get_db
 from app.core.models import EmailProfile, EmailResource, EmailTemplate, RoleEnum, User
 from app.core import email_sanitize, email_send
+from app.core.security import decrypt_secret, encrypt_secret
 from app.core.rate_limiter import rate_limiter as _rate_limiter, RateLimiterUnavailable
 from app.services.audit_logger import AuditLogger
 
@@ -120,6 +121,8 @@ class ProfileIn(BaseModel):
     from_email: str = Field(min_length=3, max_length=255)
     from_name: Optional[str] = Field(default=None, max_length=120)
     is_default: Optional[bool] = None
+    # Opt out of SMTP TLS certificate verification (e.g. an internal relay with a self-signed cert).
+    smtp_allow_insecure_tls: bool = False
 
 
 class ProfileTestIn(BaseModel):
@@ -134,6 +137,7 @@ class ProfileTestIn(BaseModel):
     from_email: Optional[str] = None
     from_name: Optional[str] = None
     to_addr: Optional[str] = None
+    smtp_allow_insecure_tls: Optional[bool] = None
 
 
 def _validate_profile_fields(p: ProfileIn) -> None:
@@ -161,6 +165,7 @@ def _profile_out(p: EmailProfile) -> dict:
         "from_name": p.from_name,
         "is_default": p.is_default,
         "has_password": bool(p.smtp_password),
+        "smtp_allow_insecure_tls": bool(p.smtp_allow_insecure_tls),
         "created_at": p.created_at.isoformat() if p.created_at else None,
         "updated_at": p.updated_at.isoformat() if p.updated_at else None,
     }
@@ -221,10 +226,11 @@ async def create_profile(payload: ProfileIn, request: Request,
         smtp_server=payload.smtp_server.strip(),
         smtp_port=payload.smtp_port,
         smtp_username=(payload.smtp_username or "").strip() or None,
-        smtp_password=(payload.smtp_password or None),
+        smtp_password=(encrypt_secret(payload.smtp_password) or None),  # encrypted at rest
         from_email=payload.from_email.strip(),
         from_name=(payload.from_name or "").strip() or None,
         is_default=make_default,
+        smtp_allow_insecure_tls=bool(payload.smtp_allow_insecure_tls),
     )
     db.add(p)
     try:
@@ -254,9 +260,10 @@ async def update_profile(profile_id: uuid.UUID, payload: ProfileIn, request: Req
     p.smtp_username = (payload.smtp_username or "").strip() or None
     p.from_email = payload.from_email.strip()
     p.from_name = (payload.from_name or "").strip() or None
-    # Write-only password: overwrite ONLY when a non-empty value is supplied.
+    p.smtp_allow_insecure_tls = bool(payload.smtp_allow_insecure_tls)
+    # Write-only password: overwrite (encrypted at rest) ONLY when a non-empty value is supplied.
     if payload.smtp_password:
-        p.smtp_password = payload.smtp_password
+        p.smtp_password = encrypt_secret(payload.smtp_password)
     if payload.is_default is True and not p.is_default:
         db.query(EmailProfile).filter(EmailProfile.is_default.is_(True),
                                       EmailProfile.id != p.id).update(
@@ -321,13 +328,14 @@ async def test_profile(payload: ProfileTestIn, request: Request,
         if p is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
         cfg = {"smtp_server": p.smtp_server, "smtp_port": p.smtp_port,
-               "smtp_username": p.smtp_username or "", "smtp_password": p.smtp_password or "",
-               "from_email": p.from_email, "from_name": p.from_name or ""}
+               "smtp_username": p.smtp_username or "", "smtp_password": decrypt_secret(p.smtp_password),
+               "from_email": p.from_email, "from_name": p.from_name or "",
+               "smtp_allow_insecure_tls": bool(p.smtp_allow_insecure_tls)}
         stored_target = ((p.smtp_server or ""), int(p.smtp_port or 587), (p.smtp_username or ""))
         stored_has_password = bool(p.smtp_password)
     else:
         cfg = {"smtp_server": "", "smtp_port": 587, "smtp_username": "",
-               "smtp_password": "", "from_email": "", "from_name": ""}
+               "smtp_password": "", "from_email": "", "from_name": "", "smtp_allow_insecure_tls": False}
         stored_target = None
         stored_has_password = False
     # Overlay any fields the caller provided (edited-but-unsaved values); password only when non-empty.
@@ -335,6 +343,8 @@ async def test_profile(payload: ProfileTestIn, request: Request,
         val = getattr(payload, field)
         if val is not None:
             cfg[field] = val
+    if payload.smtp_allow_insecure_tls is not None:
+        cfg["smtp_allow_insecure_tls"] = bool(payload.smtp_allow_insecure_tls)
     if payload.smtp_password:
         cfg["smtp_password"] = payload.smtp_password
 
@@ -755,8 +765,9 @@ class SendIn(BaseModel):
 
 def _profile_cfg(p: EmailProfile) -> dict:
     return {"smtp_server": p.smtp_server, "smtp_port": p.smtp_port,
-            "smtp_username": p.smtp_username or "", "smtp_password": p.smtp_password or "",
-            "from_email": p.from_email, "from_name": p.from_name or ""}
+            "smtp_username": p.smtp_username or "", "smtp_password": decrypt_secret(p.smtp_password),
+            "from_email": p.from_email, "from_name": p.from_name or "",
+            "smtp_allow_insecure_tls": bool(p.smtp_allow_insecure_tls)}
 
 
 @router.post("/templates/{template_id}/send")

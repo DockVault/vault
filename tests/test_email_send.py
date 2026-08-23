@@ -119,6 +119,39 @@ def test_starttls_uses_verifying_context(fake_smtp):
         "STARTTLS must verify the server certificate"
 
 
+def test_allow_insecure_tls_uses_unverified_context(fake_smtp):
+    import ssl as _ssl
+    # Implicit TLS (465) with the opt-out -> encrypted but NOT verifying.
+    cfg = _cfg(smtp_port=465, smtp_username="u", smtp_password="p", smtp_allow_insecure_tls=True)
+    es.smtp_send(cfg, _msg(cfg))
+    ctx = fake_smtp.last.tls_context
+    assert isinstance(ctx, _ssl.SSLContext)
+    assert ctx.check_hostname is False and ctx.verify_mode == _ssl.CERT_NONE, \
+        "smtp_allow_insecure_tls must skip certificate verification"
+    # STARTTLS (587) with the opt-out -> same.
+    cfg587 = _cfg(smtp_port=587, smtp_username="u", smtp_password="p", smtp_allow_insecure_tls=True)
+    es.smtp_send(cfg587, _msg(cfg587))
+    sctx = fake_smtp.last.starttls_context
+    assert sctx.check_hostname is False and sctx.verify_mode == _ssl.CERT_NONE
+
+
+def test_plaintext_no_auth_send_is_allowed(fake_smtp):
+    # Mailpit-style: a plaintext port with NO STARTTLS and NO username sends fine and is never
+    # blocked — the cleartext-credential guard only triggers when a username is set, and TLS
+    # verification only applies to 465/STARTTLS (neither used here).
+    cfg = _cfg(smtp_port=1025, smtp_username="", smtp_password="")
+    import app.core.email_send as m
+    def _plain(host, port, timeout=None, context=None):
+        inst = _FakeSMTP(host, port, timeout)
+        inst.extns = set()          # no STARTTLS advertised (like Mailpit's default)
+        return inst
+    m.smtplib.SMTP = _plain
+    es.smtp_send(cfg, _msg(cfg))     # must not raise
+    assert len(_FakeSMTP.last.sent) == 1
+    assert _FakeSMTP.last.logged_in is None
+    assert _FakeSMTP.last.starttls_called is False
+
+
 def test_starttls_strip_defense_refuses_login_over_cleartext(fake_smtp):
     cfg = _cfg(smtp_port=587, smtp_username="u", smtp_password="p")
     # Server does NOT advertise STARTTLS -> credentials must not be sent.
