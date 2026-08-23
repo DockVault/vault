@@ -13509,6 +13509,69 @@ def _seed_admin_user():
         print(f"⚠ Admin bootstrap skipped: {e}")
 
 
+# Starter share-tag set seeded onto a FRESH deployment so sharing is usable out of the box. The
+# create-allowlist is fail-closed (auto_enroll off + empty lists => grants no one), so each seed tag
+# sets auto_enroll_new_users=True to grant every internal user create rights; an admin can tighten
+# the allowlist per tag afterwards. Names are the owner-chosen set; the policy is a sensible default an
+# admin can edit. Lifetime/cap fields fall to the model defaults (7-day ceiling, 1-day default, no
+# recipient/download cap). Colors are drawn from the UI's chip palette (unknown names fall back).
+_DEFAULT_SHARE_TAGS = [
+    {
+        "name": "Normal", "color": "sky",
+        "description": "Everyday sharing with the standard limits.",
+        "allowed_audiences": ["anyone_internal", "users", "departments"],
+        "allow_view_only": True, "default_view_only": False, "force_view_only": False,
+        "allow_custom": True, "auto_enroll_new_users": True,
+    },
+    {
+        "name": "Internal", "color": "indigo",
+        "description": "For anyone inside the organisation who holds the link.",
+        "allowed_audiences": ["anyone_internal", "users", "departments"],
+        "allow_view_only": True, "default_view_only": False, "force_view_only": False,
+        "allow_custom": True, "auto_enroll_new_users": True,
+    },
+    {
+        "name": "Confidential", "color": "amber",
+        "description": "Sensitive — share only with named people or departments.",
+        "allowed_audiences": ["users", "departments"],
+        "allow_view_only": True, "default_view_only": False, "force_view_only": False,
+        "allow_custom": True, "auto_enroll_new_users": True,
+    },
+    {
+        "name": "Confidential (Read)", "color": "rose",
+        "description": "Sensitive, view-only — recipients can read but not download.",
+        "allowed_audiences": ["users", "departments"],
+        "allow_view_only": True, "default_view_only": True, "force_view_only": True,
+        "allow_custom": True, "auto_enroll_new_users": True,
+    },
+]
+
+
+def _seed_default_share_tags():
+    """Seed the starter share-tag set on a FRESH deployment so sharing works out of the box.
+
+    Guarded by _should_seed_default_tags: runs only when the share_tags table is empty AND sharing is
+    not already enabled — so it never re-adds a removed tag and never silently widens sharing on an
+    existing deployment that had already opted in. The seed tags reference the bootstrap admin as
+    creator when one exists (else NULL). Best-effort: a failure logs and is swallowed so it can never
+    brick startup.
+    """
+    try:
+        from app.core.database import get_db_context
+        from app.core.models import ShareTag, User, RoleEnum
+        with get_db_context() as db:
+            has_tags = db.query(ShareTag).first() is not None
+            if not sharing_policy.should_seed_default_tags(has_tags, _sharing_enabled(db)):
+                return
+            admin = db.query(User).filter(User.role == RoleEnum.ADMIN).first()
+            created_by = admin.id if admin else None
+            for spec in _DEFAULT_SHARE_TAGS:
+                db.add(ShareTag(created_by=created_by, **spec))
+            print(f"[OK] Seeded {len(_DEFAULT_SHARE_TAGS)} default share tags")
+    except Exception as e:
+        print(f"⚠ Default share-tag seeding skipped: {e}")
+
+
 def _backfill_default_permissions():
     """Grant role-default endpoint permissions to existing non-admin users
     (idempotent). Picks up newly-added defaults such as temp-credential
@@ -14213,6 +14276,7 @@ async def lifespan(app: FastAPI):
     _backfill_encrypted_names()
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
     _seed_admin_user()
+    _seed_default_share_tags()  # after the admin exists, so seed tags can record it as creator
     _backfill_default_permissions()
     
     # Start background task for session cleanup
