@@ -10,7 +10,7 @@
     <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
     <link rel="apple-touch-icon" href="/static/assets/logo.png?v=1">
     <link rel="stylesheet" href="/static/css/theme.css?v=20260822a">
-    <link rel="stylesheet" href="/static/css/components.css?v=20251015c">
+    <link rel="stylesheet" href="/static/css/components.css?v=20260823a">
     <link rel="stylesheet" href="/static/css/utilities.css?v=20251015c">
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-sans-500.woff2" crossorigin>
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-mono-500.woff2" crossorigin>
@@ -1925,9 +1925,9 @@
                                     <label class="checkbox-label"><input type="checkbox" id="share-view-only" /> View only (recipients can preview but not download)</label>
                                 </div>
                                 <div id="share-limits-group" style="display:none;">
-                                    <div class="form-group"><label for="share-lifetime-days">Expires after (days, optional)</label><input id="share-lifetime-days" type="number" min="1" step="1" class="input" /></div>
-                                    <div class="form-group"><label for="share-max-recipients">Max recipients (optional)</label><input id="share-max-recipients" type="number" min="1" step="1" class="input" /></div>
-                                    <div class="form-group"><label for="share-max-downloads">Max downloads per recipient (optional)</label><input id="share-max-downloads" type="number" min="1" step="1" class="input" /></div>
+                                    <div class="form-group"><label for="share-lifetime-days">Expires after (days, optional)</label><input id="share-lifetime-days" type="text" inputmode="numeric" maxlength="7" autocomplete="off" class="input" aria-describedby="share-lifetime-hint" /><small class="form-help" id="share-lifetime-hint"></small></div>
+                                    <div class="form-group"><label for="share-max-recipients">Max recipients (optional)</label><input id="share-max-recipients" type="text" inputmode="numeric" maxlength="10" autocomplete="off" class="input" aria-describedby="share-recipients-hint" /><small class="form-help" id="share-recipients-hint"></small></div>
+                                    <div class="form-group"><label for="share-max-downloads">Max downloads per recipient (optional)</label><input id="share-max-downloads" type="text" inputmode="numeric" maxlength="10" autocomplete="off" class="input" aria-describedby="share-downloads-hint" /><small class="form-help" id="share-downloads-hint"></small></div>
                                 </div>
                                 <div id="share-create-error" class="alert alert-error" style="display:none;"></div>
                             </div>
@@ -2769,7 +2769,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260823e"></script>
+    <script src="/static/js/app.js?v=20260823f"></script>
 </body>
 </html>
 

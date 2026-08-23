@@ -290,7 +290,8 @@
 
 /* Form Validation States */
 .form-control.is-invalid,
-.form-input.is-invalid {
+.form-input.is-invalid,
+.input.is-invalid {
     border-color: var(--error);
 }
 
