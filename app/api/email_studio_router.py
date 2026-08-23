@@ -294,7 +294,14 @@ async def delete_profile(profile_id: uuid.UUID, request: Request,
                     .order_by(EmailProfile.created_at, EmailProfile.id).first())
         if promoted is not None:
             promoted.is_default = True
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two concurrent deletes of the default could each promote a different profile and collide on
+        # the single-default partial index — same race the create/update paths guard.
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="The default profile changed at the same time; please retry.")
     _audit(db, request, admin, "email_profile_deleted", profile_id=str(profile_id), name=name,
            promoted_default=str(promoted.id) if promoted else None)
 
@@ -536,16 +543,24 @@ async def preview_template(payload: PreviewIn, request: Request,
         brand_name=_brand_name(db))
     # Bound the total bytes inlined into ONE preview: a template can reference many/large images and
     # base64 inflates ~33%, so without a budget a single request could build a multi-GB response and
-    # OOM the worker. Images past the budget are dropped from the preview (best-effort render).
-    inlined = {"n": 0}
+    # OOM the worker. Each distinct image's bytes are loaded/encoded AT MOST ONCE (memoized), and once
+    # the budget can't fit the next image we stop resolving entirely, so a body that references images
+    # thousands of times can't force thousands of DB reads + base64 encodes either.
+    state = {"bytes": 0, "stopped": False}
+    uri_cache: dict[str, str] = {}
 
     def preview_src(rid: str) -> str:
-        uri = _resource_data_uri(db, rid)
+        if state["stopped"]:
+            return ""
+        if rid not in uri_cache:
+            uri_cache[rid] = _resource_data_uri(db, rid) or ""
+        uri = uri_cache[rid]
         if not uri:
             return ""
-        if inlined["n"] + len(uri) > _PREVIEW_INLINE_BUDGET:
+        if state["bytes"] + len(uri) > _PREVIEW_INLINE_BUDGET:
+            state["stopped"] = True      # budget exhausted — drop this and every later image
             return ""
-        inlined["n"] += len(uri)
+        state["bytes"] += len(uri)       # count EVERY emission so repeats respect the budget too
         return uri
 
     html = email_sanitize.render_for_preview(

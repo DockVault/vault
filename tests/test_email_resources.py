@@ -203,6 +203,22 @@ def test_preview_resolves_a_real_uploaded_image(admin, clean_resources):
     assert rid in r.json()["referenced_resource_ids"]
 
 
+def test_preview_caps_total_inlined_bytes(admin, clean_resources):
+    # A body that references image(s) totalling more than the per-preview inline budget must have the
+    # overflow DROPPED (bounds the response + peak memory). Memoization keeps this fast: one distinct
+    # image, so the bytes are loaded/encoded once even though it's referenced many times.
+    big = b"\x89PNG\r\n\x1a\n" + b"\x00" * (300 * 1024)         # ~300 KB
+    rid = _upload(admin, big).json()["id"]
+    refs = 80                                                   # ~24 MB if all inlined; budget is 16 MB
+    body = "".join(f'<img data-resource-id="{rid}">' for _ in range(refs))
+    r = admin.post("/email/templates/preview", json={"body_html": body})
+    assert r.status_code == 200, r.text
+    html = r.json()["html"]
+    emitted = html.count('src="data:image/png;base64,')
+    assert 0 < emitted < refs                                   # the cap dropped the overflow
+    assert len(html) <= 17 * 1024 * 1024                        # response bounded near the 16 MB budget
+
+
 def test_preview_drops_a_deleted_image_reference(admin, clean_resources):
     up = _upload(admin, PNG).json()
     rid = up["id"]
