@@ -18,10 +18,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.core.database import get_db
-from app.core.models import EmailProfile, RoleEnum, User
+from app.core.models import EmailProfile, EmailResource, EmailTemplate, RoleEnum, User
 from app.core import email_sanitize, email_send
 from app.core.rate_limiter import rate_limiter as _rate_limiter
 from app.services.audit_logger import AuditLogger
@@ -334,3 +334,180 @@ async def test_profile(payload: ProfileTestIn, request: Request,
     _audit(db, request, admin, "email_profile_test_sent", to=to_addr,
            profile_id=str(payload.profile_id) if payload.profile_id else None)
     return {"message": f"Test email sent to {to_addr}"}
+
+
+# --------------------------------------------------------------------------------------------------
+# Templates
+# --------------------------------------------------------------------------------------------------
+
+# Cap the stored body so a single template cannot be used to exhaust memory/storage.
+_MAX_BODY = 1_000_000
+
+
+class TemplateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=255)
+    profile_id: Optional[uuid.UUID] = None
+    subject: str = Field(default="", max_length=255)
+    body_html: str = Field(default="", max_length=_MAX_BODY)
+
+
+class PreviewIn(BaseModel):
+    subject: Optional[str] = Field(default="", max_length=255)
+    body_html: str = Field(default="", max_length=_MAX_BODY)
+    sample_username: Optional[str] = Field(default=None, max_length=255)
+    sample_email: Optional[str] = Field(default=None, max_length=255)
+
+
+def _resource_exists(db: Session, rid: str) -> bool:
+    try:
+        return db.query(EmailResource.id).filter(EmailResource.id == uuid.UUID(str(rid))).first() is not None
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _brand_name(db: Session) -> str:
+    try:
+        from app.config.effective import get_effective_branding
+        return get_effective_branding(db).app_name or ""
+    except Exception:
+        return ""
+
+
+def _template_out(t: EmailTemplate, *, include_body: bool = False) -> dict:
+    d = {
+        "id": str(t.id),
+        "name": t.name,
+        "description": t.description,
+        "profile_id": str(t.profile_id) if t.profile_id else None,
+        "subject": t.subject,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+    }
+    # Card preview of the linked sending profile (server / from), or None when unassigned.
+    d["profile"] = ({"id": str(t.profile.id), "name": t.profile.name,
+                     "smtp_server": t.profile.smtp_server, "from_email": t.profile.from_email,
+                     "from_name": t.profile.from_name} if t.profile else None)
+    if include_body:
+        d["body_html"] = t.body_html
+        d["referenced_resource_ids"] = email_sanitize.extract_resource_ids(t.body_html or "")
+        d["unknown_tokens"] = email_sanitize.unknown_tokens(t.body_html or "")
+    return d
+
+
+def _guard_template_input(db: Session, request: Request, admin: User, payload: TemplateIn) -> None:
+    """Reject a bad subject / missing profile, and — the security gate — raise a security event and
+    reject when the RAW body contains clearly-malicious content (script/handler/js-uri/iframe)."""
+    if payload.subject and _CTRL_RE.search(payload.subject):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Subject contains invalid control characters.")
+    if payload.profile_id is not None and db.get(EmailProfile, payload.profile_id) is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="The selected sending profile does not exist.")
+    # Only ACTUAL injection attempts (script/handler/js-uri/iframe/…) reject + raise a security
+    # event; benign-but-unsupported markup (a <style> block, <meta>, <form>) is left for the
+    # sanitizer to strip silently, so pasting ordinary marketing HTML isn't treated as an attack.
+    reasons = email_sanitize.hostile_reasons(payload.body_html or "")
+    if reasons:
+        from app.services.security_monitor import get_security_monitor
+        get_security_monitor(db).record_malicious_email_content(
+            user_id=admin.id, username=admin.username, ip_address=_client_ip(request),
+            surface="email_template", reasons=sorted(set(reasons)))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The template contains content that is not allowed (for example scripts or event handlers) and was blocked.")
+
+
+@router.get("/templates")
+async def list_templates(db: Session = Depends(get_db)):
+    rows = (db.query(EmailTemplate)
+            .options(joinedload(EmailTemplate.profile))   # avoid an N+1 for each card's profile
+            .order_by(EmailTemplate.updated_at.desc()).all())
+    return {"templates": [_template_out(t) for t in rows]}
+
+
+@router.get("/templates/{template_id}")
+async def get_template(template_id: uuid.UUID, db: Session = Depends(get_db)):
+    t = db.get(EmailTemplate, template_id)
+    if t is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found.")
+    return _template_out(t, include_body=True)
+
+
+@router.post("/templates", status_code=status.HTTP_201_CREATED)
+async def create_template(payload: TemplateIn, request: Request,
+                          admin: User = Depends(require_interactive_admin),
+                          db: Session = Depends(get_db)):
+    _guard_template_input(db, request, admin, payload)
+    t = EmailTemplate(
+        name=payload.name.strip(),
+        description=(payload.description or "").strip() or None,
+        profile_id=payload.profile_id,
+        subject=payload.subject.strip(),
+        body_html=email_sanitize.sanitize_email_html(payload.body_html),   # store only sanitized
+        created_by=admin.id,
+        updated_by=admin.id,
+    )
+    db.add(t)
+    db.commit()
+    db.refresh(t)
+    _audit(db, request, admin, "email_template_created", template_id=str(t.id), name=t.name)
+    return _template_out(t, include_body=True)
+
+
+@router.put("/templates/{template_id}")
+async def update_template(template_id: uuid.UUID, payload: TemplateIn, request: Request,
+                          admin: User = Depends(require_interactive_admin),
+                          db: Session = Depends(get_db)):
+    t = db.get(EmailTemplate, template_id)
+    if t is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found.")
+    _guard_template_input(db, request, admin, payload)
+    t.name = payload.name.strip()
+    t.description = (payload.description or "").strip() or None
+    t.profile_id = payload.profile_id
+    t.subject = payload.subject.strip()
+    t.body_html = email_sanitize.sanitize_email_html(payload.body_html)
+    t.updated_by = admin.id
+    db.commit()
+    db.refresh(t)
+    _audit(db, request, admin, "email_template_updated", template_id=str(t.id), name=t.name)
+    return _template_out(t, include_body=True)
+
+
+@router.delete("/templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_template(template_id: uuid.UUID, request: Request,
+                          admin: User = Depends(require_interactive_admin),
+                          db: Session = Depends(get_db)):
+    t = db.get(EmailTemplate, template_id)
+    if t is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found.")
+    name = t.name
+    db.delete(t)
+    db.commit()
+    _audit(db, request, admin, "email_template_deleted", template_id=str(template_id), name=name)
+
+
+@router.post("/templates/preview")
+async def preview_template(payload: PreviewIn,
+                           admin: User = Depends(require_interactive_admin),
+                           db: Session = Depends(get_db)):
+    """Stateless: sanitize + personalize + resolve images to admin-only URLs, for the editor's
+    render pane. Deliberately does NOT raise a security event (it runs live as the admin types) —
+    it just shows the sanitized result, which visibly strips anything unsafe."""
+    ctx = email_sanitize.token_context(
+        recipient={"username": payload.sample_username or "jsmith",
+                   "email": payload.sample_email or "jsmith@example.com"},
+        brand_name=_brand_name(db))
+    html = email_sanitize.render_for_preview(
+        payload.body_html, context=ctx,
+        resource_exists=lambda rid: _resource_exists(db, rid),
+        resource_url=lambda rid: f"/email/resources/{rid}")
+    subject = email_sanitize.render_subject(payload.subject or "", ctx)   # header-safe (strips CR/LF)
+    return {
+        "html": html,
+        "subject": subject,
+        "unknown_tokens": email_sanitize.unknown_tokens(payload.body_html or ""),
+        "referenced_resource_ids": email_sanitize.extract_resource_ids(
+            email_sanitize.sanitize_email_html(payload.body_html)),
+    }

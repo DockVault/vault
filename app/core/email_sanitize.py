@@ -103,8 +103,12 @@ def sanitize_email_html(raw: Optional[str]) -> str:
 _URL_ATTR = r"(?:href|src|action|formaction|xlink:href)\s*=\s*['\"]?\s*"
 _MALICIOUS_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     ("script_tag", re.compile(r"<\s*/?\s*script\b", re.IGNORECASE)),
-    # `[\s/]` catches both `<a onclick=` and the HTML5 slash-delimited `<a/onclick=`.
-    ("event_handler", re.compile(r"<[a-z][^>]*?[\s/]on[a-z]+\s*=", re.IGNORECASE)),
+    # `[\s/]` catches both `<a onclick=` and the HTML5 slash-delimited `<a/onclick=`. The between
+    # scan is BOUNDED ({0,300}, not `*?`) so the match stays O(n): an unbounded lazy `[^>]*?` is
+    # O(n^2) on adversarial input like "<a<a<a…" (no '>' to anchor), enough to pin a worker for
+    # minutes at the 1 MB body cap. A real handler sits within a few attributes of the tag name, so
+    # 300 chars is generous; nh3 strips anything this misses regardless.
+    ("event_handler", re.compile(r"<[a-z][^>]{0,300}?[\s/]on[a-z]+\s*=", re.IGNORECASE)),
     ("js_uri", re.compile(_URL_ATTR + r"javascript:", re.IGNORECASE)),
     ("vbscript_uri", re.compile(_URL_ATTR + r"vbscript:", re.IGNORECASE)),
     ("data_html_uri", re.compile(_URL_ATTR + r"data\s*:\s*text/html", re.IGNORECASE)),
@@ -118,18 +122,37 @@ _MALICIOUS_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
 )
 
 
-def detect_malicious(raw: Optional[str]) -> list[str]:
-    """Return the list of hostile-pattern names found in ``raw`` (empty means clean).
+# The subset of patterns that indicate an ACTUAL injection / active-content attempt, as opposed to
+# markup that is merely disallowed-but-harmless in v1 (an inline <style> block, a <meta>, a <form>,
+# a bare <svg>). The hostile subset drives reject + a security event; the rest are simply stripped by
+# the sanitizer, so an admin pasting ordinary marketing-email HTML is cleaned, not accused.
+_HOSTILE_REASONS = frozenset({
+    "script_tag", "event_handler", "js_uri", "vbscript_uri", "data_html_uri",
+    "iframe", "object_embed", "srcdoc",
+})
 
-    BEST-EFFORT alerting signal, not the security boundary — sanitize_email_html is what actually
-    neutralizes content. Used at SAVE and BEFORE SEND to decide whether to reject the payload and
-    raise a security event. Runs on the RAW input (before sanitization), so it sees exactly what the
-    author or a tamperer supplied. Deliberately conservative (matches real tags / attribute-context
-    schemes) to avoid rejecting a legitimate template that merely displays such strings as text.
+
+def detect_malicious(raw: Optional[str]) -> list[str]:
+    """Return ALL flagged pattern names found in ``raw`` (empty means clean) — both the genuinely
+    hostile ones and the merely-disallowed ones. See :func:`hostile_reasons` for the subset that
+    should trigger rejection + a security event.
+
+    BEST-EFFORT signal, not the security boundary — sanitize_email_html is what actually neutralizes
+    content. Runs on the RAW input, so it sees exactly what the author or a tamperer supplied.
+    Deliberately conservative (matches real tags / attribute-context schemes) to avoid flagging a
+    template that merely displays such strings as text.
     """
     if not raw:
         return []
     return [name for name, pattern in _MALICIOUS_PATTERNS if pattern.search(raw)]
+
+
+def hostile_reasons(raw: Optional[str]) -> list[str]:
+    """The genuinely-hostile subset of :func:`detect_malicious` — an actual script tag, event
+    handler, javascript:/vbscript:/data:text/html URL, iframe, object/embed, or srcdoc. This is what
+    the save/send paths reject and raise a security event on. A benign-but-unsupported tag (a
+    <style> block, <meta>, <form>, bare <svg>) is NOT hostile: the sanitizer strips it silently."""
+    return [r for r in detect_malicious(raw) if r in _HOSTILE_REASONS]
 
 
 # --------------------------------------------------------------------------------------------------
@@ -199,6 +222,35 @@ def substitute_tokens(sanitized_html: str, context: dict[str, str]) -> str:
         return match.group(0)
 
     return _TOKEN_RE.sub(repl, sanitized_html)
+
+
+def substitute_tokens_plain(text: str, context: dict[str, str]) -> str:
+    """Substitute ``{{ token }}`` in a PLAIN-TEXT context (e.g. an email subject line).
+
+    Unlike :func:`substitute_tokens`, values are inserted verbatim (NOT HTML-escaped), because the
+    result is a header/plain text, not HTML. Unknown tokens are left literal. The caller is
+    responsible for control-char/header-injection validation of the result (a subject with a token
+    that expands to a newline must be rejected before it reaches an email header)."""
+    if not text:
+        return ""
+
+    def repl(match: "re.Match[str]") -> str:
+        key = match.group(1)
+        return context[key] if key in context else match.group(0)
+
+    return _TOKEN_RE.sub(repl, text)
+
+
+# Control characters that must never reach an email header (CR/LF are the header-injection vector).
+_CONTROL_RE = re.compile(r"[\r\n\x00-\x1f\x7f]")
+
+
+def render_subject(subject: Optional[str], context: dict[str, str]) -> str:
+    """Render an email subject: substitute tokens, then STRIP any control characters from the
+    RESULT. This is the header-safe entry point — a recipient field that expands to a CR/LF (a
+    username is not control-char-validated at its own boundary) cannot inject an email header.
+    Use this for BOTH the editor preview and the send path, so no caller can forget the check."""
+    return _CONTROL_RE.sub("", substitute_tokens_plain(subject or "", context))
 
 
 def unknown_tokens(raw_or_sanitized: str) -> list[str]:

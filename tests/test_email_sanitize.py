@@ -151,6 +151,40 @@ def test_detect_does_not_false_positive_on_escaped_text_or_prose(raw):
     assert es.detect_malicious(raw) == []
 
 
+@pytest.mark.parametrize("hostile", [
+    "<script>x</script>", '<div onclick="x">y</div>', '<a href="javascript:x">y</a>',
+    "<iframe src=x></iframe>", '<img src=x onerror="x">', '<a href="vbscript:x">y</a>',
+])
+def test_hostile_reasons_flags_real_injection(hostile):
+    assert es.hostile_reasons(hostile)
+
+
+@pytest.mark.parametrize("benign", [
+    "<style>.x{color:red}</style>", "<meta http-equiv=refresh>", "<form action=/x>x</form>",
+    "<svg width=1></svg>", "<table><tr><td>c</td></tr></table>",
+])
+def test_hostile_reasons_excludes_benign_but_unsupported_markup(benign):
+    # These are stripped by the sanitizer, not treated as an attack — no reject, no security event.
+    assert es.hostile_reasons(benign) == []
+
+
+def test_render_subject_strips_control_chars_from_substituted_value():
+    ctx = es.token_context(recipient={"username": "eve\r\nBcc: attacker@evil.example"})
+    out = es.render_subject("Hi {{user.username}}", ctx)
+    assert "\r" not in out and "\n" not in out          # no header injection possible
+    assert out == "Hi eveBcc: attacker@evil.example"
+
+
+def test_detect_malicious_is_linear_not_quadratic_on_adversarial_input():
+    # The bounded event_handler scan must not blow up on "<a<a<a…" (no '>' anchor). A quadratic
+    # scan would take minutes at this size; the bounded one is well under a second.
+    import time
+    payload = "<a" * 120000   # ~240 KB
+    start = time.perf_counter()
+    es.detect_malicious(payload)
+    assert time.perf_counter() - start < 2.0
+
+
 # --------------------------------------------------------------------------------------------------
 # tokens
 # --------------------------------------------------------------------------------------------------
@@ -209,6 +243,14 @@ def test_unknown_tokens_left_literal_and_reported():
 def test_token_whitespace_inside_braces_substitutes():
     ctx = es.token_context(recipient={"username": "jo"})
     assert "jo" in es.substitute_tokens("Hi {{  user.username  }}", ctx)
+
+
+def test_substitute_tokens_plain_does_not_html_escape():
+    # A subject is a header, not HTML: values go in verbatim (no &amp;), unknown tokens stay literal.
+    ctx = es.token_context(recipient={"username": "A & B <co>"})
+    out = es.substitute_tokens_plain("Welcome {{user.username}} {{unknown}}", ctx)
+    assert out == "Welcome A & B <co> {{unknown}}"
+    assert es.substitute_tokens_plain("", ctx) == ""
 
 
 def test_token_context_fields():
