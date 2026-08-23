@@ -735,11 +735,12 @@ class InviteAccept(BaseModel):
 
 
 class SignupRequest(BaseModel):
-    # Public self-signup. Mass-assignment defense: the ONLY fields a visitor may supply. role,
-    # is_active, is_locked, storage_quota, created_by are structurally unrepresentable — the handler
-    # forces role=user / active (column default) / created_by=NULL. `email` is EmailStr so a
-    # multiple-'@' address is rejected at the schema edge (the domain gate rsplit('@')s and would
-    # otherwise treat everything after the last '@' as the domain).
+    # Public self-signup. Mass-assignment defense: the ONLY fields a visitor may supply. Any
+    # role/is_active/is_locked/storage_quota/created_by key in the body is IGNORED by the schema
+    # (pydantic's default extra='ignore') and the handler forces the safe values itself
+    # (role=user, created_by=NULL, active/unlocked column defaults) — it never reads those keys.
+    # `email` is EmailStr so a multiple-'@' address is rejected at the schema edge (the domain gate
+    # rsplit('@')s and would otherwise treat everything after the last '@' as the domain).
     username: str = Field(..., min_length=3, max_length=50)
     email: Optional[EmailStr] = None
     password: str = Field(..., min_length=8)
@@ -3315,7 +3316,7 @@ async def create_invite(
     """Mint an account invitation (interactive admin only — a temp-cred admin is refused). The
     plaintext invite link is returned ONCE; only its peppered HMAC is stored."""
     from app.core.models import AccountInvitation
-    from app.core.account_policy import email_allowed_by_domain_gate
+    from app.core.account_policy import email_allowed_by_domain_gate, signup_email_is_ascii
     from app.core import invitations
     from sqlalchemy.exc import IntegrityError
 
@@ -3350,6 +3351,10 @@ async def create_invite(
     if pol.get("email_requirement") == "required" and not email:
         raise HTTPException(status_code=400, detail="An email address is required for new accounts.")
     if email:
+        # ASCII-only, same as self-signup: the domain-gate config is ASCII/punycode, so a unicode IDN
+        # domain (or a homograph of a denylisted one) would otherwise slip the allow/deny check.
+        if not signup_email_is_ascii(email):
+            raise HTTPException(status_code=400, detail="That email domain is not permitted.")
         if not email_allowed_by_domain_gate(email, pol.get("signup_email_domain_mode"),
                                             pol.get("signup_email_domains")):
             raise HTTPException(status_code=400, detail="That email domain is not permitted.")
@@ -3540,7 +3545,7 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
     from app.core.models import AccountInvitation, RoleEnum, User
     from app.core import invitations
     from app.core.email_identity import normalize_email, email_in_use
-    from app.core.account_policy import email_allowed_by_domain_gate
+    from app.core.account_policy import email_allowed_by_domain_gate, signup_email_is_ascii
     from app.core.security import hash_password
     from app.core.endpoint_permissions import grant_default_permissions_for_role
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
@@ -3599,6 +3604,11 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
             _audit_accept_failure(db, prefix, client_ip, reason="email_required")
             raise HTTPException(status_code=400, detail="An email address is required.")
         if body_email:
+            # ASCII-only, same as self-signup (uniform across all three account-creation surfaces):
+            # a unicode IDN domain would otherwise slip the ASCII/punycode allow/deny gate.
+            if not signup_email_is_ascii(body_email):
+                _audit_accept_failure(db, prefix, client_ip, reason="email_non_ascii")
+                raise HTTPException(status_code=400, detail="That email domain is not permitted.")
             if not email_allowed_by_domain_gate(body_email, pol.get("signup_email_domain_mode"),
                                                 pol.get("signup_email_domains")):
                 _audit_accept_failure(db, prefix, client_ip, reason="email_domain")
@@ -3710,8 +3720,9 @@ async def self_signup(payload: SignupRequest, request: Request, db: Session = De
     """PUBLIC: create an account from the login screen when self-signup is enabled. Mass-assignment
     proof (role forced to 'user', created_by NULL — neither is representable in the body),
     rate-limited per IP AND per attempted username (both fail-closed), email domain-gated + ASCII-only,
-    audited on every outcome. The account is NOT signed in — success returns to the login page
-    (mirrors invitation accept)."""
+    audited on every processed outcome (throttle 429/503 rejections are deliberately not audited, to
+    avoid audit-row amplification during an attack). The account is NOT signed in — success returns to
+    the login page (mirrors invitation accept)."""
     import time as _t
     from app.core.models import RoleEnum, User
     from app.core.email_identity import normalize_email, email_in_use
@@ -3775,12 +3786,14 @@ async def self_signup(payload: SignupRequest, request: Request, db: Session = De
             _audit_signup_failure(db, uname, client_ip, reason="email_in_use")
             raise HTTPException(status_code=400, detail="That email address is already in use.")
 
-    # (e) Plan cap.
+    # (e) Plan cap. _enforce_user_cap's message names the exact user count and plan cap — fine for an
+    # authenticated admin, but on this PUBLIC surface it would hand anonymous visitors a recon oracle.
+    # Swap it for a generic answer.
     try:
         _enforce_user_cap(db)
     except HTTPException:
         _audit_signup_failure(db, uname, client_ip, reason="user_cap")
-        raise
+        raise HTTPException(status_code=503, detail="Sign-ups are not available right now.")
 
     # (f) Uniqueness + impersonation guard, then build the account in ONE transaction. Role is FORCED
     # to USER and created_by is NULL — a self-signed account can never be an admin or claim a creator.

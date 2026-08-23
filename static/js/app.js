@@ -1028,6 +1028,9 @@ function _showSignupForm(show) {
     ids.forEach(id => { const el = document.getElementById(id); if (el) el.style.display = show ? 'none' : (id === 'login-error' ? 'none' : ''); });
     const form = document.getElementById('signup-form');
     if (form) form.style.display = show ? '' : 'none';
+    // Clear any stale signup error so it never re-appears on a later reopen of the form.
+    const serr = document.getElementById('signup-error');
+    if (serr) { serr.textContent = ''; serr.style.display = 'none'; }
     if (show) { const u = document.getElementById('signup-username'); if (u) u.focus(); }
     else { const u = document.getElementById('username'); if (u) u.focus(); }
 }

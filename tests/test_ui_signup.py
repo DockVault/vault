@@ -88,6 +88,39 @@ def test_login_identifier_label_follows_policy(page: Page, admin, restore_settin
     expect(page.locator("#username-label")).to_have_text(label, timeout=10000)
 
 
+def test_signup_inputs_are_labelled(page: Page, admin, restore_settings):
+    # a11y: every signup input has an explicit <label for="..."> association (mirrors the login form)
+    _set(admin, signup_enabled=True, email_requirement="required", login_identifier="username")
+    page.goto("/")
+    expect(page.locator("#signup-toggle")).to_be_visible(timeout=10000)
+    page.locator("#show-signup-link").click()
+    for input_id in ("signup-username", "signup-email", "signup-password"):
+        assert page.locator(f"label[for='{input_id}']").count() == 1, f"{input_id} is unlabelled"
+
+
+def test_stale_signup_error_does_not_reappear_on_reopen(page: Page, admin, restore_settings):
+    # reopening the signup form must not resurrect a prior error message
+    _set(admin, signup_enabled=True, email_requirement="optional", login_identifier="username")
+    existing = admin.create_user(role="user")
+    try:
+        page.goto("/")
+        expect(page.locator("#signup-toggle")).to_be_visible(timeout=10000)
+        page.locator("#show-signup-link").click()
+        # provoke an error (username taken)
+        page.locator("#signup-username").fill(existing["_username"])
+        page.locator("#signup-password").fill(STRONG_PW)
+        page.locator("#signup-form button[type=submit]").click()
+        expect(page.locator("#signup-error")).to_be_visible(timeout=10000)
+        # go back and reopen — the stale error must be gone
+        page.locator("#show-login-link").click()
+        page.locator("#show-signup-link").click()
+        expect(page.locator("#signup-error")).to_be_hidden()
+    finally:
+        for u in admin.get("/users").json():
+            if u.get("username") == existing["_username"]:
+                admin.delete_user(u["id"])
+
+
 def test_signup_end_to_end_returns_to_login(page: Page, admin, restore_settings):
     _set(admin, signup_enabled=True, email_requirement="optional", login_identifier="username",
          signup_email_domain_mode="off")

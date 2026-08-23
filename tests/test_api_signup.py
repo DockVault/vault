@@ -86,11 +86,15 @@ def test_auth_policy_minimal_keys_and_no_leak(admin, restore_settings):
     assert body["login_identifier"] == "either"
     assert body["email_requirement"] == "required"
     pp = body["password_policy"]
-    assert isinstance(pp, dict) and "min_length" in pp
-    for k in ("require_uppercase", "require_lowercase", "require_numbers", "require_special"):
-        assert k in pp
+    assert isinstance(pp, dict)
 
-    # NEGATIVE: none of the leak-sensitive keys may ride along (PUT /settings merges freely).
+    # EXACT key-set (not just a denylist): any future key added to the response — sensitive or not —
+    # trips this and forces a review of the public surface.
+    assert set(body) == {"signup_enabled", "login_identifier", "email_requirement", "password_policy"}
+    assert set(pp) == {"min_length", "require_uppercase", "require_lowercase",
+                       "require_numbers", "require_special"}
+
+    # NEGATIVE (belt-and-braces): none of the leak-sensitive keys may ride along.
     for leaked in ("invite_enabled", "invite_ttl_hours", "signup_email_domain_mode",
                    "signup_email_domains", "email_change_requires_verification",
                    "smtp_server", "from_email", "smtp_password", "zero_knowledge_enabled",
@@ -253,6 +257,33 @@ def test_signup_unicode_idn_email_rejected_400(admin, restore_settings, idn_emai
     assert r.status_code == 400, f"{idn_email!r} -> {r.status_code}: {r.text}"
 
 
+# ---- username validated identically to every other creation path -------------------------------
+@pytest.mark.parametrize("bad_username,expect", [
+    ("ab", 422),               # under the 3-char floor (schema)
+    ("has@sign", 422),         # '@' banned (would shadow an email under 'either' login)
+    ("has<script>", 422),      # markup chars banned
+])
+def test_signup_username_shape_enforced(admin, restore_settings, bad_username, expect):
+    _enable_signup(admin)
+    r = _signup(admin, {"username": bad_username, "password": STRONG_PW,
+                        "email": f"{unique('u')}@example.com"})
+    assert r.status_code == expect, f"{bad_username!r} -> {r.status_code}: {r.text}"
+
+
+def test_signup_domain_block_message_is_generic_across_modes(admin, restore_settings):
+    # A blocked address returns the SAME generic message whether it missed an allowlist, hit a
+    # denylist, or was rejected as non-ASCII — so the response can't be used to fingerprint the mode.
+    _enable_signup(admin, signup_email_domain_mode="allowlist", signup_email_domains=["acme.com"])
+    miss = _signup(admin, {"username": unique("g1"), "password": STRONG_PW, "email": "x@other.com"})
+    idn = _signup(admin, {"username": unique("g2"), "password": STRONG_PW, "email": "x@bücher.de"})
+    _set(admin, signup_email_domain_mode="denylist", signup_email_domains=["evil.com"])
+    hit = _signup(admin, {"username": unique("g3"), "password": STRONG_PW, "email": "x@evil.com"})
+    for r in (miss, idn, hit):
+        assert r.status_code == 400, r.text
+    msgs = {miss.json().get("detail"), idn.json().get("detail"), hit.json().get("detail")}
+    assert len(msgs) == 1, f"domain-block message differs across modes (fingerprintable): {msgs}"
+
+
 # ---- password policy ---------------------------------------------------------------------------
 def test_signup_weak_password_400(admin, restore_settings):
     _enable_signup(admin)
@@ -287,6 +318,9 @@ def test_signup_mass_assignment_ignored(admin, restore_settings):
         assert str(row.get("role")).lower() == "user", "signup minted a non-user role"
         assert row.get("is_active") is True, "signup honored a body is_active=false"
         assert row.get("is_locked") in (False, None), "signup honored a body is_locked=true"
+        # the injected quota must not have taken effect (account inherits the deployment default)
+        if "storage_quota_bytes" in row:
+            assert row.get("storage_quota_bytes") is None, "signup honored a body storage quota"
     finally:
         _cleanup(admin, name)
 
@@ -315,9 +349,15 @@ def test_signup_outcomes_are_audited(admin, restore_settings):
                                "email": f"{name}@example.com"}).status_code == 200
         _set(admin, signup_enabled=False)
         _signup(admin, {"username": unique("audx"), "password": STRONG_PW})  # a disabled failure
-        r = admin.get("/audit/events", params={"limit": 100})
+        r = admin.get("/audit/events", params={"limit": 200})
         if r.status_code != 200:
             pytest.skip("audit events endpoint unavailable")
-        assert "account_self_signup" in r.text
+        rows = r.json()
+        rows = rows.get("events", rows) if isinstance(rows, dict) else rows
+        pairs = [(e.get("action"), e.get("level")) for e in rows]
+        # both outcomes recorded DISTINCTLY (the success action is a strict substring of the failed
+        # one, so a substring match would be vacuous — match the exact action + level instead).
+        assert ("account_self_signup", "success") in pairs, pairs[:10]
+        assert any(a == "account_self_signup_failed" for a, _ in pairs), pairs[:10]
     finally:
         _cleanup(admin, name)
