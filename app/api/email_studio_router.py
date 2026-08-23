@@ -24,7 +24,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, defer, joinedload
 
 from app.core.database import get_db
-from app.core.models import EmailProfile, EmailResource, EmailTemplate, RoleEnum, User
+from app.core.models import EmailAction, EmailProfile, EmailResource, EmailTemplate, RoleEnum, User
 from app.core import email_sanitize, email_send
 from app.core.security import decrypt_secret, encrypt_secret
 from app.core.rate_limiter import rate_limiter as _rate_limiter, RateLimiterUnavailable
@@ -461,7 +461,19 @@ def _vault_url() -> str:
     return ""
 
 
-def _template_out(t: EmailTemplate, *, include_body: bool = False) -> dict:
+def _template_action_map(db: Session) -> dict:
+    """{template_id(str): {key, name, category}} for templates bound to an automated email — so a card
+    can badge a protected/system template and hide its Delete."""
+    out: dict = {}
+    for a in db.query(EmailAction).filter(EmailAction.template_id.isnot(None)).all():
+        # a system binding wins over an optional one for the badge
+        cur = out.get(str(a.template_id))
+        if cur is None or (a.category == "system" and cur.get("category") != "system"):
+            out[str(a.template_id)] = {"key": a.key, "name": a.name, "category": a.category}
+    return out
+
+
+def _template_out(t: EmailTemplate, *, include_body: bool = False, action_map: Optional[dict] = None) -> dict:
     d = {
         "id": str(t.id),
         "name": t.name,
@@ -475,6 +487,8 @@ def _template_out(t: EmailTemplate, *, include_body: bool = False) -> dict:
     d["profile"] = ({"id": str(t.profile.id), "name": t.profile.name,
                      "smtp_server": t.profile.smtp_server, "from_email": t.profile.from_email,
                      "from_name": t.profile.from_name} if t.profile else None)
+    # Which automated email this template is bound to (protected / non-removable when 'system').
+    d["bound_action"] = (action_map or {}).get(str(t.id))
     if include_body:
         d["body_html"] = t.body_html
         d["referenced_resource_ids"] = email_sanitize.extract_resource_ids(t.body_html or "")
@@ -510,7 +524,8 @@ async def list_templates(db: Session = Depends(get_db)):
     rows = (db.query(EmailTemplate)
             .options(joinedload(EmailTemplate.profile))   # avoid an N+1 for each card's profile
             .order_by(EmailTemplate.updated_at.desc()).all())
-    return {"templates": [_template_out(t) for t in rows]}
+    amap = _template_action_map(db)
+    return {"templates": [_template_out(t, action_map=amap) for t in rows]}
 
 
 @router.get("/templates/{template_id}")
@@ -518,7 +533,7 @@ async def get_template(template_id: uuid.UUID, db: Session = Depends(get_db)):
     t = db.get(EmailTemplate, template_id)
     if t is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found.")
-    return _template_out(t, include_body=True)
+    return _template_out(t, include_body=True, action_map=_template_action_map(db))
 
 
 @router.post("/templates", status_code=status.HTTP_201_CREATED)
@@ -569,6 +584,19 @@ async def delete_template(template_id: uuid.UUID, request: Request,
     t = db.get(EmailTemplate, template_id)
     if t is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found.")
+    # A template bound to an automated email is protected: a SYSTEM action's template is non-removable
+    # (the vault must be able to send it); an OPTIONAL action's must be re-pointed first. This is what
+    # makes the seeded system templates "non-removable" without adding a column to email_templates.
+    refs = db.query(EmailAction).filter(EmailAction.template_id == template_id).all()
+    sys_ref = next((a for a in refs if a.category == "system"), None)
+    if sys_ref is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"This template is the system template for “{sys_ref.name}” and can't be "
+                                   "deleted while it's in use; change or reset that action's template first.")
+    if refs:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"This template is used by the “{refs[0].name}” automated email; "
+                                   "change that action's template first.")
     name = t.name
     db.delete(t)
     db.commit()
@@ -630,6 +658,100 @@ async def preview_template(payload: PreviewIn, request: Request,
         "referenced_resource_ids": email_sanitize.extract_resource_ids(
             email_sanitize.sanitize_email_html(payload.body_html)),
     }
+
+
+# --------------------------------------------------------------------------------------------------
+# Automated emails (the action catalog: bind a template to each send-case; toggle optional ones)
+# --------------------------------------------------------------------------------------------------
+
+class ActionUpdateIn(BaseModel):
+    template_id: Optional[uuid.UUID] = None
+    enabled: Optional[bool] = None
+
+
+def _action_out(a: EmailAction) -> dict:
+    tpl = a.template
+    return {
+        "key": a.key,
+        "name": a.name,
+        "description": a.description,
+        "category": a.category,
+        "enabled": bool(a.enabled),
+        "template_id": str(a.template_id) if a.template_id else None,
+        "template": ({"id": str(tpl.id), "name": tpl.name, "subject": tpl.subject} if tpl else None),
+    }
+
+
+@router.get("/actions")
+async def list_actions(_admin: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
+    """The catalog of automated-email cases and their bound templates. Seeded + permanent (no create/
+    delete): a ``system`` action always sends and keeps a non-removable template; an ``optional`` one
+    is opt-in via ``enabled``."""
+    rows = (db.query(EmailAction)
+            .order_by(EmailAction.category, EmailAction.name).all())
+    return {"actions": [_action_out(a) for a in rows]}
+
+
+@router.put("/actions/{key}")
+async def update_action(key: str, payload: ActionUpdateIn, request: Request,
+                        admin: User = Depends(require_interactive_admin),
+                        db: Session = Depends(get_db)):
+    """Bind a template to an action and (for optional actions) toggle it on/off. A system action must
+    always keep a valid template — its ``template_id`` can be changed but not cleared, and it stays
+    enabled. Delivery for the action then flows through the central send helper."""
+    action = db.get(EmailAction, key)
+    if action is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown email action.")
+
+    if payload.template_id is not None:
+        tpl = db.get(EmailTemplate, payload.template_id)
+        if tpl is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Template not found.")
+        action.template_id = tpl.id
+    elif "template_id" in payload.model_fields_set:      # explicit null = revert to the built-in default
+        action.template_id = None                        # (a system action then sends its built-in body)
+
+    if action.category == "system":
+        action.enabled = True                            # system actions are always on
+    elif payload.enabled is not None:
+        action.enabled = bool(payload.enabled)
+
+    db.commit()
+    _audit(db, request, admin, "email_action_updated", action_key=key,
+           template_id=str(action.template_id) if action.template_id else None, enabled=bool(action.enabled))
+    return _action_out(action)
+
+
+class ActionTestIn(BaseModel):
+    to_addr: Optional[str] = None
+
+
+@router.post("/actions/{key}/test")
+async def test_action(key: str, payload: ActionTestIn, request: Request,
+                      admin: User = Depends(require_interactive_admin),
+                      db: Session = Depends(get_db)):
+    """Send the action's email with SAMPLE token values to a chosen address, so an admin can preview an
+    automated email through real delivery. Force-sends even a disabled optional action (it's a test)."""
+    from app.core.email_actions import send_action_email
+    action = db.get(EmailAction, key)
+    if action is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown email action.")
+    _rate_limit(admin.id, limit=30, window=60, prefix="email_action_test",
+                detail="Too many test emails; please wait a moment.")
+    to_addr = (payload.to_addr or "").strip() or (admin.email or "").strip()
+    if not _valid_address(to_addr):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Enter a valid recipient address (or set one on your admin account).")
+    sample = {"link": (_vault_url() or "https://vault.example.com") + "/sample-token",
+              "code": "482913", "expires": "in 24 hours"}
+    try:
+        send_action_email(db, key, recipient={"email": to_addr, "username": admin.username or "admin"},
+                          action_context=sample, force=True, raise_errors=True)
+    except email_send.EmailSendError as e:
+        code = status.HTTP_400_BAD_REQUEST if e.category == "config" else status.HTTP_502_BAD_GATEWAY
+        raise HTTPException(status_code=code, detail=e.message)
+    _audit(db, request, admin, "email_action_test_sent", action_key=key, to=to_addr)
+    return {"message": f"Test email for “{action.name}” sent to {to_addr}"}
 
 
 # --------------------------------------------------------------------------------------------------
