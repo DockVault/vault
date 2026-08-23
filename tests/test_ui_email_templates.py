@@ -120,8 +120,27 @@ def test_add_dynamic_action_inserts_token(admin_page: Page):
     _new_template(page, name="Dyn", body="")
     page.click("#et-add-dynamic")
     expect(page.locator("#et-dyn-menu")).to_be_visible()
-    page.locator('#et-dyn-menu button:has-text("Recipient username")').click()
+    # Two-level menu: pick the group, then the token in its flyout submenu.
+    page.locator('.et-dyn-group:has-text("Recipient")').click()
+    sub = page.locator("#et-dyn-submenu")
+    expect(sub).to_be_visible()
+    sub.locator('button:has-text("Username")').first.click()
     expect(page.locator("#et-body")).to_have_value("{{user.username}}")
+
+
+def test_dynamic_menu_groups_and_new_tokens(admin_page: Page, admin):
+    # The menu is grouped, and the new Sender / Branding / Automated-action groups + tokens are present.
+    groups = {g["group"] for g in admin.get("/email/dynamic-actions").json()["groups"]}
+    assert {"Recipient", "Sender", "Branding", "Date & time", "Automated action"} <= groups
+    page = admin_page
+    _open_email_tab(page)
+    _new_template(page, name="Grp", body="")
+    page.click("#et-add-dynamic")
+    expect(page.locator('.et-dyn-group:has-text("Automated action")')).to_be_visible()
+    page.locator('.et-dyn-group:has-text("Automated action")').click()
+    sub = page.locator("#et-dyn-submenu")
+    sub.locator('button:has-text("Action link")').first.click()
+    expect(page.locator("#et-body")).to_have_value("{{action.link}}")
 
 
 def test_add_image_inserts_data_resource_id(admin_page: Page, admin):
@@ -319,27 +338,28 @@ def test_editor_code_pane_has_adequate_height(admin_page: Page):
 
 
 def test_dynamic_menu_is_not_clipped(admin_page: Page):
-    # The editor card's `overflow:hidden` used to clip the dropdown to ~2.5 items. With overflow now
-    # visible, the whole menu renders: every item sits inside the menu box (not cut off), and the last
-    # item is reachable.
+    # The editor card must not clip the flyout submenu, and the submenu must stay within the viewport
+    # (flip-up/left keeps every token reachable without scrolling the page).
     page = admin_page
     _open_email_tab(page)
     _new_template(page, name="Menu", body="")
     page.click("#et-add-dynamic")
     menu = page.locator("#et-dyn-menu")
     expect(menu).to_be_visible()
-    items = menu.locator("button")
-    n = items.count()
-    assert n >= 4
-    box = menu.bounding_box()
-    last = items.last.bounding_box()
-    # the last item is fully within the rendered menu
-    assert last["y"] + last["height"] <= box["y"] + box["height"] + 1
-    expect(items.last).to_be_visible()
-    # Pin the actual fix: the editor card must NOT clip its overflow (bounding-box/visibility checks
-    # alone are insensitive to an ancestor's overflow:hidden, so assert the computed value directly).
+    groups = menu.locator(".et-dyn-group")
+    assert groups.count() >= 4
+    # Pin the overflow fix directly (bounding-box/visibility checks are insensitive to an ancestor's
+    # overflow:hidden).
     assert page.locator("#email-template-editor").evaluate(
         "el => getComputedStyle(el).overflowX") == "visible"
+    # Open the LAST group (closest to the bottom) — its submenu must sit fully within the viewport.
+    groups.last.click()
+    sub = page.locator("#et-dyn-submenu")
+    expect(sub).to_be_visible()
+    within = sub.evaluate(
+        "el => { const r = el.getBoundingClientRect();"
+        " return r.bottom <= window.innerHeight + 1 && r.right <= window.innerWidth + 1 && r.top >= -1 && r.left >= -1; }")
+    assert within is True
 
 
 @pytest.mark.skipif(not (MAILPIT_URL and MAILPIT_SMTP_HOST),

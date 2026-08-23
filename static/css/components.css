@@ -422,9 +422,15 @@
 .et-view.active { background: var(--surface-3); color: var(--text-primary); }
 .et-dyn-wrap { position: relative; display: inline-block; }
 .et-dyn-menu { position: absolute; top: 100%; left: 0; z-index: 20; min-width: 220px; background: var(--surface-0); border: 1px solid var(--surface-3); border-radius: var(--radius-md); box-shadow: var(--shadow-lg); padding: var(--space-xs); }
-.et-dyn-menu button { display: block; width: 100%; text-align: left; background: none; border: none; padding: 6px 10px; border-radius: var(--radius-sm); color: var(--text-primary); cursor: pointer; font-size: var(--text-sm); }
-.et-dyn-menu button:hover { background: var(--surface-2); }
-.et-dyn-menu .et-dyn-token { color: var(--text-tertiary); font-size: var(--text-xs); }
+/* The dynamic-action menu is a two-level list: a scrollable list of GROUP rows, each opening a
+   flyout submenu of tokens (positioned in JS, viewport-aware so it flips up/left near an edge). */
+.et-dyn-group { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; text-align: left; background: none; border: none; padding: 7px 10px; border-radius: var(--radius-sm); color: var(--text-primary); cursor: pointer; font-size: var(--text-sm); }
+.et-dyn-group:hover, .et-dyn-group.active { background: var(--surface-2); }
+.et-dyn-chevron { color: var(--text-tertiary); font-size: var(--text-xs); }
+.et-dyn-submenu { position: fixed; z-index: 70; min-width: 230px; max-height: 60vh; overflow-y: auto; background: var(--surface-0); border: 1px solid var(--surface-3); border-radius: var(--radius-md); box-shadow: var(--shadow-lg); padding: var(--space-xs); }
+.et-dyn-submenu button { display: block; width: 100%; text-align: left; background: none; border: none; padding: 5px 10px; border-radius: var(--radius-sm); color: var(--text-primary); cursor: pointer; font-size: var(--text-sm); }
+.et-dyn-submenu button:hover { background: var(--surface-2); }
+.et-dyn-submenu .et-dyn-token { color: var(--text-tertiary); font-size: var(--text-xs); }
 .et-panes { display: grid; gap: var(--space-md); }
 .et-panes.et-view-code { grid-template-columns: 1fr; }
 .et-panes.et-view-render { grid-template-columns: 1fr; }
@@ -459,8 +465,8 @@
 /* The editor card must let the dynamic-action dropdown escape (it otherwise clips against the card's
    `overflow:hidden`); the ID beats `.card`. */
 #email-template-editor { overflow: visible; }
-.et-dyn-menu { z-index: 60; max-height: 340px; overflow-y: auto; }
-.et-dyn-menu button { padding: 5px 10px; }
+/* Group list scrolls after ~4 rows (5 groups today), so the top-level menu stays compact. */
+.et-dyn-menu { z-index: 60; max-height: 168px; overflow-y: auto; min-width: 200px; }
 
 /* Give the code textarea and render iframe an adequate, EQUAL min-height so switching Code/Render
    doesn't jump. The ID+2-class selector beats `#settings-section .form-control`, which otherwise caps

@@ -163,19 +163,53 @@ class DynamicAction(NamedTuple):
     token: str
     label: str
     sample: str
+    group: str
+    description: str = ""
 
 
-#: The catalog offered by the editor's "Add Dynamic Action" dropdown and accepted by the renderer.
-#: Future server-minted values (e.g. ``{{otp}}``) slot in here without touching the render loop.
+#: The catalog offered by the editor's "Add Dynamic Action" dropdown and accepted by the renderer,
+#: grouped for a two-level menu. Declaration order is the display order (both of groups and of the
+#: actions within a group). Future server-minted values (e.g. ``{{otp}}``) slot into a group here
+#: without touching the render loop.
 DYNAMIC_ACTIONS: tuple[DynamicAction, ...] = (
-    DynamicAction("current_date", "Current date", "2026-08-23"),
-    DynamicAction("current_time", "Current time", "14:05"),
-    DynamicAction("current_datetime", "Current date & time", "2026-08-23 14:05"),
-    DynamicAction("user.username", "Recipient username", "jsmith"),
-    DynamicAction("user.email", "Recipient email", "jsmith@example.com"),
-    DynamicAction("user.display_name", "Recipient display name", "J. Smith"),
-    DynamicAction("vault.name", "Vault / brand name", "Secure Vault"),
+    # Recipient — resolved per recipient at send time.
+    DynamicAction("user.username", "Username", "jsmith", "Recipient", "The recipient's username"),
+    DynamicAction("user.email", "Email address", "jsmith@example.com", "Recipient", "The recipient's email address"),
+    DynamicAction("user.display_name", "Display name", "J. Smith", "Recipient", "The display name, falling back to the username"),
+    # Sender — the sending profile's identity.
+    DynamicAction("sender.from_name", "From name", "Secure Vault", "Sender", "The sending profile's From name"),
+    DynamicAction("sender.from_email", "From address", "noreply@example.com", "Sender", "The sending profile's From address"),
+    # Branding — the vault's identity.
+    DynamicAction("vault.name", "Vault name", "Secure Vault", "Branding", "Your vault's brand name"),
+    DynamicAction("vault.url", "Vault URL", "https://vault.example.com", "Branding", "Your vault's address (best effort, may be empty)"),
+    # Date & time — UTC, evaluated at send time.
+    DynamicAction("current_date", "Date", "2026-08-24", "Date & time", "Today's date (UTC)"),
+    DynamicAction("current_time", "Time", "14:05", "Date & time", "The current time (UTC)"),
+    DynamicAction("current_datetime", "Date & time", "2026-08-24 14:05", "Date & time", "The current date and time (UTC)"),
+    DynamicAction("current_year", "Year", "2026", "Date & time", "The current year — handy for footers"),
+    # Automated action — populated ONLY when the vault sends an automated email (invite / reset /
+    # verify); empty in a manual send or preview, so a template can show them conditionally.
+    DynamicAction("action.link", "Action link", "https://vault.example.com/invite/…", "Automated action", "The action's link (invite / reset / verify) — empty in a manual send"),
+    DynamicAction("action.code", "Action code", "482913", "Automated action", "A one-time code — empty in a manual send"),
+    DynamicAction("action.expires", "Expires", "in 24 hours", "Automated action", "When the link or code expires"),
 )
+
+
+def dynamic_action_groups() -> list[dict]:
+    """The dynamic-action catalog grouped for the editor's two-level menu, preserving declaration
+    order of groups and of actions within each group."""
+    groups: list[dict] = []
+    by_name: dict[str, dict] = {}
+    for a in DYNAMIC_ACTIONS:
+        g = by_name.get(a.group)
+        if g is None:
+            g = {"group": a.group, "actions": []}
+            by_name[a.group] = g
+            groups.append(g)
+        g["actions"].append({"token": a.token, "label": a.label,
+                             "sample": a.sample, "description": a.description})
+    return groups
+
 
 _KNOWN_TOKENS: set[str] = {a.token for a in DYNAMIC_ACTIONS}
 _TOKEN_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")
@@ -185,20 +219,35 @@ def token_context(
     *,
     recipient: Optional[dict] = None,
     brand_name: str = "",
+    vault_url: str = "",
+    sender: Optional[dict] = None,
+    action: Optional[dict] = None,
     now: Optional[datetime] = None,
 ) -> dict[str, str]:
-    """Build the substitution map for one recipient. Missing recipient fields render empty."""
+    """Build the substitution map for one recipient. Every key in DYNAMIC_ACTIONS is present; missing
+    inputs render as an empty string (never ``None``/``KeyError``). ``sender`` carries the resolved
+    sending profile ({from_name, from_email}); ``action`` carries an automated email's per-send values
+    ({link, code, expires}) and is empty for a manual send/preview."""
     recipient = recipient or {}
+    sender = sender or {}
+    action = action or {}
     now = now or datetime.now(timezone.utc)   # UTC, tz-aware (utcnow() is deprecated in 3.12+)
     username = str(recipient.get("username") or "")
     return {
         "current_date": now.strftime("%Y-%m-%d"),
         "current_time": now.strftime("%H:%M"),
         "current_datetime": now.strftime("%Y-%m-%d %H:%M"),
+        "current_year": now.strftime("%Y"),
         "user.username": username,
         "user.email": str(recipient.get("email") or ""),
         "user.display_name": str(recipient.get("display_name") or username),
+        "sender.from_name": str(sender.get("from_name") or ""),
+        "sender.from_email": str(sender.get("from_email") or ""),
         "vault.name": str(brand_name or ""),
+        "vault.url": str(vault_url or ""),
+        "action.link": str(action.get("link") or ""),
+        "action.code": str(action.get("code") or ""),
+        "action.expires": str(action.get("expires") or ""),
     }
 
 

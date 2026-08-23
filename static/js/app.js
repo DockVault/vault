@@ -8101,6 +8101,7 @@ async function openTemplateEditor(t) {
 function closeTemplateEditor() {
     document.getElementById('email-template-editor').hidden = true;
     _editingTemplateId = null;
+    closeDynMenu();   // dismiss the body-level flyout submenu so it can't orphan
 }
 
 function setEditorView(view) {
@@ -8218,25 +8219,86 @@ function applyEditorFormat(fmt) {
     if (m) _etWrap(m[0], m[1], m[2]);
 }
 
+let _dynGroups = null;   // cached [{group, actions:[{token,label,description}]}]
+
+function _groupsFromFlat(data) {
+    // Fallback if the server returns only the flat `actions` list (older backend).
+    return [{ group: 'Tokens', actions: (data && data.actions) || [] }];
+}
+
+function closeDynMenu() {
+    const menu = document.getElementById('et-dyn-menu');
+    if (menu) menu.hidden = true;
+    const btn = document.getElementById('et-add-dynamic');
+    if (btn) btn.setAttribute('aria-expanded', 'false');
+    _closeDynSubmenu();
+}
+
+function _closeDynSubmenu() {
+    const sub = document.getElementById('et-dyn-submenu');
+    if (sub) sub.remove();
+    document.querySelectorAll('.et-dyn-group.active').forEach(r => r.classList.remove('active'));
+}
+
 async function toggleDynamicMenu() {
     const menu = document.getElementById('et-dyn-menu');
     const btn = document.getElementById('et-add-dynamic');
-    if (!menu.hidden) { menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); return; }
+    if (!menu.hidden) { closeDynMenu(); return; }
     menu.replaceChildren();
+    _closeDynSubmenu();
     try {
-        const data = await apiRequest('/email/dynamic-actions', { silent: true });
-        (data && data.actions || []).forEach(a => {
-            const b = document.createElement('button'); b.type = 'button'; b.setAttribute('role', 'menuitem');
-            const lbl = document.createElement('div'); lbl.textContent = a.label;
-            const tok = document.createElement('div'); tok.className = 'et-dyn-token'; tok.textContent = '{{' + a.token + '}}';
-            b.appendChild(lbl); b.appendChild(tok);
-            b.addEventListener('click', () => {
-                _etInsertText('{{' + a.token + '}}'); menu.hidden = true; btn.setAttribute('aria-expanded', 'false');
-            });
-            menu.appendChild(b);
+        if (!_dynGroups) {
+            const data = await apiRequest('/email/dynamic-actions', { silent: true });
+            _dynGroups = (data && Array.isArray(data.groups) && data.groups.length) ? data.groups : _groupsFromFlat(data);
+        }
+        _dynGroups.forEach(g => {
+            const row = document.createElement('button');
+            row.type = 'button'; row.className = 'et-dyn-group'; row.setAttribute('role', 'menuitem');
+            row.setAttribute('aria-haspopup', 'true'); row.setAttribute('aria-expanded', 'false');
+            const name = document.createElement('span'); name.textContent = g.group;
+            const chev = document.createElement('span'); chev.className = 'et-dyn-chevron'; chev.textContent = '▸';
+            row.appendChild(name); row.appendChild(chev);
+            row.addEventListener('click', (e) => { e.stopPropagation(); openDynGroupSubmenu(row, g); });
+            menu.appendChild(row);
         });
     } catch (e) {}
     menu.hidden = false; btn.setAttribute('aria-expanded', 'true');
+}
+
+function openDynGroupSubmenu(row, group) {
+    const existing = document.getElementById('et-dyn-submenu');
+    if (existing && existing.dataset.group === group.group) { _closeDynSubmenu(); return; }  // toggle
+    _closeDynSubmenu();
+    const sub = document.createElement('div');
+    sub.id = 'et-dyn-submenu'; sub.className = 'et-dyn-submenu'; sub.dataset.group = group.group;
+    sub.setAttribute('role', 'menu');
+    (group.actions || []).forEach(a => {
+        const b = document.createElement('button'); b.type = 'button'; b.setAttribute('role', 'menuitem');
+        if (a.description) b.title = a.description;
+        const lbl = document.createElement('div'); lbl.textContent = a.label;
+        const tok = document.createElement('div'); tok.className = 'et-dyn-token'; tok.textContent = '{{' + a.token + '}}';
+        b.appendChild(lbl); b.appendChild(tok);
+        b.addEventListener('click', (e) => { e.stopPropagation(); _etInsertText('{{' + a.token + '}}'); closeDynMenu(); });
+        sub.appendChild(b);
+    });
+    document.body.appendChild(sub);     // body-level so no ancestor overflow can clip it
+    row.classList.add('active'); row.setAttribute('aria-expanded', 'true');
+    _positionDynSubmenu(sub, row);
+}
+
+function _positionDynSubmenu(sub, row) {
+    // Flyout beside the group row; flip LEFT if it would overflow the right edge, and flip UP
+    // (bottom-align to the row) if it would overflow the viewport bottom. position:fixed => the
+    // getBoundingClientRect coordinates are already viewport-relative.
+    const rr = row.getBoundingClientRect();
+    const sw = sub.offsetWidth, sh = sub.offsetHeight;
+    const vw = window.innerWidth, vh = window.innerHeight, m = 8;
+    let left = rr.right + 4;
+    if (left + sw > vw - m) left = Math.max(m, rr.left - sw - 4);   // no room right -> go left
+    let top = rr.top;
+    if (top + sh > vh - m) top = Math.max(m, rr.bottom - sh);       // no room below -> flip up
+    sub.style.left = Math.round(left) + 'px';
+    sub.style.top = Math.round(top) + 'px';
 }
 
 async function openImagePicker() {
@@ -8581,15 +8643,15 @@ function attachSettingsListeners() {
         });
         const etSendGo = document.getElementById('et-send-go');
         if (etSendGo) etSendGo.addEventListener('click', sendTemplateNow);
-        // Close the dynamic-action menu on an outside click.
+        // Close the dynamic-action menu (and its body-level flyout submenu) on an outside click.
         document.addEventListener('click', (e) => {
             const menu = document.getElementById('et-dyn-menu');
-            if (menu && !menu.hidden && !e.target.closest('.et-dyn-wrap')) {
-                menu.hidden = true;
-                const b = document.getElementById('et-add-dynamic');
-                if (b) b.setAttribute('aria-expanded', 'false');
+            if (menu && !menu.hidden && !e.target.closest('.et-dyn-wrap') && !e.target.closest('#et-dyn-submenu')) {
+                closeDynMenu();
             }
         });
+        // Keep the flyout submenu glued to its row on scroll/resize while the menu is open.
+        window.addEventListener('resize', _closeDynSubmenu);
     }
     
     // Audit log buttons

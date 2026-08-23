@@ -423,4 +423,47 @@ def test_dynamic_actions_catalog_shape():
     tokens = {a.token for a in es.DYNAMIC_ACTIONS}
     assert {"current_date", "user.username", "user.email", "vault.name"} <= tokens
     for a in es.DYNAMIC_ACTIONS:
-        assert a.token and a.label and a.sample
+        assert a.token and a.label and a.sample and a.group
+
+
+def test_dynamic_action_groups_cover_every_token_in_order():
+    groups = es.dynamic_action_groups()
+    names = [g["group"] for g in groups]
+    # the expected groups appear, and in declaration order
+    assert names == ["Recipient", "Sender", "Branding", "Date & time", "Automated action"]
+    grouped_tokens = {a["token"] for g in groups for a in g["actions"]}
+    assert grouped_tokens == {a.token for a in es.DYNAMIC_ACTIONS}     # no token dropped/duplicated
+    # the new useful tokens are present
+    assert {"sender.from_name", "sender.from_email", "vault.url", "current_year",
+            "action.link", "action.code", "action.expires"} <= grouped_tokens
+
+
+def test_token_context_has_every_catalog_key_and_never_none():
+    ctx = es.token_context()          # all inputs omitted
+    for a in es.DYNAMIC_ACTIONS:
+        assert a.token in ctx and ctx[a.token] == "" or ctx[a.token]  # present; empty string, never None
+        assert ctx[a.token] is not None
+
+
+def test_token_context_populates_new_groups():
+    ctx = es.token_context(
+        recipient={"username": "jo", "email": "jo@x.test"},
+        brand_name="Acme Vault", vault_url="https://v.example.com",
+        sender={"from_name": "Acme", "from_email": "no-reply@x.test"},
+        action={"link": "https://v.example.com/i/abc", "code": "123456", "expires": "in 1 hour"})
+    assert ctx["sender.from_name"] == "Acme" and ctx["sender.from_email"] == "no-reply@x.test"
+    assert ctx["vault.url"] == "https://v.example.com"
+    assert ctx["action.link"].endswith("/i/abc") and ctx["action.code"] == "123456"
+    assert ctx["action.expires"] == "in 1 hour"
+    assert ctx["current_year"].isdigit() and len(ctx["current_year"]) == 4
+
+
+def test_new_tokens_substitute_and_escape_in_send():
+    # the new tokens render through the full send path, and a hostile value stays inert (escaped).
+    body = '<p>Hi {{user.username}} — <a href="{{action.link}}">open</a> · {{sender.from_name}}</p>'
+    ctx = es.token_context(recipient={"username": "jo"},
+                           sender={"from_name": 'Ops"><script>x</script>'},
+                           action={"link": "https://v.example.com/i/abc"})
+    html, _ = es.render_for_send(body, context=ctx, load_resource=lambda r: None)
+    assert "jo" in html and "https://v.example.com/i/abc" in html
+    assert "<script" not in html.lower()          # the hostile from_name value can't inject markup

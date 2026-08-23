@@ -92,12 +92,14 @@ async def list_dynamic_actions(
     """The personalization tokens the template editor's 'Add Dynamic Action' dropdown offers.
 
     Server-owned so the accepted set and the UI list can never drift. Values are substituted per
-    recipient at send time (see app.core.email_sanitize)."""
+    recipient at send time (see app.core.email_sanitize). Returns both a flat ``actions`` list (kept
+    for compatibility) and a ``groups`` list for the two-level menu."""
     return {
         "actions": [
             {"token": a.token, "label": a.label, "sample": a.sample}
             for a in email_sanitize.DYNAMIC_ACTIONS
-        ]
+        ],
+        "groups": email_sanitize.dynamic_action_groups(),
     }
 
 
@@ -441,6 +443,24 @@ def _brand_name(db: Session) -> str:
         return ""
 
 
+def _vault_url() -> str:
+    """Best-effort public base URL for the ``{{vault.url}}`` token, derived from the first configured
+    ALLOWED_HOSTS entry. Empty when nothing usable is set (a wildcard or unset host) — the token then
+    renders empty rather than guessing. Never raises."""
+    try:
+        from app.core.config import settings
+        raw = (settings.allowed_hosts or "").strip()
+    except Exception:
+        return ""
+    for host in (h.strip() for h in raw.split(",")):
+        if not host or host in ("*", "0.0.0.0") or host.startswith("."):
+            continue
+        if host.startswith("http://") or host.startswith("https://"):
+            return host.rstrip("/")
+        return f"https://{host}".rstrip("/")
+    return ""
+
+
 def _template_out(t: EmailTemplate, *, include_body: bool = False) -> dict:
     d = {
         "id": str(t.id),
@@ -566,10 +586,16 @@ async def preview_template(payload: PreviewIn, request: Request,
     # under the cap; the limit only bounds a scripted loop against the (now byte-inlining) preview.
     _rate_limit(admin.id, limit=120, window=60, prefix="email_preview",
                 detail="Too many preview requests; please slow down.")
+    # Preview uses SAMPLE values so the admin sees every token resolve, including the sender/branding
+    # and the automated-action tokens (which are empty in a manual send but populated for invite/reset).
     ctx = email_sanitize.token_context(
         recipient={"username": payload.sample_username or "jsmith",
                    "email": payload.sample_email or "jsmith@example.com"},
-        brand_name=_brand_name(db))
+        brand_name=_brand_name(db),
+        vault_url=_vault_url() or "https://vault.example.com",
+        sender={"from_name": _brand_name(db) or "Secure Vault", "from_email": "noreply@example.com"},
+        action={"link": (_vault_url() or "https://vault.example.com") + "/invite/sample-token",
+                "code": "482913", "expires": "in 24 hours"})
     # Bound the total bytes inlined into ONE preview: a template can reference many/large images and
     # base64 inflates ~33%, so without a budget a single request could build a multi-GB response and
     # OOM the worker. Each distinct image's bytes are loaded/encoded AT MOST ONCE (memoized), and once
@@ -854,9 +880,12 @@ async def send_template(template_id: uuid.UUID, payload: SendIn, request: Reques
         return _rc[rid]
 
     brand = _brand_name(db)
+    vault_url = _vault_url()
+    sender = {"from_name": cfg.get("from_name") or "", "from_email": cfg.get("from_email") or ""}
     messages, prepared = [], []
     for rec in recipients:
-        ctx = email_sanitize.token_context(recipient=rec, brand_name=brand)
+        ctx = email_sanitize.token_context(recipient=rec, brand_name=brand,
+                                           vault_url=vault_url, sender=sender)
         subject = email_sanitize.render_subject(t.subject, ctx)
         html, inline = email_sanitize.render_for_send(t.body_html, context=ctx, load_resource=load_resource)
         text = email_sanitize.render_plaintext_fallback(html)
