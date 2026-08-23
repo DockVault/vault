@@ -12950,6 +12950,10 @@ document.addEventListener('DOMContentLoaded', () => {
     // the app — run it and stop here so the login/session bootstrap below is skipped.
     const inviteToken = new URLSearchParams(location.search).get('invite');
     if (inviteToken) {
+        // Strip ?invite=<token> from the URL immediately (keep the token only in JS memory), so the
+        // single-use token can't leak via the Referer header of any sub-resource this page loads, or
+        // sit in browser/proxy history. Done before initInviteFlow fetches anything.
+        try { history.replaceState(null, '', location.pathname); } catch (_) {}
         document.documentElement.removeAttribute('data-auth');
         initInviteFlow(inviteToken);
         return;
