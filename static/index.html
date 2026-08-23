@@ -10,7 +10,7 @@
     <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
     <link rel="apple-touch-icon" href="/static/assets/logo.png?v=1">
     <link rel="stylesheet" href="/static/css/theme.css?v=20260822a">
-    <link rel="stylesheet" href="/static/css/components.css?v=20260823b">
+    <link rel="stylesheet" href="/static/css/components.css?v=20260823e">
     <link rel="stylesheet" href="/static/css/utilities.css?v=20251015c">
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-sans-500.woff2" crossorigin>
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-mono-500.woff2" crossorigin>
@@ -1370,7 +1370,7 @@
                                 <h3>Email — Sending profiles</h3>
                             </div>
                             <div class="p-lg">
-                                <div class="alert alert-info mb-md">A <strong>sending profile</strong> is an SMTP sender identity (server, credentials, From address). Create one or more; the <strong>default</strong> profile also powers the vault's own system mail. Each profile saves on its own — there is no central Save here.</div>
+                                <div class="email-hint">A <strong>sending profile</strong> is an SMTP sender identity (server, credentials, From address). Create one or more; the <strong>default</strong> profile also powers the vault's own system mail. Each profile saves on its own — there is no central Save here. <em>If the vault runs in a container, the SMTP server is reached from inside it — <strong>localhost</strong> means the vault container itself, so use the mail server's hostname (e.g. <code>host.docker.internal</code> or the service name), not <code>localhost</code>.</em></div>
                                 <div id="email-profiles-grid" class="email-card-grid" role="list" aria-label="Sending profiles"></div>
                             </div>
                         </div>
@@ -1435,7 +1435,7 @@
                         <div class="card mt-lg">
                             <div class="card-header"><h3>Email templates</h3></div>
                             <div class="p-lg">
-                                <div class="alert alert-info mb-md">Author HTML emails that send through a chosen profile. Insert images from your resource folder and personalization tokens; the preview renders exactly what recipients receive.</div>
+                                <div class="email-hint">Author HTML emails that send through a chosen profile. Insert images from your resource folder and personalization tokens; the preview renders exactly what recipients receive.</div>
                                 <div id="email-templates-grid" class="email-card-grid" role="list" aria-label="Email templates"></div>
                             </div>
                         </div>
@@ -1494,6 +1494,19 @@
                                         <label for="et-image-upload" class="btn btn-secondary">Upload an image…</label>
                                         <input type="file" id="et-image-upload" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none">
                                         <span id="et-image-upload-msg" class="text-sm ml-md" role="status" aria-live="polite"></span>
+                                    </div>
+                                    <div class="et-image-size-row">
+                                        <label for="et-image-size">Insert at size</label>
+                                        <select id="et-image-size" class="form-control">
+                                            <option value="150">Small (150px)</option>
+                                            <option value="320" selected>Medium (320px)</option>
+                                            <option value="480">Large (480px)</option>
+                                            <option value="640">X-Large (640px)</option>
+                                            <option value="0">Original</option>
+                                            <option value="custom">Custom…</option>
+                                        </select>
+                                        <input type="number" id="et-image-custom-width" class="form-control" min="1" max="2000" placeholder="width px" hidden>
+                                        <span class="text-xs text-secondary">Pick a thumbnail to insert it at this width.</span>
                                     </div>
                                     <div id="et-image-grid" class="et-image-grid" role="list"></div>
                                 </div>

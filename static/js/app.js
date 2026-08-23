@@ -8277,8 +8277,29 @@ async function buildImageThumb(res) {
     const name = document.createElement('div'); name.className = 'et-image-name'; name.textContent = res.filename || res.id;
     item.appendChild(img); item.appendChild(name);
     // Insert only the UUID reference (no path/URL); alt is added by the admin if wanted.
-    item.addEventListener('click', () => { _etInsertText('<img data-resource-id="' + res.id + '">'); closeModal(); });
+    item.addEventListener('click', () => { _etInsertText(_etImageMarkup(res.id)); closeModal(); });
     return item;
+}
+
+// Build the <img> markup for an inserted resource, honoring the size picker. Emits a `width` (which
+// the sanitizer allows and the preview/send both render) unless "Original" (0) is chosen. Never emits
+// a path/URL — only the UUID reference.
+function _etImageMarkup(resourceId) {
+    let w = 0;
+    const sizeSel = document.getElementById('et-image-size');
+    if (sizeSel) {
+        if (sizeSel.value === 'custom') {
+            const c = document.getElementById('et-image-custom-width');
+            w = c ? parseInt(c.value, 10) : 0;
+        } else {
+            w = parseInt(sizeSel.value, 10);
+        }
+    }
+    if (Number.isFinite(w) && w > 0) {
+        w = Math.min(2000, Math.max(1, w));
+        return '<img data-resource-id="' + resourceId + '" width="' + w + '">';
+    }
+    return '<img data-resource-id="' + resourceId + '">';
 }
 
 async function uploadImageResource(file) {
@@ -8553,6 +8574,11 @@ function attachSettingsListeners() {
         if (etAddDyn) etAddDyn.addEventListener('click', (e) => { e.stopPropagation(); toggleDynamicMenu(); });
         const etImgUpload = document.getElementById('et-image-upload');
         if (etImgUpload) etImgUpload.addEventListener('change', (e) => { if (e.target.files[0]) uploadImageResource(e.target.files[0]); });
+        const etImgSize = document.getElementById('et-image-size');
+        if (etImgSize) etImgSize.addEventListener('change', () => {
+            const c = document.getElementById('et-image-custom-width');
+            if (c) c.hidden = (etImgSize.value !== 'custom');
+        });
         const etSendGo = document.getElementById('et-send-go');
         if (etSendGo) etSendGo.addEventListener('click', sendTemplateNow);
         // Close the dynamic-action menu on an outside click.

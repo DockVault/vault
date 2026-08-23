@@ -438,6 +438,35 @@
 .et-image-item:hover { border-color: var(--text-secondary); }
 .et-image-item img { width: 100%; height: 72px; object-fit: contain; background: #fff; border-radius: var(--radius-sm); }
 .et-image-item .et-image-name { font-size: var(--text-xs); color: var(--text-tertiary); overflow-wrap: anywhere; text-align: center; max-width: 100%; }
+.et-image-size-row { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-sm); margin-top: var(--space-sm); }
+.et-image-size-row label { font-size: var(--text-sm); color: var(--text-secondary); }
+.et-image-size-row select { width: auto; min-width: 150px; }
+.et-image-size-row input[type="number"] { width: auto; min-width: 110px; }
+
+/* An info/help box that flows as normal text. Deliberately NOT `.alert`, whose flex layout scatters
+   inline <strong>/<em> into separate flex items. */
+.email-hint {
+    font-size: var(--text-sm); line-height: 1.55; color: var(--text-secondary);
+    background: color-mix(in srgb, var(--info) 8%, var(--surface-1));
+    border: 1px solid color-mix(in srgb, var(--info) 22%, transparent);
+    border-left: 3px solid var(--info);
+    border-radius: var(--radius-md); padding: var(--space-sm) var(--space-md);
+    margin-bottom: var(--space-md);
+}
+.email-hint strong { color: var(--text-primary); font-weight: 600; }
+.email-hint code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .92em; background: var(--surface-3); padding: 0 4px; border-radius: var(--radius-sm); }
+
+/* The editor card must let the dynamic-action dropdown escape (it otherwise clips against the card's
+   `overflow:hidden`); the ID beats `.card`. */
+#email-template-editor { overflow: visible; }
+.et-dyn-menu { z-index: 60; max-height: 340px; overflow-y: auto; }
+.et-dyn-menu button { padding: 5px 10px; }
+
+/* Give the code textarea and render iframe an adequate, EQUAL min-height so switching Code/Render
+   doesn't jump. The ID+2-class selector beats `#settings-section .form-control`, which otherwise caps
+   the textarea at 32px. */
+#email-template-editor .et-panes .et-code,
+#email-template-editor .et-panes .et-render { min-height: 480px; }
 
 @keyframes slideUp {
     from {

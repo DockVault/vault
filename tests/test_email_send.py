@@ -187,20 +187,33 @@ def test_auth_error_maps_to_auth_category(fake_smtp):
     assert ei.value.category == "auth"
 
 
-def test_transport_error_message_is_generic(fake_smtp):
+def _transport_message_for(exc):
     cfg = _cfg(smtp_port=465)
     orig = smtplib.SMTP_SSL
     def _mk(host, port, timeout=None, context=None):
         inst = orig(host, port, timeout)
-        inst.send_exc = ConnectionRefusedError("Connection refused to 10.0.0.1:22")
+        inst.send_exc = exc
         return inst
     smtplib.SMTP_SSL = _mk
-    with pytest.raises(es.EmailSendError) as ei:
-        es.smtp_send(cfg, _msg(cfg))
-    assert ei.value.category == "transport"
-    # The response must not distinguish the failure (no class name / host / detail) -> SSRF oracle.
-    assert "ConnectionRefused" not in ei.value.message
-    assert "10.0.0.1" not in ei.value.message
+    try:
+        with pytest.raises(es.EmailSendError) as ei:
+            es.smtp_send(cfg, _msg(cfg))
+        return ei.value
+    finally:
+        smtplib.SMTP_SSL = orig
+
+
+def test_transport_error_message_leaks_no_detail_and_gives_no_oracle(fake_smtp):
+    refused = _transport_message_for(ConnectionRefusedError("Connection refused to 10.0.0.1:22"))
+    filtered = _transport_message_for(smtplib.SMTPServerDisconnected("service not available"))
+    assert refused.category == "transport" and filtered.category == "transport"
+    # The message may echo the admin's OWN configured host:port (helpful), but must not leak the
+    # exception class/detail...
+    for m in (refused.message, filtered.message):
+        assert "ConnectionRefused" not in m and "SMTPServerDisconnected" not in m
+        assert "10.0.0.1" not in m and "not available" not in m
+    # ...and must be IDENTICAL across failure modes, so it can't be used to probe internal ports.
+    assert refused.message == filtered.message
 
 
 def test_missing_server_raises_config(fake_smtp):

@@ -132,9 +132,34 @@ def test_add_image_inserts_data_resource_id(admin_page: Page, admin):
     page.click("#et-add-image")
     expect(page.locator("#email-image-modal")).to_have_class(re.compile(r"\bactive\b"))
     page.locator(f'.et-image-item:has-text("logo.png")').click()
-    expect(page.locator("#et-body")).to_have_value(f'<img data-resource-id="{res["id"]}">')
-    # the reference is a UUID; no path/URL appears in the source
+    # default size is Medium (320): UUID-only reference + a width, never a path/URL.
+    expect(page.locator("#et-body")).to_have_value(f'<img data-resource-id="{res["id"]}" width="320">')
     assert "/email/resources/" not in page.locator("#et-body").input_value()
+
+
+def test_add_image_size_presets_and_custom(admin_page: Page, admin):
+    res = admin.post("/email/resources", files={"file": ("logo.png", PNG, "application/octet-stream")}).json()
+    rid = res["id"]
+    page = admin_page
+    _open_email_tab(page)
+    _new_template(page, name="Sized", body="")
+
+    def insert(size_value, custom=None):
+        page.fill("#et-body", "")
+        page.click("#et-add-image")
+        expect(page.locator("#email-image-modal")).to_have_class(re.compile(r"\bactive\b"))
+        page.select_option("#et-image-size", size_value)
+        if custom is not None:
+            expect(page.locator("#et-image-custom-width")).to_be_visible()   # revealed only for custom
+            page.fill("#et-image-custom-width", str(custom))
+        page.locator('.et-image-item:has-text("logo.png")').click()
+
+    insert("480")
+    expect(page.locator("#et-body")).to_have_value(f'<img data-resource-id="{rid}" width="480">')
+    insert("0")                                                              # Original -> no width
+    expect(page.locator("#et-body")).to_have_value(f'<img data-resource-id="{rid}">')
+    insert("custom", custom=225)
+    expect(page.locator("#et-body")).to_have_value(f'<img data-resource-id="{rid}" width="225">')
 
 
 def test_client_script_pre_check_blocks_save(admin_page: Page, admin):
@@ -272,6 +297,49 @@ def test_edit_refuses_to_open_when_body_fetch_fails(admin_page: Page, admin):
         page.locator('.email-profile-card:has-text("Vanishing") .etc-edit').click()
     assert resp.value.status == 404
     expect(page.locator("#email-template-editor")).to_be_hidden()   # must not open blank
+
+
+def test_email_hints_flow_as_text_not_scattered_flex(admin_page: Page):
+    # The hint boxes must be `.email-hint` (block flow), NOT `.alert` (whose flex layout scatters the
+    # inline <strong>/<em> into separate columns).
+    page = admin_page
+    _open_email_tab(page)
+    hint = page.locator("#settings-tab-email .email-hint").first
+    expect(hint).to_be_visible()
+    assert hint.evaluate("el => getComputedStyle(el).display") == "block"
+    assert page.locator("#settings-tab-email .alert-info").count() == 0
+
+
+def test_editor_code_pane_has_adequate_height(admin_page: Page):
+    page = admin_page
+    _open_email_tab(page)
+    _new_template(page, name="Tall")
+    mh = page.locator("#et-body").evaluate("el => parseFloat(getComputedStyle(el).minHeight)")
+    assert mh >= 400, f"code textarea min-height too small: {mh}px"
+
+
+def test_dynamic_menu_is_not_clipped(admin_page: Page):
+    # The editor card's `overflow:hidden` used to clip the dropdown to ~2.5 items. With overflow now
+    # visible, the whole menu renders: every item sits inside the menu box (not cut off), and the last
+    # item is reachable.
+    page = admin_page
+    _open_email_tab(page)
+    _new_template(page, name="Menu", body="")
+    page.click("#et-add-dynamic")
+    menu = page.locator("#et-dyn-menu")
+    expect(menu).to_be_visible()
+    items = menu.locator("button")
+    n = items.count()
+    assert n >= 4
+    box = menu.bounding_box()
+    last = items.last.bounding_box()
+    # the last item is fully within the rendered menu
+    assert last["y"] + last["height"] <= box["y"] + box["height"] + 1
+    expect(items.last).to_be_visible()
+    # Pin the actual fix: the editor card must NOT clip its overflow (bounding-box/visibility checks
+    # alone are insensitive to an ancestor's overflow:hidden, so assert the computed value directly).
+    assert page.locator("#email-template-editor").evaluate(
+        "el => getComputedStyle(el).overflowX") == "visible"
 
 
 @pytest.mark.skipif(not (MAILPIT_URL and MAILPIT_SMTP_HOST),

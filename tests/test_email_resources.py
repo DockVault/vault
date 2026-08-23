@@ -188,7 +188,7 @@ def test_preview_resolves_a_real_uploaded_image(admin, clean_resources):
     up = _upload(admin, PNG).json()
     rid = up["id"]
     r = admin.post("/email/templates/preview",
-                   json={"body_html": f'<p>hi</p><img data-resource-id="{rid}">'})
+                   json={"body_html": f'<p>hi</p><img data-resource-id="{rid}" width="320">'})
     assert r.status_code == 200, r.text
     html = r.json()["html"]
     # The preview INLINES the bytes as a data: URI so the sandboxed (opaque-origin) iframe can render
@@ -196,6 +196,8 @@ def test_preview_resolves_a_real_uploaded_image(admin, clean_resources):
     assert 'src="data:image/png;base64,' in html
     assert "/email/resources/" not in html
     assert rid not in html                                       # the UUID location is not disclosed
+    # The chosen display width survives to the preview, so Render shows the size recipients will see.
+    assert 'width="320"' in html
     # The inlined payload must be THE uploaded bytes (not empty / a wrong row).
     m = re.search(r'src="data:image/png;base64,([^"]+)"', html)
     assert m, html

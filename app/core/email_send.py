@@ -202,7 +202,10 @@ def smtp_send(cfg: dict, msg: EmailMessage) -> None:
         # (an internal-network probe oracle).
         print(f"[email] send failed: {type(e).__name__}: {e}")
         raise EmailSendError(
-            "transport", "Could not send the email — check the SMTP server, port, and TLS settings.")
+            "transport",
+            f"Could not reach the SMTP server at {host}:{port}. Check the address, port, and TLS "
+            "settings. If the vault runs in a container, 'localhost' is the container itself — use the "
+            "mail server's hostname (e.g. host.docker.internal or the service name).")
 
 
 def smtp_send_batch(cfg: dict, messages: list) -> list:
@@ -260,5 +263,8 @@ def smtp_send_batch(cfg: dict, messages: list) -> list:
     except (smtplib.SMTPException, OSError) as e:
         print(f"[email] batch connect failed: {type(e).__name__}: {e}")
         raise EmailSendError(
-            "transport", "Could not connect to the SMTP server — check the server, port, and TLS settings.")
+            "transport",
+            f"Could not reach the SMTP server at {host}:{port}. Check the address, port, and TLS "
+            "settings. If the vault runs in a container, 'localhost' is the container itself — use the "
+            "mail server's hostname (e.g. host.docker.internal or the service name).")
     return results
