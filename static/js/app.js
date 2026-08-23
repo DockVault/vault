@@ -7736,7 +7736,12 @@ async function openVault(vaultId) {
             } catch (e) {
                 state.currentVault = null;
                 state.currentVaultId = null;
-                showWarning((e && e.message) || 'Vault unlock cancelled');
+                const msg = (e && e.message) || 'Vault unlock cancelled';
+                // A user cancelling the prompt is a gentle warning; a WRONG passphrase / key mismatch
+                // is a real failure and must surface clearly (this is the "surfaces a clear error"
+                // guarantee — a wrong passphrase used to be swallowed).
+                if (/cancel/i.test(msg)) showWarning(msg);
+                else showError(msg);
                 return;
             }
         }
