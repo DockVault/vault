@@ -10,15 +10,16 @@ template, resource, and sending endpoints fill in the rest of the CRUD.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, defer, joinedload
 
 from app.core.database import get_db
 from app.core.models import EmailProfile, EmailResource, EmailTemplate, RoleEnum, User
@@ -511,3 +512,137 @@ async def preview_template(payload: PreviewIn,
         "referenced_resource_ids": email_sanitize.extract_resource_ids(
             email_sanitize.sanitize_email_html(payload.body_html)),
     }
+
+
+# --------------------------------------------------------------------------------------------------
+# Resource folder (private admin-only images embedded in templates by UUID)
+# --------------------------------------------------------------------------------------------------
+
+_MAX_RESOURCE_BYTES = 5 * 1024 * 1024   # 5 MB per image
+_MAX_RESOURCE_COUNT = 1000              # ceiling on stored images, so the folder can't grow unbounded
+
+# Content type is decided by SNIFFING the bytes, never by trusting the client's Content-Type. Only
+# raster formats — deliberately NO SVG (it can carry script and would execute if a browser rendered
+# the served bytes).
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+
+
+def _sniff_image(data: bytes) -> Optional[str]:
+    """Return the image content-type inferred from the magic bytes, or None if not a supported
+    raster image. WebP is RIFF-container: 'RIFF'<size>'WEBP'."""
+    for magic, ct in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            return ct
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _safe_filename(name: Optional[str]) -> str:
+    """Display-only filename: strip any path, drop control chars, cap length."""
+    base = (name or "image").replace("\\", "/").rsplit("/", 1)[-1]
+    base = _CTRL_RE.sub("", base).strip() or "image"
+    return base[:255]
+
+
+def _resource_out(r: EmailResource) -> dict:
+    """Metadata only — never the bytes (those come from the byte-serving route)."""
+    return {
+        "id": str(r.id),
+        "filename": r.filename,
+        "content_type": r.content_type,
+        "byte_size": r.byte_size,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+@router.get("/resources")
+async def list_resources(db: Session = Depends(get_db)):
+    # DEFER the LargeBinary `data` column: the list is metadata-only, so loading every image's bytes
+    # (up to 5 MB each) into memory just to drop them would be a needless memory/DoS cost.
+    rows = (db.query(EmailResource).options(defer(EmailResource.data))
+            .order_by(EmailResource.created_at.desc()).all())
+    return {"resources": [_resource_out(r) for r in rows]}
+
+
+@router.post("/resources", status_code=status.HTTP_201_CREATED)
+async def upload_resource(request: Request, file: UploadFile = File(...),
+                          admin: User = Depends(require_interactive_admin),
+                          db: Session = Depends(get_db)):
+    # Throttle uploads (fail-closed, per admin) so the folder can't be filled rapidly, and cap the
+    # total count so it can't grow without bound. (The multipart body is buffered by Starlette
+    # before this handler runs — a pre-auth over-cap body is a known app-wide characteristic shared
+    # with the brand-asset uploader; bounding it before parsing is deferred to a middleware change.)
+    allowed, _, reset = _rate_limiter.check_rate_limit(
+        identifier=str(admin.id), limit=60, window=60, prefix="email_resource_upload", fail_open=False)
+    if not allowed:
+        import time as _t
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many uploads; please wait a moment.",
+                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    if db.query(EmailResource.id).count() >= _MAX_RESOURCE_COUNT:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Resource limit reached ({_MAX_RESOURCE_COUNT}); delete some images first.")
+    # read() bounds only the handler's in-memory copy; +1 lets an over-cap upload 413 cleanly.
+    data = await file.read(_MAX_RESOURCE_BYTES + 1)
+    if len(data) > _MAX_RESOURCE_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                            detail=f"Image too large (max {_MAX_RESOURCE_BYTES // (1024 * 1024)} MB).")
+    if not data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="The uploaded file is empty.")
+    content_type = _sniff_image(data)
+    if content_type is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Only PNG, JPEG, GIF, or WebP images are allowed.")
+    r = EmailResource(
+        filename=_safe_filename(file.filename),
+        content_type=content_type,
+        byte_size=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+        data=data,
+        uploaded_by=admin.id,
+    )
+    db.add(r)
+    db.commit()
+    db.refresh(r)
+    _audit(db, request, admin, "email_resource_uploaded", resource_id=str(r.id),
+           filename=r.filename, content_type=r.content_type, byte_size=r.byte_size)
+    return _resource_out(r)
+
+
+@router.get("/resources/{resource_id}")
+async def get_resource_bytes(resource_id: uuid.UUID, db: Session = Depends(get_db)):
+    """Serve the raw image bytes (admin-gated by the router dependency) for the editor preview.
+    Content-Type is the SNIFFED type stored at upload; nosniff stops the browser guessing another."""
+    r = db.get(EmailResource, resource_id)
+    if r is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found.")
+    return Response(
+        content=r.data,
+        media_type=r.content_type,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "inline",          # no filename -> no header-injection surface
+            # NB: Cache-Control is set globally by the security-header middleware
+            # (no-store, no-cache, must-revalidate, private), which is the right default for an
+            # admin-only image, so we don't set our own here (it would be overridden anyway).
+        },
+    )
+
+
+@router.delete("/resources/{resource_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_resource(resource_id: uuid.UUID, request: Request,
+                          admin: User = Depends(require_interactive_admin),
+                          db: Session = Depends(get_db)):
+    r = db.get(EmailResource, resource_id)
+    if r is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found.")
+    fn = r.filename
+    db.delete(r)   # templates keep the data-resource-id; it simply stops resolving (dangling -> dropped)
+    db.commit()
+    _audit(db, request, admin, "email_resource_deleted", resource_id=str(resource_id), filename=fn)
