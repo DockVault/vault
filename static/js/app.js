@@ -944,28 +944,148 @@ function updateProfileUI(user) {
 // would mislabel the form. On any failure the static "Username" fallback stays.
 async function applyLoginPolicyLabel() {
     try {
-        const res = await fetch(`${API_BASE}/auth/login-policy`, { headers: { Accept: 'application/json' } });
+        const res = await fetch(`${API_BASE}/auth/policy`, { headers: { Accept: 'application/json' } });
         if (!res.ok) return;
-        const { login_identifier: mode } = await res.json();
+        const policy = await res.json();
+        const mode = policy.login_identifier;
         const label = document.getElementById('username-label');
         const input = document.getElementById('username');
-        if (!input) return;
-        if (mode === 'email') {
-            if (label) label.textContent = 'Email';
-            input.setAttribute('autocomplete', 'email');
-            input.setAttribute('inputmode', 'email');
-        } else if (mode === 'either') {
-            if (label) label.textContent = 'Username or email';
-            input.setAttribute('autocomplete', 'username');
-            input.removeAttribute('inputmode');
-        } else {
-            if (label) label.textContent = 'Username';
-            input.setAttribute('autocomplete', 'username');
-            input.removeAttribute('inputmode');
+        if (input) {
+            if (mode === 'email') {
+                if (label) label.textContent = 'Email';
+                input.setAttribute('autocomplete', 'email');
+                input.setAttribute('inputmode', 'email');
+            } else if (mode === 'either') {
+                if (label) label.textContent = 'Username or email';
+                input.setAttribute('autocomplete', 'username');
+                input.removeAttribute('inputmode');
+            } else {
+                if (label) label.textContent = 'Username';
+                input.setAttribute('autocomplete', 'username');
+                input.removeAttribute('inputmode');
+            }
         }
+        _initSignupAffordance(policy);
     } catch (_) { /* keep the static fallback */ }
 }
 applyLoginPolicyLabel();
+
+// ---- Self-signup (public, unauthenticated) --------------------------------
+// The toggle + form are hidden until /auth/policy confirms signup_enabled. Email presence/required
+// is driven by the same policy: the field is always PRESENT (so an optional address can be given),
+// and `required` when the org requires email OR login is by email/either (an account with no email
+// could never sign in under those identifiers). Bare fetch only; DOM values via textContent (house
+// XSS rule); no token is stored — success returns to the sign-in form (it does NOT auto-sign-in).
+let _signupWired = false;
+
+function _initSignupAffordance(policy) {
+    const toggle = document.getElementById('signup-toggle');
+    const form = document.getElementById('signup-form');
+    if (!toggle || !form) return;
+    if (!policy || !policy.signup_enabled) {           // off → stay hidden, offer nothing
+        toggle.style.display = 'none';
+        form.style.display = 'none';
+        return;
+    }
+    toggle.style.display = '';
+
+    // Email field state per policy.
+    const emailRequired = policy.email_requirement === 'required'
+        || policy.login_identifier === 'email' || policy.login_identifier === 'either';
+    const emailGroup = document.getElementById('signup-email-group');
+    const emailInput = document.getElementById('signup-email');
+    const emailLabel = document.getElementById('signup-email-label');
+    if (emailGroup) emailGroup.style.display = '';       // present in both required/optional shapes
+    if (emailInput) emailInput.required = emailRequired;
+    if (emailLabel) emailLabel.textContent = emailRequired ? 'Email' : 'Email (optional)';
+
+    // Password requirement hints, mirroring the enforced policy.
+    const pol = policy.password_policy || {};
+    const hint = document.getElementById('signup-password-hint');
+    if (hint) {
+        const parts = [];
+        if (pol.min_length) parts.push(`at least ${pol.min_length} characters`);
+        if (pol.require_uppercase) parts.push('an uppercase letter');
+        if (pol.require_lowercase) parts.push('a lowercase letter');
+        if (pol.require_numbers) parts.push('a number');
+        if (pol.require_special) parts.push('a special character');
+        hint.textContent = parts.length ? 'Must include ' + parts.join(', ') + '.' : '';
+    }
+    const pwInput = document.getElementById('signup-password');
+    if (pwInput && pol.min_length) pwInput.minLength = pol.min_length;
+
+    if (_signupWired) return;                            // attach listeners once
+    _signupWired = true;
+    const showSignup = document.getElementById('show-signup-link');
+    const showLogin = document.getElementById('show-login-link');
+    if (showSignup) showSignup.addEventListener('click', (e) => { e.preventDefault(); _showSignupForm(true); });
+    if (showLogin) showLogin.addEventListener('click', (e) => { e.preventDefault(); _showSignupForm(false); });
+    form.addEventListener('submit', _submitSignup);
+}
+
+function _showSignupForm(show) {
+    const ids = ['login-form', 'login-error', 'signup-toggle'];
+    ids.forEach(id => { const el = document.getElementById(id); if (el) el.style.display = show ? 'none' : (id === 'login-error' ? 'none' : ''); });
+    const form = document.getElementById('signup-form');
+    if (form) form.style.display = show ? '' : 'none';
+    if (show) { const u = document.getElementById('signup-username'); if (u) u.focus(); }
+    else { const u = document.getElementById('username'); if (u) u.focus(); }
+}
+
+async function _submitSignup(e) {
+    e.preventDefault();
+    const err = document.getElementById('signup-error');
+    const btn = e.target.querySelector('button[type="submit"]');
+    const uname = (document.getElementById('signup-username') || {}).value || '';
+    const emailInput = document.getElementById('signup-email');
+    const pw = (document.getElementById('signup-password') || {}).value || '';
+    if (err) err.style.display = 'none';
+    if (btn) { btn.disabled = true; btn.textContent = 'Creating…'; }
+    const restore = () => { if (btn) { btn.disabled = false; btn.textContent = 'Create account'; } };
+    try {
+        const payload = { username: uname.trim(), password: pw };
+        const emailVal = emailInput ? emailInput.value.trim() : '';
+        if (emailVal) payload.email = emailVal;
+        const res = await fetch(`${API_BASE}/auth/signup`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            if (err) {
+                err.textContent = (data && data.detail) ? data.detail : 'Could not create the account. Please try again.';
+                err.style.display = 'block';
+            }
+            restore();
+            return;
+        }
+        _signupSucceeded(uname.trim());
+    } catch (_) {
+        if (err) { err.textContent = 'Could not create the account. Please try again.'; err.style.display = 'block'; }
+        restore();
+    }
+}
+
+function _signupSucceeded(username) {
+    const form = document.getElementById('signup-form');
+    if (form) form.style.display = 'none';
+    const login = document.getElementById('login-form');
+    if (login) login.style.display = '';
+    const toggle = document.getElementById('signup-toggle');
+    if (toggle) toggle.style.display = '';
+    // Prefill the username and surface a success note in the login error box (reused as a banner).
+    const u = document.getElementById('username');
+    if (u && username) u.value = username;
+    const note = document.getElementById('login-error');
+    if (note) {
+        note.className = 'alert alert-success mt-md';
+        note.textContent = 'Account created. Sign in with your new password.';
+        note.style.display = 'block';
+    }
+    const pw = document.getElementById('password');
+    if (pw) pw.focus();
+}
 
 // ---- Invitation acceptance (public, unauthenticated) -----------------------
 // Reached via /?invite=<token>. Bare fetch only (never apiRequest — it would attach a stale Bearer
@@ -1109,10 +1229,12 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
     const username = document.getElementById('username').value;
     const password = document.getElementById('password').value;
     const errorDiv = document.getElementById('login-error');
-    
-    // Hide previous errors
+
+    // Hide previous errors. Reset the class too: self-signup success reuses this box as a green
+    // success banner (alert-success), so restore alert-error before a login failure renders here.
     errorDiv.style.display = 'none';
-    
+    errorDiv.className = 'alert alert-error mt-md';
+
     try {
         const response = await fetch(`${API_BASE}/auth/login`, {
             method: 'POST',

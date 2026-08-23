@@ -98,6 +98,26 @@ def email_allowed_by_domain_gate(email, mode, domains) -> bool:
     return True  # "off" or any unknown mode: no domain restriction
 
 
+def signup_email_is_ascii(email) -> bool:
+    """Is this candidate signup email pure ASCII (local part AND domain)?
+
+    Self-signup requires it, deliberately. The domain-gate config (normalize_domains) accepts
+    ASCII/punycode labels only, but pydantic EmailStr hands the gate the UNICODE form of an IDN
+    domain -- so a unicode 'evіl.com' (Cyrillic i) would neither match an ASCII allowlist entry
+    (wrongly denied) nor be caught by an ASCII denylist entry (wrongly allowed). Rejecting any
+    non-ASCII address at the signup edge closes BOTH mismatches, plus the SMTPUTF8 non-ASCII-local
+    case (which has no ASCII form at all). A blank/None candidate is 'acceptable' here -- its absence
+    is handled by the email-requirement check, not by this ASCII gate.
+    """
+    if not email:
+        return True
+    try:
+        str(email).encode("ascii")
+        return True
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return False
+
+
 def normalize_domains(value) -> list[str]:
     """Validate and normalize a signup-domain list; raise AccountPolicyError on any bad entry.
 
