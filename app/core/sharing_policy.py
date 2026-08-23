@@ -77,6 +77,19 @@ def user_can_create_with_tag(tag, user_id, user_group_ids) -> bool:
     return bool(tag.get("auto_enroll_new_users", False))
 
 
+def should_seed_default_tags(has_existing_tags: bool, sharing_already_enabled: bool) -> bool:
+    """Whether startup should seed the starter share-tag set.
+
+    Seed ONLY when there are no share tags AND sharing has not already been turned on. A fresh
+    deployment (sharing defaults OFF, no tags) is seeded — the tags sit inert until an admin enables
+    sharing. A deployment whose admin has ALREADY enabled sharing is never silently given a set of
+    permissive auto-enroll tags on upgrade: an empty tag list there is the admin's own state to fill,
+    not ours to widen. (Deactivated tags remain rows, so `has_existing_tags` also blocks re-adding a
+    tag an admin removed.)
+    """
+    return not has_existing_tags and not sharing_already_enabled
+
+
 def user_matches_claim_audience(claim_audience, audience_user_ids, audience_department_ids,
                                 user_id, user_group_ids) -> bool:
     """Whether a user may CLAIM a share, given its claim-audience. Governs REDEMPTION (distinct from the
