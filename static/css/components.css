@@ -391,6 +391,54 @@
 .us-section-title { margin: 0 0 var(--space-sm) 0; font-size: var(--text-base); font-weight: 600; }
 .us-profile-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-sm); }
 
+/* Email Studio — sending-profile / template card grid (shared base, both skins). */
+.email-card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: var(--space-md); }
+.email-profile-card {
+    border: 1px solid var(--surface-3); border-radius: var(--radius-lg); padding: var(--space-md);
+    display: flex; flex-direction: column; gap: var(--space-xs); background: var(--surface-1); min-height: 120px;
+}
+.email-profile-card .epc-title { font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: var(--space-xs); min-width: 0; }
+.email-profile-card .epc-title > span:first-child { overflow-wrap: anywhere; min-width: 0; }
+.email-profile-card .epc-desc { font-size: var(--text-sm); color: var(--text-secondary); flex: 1 1 auto; word-break: break-word; }
+.email-profile-card .epc-meta { font-size: var(--text-xs); color: var(--text-tertiary); overflow-wrap: anywhere; }
+.email-profile-card .epc-actions { margin-top: var(--space-sm); display: flex; gap: var(--space-xs); flex-wrap: wrap; }
+.epc-badge {
+    font-size: var(--text-xs); font-weight: 600; padding: 1px 7px; border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--text-primary) 12%, transparent); color: var(--text-secondary);
+}
+.email-card-add {
+    border: 1px dashed var(--surface-3); border-radius: var(--radius-lg); padding: var(--space-md);
+    display: flex; align-items: center; justify-content: center; gap: var(--space-xs); cursor: pointer;
+    color: var(--text-secondary); background: transparent; min-height: 120px; font-weight: 500; text-align: center;
+}
+.email-card-add:hover { border-color: var(--text-secondary); color: var(--text-primary); background: var(--surface-1); }
+
+/* Email templates — wider cards + the inline code/render/split editor. */
+#email-templates-grid { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+.et-editor-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-md); }
+.et-editor-headbtns { display: flex; gap: var(--space-sm); }
+.et-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-xs); margin: var(--space-md) 0; padding-bottom: var(--space-sm); border-bottom: 1px solid var(--surface-3); }
+.et-view-toggle { margin-left: auto; display: inline-flex; gap: 2px; }
+.et-view.active { background: var(--surface-3); color: var(--text-primary); }
+.et-dyn-wrap { position: relative; display: inline-block; }
+.et-dyn-menu { position: absolute; top: 100%; left: 0; z-index: 20; min-width: 220px; background: var(--surface-0); border: 1px solid var(--surface-3); border-radius: var(--radius-md); box-shadow: var(--shadow-lg); padding: var(--space-xs); }
+.et-dyn-menu button { display: block; width: 100%; text-align: left; background: none; border: none; padding: 6px 10px; border-radius: var(--radius-sm); color: var(--text-primary); cursor: pointer; font-size: var(--text-sm); }
+.et-dyn-menu button:hover { background: var(--surface-2); }
+.et-dyn-menu .et-dyn-token { color: var(--text-tertiary); font-size: var(--text-xs); }
+.et-panes { display: grid; gap: var(--space-md); }
+.et-panes.et-view-code { grid-template-columns: 1fr; }
+.et-panes.et-view-render { grid-template-columns: 1fr; }
+.et-panes.et-view-split { grid-template-columns: 1fr 1fr; }
+.et-panes.et-view-code .et-render { display: none; }
+.et-panes.et-view-render .et-code { display: none; }
+.et-code { min-height: 60vh; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; line-height: 1.5; resize: vertical; white-space: pre; }
+.et-render { min-height: 60vh; width: 100%; border: 1px solid var(--surface-3); border-radius: var(--radius-md); background: #ffffff; }
+.et-image-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: var(--space-sm); margin-top: var(--space-md); max-height: 50vh; overflow-y: auto; }
+.et-image-item { border: 1px solid var(--surface-3); border-radius: var(--radius-md); padding: 4px; cursor: pointer; background: var(--surface-1); display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.et-image-item:hover { border-color: var(--text-secondary); }
+.et-image-item img { width: 100%; height: 72px; object-fit: contain; background: #fff; border-radius: var(--radius-sm); }
+.et-image-item .et-image-name { font-size: var(--text-xs); color: var(--text-tertiary); overflow-wrap: anywhere; text-align: center; max-width: 100%; }
+
 @keyframes slideUp {
     from {
         transform: translateY(30px);

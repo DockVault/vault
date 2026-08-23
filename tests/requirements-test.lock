@@ -74,6 +74,8 @@ mdurl==0.1.2
     # via markdown-it-py
 msgpack==1.2.1
     # via cachecontrol
+nh3==0.3.6
+    # via -r tests/requirements-test.txt
 packageurl-python==0.17.6
     # via cyclonedx-python-lib
 packaging==26.2

@@ -1351,38 +1351,158 @@
                     <div id="settings-tab-email" class="settings-tab-content">
                         <div class="card">
                             <div class="card-header">
-                                <h3>Email Configuration</h3>
+                                <h3>Email — Sending profiles</h3>
                             </div>
                             <div class="p-lg">
-                                <div class="alert alert-info mb-md">These SMTP settings power the <strong>Send Test Email</strong> button below only — the vault does not send automated notification emails.</div>
-                                <div class="form-group">
-                                    <label for="setting-smtp-server">SMTP Server</label>
-                                    <input type="text" id="setting-smtp-server" class="form-control" placeholder="smtp.gmail.com">
+                                <div class="alert alert-info mb-md">A <strong>sending profile</strong> is an SMTP sender identity (server, credentials, From address). Create one or more; the <strong>default</strong> profile also powers the vault's own system mail. Each profile saves on its own — there is no central Save here.</div>
+                                <div id="email-profiles-grid" class="email-card-grid" role="list" aria-label="Sending profiles"></div>
+                            </div>
+                        </div>
+
+                        <!-- Create / edit a sending profile -->
+                        <div id="email-profile-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="email-profile-modal-title">
+                            <div class="modal-content">
+                                <div class="modal-header">
+                                    <h3 id="email-profile-modal-title">New sending profile</h3>
                                 </div>
-                                <div class="form-group">
-                                    <label for="setting-smtp-port">SMTP Port</label>
-                                    <input type="number" id="setting-smtp-port" class="form-control" placeholder="587" min="1" max="65535">
+                                <div class="modal-body">
+                                    <div class="form-group">
+                                        <label for="ep-name">Title</label>
+                                        <input type="text" id="ep-name" class="form-control" maxlength="120" placeholder="e.g. Support mailbox">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="ep-description">Description</label>
+                                        <input type="text" id="ep-description" class="form-control" maxlength="255" placeholder="Optional">
+                                    </div>
+                                    <div class="us-profile-grid">
+                                        <div class="form-group">
+                                            <label for="ep-server">SMTP Server</label>
+                                            <input type="text" id="ep-server" class="form-control" placeholder="smtp.example.com">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="ep-port">Port</label>
+                                            <input type="number" id="ep-port" class="form-control" min="1" max="65535" placeholder="587">
+                                        </div>
+                                    </div>
+                                    <div class="us-profile-grid">
+                                        <div class="form-group">
+                                            <label for="ep-username">Username</label>
+                                            <input type="text" id="ep-username" class="form-control" placeholder="Optional" autocomplete="off">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="ep-password">Password</label>
+                                            <input type="password" id="ep-password" class="form-control" placeholder="••••••••" autocomplete="new-password">
+                                            <small class="text-secondary" id="ep-password-hint">Leave blank to keep the stored password</small>
+                                        </div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="ep-from-email">From email address</label>
+                                        <input type="email" id="ep-from-email" class="form-control" placeholder="noreply@example.com">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="ep-from-name">From name</label>
+                                        <input type="text" id="ep-from-name" class="form-control" placeholder="e.g. Secure Vault">
+                                    </div>
+                                    <label class="checkbox-label"><input type="checkbox" id="ep-default"> Default profile (used by the vault's own system mail)</label>
+                                    <label class="checkbox-label"><input type="checkbox" id="ep-insecure-tls"> Allow insecure TLS (accept a self-signed certificate — only for a trusted internal relay)</label>
+                                    <div id="email-profile-result" class="text-sm mt-sm" role="status" aria-live="polite"></div>
                                 </div>
-                                <div class="form-group">
-                                    <label for="setting-smtp-username">SMTP Username</label>
-                                    <input type="text" id="setting-smtp-username" class="form-control" placeholder="user@example.com">
+                                <div class="modal-footer">
+                                    <button type="button" class="btn btn-secondary close-modal-btn" id="ep-cancel">Cancel</button>
+                                    <button type="button" class="btn btn-secondary" id="ep-send-test">📧 Send test</button>
+                                    <button type="button" class="btn btn-primary" id="ep-save">Save</button>
                                 </div>
-                                <div class="form-group">
-                                    <label for="setting-smtp-password">SMTP Password</label>
-                                    <input type="password" id="setting-smtp-password" class="form-control" placeholder="••••••••">
-                                    <small class="text-secondary">Leave empty to keep existing password</small>
+                            </div>
+                        </div>
+
+                        <!-- ============ Email templates ============ -->
+                        <div class="card mt-lg">
+                            <div class="card-header"><h3>Email templates</h3></div>
+                            <div class="p-lg">
+                                <div class="alert alert-info mb-md">Author HTML emails that send through a chosen profile. Insert images from your resource folder and personalization tokens; the preview renders exactly what recipients receive.</div>
+                                <div id="email-templates-grid" class="email-card-grid" role="list" aria-label="Email templates"></div>
+                            </div>
+                        </div>
+
+                        <!-- Inline template editor -->
+                        <div id="email-template-editor" class="card mt-lg" hidden>
+                            <div class="card-header et-editor-head">
+                                <h3 id="et-editor-title">New template</h3>
+                                <div class="et-editor-headbtns">
+                                    <button type="button" class="btn btn-secondary" id="et-cancel">Cancel</button>
+                                    <button type="button" class="btn btn-primary" id="et-save">Save template</button>
                                 </div>
-                                <div class="form-group">
-                                    <label for="setting-from-email">From Email Address</label>
-                                    <input type="email" id="setting-from-email" class="form-control" placeholder="noreply@example.com">
+                            </div>
+                            <div class="p-lg">
+                                <div class="us-profile-grid">
+                                    <div class="form-group"><label for="et-name">Template name</label><input type="text" id="et-name" class="form-control" maxlength="120"></div>
+                                    <div class="form-group"><label for="et-profile">Sending profile</label><select id="et-profile" class="form-control"></select></div>
                                 </div>
-                                <div class="form-group">
-                                    <label for="setting-from-name">From Name</label>
-                                    <input type="text" id="setting-from-name" class="form-control" placeholder="e.g. Secure Vault">
+                                <div class="form-group"><label for="et-description">Description</label><input type="text" id="et-description" class="form-control" maxlength="255"></div>
+                                <div class="form-group"><label for="et-subject">Subject</label><input type="text" id="et-subject" class="form-control" maxlength="255" placeholder="Hello {{user.username}}"></div>
+
+                                <div class="et-toolbar" role="toolbar" aria-label="Formatting">
+                                    <button type="button" class="btn btn-secondary btn-sm" data-fmt="bold" title="Bold"><strong>B</strong></button>
+                                    <button type="button" class="btn btn-secondary btn-sm" data-fmt="italic" title="Italic"><em>I</em></button>
+                                    <button type="button" class="btn btn-secondary btn-sm" data-fmt="h1" title="Heading 1">H1</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" data-fmt="h2" title="Heading 2">H2</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" data-fmt="h3" title="Heading 3">H3</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" data-fmt="ul" title="Bullet list">• List</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" data-fmt="ol" title="Numbered list">1. List</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" id="et-add-image" title="Insert image">🖼 Image</button>
+                                    <span class="et-dyn-wrap">
+                                        <button type="button" class="btn btn-secondary btn-sm" id="et-add-dynamic" aria-haspopup="true" aria-expanded="false">＋ Dynamic action ▾</button>
+                                        <div id="et-dyn-menu" class="et-dyn-menu" hidden role="menu"></div>
+                                    </span>
+                                    <span class="et-view-toggle" role="tablist" aria-label="Editor view">
+                                        <button type="button" class="btn btn-secondary btn-sm et-view active" data-view="code">Code</button>
+                                        <button type="button" class="btn btn-secondary btn-sm et-view" data-view="render">Render</button>
+                                        <button type="button" class="btn btn-secondary btn-sm et-view" data-view="split">Split</button>
+                                    </span>
                                 </div>
-                                <div class="form-group">
-                                    <button id="test-email-btn" class="btn btn-secondary">📧 Send Test Email</button>
-                                    <span id="test-email-result" class="ml-md text-sm"></span>
+
+                                <div id="et-panes" class="et-panes et-view-code">
+                                    <textarea id="et-body" class="form-control et-code" spellcheck="false" placeholder="<p>Hi {{user.username}}</p>"></textarea>
+                                    <iframe id="et-preview" class="et-render" sandbox="" title="Email preview"></iframe>
+                                </div>
+                                <div id="et-editor-msg" class="text-sm mt-sm" role="status" aria-live="polite"></div>
+                            </div>
+                        </div>
+
+                        <!-- Add-image resource picker -->
+                        <div id="email-image-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="email-image-modal-title">
+                            <div class="modal-content">
+                                <div class="modal-header"><h3 id="email-image-modal-title">Insert an image</h3></div>
+                                <div class="modal-body">
+                                    <div class="form-group">
+                                        <label for="et-image-upload" class="btn btn-secondary">Upload an image…</label>
+                                        <input type="file" id="et-image-upload" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none">
+                                        <span id="et-image-upload-msg" class="text-sm ml-md" role="status" aria-live="polite"></span>
+                                    </div>
+                                    <div id="et-image-grid" class="et-image-grid" role="list"></div>
+                                </div>
+                                <div class="modal-footer"><button type="button" class="btn btn-secondary close-modal-btn">Close</button></div>
+                            </div>
+                        </div>
+
+                        <!-- Send template -->
+                        <div id="email-send-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="email-send-modal-title">
+                            <div class="modal-content">
+                                <div class="modal-header"><h3 id="email-send-modal-title">Send template</h3></div>
+                                <div class="modal-body">
+                                    <div class="form-group">
+                                        <label for="et-send-users">Vault users</label>
+                                        <select id="et-send-users" class="form-control" multiple size="6"></select>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="et-send-addresses">Additional addresses (comma or newline separated)</label>
+                                        <textarea id="et-send-addresses" class="form-control" rows="2" placeholder="someone@example.com"></textarea>
+                                    </div>
+                                    <div id="et-send-results" class="text-sm" role="status" aria-live="polite"></div>
+                                </div>
+                                <div class="modal-footer">
+                                    <button type="button" class="btn btn-secondary close-modal-btn">Cancel</button>
+                                    <button type="button" class="btn btn-primary" id="et-send-go">Send</button>
                                 </div>
                             </div>
                         </div>

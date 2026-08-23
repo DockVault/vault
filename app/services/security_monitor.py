@@ -62,6 +62,10 @@ class SecurityEventType:
     # Raised when the durable Redis event counter is unavailable, so threshold-based detection
     # (brute-force / bulk-operation) is effectively blind -- operators must see this.
     DETECTION_DEGRADED = "detection_degraded"
+    # Raised when an admin-authored email payload (template body/subject) contained clearly-
+    # malicious content (a script tag, event handler, javascript: URL, etc.) and was rejected at
+    # save or before send. Tied to the acting user so it is attributable.
+    MALICIOUS_EMAIL_CONTENT = "malicious_email_content"
 
 
 class SecurityAlertLevel:
@@ -202,7 +206,34 @@ class SecurityMonitor:
             )
         
         logger.info(f"File deletion recorded: {file_count} file(s) from vault {vault_id} by user {user_id}")
-    
+
+    def record_malicious_email_content(self, *, user_id=None, username=None, ip_address=None,
+                                       surface="email_template", reasons=None):
+        """Record a rejected admin-authored email payload that contained clearly-malicious content.
+
+        Raised at SAVE and BEFORE SEND when email_sanitize.detect_malicious flags the raw payload,
+        so an injection attempt (or a malicious admin editing a template on a running deployment) is
+        attributable to the acting user. Never raises: alerting must not break the reject path."""
+        reasons = list(reasons or [])
+        try:
+            self._raise_alert(
+                event_type=SecurityEventType.MALICIOUS_EMAIL_CONTENT,
+                severity=SecurityAlertLevel.WARNING,
+                username=username,
+                user_id=str(user_id) if user_id else None,
+                ip_address=ip_address,
+                details={"surface": surface, "reasons": reasons},
+                message=(f"WARNING: Malicious content blocked in {surface} from "
+                         f"{username or user_id or 'unknown user'}: "
+                         f"{', '.join(reasons) or 'unspecified'}"),
+            )
+        except Exception:
+            logger.exception("failed to record malicious-email-content alert")
+            try:
+                self.db.rollback()   # keep the shared session usable after a failed alert commit
+            except Exception:
+                pass
+
     # ========================================================================
     # Analysis and Detection
     # ========================================================================
