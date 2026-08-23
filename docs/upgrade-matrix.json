@@ -49,6 +49,10 @@
     "0.12.0": {
       "released": "2026-08-22",
       "notes": "No schema change; same physical schema as 0.11.0/0.11.1/0.11.2. Adds credential lock/unlock/change-passphrase plus start/stop/restart/status lifecycle commands to the dockvault.py host management tool, so an operator can seal the .env secrets file into an encrypted .env.enc while a deployment is off (envelope encryption: a Fernet data key wrapped under a scrypt-derived passphrase key, with a stable recovery key). This is a host-tool change only; the container image is functionally unchanged from 0.11.2. Also hardens the test suite. A rollback is clean and needs no backup."
+    },
+    "0.13.0": {
+      "released": "2026-08-23",
+      "notes": "Account onboarding. Adds two tables (account_invitations, email_change_codes), created automatically and idempotently at boot by create_all; both are additive and unused by 0.12.0, so a rollback is clean -- take a backup before upgrading. Verified live: a 0.12.0 stack upgraded to 0.13.0 over the same volume creates both tables (schema complete) and self-signup works. Features: admin account invitations (mint / list / revoke, plus a public single-use accept link); public self-signup gated by an org policy (email requirement, signup domain allow/deny, login identifier username/email/either); self-service email change with an emailed one-time verification code; a last-admin-email lockout guard; and log-access fixes (web log-pull in the split-container shape plus a settings-tab overflow fix)."
     }
   },
   "edges": [
@@ -61,7 +65,8 @@
     { "from": "0.10.0", "to": "0.11.0", "kind": "direct", "reversible": true, "requires_backup": true },
     { "from": "0.11.0", "to": "0.11.1", "kind": "direct", "reversible": true, "requires_backup": false },
     { "from": "0.11.1", "to": "0.11.2", "kind": "direct", "reversible": true, "requires_backup": false },
-    { "from": "0.11.2", "to": "0.12.0", "kind": "direct", "reversible": true, "requires_backup": false }
+    { "from": "0.11.2", "to": "0.12.0", "kind": "direct", "reversible": true, "requires_backup": false },
+    { "from": "0.12.0", "to": "0.13.0", "kind": "direct", "reversible": true, "requires_backup": true }
   ],
   "waivers": []
 }
