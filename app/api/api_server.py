@@ -1649,6 +1649,31 @@ def broadcast_event(event_data: dict, include_metrics: bool = True) -> None:
         print(f"Error broadcasting event: {e}")
 
 
+def _vault_activity_fields(vault=None, current_user=None) -> dict:
+    """Enrichment fields for Live Monitor activity events.
+
+    The base upload/download broadcasts only carried actor + IP + file, so the operator could not
+    tell WHICH vault an event touched or whether it was a Standard vs zero-knowledge vault, nor
+    whether a temporary credential acted. This returns those fields to spread into an event dict
+    (``{**event, **_vault_activity_fields(vault, current_user)}``). All lookups are getattr-guarded
+    so a partially-bound caller (e.g. an error path where the vault was never fetched) is safe.
+    """
+    fields: dict = {}
+    if vault is not None:
+        vid = getattr(vault, "id", None)
+        fields["vault_id"] = str(vid) if vid else None
+        fields["vault_name"] = getattr(vault, "name", None)
+        # Raw column value: "standard" | "zero_knowledge". The UI maps this to a badge.
+        fields["vault_type"] = getattr(vault, "type", "standard")
+    if current_user is not None and getattr(current_user, "_is_temp_session", False):
+        # A temporary session IS the account; surface it so the feed shows main-vs-temp actor.
+        fields["is_temporary"] = True
+        tcid = getattr(current_user, "_temp_cred_id", None)
+        if tcid:
+            fields["temp_credential_id"] = str(tcid)
+    return fields
+
+
 # API Endpoints
 
 @app.get("/api")
@@ -9815,7 +9840,8 @@ async def upload_file(
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "operation_id": operation_id,
                         "file_name": upload_file.filename,
-                        "bytes_uploaded": 0
+                        "bytes_uploaded": 0,
+                        **_vault_activity_fields(vault, current_user)
                     }
                 })
                 
@@ -9841,7 +9867,8 @@ async def upload_file(
                                     "file_name": upload_file.filename,
                                     "bytes_uploaded": bytes_uploaded,
                                     "completed": True,
-                                    "cancelled": True  # Mark as cancelled
+                                    "cancelled": True,  # Mark as cancelled
+                                    **_vault_activity_fields(vault, current_user)
                                 }
                             })
                             # Cleanup: partial file will be deleted by context manager __exit__
@@ -9882,7 +9909,8 @@ async def upload_file(
                                         "timestamp": datetime.now(timezone.utc).isoformat(),
                                         "operation_id": operation_id,
                                         "file_name": upload_file.filename,
-                                        "severity": "medium"
+                                        "severity": "medium",
+                                        **_vault_activity_fields(vault, current_user)
                                     }
                                 })
                                 
@@ -9917,7 +9945,8 @@ async def upload_file(
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
                                     "operation_id": operation_id,
                                     "file_name": upload_file.filename,
-                                    "bytes_uploaded": bytes_uploaded
+                                    "bytes_uploaded": bytes_uploaded,
+                                    **_vault_activity_fields(vault, current_user)
                                 },
                                 "traffic": {
                                     "upload": bytes_uploaded,
@@ -9968,7 +9997,8 @@ async def upload_file(
                         "operation_id": operation_id,
                         "file_name": upload_file.filename,
                         "bytes_uploaded": bytes_uploaded,
-                        "completed": True
+                        "completed": True,
+                        **_vault_activity_fields(vault, current_user)
                     }
                 })
                 
@@ -10017,7 +10047,8 @@ async def upload_file(
                         "operation_id": operation_id,
                         "file_name": file.original_name,
                         "bytes_uploaded": file.size_bytes,
-                        "completed": True
+                        "completed": True,
+                        **_vault_activity_fields(vault, current_user)
                     },
                     "traffic": {
                         "upload": file.size_bytes,
@@ -11310,6 +11341,7 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
                 "file_name": disp_name,
                 "bytes_uploaded": file.size_bytes,
                 "completed": True,
+                **_vault_activity_fields(vault, current_user),
             },
             "traffic": {"upload": file.size_bytes, "download": 0},
         })
@@ -11707,6 +11739,7 @@ async def download_file(
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "operation_id": operation_id,
                 "completed": False,
+                **_vault_activity_fields(vault, current_user),
             }
         })
 
@@ -11837,6 +11870,7 @@ async def download_file(
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                             "operation_id": operation_id,
                             "completed": terminal_success,
+                            **_vault_activity_fields(vault, current_user),
                         },
                         "traffic": {
                             "upload": 0,
@@ -11858,6 +11892,7 @@ async def download_file(
                             "completed": True,
                             "cancelled": True,
                             "worker_stopped": True,
+                            **_vault_activity_fields(vault, current_user),
                         }
                     })
                 end_operation(operation_id)
@@ -11995,6 +12030,7 @@ async def download_file(
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
                                     "operation_id": operation_id,
                                     "completed": served_bytes == span.length,
+                                    **_vault_activity_fields(vault, current_user),
                                 },
                                 "traffic": {"upload": 0, "download": served_bytes},
                             })

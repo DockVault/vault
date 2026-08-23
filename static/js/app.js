@@ -1337,6 +1337,19 @@ function logout() {
     // logs in on this same tab (no page refresh) is still prompted to set up a key.
     _zkInvitePrompted = false;
 
+    // Drop the Live Monitor feed + backfill state. The feed is now kept across section re-entry
+    // ("keep old results"), so it MUST be scrubbed here or the previous user's live activity — and
+    // the admin-only /audit/log history it may have backfilled (usernames, IPs, vault names) —
+    // would show to the NEXT user who logs in on this same tab (no page refresh). Re-arming
+    // monitorHistoryLoaded makes the next user's backfill run fresh under THEIR own permissions;
+    // cleanupMonitor closes this session's socket (the next initMonitor reconnects with the new
+    // token). monitorListenersAttached is intentionally left set — the filter/clear/reconnect DOM
+    // nodes are static and survive the SPA screen swap, so re-attaching would duplicate handlers.
+    monitorEvents = [];
+    monitorMetrics.totalEvents = 0;
+    monitorHistoryLoaded = false;
+    cleanupMonitor();
+
     // Tear down any open vault session + its watchers.
     if (state.accessCheckInterval) { clearInterval(state.accessCheckInterval); state.accessCheckInterval = null; }
     stopVaultFileWatch();
@@ -5187,23 +5200,28 @@ let monitorMetrics = {
     activeSessions: 0,
     totalEvents: 0
 };
+let monitorHistoryLoaded = false;     // one-time persisted-history backfill per page load
+let monitorListenersAttached = false; // guard: initMonitor runs on every section entry
 
 // Initialize Live Monitor
 function initMonitor() {
     console.log('🔴 Initializing Live Monitor...');
-    
-    // Reset events
-    monitorEvents = [];
+
+    // Keep whatever already accumulated this session ("keep old results and show them but also
+    // fetch new ones live") — re-render what we have instead of wiping on every re-entry.
     updateMonitorUI();
-    
+
     // Connect to WebSocket for real-time events
     connectMonitorWebSocket();
-    
-    // Attach event listeners
+
+    // Attach event listeners (once — this runs on every navigation to the section)
     attachMonitorListeners();
-    
+
     // Fetch initial statistics
     fetchMonitorStats();
+
+    // Seed persisted history so the feed isn't empty until the next live event (admin only).
+    backfillMonitorHistory();
 }
 
 // Schedule at most ONE pending reconnect. Any newer schedule (or a direct connect) cancels the prior
@@ -5297,9 +5315,25 @@ function connectMonitorWebSocket() {
 
 // Handle incoming monitor event
 function handleMonitorEvent(data) {
-    // Event types: login, logout, upload, download, vault_access, temp_cred_created, temp_cred_used, error
-    // Server broadcasts wrap the event under `event`; unwrap for inspection.
+    // Emitted types: login, logout, upload, download, security_incident, error (+ Path A operation_cancelled).
+    // Server broadcasts wrap the event under `event`; unwrap for inspection. (The historic bug read the
+    // row fields off the TOP-LEVEL `data`, so wrapped Path-A frames rendered as type:'unknown' with an
+    // empty message and were then filtered out — the whole feed looked dead. Build the row from `ev`.)
     const ev = (data && data.event) ? data.event : data;
+
+    // Stats frames are top-level (never wrapped) — update metrics and stop.
+    if (data.type === 'stats') {
+        monitorMetrics.activeUsers = data.active_users || 0;
+        monitorMetrics.activeSessions = data.active_sessions || 0;
+        updateMonitorMetrics();
+        return;
+    }
+
+    // Control frames from the auth handshake / keepalive are not activity — the status dot already
+    // reflects the connection (ws.onopen), so don't render them as feed rows.
+    if (data.type === 'connected' || data.type === 'pong') {
+        return;
+    }
 
     // Owner notification: a temporary credential I created just signed in.
     if (ev && ev.type === 'login' && ev.is_temporary && currentUser &&
@@ -5307,42 +5341,128 @@ function handleMonitorEvent(data) {
         showWarning(`Temporary credential ${ev.temp_username || ''} just signed in${ev.ip ? ' from ' + ev.ip : ''}`.trim());
     }
 
-    if (data.type === 'stats') {
-        // Update metrics
-        monitorMetrics.activeUsers = data.active_users || 0;
-        monitorMetrics.activeSessions = data.active_sessions || 0;
-        updateMonitorMetrics();
+    // Path B (ProgressTracker) publishes UNWRAPPED operation_start/complete/cancelled frames that
+    // duplicate the richer Path A upload/download lifecycle (same operation_id). Don't render them.
+    if (!(data && data.event) && typeof ev.type === 'string' && ev.type.indexOf('operation_') === 0) {
         return;
     }
-    
-    // Add event to list
-    const event = {
-        id: Date.now() + Math.random(),
-        timestamp: data.timestamp || new Date().toISOString(),
-        type: data.type || 'unknown',
-        user: data.user || 'System',
-        message: data.message || '',
-        details: data.details || {},
-        icon: getEventIcon(data.type)
-    };
-    
-    monitorEvents.unshift(event); // Add to beginning
-    
-    // Keep only last 100 events
-    if (monitorEvents.length > 100) {
-        monitorEvents = monitorEvents.slice(0, 100);
-    }
-    
-    // Update metrics
-    monitorMetrics.totalEvents = monitorEvents.length;
-    
-    // Calculate events per minute (count events in last minute)
-    const oneMinuteAgo = new Date(Date.now() - 60000).toISOString();
-    const recentEvents = monitorEvents.filter(e => e.timestamp > oneMinuteAgo);
-    monitorMetrics.eventsRate = recentEvents.length;
-    
-    // Update UI
+
+    ingestMonitorEvent(ev, 'live');
     updateMonitorUI();
+}
+
+// Normalize a raw event (a live WS frame, or a backfilled audit row already shaped like one) into
+// the monitor's row model. Repeated frames of one operation (upload start -> progress -> complete)
+// share an operation_id and COALESCE into a single row that updates in place, so one transfer is one
+// row instead of a wall of progress lines.
+function ingestMonitorEvent(ev, source) {
+    const evt = {
+        id: Date.now() + Math.random(),
+        operationId: ev.operation_id || null,
+        timestamp: ev.timestamp || new Date().toISOString(),
+        type: ev.type || 'unknown',
+        user: ev.user || 'System',
+        // Server frames carry `description`/`title`; audit-backfill rows are pre-mapped to `description`.
+        message: ev.description || ev.title || '',
+        ip: ev.ip || '',
+        vaultName: ev.vault_name || '',
+        vaultType: ev.vault_type || '',        // 'zero_knowledge' | 'standard'
+        isTemporary: !!ev.is_temporary,
+        tempUsername: ev.temp_username || '',
+        fileName: ev.file_name || '',
+        completed: ev.completed === true,
+        cancelled: ev.cancelled === true,
+        source: source || 'live',
+        icon: getEventIcon(ev.type)
+    };
+
+    if (evt.operationId) {
+        const idx = monitorEvents.findIndex(e => e.operationId && e.operationId === evt.operationId);
+        if (idx !== -1) {
+            const prev = monitorEvents[idx];
+            evt.id = prev.id;         // keep the row's identity
+            evt.source = prev.source; // a live op stays "live" even as it updates
+            // MERGE, don't blindly replace: a follow-up frame for the same operation can be thin
+            // (the /api/operations/{id}/cancel endpoint emits a generic `operation_cancelled` with
+            // no vault fields and no specific type). Carry forward the enrichment it omits so the
+            // row doesn't lose its Vault/ZK/temp badges, and keep the specific transfer type rather
+            // than letting a generic operation_* status frame flip it out of the upload/download
+            // filter — just record the cancellation.
+            evt.vaultName = evt.vaultName || prev.vaultName;
+            evt.vaultType = evt.vaultType || prev.vaultType;
+            evt.isTemporary = evt.isTemporary || prev.isTemporary;
+            evt.tempUsername = evt.tempUsername || prev.tempUsername;
+            evt.fileName = evt.fileName || prev.fileName;
+            if (!evt.user || evt.user === 'System') evt.user = prev.user;
+            if (evt.type.indexOf('operation_') === 0 && prev.type.indexOf('operation_') !== 0) {
+                if (evt.type === 'operation_cancelled') evt.cancelled = true;
+                evt.type = prev.type;
+                evt.icon = getEventIcon(evt.type);
+            }
+            monitorEvents.splice(idx, 1);           // drop the old position; re-add at the top
+        }
+    }
+
+    monitorEvents.unshift(evt);
+    if (monitorEvents.length > 200) {
+        monitorEvents = monitorEvents.slice(0, 200);
+    }
+
+    monitorMetrics.totalEvents = monitorEvents.length;
+    // Events/min counts distinct LIVE rows seen in the last minute (history rows don't inflate it).
+    const oneMinuteAgo = new Date(Date.now() - 60000).toISOString();
+    monitorMetrics.eventsRate = monitorEvents.filter(e => e.source === 'live' && e.timestamp > oneMinuteAgo).length;
+}
+
+// Map a persisted audit action name to a monitor event type (the audit log and the live feed use
+// different vocabularies: `file_upload` vs `upload`, `login_success` vs `login`, etc.).
+function auditActionToType(action) {
+    const a = String(action || '').toLowerCase();
+    if (a.indexOf('login') === 0) return 'login';
+    if (a.indexOf('logout') === 0) return 'logout';
+    if (a.indexOf('file_upload') === 0 || a === 'upload') return 'upload';
+    if (a.indexOf('file_download') === 0 || a.indexOf('file.download') === 0 || a === 'download') return 'download';
+    if (a.indexOf('size_limit') === 0) return 'security_incident';
+    if (a.indexOf('fail') !== -1 || a.indexOf('error') !== -1 || a.indexOf('denied') !== -1 || a.indexOf('violation') !== -1) return 'error';
+    return 'info';
+}
+
+// One-line description for a backfilled audit row.
+function auditRowDescription(r, type) {
+    const det = (r && r.details) || {};
+    const fileName = det.file_name || '';
+    const label = String(r.action || type).replace(/_/g, ' ');
+    const status = (r.status && r.status !== 'success') ? ` (${r.status})` : '';
+    return (fileName ? fileName + ' — ' : '') + label + status;
+}
+
+// Seed the feed with persisted history so re-opening the monitor shows past activity, not just
+// live-from-now. The endpoint is admin-only; non-admins (403) or a transient error just get live.
+async function backfillMonitorHistory() {
+    if (monitorHistoryLoaded) return;
+    monitorHistoryLoaded = true;   // one attempt per page load, even on failure
+    try {
+        const rows = await apiRequest('/audit/log?limit=100', { silent: true });
+        if (!Array.isArray(rows) || rows.length === 0) return;
+        // Oldest first so the successive unshifts leave newest at the top; history sits below live.
+        rows.slice().reverse().forEach(r => {
+            const type = auditActionToType(r.action);
+            const det = r.details || {};
+            ingestMonitorEvent({
+                type: type,
+                timestamp: r.timestamp,
+                user: r.username || 'System',
+                description: auditRowDescription(r, type),
+                ip: r.ip_address || '',
+                vault_name: det.vault_name || '',
+                is_temporary: !!r.temp_credential_id,
+                file_name: det.file_name || ''
+            }, 'history');
+        });
+        updateMonitorUI();
+    } catch (e) {
+        console.log('Monitor history backfill unavailable (non-admin or transient)');
+    }
 }
 
 // Get icon for event type (returns inline SVG markup from the sprite)
@@ -5359,6 +5479,8 @@ function getEventIcon(type) {
         'temp_cred_expired': 'clock',
         'user_created': 'user',
         'user_deleted': 'trash',
+        'security_incident': 'alert-triangle',
+        'operation_cancelled': 'info',
         'error': 'alert-triangle',
         'warning': 'alert-triangle',
         'info': 'info'
@@ -5404,70 +5526,101 @@ function updateMonitorMetrics() {
     document.getElementById('monitor-session-info').textContent = sessionInfo;
 }
 
+// A filter chip may cover more than one raw event type (e.g. "Security" = error + size-limit
+// incidents). Types not listed here filter by exact equality (login/upload/download/logout).
+const MONITOR_FILTER_GROUPS = {
+    security: ['error', 'security_incident']
+};
+
+function monitorFilterMatches(eventType, filter) {
+    if (filter === 'all') return true;
+    const wanted = MONITOR_FILTER_GROUPS[filter] || [filter];
+    return wanted.indexOf(eventType) !== -1;
+}
+
 // Update monitor UI
 function updateMonitorUI() {
     updateMonitorMetrics();
-    
+
     const eventsList = document.getElementById('monitor-events-list');
     const eventCount = document.getElementById('monitor-event-count');
-    
+
     if (!eventsList) return;
-    
-    // Filter events
-    const filteredEvents = monitorCurrentFilter === 'all' 
-        ? monitorEvents 
-        : monitorEvents.filter(e => e.type === monitorCurrentFilter);
-    
+
+    // Filter events (chip may map to a group of raw types)
+    const filteredEvents = monitorEvents.filter(e => monitorFilterMatches(e.type, monitorCurrentFilter));
+
     // Update count
     if (eventCount) {
-        eventCount.textContent = `${filteredEvents.length} events`;
+        eventCount.textContent = `${filteredEvents.length} event${filteredEvents.length === 1 ? '' : 's'}`;
     }
-    
+
     // Render events
     if (filteredEvents.length === 0) {
+        const waitingFor = monitorCurrentFilter === 'all' ? 'activity' : monitorCurrentFilter + ' events';
         eventsList.innerHTML = `
-            <div class="text-center py-xl text-secondary">
-                <div style="font-size: 3rem; margin-bottom: 1rem;">${iconSvg('activity', 'icon-lg')}</div>
-                <p class="font-semibold mb-xs">No events yet</p>
-                <p class="text-sm">Waiting for ${monitorCurrentFilter === 'all' ? 'events' : monitorCurrentFilter + ' events'}...</p>
+            <div class="empty-state-center">
+                ${iconSvg('activity', 'icon-lg')}
+                <h3>No events yet</h3>
+                <p>Live ${escapeHtml(waitingFor)} will appear here as it happens.</p>
             </div>
         `;
         return;
     }
-    
+
+    // Type -> border/badge colour
+    const typeColors = {
+        'login': 'success',
+        'logout': 'secondary',
+        'upload': 'primary',
+        'download': 'info',
+        'security_incident': 'danger',
+        'operation_cancelled': 'secondary',
+        'error': 'danger'
+    };
+
     eventsList.innerHTML = filteredEvents.map(event => {
         const time = parseServerTime(event.timestamp);
         const timeStr = time ? time.toLocaleTimeString() : '—';
-        
-        // Event type badge color
-        const typeColors = {
-            'login': 'success',
-            'logout': 'secondary',
-            'upload': 'primary',
-            'download': 'info',
-            'vault_access': 'warning',
-            'error': 'danger'
-        };
         const badgeClass = typeColors[event.type] || 'secondary';
-        
+
+        // Which-account (main vs temp) badge
+        const tempBadge = event.isTemporary
+            ? `<span class="badge badge-info" title="Acted via a temporary credential">temp${event.tempUsername ? ': ' + escapeHtml(event.tempUsername) : ''}</span>`
+            : '';
+        // Standard vs zero-knowledge vault badge
+        const zk = event.vaultType === 'zero_knowledge';
+        const vaultBadge = event.vaultType
+            ? `<span class="badge badge-${zk ? 'warning' : 'secondary'}" title="${zk ? 'Zero-knowledge vault' : 'Standard vault'}">${zk ? 'ZK' : 'Standard'}</span>`
+            : '';
+        // History (backfilled from the audit log) vs live
+        const histBadge = event.source === 'history'
+            ? `<span class="badge badge-secondary" title="From audit history">history</span>`
+            : '';
+
+        // Metadata line: vault name + client IP (file name is already in the message)
+        const meta = [];
+        if (event.vaultName) meta.push(`Vault: ${escapeHtml(event.vaultName)}`);
+        if (event.ip) meta.push(`IP: ${escapeHtml(event.ip)}`);
+        const metaLine = meta.length
+            ? `<div class="text-xs text-secondary mt-xs flex gap-md flex-wrap">${meta.map(m => `<span>${m}</span>`).join('')}</div>`
+            : '';
+
         return `
-            <div class="monitor-event-item" style="border-left: 4px solid var(--${badgeClass}); padding: 1rem; margin-bottom: 0.5rem; background: var(--surface-1); border-radius: 8px;">
+            <div class="monitor-event-item" style="border-left: 4px solid var(--${badgeClass}); padding: 0.6rem 0.85rem; margin-bottom: 0.4rem; background: var(--surface-1); border-radius: 8px;">
                 <div class="flex items-start gap-md">
-                    <span style="font-size: 1.5rem;">${event.icon}</span>
-                    <div class="flex-1">
-                        <div class="flex items-center gap-md mb-xs">
+                    <span style="font-size: 1.25rem; line-height: 1.4;">${event.icon}</span>
+                    <div class="flex-1" style="min-width: 0;">
+                        <div class="flex items-center gap-sm mb-xs flex-wrap">
                             <span class="font-semibold">${escapeHtml(event.user)}</span>
-                            <span class="badge badge-${badgeClass}">${escapeHtml(event.type.replace('_', ' '))}</span>
+                            <span class="badge badge-${badgeClass}">${escapeHtml(event.type.replace(/_/g, ' '))}</span>
+                            ${tempBadge}
+                            ${vaultBadge}
+                            ${histBadge}
                             <span class="text-xs text-secondary ml-auto">${timeStr}</span>
                         </div>
-                        <p class="text-sm text-secondary">${escapeHtml(event.message || `${event.type} event`)}</p>
-                        ${Object.keys(event.details).length > 0 ? `
-                            <div class="text-xs text-secondary mt-xs">
-                                ${Object.entries(event.details).map(([key, value]) =>
-                                    `<span class="mr-md">${escapeHtml(key)}: ${escapeHtml(String(value))}</span>`
-                                ).join('')}
-                            </div>
-                        ` : ''}
+                        <p class="text-sm text-secondary" style="word-break: break-word;">${escapeHtml(event.message || `${event.type} event`)}</p>
+                        ${metaLine}
                     </div>
                 </div>
             </div>
@@ -5495,6 +5648,11 @@ async function fetchMonitorStats() {
 
 // Attach monitor event listeners
 function attachMonitorListeners() {
+    // initMonitor() runs on every navigation to the section; attach the click handlers only once so
+    // the filter/clear/reconnect buttons don't accumulate duplicate listeners across re-entries.
+    if (monitorListenersAttached) return;
+    monitorListenersAttached = true;
+
     // Event filter buttons
     document.querySelectorAll('.event-filter-btn').forEach(btn => {
         btn.addEventListener('click', () => {
