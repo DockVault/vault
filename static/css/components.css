@@ -750,6 +750,61 @@ button.vault-sort-dir {
     transform: translateY(0);
 }
 
+/* Notifications bell + dropdown (mirrors the profile-menu show/hide pattern; self-contained so it
+   renders in all three skins via the shared design tokens) */
+.notif-menu { position: relative; display: flex; align-items: center; margin-right: var(--space-md); }
+.notif-btn {
+    position: relative; background: none; border: none; cursor: pointer; padding: var(--space-xs);
+    display: flex; align-items: center; color: var(--text-secondary);
+    border-radius: var(--radius-full); transition: all var(--transition-base);
+}
+.notif-btn:hover { color: var(--text-primary); background: var(--surface-2); }
+.notif-badge {
+    position: absolute; top: -2px; right: -2px; min-width: 18px; height: 18px; padding: 0 5px;
+    border-radius: var(--radius-full); background: var(--error); color: #fff; font-size: 11px;
+    font-weight: 700; line-height: 18px; text-align: center;
+}
+.notif-dropdown {
+    position: absolute; top: calc(100% + var(--space-xs)); right: 0; width: 340px; max-width: 90vw;
+    background: var(--surface-1); border: 1px solid var(--border-color); border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-lg); opacity: 0; visibility: hidden; transform: translateY(-8px);
+    transition: all var(--transition-base); z-index: 1000; overflow: hidden;
+}
+.notif-menu.active .notif-dropdown { opacity: 1; visibility: visible; transform: translateY(0); }
+.notif-dropdown-header {
+    padding: var(--space-sm) var(--space-md); display: flex; align-items: center;
+    justify-content: space-between; border-bottom: 1px solid var(--border-color);
+    background: linear-gradient(135deg, var(--surface-2) 0%, var(--surface-1) 100%);
+}
+.notif-dropdown-title { font-weight: 600; color: var(--text-primary); font-size: var(--text-base); }
+.notif-mark-all {
+    background: none; border: none; cursor: pointer; color: var(--brand-accent);
+    font-size: var(--text-sm); padding: 0;
+}
+.notif-mark-all:hover { text-decoration: underline; }
+.notif-list { max-height: 380px; overflow-y: auto; }
+.notif-item {
+    display: flex; gap: var(--space-sm); padding: var(--space-sm) var(--space-md);
+    border-bottom: 1px solid var(--border-color); cursor: pointer;
+    transition: background var(--transition-base);
+}
+.notif-item:last-child { border-bottom: none; }
+.notif-item:hover { background: var(--surface-2); }
+.notif-item.unread { background: color-mix(in srgb, var(--brand-accent) 8%, transparent); }
+.notif-item-body { flex: 1; min-width: 0; }
+.notif-item-title { font-weight: 600; color: var(--text-primary); font-size: var(--text-sm); }
+.notif-item-text { color: var(--text-secondary); font-size: var(--text-sm); word-break: break-word; }
+.notif-item-time { color: var(--text-tertiary); font-size: var(--text-xs); margin-top: 2px; }
+.notif-item-dismiss {
+    background: none; border: none; cursor: pointer; color: var(--text-tertiary); padding: 2px;
+    flex: 0 0 auto; align-self: flex-start; border-radius: var(--radius-sm);
+}
+.notif-item-dismiss:hover { color: var(--error); }
+.notif-empty {
+    padding: var(--space-lg) var(--space-md); text-align: center;
+    color: var(--text-tertiary); font-size: var(--text-sm);
+}
+
 .profile-dropdown-header {
     padding: var(--space-md);
     display: flex;

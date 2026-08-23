@@ -1310,6 +1310,9 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         // events per connection (admins see all; everyone else only their own).
         try { connectMonitorWebSocket(); } catch (_) {}
 
+        // Load the notification bell (persistent counterpart to the live temp-login toast)
+        initNotifications();
+
         // Load dashboard stats
         loadDashboardStats();
 
@@ -1352,6 +1355,10 @@ function logout() {
     monitorMetrics.totalEvents = 0;
     monitorHistoryLoaded = false;
     cleanupMonitor();
+
+    // Wipe the notification bell so a prior user's notifications never show to the next user on this
+    // same tab, and stop the unread-count poll.
+    resetNotifications();
 
     // Tear down any open vault session + its watchers.
     if (state.accessCheckInterval) { clearInterval(state.accessCheckInterval); state.accessCheckInterval = null; }
@@ -5442,6 +5449,9 @@ function handleMonitorEvent(data) {
     if (ev && ev.type === 'login' && ev.is_temporary && currentUser &&
         String(ev.owner_user_id) === String(currentUser.id)) {
         showWarning(`Temporary credential ${ev.temp_username || ''} just signed in${ev.ip ? ' from ' + ev.ip : ''}`.trim());
+        // Reflect it on the bell right away — the durable row is persisted server-side and the exact
+        // list reconciles on the next poll / when the panel opens.
+        if (!isScopedTemp) { notifUnread = (notifUnread || 0) + 1; updateNotifBadge(); }
     }
 
     // Path B (ProgressTracker) publishes UNWRAPPED operation_start/complete/cancelled frames that
@@ -5801,6 +5811,133 @@ function cleanupMonitor() {
         monitorWebSocket.close();
         monitorWebSocket = null;
     }
+}
+
+// ============================================================================
+// NOTIFICATIONS (bell + dropdown; the persistent counterpart to the live toast)
+// ============================================================================
+let notifPollTimer = null;
+let notifItems = [];
+let notifUnread = 0;
+
+// Map a server-supplied notification target to an in-app section. Targets are short server-controlled
+// tokens, and we only ever navigate to a KNOWN sidebar section — never inject an arbitrary href.
+const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds', '#vaults': 'vaults' };
+
+async function initNotifications() {
+    // Idempotent — called on login AND on refresh-restore. A temp session owns no notifications.
+    if (!authToken || isScopedTemp) return;
+    await loadNotifications();
+    startNotifPoll();
+}
+
+async function loadNotifications() {
+    if (!authToken) return;
+    try {
+        const data = await apiRequest('/notifications?limit=20', { silent: true });
+        notifItems = (data && data.notifications) || [];
+        notifUnread = (data && data.unread_count) || 0;
+        renderNotifications();
+    } catch (e) { /* transient — keep the last rendered state */ }
+}
+
+async function refreshNotifUnread() {
+    if (!authToken) return;
+    try {
+        const data = await apiRequest('/notifications/unread-count', { silent: true });
+        const n = (data && data.count) || 0;
+        const panelOpen = !!document.querySelector('.notif-menu.active');
+        if (n !== notifUnread || panelOpen) { await loadNotifications(); }  // count moved (or panel open) -> refresh
+        else { updateNotifBadge(); }
+    } catch (e) { /* ignore a transient poll error */ }
+}
+
+function startNotifPoll() {
+    stopNotifPoll();
+    notifPollTimer = setInterval(refreshNotifUnread, 60000);  // unread-count heartbeat
+}
+function stopNotifPoll() {
+    if (notifPollTimer) { clearInterval(notifPollTimer); notifPollTimer = null; }
+}
+
+function updateNotifBadge() {
+    const badge = document.getElementById('notif-badge');
+    if (!badge) return;
+    if (notifUnread > 0) { badge.textContent = notifUnread > 99 ? '99+' : String(notifUnread); badge.hidden = false; }
+    else { badge.hidden = true; }
+}
+
+function renderNotifications() {
+    updateNotifBadge();
+    const list = document.getElementById('notif-list');
+    const empty = document.getElementById('notif-empty');
+    if (!list) return;
+    list.replaceChildren();
+    if (!notifItems.length) { if (empty) empty.style.display = ''; return; }
+    if (empty) empty.style.display = 'none';
+    notifItems.forEach(n => list.appendChild(buildNotifRow(n)));
+}
+
+function buildNotifRow(n) {
+    // Built with createElement + textContent (via _el) so notification title/body — which can carry
+    // another user's name or a file name — is never interpolated as HTML.
+    const row = _el('div', 'notif-item' + (n.is_read ? '' : ' unread'));
+    row.dataset.id = n.id;
+    const body = _el('div', 'notif-item-body');
+    body.appendChild(_el('div', 'notif-item-title', n.title || ''));
+    if (n.body) body.appendChild(_el('div', 'notif-item-text', n.body));
+    const t = parseServerTime(n.created_at);
+    body.appendChild(_el('div', 'notif-item-time', t ? t.toLocaleString() : ''));
+    row.appendChild(body);
+    const x = _el('button', 'notif-item-dismiss'); x.type = 'button'; x.setAttribute('aria-label', 'Dismiss');
+    x.appendChild(_svgIcon('x', 'icon-sm'));
+    x.addEventListener('click', (e) => { e.stopPropagation(); dismissNotif(n.id); });
+    row.appendChild(x);
+    row.addEventListener('click', () => onNotifClick(n));
+    return row;
+}
+
+async function onNotifClick(n) {
+    if (!n.is_read) await markNotifRead(n.id);
+    const section = _NOTIF_TARGET_SECTION[n.target];
+    const menu = document.querySelector('.notif-menu'); if (menu) menu.classList.remove('active');
+    if (section) {
+        const item = document.querySelector('.sidebar-item[data-section="' + section + '"]');
+        if (item) item.click();
+    }
+}
+
+async function markNotifRead(id) {
+    try { await apiRequest('/notifications/' + id + '/read', { method: 'POST', silent: true }); }
+    catch (e) { return; }
+    const it = notifItems.find(x => x.id === id);
+    if (it && !it.is_read) { it.is_read = true; notifUnread = Math.max(0, notifUnread - 1); }
+    renderNotifications();
+}
+
+async function markAllNotifRead() {
+    try { await apiRequest('/notifications/read-all', { method: 'POST', silent: true }); }
+    catch (e) { return; }
+    notifItems.forEach(x => { x.is_read = true; });
+    notifUnread = 0;
+    renderNotifications();
+}
+
+async function dismissNotif(id) {
+    try { await apiRequest('/notifications/' + id, { method: 'DELETE', silent: true }); }
+    catch (e) { return; }
+    const it = notifItems.find(x => x.id === id);
+    if (it && !it.is_read) notifUnread = Math.max(0, notifUnread - 1);
+    notifItems = notifItems.filter(x => x.id !== id);
+    renderNotifications();
+}
+
+// Wipe the bell state on logout so a prior user's notifications never show to the next user on the
+// same tab (mirrors the remembered-vault / monitor scrub in logout()).
+function resetNotifications() {
+    stopNotifPoll();
+    notifItems = []; notifUnread = 0;
+    renderNotifications();
 }
 
 // ============================================================================
@@ -13686,6 +13823,9 @@ async function enterAuthedSession() {
     try { restored = await restoreLastView(); } catch (e) { console.error('Restore failed:', e); }
     if (!restored) loadDashboardStats();
 
+    // Load the notification bell after a refresh too.
+    initNotifications();
+
     // Restrict the sidebar for a scoped temp credential AFTER any restore.
     await loadSessionAccess();
 
@@ -13836,7 +13976,28 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
     }
-    
+
+    // Notification bell toggle (mirrors the profile dropdown)
+    const notifBtn = document.getElementById('notif-btn');
+    const notifMenu = document.getElementById('notif-menu');
+    if (notifBtn && notifMenu) {
+        notifBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const opening = !notifMenu.classList.contains('active');
+            notifMenu.classList.toggle('active');
+            notifBtn.setAttribute('aria-expanded', opening ? 'true' : 'false');
+            if (opening) loadNotifications();  // pull the freshest list when the panel opens
+        });
+        document.addEventListener('click', (e) => {
+            if (!notifMenu.contains(e.target)) {
+                notifMenu.classList.remove('active');
+                notifBtn.setAttribute('aria-expanded', 'false');
+            }
+        });
+        const markAll = document.getElementById('notif-mark-all');
+        if (markAll) markAll.addEventListener('click', (e) => { e.stopPropagation(); markAllNotifRead(); });
+    }
+
     // Dropdown logout button
     const dropdownLogoutBtn = document.getElementById('dropdown-logout-btn');
     if (dropdownLogoutBtn) {
