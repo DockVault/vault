@@ -8711,8 +8711,23 @@ async def list_vault_permissions(
 
         result = db.execute(stmt).fetchall()
 
+        # For a zero-knowledge vault, surface each member's encryption-key status so the UI can show
+        # "Pending encryption key setup" for a member granted access before they created their key
+        # (allowed: the authz membership row exists, but no wrapped DEK can be issued until they have a
+        # keypair). Standard vaults have no per-member keys, so the flag is not applicable there.
+        is_zk = getattr(vault, "type", None) == "zero_knowledge"
+        keyed_user_ids = set()
+        if is_zk and result:
+            from app.core.models import UserKeyPair
+            member_ids = [row.user_id for row in result]
+            keyed_user_ids = {
+                uid for (uid,) in db.query(UserKeyPair.user_id).filter(
+                    UserKeyPair.user_id.in_(member_ids)).all()
+            }
+
         permissions = []
         for row in result:
+            has_key = row.user_id in keyed_user_ids
             permissions.append({
                 "user_id": row.user_id,
                 "username": row.username,
@@ -8721,9 +8736,13 @@ async def list_vault_permissions(
                 "write_permission": row.write_permission,
                 "delete_permission": row.delete_permission,
                 "manage_permission": row.manage_permission,
-                "added_at": row.added_at
+                "added_at": row.added_at,
+                # ZK encryption-key status: null for a standard vault; for a ZK vault, whether the
+                # member has set up their key, and whether they're still pending it.
+                "has_encryption_key": (has_key if is_zk else None),
+                "pending_key_setup": (is_zk and not has_key),
             })
-        
+
         # Use conditional response with ETag
         return handle_conditional_response(request, permissions)
         

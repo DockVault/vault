@@ -29,25 +29,26 @@ def _between(start_marker: str, end_marker: str) -> str:
     return APP_JS[start:end]
 
 
-def test_create_only_public_key_helper_never_unlocks_private_identity_key():
+def test_create_public_key_helper_refuses_keyless_and_never_touches_private_key():
     helper = _between(
         "async function zkEnsurePublicKeyForCreate()",
         '// --- Standalone "set up my encryption key"',
     )
 
-    assert helper.count("apiRequest('/ecc/keys/public'") == 2
-    assert "await zkRegisterNewKeypair()" in helper
-    assert "e.status === 409" in helper
+    # Reads ONLY the public identity endpoint, exactly once (no refetch loop).
+    assert helper.count("apiRequest('/ecc/keys/public'") == 1
 
-    # Both return paths hand back the PUBLIC key and the account id that arrived with it. The
-    # helper used to return the key alone; the account id now travels with it because a version-2
-    # lock stamps the account it was made for, and the only other source is local session state,
-    # which this app does not trust for that. What matters to this contract is unchanged: the
-    # values come from the PUBLIC endpoint's response and nothing else.
+    # The has-keypair path returns the PUBLIC key and the account id that arrived with it (a
+    # version-2 lock stamps the account it was made for), from the PUBLIC endpoint and nothing else.
     assert "pem: pub.public_key" in helper
-    assert "pem: registered.public_key" in helper
     assert "userId: pub.user_id" in helper
-    assert "userId: registered.user_id" in helper
+
+    # REFUSE + GUIDE: a keyless user is NOT silently registered mid-create. Registering there
+    # presented the account encryption-key passphrase prompt at create time, which users confused
+    # with a vault password. The helper now throws a coded, guiding error instead — the encryption
+    # key must be set up deliberately first, via the standalone flow.
+    assert "await zkRegisterNewKeypair()" not in helper
+    assert "zk_no_encryption_key" in helper
 
     # The actual boundary, untouched: this helper must never reach for the private identity key.
     assert "zkEnsureUnlocked" not in helper

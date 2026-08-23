@@ -2761,6 +2761,14 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                 }
                 zkPendingDek = dek;
             } catch (err) {
+                if (err && err.code === 'zk_no_encryption_key') {
+                    // First ZK vault with no encryption key yet: guide the user to set the key up
+                    // deliberately (and open that flow for them), rather than confusing the key
+                    // passphrase with a vault password. Abort this create; they re-create afterward.
+                    showWarning(err.message);
+                    try { openEncryptionKeyModal(); } catch (_) { /* modal optional */ }
+                    return;
+                }
                 showError(isCodedCryptoError(err)
                     ? safeMessageForCode(err.code, 'unlock')
                     : 'Encryption key setup failed.');
@@ -7716,6 +7724,23 @@ async function openVault(vaultId) {
             state.setVaultPassword(password);
         }
 
+        // Zero-knowledge vaults: require the encryption-key unlock BEFORE entering. The unlock used to
+        // be lazy — triggered only when a file with an encrypted name was listed — so an empty ZK
+        // vault (or one holding only legacy-plaintext rows) opened with no passphrase prompt at all,
+        // leaving the user "inside" a vault they never unlocked. Gate it here, mirroring the password
+        // path: zkEnsureUnlocked() prompts + decrypts + verifies against the registered public key,
+        // and throws on cancel / wrong passphrase / mismatch.
+        if (isZkVault(vault)) {
+            try {
+                await zkEnsureUnlocked();
+            } catch (e) {
+                state.currentVault = null;
+                state.currentVaultId = null;
+                showWarning((e && e.message) || 'Vault unlock cancelled');
+                return;
+            }
+        }
+
         // Load vault files — this validates the password. If it fails (wrong /
         // changed password), do NOT show the vault view.
         const loaded = await loadVaultFiles();
@@ -8810,24 +8835,17 @@ async function zkEnsurePublicKeyForCreate() {
         if (!pub.user_id) throw new Error('Your account identity is unavailable.');
         return { pem: pub.public_key, userId: pub.user_id };
     }
-    try {
-        await zkRegisterNewKeypair();
-    } catch (e) {
-        // Race: another tab/device registered first after our initial lookup. The losing browser
-        // must discard its unregistered key and use the winner's public key; it must not fetch the
-        // winner's encrypted private envelope or ask for that unrelated passphrase.
-        if (!(e && e.status === 409)) throw e;
-    }
-    // Refetch after either successful registration or a 409 race. Returning the locally generated
-    // PEM would be wrong in the race and would wrap the new vault to an unregistered, unusable key.
-    const registered = await apiRequest('/ecc/keys/public', { silent: true });
-    if (!registered || !registered.has_keypair || !registered.public_key) {
-        throw new Error('Your registered public key is unavailable.');
-    }
-    // Same check as the branch above. This is the first-registration path, so leaving it off
-    // here would have meant the guard covered everyone except a brand-new user.
-    if (!registered.user_id) throw new Error('Your account identity is unavailable.');
-    return { pem: registered.public_key, userId: registered.user_id };
+    // REFUSE + GUIDE — do NOT silently register a keypair here. Registering mid-vault-create presents
+    // the account encryption-KEY passphrase prompt at the exact moment the user is creating a vault,
+    // so they read it as "the vault's password" and set the two to the same value. The encryption key
+    // is account-level, the only key to every ZK vault, and irrecoverable — it must be set up
+    // deliberately, once, via the profile "Set up encryption key" flow. Refuse here and route them
+    // there; they re-create the vault afterward. (The server also refuses create for a keyless user.)
+    const err = new Error('Set up your encryption key before creating a zero-knowledge vault. Use '
+        + '"Set up encryption key" in your profile menu (top-right), create your key, then create the '
+        + 'vault. Your encryption-key passphrase is NOT the vault password.');
+    err.code = 'zk_no_encryption_key';
+    throw err;
 }
 
 // --- Standalone "set up my encryption key" (account-level, profile menu) ------
@@ -9649,19 +9667,19 @@ async function zkWrapDekForRecipient(dek, recipientPub, transcript) {
 async function zkShareVaultToUser(vaultId, userId) {
     const pk = await apiRequest(`/ecc/users/${userId}/public-key`, { silent: true });
     if (!pk || !pk.has_keypair || !pk.public_key) {
-        // Team-onboarding: a zero-knowledge DEK can't be wrapped for a keyless
-        // recipient, so record an invite (prompts them to set up a key) and report an
-        // actionable message. Best-effort — a failed invite still yields a clear reason.
+        // Team-onboarding: a zero-knowledge DEK can't be wrapped for a keyless recipient yet, so
+        // record an invite (which prompts them to set up a key) and report PENDING — do NOT throw.
+        // The caller still creates the authz membership row (the server permits a keyless member);
+        // the wrapped key follows automatically once the recipient sets up their encryption key.
+        // Best-effort invite: the membership row + pending state stand even if the invite POST fails.
         let invited = false;
         try {
             await apiRequest(`/ecc/vaults/${vaultId}/invites`, {
                 method: 'POST', body: JSON.stringify({ user_id: userId }), silent: true,
             });
             invited = true;
-        } catch (_) { /* fall through to the plain message */ }
-        throw new Error(invited
-            ? "that user hasn't set up an encryption key yet — we've asked them to set one up. Share again once they have."
-            : "that user hasn't set up an encryption key yet, so they can't open a zero-knowledge vault.");
+        } catch (_) { /* the membership row + pending state still stand */ }
+        return { pending: true, invited };
     }
     const recipientPub = await eccLib().importPublicKeyPEM(pk.public_key);
     const keys = await apiRequest(`/ecc/vaults/${vaultId}/keys`, { silent: true });
@@ -9682,7 +9700,7 @@ async function zkShareVaultToUser(vaultId, userId) {
             method: 'POST',
             body: JSON.stringify({ user_id: userId, wrapped_team_privkey: wrappedKey, team_ephemeral_public_key: ephemeralPublicKey }),
         });
-        return;
+        return { pending: false };
     }
     // DIRECT: wrap the DEK straight to the recipient.
     // Pin the DEK to the epoch we already read above. Called with no epoch this refetches
@@ -9710,6 +9728,7 @@ async function zkShareVaultToUser(vaultId, userId) {
             dek_version: shareEpoch != null ? shareEpoch : undefined,
         }),
     });
+    return { pending: false };
 }
 
 // Team-onboarding (recipient side): if a manager has invited this (keyless) user
@@ -11832,9 +11851,15 @@ async function loadVaultPermissions() {
                 : '';
             const addedDate = parseServerTime(perm.added_at);
             const added = (addedDate && !isNaN(addedDate)) ? addedDate.toLocaleDateString() : '—';
+            // ZK vaults: a member granted access before setting up their encryption key holds the
+            // authz row but can't open the vault until they create their key. Flag it so the manager
+            // knows the access is real but not yet usable by that member.
+            const pendingBadge = perm.pending_key_setup
+                ? ` <span class="badge badge-warning" title="Access granted, but this member hasn't set up their encryption key yet — they can't open this zero-knowledge vault until they do.">Pending encryption key setup</span>`
+                : '';
             return `
             <tr>
-                <td>${escapeHtml(perm.username)}</td>
+                <td>${escapeHtml(perm.username)}${pendingBadge}</td>
                 <td>${escapeHtml(perm.email || '-')}</td>
                 <td>
                     <select class="form-control form-control-sm perm-level-select" data-user-id="${perm.user_id}" style="max-width:170px" ${locked ? 'disabled' : ''}>
@@ -12163,14 +12188,24 @@ async function confirmVaultGrant() {
     if (!ids.length) return;
     const zk = isZkVault(state.currentVault);
     const results = await Promise.allSettled(ids.map(async uid => {
-        // Zero-knowledge: re-wrap the DEK to each recipient first (skips the
-        // permission grant for anyone without a keypair, surfaced as a failure).
-        if (zk) await zkShareVaultToUser(state.currentVault.id, uid);
-        return apiRequest(`/vaults/${state.currentVault.id}/permissions`, { method: 'POST', body: JSON.stringify({ user_id: uid, level }) });
+        // Zero-knowledge: try to wrap the DEK to each recipient. A keyless recipient returns
+        // {pending:true} (an invite is recorded) rather than throwing — we STILL create the authz
+        // membership row below (the server permits a keyless member); the wrapped key follows once
+        // they set up their encryption key.
+        let pending = false;
+        if (zk) {
+            const r = await zkShareVaultToUser(state.currentVault.id, uid);
+            pending = !!(r && r.pending);
+        }
+        await apiRequest(`/vaults/${state.currentVault.id}/permissions`, { method: 'POST', body: JSON.stringify({ user_id: uid, level }) });
+        return { pending };
     }));
-    const ok = results.filter(r => r.status === 'fulfilled').length;
-    const failed = results.length - ok;
+    const settled = results.filter(r => r.status === 'fulfilled');
+    const pendingCount = settled.filter(r => r.value && r.value.pending).length;
+    const ok = settled.length - pendingCount;
+    const failed = results.length - settled.length;
     if (ok) showSuccess(`Granted access to ${ok} user(s)`);
+    if (pendingCount) showWarning(`${pendingCount} user(s) added — pending their encryption key setup`);
     if (failed) showError(`${failed} grant(s) failed`);
     closeModal();
     await loadVaultPermissions();
@@ -12662,10 +12697,13 @@ async function handleAddPermission(e) {
     }
     
     try {
-        // For a zero-knowledge vault, re-wrap the DEK to the recipient FIRST so we
-        // never grant access to someone who can't decrypt (throws if they have no key).
+        // Zero-knowledge: wrap the DEK to the recipient. A keyless recipient returns {pending:true}
+        // (an invite is recorded) instead of throwing — we STILL create the membership row below
+        // (the server permits a keyless member); the wrapped key follows once they set up their key.
+        let pending = false;
         if (isZkVault(state.currentVault)) {
-            await zkShareVaultToUser(state.currentVault.id, userId);
+            const r = await zkShareVaultToUser(state.currentVault.id, userId);
+            pending = !!(r && r.pending);
         }
 
         await apiRequest(`/vaults/${state.currentVault.id}/permissions`, {
@@ -12676,11 +12714,15 @@ async function handleAddPermission(e) {
             })
         });
 
-        showSuccess('Permission granted successfully');
+        if (pending) {
+            showWarning('User added — pending their encryption key setup. They can open the vault once they create their encryption key.');
+        } else {
+            showSuccess('Permission granted successfully');
+        }
         closeModal('add-permission-modal');
         document.getElementById('add-permission-form').reset();
         await loadVaultPermissions();
-        
+
     } catch (error) {
         console.error('Failed to add permission:', error);
         showError(error.message || 'Failed to add permission');
