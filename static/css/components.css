@@ -462,6 +462,23 @@
 .email-hint strong { color: var(--text-primary); font-weight: 600; }
 .email-hint code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .92em; background: var(--surface-3); padding: 0 4px; border-radius: var(--radius-sm); }
 
+/* Automated-email (action) rows + the "bound to an action" badge on a template card. */
+.email-action-row { border: 1px solid var(--surface-3); border-radius: var(--radius-md); padding: var(--space-md); margin-bottom: var(--space-sm); background: var(--surface-1); }
+.ear-head { display: flex; align-items: center; gap: var(--space-sm); }
+.ear-name { font-weight: 600; color: var(--text-primary); }
+.ear-badge { font-size: var(--text-xs); padding: 1px 8px; border-radius: 999px; }
+.ear-badge-system { background: color-mix(in srgb, var(--info) 18%, transparent); color: var(--info); }
+.ear-badge-optional { background: var(--surface-3); color: var(--text-secondary); }
+.ear-desc { font-size: var(--text-sm); color: var(--text-secondary); margin: 4px 0 8px; }
+.ear-controls { display: flex; align-items: flex-end; flex-wrap: wrap; gap: var(--space-md); }
+.ear-field { display: flex; flex-direction: column; gap: 2px; font-size: var(--text-xs); color: var(--text-secondary); }
+.ear-template { min-width: 220px; width: auto; }
+.ear-notify { margin: 0; }
+.ear-msg { min-width: 60px; }
+.epc-badge { font-size: var(--text-xs); padding: 1px 7px; border-radius: 999px; margin-left: 6px; }
+.epc-badge-system { background: color-mix(in srgb, var(--info) 18%, transparent); color: var(--info); }
+.epc-badge-inuse { background: var(--surface-3); color: var(--text-secondary); }
+
 /* The editor card must let the dynamic-action dropdown escape (it otherwise clips against the card's
    `overflow:hidden`); the ID beats `.card`. */
 #email-template-editor { overflow: visible; }

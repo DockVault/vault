@@ -6190,7 +6190,7 @@ function setupSettingsTabs() {
             if (tabId === 'logs') { loadLogSettings(); }  // refresh on tab open
             if (tabId === 'sharing') { setupShareTagsUI(); loadShareTags(); }  // wire (idempotent) + refresh
             if (tabId === 'accounts') { setupAccountsPolicyUI(); refreshAccountsPolicyUI(); }  // wire + reflect deps
-            if (tabId === 'email') { loadEmailProfiles(); loadEmailTemplates(); }  // refresh profiles + templates on tab open
+            if (tabId === 'email') { loadEmailProfiles(); loadEmailTemplates(); loadEmailActions(); }  // refresh profiles + templates + actions on tab open
         });
     });
 }
@@ -8032,6 +8032,15 @@ function buildEmailTemplateCard(t) {
     card.className = 'email-profile-card'; card.setAttribute('role', 'listitem'); card.dataset.templateId = t.id;
     const title = document.createElement('div'); title.className = 'epc-title';
     const name = document.createElement('span'); name.textContent = t.name || '(untitled)'; title.appendChild(name);
+    if (t.bound_action) {
+        const isSys = t.bound_action.category === 'system';
+        const badge = document.createElement('span');
+        badge.className = 'epc-badge ' + (isSys ? 'epc-badge-system' : 'epc-badge-inuse');
+        badge.textContent = isSys ? 'System' : 'In use';
+        badge.title = 'Used by the ' + (isSys ? 'system' : 'automated') + ' email “' + t.bound_action.name +
+            '” — change that action first to delete this template.';
+        title.appendChild(badge);
+    }
     card.appendChild(title);
     const desc = document.createElement('div'); desc.className = 'epc-desc'; desc.textContent = t.description || ''; card.appendChild(desc);
     const meta = document.createElement('div'); meta.className = 'epc-meta';
@@ -8043,15 +8052,110 @@ function buildEmailTemplateCard(t) {
     }
     card.appendChild(meta);
     const actions = document.createElement('div'); actions.className = 'epc-actions';
-    for (const [label, cls, fn] of [['Edit', 'etc-edit', () => openTemplateEditor(t)],
-                                    ['Send', 'etc-send', () => openSendModal(t)],
-                                    ['Delete', 'etc-delete', () => deleteTemplate(t)]]) {
+    const rowDefs = [['Edit', 'etc-edit', () => openTemplateEditor(t)],
+                     ['Send', 'etc-send', () => openSendModal(t)]];
+    if (!t.bound_action) rowDefs.push(['Delete', 'etc-delete', () => deleteTemplate(t)]);   // bound = non-removable
+    for (const [label, cls, fn] of rowDefs) {
         const b = document.createElement('button'); b.type = 'button';
         b.className = 'btn btn-secondary btn-sm ' + cls; b.textContent = label;
         b.addEventListener('click', fn); actions.appendChild(b);
     }
     card.appendChild(actions);
     return card;
+}
+
+// ---- Automated emails (actions) ------------------------------------------------------------------
+async function loadEmailActions() {
+    const list = document.getElementById('email-actions-list');
+    if (!list) return;
+    try {
+        const [actions, templates] = await Promise.all([
+            apiRequest('/email/actions', { silent: true }),
+            apiRequest('/email/templates', { silent: true }),
+        ]);
+        renderEmailActions((actions && actions.actions) || [], (templates && templates.templates) || []);
+    } catch (e) { list.replaceChildren(); }
+}
+
+function renderEmailActions(actions, templates) {
+    const list = document.getElementById('email-actions-list');
+    list.replaceChildren();
+    actions.forEach(a => list.appendChild(buildActionRow(a, templates)));
+}
+
+function buildActionRow(a, templates) {
+    const row = document.createElement('div');
+    row.className = 'email-action-row'; row.setAttribute('role', 'listitem'); row.dataset.actionKey = a.key;
+
+    const head = document.createElement('div'); head.className = 'ear-head';
+    const nm = document.createElement('span'); nm.className = 'ear-name'; nm.textContent = a.name; head.appendChild(nm);
+    const badge = document.createElement('span');
+    badge.className = 'ear-badge ' + (a.category === 'system' ? 'ear-badge-system' : 'ear-badge-optional');
+    badge.textContent = a.category === 'system' ? 'System' : 'Optional';
+    head.appendChild(badge);
+    row.appendChild(head);
+
+    const desc = document.createElement('div'); desc.className = 'ear-desc'; desc.textContent = a.description || ''; row.appendChild(desc);
+
+    const controls = document.createElement('div'); controls.className = 'ear-controls';
+    // template picker
+    const tplWrap = document.createElement('label'); tplWrap.className = 'ear-field';
+    tplWrap.appendChild(document.createTextNode('Template'));
+    const sel = document.createElement('select'); sel.className = 'form-control ear-template';
+    const optDefault = document.createElement('option');
+    optDefault.value = '';
+    optDefault.textContent = a.category === 'system' ? 'Built-in default' : '(none — don’t send)';
+    sel.appendChild(optDefault);
+    templates.forEach(t => {
+        const o = document.createElement('option'); o.value = t.id; o.textContent = t.name || '(untitled)';
+        if (a.template_id === t.id) o.selected = true;
+        sel.appendChild(o);
+    });
+    sel.addEventListener('change', () => saveAction(a.key, { template_id: sel.value || null }));
+    tplWrap.appendChild(sel); controls.appendChild(tplWrap);
+
+    // notify toggle (optional actions only)
+    if (a.category !== 'system') {
+        const tog = document.createElement('label'); tog.className = 'checkbox-label ear-notify';
+        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!a.enabled;
+        cb.addEventListener('change', () => saveAction(a.key, { enabled: cb.checked }));
+        tog.appendChild(cb); tog.appendChild(document.createTextNode(' Notify by email'));
+        controls.appendChild(tog);
+    }
+
+    const test = document.createElement('button'); test.type = 'button';
+    test.className = 'btn btn-secondary btn-sm ear-test'; test.textContent = '📧 Send test';
+    test.addEventListener('click', () => testAction(a.key, row));
+    controls.appendChild(test);
+
+    const msg = document.createElement('span'); msg.className = 'ear-msg text-sm'; msg.setAttribute('role', 'status'); controls.appendChild(msg);
+    row.appendChild(controls);
+    return row;
+}
+
+async function saveAction(key, patch) {
+    try {
+        await apiRequest('/email/actions/' + encodeURIComponent(key), { method: 'PUT', body: JSON.stringify(patch) });
+        await loadEmailActions();          // reflect the new binding + re-badge templates
+        await loadEmailTemplates();
+    } catch (e) {
+        showError((e && e.message) || 'Could not update the automated email.');
+        await loadEmailActions();          // revert the control to the stored state
+    }
+}
+
+async function testAction(key, row) {
+    const msg = row.querySelector('.ear-msg');
+    const to = prompt('Send a test of this email to which address?');
+    if (to === null) return;
+    if (msg) { msg.textContent = 'Sending…'; msg.style.color = 'var(--text-secondary)'; }
+    try {
+        const r = await apiRequest('/email/actions/' + encodeURIComponent(key) + '/test',
+            { method: 'POST', body: JSON.stringify({ to_addr: (to || '').trim() }) });
+        if (msg) { msg.textContent = '✓ ' + ((r && r.message) || 'Test sent'); msg.style.color = 'var(--success)'; }
+    } catch (e) {
+        if (msg) { msg.textContent = '✗ ' + ((e && e.message) || 'Test failed'); msg.style.color = 'var(--error)'; }
+    }
 }
 
 async function openTemplateEditor(t) {

@@ -10,7 +10,7 @@
     <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
     <link rel="apple-touch-icon" href="/static/assets/logo.png?v=1">
     <link rel="stylesheet" href="/static/css/theme.css?v=20260822a">
-    <link rel="stylesheet" href="/static/css/components.css?v=20260823e">
+    <link rel="stylesheet" href="/static/css/components.css?v=20260824a">
     <link rel="stylesheet" href="/static/css/utilities.css?v=20251015c">
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-sans-500.woff2" crossorigin>
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-mono-500.woff2" crossorigin>
@@ -1437,6 +1437,15 @@
                             <div class="p-lg">
                                 <div class="email-hint">Author HTML emails that send through a chosen profile. Insert images from your resource folder and personalization tokens; the preview renders exactly what recipients receive.</div>
                                 <div id="email-templates-grid" class="email-card-grid" role="list" aria-label="Email templates"></div>
+                            </div>
+                        </div>
+
+                        <!-- ============ Automated emails (actions) ============ -->
+                        <div class="card mt-lg">
+                            <div class="card-header"><h3>Automated emails</h3></div>
+                            <div class="p-lg">
+                                <div class="email-hint">These are the emails the vault sends automatically. <strong>System</strong> emails always send and use a built-in template until you choose your own; <strong>optional</strong> ones send only when you turn on <em>Notify by email</em>. Pick a template per action — delivery and personalization are handled for you.</div>
+                                <div id="email-actions-list" role="list" aria-label="Automated emails"></div>
                             </div>
                         </div>
 
