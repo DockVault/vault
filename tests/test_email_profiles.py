@@ -104,6 +104,25 @@ def test_password_is_write_only(admin, clean_profiles):
     assert secret not in r2.text
 
 
+def test_test_send_wont_pair_stored_password_with_a_new_host(admin, clean_profiles):
+    """The write-only SMTP password must not be reusable against a caller-changed connection target:
+    that would let an admin exfiltrate the stored credential to an attacker-controlled host."""
+    p = admin.post("/email/profiles", json=_valid_profile(
+        smtp_server="smtp.example.com", smtp_port=587, smtp_username="u@example.com",
+        smtp_password="Stored-SMTP-Pw-99")).json()
+    # Change the host, supply NO password -> refused before any connection is attempted.
+    r = admin.post("/email/profiles/test", json={
+        "profile_id": p["id"], "smtp_server": "attacker.example", "to_addr": "x@example.com"})
+    assert r.status_code == 400, r.text
+    assert "re-enter" in (r.json().get("detail") or "").lower()
+    # Supplying a FRESH password passes the guard (then fails later as an ordinary transport error,
+    # never the re-enter guard) — so a legitimate "test against a different server" still works.
+    r2 = admin.post("/email/profiles/test", json={
+        "profile_id": p["id"], "smtp_server": "attacker.invalid", "smtp_password": "fresh-pw",
+        "to_addr": "x@example.com"})
+    assert "re-enter" not in (r2.json().get("detail") or "").lower()
+
+
 def test_single_default_is_enforced(admin, clean_profiles):
     a = admin.post("/email/profiles", json=_valid_profile(name="A")).json()
     b = admin.post("/email/profiles", json=_valid_profile(name="B", is_default=True)).json()

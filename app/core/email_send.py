@@ -12,6 +12,7 @@ library + SQLAlchemy models, so it stays importable without FastAPI.
 from __future__ import annotations
 
 import smtplib
+import ssl
 from email.message import EmailMessage
 from typing import Optional
 
@@ -155,12 +156,17 @@ def smtp_send(cfg: dict, msg: EmailMessage) -> None:
     username = (cfg.get("smtp_username") or "").strip()
     password = cfg.get("smtp_password") or ""
     try:
-        server = smtplib.SMTP_SSL(host, port, timeout=15) if port == 465 else smtplib.SMTP(host, port, timeout=15)
+        # Verify the server's TLS certificate (create_default_context => check_hostname + CERT_REQUIRED)
+        # on BOTH implicit-TLS (465) and STARTTLS, so an active on-path attacker can't present a forged
+        # cert and capture the SMTP credentials / mail. smtplib's default context does NOT verify.
+        tls_ctx = ssl.create_default_context()
+        server = (smtplib.SMTP_SSL(host, port, timeout=15, context=tls_ctx)
+                  if port == 465 else smtplib.SMTP(host, port, timeout=15))
         with server:
             server.ehlo()
             encrypted = port == 465
             if port != 465 and server.has_extn("starttls"):
-                server.starttls()
+                server.starttls(context=tls_ctx)
                 server.ehlo()
                 encrypted = True
             if username and not encrypted:
@@ -206,12 +212,15 @@ def smtp_send_batch(cfg: dict, messages: list) -> list:
     password = cfg.get("smtp_password") or ""
     results = [{"ok": False, "error": "not attempted"} for _ in messages]
     try:
-        server = smtplib.SMTP_SSL(host, port, timeout=30) if port == 465 else smtplib.SMTP(host, port, timeout=30)
+        # Verify the server's TLS certificate on both implicit-TLS (465) and STARTTLS (see smtp_send).
+        tls_ctx = ssl.create_default_context()
+        server = (smtplib.SMTP_SSL(host, port, timeout=30, context=tls_ctx)
+                  if port == 465 else smtplib.SMTP(host, port, timeout=30))
         with server:
             server.ehlo()
             encrypted = port == 465
             if port != 465 and server.has_extn("starttls"):
-                server.starttls()
+                server.starttls(context=tls_ctx)
                 server.ehlo()
                 encrypted = True
             if username and not encrypted:

@@ -20,8 +20,9 @@ class _FakeSMTP:
     """Records the connect/ehlo/starttls/login/send sequence. Configurable failure injection."""
     last = None
 
-    def __init__(self, host, port, timeout=None):
+    def __init__(self, host, port, timeout=None, context=None):
         self.host, self.port = host, port
+        self.tls_context = context          # SMTP_SSL now passes a verifying ssl context
         self.starttls_called = False
         self.logged_in = None
         self.sent = []
@@ -46,6 +47,7 @@ class _FakeSMTP:
 
     def starttls(self, *a, **k):
         self.starttls_called = True
+        self.starttls_context = k.get("context")
 
     def login(self, user, password):
         if self.login_exc:
@@ -97,10 +99,30 @@ def test_starttls_used_then_login_when_advertised(fake_smtp):
     assert fake_smtp.last.logged_in == ("u", "p")
 
 
+def test_implicit_tls_uses_verifying_context(fake_smtp):
+    import ssl as _ssl
+    cfg = _cfg(smtp_port=465, smtp_username="u", smtp_password="p")
+    es.smtp_send(cfg, _msg(cfg))
+    ctx = fake_smtp.last.tls_context
+    assert isinstance(ctx, _ssl.SSLContext), "SMTP_SSL must be given an ssl context"
+    assert ctx.check_hostname is True and ctx.verify_mode == _ssl.CERT_REQUIRED, \
+        "implicit-TLS (465) must verify the server certificate"
+
+
+def test_starttls_uses_verifying_context(fake_smtp):
+    import ssl as _ssl
+    cfg = _cfg(smtp_port=587, smtp_username="u", smtp_password="p")
+    es.smtp_send(cfg, _msg(cfg))
+    ctx = getattr(fake_smtp.last, "starttls_context", None)
+    assert isinstance(ctx, _ssl.SSLContext), "starttls() must be given an ssl context"
+    assert ctx.check_hostname is True and ctx.verify_mode == _ssl.CERT_REQUIRED, \
+        "STARTTLS must verify the server certificate"
+
+
 def test_starttls_strip_defense_refuses_login_over_cleartext(fake_smtp):
     cfg = _cfg(smtp_port=587, smtp_username="u", smtp_password="p")
     # Server does NOT advertise STARTTLS -> credentials must not be sent.
-    def _no_starttls(host, port, timeout=None):
+    def _no_starttls(host, port, timeout=None, context=None):
         inst = _FakeSMTP(host, port, timeout)
         inst.extns = set()
         return inst
@@ -122,7 +144,7 @@ def test_no_login_without_username(fake_smtp):
 def test_auth_error_maps_to_auth_category(fake_smtp):
     cfg = _cfg(smtp_port=465, smtp_username="u", smtp_password="bad")
     orig = smtplib.SMTP_SSL
-    def _mk(host, port, timeout=None):
+    def _mk(host, port, timeout=None, context=None):
         inst = orig(host, port, timeout)
         inst.login_exc = smtplib.SMTPAuthenticationError(535, b"nope")
         return inst
@@ -135,7 +157,7 @@ def test_auth_error_maps_to_auth_category(fake_smtp):
 def test_transport_error_message_is_generic(fake_smtp):
     cfg = _cfg(smtp_port=465)
     orig = smtplib.SMTP_SSL
-    def _mk(host, port, timeout=None):
+    def _mk(host, port, timeout=None, context=None):
         inst = orig(host, port, timeout)
         inst.send_exc = ConnectionRefusedError("Connection refused to 10.0.0.1:22")
         return inst
@@ -179,7 +201,7 @@ def test_batch_sends_all_over_one_connection(fake_smtp):
 
 def test_batch_per_message_failure_is_isolated(fake_smtp):
     cfg = _cfg(smtp_port=465)
-    def _mk(host, port, timeout=None):
+    def _mk(host, port, timeout=None, context=None):
         inst = _FakeSMTP(host, port, timeout)
         inst.fail_send_indices = {1}                # only the 2nd recipient fails
         return inst
@@ -191,7 +213,7 @@ def test_batch_per_message_failure_is_isolated(fake_smtp):
 
 def test_batch_connect_failure_raises(fake_smtp):
     cfg = _cfg(smtp_port=465)
-    def _mk(host, port, timeout=None):
+    def _mk(host, port, timeout=None, context=None):
         raise ConnectionRefusedError("nope")
     smtplib.SMTP_SSL = _mk
     with pytest.raises(es.EmailSendError) as ei:

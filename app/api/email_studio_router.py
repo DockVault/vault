@@ -323,9 +323,13 @@ async def test_profile(payload: ProfileTestIn, request: Request,
         cfg = {"smtp_server": p.smtp_server, "smtp_port": p.smtp_port,
                "smtp_username": p.smtp_username or "", "smtp_password": p.smtp_password or "",
                "from_email": p.from_email, "from_name": p.from_name or ""}
+        stored_target = ((p.smtp_server or ""), int(p.smtp_port or 587), (p.smtp_username or ""))
+        stored_has_password = bool(p.smtp_password)
     else:
         cfg = {"smtp_server": "", "smtp_port": 587, "smtp_username": "",
                "smtp_password": "", "from_email": "", "from_name": ""}
+        stored_target = None
+        stored_has_password = False
     # Overlay any fields the caller provided (edited-but-unsaved values); password only when non-empty.
     for field in ("smtp_server", "smtp_port", "smtp_username", "from_email", "from_name"):
         val = getattr(payload, field)
@@ -333,6 +337,21 @@ async def test_profile(payload: ProfileTestIn, request: Request,
             cfg[field] = val
     if payload.smtp_password:
         cfg["smtp_password"] = payload.smtp_password
+
+    # SECURITY: never pair the STORED (write-only) SMTP password with a caller-CHANGED connection
+    # target. Overlaying only smtp_server/port/username while reusing the saved password would let an
+    # admin exfiltrate the profile's password (which no GET ever returns) to an attacker-chosen host.
+    # If the target changed and no fresh password was supplied, refuse — the tester must re-enter it.
+    if stored_target is not None and stored_has_password and not payload.smtp_password:
+        try:
+            eff_port = int(cfg.get("smtp_port") or 587)
+        except (TypeError, ValueError):
+            eff_port = 587
+        eff_target = ((cfg.get("smtp_server") or ""), eff_port, (cfg.get("smtp_username") or ""))
+        if eff_target != stored_target:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Re-enter the SMTP password to test against a different server, port, or username.")
 
     to_addr = (payload.to_addr or "").strip() or (admin.email or "").strip() or (cfg.get("from_email") or "").strip()
     if not to_addr:
