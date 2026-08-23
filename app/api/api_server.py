@@ -2534,13 +2534,11 @@ def _username_email_collision(db: Session):
 
 
 def _smtp_configured(db: Session) -> bool:
-    """True when the deployment can send mail — an SMTP server and a From address are set in the
-    stored settings (same signal send_test_email checks). Gates turning ON email-change
-    verification, which relies on emailing a one-time code."""
-    from app.core.models import SystemSetting
-    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
-    cfg = dict(row.value) if row and row.value else {}
-    return bool((cfg.get("smtp_server") or "").strip() and (cfg.get("from_email") or "").strip())
+    """True when the deployment can send mail — the default sending profile (or, until a profile
+    exists, the legacy global SMTP config) has an SMTP server and a From address. Gates turning ON
+    email-change verification, which relies on emailing a one-time code."""
+    from app.core import email_send
+    return email_send.smtp_configured(db)
 
 
 def _email_change_requires_verification(db: Session) -> bool:
@@ -2579,64 +2577,22 @@ def _invite_pepper() -> str:
 
 
 def _send_email(db: Session, *, to_addr: str, subject: str, body: str) -> None:
-    """Send one plaintext email using the stored SMTP settings, raising a CLEAN HTTPException
-    (400/502) on any failure — never a 500, never surfacing the SMTP password. Mirrors the
-    connect / STARTTLS-strip-defense / login / send sequence of /settings/test-email (its sibling);
-    keep the two in step if either changes."""
-    import smtplib
-    from email.message import EmailMessage
-    from app.core.models import SystemSetting
-
-    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
-    cfg = dict(row.value) if row and row.value else {}
-    host = (cfg.get("smtp_server") or "").strip()
-    from_email = (cfg.get("from_email") or "").strip()
-    if not host or not from_email:
+    """Send one plaintext email through the default sending profile (or the legacy global SMTP
+    config until a profile exists), raising a CLEAN HTTPException (400/502) on any failure — never a
+    500, never surfacing the SMTP password. The connect / STARTTLS-strip-defense / login / send
+    sequence lives in app.core.email_send, shared with the Email Studio."""
+    from app.core import email_send
+    cfg = email_send.resolve_default_config(db)
+    if not cfg:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="SMTP is not configured. Set the SMTP server and From address in Settings → Email first.")
+            detail="Email is not configured. Add a sending profile in Settings → Email first.")
     try:
-        port = int(cfg.get("smtp_port") or 587)
-    except (TypeError, ValueError):
-        port = 587
-    username = (cfg.get("smtp_username") or "").strip()
-    password = cfg.get("smtp_password") or ""
-    from_name = (cfg.get("from_name") or "").strip()
-    try:
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = f"{from_name} <{from_email}>" if from_name else from_email
-        msg["To"] = to_addr
-        msg.set_content(body)
-        if port == 465:
-            server = smtplib.SMTP_SSL(host, port, timeout=15)
-        else:
-            server = smtplib.SMTP(host, port, timeout=15)
-        with server:
-            server.ehlo()
-            encrypted = port == 465
-            if port != 465 and server.has_extn("starttls"):
-                server.starttls()
-                server.ehlo()
-                encrypted = True
-            if username and not encrypted:
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail="The SMTP server does not offer STARTTLS; refusing to send credentials over an unencrypted connection.")
-            if username:
-                server.login(username, password)
-            server.send_message(msg)
-    except smtplib.SMTPAuthenticationError:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
-                            detail="SMTP authentication failed — check the username and password.")
-    except (ValueError, UnicodeError) as e:
-        print(f"email send config invalid: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                            detail="The SMTP configuration is invalid — check the server address and the From name/address.")
-    except (smtplib.SMTPException, OSError) as e:
-        print(f"email send failed: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
-                            detail="Could not send the email — check the SMTP server, port, and TLS settings.")
+        msg = email_send.build_message(cfg, to_addr=to_addr, subject=subject, text_body=body)
+        email_send.smtp_send(cfg, msg)
+    except email_send.EmailSendError as e:
+        code = status.HTTP_400_BAD_REQUEST if e.category == "config" else status.HTTP_502_BAD_GATEWAY
+        raise HTTPException(status_code=code, detail=e.message)
 
 
 def _validate_settings_payload(payload: dict, db: Session) -> None:
@@ -13475,6 +13431,20 @@ def _backfill_default_permissions():
         print(f"⚠ Permission backfill skipped: {e}")
 
 
+def _seed_default_email_profile():
+    """Import the legacy global SMTP config into a default sending profile on first boot after this
+    feature lands (idempotent — a no-op once any profile exists), so system mail and the Email Studio
+    start from the config the deployment already had."""
+    try:
+        from app.core.database import get_db_context
+        from app.core import email_send
+        with get_db_context() as db:
+            if email_send.seed_default_profile(db):
+                print("[OK] Seeded default email sending profile from legacy SMTP config")
+    except Exception as e:
+        print(f"⚠ Default email profile seed skipped: {e}")
+
+
 def _app_version():
     """The running version, or None. Never raises: this is provenance on a bookkeeping row."""
     try:
@@ -14163,7 +14133,8 @@ async def lifespan(app: FastAPI):
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
     _seed_admin_user()
     _backfill_default_permissions()
-    
+    _seed_default_email_profile()
+
     # Start background task for session cleanup
     cleanup_task = asyncio.create_task(cleanup_expired_sessions())
     print("[OK] Session cleanup task started")

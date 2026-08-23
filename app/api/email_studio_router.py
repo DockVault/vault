@@ -10,13 +10,21 @@ template, resource, and sending endpoints fill in the rest of the CRUD.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import re
+import uuid
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.models import RoleEnum, User
-from app.core import email_sanitize
+from app.core.models import EmailProfile, RoleEnum, User
+from app.core import email_sanitize, email_send
+from app.core.rate_limiter import rate_limiter as _rate_limiter
+from app.services.audit_logger import AuditLogger
 
 security_scheme = HTTPBearer()
 
@@ -87,3 +95,242 @@ async def list_dynamic_actions(
             for a in email_sanitize.DYNAMIC_ACTIONS
         ]
     }
+
+
+# --------------------------------------------------------------------------------------------------
+# Sending profiles
+# --------------------------------------------------------------------------------------------------
+
+# A control character in a header field is a header-injection vector; reject at save time (the
+# message builder would also reject it, but a clean 400 on save is friendlier than a failed send).
+_CTRL_RE = re.compile(r"[\r\n\x00-\x1f\x7f]")
+
+
+class ProfileIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=255)
+    smtp_server: str = Field(min_length=1, max_length=255)
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_username: Optional[str] = Field(default=None, max_length=255)
+    # Write-only: on update, an omitted or empty value keeps the stored password.
+    smtp_password: Optional[str] = None
+    from_email: str = Field(min_length=3, max_length=255)
+    from_name: Optional[str] = Field(default=None, max_length=120)
+    is_default: Optional[bool] = None
+
+
+class ProfileTestIn(BaseModel):
+    """Send a test WITHOUT saving. With profile_id, tests that saved profile (its stored password is
+    used when the password field is left blank); the other fields overlay it, so an edited-but-unsaved
+    profile can be tested. Without profile_id, tests a brand-new unsaved profile from these fields."""
+    profile_id: Optional[uuid.UUID] = None
+    smtp_server: Optional[str] = None
+    smtp_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    smtp_username: Optional[str] = None
+    smtp_password: Optional[str] = None
+    from_email: Optional[str] = None
+    from_name: Optional[str] = None
+    to_addr: Optional[str] = None
+
+
+def _validate_profile_fields(p: ProfileIn) -> None:
+    for label, value in (("name", p.name), ("From name", p.from_name),
+                         ("From address", p.from_email), ("SMTP server", p.smtp_server),
+                         ("SMTP username", p.smtp_username)):
+        if value and _CTRL_RE.search(value):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"{label} contains invalid control characters.")
+    if "@" not in (p.from_email or "") or (p.from_email or "").strip() != p.from_email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="From address must be a valid email address.")
+
+
+def _profile_out(p: EmailProfile) -> dict:
+    """Serialize a profile — NEVER including the password (only a boolean 'has_password' hint)."""
+    return {
+        "id": str(p.id),
+        "name": p.name,
+        "description": p.description,
+        "smtp_server": p.smtp_server,
+        "smtp_port": p.smtp_port,
+        "smtp_username": p.smtp_username,
+        "from_email": p.from_email,
+        "from_name": p.from_name,
+        "is_default": p.is_default,
+        "has_password": bool(p.smtp_password),
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+    }
+
+
+def _client_ip(request: Request) -> Optional[str]:
+    from app.api.api_server import get_client_ip
+    return get_client_ip(request)
+
+
+def _audit(db: Session, request: Request, user: User, action: str, **details) -> None:
+    try:
+        AuditLogger(db).log_action(action=action, status="success", user=user,
+                                   ip_address=_client_ip(request), details=details or None)
+    except Exception:
+        pass  # never fail the operation because the audit write did
+
+
+@router.get("/profiles")
+async def list_profiles(db: Session = Depends(get_db)):
+    """All sending profiles, default first then newest, passwords stripped."""
+    rows = (db.query(EmailProfile)
+            .order_by(EmailProfile.is_default.desc(), EmailProfile.created_at.desc())
+            .all())
+    return {"profiles": [_profile_out(p) for p in rows]}
+
+
+@router.post("/profiles", status_code=status.HTTP_201_CREATED)
+async def create_profile(payload: ProfileIn, request: Request,
+                         admin: User = Depends(require_interactive_admin),
+                         db: Session = Depends(get_db)):
+    _validate_profile_fields(payload)
+    # The first profile is always the default; otherwise honor the flag. Clearing any existing
+    # default first keeps the partial-unique index satisfied within one transaction.
+    make_default = bool(payload.is_default) or db.query(EmailProfile.id).first() is None
+    if make_default:
+        db.query(EmailProfile).filter(EmailProfile.is_default.is_(True)).update(
+            {"is_default": False}, synchronize_session=False)
+    p = EmailProfile(
+        name=payload.name.strip(),
+        description=(payload.description or "").strip() or None,
+        smtp_server=payload.smtp_server.strip(),
+        smtp_port=payload.smtp_port,
+        smtp_username=(payload.smtp_username or "").strip() or None,
+        smtp_password=(payload.smtp_password or None),
+        from_email=payload.from_email.strip(),
+        from_name=(payload.from_name or "").strip() or None,
+        is_default=make_default,
+    )
+    db.add(p)
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two admins set a default concurrently; the partial-unique index rejected the second.
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="Another default profile was set at the same time; please retry.")
+    db.refresh(p)
+    _audit(db, request, admin, "email_profile_created", profile_id=str(p.id), name=p.name)
+    return _profile_out(p)
+
+
+@router.put("/profiles/{profile_id}")
+async def update_profile(profile_id: uuid.UUID, payload: ProfileIn, request: Request,
+                         admin: User = Depends(require_interactive_admin),
+                         db: Session = Depends(get_db)):
+    p = db.get(EmailProfile, profile_id)
+    if p is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
+    _validate_profile_fields(payload)
+    p.name = payload.name.strip()
+    p.description = (payload.description or "").strip() or None
+    p.smtp_server = payload.smtp_server.strip()
+    p.smtp_port = payload.smtp_port
+    p.smtp_username = (payload.smtp_username or "").strip() or None
+    p.from_email = payload.from_email.strip()
+    p.from_name = (payload.from_name or "").strip() or None
+    # Write-only password: overwrite ONLY when a non-empty value is supplied.
+    if payload.smtp_password:
+        p.smtp_password = payload.smtp_password
+    if payload.is_default is True and not p.is_default:
+        db.query(EmailProfile).filter(EmailProfile.is_default.is_(True),
+                                      EmailProfile.id != p.id).update(
+            {"is_default": False}, synchronize_session=False)
+        p.is_default = True
+    elif payload.is_default is False and p.is_default:
+        p.is_default = False
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="Another default profile was set at the same time; please retry.")
+    db.refresh(p)
+    _audit(db, request, admin, "email_profile_updated", profile_id=str(p.id), name=p.name)
+    return _profile_out(p)
+
+
+@router.delete("/profiles/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_profile(profile_id: uuid.UUID, request: Request,
+                         admin: User = Depends(require_interactive_admin),
+                         db: Session = Depends(get_db)):
+    p = db.get(EmailProfile, profile_id)
+    if p is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
+    name = p.name
+    was_default = p.is_default
+    db.delete(p)  # templates referencing it have profile_id set to NULL (FK ondelete=SET NULL)
+    db.flush()    # apply the delete before choosing a replacement default (partial-index safe)
+    promoted = None
+    if was_default:
+        # Don't strand system mail: promote the oldest remaining profile to default so a good
+        # profile keeps driving system mail instead of silently falling back to the legacy config.
+        promoted = (db.query(EmailProfile)
+                    .order_by(EmailProfile.created_at, EmailProfile.id).first())
+        if promoted is not None:
+            promoted.is_default = True
+    db.commit()
+    _audit(db, request, admin, "email_profile_deleted", profile_id=str(profile_id), name=name,
+           promoted_default=str(promoted.id) if promoted else None)
+
+
+@router.post("/profiles/test")
+async def test_profile(payload: ProfileTestIn, request: Request,
+                       admin: User = Depends(require_interactive_admin),
+                       db: Session = Depends(get_db)):
+    """Send a one-off test email through a profile's config WITHOUT saving anything."""
+    allowed, _, reset = _rate_limiter.check_rate_limit(
+        identifier=str(admin.id), limit=5, window=60, prefix="email_profile_test", fail_open=False)
+    if not allowed:
+        import time as _t
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many test emails; please wait a moment.",
+                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+
+    if payload.profile_id is not None:
+        p = db.get(EmailProfile, payload.profile_id)
+        if p is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
+        cfg = {"smtp_server": p.smtp_server, "smtp_port": p.smtp_port,
+               "smtp_username": p.smtp_username or "", "smtp_password": p.smtp_password or "",
+               "from_email": p.from_email, "from_name": p.from_name or ""}
+    else:
+        cfg = {"smtp_server": "", "smtp_port": 587, "smtp_username": "",
+               "smtp_password": "", "from_email": "", "from_name": ""}
+    # Overlay any fields the caller provided (edited-but-unsaved values); password only when non-empty.
+    for field in ("smtp_server", "smtp_port", "smtp_username", "from_email", "from_name"):
+        val = getattr(payload, field)
+        if val is not None:
+            cfg[field] = val
+    if payload.smtp_password:
+        cfg["smtp_password"] = payload.smtp_password
+
+    to_addr = (payload.to_addr or "").strip() or (admin.email or "").strip() or (cfg.get("from_email") or "").strip()
+    if not to_addr:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="No recipient address — set a From address or a recipient.")
+    # The recipient and any overlaid header fields skip the create/update validation, so guard them
+    # here too — a clean 400 rather than relying solely on the message builder (belt-and-suspenders).
+    for label, value in (("Recipient", to_addr), ("From address", cfg.get("from_email")),
+                         ("From name", cfg.get("from_name")), ("SMTP server", cfg.get("smtp_server"))):
+        if value and _CTRL_RE.search(str(value)):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"{label} contains invalid control characters.")
+    try:
+        msg = email_send.build_message(
+            cfg, to_addr=to_addr, subject="DockVault test email",
+            text_body=("This is a test email from your vault's email configuration.\n"
+                       "If you received it, outbound email delivery is working."))
+        email_send.smtp_send(cfg, msg)
+    except email_send.EmailSendError as e:
+        code = status.HTTP_400_BAD_REQUEST if e.category == "config" else status.HTTP_502_BAD_GATEWAY
+        raise HTTPException(status_code=code, detail=e.message)
+    _audit(db, request, admin, "email_profile_test_sent", to=to_addr,
+           profile_id=str(payload.profile_id) if payload.profile_id else None)
+    return {"message": f"Test email sent to {to_addr}"}
