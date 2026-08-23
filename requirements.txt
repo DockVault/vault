@@ -43,5 +43,11 @@ bcrypt==5.0.0
 PyJWT==2.13.0
 keyring==25.7.0
 
+# HTML sanitization for admin-authored email templates. nh3 is a Rust ammonia binding: an
+# allowlist sanitizer applied on save AND before send, so no active content can be stored or
+# mailed. Ships cp38-abi3 musllinux + manylinux wheels, so the alpine image installs a wheel
+# (no compiler) on both amd64 and arm64.
+nh3==0.3.6
+
 # NOTE: `requests` was removed — the only outbound HTTP is a stdlib-urllib localhost /health probe.
 # (The test suite's own `requests` dependency lives in tests/requirements-test.txt, not in the image.)

@@ -622,6 +622,10 @@ from app.config.effective import BRAND_SETTINGS_KEY, set_brand_overrides
 from app.api.ecc_router import router as ecc_router
 app.include_router(ecc_router, prefix="/ecc")
 
+# Import and include Email Studio router (SMTP profiles / HTML templates / image resources)
+from app.api.email_studio_router import router as email_studio_router
+app.include_router(email_studio_router, prefix="/email")
+
 @app.get("/download-sw.js", include_in_schema=False)
 async def download_service_worker():
     """The streaming-download sink, served from the ORIGIN ROOT rather than /static/js/.

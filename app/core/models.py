@@ -9,7 +9,7 @@ import uuid
 
 from sqlalchemy import (
     Column, String, Integer, Boolean, DateTime, ForeignKey,
-    Text, BigInteger, Enum, Table, JSON, Index, CheckConstraint, UniqueConstraint, text
+    Text, BigInteger, LargeBinary, Enum, Table, JSON, Index, CheckConstraint, UniqueConstraint, text
 )
 from sqlalchemy.orm import relationship, declarative_base, backref
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -1720,4 +1720,118 @@ class SchemaStep(Base):
     __table_args__ = (
         # The only question health asks: is anything currently failed.
         Index('idx_schema_steps_outcome', 'outcome'),
+    )
+
+
+# ============================================================================
+# Email Studio (admin-authored SMTP profiles, HTML templates, image resources)
+# ============================================================================
+#
+# Three WHOLE NEW tables, deliberately (mirrors UserPreference's reasoning): init_db() only runs
+# create_all(), which creates missing tables but never ALTERs existing ones, so new tables migrate
+# cleanly onto already-deployed vaults.
+#
+# NOTE: as of this change the vault's own system mail (email-change verification) still reads the
+# legacy single SMTP config in SystemSetting('global'); it is NOT yet repointed at EmailProfile.
+# The follow-up that adds the profiles API also seeds a default EmailProfile from that legacy
+# config and switches the system-mail path over — until then there is intentionally no default
+# profile row, and nothing here depends on one.
+
+class EmailProfile(Base):
+    """One SMTP sender identity: server/credentials + a From address the admin can name.
+
+    ``smtp_password`` is write-only at the API boundary (never returned by any GET; an update that
+    omits it keeps the stored value), matching the existing settings behavior. Exactly one profile
+    may be ``is_default`` — the one the vault's own system mail (email-change verification) uses.
+    """
+    __tablename__ = 'email_profiles'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(120), nullable=False)
+    description = Column(String(255), nullable=True)
+    smtp_server = Column(String(255), nullable=False, default='')
+    smtp_port = Column(Integer, nullable=False, default=587)
+    smtp_username = Column(String(255), nullable=True)
+    # Stored server-side; stripped from every read. Not the crown-jewel secret the deployment key
+    # protects, but it is never emitted to a client.
+    smtp_password = Column(Text, nullable=True)
+    from_email = Column(String(255), nullable=False, default='')
+    from_name = Column(String(120), nullable=True)
+    is_default = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, nullable=False,
+                        server_default=text("(now() AT TIME ZONE 'utc')"),
+                        default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False,
+                        server_default=text("(now() AT TIME ZONE 'utc')"),
+                        default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    templates = relationship("EmailTemplate", back_populates="profile", passive_deletes=True)
+
+    __table_args__ = (
+        # At most one default profile, enforced at the schema level by a PARTIAL unique index over
+        # the rows where is_default is true (the same create_all-portable pattern this file already
+        # uses for the case-insensitive name/email uniqueness above). The application write path
+        # still clear-then-sets within one transaction, but the DB is the backstop against a concurrent
+        # or buggy writer creating two defaults — so "the default profile" is always well-defined.
+        Index('idx_email_profile_default', 'is_default',
+              unique=True, postgresql_where=text('is_default')),
+    )
+
+
+class EmailTemplate(Base):
+    """An admin-authored HTML email: a subject + a sanitized body, sent through a chosen profile.
+
+    ``body_html`` is ALWAYS the output of email_sanitize.sanitize_email_html — nothing else is ever
+    persisted here. Images inside it are referenced only by ``<img data-resource-id="UUID">``.
+    """
+    __tablename__ = 'email_templates'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(120), nullable=False)
+    description = Column(String(255), nullable=True)
+    profile_id = Column(UUID(as_uuid=True),
+                        ForeignKey('email_profiles.id', ondelete='SET NULL'), nullable=True)
+    subject = Column(String(255), nullable=False, default='')
+    body_html = Column(Text, nullable=False, default='')
+    created_by = Column(UUID(as_uuid=True),
+                        ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    updated_by = Column(UUID(as_uuid=True),
+                        ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = Column(DateTime, nullable=False,
+                        server_default=text("(now() AT TIME ZONE 'utc')"),
+                        default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False,
+                        server_default=text("(now() AT TIME ZONE 'utc')"),
+                        default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    profile = relationship("EmailProfile", back_populates="templates")
+
+    __table_args__ = (
+        Index('idx_email_template_profile', 'profile_id'),
+    )
+
+
+class EmailResource(Base):
+    """A private image/GIF an admin uploads once and embeds in templates by its UUID.
+
+    The bytes live IN THE DATABASE (not on disk) so there is no filesystem path to leak; the UUID
+    primary key IS the only reference used anywhere. Served solely through an admin-gated endpoint,
+    and embedded in outgoing mail as an inline ``cid:`` part — never as a URL back to the vault.
+    """
+    __tablename__ = 'email_resources'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    filename = Column(String(255), nullable=False, default='')
+    content_type = Column(String(100), nullable=False)
+    byte_size = Column(Integer, nullable=False, default=0)
+    sha256 = Column(String(64), nullable=True)
+    data = Column(LargeBinary, nullable=False)
+    uploaded_by = Column(UUID(as_uuid=True),
+                         ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = Column(DateTime, nullable=False,
+                        server_default=text("(now() AT TIME ZONE 'utc')"),
+                        default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_email_resource_created', 'created_at'),
     )
