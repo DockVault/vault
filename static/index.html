@@ -292,6 +292,10 @@
                         <span class="sidebar-icon"><svg class="icon"><use href="#i-link"/></svg></span>
                         <span class="sidebar-text">Shared</span>
                     </a>
+                    <a href="#" class="sidebar-item" data-section="notes" id="nav-notes">
+                        <span class="sidebar-icon"><svg class="icon"><use href="#i-file-text"/></svg></span>
+                        <span class="sidebar-text">Notes</span>
+                    </a>
                     <a href="#" class="sidebar-item" data-section="temp-creds">
                         <span class="sidebar-icon"><svg class="icon"><use href="#i-clock"/></svg></span>
                         <span class="sidebar-text">Temp Credentials</span>
@@ -838,6 +842,81 @@
                                     </button>
                                 </div>
                             </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Notes Section. Personal server-side notes; "Send note" makes a snapshot copy for
+                     another user. Note text is masked when "Hide note text" is on (a local privacy
+                     toggle); the per-note eye reveals one. Rows are rendered with textContent. -->
+                <div id="notes-section" class="content-section">
+                    <div class="flex justify-between items-center mb-lg">
+                        <h2 class="text-2xl font-bold">Notes</h2>
+                        <div class="flex items-center gap-sm">
+                            <label class="checkbox-label" style="margin:0;">
+                                <input type="checkbox" id="notes-hide-toggle">
+                                <span>Hide note text</span>
+                            </label>
+                            <button id="note-new-btn" class="btn btn-primary btn-sm" type="button"><svg class="icon icon-sm"><use href="#i-plus"/></svg> New note</button>
+                        </div>
+                    </div>
+                    <div class="tabs mb-md" role="tablist">
+                        <button class="tab-btn active" data-notes-tab="mine" type="button">My notes</button>
+                        <button class="tab-btn" data-notes-tab="received" type="button">Sent to me <span id="notes-received-count" class="badge badge-secondary" hidden>0</span></button>
+                    </div>
+                    <div id="notes-tab-mine">
+                        <div id="notes-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--space-md);"></div>
+                    </div>
+                    <div id="notes-tab-received" style="display:none;">
+                        <div id="notes-received-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--space-md);"></div>
+                    </div>
+                </div>
+
+                <!-- Note create/edit modal -->
+                <div id="note-editor-modal" class="modal" role="dialog" aria-modal="true">
+                    <div class="modal-overlay" data-note-close></div>
+                    <div class="modal-content" style="max-width: 640px;">
+                        <div class="modal-header">
+                            <h3 id="note-editor-title" class="text-xl font-bold">New note</h3>
+                            <button class="modal-close" type="button" data-note-close aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <div class="form-group">
+                                <label for="note-editor-title-input">Title</label>
+                                <input type="text" id="note-editor-title-input" class="form-input" maxlength="255" placeholder="Note title">
+                            </div>
+                            <div class="form-group">
+                                <label for="note-editor-body-input">Text</label>
+                                <textarea id="note-editor-body-input" class="form-textarea" rows="8" placeholder="Write your note…"></textarea>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button class="btn btn-ghost" type="button" data-note-close>Cancel</button>
+                            <button id="note-editor-save" class="btn btn-primary" type="button">Save</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Send note modal -->
+                <div id="note-send-modal" class="modal" role="dialog" aria-modal="true">
+                    <div class="modal-overlay" data-note-send-close></div>
+                    <div class="modal-content" style="max-width: 480px;">
+                        <div class="modal-header">
+                            <h3 class="text-xl font-bold">Send a copy of this note</h3>
+                            <button class="modal-close" type="button" data-note-send-close aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <p class="text-secondary mb-sm">The recipient gets their own copy — your later edits won't change it.</p>
+                            <div class="form-group">
+                                <label for="note-send-search">Recipient</label>
+                                <input type="text" id="note-send-search" class="form-input" placeholder="Search by username or email…" autocomplete="off">
+                                <div id="note-send-results" class="mt-sm"></div>
+                            </div>
+                            <p id="note-send-chosen" class="text-secondary" hidden></p>
+                        </div>
+                        <div class="modal-footer">
+                            <button class="btn btn-ghost" type="button" data-note-send-close>Cancel</button>
+                            <button id="note-send-confirm" class="btn btn-primary" type="button" disabled>Send</button>
                         </div>
                     </div>
                 </div>
@@ -2970,7 +3049,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260824c"></script>
+    <script src="/static/js/app.js?v=20260824e"></script>
 </body>
 </html>
 

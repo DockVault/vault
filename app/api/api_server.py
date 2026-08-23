@@ -7474,6 +7474,224 @@ async def dismiss_notification(
     return {"ok": True}
 
 
+# ---------------------------------------------------------------------------
+# Notes — personal server-side notes (title + text). "Send note" is a snapshot
+# COPY to another user (no live share, no cascade): the recipient gets their own
+# row and can adopt it into their notes. Personal data: every query is scoped to
+# the requesting account (owner_id); a temporary-credential session is excluded.
+# ---------------------------------------------------------------------------
+_NOTE_TITLE_MAX = 255
+_NOTE_BODY_MAX = 100_000
+
+
+class NoteIn(BaseModel):
+    title: str = ""
+    body: str = ""
+
+
+class NoteUpdate(BaseModel):
+    title: Optional[str] = None
+    body: Optional[str] = None
+    is_favorite: Optional[bool] = None
+
+
+class NoteSend(BaseModel):
+    recipient_user_id: uuid.UUID
+
+
+def _notes_denied_for_temp(current_user) -> bool:
+    # Notes belong to the underlying account; a least-privilege temp session must not read or write
+    # them (matches the notification bell). The temp-account note model is a deferred follow-up.
+    return bool(getattr(current_user, "_is_temp_session", False))
+
+
+def _clean_note_fields(title, body):
+    title = (title or "").strip()
+    # Drop control chars (CR/LF etc.): the title also lands in a notification title on send.
+    title = ''.join(c for c in title if ord(c) >= 32 and ord(c) != 127)
+    if len(title) > _NOTE_TITLE_MAX:
+        raise HTTPException(status_code=400, detail=f"Title is too long (max {_NOTE_TITLE_MAX} characters)")
+    body = body or ""
+    if len(body) > _NOTE_BODY_MAX:
+        raise HTTPException(status_code=400,
+                            detail=f"Note is too long (max {_NOTE_BODY_MAX} characters)")
+    return title, body
+
+
+def _note_dict(n) -> dict:
+    return {
+        "id": str(n.id),
+        "title": n.title or "",
+        "body": n.body or "",
+        "is_favorite": bool(n.is_favorite),
+        "adopted": bool(n.adopted),
+        "sent_from": n.sent_from_name if n.sent_from_user_id else None,
+        "created_at": n.created_at.isoformat() if n.created_at else None,
+        "updated_at": n.updated_at.isoformat() if n.updated_at else None,
+    }
+
+
+def _get_owned_note(db, current_user, note_id):
+    from app.core.models import Note
+    n = db.query(Note).filter(Note.id == note_id, Note.owner_id == current_user.id).first()
+    if not n:
+        raise HTTPException(status_code=404, detail="Note not found")
+    return n
+
+
+@app.get("/notes")
+async def list_notes(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """My notes: the ones I authored plus received copies I have adopted. Favourites first."""
+    from app.core.models import Note
+    if _notes_denied_for_temp(current_user):
+        return {"notes": []}
+    rows = (db.query(Note)
+            .filter(Note.owner_id == current_user.id, Note.adopted.is_(True))
+            .order_by(Note.is_favorite.desc(), Note.updated_at.desc())
+            .all())
+    return {"notes": [_note_dict(n) for n in rows]}
+
+
+@app.get("/notes/received")
+async def list_received_notes(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Notes other users sent me that I have not adopted yet ("sent to me")."""
+    from app.core.models import Note
+    if _notes_denied_for_temp(current_user):
+        return {"notes": []}
+    rows = (db.query(Note)
+            .filter(Note.owner_id == current_user.id, Note.adopted.is_(False))
+            .order_by(Note.created_at.desc())
+            .all())
+    return {"notes": [_note_dict(n) for n in rows]}
+
+
+@app.post("/notes")
+async def create_note(
+    body: NoteIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from app.core.models import Note
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    title, text = _clean_note_fields(body.title, body.body)
+    if not title and not text:
+        raise HTTPException(status_code=400, detail="A note needs a title or some text")
+    n = Note(owner_id=current_user.id, title=title, body=text, adopted=True)
+    db.add(n)
+    db.commit()
+    db.refresh(n)
+    return _note_dict(n)
+
+
+@app.get("/notes/{note_id}")
+async def get_note(
+    note_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    return _note_dict(_get_owned_note(db, current_user, note_id))
+
+
+@app.patch("/notes/{note_id}")
+async def update_note(
+    note_id: uuid.UUID,
+    body: NoteUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    n = _get_owned_note(db, current_user, note_id)
+    if body.title is not None or body.body is not None:
+        title, text = _clean_note_fields(
+            n.title if body.title is None else body.title,
+            n.body if body.body is None else body.body)
+        n.title = title
+        n.body = text
+    if body.is_favorite is not None:
+        n.is_favorite = bool(body.is_favorite)
+    db.commit()
+    db.refresh(n)
+    return _note_dict(n)
+
+
+@app.delete("/notes/{note_id}")
+async def delete_note(
+    note_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    n = _get_owned_note(db, current_user, note_id)
+    db.delete(n)
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/notes/{note_id}/adopt")
+async def adopt_note(
+    note_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Add a received note to my own notes (it becomes a normal, editable note of mine)."""
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    n = _get_owned_note(db, current_user, note_id)
+    n.adopted = True
+    db.commit()
+    db.refresh(n)
+    return _note_dict(n)
+
+
+@app.post("/notes/{note_id}/send")
+async def send_note(
+    note_id: uuid.UUID,
+    body: NoteSend,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Send a SNAPSHOT COPY of my note to another user. They get their own editable copy under
+    "sent to me" (no live link, no cascade) and an in-app notification."""
+    from app.core.models import Note
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    src = _get_owned_note(db, current_user, note_id)
+    if str(body.recipient_user_id) == str(current_user.id):
+        raise HTTPException(status_code=400, detail="You cannot send a note to yourself")
+    recipient = db.query(User).filter(User.id == body.recipient_user_id).first()
+    if not recipient or not recipient.is_active or recipient.role == RoleEnum.EXTERNAL:
+        raise HTTPException(status_code=404, detail="Recipient not found")
+    sender_name = current_user.username or (current_user.email or "Someone")
+    copy = Note(owner_id=recipient.id, title=src.title, body=src.body,
+                sent_from_user_id=current_user.id, sent_from_name=sender_name, adopted=False)
+    db.add(copy)
+    db.commit()
+    # Best-effort in-app notification (separate session; never fails the send).
+    _notify_users([str(recipient.id)], "note_received", f"{sender_name} sent you a note",
+                  body=(src.title or "Untitled note"), target="#notes")
+    try:
+        AuditLogger(db).log_action(
+            action='note_send', status='success', user=current_user, resource_type='note',
+            resource_id=str(note_id),
+            details={'recipient_user_id': str(recipient.id)},
+            ip_address=get_client_ip(request))
+    except Exception:
+        pass
+    return {"ok": True}
+
+
 @app.post("/groups/{group_id}/members")
 async def add_group_members(
     group_id: uuid.UUID,

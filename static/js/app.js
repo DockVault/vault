@@ -227,7 +227,7 @@ function updateUIForPermissions() {
 // Sidebar sections a SCOPED temp credential can never access (temp_scope maps
 // these endpoint groups to '__deny__'). Hidden the moment we know it's a scoped
 // temp session, so a slow/failed /auth/session probe can't leave them painted.
-const TEMP_FORBIDDEN_SECTIONS = ['users', 'groups', 'settings', 'monitor', 'roles'];
+const TEMP_FORBIDDEN_SECTIONS = ['users', 'groups', 'settings', 'monitor', 'roles', 'notes'];
 function hideAdminNavForTempSession() {
     if (!isScopedTemp) return;
     TEMP_FORBIDDEN_SECTIONS.forEach(sec => {
@@ -5958,7 +5958,7 @@ let notifUnread = 0;
 
 // Map a server-supplied notification target to an in-app section. Targets are short server-controlled
 // tokens, and we only ever navigate to a KNOWN sidebar section — never inject an arbitrary href.
-const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds', '#vaults': 'vaults' };
+const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds', '#vaults': 'vaults', '#notes': 'notes' };
 
 async function initNotifications() {
     // Idempotent — called on login AND on refresh-restore. A temp session owns no notifications.
@@ -13935,6 +13935,277 @@ async function loadUsersForPermission() {
 
 // Open a modal by id (several handlers referenced openModal but it was undefined,
 // so vault settings/permission buttons silently threw and did nothing).
+// ================= Notes =====================================================================
+// Personal server-side notes + "send note" (a snapshot copy to another user). Note text can be
+// masked with the "Hide note text" toggle (a local privacy screen, remembered per browser); the
+// per-note eye reveals one. All names/text render via _el (textContent) — never HTML.
+function _notesState() {
+    if (!state.notes) state.notes = [];
+    if (!state.notesReceived) state.notesReceived = [];
+    if (!(state.notesRevealed instanceof Set)) state.notesRevealed = new Set();
+    if (typeof state.notesHideText !== 'boolean') {
+        try { state.notesHideText = localStorage.getItem('notesHideText') === '1'; }
+        catch (_) { state.notesHideText = false; }
+    }
+    if (!state.notesTab) state.notesTab = 'mine';
+}
+
+async function loadNotes() {
+    _notesState();
+    wireNotesOnce();
+    const mine = document.getElementById('notes-list');
+    if (mine) mine.replaceChildren(_el('div', 'spinner'));
+    try {
+        const [a, b] = await Promise.all([apiRequest('/notes'), apiRequest('/notes/received')]);
+        state.notes = (a && a.notes) || [];
+        state.notesReceived = (b && b.notes) || [];
+        renderNotes();
+    } catch (e) {
+        if (mine) mine.replaceChildren(_el('div', 'alert alert-error', 'Failed to load notes: ' + ((e && e.message) || '')));
+    }
+}
+
+function renderNotes() {
+    _notesState();
+    const hideToggle = document.getElementById('notes-hide-toggle');
+    if (hideToggle) hideToggle.checked = state.notesHideText;
+    // Tabs
+    document.querySelectorAll('#notes-section .tab-btn[data-notes-tab]').forEach(
+        b => b.classList.toggle('active', b.getAttribute('data-notes-tab') === state.notesTab));
+    const mineTab = document.getElementById('notes-tab-mine');
+    const recvTab = document.getElementById('notes-tab-received');
+    if (mineTab) mineTab.style.display = state.notesTab === 'mine' ? '' : 'none';
+    if (recvTab) recvTab.style.display = state.notesTab === 'received' ? '' : 'none';
+    // Received count badge
+    const badge = document.getElementById('notes-received-count');
+    if (badge) {
+        badge.textContent = String(state.notesReceived.length);
+        badge.hidden = state.notesReceived.length === 0;
+    }
+    // My notes
+    const mine = document.getElementById('notes-list');
+    if (mine) {
+        if (!state.notes.length) {
+            mine.replaceChildren(_el('p', 'text-secondary p-md', 'No notes yet. Create one to get started.'));
+        } else {
+            mine.replaceChildren(...state.notes.map(n => _noteCard(n, false)));
+        }
+    }
+    // Received
+    const recv = document.getElementById('notes-received-list');
+    if (recv) {
+        if (!state.notesReceived.length) {
+            recv.replaceChildren(_el('p', 'text-secondary p-md', 'Notes other people send you will appear here.'));
+        } else {
+            recv.replaceChildren(...state.notesReceived.map(n => _noteCard(n, true)));
+        }
+    }
+}
+
+function _noteCard(n, received) {
+    const card = _el('div', 'card');
+    const bodyWrap = _el('div', 'card-body');
+    const head = _el('div', 'flex justify-between items-center gap-sm');
+    head.appendChild(_el('h3', 'text-lg font-bold', n.title || 'Untitled note'));
+    if (!received) {
+        // A plain inline button (NOT .vault-fav, which is position:absolute and would escape the
+        // card). The gold fill on the star marks the favourited state; the is-fav class is a hook.
+        const star = _el('button', 'btn btn-ghost btn-sm note-fav' + (n.is_favorite ? ' is-fav' : ''));
+        star.type = 'button';
+        star.setAttribute('aria-label', n.is_favorite ? 'Remove from favourites' : 'Add to favourites');
+        const ic = _svgIcon('star', 'icon-sm');
+        if (n.is_favorite) { ic.style.fill = '#f5b301'; ic.style.stroke = '#f5b301'; }
+        star.appendChild(ic);
+        star.addEventListener('click', () => toggleNoteFavorite(n.id, !n.is_favorite));
+        head.appendChild(star);
+    }
+    bodyWrap.appendChild(head);
+
+    if (received && n.sent_from) {
+        bodyWrap.appendChild(_el('div', 'text-secondary text-sm', 'Sent from ' + n.sent_from));
+    }
+
+    // Body — masked when the global hide is on and this note isn't individually revealed.
+    const masked = state.notesHideText && !state.notesRevealed.has(n.id);
+    const bodyRow = _el('div', 'flex items-center gap-sm mt-sm');
+    if (masked) {
+        bodyRow.appendChild(_el('span', 'text-tertiary', '•••••• hidden'));
+    } else {
+        bodyRow.appendChild(_el('div', 'note-body', n.body || ''));
+    }
+    if (state.notesHideText) {
+        const eye = _el('button', 'btn btn-ghost btn-sm');
+        eye.type = 'button';
+        eye.setAttribute('aria-label', masked ? 'Show note text' : 'Hide note text');
+        eye.appendChild(_svgIcon('eye', 'icon-sm'));
+        eye.addEventListener('click', () => {
+            if (state.notesRevealed.has(n.id)) state.notesRevealed.delete(n.id);
+            else state.notesRevealed.add(n.id);
+            renderNotes();
+        });
+        bodyRow.appendChild(eye);
+    }
+    bodyWrap.appendChild(bodyRow);
+
+    const actions = _el('div', 'flex gap-sm mt-md');
+    if (received) {
+        const adopt = _el('button', 'btn btn-primary btn-sm', 'Add to my notes');
+        adopt.type = 'button';
+        adopt.addEventListener('click', () => adoptNote(n.id));
+        actions.appendChild(adopt);
+    } else {
+        const edit = _el('button', 'btn btn-secondary btn-sm', 'Edit');
+        edit.type = 'button';
+        edit.addEventListener('click', () => openNoteEditor(n));
+        actions.appendChild(edit);
+        const send = _el('button', 'btn btn-ghost btn-sm', 'Send');
+        send.type = 'button';
+        send.addEventListener('click', () => openSendNote(n.id));
+        actions.appendChild(send);
+        const del = _el('button', 'btn btn-ghost btn-sm', 'Delete');
+        del.type = 'button';
+        del.addEventListener('click', () => deleteNoteItem(n.id, n.title));
+        actions.appendChild(del);
+    }
+    bodyWrap.appendChild(actions);
+    card.appendChild(bodyWrap);
+    return card;
+}
+
+function openNoteEditor(note) {
+    _notesState();
+    state.editingNoteId = note ? note.id : null;
+    const t = document.getElementById('note-editor-title-input');
+    const b = document.getElementById('note-editor-body-input');
+    const h = document.getElementById('note-editor-title');
+    if (t) t.value = note ? (note.title || '') : '';
+    if (b) b.value = note ? (note.body || '') : '';
+    if (h) h.textContent = note ? 'Edit note' : 'New note';
+    openModal('note-editor-modal');
+    if (t) t.focus();
+}
+
+async function saveNote() {
+    const t = document.getElementById('note-editor-title-input');
+    const b = document.getElementById('note-editor-body-input');
+    const title = (t && t.value) || '';
+    const body = (b && b.value) || '';
+    if (!title.trim() && !body.trim()) { showError('A note needs a title or some text'); return; }
+    try {
+        if (state.editingNoteId) {
+            await apiRequest('/notes/' + state.editingNoteId, { method: 'PATCH', body: JSON.stringify({ title, body }) });
+        } else {
+            await apiRequest('/notes', { method: 'POST', body: JSON.stringify({ title, body }) });
+        }
+        closeModal();
+        showSuccess('Note saved');
+        await loadNotes();
+    } catch (e) { showError((e && e.message) || 'Could not save the note'); }
+}
+
+async function toggleNoteFavorite(id, on) {
+    const n = (state.notes || []).find(x => x.id === id);
+    if (n) n.is_favorite = on;   // optimistic
+    renderNotes();
+    try { await apiRequest('/notes/' + id, { method: 'PATCH', body: JSON.stringify({ is_favorite: on }) }); await loadNotes(); }
+    catch (e) { if (n) n.is_favorite = !on; renderNotes(); showError((e && e.message) || 'Could not update the note'); }
+}
+
+async function deleteNoteItem(id, title) {
+    const ok = await showConfirm(`Delete note "${title || 'Untitled'}"? This cannot be undone.`);
+    if (!ok) return;
+    try { await apiRequest('/notes/' + id, { method: 'DELETE' }); showSuccess('Note deleted'); await loadNotes(); }
+    catch (e) { showError((e && e.message) || 'Could not delete the note'); }
+}
+
+async function adoptNote(id) {
+    try { await apiRequest('/notes/' + id + '/adopt', { method: 'POST' }); showSuccess('Added to your notes'); await loadNotes(); }
+    catch (e) { showError((e && e.message) || 'Could not add the note'); }
+}
+
+function openSendNote(id) {
+    state.sendingNoteId = id;
+    state.sendRecipientId = null;
+    const search = document.getElementById('note-send-search');
+    const results = document.getElementById('note-send-results');
+    const chosen = document.getElementById('note-send-chosen');
+    const confirm = document.getElementById('note-send-confirm');
+    if (search) search.value = '';
+    if (results) results.replaceChildren();
+    if (chosen) { chosen.hidden = true; chosen.textContent = ''; }
+    if (confirm) confirm.disabled = true;
+    openModal('note-send-modal');
+    if (search) search.focus();
+}
+
+let _noteSearchTimer = null;
+function onNoteRecipientSearch() {
+    const search = document.getElementById('note-send-search');
+    const results = document.getElementById('note-send-results');
+    if (!search || !results) return;
+    const q = search.value.trim();
+    if (_noteSearchTimer) clearTimeout(_noteSearchTimer);
+    if (q.length < 2) { results.replaceChildren(); return; }
+    _noteSearchTimer = setTimeout(async () => {
+        try {
+            const users = await apiRequest('/users/search?q=' + encodeURIComponent(q), { silent: true });
+            results.replaceChildren();
+            (users || []).slice(0, 8).forEach(u => {
+                const row = _el('button', 'btn btn-ghost btn-sm', u.username || u.email || u.id);
+                row.type = 'button';
+                row.style.display = 'block';
+                row.style.width = '100%';
+                row.style.textAlign = 'left';
+                row.addEventListener('click', () => {
+                    state.sendRecipientId = u.id;
+                    const chosen = document.getElementById('note-send-chosen');
+                    if (chosen) { chosen.hidden = false; chosen.textContent = 'Sending to: ' + (u.username || u.email || u.id); }
+                    const confirm = document.getElementById('note-send-confirm');
+                    if (confirm) confirm.disabled = false;
+                });
+                results.appendChild(row);
+            });
+            if (!users || !users.length) results.replaceChildren(_el('p', 'text-tertiary text-sm', 'No matching users'));
+        } catch (e) { results.replaceChildren(_el('p', 'text-tertiary text-sm', 'Search unavailable')); }
+    }, 250);
+}
+
+async function confirmSendNote() {
+    if (!state.sendingNoteId || !state.sendRecipientId) return;
+    const btn = document.getElementById('note-send-confirm');
+    if (btn) btn.disabled = true;
+    try {
+        await apiRequest('/notes/' + state.sendingNoteId + '/send',
+            { method: 'POST', body: JSON.stringify({ recipient_user_id: state.sendRecipientId }) });
+        closeModal();
+        showSuccess('Note sent');
+    } catch (e) { showError((e && e.message) || 'Could not send the note'); if (btn) btn.disabled = false; }
+}
+
+function wireNotesOnce() {
+    if (state._notesWired) return;
+    state._notesWired = true;
+    const nw = document.getElementById('note-new-btn');
+    if (nw) nw.addEventListener('click', () => openNoteEditor(null));
+    document.querySelectorAll('#notes-section .tab-btn[data-notes-tab]').forEach(b =>
+        b.addEventListener('click', () => { state.notesTab = b.getAttribute('data-notes-tab'); renderNotes(); }));
+    const hide = document.getElementById('notes-hide-toggle');
+    if (hide) hide.addEventListener('change', () => {
+        state.notesHideText = hide.checked;
+        try { localStorage.setItem('notesHideText', hide.checked ? '1' : '0'); } catch (_) {}
+        state.notesRevealed = new Set();  // a fresh mask reveals nothing
+        renderNotes();
+    });
+    const save = document.getElementById('note-editor-save');
+    if (save) save.addEventListener('click', saveNote);
+    const sendConfirm = document.getElementById('note-send-confirm');
+    if (sendConfirm) sendConfirm.addEventListener('click', confirmSendNote);
+    const sendSearch = document.getElementById('note-send-search');
+    if (sendSearch) sendSearch.addEventListener('input', onNoteRecipientSearch);
+    document.querySelectorAll('[data-note-close], [data-note-send-close]').forEach(el =>
+        el.addEventListener('click', closeModal));
+}
+
 function openModal(id) {
     const modal = document.getElementById(id);
     if (modal) modal.classList.add('active');
@@ -14332,6 +14603,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     loadVaults().catch(err => console.error('Failed to load vaults:', err));
                 } else if (section === 'shared') {
                     loadShared().catch(err => console.error('Failed to load shared items:', err));
+                } else if (section === 'notes') {
+                    loadNotes().catch(err => console.error('Failed to load notes:', err));
                 } else if (section === 'temp-creds') {
                     loadTempCreds().catch(err => console.error('Failed to load temp creds:', err));
                 } else if (section === 'users') {
