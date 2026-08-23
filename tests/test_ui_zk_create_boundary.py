@@ -311,7 +311,7 @@ def test_existing_identity_create_only_uses_fresh_deks_without_private_key(
         _raise_cleanup_errors(cleanup_errors)
 
 
-def test_first_key_registration_race_refetches_public_key_without_private_unlock(
+def test_keyless_first_create_refuses_and_guides_without_registering(
     browser, admin
 ):
     settings_before = None
@@ -365,45 +365,24 @@ def test_first_key_registration_race_refetches_public_key_without_private_unlock
         page.select_option("#vault-type", "zero_knowledge")
         page.click("#create-vault-form button[type=submit]")
 
-        expect(page.locator("#confirm-modal")).to_be_visible(timeout=8_000)
+        # A keyless user creating their first zero-knowledge vault is REFUSED + GUIDED — the app no
+        # longer silently registers the account encryption key mid-create (users read that passphrase
+        # prompt as the vault's password). The submit aborts and the standalone "Set up encryption
+        # key" modal opens as guidance. Nothing is registered, no vault is created, the private
+        # identity key is never touched, and no vault-password / registration confirm ever appears.
+        expect(page.locator("#encryption-key-modal")).to_be_visible(timeout=8_000)
         assert requests_seen == [("GET", "/ecc/keys/public")], requests_seen
-
-        winner_scalar = _register_concurrent_identity(owner)
-        _complete_first_key_prompts(page, browser_passphrase)
-        expect(page.locator("#create-vault-modal")).to_be_hidden(timeout=20_000)
-        expect(page.locator("#confirm-modal")).to_be_hidden()
-
-        assert requests_seen == [
-            ("GET", "/ecc/keys/public"),
-            ("POST", "/ecc/keys/register/challenge"),
-            ("POST", "/ecc/keys/register"),
-            ("GET", "/ecc/keys/public"),
-            ("POST", "/vaults"),
-        ], requests_seen
-        assert [
-            status
-            for method, path, status in responses_seen
-            if method == "POST" and path == "/ecc/keys/register"
-        ] == [409]
         assert not any(path == "/ecc/keys/private" for _, path in requests_seen)
         assert page.evaluate("() => zkState.privateKey === null") is True
 
+        # No keypair was registered and no vault was created.
+        assert owner.get("/ecc/keys/public").json()["has_keypair"] is False
         matches = [
             vault
             for vault in owner.get("/vaults").json()
             if vault["name"] == vault_name
         ]
-        assert len(matches) == 1, f"registration-race vault mismatch: {matches!r}"
-        vault_id = matches[0]["id"]
-
-        evidence = _dek_evidence(page)
-        if len(evidence) != 1 or evidence[0]["byteLength"] != 32:
-            raise AssertionError(
-                "registration-race create did not generate one AES-256 DEK"
-            )
-        _assert_persisted_dek_matches(
-            owner, vault_id, winner_scalar, evidence[0]["digest"]
-        )
+        assert matches == [], f"a vault was created despite refusal: {matches!r}"
     finally:
         _cleanup_contexts(contexts, cleanup_errors)
         vault_ids = _collect_vault_ids_for_cleanup(

@@ -8715,7 +8715,7 @@ async def list_vault_permissions(
         # "Pending encryption key setup" for a member granted access before they created their key
         # (allowed: the authz membership row exists, but no wrapped DEK can be issued until they have a
         # keypair). Standard vaults have no per-member keys, so the flag is not applicable there.
-        is_zk = getattr(vault, "type", None) == "zero_knowledge"
+        is_zk = _is_zk_vault(vault)
         keyed_user_ids = set()
         if is_zk and result:
             from app.core.models import UserKeyPair
