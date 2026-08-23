@@ -34,25 +34,31 @@ class EmailSendError(Exception):
 
 
 def _profile_to_cfg(p) -> dict:
+    # DECRYPT the at-rest password so system mail (and any resolve_default_config caller) authenticates
+    # with the real secret, not the stored Fernet token. decrypt_secret returns a legacy plaintext
+    # value unchanged. Also carry the per-profile insecure-TLS opt-out.
+    from app.core.security import decrypt_secret
     return {
         "smtp_server": p.smtp_server or "",
         "smtp_port": p.smtp_port or 587,
         "smtp_username": p.smtp_username or "",
-        "smtp_password": p.smtp_password or "",
+        "smtp_password": decrypt_secret(p.smtp_password or ""),
         "from_email": p.from_email or "",
         "from_name": p.from_name or "",
+        "smtp_allow_insecure_tls": bool(getattr(p, "smtp_allow_insecure_tls", False)),
     }
 
 
 def _legacy_cfg(db: Session) -> dict:
     from app.core.models import SystemSetting
+    from app.core.security import decrypt_secret
     row = db.query(SystemSetting).filter(SystemSetting.key == _LEGACY_SETTINGS_KEY).first()
     cfg = dict(row.value) if row and row.value else {}
     return {
         "smtp_server": cfg.get("smtp_server") or "",
         "smtp_port": cfg.get("smtp_port") or 587,
         "smtp_username": cfg.get("smtp_username") or "",
-        "smtp_password": cfg.get("smtp_password") or "",
+        "smtp_password": decrypt_secret(cfg.get("smtp_password") or ""),
         "from_email": cfg.get("from_email") or "",
         "from_name": cfg.get("from_name") or "",
     }
