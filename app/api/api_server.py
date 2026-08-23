@@ -2821,6 +2821,10 @@ async def get_settings(
         data.setdefault(key, 0)
     data["rate_limit_api_enabled"] = bool(settings.rate_limit_api_enabled)
     data["rate_limit_api_deployment_defaults"] = _api_rate_limit_deployment_defaults()
+    # Whether the deployment can send mail — the default sending profile (or the legacy global SMTP
+    # config) is usable. The Accounts tab gates email-change verification on this rather than on the
+    # now-removed inline SMTP fields.
+    data["smtp_configured"] = _smtp_configured(db)
     return data
 
 

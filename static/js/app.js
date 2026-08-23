@@ -754,7 +754,10 @@ async function apiRequest(endpoint, options = {}) {
         let data;
         const contentType = response.headers.get('content-type');
         if (contentType && contentType.includes('application/json')) {
-            data = await response.json();
+            // Read text first so an EMPTY body (e.g. 204 No Content on a DELETE) yields null
+            // instead of throwing "Unexpected end of JSON input".
+            const raw = await response.text();
+            data = raw ? JSON.parse(raw) : null;
         } else if (!response.ok) {
             // Non-JSON error response
             const text = await response.text();
@@ -5784,6 +5787,7 @@ function setupSettingsTabs() {
             if (tabId === 'logs') { loadLogSettings(); }  // refresh on tab open
             if (tabId === 'sharing') { setupShareTagsUI(); loadShareTags(); }  // wire (idempotent) + refresh
             if (tabId === 'accounts') { setupAccountsPolicyUI(); refreshAccountsPolicyUI(); }  // wire + reflect deps
+            if (tabId === 'email') { loadEmailProfiles(); }  // refresh the sending-profile grid on tab open
         });
     });
 }
@@ -6411,7 +6415,8 @@ function populateAccountsPolicy(settings) {
     setVal('setting-login-identifier', settings.login_identifier || 'username');
     setChk('setting-email-change-verification', settings.email_change_requires_verification);
     accountsDomains = Array.isArray(settings.signup_email_domains) ? settings.signup_email_domains.slice() : [];
-    accountsSmtpConfigured = !!((settings.smtp_server || '').trim() && (settings.from_email || '').trim());
+    // Profile-aware: the backend reports whether a usable sending profile (or legacy config) exists.
+    accountsSmtpConfigured = settings.smtp_configured === true;
     setupAccountsPolicyUI();
     renderAccountsDomains();
     refreshAccountsPolicyUI();
@@ -6515,13 +6520,8 @@ async function loadSettings() {
         document.getElementById('setting-storage-path').value = settings.storage_path || '';
         renderDeploymentStorageSetting(settings);
         
-        // Email
-        document.getElementById('setting-smtp-server').value = settings.smtp_server || '';
-        document.getElementById('setting-smtp-port').value = settings.smtp_port || 587;
-        document.getElementById('setting-smtp-username').value = settings.smtp_username || '';
-        // Don't populate password for security
-        document.getElementById('setting-from-email').value = settings.from_email || '';
-        document.getElementById('setting-from-name').value = settings.from_name || '';
+        // Email — sending profiles are managed on their own (see loadEmailProfiles), not via the
+        // central settings save.
 
         // SFTP & Encryption
         const zkEl = document.getElementById('setting-zero-knowledge-enabled');
@@ -6643,13 +6643,9 @@ async function saveAllSettings() {
                 const n = Number(raw);
                 return Number.isFinite(n) ? n : null;
             })(),
-            
-            // Email
-            smtp_server: document.getElementById('setting-smtp-server').value,
-            smtp_port: parseInt(document.getElementById('setting-smtp-port').value) || 587,
-            smtp_username: document.getElementById('setting-smtp-username').value,
-            from_email: document.getElementById('setting-from-email').value,
-            from_name: document.getElementById('setting-from-name').value,
+
+            // Email SMTP config now lives in sending profiles (Settings → Email), managed on their
+            // own, so it is no longer part of the central settings save.
 
             // SFTP & Encryption
             zero_knowledge_enabled: document.getElementById('setting-zero-knowledge-enabled').checked,
@@ -6696,12 +6692,6 @@ async function saveAllSettings() {
         // Accounts & Access: the org-onboarding policy block.
         collectAccountsPolicy(settings);
 
-        // Only include password if provided
-        const smtpPassword = document.getElementById('setting-smtp-password').value;
-        if (smtpPassword) {
-            settings.smtp_password = smtpPassword;
-        }
-        
         // Save to API
         await apiRequest('/settings', {
             method: 'PUT',
@@ -7415,45 +7405,190 @@ async function loadStorageStats() {
 }
 
 // Test email configuration
-async function testEmail() {
-    const resultSpan = document.getElementById('test-email-result');
-    const btn = document.getElementById('test-email-btn');
-    
+// ============================================================================
+// Email Studio — sending profiles (Settings → Email)
+// ============================================================================
+let _editingEmailProfileId = null;
+
+async function loadEmailProfiles() {
+    const grid = document.getElementById('email-profiles-grid');
+    if (!grid) return;
+    try {
+        const data = await apiRequest('/email/profiles', { silent: true });
+        renderEmailProfilesGrid((data && data.profiles) || []);
+    } catch (e) {
+        grid.replaceChildren();
+        const err = document.createElement('div');
+        err.className = 'text-sm text-secondary';
+        err.textContent = 'Could not load sending profiles.';
+        grid.appendChild(err);
+    }
+}
+
+function renderEmailProfilesGrid(profiles) {
+    const grid = document.getElementById('email-profiles-grid');
+    if (!grid) return;
+    grid.replaceChildren();
+    profiles.forEach(p => grid.appendChild(buildEmailProfileCard(p)));
+    const add = document.createElement('button');
+    add.type = 'button';
+    add.className = 'email-card-add';
+    add.id = 'email-profile-add';
+    add.textContent = '+ Create profile';
+    add.addEventListener('click', () => openEmailProfileModal(null));
+    grid.appendChild(add);
+}
+
+function buildEmailProfileCard(p) {
+    const card = document.createElement('div');
+    card.className = 'email-profile-card';
+    card.setAttribute('role', 'listitem');
+    card.dataset.profileId = p.id;
+
+    const title = document.createElement('div');
+    title.className = 'epc-title';
+    const name = document.createElement('span');
+    name.textContent = p.name || '(untitled)';
+    title.appendChild(name);
+    if (p.is_default) {
+        const badge = document.createElement('span');
+        badge.className = 'epc-badge';
+        badge.textContent = 'Default';
+        title.appendChild(badge);
+    }
+    card.appendChild(title);
+
+    const desc = document.createElement('div');
+    desc.className = 'epc-desc';
+    desc.textContent = p.description || '';
+    card.appendChild(desc);
+
+    const meta = document.createElement('div');
+    meta.className = 'epc-meta';
+    meta.textContent = [p.from_email, p.smtp_server].filter(Boolean).join(' · ');
+    card.appendChild(meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'epc-actions';
+    const edit = document.createElement('button');
+    edit.type = 'button';
+    edit.className = 'btn btn-secondary btn-sm epc-edit';
+    edit.textContent = 'Edit';
+    edit.addEventListener('click', () => openEmailProfileModal(p));
+    actions.appendChild(edit);
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'btn btn-secondary btn-sm epc-delete';
+    del.textContent = 'Delete';
+    del.addEventListener('click', () => deleteEmailProfile(p));
+    actions.appendChild(del);
+    card.appendChild(actions);
+    return card;
+}
+
+function openEmailProfileModal(profile) {
+    _editingEmailProfileId = profile ? profile.id : null;
+    document.getElementById('email-profile-modal-title').textContent =
+        profile ? 'Edit sending profile' : 'New sending profile';
+    const val = (id, v) => { document.getElementById(id).value = v; };
+    val('ep-name', profile ? (profile.name || '') : '');
+    val('ep-description', profile ? (profile.description || '') : '');
+    val('ep-server', profile ? (profile.smtp_server || '') : '');
+    val('ep-port', profile ? (profile.smtp_port || 587) : 587);
+    val('ep-username', profile ? (profile.smtp_username || '') : '');
+    val('ep-password', '');
+    val('ep-from-email', profile ? (profile.from_email || '') : '');
+    val('ep-from-name', profile ? (profile.from_name || '') : '');
+    document.getElementById('ep-default').checked = profile ? !!profile.is_default : false;
+    document.getElementById('ep-password-hint').textContent =
+        (profile && profile.has_password) ? 'Password is set — leave blank to keep it'
+                                          : 'Enter a password if your server requires authentication';
+    const result = document.getElementById('email-profile-result');
+    result.textContent = '';
+    document.getElementById('email-profile-modal').classList.add('active');
+    document.getElementById('ep-name').focus();
+}
+
+function closeEmailProfileModal() {
+    document.getElementById('email-profile-modal').classList.remove('active');
+    _editingEmailProfileId = null;
+}
+
+function _collectEmailProfileForm() {
+    const g = id => document.getElementById(id).value;
+    const body = {
+        name: g('ep-name').trim(),
+        description: g('ep-description').trim() || null,
+        smtp_server: g('ep-server').trim(),
+        smtp_port: parseInt(g('ep-port')) || 587,
+        smtp_username: g('ep-username').trim() || null,
+        from_email: g('ep-from-email').trim(),
+        from_name: g('ep-from-name').trim() || null,
+        is_default: document.getElementById('ep-default').checked,
+    };
+    const pw = g('ep-password');
+    if (pw) body.smtp_password = pw;
+    return body;
+}
+
+async function saveEmailProfile() {
+    const btn = document.getElementById('ep-save');
+    const result = document.getElementById('email-profile-result');
+    const body = _collectEmailProfileForm();
     try {
         btn.disabled = true;
-        btn.textContent = 'Sending...';
-        resultSpan.textContent = '';
-
-        // Save the Email-tab fields FIRST. The test endpoint reads the STORED settings, so an unsaved
-        // form would otherwise report "SMTP is not configured" even though the fields are filled in.
-        // This is a targeted PUT of just the SMTP keys — it merges server-side and leaves any other
-        // unsaved settings on the page untouched. The password is sent only when entered, so testing
-        // never blanks a stored password.
-        const emailSettings = {
-            smtp_server: document.getElementById('setting-smtp-server').value,
-            smtp_port: parseInt(document.getElementById('setting-smtp-port').value) || 587,
-            smtp_username: document.getElementById('setting-smtp-username').value,
-            from_email: document.getElementById('setting-from-email').value,
-            from_name: document.getElementById('setting-from-name').value,
-        };
-        const smtpPassword = document.getElementById('setting-smtp-password').value;
-        if (smtpPassword) emailSettings.smtp_password = smtpPassword;
-        await apiRequest('/settings', { method: 'PUT', body: JSON.stringify(emailSettings) });
-
-        await apiRequest('/settings/test-email', {
-            method: 'POST'
-        });
-
-        showSuccess('Test email sent successfully');
-        resultSpan.textContent = '✓ Email sent';
-        resultSpan.style.color = 'var(--success)';
-    } catch (error) {
-        showError('Failed to send test email: ' + error.message);
-        resultSpan.textContent = '✗ Failed';
-        resultSpan.style.color = 'var(--error)';
+        if (_editingEmailProfileId) {
+            await apiRequest('/email/profiles/' + _editingEmailProfileId,
+                             { method: 'PUT', body: JSON.stringify(body) });
+        } else {
+            await apiRequest('/email/profiles', { method: 'POST', body: JSON.stringify(body) });
+        }
+        closeEmailProfileModal();
+        await loadEmailProfiles();
+        showSuccess('Sending profile saved');
+    } catch (e) {
+        result.textContent = '✗ ' + (e.message || 'Save failed');
+        result.style.color = 'var(--error)';
     } finally {
         btn.disabled = false;
-        btn.textContent = '📧 Send Test Email';
+    }
+}
+
+async function sendEmailProfileTest() {
+    const btn = document.getElementById('ep-send-test');
+    const result = document.getElementById('email-profile-result');
+    const body = _collectEmailProfileForm();   // send WITHOUT saving
+    const payload = {
+        profile_id: _editingEmailProfileId || null,   // use the stored password when the field is blank
+        smtp_server: body.smtp_server, smtp_port: body.smtp_port,
+        smtp_username: body.smtp_username || '', from_email: body.from_email,
+        from_name: body.from_name || '',
+    };
+    if (body.smtp_password) payload.smtp_password = body.smtp_password;
+    try {
+        btn.disabled = true;
+        result.textContent = 'Sending test…';
+        result.style.color = 'var(--text-secondary)';
+        const r = await apiRequest('/email/profiles/test', { method: 'POST', body: JSON.stringify(payload) });
+        result.textContent = '✓ ' + ((r && r.message) || 'Test email sent');
+        result.style.color = 'var(--success)';
+    } catch (e) {
+        result.textContent = '✗ ' + (e.message || 'Test failed');
+        result.style.color = 'var(--error)';
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+async function deleteEmailProfile(p) {
+    if (!confirm('Delete the sending profile "' + (p.name || '') +
+                 '"? Templates using it will fall back to the default.')) return;
+    try {
+        await apiRequest('/email/profiles/' + p.id, { method: 'DELETE' });
+        await loadEmailProfiles();
+        showSuccess('Sending profile deleted');
+    } catch (e) {
+        showError('Could not delete profile: ' + (e.message || ''));
     }
 }
 
@@ -7621,11 +7756,11 @@ function attachSettingsListeners() {
         saveBtn.addEventListener('click', saveAllSettings);
     }
     
-    // Test email button
-    const testEmailBtn = document.getElementById('test-email-btn');
-    if (testEmailBtn) {
-        testEmailBtn.addEventListener('click', testEmail);
-    }
+    // Email Studio — sending-profile modal buttons (Cancel uses the shared close-modal-btn handler).
+    const epSave = document.getElementById('ep-save');
+    if (epSave) epSave.addEventListener('click', saveEmailProfile);
+    const epTest = document.getElementById('ep-send-test');
+    if (epTest) epTest.addEventListener('click', sendEmailProfileTest);
     
     // Audit log buttons
     const searchBtn = document.getElementById('audit-search-btn');

@@ -1352,38 +1352,65 @@
                     <div id="settings-tab-email" class="settings-tab-content">
                         <div class="card">
                             <div class="card-header">
-                                <h3>Email Configuration</h3>
+                                <h3>Email — Sending profiles</h3>
                             </div>
                             <div class="p-lg">
-                                <div class="alert alert-info mb-md">These SMTP settings power the <strong>Send Test Email</strong> button below only — the vault does not send automated notification emails.</div>
-                                <div class="form-group">
-                                    <label for="setting-smtp-server">SMTP Server</label>
-                                    <input type="text" id="setting-smtp-server" class="form-control" placeholder="smtp.gmail.com">
+                                <div class="alert alert-info mb-md">A <strong>sending profile</strong> is an SMTP sender identity (server, credentials, From address). Create one or more; the <strong>default</strong> profile also powers the vault's own system mail. Each profile saves on its own — there is no central Save here.</div>
+                                <div id="email-profiles-grid" class="email-card-grid" role="list" aria-label="Sending profiles"></div>
+                            </div>
+                        </div>
+
+                        <!-- Create / edit a sending profile -->
+                        <div id="email-profile-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="email-profile-modal-title">
+                            <div class="modal-content">
+                                <div class="modal-header">
+                                    <h3 id="email-profile-modal-title">New sending profile</h3>
                                 </div>
-                                <div class="form-group">
-                                    <label for="setting-smtp-port">SMTP Port</label>
-                                    <input type="number" id="setting-smtp-port" class="form-control" placeholder="587" min="1" max="65535">
+                                <div class="modal-body">
+                                    <div class="form-group">
+                                        <label for="ep-name">Title</label>
+                                        <input type="text" id="ep-name" class="form-control" maxlength="120" placeholder="e.g. Support mailbox">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="ep-description">Description</label>
+                                        <input type="text" id="ep-description" class="form-control" maxlength="255" placeholder="Optional">
+                                    </div>
+                                    <div class="us-profile-grid">
+                                        <div class="form-group">
+                                            <label for="ep-server">SMTP Server</label>
+                                            <input type="text" id="ep-server" class="form-control" placeholder="smtp.example.com">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="ep-port">Port</label>
+                                            <input type="number" id="ep-port" class="form-control" min="1" max="65535" placeholder="587">
+                                        </div>
+                                    </div>
+                                    <div class="us-profile-grid">
+                                        <div class="form-group">
+                                            <label for="ep-username">Username</label>
+                                            <input type="text" id="ep-username" class="form-control" placeholder="Optional" autocomplete="off">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="ep-password">Password</label>
+                                            <input type="password" id="ep-password" class="form-control" placeholder="••••••••" autocomplete="new-password">
+                                            <small class="text-secondary" id="ep-password-hint">Leave blank to keep the stored password</small>
+                                        </div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="ep-from-email">From email address</label>
+                                        <input type="email" id="ep-from-email" class="form-control" placeholder="noreply@example.com">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="ep-from-name">From name</label>
+                                        <input type="text" id="ep-from-name" class="form-control" placeholder="e.g. Secure Vault">
+                                    </div>
+                                    <label class="checkbox-label"><input type="checkbox" id="ep-default"> Default profile (used by the vault's own system mail)</label>
+                                    <div id="email-profile-result" class="text-sm mt-sm" role="status" aria-live="polite"></div>
                                 </div>
-                                <div class="form-group">
-                                    <label for="setting-smtp-username">SMTP Username</label>
-                                    <input type="text" id="setting-smtp-username" class="form-control" placeholder="user@example.com">
-                                </div>
-                                <div class="form-group">
-                                    <label for="setting-smtp-password">SMTP Password</label>
-                                    <input type="password" id="setting-smtp-password" class="form-control" placeholder="••••••••">
-                                    <small class="text-secondary">Leave empty to keep existing password</small>
-                                </div>
-                                <div class="form-group">
-                                    <label for="setting-from-email">From Email Address</label>
-                                    <input type="email" id="setting-from-email" class="form-control" placeholder="noreply@example.com">
-                                </div>
-                                <div class="form-group">
-                                    <label for="setting-from-name">From Name</label>
-                                    <input type="text" id="setting-from-name" class="form-control" placeholder="e.g. Secure Vault">
-                                </div>
-                                <div class="form-group">
-                                    <button id="test-email-btn" class="btn btn-secondary">📧 Send Test Email</button>
-                                    <span id="test-email-result" class="ml-md text-sm"></span>
+                                <div class="modal-footer">
+                                    <button type="button" class="btn btn-secondary close-modal-btn" id="ep-cancel">Cancel</button>
+                                    <button type="button" class="btn btn-secondary" id="ep-send-test">📧 Send test</button>
+                                    <button type="button" class="btn btn-primary" id="ep-save">Save</button>
                                 </div>
                             </div>
                         </div>
