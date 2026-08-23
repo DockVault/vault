@@ -5787,7 +5787,7 @@ function setupSettingsTabs() {
             if (tabId === 'logs') { loadLogSettings(); }  // refresh on tab open
             if (tabId === 'sharing') { setupShareTagsUI(); loadShareTags(); }  // wire (idempotent) + refresh
             if (tabId === 'accounts') { setupAccountsPolicyUI(); refreshAccountsPolicyUI(); }  // wire + reflect deps
-            if (tabId === 'email') { loadEmailProfiles(); }  // refresh the sending-profile grid on tab open
+            if (tabId === 'email') { loadEmailProfiles(); loadEmailTemplates(); }  // refresh profiles + templates on tab open
         });
     });
 }
@@ -7592,6 +7592,369 @@ async function deleteEmailProfile(p) {
     }
 }
 
+// ============================================================================
+// Email Studio — templates (grid + inline code/render/split editor + send)
+// ============================================================================
+let _editingTemplateId = null;
+let _sendTemplateId = null;
+let _etPreviewTimer = null;
+
+async function loadEmailTemplates() {
+    const grid = document.getElementById('email-templates-grid');
+    if (!grid) return;
+    try {
+        const data = await apiRequest('/email/templates', { silent: true });
+        renderEmailTemplatesGrid((data && data.templates) || []);
+    } catch (e) {
+        grid.replaceChildren();
+    }
+}
+
+function renderEmailTemplatesGrid(templates) {
+    const grid = document.getElementById('email-templates-grid');
+    if (!grid) return;
+    grid.replaceChildren();
+    templates.forEach(t => grid.appendChild(buildEmailTemplateCard(t)));
+    const add = document.createElement('button');
+    add.type = 'button'; add.className = 'email-card-add'; add.id = 'email-template-add';
+    add.textContent = '+ Create template';
+    add.addEventListener('click', () => openTemplateEditor(null));
+    grid.appendChild(add);
+}
+
+function buildEmailTemplateCard(t) {
+    const card = document.createElement('div');
+    card.className = 'email-profile-card'; card.setAttribute('role', 'listitem'); card.dataset.templateId = t.id;
+    const title = document.createElement('div'); title.className = 'epc-title';
+    const name = document.createElement('span'); name.textContent = t.name || '(untitled)'; title.appendChild(name);
+    card.appendChild(title);
+    const desc = document.createElement('div'); desc.className = 'epc-desc'; desc.textContent = t.description || ''; card.appendChild(desc);
+    const meta = document.createElement('div'); meta.className = 'epc-meta';
+    if (t.profile) {
+        const parts = [t.profile.from_email, t.profile.smtp_server].filter(Boolean).join(' · ');
+        meta.textContent = 'via ' + parts + (t.profile.from_name ? ' (' + t.profile.from_name + ')' : '');
+    } else {
+        meta.textContent = 'No sending profile assigned';
+    }
+    card.appendChild(meta);
+    const actions = document.createElement('div'); actions.className = 'epc-actions';
+    for (const [label, cls, fn] of [['Edit', 'etc-edit', () => openTemplateEditor(t)],
+                                    ['Send', 'etc-send', () => openSendModal(t)],
+                                    ['Delete', 'etc-delete', () => deleteTemplate(t)]]) {
+        const b = document.createElement('button'); b.type = 'button';
+        b.className = 'btn btn-secondary btn-sm ' + cls; b.textContent = label;
+        b.addEventListener('click', fn); actions.appendChild(b);
+    }
+    card.appendChild(actions);
+    return card;
+}
+
+async function openTemplateEditor(t) {
+    _editingTemplateId = t ? t.id : null;
+    const sel = document.getElementById('et-profile');
+    sel.replaceChildren();
+    const none = document.createElement('option'); none.value = ''; none.textContent = '(none — uses the default profile)'; sel.appendChild(none);
+    try {
+        const data = await apiRequest('/email/profiles', { silent: true });
+        (data && data.profiles || []).forEach(p => {
+            const o = document.createElement('option'); o.value = p.id;
+            o.textContent = p.name + (p.is_default ? ' (default)' : ''); sel.appendChild(o);
+        });
+    } catch (e) {}
+    document.getElementById('et-editor-title').textContent = t ? 'Edit template' : 'New template';
+    document.getElementById('et-name').value = t ? (t.name || '') : '';
+    document.getElementById('et-description').value = t ? (t.description || '') : '';
+    document.getElementById('et-subject').value = t ? (t.subject || '') : '';
+    sel.value = (t && t.profile_id) ? t.profile_id : '';
+    document.getElementById('et-editor-msg').textContent = '';
+    let body = '';
+    if (t) {
+        // The list endpoint omits body_html; fetch the full row. If that fails, REFUSE to open — an
+        // editor showing an empty body over a populated name/subject would silently overwrite the
+        // stored body on Save.
+        let full = null;
+        try { full = await apiRequest('/email/templates/' + t.id, { silent: true }); } catch (e) {}
+        if (!full) {
+            // closeTemplateEditor() (not just nulling the id) also HIDES the editor, so if it was
+            // already open on another template this failed edit can't leave a half-populated form
+            // whose Save would create a mismatched new template.
+            closeTemplateEditor();
+            showError('Could not load the template for editing. Please try again.');
+            return;
+        }
+        body = full.body_html || '';
+    }
+    document.getElementById('et-body').value = body;
+    setEditorView('code');
+    const ed = document.getElementById('email-template-editor');
+    ed.hidden = false;
+    ed.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    refreshTemplatePreview();
+    document.getElementById('et-name').focus();
+}
+
+function closeTemplateEditor() {
+    document.getElementById('email-template-editor').hidden = true;
+    _editingTemplateId = null;
+}
+
+function setEditorView(view) {
+    const panes = document.getElementById('et-panes');
+    panes.classList.remove('et-view-code', 'et-view-render', 'et-view-split');
+    panes.classList.add('et-view-' + view);
+    document.querySelectorAll('.et-view').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+    if (view !== 'code') refreshTemplatePreview();
+}
+
+async function refreshTemplatePreview() {
+    const iframe = document.getElementById('et-preview');
+    if (!iframe) return;
+    const body = document.getElementById('et-body').value;
+    const subject = document.getElementById('et-subject').value;
+    try {
+        const r = await apiRequest('/email/templates/preview',
+            { method: 'POST', body: JSON.stringify({ body_html: body, subject: subject }), silent: true });
+        // The ONLY html sink: a SANDBOXED iframe (sandbox="" => scripts disabled), fed the
+        // server-sanitized preview. Never innerHTML on the main document.
+        iframe.srcdoc = (r && r.html) || '';
+    } catch (e) {
+        iframe.srcdoc = '';
+    }
+}
+
+function scheduleTemplatePreview() {
+    clearTimeout(_etPreviewTimer);
+    _etPreviewTimer = setTimeout(refreshTemplatePreview, 400);
+}
+
+// UX-only pre-check; the server is authoritative (it re-sanitizes + raises a security event).
+function _clientMaliciousCheck(html) {
+    return /<\s*script\b/i.test(html) || /<[a-z][^>]*?[\s/]on[a-z]+\s*=/i.test(html) || /javascript\s*:/i.test(html);
+}
+
+async function saveTemplate() {
+    const msg = document.getElementById('et-editor-msg');
+    const body = document.getElementById('et-body').value;
+    if (_clientMaliciousCheck(body)) {
+        msg.textContent = '✗ The template contains scripts or event handlers, which are not allowed. Remove them before saving.';
+        msg.style.color = 'var(--error)';
+        return;
+    }
+    const payload = {
+        name: document.getElementById('et-name').value.trim(),
+        description: document.getElementById('et-description').value.trim() || null,
+        profile_id: document.getElementById('et-profile').value || null,
+        subject: document.getElementById('et-subject').value,
+        body_html: body,
+    };
+    const btn = document.getElementById('et-save');
+    try {
+        btn.disabled = true;
+        if (_editingTemplateId) {
+            await apiRequest('/email/templates/' + _editingTemplateId, { method: 'PUT', body: JSON.stringify(payload) });
+        } else {
+            await apiRequest('/email/templates', { method: 'POST', body: JSON.stringify(payload) });
+        }
+        closeTemplateEditor();
+        await loadEmailTemplates();
+        showSuccess('Template saved');
+    } catch (e) {
+        msg.textContent = '✗ ' + (e.message || 'Save failed');
+        msg.style.color = 'var(--error)';
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+async function deleteTemplate(t) {
+    if (!confirm('Delete the template "' + (t.name || '') + '"?')) return;
+    try {
+        await apiRequest('/email/templates/' + t.id, { method: 'DELETE' });
+        if (_editingTemplateId === t.id) closeTemplateEditor();
+        await loadEmailTemplates();
+        showSuccess('Template deleted');
+    } catch (e) {
+        showError('Could not delete template: ' + (e.message || ''));
+    }
+}
+
+// --- toolbar: wrap the selection / insert at the cursor in the source textarea ---
+function _etWrap(before, after, placeholder) {
+    const ta = document.getElementById('et-body');
+    const s = ta.selectionStart, e = ta.selectionEnd;
+    const sel = ta.value.slice(s, e) || (placeholder || '');
+    ta.value = ta.value.slice(0, s) + before + sel + (after || '') + ta.value.slice(e);
+    ta.focus();
+    ta.selectionStart = s + before.length;
+    ta.selectionEnd = s + before.length + sel.length;
+    scheduleTemplatePreview();
+}
+
+function _etInsertText(text) {
+    const ta = document.getElementById('et-body');
+    const s = ta.selectionStart, e = ta.selectionEnd;
+    ta.value = ta.value.slice(0, s) + text + ta.value.slice(e);
+    ta.focus();
+    ta.selectionStart = ta.selectionEnd = s + text.length;
+    scheduleTemplatePreview();
+}
+
+function applyEditorFormat(fmt) {
+    const map = {
+        bold: ['<strong>', '</strong>', 'bold text'],
+        italic: ['<em>', '</em>', 'italic text'],
+        h1: ['<h1>', '</h1>', 'Heading'],
+        h2: ['<h2>', '</h2>', 'Heading'],
+        h3: ['<h3>', '</h3>', 'Heading'],
+        ul: ['<ul>\n  <li>', '</li>\n</ul>', 'item'],
+        ol: ['<ol>\n  <li>', '</li>\n</ol>', 'item'],
+    };
+    const m = map[fmt];
+    if (m) _etWrap(m[0], m[1], m[2]);
+}
+
+async function toggleDynamicMenu() {
+    const menu = document.getElementById('et-dyn-menu');
+    const btn = document.getElementById('et-add-dynamic');
+    if (!menu.hidden) { menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); return; }
+    menu.replaceChildren();
+    try {
+        const data = await apiRequest('/email/dynamic-actions', { silent: true });
+        (data && data.actions || []).forEach(a => {
+            const b = document.createElement('button'); b.type = 'button'; b.setAttribute('role', 'menuitem');
+            const lbl = document.createElement('div'); lbl.textContent = a.label;
+            const tok = document.createElement('div'); tok.className = 'et-dyn-token'; tok.textContent = '{{' + a.token + '}}';
+            b.appendChild(lbl); b.appendChild(tok);
+            b.addEventListener('click', () => {
+                _etInsertText('{{' + a.token + '}}'); menu.hidden = true; btn.setAttribute('aria-expanded', 'false');
+            });
+            menu.appendChild(b);
+        });
+    } catch (e) {}
+    menu.hidden = false; btn.setAttribute('aria-expanded', 'true');
+}
+
+async function openImagePicker() {
+    document.getElementById('et-image-upload-msg').textContent = '';
+    await loadImageResources();
+    document.getElementById('email-image-modal').classList.add('active');
+}
+
+async function loadImageResources() {
+    const grid = document.getElementById('et-image-grid');
+    grid.replaceChildren();
+    try {
+        const data = await apiRequest('/email/resources', { silent: true });
+        const resources = (data && data.resources) || [];
+        for (const res of resources) grid.appendChild(await buildImageThumb(res));
+        if (!resources.length) {
+            const empty = document.createElement('div'); empty.className = 'text-sm text-secondary';
+            empty.textContent = 'No images yet — upload one above.'; grid.appendChild(empty);
+        }
+    } catch (e) {}
+}
+
+async function buildImageThumb(res) {
+    const item = document.createElement('div'); item.className = 'et-image-item'; item.setAttribute('role', 'listitem');
+    const img = document.createElement('img'); img.alt = res.filename || '';
+    // An <img src> can't send an Authorization header, so fetch the bytes with the bearer token and
+    // use a blob URL for the thumbnail.
+    try {
+        const resp = await fetch(`${API_BASE}/email/resources/${res.id}`, { headers: { 'Authorization': `Bearer ${authToken}` } });
+        if (resp.ok) {
+            const url = URL.createObjectURL(await resp.blob());
+            // Free the blob once the browser has decoded it (the picker can reopen many times, each
+            // loading up to 1000 images, so an un-revoked URL pins the full bytes for the session).
+            img.onload = img.onerror = () => URL.revokeObjectURL(url);
+            img.src = url;
+        }
+    } catch (e) {}
+    const name = document.createElement('div'); name.className = 'et-image-name'; name.textContent = res.filename || res.id;
+    item.appendChild(img); item.appendChild(name);
+    // Insert only the UUID reference (no path/URL); alt is added by the admin if wanted.
+    item.addEventListener('click', () => { _etInsertText('<img data-resource-id="' + res.id + '">'); closeModal(); });
+    return item;
+}
+
+async function uploadImageResource(file) {
+    const msg = document.getElementById('et-image-upload-msg');
+    const fd = new FormData(); fd.append('file', file);
+    try {
+        msg.textContent = 'Uploading…';
+        // FormData must set its own multipart boundary, so fetch directly (apiRequest forces JSON).
+        const resp = await fetch(`${API_BASE}/email/resources`, {
+            method: 'POST', headers: { 'Authorization': `Bearer ${authToken}` }, body: fd });
+        if (!resp.ok) {
+            const d = await resp.json().catch(() => ({}));
+            // detail is usually a string, but a 422 makes it a list of error objects — coerce so the
+            // message never renders as "[object Object]".
+            const detail = typeof d.detail === 'string' ? d.detail : '';
+            throw new Error(detail || `Upload failed (${resp.status})`);
+        }
+        msg.textContent = '✓ Uploaded';
+        await loadImageResources();
+    } catch (e) {
+        msg.textContent = '✗ ' + (e.message || 'Upload failed');
+    }
+}
+
+async function openSendModal(t) {
+    _sendTemplateId = t.id;
+    document.getElementById('email-send-modal-title').textContent = 'Send: ' + (t.name || 'template');
+    document.getElementById('et-send-results').replaceChildren();
+    document.getElementById('et-send-addresses').value = '';
+    const sel = document.getElementById('et-send-users'); sel.replaceChildren();
+    try {
+        const users = await apiRequest('/users', { silent: true });
+        (Array.isArray(users) ? users : []).filter(u => u.email).forEach(u => {
+            const o = document.createElement('option'); o.value = u.id;
+            o.textContent = u.username + ' <' + u.email + '>'; sel.appendChild(o);
+        });
+    } catch (e) {}
+    document.getElementById('email-send-modal').classList.add('active');
+}
+
+async function sendTemplateNow() {
+    const results = document.getElementById('et-send-results');
+    const sel = document.getElementById('et-send-users');
+    const userIds = Array.from(sel.selectedOptions).map(o => o.value);
+    const addresses = document.getElementById('et-send-addresses').value.split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
+    if (!userIds.length && !addresses.length) {
+        results.replaceChildren(); results.textContent = 'Select at least one recipient.'; results.style.color = 'var(--error)'; return;
+    }
+    const btn = document.getElementById('et-send-go');
+    try {
+        btn.disabled = true;
+        results.replaceChildren(); results.textContent = 'Sending…'; results.style.color = 'var(--text-secondary)';
+        const r = await apiRequest('/email/templates/' + _sendTemplateId + '/send',
+            { method: 'POST', body: JSON.stringify({ user_ids: userIds, addresses: addresses }) });
+        renderSendResults(r);
+    } catch (e) {
+        results.replaceChildren(); results.textContent = '✗ ' + (e.message || 'Send failed'); results.style.color = 'var(--error)';
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+function renderSendResults(r) {
+    const box = document.getElementById('et-send-results');
+    box.replaceChildren();
+    box.style.color = '';
+    const rows = r.results || [];
+    const sent = r.sent || 0;
+    const failed = rows.length - sent;   // total shown minus succeeded — invalid/no-email rows included
+    const summary = document.createElement('div');
+    summary.textContent = failed > 0
+        ? `Sent ${sent} of ${rows.length}, ${failed} failed.`
+        : `Sent ${sent} of ${rows.length}.`;
+    box.appendChild(summary);
+    rows.forEach(row => {
+        const li = document.createElement('div'); li.className = 'text-xs';
+        li.textContent = (row.ok ? '✓ ' : '✗ ') + row.recipient + (row.error ? ' — ' + row.error : '');
+        box.appendChild(li);
+    });
+}
+
 // Load users for audit filter dropdown
 async function loadAuditFilterUsers() {
     try {
@@ -7761,6 +8124,42 @@ function attachSettingsListeners() {
     if (epSave) epSave.addEventListener('click', saveEmailProfile);
     const epTest = document.getElementById('ep-send-test');
     if (epTest) epTest.addEventListener('click', sendEmailProfileTest);
+
+    // Email Studio — template editor + toolbar + image picker + send. Wire ONCE: initSettings() (and
+    // thus attachSettingsListeners) runs on every navigation to Settings, and the arrow-wrapped
+    // listeners below create a fresh function each time, so without this guard they would stack
+    // (double-formatting, duplicate uploads, an unremovable document click handler per visit).
+    const etEditor = document.getElementById('email-template-editor');
+    if (etEditor && !etEditor.dataset.wired) {
+        etEditor.dataset.wired = '1';
+        const etSave = document.getElementById('et-save');
+        if (etSave) etSave.addEventListener('click', saveTemplate);
+        const etCancel = document.getElementById('et-cancel');
+        if (etCancel) etCancel.addEventListener('click', closeTemplateEditor);
+        document.querySelectorAll('.et-view').forEach(b => b.addEventListener('click', () => setEditorView(b.dataset.view)));
+        document.querySelectorAll('.et-toolbar [data-fmt]').forEach(b => b.addEventListener('click', () => applyEditorFormat(b.dataset.fmt)));
+        const etBody = document.getElementById('et-body');
+        if (etBody) etBody.addEventListener('input', scheduleTemplatePreview);
+        const etSubject = document.getElementById('et-subject');
+        if (etSubject) etSubject.addEventListener('input', scheduleTemplatePreview);
+        const etAddImg = document.getElementById('et-add-image');
+        if (etAddImg) etAddImg.addEventListener('click', openImagePicker);
+        const etAddDyn = document.getElementById('et-add-dynamic');
+        if (etAddDyn) etAddDyn.addEventListener('click', (e) => { e.stopPropagation(); toggleDynamicMenu(); });
+        const etImgUpload = document.getElementById('et-image-upload');
+        if (etImgUpload) etImgUpload.addEventListener('change', (e) => { if (e.target.files[0]) uploadImageResource(e.target.files[0]); });
+        const etSendGo = document.getElementById('et-send-go');
+        if (etSendGo) etSendGo.addEventListener('click', sendTemplateNow);
+        // Close the dynamic-action menu on an outside click.
+        document.addEventListener('click', (e) => {
+            const menu = document.getElementById('et-dyn-menu');
+            if (menu && !menu.hidden && !e.target.closest('.et-dyn-wrap')) {
+                menu.hidden = true;
+                const b = document.getElementById('et-add-dynamic');
+                if (b) b.setAttribute('aria-expanded', 'false');
+            }
+        });
+    }
     
     // Audit log buttons
     const searchBtn = document.getElementById('audit-search-btn');

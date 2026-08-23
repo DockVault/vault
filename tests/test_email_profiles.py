@@ -180,7 +180,7 @@ def test_test_send_rejects_control_chars_in_recipient(admin, clean_profiles):
 
 
 def test_test_send_is_rate_limited(admin, clean_profiles):
-    # A FRESH admin so this consumes its own 5/60s budget and doesn't perturb the other test-sends.
+    # A FRESH admin so this consumes its own 30/60s budget and doesn't perturb the other test-sends.
     fresh = admin.create_user(role="admin")
     c = admin.clone_anonymous()
     c.login(fresh["_username"], fresh["_password"])
@@ -188,8 +188,11 @@ def test_test_send_is_rate_limited(admin, clean_profiles):
         codes = [c.post("/email/profiles/test", json={
             "smtp_server": "127.0.0.1", "smtp_port": 1,
             "from_email": "x@example.com", "to_addr": "y@example.com"}).status_code
-            for _ in range(8)]
-        assert 429 in codes, codes
+            for _ in range(34)]                      # > the 30/60s courtesy cap
+        # Pin the RAISED cap, not merely "some cap": the first 25 (well under 30) must pass, and the
+        # limit must bite past 30. (25/30 leaves slack for the limiter's inclusive/exclusive edge.)
+        assert 429 not in codes[:25], codes
+        assert 429 in codes[30:], codes
     finally:
         admin.delete_user(fresh["id"])
 

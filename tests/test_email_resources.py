@@ -6,6 +6,9 @@ SVG). The byte-serving route is admin-gated and used by the editor preview, whic
 real uploaded image (a dangling / deleted reference is dropped).
 """
 
+import base64
+import re
+
 import pytest
 
 from conftest import ApiClient, BASE_URL, unique
@@ -187,7 +190,16 @@ def test_preview_resolves_a_real_uploaded_image(admin, clean_resources):
     r = admin.post("/email/templates/preview",
                    json={"body_html": f'<p>hi</p><img data-resource-id="{rid}">'})
     assert r.status_code == 200, r.text
-    assert f'src="/email/resources/{rid}"' in r.json()["html"]   # resolves now that it exists
+    html = r.json()["html"]
+    # The preview INLINES the bytes as a data: URI so the sandboxed (opaque-origin) iframe can render
+    # them without authenticating to the admin-gated byte route. The location is never a URL/path.
+    assert 'src="data:image/png;base64,' in html
+    assert "/email/resources/" not in html
+    assert rid not in html                                       # the UUID location is not disclosed
+    # The inlined payload must be THE uploaded bytes (not empty / a wrong row).
+    m = re.search(r'src="data:image/png;base64,([^"]+)"', html)
+    assert m, html
+    assert base64.b64decode(m.group(1)) == PNG
     assert rid in r.json()["referenced_resource_ids"]
 
 

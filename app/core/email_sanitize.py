@@ -31,7 +31,7 @@ from __future__ import annotations
 import html as _html
 import re
 import uuid as _uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Iterable, NamedTuple, Optional
 
 import nh3
@@ -189,7 +189,7 @@ def token_context(
 ) -> dict[str, str]:
     """Build the substitution map for one recipient. Missing recipient fields render empty."""
     recipient = recipient or {}
-    now = now or datetime.utcnow()
+    now = now or datetime.now(timezone.utc)   # UTC, tz-aware (utcnow() is deprecated in 3.12+)
     username = str(recipient.get("username") or "")
     return {
         "current_date": now.strftime("%Y-%m-%d"),

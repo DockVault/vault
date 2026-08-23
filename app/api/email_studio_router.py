@@ -10,6 +10,7 @@ template, resource, and sending endpoints fill in the rest of the CRUD.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import re
 import uuid
@@ -303,7 +304,9 @@ async def test_profile(payload: ProfileTestIn, request: Request,
                        admin: User = Depends(require_interactive_admin),
                        db: Session = Depends(get_db)):
     """Send a one-off test email through a profile's config WITHOUT saving anything."""
-    _rate_limit(admin.id, limit=5, window=60, prefix="email_profile_test",
+    # Courtesy throttle only (this is admin-gated, not a security boundary): an admin iterating on a
+    # profile legitimately clicks "Send test" several times in a row. 30/min matches the bulk-send cap.
+    _rate_limit(admin.id, limit=30, window=60, prefix="email_profile_test",
                 detail="Too many test emails; please wait a moment.")
 
     if payload.profile_id is not None:
@@ -377,6 +380,21 @@ def _resource_exists(db: Session, rid: str) -> bool:
         return db.query(EmailResource.id).filter(EmailResource.id == uuid.UUID(str(rid))).first() is not None
     except (ValueError, TypeError, AttributeError):
         return False
+
+
+def _resource_data_uri(db: Session, rid: str) -> Optional[str]:
+    """A self-contained data: URI for an image, so the editor's SANDBOXED preview iframe can render
+    it (the iframe has an opaque origin and can't authenticate to the byte-serving route). The sent
+    email uses cid: parts instead; only the live preview inlines the bytes."""
+    try:
+        row = (db.query(EmailResource.content_type, EmailResource.data)
+               .filter(EmailResource.id == uuid.UUID(str(rid))).first())
+    except (ValueError, TypeError):
+        row = None
+    if not row:
+        return None
+    content_type, data = row
+    return f"data:{content_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
 def _brand_name(db: Session) -> str:
@@ -502,20 +520,38 @@ async def delete_template(template_id: uuid.UUID, request: Request,
 
 
 @router.post("/templates/preview")
-async def preview_template(payload: PreviewIn,
+async def preview_template(payload: PreviewIn, request: Request,
                            admin: User = Depends(require_interactive_admin),
                            db: Session = Depends(get_db)):
     """Stateless: sanitize + personalize + resolve images to admin-only URLs, for the editor's
     render pane. Deliberately does NOT raise a security event (it runs live as the admin types) —
     it just shows the sanitized result, which visibly strips anything unsafe."""
+    # Courtesy throttle: the render pane fires this on a debounce, so a real editing burst stays well
+    # under the cap; the limit only bounds a scripted loop against the (now byte-inlining) preview.
+    _rate_limit(admin.id, limit=120, window=60, prefix="email_preview",
+                detail="Too many preview requests; please slow down.")
     ctx = email_sanitize.token_context(
         recipient={"username": payload.sample_username or "jsmith",
                    "email": payload.sample_email or "jsmith@example.com"},
         brand_name=_brand_name(db))
+    # Bound the total bytes inlined into ONE preview: a template can reference many/large images and
+    # base64 inflates ~33%, so without a budget a single request could build a multi-GB response and
+    # OOM the worker. Images past the budget are dropped from the preview (best-effort render).
+    inlined = {"n": 0}
+
+    def preview_src(rid: str) -> str:
+        uri = _resource_data_uri(db, rid)
+        if not uri:
+            return ""
+        if inlined["n"] + len(uri) > _PREVIEW_INLINE_BUDGET:
+            return ""
+        inlined["n"] += len(uri)
+        return uri
+
     html = email_sanitize.render_for_preview(
         payload.body_html, context=ctx,
         resource_exists=lambda rid: _resource_exists(db, rid),
-        resource_url=lambda rid: f"/email/resources/{rid}")
+        resource_url=preview_src)
     subject = email_sanitize.render_subject(payload.subject or "", ctx)   # header-safe (strips CR/LF)
     return {
         "html": html,
@@ -532,6 +568,8 @@ async def preview_template(payload: PreviewIn,
 
 _MAX_RESOURCE_BYTES = 5 * 1024 * 1024   # 5 MB per image
 _MAX_RESOURCE_COUNT = 1000              # ceiling on stored images, so the folder can't grow unbounded
+# Per-preview cap on total inlined image bytes (base64 data: URIs) — bounds one preview's memory.
+_PREVIEW_INLINE_BUDGET = 16 * 1024 * 1024
 
 # Content type is decided by SNIFFING the bytes, never by trusting the client's Content-Type. Only
 # raster formats — deliberately NO SVG (it can carry script and would execute if a browser rendered

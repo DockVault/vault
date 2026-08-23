@@ -1414,6 +1414,98 @@
                                 </div>
                             </div>
                         </div>
+
+                        <!-- ============ Email templates ============ -->
+                        <div class="card mt-lg">
+                            <div class="card-header"><h3>Email templates</h3></div>
+                            <div class="p-lg">
+                                <div class="alert alert-info mb-md">Author HTML emails that send through a chosen profile. Insert images from your resource folder and personalization tokens; the preview renders exactly what recipients receive.</div>
+                                <div id="email-templates-grid" class="email-card-grid" role="list" aria-label="Email templates"></div>
+                            </div>
+                        </div>
+
+                        <!-- Inline template editor -->
+                        <div id="email-template-editor" class="card mt-lg" hidden>
+                            <div class="card-header et-editor-head">
+                                <h3 id="et-editor-title">New template</h3>
+                                <div class="et-editor-headbtns">
+                                    <button type="button" class="btn btn-secondary" id="et-cancel">Cancel</button>
+                                    <button type="button" class="btn btn-primary" id="et-save">Save template</button>
+                                </div>
+                            </div>
+                            <div class="p-lg">
+                                <div class="us-profile-grid">
+                                    <div class="form-group"><label for="et-name">Template name</label><input type="text" id="et-name" class="form-control" maxlength="120"></div>
+                                    <div class="form-group"><label for="et-profile">Sending profile</label><select id="et-profile" class="form-control"></select></div>
+                                </div>
+                                <div class="form-group"><label for="et-description">Description</label><input type="text" id="et-description" class="form-control" maxlength="255"></div>
+                                <div class="form-group"><label for="et-subject">Subject</label><input type="text" id="et-subject" class="form-control" maxlength="255" placeholder="Hello {{user.username}}"></div>
+
+                                <div class="et-toolbar" role="toolbar" aria-label="Formatting">
+                                    <button type="button" class="btn btn-secondary btn-sm" data-fmt="bold" title="Bold"><strong>B</strong></button>
+                                    <button type="button" class="btn btn-secondary btn-sm" data-fmt="italic" title="Italic"><em>I</em></button>
+                                    <button type="button" class="btn btn-secondary btn-sm" data-fmt="h1" title="Heading 1">H1</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" data-fmt="h2" title="Heading 2">H2</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" data-fmt="h3" title="Heading 3">H3</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" data-fmt="ul" title="Bullet list">• List</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" data-fmt="ol" title="Numbered list">1. List</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" id="et-add-image" title="Insert image">🖼 Image</button>
+                                    <span class="et-dyn-wrap">
+                                        <button type="button" class="btn btn-secondary btn-sm" id="et-add-dynamic" aria-haspopup="true" aria-expanded="false">＋ Dynamic action ▾</button>
+                                        <div id="et-dyn-menu" class="et-dyn-menu" hidden role="menu"></div>
+                                    </span>
+                                    <span class="et-view-toggle" role="tablist" aria-label="Editor view">
+                                        <button type="button" class="btn btn-secondary btn-sm et-view active" data-view="code">Code</button>
+                                        <button type="button" class="btn btn-secondary btn-sm et-view" data-view="render">Render</button>
+                                        <button type="button" class="btn btn-secondary btn-sm et-view" data-view="split">Split</button>
+                                    </span>
+                                </div>
+
+                                <div id="et-panes" class="et-panes et-view-code">
+                                    <textarea id="et-body" class="form-control et-code" spellcheck="false" placeholder="<p>Hi {{user.username}}</p>"></textarea>
+                                    <iframe id="et-preview" class="et-render" sandbox="" title="Email preview"></iframe>
+                                </div>
+                                <div id="et-editor-msg" class="text-sm mt-sm" role="status" aria-live="polite"></div>
+                            </div>
+                        </div>
+
+                        <!-- Add-image resource picker -->
+                        <div id="email-image-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="email-image-modal-title">
+                            <div class="modal-content">
+                                <div class="modal-header"><h3 id="email-image-modal-title">Insert an image</h3></div>
+                                <div class="modal-body">
+                                    <div class="form-group">
+                                        <label for="et-image-upload" class="btn btn-secondary">Upload an image…</label>
+                                        <input type="file" id="et-image-upload" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none">
+                                        <span id="et-image-upload-msg" class="text-sm ml-md" role="status" aria-live="polite"></span>
+                                    </div>
+                                    <div id="et-image-grid" class="et-image-grid" role="list"></div>
+                                </div>
+                                <div class="modal-footer"><button type="button" class="btn btn-secondary close-modal-btn">Close</button></div>
+                            </div>
+                        </div>
+
+                        <!-- Send template -->
+                        <div id="email-send-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="email-send-modal-title">
+                            <div class="modal-content">
+                                <div class="modal-header"><h3 id="email-send-modal-title">Send template</h3></div>
+                                <div class="modal-body">
+                                    <div class="form-group">
+                                        <label for="et-send-users">Vault users</label>
+                                        <select id="et-send-users" class="form-control" multiple size="6"></select>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="et-send-addresses">Additional addresses (comma or newline separated)</label>
+                                        <textarea id="et-send-addresses" class="form-control" rows="2" placeholder="someone@example.com"></textarea>
+                                    </div>
+                                    <div id="et-send-results" class="text-sm" role="status" aria-live="polite"></div>
+                                </div>
+                                <div class="modal-footer">
+                                    <button type="button" class="btn btn-secondary close-modal-btn">Cancel</button>
+                                    <button type="button" class="btn btn-primary" id="et-send-go">Send</button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- SFTP & Encryption Settings Tab -->
