@@ -713,25 +713,35 @@ def test_zero_knowledge_vault_end_to_end(page: Page, admin):
     vid = None
     try:
         _login(page, user["_username"], user["_password"])
+
+        # Set up the account encryption key FIRST, via the standalone flow — creating a
+        # zero-knowledge vault now requires an existing key (the app no longer registers it inline
+        # mid-create, which users mistook for the vault's password). Acknowledge the irrecoverability
+        # warning, then enter+confirm the passphrase.
+        page.click("#profile-btn")
+        page.click("#encryption-key-btn")
+        expect(page.locator("#encryption-key-modal")).to_be_visible(timeout=5000)
+        page.click("#encryption-key-setup-btn")
+        expect(page.locator("#confirm-modal")).to_be_visible(timeout=5000)
+        page.click("#confirm-modal-confirm-btn")
+        for _ in range(2):
+            expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=5000)
+            page.fill("#confirm-modal-input", passphrase)
+            page.click("#confirm-modal-confirm-btn")
+        expect(page.locator("#encryption-key-status")).to_contain_text(
+            "set up and active", timeout=15000
+        )
+        page.locator("#encryption-key-modal .close-modal-btn").first.click()
+        expect(page.locator("#encryption-key-modal")).to_be_hidden(timeout=5000)
+
+        # Now create the zero-knowledge vault — the key exists, so create proceeds directly (no prompt).
         page.click('.sidebar-item[data-section="vaults"]')
         page.click("#create-vault-btn")
         expect(page.locator("#create-vault-modal")).to_be_visible()
         page.fill("#vault-name", vname)
-        # ZK is enabled, so the type selector is offered.
         expect(page.locator("#vault-type-group")).to_be_visible(timeout=5000)
         page.select_option("#vault-type", "zero_knowledge")
         page.click("#create-vault-form button[type=submit]")
-
-        # First-time key setup: acknowledge the "passphrase cannot be recovered" warning
-        # (a plain confirm, no input), then enter the passphrase and confirm it (same modal).
-        expect(page.locator("#confirm-modal")).to_be_visible(timeout=5000)
-        page.click("#confirm-modal-confirm-btn")
-        expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=5000)
-        page.fill("#confirm-modal-input", passphrase)
-        page.click("#confirm-modal-confirm-btn")
-        page.fill("#confirm-modal-input", passphrase)
-        page.click("#confirm-modal-confirm-btn")
-
         expect(page.locator("#create-vault-modal")).to_be_hidden(timeout=15000)
 
         match = [v for v in owner.get("/vaults").json() if v["name"] == vname]
