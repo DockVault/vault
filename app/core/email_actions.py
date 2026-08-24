@@ -329,7 +329,8 @@ def _fallback_body_if_missing_required_token(category, body_tpl, spec):
 # --------------------------------------------------------------------------------------------------
 def send_action_email(db: Session, key: str, *, recipient: dict,
                       action_context: Optional[dict] = None, force: bool = False,
-                      raise_errors: bool = False) -> bool:
+                      raise_errors: bool = False, subject_prefix: str = "",
+                      footer_html: str = "") -> bool:
     """Send the email for a cataloged action. ``recipient`` = ``{email, username?, display_name?}``.
     Returns True if a message was handed to SMTP. By default NEVER raises for a delivery/config problem
     — it logs and returns False, so a caller flow (signup, share, …) isn't broken by mail trouble. A
@@ -400,9 +401,11 @@ def send_action_email(db: Session, key: str, *, recipient: dict,
             recipient=recipient, brand_name=brand_name(db), vault_url=vault_url(),
             sender={"from_name": cfg.get("from_name") or "", "from_email": cfg.get("from_email") or ""},
             action=action_context or {})
-        subject = email_sanitize.render_subject(subject_tpl, ctx)
+        subject = email_sanitize.render_subject(subject_prefix + subject_tpl, ctx)
         html, inline = email_sanitize.render_for_send(
             body_tpl, context=ctx, load_resource=lambda rid: _load_resource(db, rid))
+        if footer_html:                                    # e.g. a "this is a test" banner on test sends
+            html = html + email_sanitize.sanitize_email_html(footer_html)
         text = email_sanitize.render_plaintext_fallback(html)
         msg = email_send.build_message(cfg, to_addr=to_addr, subject=subject,
                                        text_body=text, html_body=html, inline_images=inline)

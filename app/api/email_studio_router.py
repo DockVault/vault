@@ -758,29 +758,55 @@ async def update_action(key: str, payload: ActionUpdateIn, request: Request,
 
 class ActionTestIn(BaseModel):
     to_addr: Optional[str] = None
+    to_user_id: Optional[uuid.UUID] = None    # send to this user's email (resolved server-side)
+
+
+# A test send is clearly marked so it can't be mistaken for a real notification: a subject prefix + a
+# footer banner. The footer uses only allowlisted tags (it is re-sanitized on the way out anyway).
+_TEST_SUBJECT_PREFIX = "[Test] "
+_TEST_FOOTER_HTML = (
+    "<hr><p><small><strong>This is a test email.</strong> It was sent from Settings &rarr; Email to "
+    "preview this template and is not a real notification. Any codes, links, and dates above are sample "
+    "values.</small></p>")
 
 
 @router.post("/actions/{key}/test")
 async def test_action(key: str, payload: ActionTestIn, request: Request,
                       admin: User = Depends(require_interactive_admin),
                       db: Session = Depends(get_db)):
-    """Send the action's email with SAMPLE token values to a chosen address, so an admin can preview an
-    automated email through real delivery. Force-sends even a disabled optional action (it's a test)."""
+    """Send the action's email with SAMPLE token values to a chosen recipient, so an admin can preview an
+    automated email through real delivery. Force-sends even a disabled optional action (it's a test), and
+    marks the message as a test (subject prefix + footer). The recipient is a picked user (its email is
+    resolved server-side — never trusting a client-supplied address for that user), else a typed address,
+    else the admin's own email."""
     from app.core.email_actions import send_action_email
     action = db.get(EmailAction, key)
     if action is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown email action.")
     _rate_limit(admin.id, limit=30, window=60, prefix="email_action_test",
                 detail="Too many test emails; please wait a moment.")
-    to_addr = (payload.to_addr or "").strip() or (admin.email or "").strip()
+    # Recipient: a picked user (resolve its own email), else a typed address, else the admin's own.
+    if payload.to_user_id is not None:
+        target = db.get(User, payload.to_user_id)
+        if target is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That user was not found.")
+        to_addr = (target.email or "").strip()
+        to_username = target.username or "user"
+        if not to_addr:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="That user has no email address on file. Pick someone else or type an address.")
+    else:
+        to_addr = (payload.to_addr or "").strip() or (admin.email or "").strip()
+        to_username = admin.username or "admin"
     if not _valid_address(to_addr):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail="Enter a valid recipient address (or set one on your admin account).")
     sample = {"link": (_vault_url() or "https://vault.example.com") + "/sample-token",
               "code": "482913", "expires": "in 24 hours"}
     try:
-        send_action_email(db, key, recipient={"email": to_addr, "username": admin.username or "admin"},
-                          action_context=sample, force=True, raise_errors=True)
+        send_action_email(db, key, recipient={"email": to_addr, "username": to_username},
+                          action_context=sample, force=True, raise_errors=True,
+                          subject_prefix=_TEST_SUBJECT_PREFIX, footer_html=_TEST_FOOTER_HTML)
     except email_send.EmailSendError as e:
         code = status.HTTP_400_BAD_REQUEST if e.category == "config" else status.HTTP_502_BAD_GATEWAY
         raise HTTPException(status_code=code, detail=e.message)

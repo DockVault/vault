@@ -453,6 +453,10 @@
 .dv-switch input:disabled + .dv-switch-track { opacity: .45; }
 .ear-notify { display: inline-flex; align-items: center; gap: 8px; margin: 0; }
 .ear-notify-state { font-size: var(--text-xs); color: var(--text-secondary); white-space: nowrap; }
+
+/* Send-test modal: the user-search results dropdown + the picked-recipient banner. */
+.et-test-results:not(:empty) { border: 1px solid var(--surface-3); border-radius: var(--radius-md); margin-top: 4px; max-height: 200px; overflow-y: auto; padding: var(--space-xs); }
+.et-test-selected { margin-top: 8px; display: flex; align-items: center; gap: 8px; font-size: var(--text-sm); color: var(--text-secondary); }
 .et-panes { display: grid; gap: var(--space-md); }
 .et-panes.et-view-code { grid-template-columns: 1fr; }
 .et-panes.et-view-render { grid-template-columns: 1fr; }

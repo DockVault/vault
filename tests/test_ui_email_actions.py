@@ -1,7 +1,11 @@
 """Settings → Email — the "Automated emails" section: the action catalog, template binding, the
 notify toggle, and the protected (non-removable) badge on a bound template card."""
+import re
+
 import pytest
 from playwright.sync_api import Page, expect
+
+from conftest import unique
 
 pytestmark = pytest.mark.ui
 
@@ -107,3 +111,26 @@ def test_notify_switch_is_disabled_without_a_template(admin_page: Page, admin):
     row = page.locator('.email-action-row[data-action-key="vault_member_added"]')
     expect(row.locator(".ear-notify input")).to_be_disabled()
     expect(row.locator(".ear-notify-state")).to_contain_text("pick a template")
+
+
+def test_send_test_opens_a_styled_modal_with_user_search(admin_page: Page, admin):
+    # "Send test" opens an in-app modal (not a native prompt) with a username/email search; picking a
+    # user shows the "will send to their email" banner.
+    uname = unique("tpick")
+    u = admin.create_user(username=uname, email=uname + "@example.com")
+    try:
+        page = admin_page
+        _open_email_tab(page)
+        page.locator('.email-action-row[data-action-key="account_welcome"] .ear-test').click()
+        expect(page.locator("#email-test-modal")).to_have_class(re.compile(r"\bactive\b"))
+        page.fill("#et-test-search", uname[:8])
+        opt = page.locator("#et-test-results .pick-row").filter(has_text=uname)
+        expect(opt.first).to_be_visible(timeout=8000)
+        opt.first.click()
+        expect(page.locator("#et-test-selected")).to_be_visible()
+        expect(page.locator("#et-test-selected")).to_contain_text(uname)
+        # typing a specific address supersedes the picked user (mutually exclusive)
+        page.fill("#et-test-addr", "someone@example.com")
+        expect(page.locator("#et-test-selected")).to_be_hidden()
+    finally:
+        admin.delete_user(u["id"])

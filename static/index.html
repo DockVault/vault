@@ -1714,6 +1714,31 @@
                                 </div>
                             </div>
                         </div>
+
+                        <!-- Send a test of an automated email -->
+                        <div id="email-test-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="email-test-modal-title">
+                            <div class="modal-content">
+                                <div class="modal-header"><h3 id="email-test-modal-title">Send a test email</h3></div>
+                                <div class="modal-body">
+                                    <p class="text-sm text-secondary">This sends the email with sample data, clearly marked as a test.</p>
+                                    <div class="form-group">
+                                        <label for="et-test-search">Send to a user</label>
+                                        <input type="text" id="et-test-search" class="form-control" placeholder="Search by username or email…" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="et-test-results" autocomplete="off">
+                                        <div id="et-test-results" class="et-test-results" role="listbox" aria-label="Matching users"></div>
+                                        <div id="et-test-selected" class="et-test-selected" role="status" aria-live="polite" hidden></div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="et-test-addr">Or send to a specific address</label>
+                                        <input type="email" id="et-test-addr" class="form-control" placeholder="you@example.com">
+                                    </div>
+                                    <div id="et-test-msg" class="text-sm" role="status" aria-live="polite"></div>
+                                </div>
+                                <div class="modal-footer">
+                                    <button type="button" class="btn btn-secondary close-modal-btn">Cancel</button>
+                                    <button type="button" class="btn btn-primary" id="et-test-send">Send test</button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- SFTP & Encryption Settings Tab -->

@@ -8354,7 +8354,7 @@ function buildActionRow(a, templates) {
 
     const test = document.createElement('button'); test.type = 'button';
     test.className = 'btn btn-secondary btn-sm ear-test'; test.textContent = '📧 Send test';
-    test.addEventListener('click', () => testAction(a.key, row));
+    test.addEventListener('click', () => openTestModal(a.key, a.name));
     controls.appendChild(test);
 
     const msg = document.createElement('span'); msg.className = 'ear-msg text-sm'; msg.setAttribute('role', 'status'); controls.appendChild(msg);
@@ -8373,18 +8373,79 @@ async function saveAction(key, patch) {
     }
 }
 
-async function testAction(key, row) {
-    const msg = row.querySelector('.ear-msg');
-    const to = prompt('Send a test of this email to which address?');
-    if (to === null) return;
-    if (msg) { msg.textContent = 'Sending…'; msg.style.color = 'var(--text-secondary)'; }
+// ---- Send-test modal (styled recipient picker: search a user, or type an address) ----------------
+let _testActionKey = null;
+let _testUserId = null;
+let _testSearchTimer = null;
+let _testSearchSeq = 0;
+
+function openTestModal(key, name) {
+    _testActionKey = key; _testUserId = null;
+    clearTimeout(_testSearchTimer); _testSearchSeq++;   // cancel any pending/in-flight search from a prior open
+    document.getElementById('email-test-modal-title').textContent = 'Send a test: ' + name;
+    document.getElementById('et-test-search').value = '';
+    document.getElementById('et-test-addr').value = '';
+    document.getElementById('et-test-results').replaceChildren();
+    const sel = document.getElementById('et-test-selected'); sel.hidden = true; sel.replaceChildren();
+    document.getElementById('et-test-msg').textContent = '';
+    document.getElementById('email-test-modal').classList.add('active');
+    document.getElementById('et-test-search').focus();
+}
+
+async function _testUserSearch(q) {
+    const results = document.getElementById('et-test-results');
+    const search = document.getElementById('et-test-search');
+    q = (q || '').trim();
+    if (q.length < 2) { results.replaceChildren(); search.setAttribute('aria-expanded', 'false'); return; }
+    const seq = ++_testSearchSeq;
     try {
-        const r = await apiRequest('/email/actions/' + encodeURIComponent(key) + '/test',
-            { method: 'POST', body: JSON.stringify({ to_addr: (to || '').trim() }) });
-        if (msg) { msg.textContent = '✓ ' + ((r && r.message) || 'Test sent'); msg.style.color = 'var(--success)'; }
+        const data = await apiRequest('/users/search?q=' + encodeURIComponent(q), { silent: true });
+        if (seq !== _testSearchSeq) return;   // drop a stale/out-of-order response
+        results.replaceChildren();
+        (data || []).slice(0, 8).forEach(u => {
+            const b = document.createElement('button'); b.type = 'button'; b.className = 'pick-row';
+            b.setAttribute('role', 'option'); b.textContent = u.username;
+            b.addEventListener('click', () => _testSelectUser(u.id, u.username));
+            results.appendChild(b);
+        });
+        search.setAttribute('aria-expanded', results.childElementCount ? 'true' : 'false');
+    } catch (e) {}
+}
+
+function _testSelectUser(id, username) {
+    _testUserId = id;
+    clearTimeout(_testSearchTimer); _testSearchSeq++;   // a pending search must not re-open the dropdown
+    document.getElementById('et-test-results').replaceChildren();
+    document.getElementById('et-test-search').value = username;
+    document.getElementById('et-test-search').setAttribute('aria-expanded', 'false');
+    document.getElementById('et-test-addr').value = '';           // user + address are mutually exclusive
+    const sel = document.getElementById('et-test-selected'); sel.hidden = false; sel.replaceChildren();
+    const txt = document.createElement('span');
+    txt.textContent = 'Will send to ' + username + '’s email address. ';
+    const change = document.createElement('button'); change.type = 'button';
+    change.className = 'btn btn-secondary btn-sm'; change.textContent = 'Change';
+    change.addEventListener('click', () => {
+        _testUserId = null; clearTimeout(_testSearchTimer); sel.hidden = true; sel.replaceChildren();
+        const s = document.getElementById('et-test-search'); s.value = ''; s.focus();
+    });
+    sel.appendChild(txt); sel.appendChild(change);
+}
+
+async function sendActionTest() {
+    if (!_testActionKey) return;
+    const msg = document.getElementById('et-test-msg');
+    const addr = document.getElementById('et-test-addr').value.trim();
+    // Picked user wins; else a typed address; else the server falls back to the admin's own email.
+    const body = _testUserId ? { to_user_id: _testUserId } : (addr ? { to_addr: addr } : {});
+    const btn = document.getElementById('et-test-send');
+    try {
+        btn.disabled = true; msg.textContent = 'Sending…'; msg.style.color = 'var(--text-secondary)';
+        const r = await apiRequest('/email/actions/' + encodeURIComponent(_testActionKey) + '/test',
+            { method: 'POST', body: JSON.stringify(body) });
+        msg.textContent = '✓ ' + ((r && r.message) || 'Test sent'); msg.style.color = 'var(--success)';
     } catch (e) {
-        if (msg) { msg.textContent = '✗ ' + ((e && e.message) || 'Test failed'); msg.style.color = 'var(--error)'; }
-    }
+        msg.textContent = '✗ ' + ((e && e.message) || 'Test failed'); msg.style.color = 'var(--error)';
+    } finally { btn.disabled = false; }
 }
 
 async function openTemplateEditor(t) {
@@ -9055,6 +9116,25 @@ function attachSettingsListeners() {
         });
         const etSendGo = document.getElementById('et-send-go');
         if (etSendGo) etSendGo.addEventListener('click', sendTemplateNow);
+        // Send-test modal: debounced user search + send.
+        const etTestSearch = document.getElementById('et-test-search');
+        if (etTestSearch) etTestSearch.addEventListener('input', () => {
+            _testUserId = null;                  // typing = re-searching, so drop any prior selection
+            const sel = document.getElementById('et-test-selected'); if (sel) { sel.hidden = true; sel.replaceChildren(); }
+            clearTimeout(_testSearchTimer);
+            _testSearchTimer = setTimeout(() => _testUserSearch(etTestSearch.value), 250);
+        });
+        const etTestAddr = document.getElementById('et-test-addr');
+        if (etTestAddr) etTestAddr.addEventListener('input', () => {
+            // Typing a specific address supersedes a picked user (they're mutually exclusive), so clear
+            // the selection + banner rather than silently ignoring the typed address.
+            if (etTestAddr.value.trim()) {
+                _testUserId = null;
+                const sel = document.getElementById('et-test-selected'); if (sel) { sel.hidden = true; sel.replaceChildren(); }
+            }
+        });
+        const etTestSend = document.getElementById('et-test-send');
+        if (etTestSend) etTestSend.addEventListener('click', sendActionTest);
         // Close the dynamic-action menu (and its body-level flyout submenu) on an outside click.
         document.addEventListener('click', (e) => {
             const menu = document.getElementById('et-dyn-menu');
