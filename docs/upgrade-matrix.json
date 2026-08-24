@@ -57,6 +57,10 @@
     "0.14.0": {
       "released": "2026-08-24",
       "notes": "Adds six additive tables (email_profiles, email_templates, email_resources for the Email Studio; notifications; notes; email_actions), all created automatically and idempotently at boot by create_all and unused by 0.13.0, so a rollback is clean -- take a backup before upgrading. Features: Email Studio (branded HTML email templates with grouped substitution tokens and automated-email actions that route the verification-code / password-reset / invitation emails through the template mechanism, with a fail-safe that never sends a system security email missing its code or link token); an in-app notification bell plus a reworked three-lane non-admin dashboard (What's waiting for you / Favourites / Most recent); move and copy for files and folders, within a vault and across Standard vaults (re-encrypting content under the destination binding; zero-knowledge cross-vault deferred); personal server-side notes with a snapshot 'send note' to other users; and a rate-limiter split giving per-chunk uploads and polled reads their own generous budgets so large uploads and normal polling are no longer throttled."
+    },
+    "0.15.0": {
+      "released": "2026-08-25",
+      "notes": "Public note links + notes UX. Adds two additive tables (note_link_tags, note_public_links), created automatically and idempotently at boot by create_all and unused by 0.14.0, so a rollback is clean -- take a backup before upgrading. Features: public note links -- a note owner can turn a note into an anonymous, tokenized SNAPSHOT link that anyone holding the link can read without signing in, governed by admin-defined 'note-link tags' that act as a security FLOOR the creator may only tighten (a longer token, an added or stronger PIN/password, a shorter expiry, fewer views), with anonymous redemption rate-limited per link, a per-link lockout after repeated wrong secrets, and fail-closed behaviour. Plus a Notes read modal with a left rail; clickable note tiles with wrapping text and bottom-aligned actions; a Send->Share chooser (send a copy to a member, or create a public link); a 'Shared (by me)' tab; live in-app notification delivery over the activity socket so a sent note appears without a page refresh (the socket now persists app-wide and re-checks session revocation); and admin oversight of every public link (list, revoke, and bulk-revoke). Host tool only: dockvault.py setup on a re-run now honours --image-source build so an operator can run freshly-pulled source instead of re-pulling the pinned release."
     }
   },
   "edges": [
@@ -71,7 +75,8 @@
     { "from": "0.11.1", "to": "0.11.2", "kind": "direct", "reversible": true, "requires_backup": false },
     { "from": "0.11.2", "to": "0.12.0", "kind": "direct", "reversible": true, "requires_backup": false },
     { "from": "0.12.0", "to": "0.13.0", "kind": "direct", "reversible": true, "requires_backup": true },
-    { "from": "0.13.0", "to": "0.14.0", "kind": "direct", "reversible": true, "requires_backup": true }
+    { "from": "0.13.0", "to": "0.14.0", "kind": "direct", "reversible": true, "requires_backup": true },
+    { "from": "0.14.0", "to": "0.15.0", "kind": "direct", "reversible": true, "requires_backup": true }
   ],
   "waivers": []
 }
