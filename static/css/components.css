@@ -957,6 +957,9 @@ button.vault-sort-dir {
 .share-tile-title { font-weight: 600; font-size: var(--text-base); }
 .share-tile-sub { font-size: var(--text-sm); color: var(--text-secondary); white-space: normal; }
 
+/* "Shared (by me)" link cards: a subtle per-tag colour spine + a wrapping title. */
+.note-link-card .note-link-title { margin: 0; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+
 .profile-dropdown-header {
     padding: var(--space-md);
     display: flex;
