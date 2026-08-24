@@ -11381,12 +11381,128 @@ async function _downloadFile(fileId, fileName) {
 // nothing decrypted is ever written to disk.
 let _previewUrl = null;
 
+// Build the little in-preview zoom toolbar (- / level / + / reset). Labels are set via
+// textContent, so nothing here is a markup sink.
+function buildZoomControls() {
+    const el = document.createElement('div');
+    el.className = 'preview-zoom-controls';
+    const mk = (label, aria) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = label;
+        b.setAttribute('aria-label', aria);
+        b.title = aria;
+        return b;
+    };
+    const minus = mk('−', 'Zoom out');
+    const level = document.createElement('span');
+    level.className = 'preview-zoom-level';
+    level.setAttribute('aria-live', 'polite');
+    level.textContent = '100%';
+    const plus = mk('+', 'Zoom in');
+    const reset = mk('↺', 'Reset zoom');
+    el.append(minus, level, plus, reset);
+    return { el, minus, level, plus, reset };
+}
+
+// Wire wheel / pinch / drag / button zooming onto one preview image. The transform is
+// applied to the <img> alone inside an overflow:hidden container, so it zooms the preview
+// and never the page. All listeners hang off the (soon-to-be-replaced) wrap element and
+// self-clean when the next preview replaces the body, so there is nothing to tear down.
+function setupImageZoom(img, wrap, controls) {
+    const MIN = 1, MAX = 8;
+    let scale = 1, tx = 0, ty = 0;
+    const apply = () => {
+        img.style.transform = scale === 1 ? '' : `translate(${tx}px, ${ty}px) scale(${scale})`;
+        wrap.classList.toggle('zoomed', scale > 1);
+        if (controls.level) controls.level.textContent = Math.round(scale * 100) + '%';
+        if (controls.minus) controls.minus.disabled = scale <= MIN + 1e-3;
+        if (controls.plus) controls.plus.disabled = scale >= MAX - 1e-3;
+    };
+    const clampPan = () => {
+        const r = wrap.getBoundingClientRect();
+        const maxX = (r.width * (scale - 1)) / 2;
+        const maxY = (r.height * (scale - 1)) / 2;
+        tx = Math.max(-maxX, Math.min(maxX, tx));
+        ty = Math.max(-maxY, Math.min(maxY, ty));
+    };
+    // Zoom so the content point currently under (cx,cy) [relative to the wrap centre]
+    // stays put. transform-origin is centre, transform = translate(t) scale(s), so a point
+    // p maps to s*p + t; solving to hold cx fixed gives t' = cx - (cx - t)*(s'/s).
+    const zoomAt = (cx, cy, next) => {
+        next = Math.max(MIN, Math.min(MAX, next));
+        if (Math.abs(next - scale) < 1e-4) return;
+        const ratio = next / scale;
+        tx = cx - (cx - tx) * ratio;
+        ty = cy - (cy - ty) * ratio;
+        scale = next;
+        if (scale <= MIN + 1e-3) { scale = MIN; tx = 0; ty = 0; }
+        clampPan();
+        apply();
+    };
+    wrap.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const r = wrap.getBoundingClientRect();
+        zoomAt(e.clientX - r.left - r.width / 2, e.clientY - r.top - r.height / 2,
+               scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15));
+    }, { passive: false });
+    wrap.addEventListener('dblclick', (e) => {
+        const r = wrap.getBoundingClientRect();
+        if (scale > 1) { scale = 1; tx = 0; ty = 0; apply(); }
+        else zoomAt(e.clientX - r.left - r.width / 2, e.clientY - r.top - r.height / 2, 2.5);
+    });
+    // Drag-to-pan when zoomed, plus two-finger pinch, via pointer events.
+    const pointers = new Map();
+    let pinchDist = 0, panLast = null;
+    const dist = () => { const p = [...pointers.values()]; return Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y); };
+    const mid = () => {
+        const p = [...pointers.values()];
+        const r = wrap.getBoundingClientRect();
+        return { x: (p[0].x + p[1].x) / 2 - r.left - r.width / 2, y: (p[0].y + p[1].y) / 2 - r.top - r.height / 2 };
+    };
+    wrap.addEventListener('pointerdown', (e) => {
+        try { wrap.setPointerCapture(e.pointerId); } catch (_) {}
+        pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (pointers.size === 2) { pinchDist = dist(); panLast = null; wrap.classList.remove('panning'); }
+        else if (scale > 1) { panLast = { x: e.clientX, y: e.clientY }; wrap.classList.add('panning'); }
+    });
+    wrap.addEventListener('pointermove', (e) => {
+        if (!pointers.has(e.pointerId)) return;
+        pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (pointers.size === 2) {
+            const d = dist();
+            if (pinchDist > 0) { const m = mid(); zoomAt(m.x, m.y, scale * (d / pinchDist)); }
+            pinchDist = d;
+        } else if (panLast && scale > 1) {
+            tx += e.clientX - panLast.x; ty += e.clientY - panLast.y;
+            panLast = { x: e.clientX, y: e.clientY };
+            clampPan(); apply();
+        }
+    });
+    const endPointer = (e) => {
+        pointers.delete(e.pointerId);
+        if (pointers.size < 2) pinchDist = 0;
+        if (pointers.size === 0) { panLast = null; wrap.classList.remove('panning'); }
+    };
+    wrap.addEventListener('pointerup', endPointer);
+    wrap.addEventListener('pointercancel', endPointer);
+    controls.plus?.addEventListener('click', () => zoomAt(0, 0, scale * 1.4));
+    controls.minus?.addEventListener('click', () => zoomAt(0, 0, scale / 1.4));
+    controls.reset?.addEventListener('click', () => { scale = 1; tx = 0; ty = 0; apply(); });
+    apply();
+}
+
 async function openFilePreview(fileId, fileName, mime) {
     const modal = document.getElementById('file-preview-modal');
     if (!modal) return;
     document.getElementById('file-preview-title').textContent = fileName;
     const bodyEl = document.getElementById('file-preview-body');
-    bodyEl.innerHTML = '<div class="spinner"></div>';
+    // Clear the image-only sizing up front so the spinner, an error (incl. a fetch/decrypt
+    // failure before the branch), and any non-image preview size to content, not a tall box.
+    bodyEl.classList.remove('preview-has-image');
+    const _spinner = document.createElement('div');
+    _spinner.className = 'spinner';
+    bodyEl.replaceChildren(_spinner);
     const dlBtn = document.getElementById('file-preview-download');
     if (dlBtn) dlBtn.onclick = () => downloadFile(fileId, fileName);
     modal.classList.add('active');
@@ -11421,12 +11537,26 @@ async function openFilePreview(fileId, fileName, mime) {
             pre.className = 'preview-text';
             pre.textContent = await blob.text();
             bodyEl.replaceChildren(pre);
-        } else if (isImg || isPdf || isVideo || isAudio) {
-            const tag = isImg ? 'img' : isPdf ? 'iframe' : isVideo ? 'video' : 'audio';
+        } else if (isImg) {
+            // Image: fit-to-view (CSS object-fit) inside a clipping container, plus a
+            // zoom control that only ever transforms the <img> -- never the page.
+            const wrap = document.createElement('div');
+            wrap.className = 'preview-zoom';
+            const img = document.createElement('img');
+            img.className = 'preview-media';
+            img.src = _previewUrl;
+            img.alt = fileName;
+            img.draggable = false;
+            const controls = buildZoomControls();
+            wrap.append(img, controls.el);
+            bodyEl.classList.add('preview-has-image');
+            bodyEl.replaceChildren(wrap);
+            setupImageZoom(img, wrap, controls);
+        } else if (isPdf || isVideo || isAudio) {
+            const tag = isPdf ? 'iframe' : isVideo ? 'video' : 'audio';
             const el = document.createElement(tag);
             el.src = _previewUrl;
-            if (isImg) { el.className = 'preview-media'; el.alt = fileName; }
-            else if (isPdf) { el.className = 'preview-frame'; el.title = fileName; }
+            if (isPdf) { el.className = 'preview-frame'; el.title = fileName; }
             else if (isVideo) { el.className = 'preview-media'; el.controls = true; }
             else { el.controls = true; el.style.width = '100%'; }
             bodyEl.replaceChildren(el);
