@@ -595,16 +595,17 @@
                                         <thead>
                                             <tr>
                                                 <th class="col-check"><input type="checkbox" id="files-select-all" class="files-check" aria-label="Select all files"></th>
-                                                <th>Name</th>
-                                                <th class="col-num">Size</th>
-                                                <th>Type</th>
-                                                <th>Modified</th>
+                                                <th class="sortable" data-sort-key="name" role="button" tabindex="0" aria-sort="none">Name<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="col-num sortable" data-sort-key="size" role="button" tabindex="0" aria-sort="none">Size<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="sortable" data-sort-key="type" role="button" tabindex="0" aria-sort="none">Type<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="sortable" data-sort-key="modified" role="button" tabindex="0" aria-sort="none">Modified<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="sortable" data-sort-key="modified_by" role="button" tabindex="0" aria-sort="none">Modified by<span class="sort-ind" aria-hidden="true"></span></th>
                                                 <th class="col-actions">Actions</th>
                                             </tr>
                                         </thead>
                                         <tbody id="vault-files-table-body">
                                             <tr>
-                                                <td colspan="6" class="text-center p-lg">Loading files...</td>
+                                                <td colspan="7" class="text-center p-lg">Loading files...</td>
                                             </tr>
                                         </tbody>
                                     </table>
@@ -3139,6 +3140,17 @@
                         </div>
                     </div>
                     <div class="modal-body" id="file-preview-body"></div>
+                </div>
+            </div>
+
+            <!-- File Info Modal -->
+            <div id="file-info-modal" class="modal">
+                <div class="modal-content" style="max-width: 560px;">
+                    <div class="modal-header">
+                        <h3 id="file-info-title" class="mono" style="font-size: var(--text-base); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">File information</h3>
+                        <button class="close-modal-btn modal-close" aria-label="Close">×</button>
+                    </div>
+                    <div class="modal-body" id="file-info-body"></div>
                 </div>
             </div>
 

@@ -10378,6 +10378,19 @@ async def list_vault_files(
         # are never emitted); the @require_vault_cap("vault.see_files") above still gates listing at all.
         folders, files = filter_listing_for_scope(db, current_user, vault_id, folder_uuid, folders, files)
 
+        # "Last modified by" for the list column: a file's last in-place modifier (the renamer), or
+        # its uploader when it was never renamed (creation is then the last change). Resolved to a
+        # username in ONE query. Shown ONLY to a NON-scoped principal -- a scoped temp credential or a
+        # share recipient must not learn the org member identities behind the files (an info leak the
+        # raw listing would otherwise add on top of the names/sizes it already returns).
+        _show_actor = _member_grade_principal(current_user, vault_id)
+        _actor_names = {}
+        if _show_actor:
+            _actor_ids = {(f.modified_by or f.uploaded_by) for f in files if (f.modified_by or f.uploaded_by)}
+            if _actor_ids:
+                for _uid, _uname in db.query(User.id, User.username).filter(User.id.in_(_actor_ids)).all():
+                    _actor_names[_uid] = _uname
+
         # Build response
         items = []
         # Zero-knowledge vaults: names/MIME are encrypted client-side under the vault DEK,
@@ -10430,6 +10443,9 @@ async def list_vault_files(
                 # rotation). Absent/None => epoch 1; the browser uses it to fetch the
                 # matching wrapped DEK on download AND to decrypt the name. Null for Standard.
                 'key_version': (meta or {}).get('key_version') if meta else None,
+                # Last-modifier username for the list column (None for scoped/share principals).
+                'modified_by_name': (_actor_names.get(file.modified_by or file.uploaded_by)
+                                     if _show_actor else None),
             }
             if is_zk:
                 entry['enc_name'] = file.enc_name
@@ -10466,6 +10482,19 @@ async def list_vault_files(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list files: {str(e)}"
         )
+
+
+def _member_grade_principal(user, vault_id) -> bool:
+    """True ONLY for a genuine owner/member/group principal on this vault -- NOT a scoped temp
+    credential and NOT a share-claim recipient. Used to decide whether to reveal org-member
+    identities (creator/last-modifier usernames): a restricted principal (scoped cred OR share
+    recipient) must never learn them. is_scoped() catches temp sessions; a share access stamps
+    _share_vault_scope for the vault (a real member never does), which catches share recipients --
+    the gap that let a share recipient read the names when the check was is_scoped() alone."""
+    from app.core.temp_scope import is_scoped
+    if is_scoped(user):
+        return False
+    return str(vault_id) not in (getattr(user, "_share_vault_scope", None) or {})
 
 
 def _has_vault_cap(user, vault_id, cap: str) -> bool:
@@ -13292,6 +13321,92 @@ async def delete_file(
         )
 
 
+@app.get("/vaults/{vault_id}/files/{file_id}/info")
+@require_endpoint_permission("FILE_VIEW")
+@require_vault_cap("vault.see_files")
+async def get_file_info(
+    vault_id: uuid.UUID,
+    file_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    x_vault_password: Optional[str] = Header(None),
+):
+    """Read-only metadata for one file: dates, size, MIME, uploader/last-modifier usernames and
+    (Standard vaults only) the stored plaintext SHA-256. Gated + scoped exactly like the listing;
+    never surfaces plaintext name/MIME/hash for a zero-knowledge vault -- the server holds only the
+    ciphertext, so its stored checksum is over ciphertext, not the file's content."""
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    try:
+        vault = vault_service.get_vault(vault_id, current_user, x_vault_password,
+                                        require_password=True, allow_share=True)
+        # A path-scoped temp credential may only read info for a file within its scope.
+        require_item_scope(db, current_user, vault_id, file_id)
+
+        file = db.query(File).filter(File.id == file_id, File.vault_id == vault_id).first()
+        if file is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+
+        is_zk = _is_zk_vault(vault)
+
+        # Names only for a genuine member (same rule as the listing column) -- a scoped temp
+        # credential OR a share recipient must not learn org-member identities. The last modifier is
+        # the renamer if the file was ever renamed, else the uploader.
+        show_actor = _member_grade_principal(current_user, vault_id)
+        last_modifier_id = file.modified_by or file.uploaded_by
+        names = {}
+        if show_actor:
+            wanted = {i for i in (file.uploaded_by, last_modifier_id) if i}
+            if wanted:
+                for uid, uname in db.query(User.id, User.username).filter(User.id.in_(wanted)).all():
+                    names[uid] = uname
+
+        # The stored checksum is a genuine plaintext SHA-256 ONLY for Standard vaults; for ZK it is
+        # over ciphertext. Reveal it only to a principal who could DOWNLOAD the file (and could thus
+        # compute the hash itself) -- mirror the /download endpoint's gates: the temp-cred
+        # file.download cap, the FILE_DOWNLOAD endpoint group for a genuine member (admins bypass),
+        # and the share downloadable scope for a share recipient (a view-only claim lists but cannot
+        # download). require_download_scope is a no-op for a genuine member and raises otherwise.
+        can_download = _has_vault_cap(current_user, vault_id, "file.download")
+        _is_temp = bool(getattr(current_user, "_is_temp_session", False))
+        _is_share = str(vault_id) in (getattr(current_user, "_share_vault_scope", None) or {})
+        if can_download and not _is_temp and not _is_share and getattr(current_user, "role", None) != RoleEnum.ADMIN:
+            from app.core.endpoint_permissions import _user_has_required_groups
+            if not _user_has_required_groups(db, current_user.id, "FILE_DOWNLOAD"):
+                can_download = False
+        if can_download:
+            try:
+                require_download_scope(db, current_user, vault_id, file_id)
+            except PermissionDeniedError:
+                can_download = False
+        checksum = file.checksum_sha256 if (not is_zk and can_download) else None
+
+        return {
+            "id": str(file.id),
+            "name": None if is_zk else file.original_name,
+            "size": file.size_bytes,
+            "mime_type": None if is_zk else file.mime_type,
+            "created_at": file.created_at.isoformat() if file.created_at else None,
+            "modified_at": file.updated_at.isoformat() if file.updated_at else None,
+            "created_by": names.get(file.uploaded_by) if show_actor else None,
+            "modified_by": names.get(last_modifier_id) if show_actor else None,
+            "checksum_sha256": checksum,
+            "checksum_algorithm": "SHA-256" if checksum else None,
+            "is_zero_knowledge": is_zk,
+        }
+    except (PasswordRequiredError, InvalidPasswordError) as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logging.getLogger(__name__).exception("get_file_info failed")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="Failed to read file info")
+
+
 @app.put("/vaults/{vault_id}/files/{file_id}/rename")
 @require_endpoint_permission("FILE_DELETE")
 @require_vault_cap("file.rename")
@@ -15117,6 +15232,9 @@ def _run_lightweight_migrations():
             "ALTER TABLE files ADD COLUMN IF NOT EXISTS enc_mime TEXT",
             "ALTER TABLE files ADD COLUMN IF NOT EXISTS name_bi VARCHAR(64)",
             "CREATE INDEX IF NOT EXISTS ix_files_name_bi ON files (name_bi)",
+            # Who last renamed the file in place (NULL = never renamed since upload). Nullable, no
+            # backfill: the model declares it nullable, so a fresh install and an upgraded one agree.
+            "ALTER TABLE files ADD COLUMN IF NOT EXISTS modified_by UUID",
             "ALTER TABLE files ALTER COLUMN name DROP NOT NULL",
             "ALTER TABLE files ALTER COLUMN original_name DROP NOT NULL",
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS enc_name TEXT",

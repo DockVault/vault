@@ -9255,6 +9255,137 @@ function formatModified(iso) {
     return `${date} · ${time}`;
 }
 
+// Sort the file list for display. Folders always group first; within each group the active column
+// (state.filesSort) drives the order, with a stable tiebreak on name so the result is deterministic.
+function sortFilesForRender(list) {
+    const items = (list || []).slice();
+    const s = state.filesSort || (state.filesSort = { key: 'name', dir: 'asc' });
+    const dir = s.dir === 'desc' ? -1 : 1;
+    const keyVal = (it) => {
+        switch (s.key) {
+            case 'size': return it.type === 'folder' ? -1 : (it.size || 0);
+            case 'type': return (friendlyFileType(it) || '').toLowerCase();
+            case 'modified': { const d = parseServerTime(it.modified); return d ? d.getTime() : 0; }
+            case 'modified_by': return (it.modified_by_name || '').toLowerCase();
+            case 'name':
+            default: return (it.name || '').toLowerCase();
+        }
+    };
+    return items.sort((a, b) => {
+        if (a.type === 'folder' && b.type !== 'folder') return -1;
+        if (a.type !== 'folder' && b.type === 'folder') return 1;
+        const va = keyVal(a), vb = keyVal(b);
+        const cmp = (typeof va === 'number' && typeof vb === 'number')
+            ? va - vb : String(va).localeCompare(String(vb));
+        if (cmp !== 0) return cmp * dir;
+        return (a.name || '').localeCompare(b.name || '');  // stable secondary key, not flipped by dir
+    });
+}
+
+// Wire the sortable table headers once (a header click sets/toggles state.filesSort and re-renders),
+// and reflect the active sort as aria-sort + a small glyph on every render. renderVaultFiles runs on
+// the 5s poll, so the wiring is guarded to attach exactly once.
+function applySortHeaderUI() {
+    const thead = document.querySelector('.files-table thead');
+    if (!thead) return;
+    const s = state.filesSort || { key: 'name', dir: 'asc' };
+    if (!thead.dataset.sortWired) {
+        thead.dataset.sortWired = '1';
+        thead.querySelectorAll('th.sortable[data-sort-key]').forEach(th => {
+            const activate = () => {
+                const key = th.getAttribute('data-sort-key');
+                const cur = state.filesSort || { key: 'name', dir: 'asc' };
+                state.filesSort = (cur.key === key)
+                    ? { key, dir: cur.dir === 'asc' ? 'desc' : 'asc' }
+                    : { key, dir: 'asc' };
+                renderVaultFiles();
+            };
+            th.addEventListener('click', activate);
+            th.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); activate(); }
+            });
+        });
+    }
+    thead.querySelectorAll('th.sortable[data-sort-key]').forEach(th => {
+        const active = th.getAttribute('data-sort-key') === s.key;
+        th.setAttribute('aria-sort', active ? (s.dir === 'desc' ? 'descending' : 'ascending') : 'none');
+        const ind = th.querySelector('.sort-ind');
+        if (ind) ind.textContent = active ? (s.dir === 'desc' ? ' ▼' : ' ▲') : '';
+    });
+}
+
+// File info modal: fetch the metadata, render it, and (Standard vaults) offer the SHA-256 hash.
+async function openFileInfo(fileId, fileName) {
+    const modal = document.getElementById('file-info-modal');
+    if (!modal) return;
+    const titleEl = document.getElementById('file-info-title');
+    if (titleEl) titleEl.textContent = fileName || 'File information';
+    const body = document.getElementById('file-info-body');
+    if (body) { const sp = document.createElement('div'); sp.className = 'spinner'; body.replaceChildren(sp); }
+    openModal('file-info-modal');
+    try {
+        const headers = {};
+        if (state.currentVault && state.currentVault.has_password && state.vaultPassword) headers['X-Vault-Password'] = state.vaultPassword;
+        const info = await apiRequest(`/vaults/${state.currentVault.id}/files/${fileId}/info`, { headers });
+        renderFileInfo(body, info, fileName);
+    } catch (e) {
+        const alert = document.createElement('div');
+        alert.className = 'alert alert-error';
+        alert.textContent = (e && e.message) ? ('Could not load file info: ' + e.message) : 'Could not load file info.';
+        if (body) body.replaceChildren(alert);
+    }
+}
+
+function renderFileInfo(body, info, fallbackName) {
+    if (!body) return;
+    const dl = document.createElement('dl');
+    dl.className = 'file-info-dl';
+    const row = (label, value) => {
+        const dt = document.createElement('dt'); dt.textContent = label;
+        const dd = document.createElement('dd');
+        dd.textContent = (value === null || value === undefined || value === '') ? '—' : String(value);
+        dl.append(dt, dd);
+    };
+    const displayName = info.name || fallbackName || '—';
+    row('Name', displayName);
+    row('Size', formatBytes(info.size || 0));
+    row('Type', info.mime_type || friendlyFileType({ type: 'file', name: displayName }));
+    row('Created', info.created_at ? formatModified(info.created_at) : null);
+    row('Modified', info.modified_at ? formatModified(info.modified_at) : null);
+    if (info.created_by) row('Created by', info.created_by);
+    if (info.modified_by) row('Modified by', info.modified_by);
+    body.replaceChildren(dl);
+
+    // Hash: Standard vaults carry a real plaintext SHA-256; ZK vaults do not (the server holds only
+    // ciphertext), so hash is Standard-only per the owner's decision.
+    const hashWrap = document.createElement('div');
+    hashWrap.className = 'file-info-hash';
+    if (info.checksum_sha256) {
+        const head = document.createElement('div'); head.className = 'file-info-hash-head';
+        const label = document.createElement('span'); label.className = 'file-info-hash-label';
+        label.textContent = info.checksum_algorithm || 'SHA-256';
+        const copy = document.createElement('button');
+        copy.type = 'button'; copy.className = 'btn btn-sm btn-secondary'; copy.textContent = 'Copy';
+        copy.addEventListener('click', async () => {
+            try { await navigator.clipboard.writeText(info.checksum_sha256); showToast('Hash copied to clipboard', 'success'); }
+            catch (_) { showToast('Could not copy to clipboard', 'error'); }
+        });
+        head.append(label, copy);
+        const val = document.createElement('code');
+        val.className = 'file-info-hash-value';
+        val.textContent = info.checksum_sha256;
+        hashWrap.append(head, val);
+    } else {
+        const note = document.createElement('div');
+        note.className = 'text-sm text-secondary';
+        note.textContent = info.is_zero_knowledge
+            ? 'Hash unavailable: a zero-knowledge vault stores only ciphertext, so the server cannot provide the file’s content hash.'
+            : 'Hash unavailable for this file.';
+        hashWrap.append(note);
+    }
+    body.appendChild(hashWrap);
+}
+
 // Render the current vault's files in the active view (table or grid). Reads
 // state.currentFiles (set by loadVaultFiles) so the view can be re-rendered on
 // a view-switch without re-fetching. All dynamic text is escaped via escapeHtml.
@@ -9264,7 +9395,7 @@ function renderVaultFiles() {
     }
     if (!(state.selectedFileIds instanceof Set)) state.selectedFileIds = new Set();
 
-    const items = state.currentFiles || [];
+    const items = sortFilesForRender(state.currentFiles || []);
     const view = state.filesView === 'grid' ? 'grid' : 'table';
     const canWrite = state.canWriteCurrentVault !== false;
 
@@ -9284,6 +9415,7 @@ function renderVaultFiles() {
     if (view === 'table') {
         renderFilesTable(items, canWrite, tbody);
         wireFileItemHandlers(tbody);
+        applySortHeaderUI();
     } else {
         renderFilesGrid(items, canWrite, grid);
         wireFileItemHandlers(grid);
@@ -9300,7 +9432,7 @@ function filesEmptyStateHtml(grid) {
         <p style="color:var(--text-secondary);">Upload files or create folders to get started</p>`;
     return grid
         ? `<div class="empty-state text-center p-xl" style="grid-column:1/-1;">${inner}</div>`
-        : `<tr><td colspan="6" style="text-align:center;padding:40px;"><div class="empty-state">${inner}</div></td></tr>`;
+        : `<tr><td colspan="7" style="text-align:center;padding:40px;"><div class="empty-state">${inner}</div></td></tr>`;
 }
 
 // Build the inline action buttons for a file/folder row or tile. Keeps the
@@ -9349,6 +9481,8 @@ function fileActionButtons(item, canWrite, opts) {
             if (canDelete) out.push(btn('move-file', 'move', 'Move'));
             if (canDelete) out.push(btn('delete-file', 'trash', 'Delete', true));
             if (vaultShareable()) out.push(btn('share-file', 'link', 'Share'));
+            // Info (dates / who / size / hash). Anyone who can list files can read it.
+            if (vaultCapAllowed('vault.see_files')) out.push(btn('file-info', 'info', 'Info'));
             // Download last so it renders on the far RIGHT of the action cluster (grid + table).
             if (canDownload) out.push(btn('download', 'download', 'Download'));
         }
@@ -9382,6 +9516,7 @@ function renderFilesTable(items, canWrite, tbody) {
                 <td class="col-num"><span class="file-size">${size}</span></td>
                 <td><span class="file-type">${escapeHtml(friendlyFileType(item))}</span></td>
                 <td><span class="file-modified">${formatModified(item.modified)}</span></td>
+                <td><span class="file-modified-by">${escapeHtml(isFolder ? '—' : (item.modified_by_name || '—'))}</span></td>
                 <td class="col-actions"><div class="file-actions">${fileActionButtons(item, canWrite, { grid: false })}</div></td>
             </tr>`;
     }).join('');
@@ -9460,6 +9595,7 @@ function wireFileItemHandlers(container) {
             else if (action === 'rename-file' || action === 'rename-folder') renameVaultItem(id, name, action === 'rename-folder' ? 'folder' : 'file');
             else if (action === 'delete-file' || action === 'delete-folder') deleteVaultItem(id, name, action === 'delete-folder' ? 'folder' : 'file');
             else if (action === 'share-file' || action === 'share-folder') openCreateShareModal(action === 'share-folder' ? 'folder' : 'file', id, name);
+            else if (action === 'file-info') openFileInfo(id, name);
             else if (action === 'copy-file' || action === 'move-file')
                 stageForMoveCopy(id, name, 'file', action === 'move-file' ? 'move' : 'copy');
             else if (action === 'copy-folder' || action === 'move-folder')

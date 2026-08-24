@@ -1908,6 +1908,22 @@ details summary:hover {
 }
 
 /* ============================================================================
+   Sortable table headers + File info modal (shared by both skins)
+   ============================================================================ */
+.data-table thead th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+.data-table thead th.sortable:hover { color: var(--text-primary); }
+.data-table thead th.sortable:focus-visible { outline: 2px solid var(--surface-4); outline-offset: -2px; }
+.sort-ind { font-size: .8em; color: var(--text-secondary); }
+
+.file-info-dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0 0 var(--space-md) 0; }
+.file-info-dl dt { color: var(--text-secondary); font-size: var(--text-sm); }
+.file-info-dl dd { margin: 0; color: var(--text-primary); word-break: break-word; }
+.file-info-hash { border-top: 1px solid var(--surface-3); padding-top: var(--space-md); }
+.file-info-hash-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); margin-bottom: 6px; }
+.file-info-hash-label { font-size: var(--text-sm); color: var(--text-secondary); }
+.file-info-hash-value { display: block; font-family: var(--font-mono); font-size: var(--text-xs); word-break: break-all; background: var(--surface-1); padding: var(--space-sm); border-radius: var(--radius-sm); color: var(--text-primary); }
+
+/* ============================================================================
    CONTINUED IN NEXT FILE...
    ============================================================================ */
 

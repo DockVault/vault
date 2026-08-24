@@ -822,7 +822,11 @@ class File(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     uploaded_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
-    
+    # The last principal to change this file in place (a rename). A same-name overwrite replaces
+    # the row with a fresh uploaded_by, so this is meaningful mainly for renames; NULL means the
+    # file has not been renamed since upload, in which case its last modifier is the uploader.
+    modified_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+
     # Relationships
     vault = relationship('Vault', back_populates='files')
     folder = relationship('Folder', back_populates='files')
