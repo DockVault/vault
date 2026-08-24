@@ -37,7 +37,7 @@ from app.core.config import bootstrap_entrypoint
 bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
-from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag
+from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink
 from app.core import sharing_policy
 from app.core import note_link_policy
 from app.core import storage_quota
@@ -6828,6 +6828,394 @@ async def deactivate_note_link_tag(
     db.commit()
     _audit_note_link_tag(db, request, current_user, "note_link_tag_deactivated", tag)
     return {"message": f"Note-link tag '{tag.name}' deactivated", "id": str(tag.id), "is_active": False}
+
+
+# ============================ PUBLIC NOTE LINKS (anonymous snapshot links) =========================
+# A NoteLink is an anonymous, tokenized SNAPSHOT of one note, governed by a NoteLinkTag floor that the
+# owner may only TIGHTEN. Creation is authenticated + feature-gated + allowlisted + per-user-capped;
+# redemption is PUBLIC, rate-limited, optionally secret-gated with a per-link lockout, and audited.
+
+_NOTELINK_TOKEN_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"  # base62
+_NOTELINK_REDEEM_LIMIT = 10          # redemption requests / minute / IP (and / token)
+_NOTELINK_REDEEM_WINDOW = 60
+_NOTELINK_FAIL_MAX = 5               # wrong-secret attempts before a lockout
+_NOTELINK_FAIL_WINDOW = 900          # 15-minute lockout window
+_NOTELINK_TOKEN_MAX_INPUT = 128      # reject absurd tokens before they touch redis/db
+_NOTELINK_SECRET_MAX = note_link_policy.PASSWORD_MAX_LEN   # cap the redeem secret before argon2
+
+
+def _notelink_gen_token(n: int) -> str:
+    import secrets as _secrets
+    return "".join(_secrets.choice(_NOTELINK_TOKEN_ALPHABET) for _ in range(int(n)))
+
+
+def _notelink_status(link, now=None) -> str:
+    now = now or datetime.utcnow()
+    if link.revoked:
+        return "revoked"
+    if link.expires_at and link.expires_at <= now:
+        return "expired"
+    if link.max_uses is not None and link.use_count >= link.max_uses:
+        return "exhausted"
+    return "active"
+
+
+def _notelink_public_dict(link, tag=None) -> dict:
+    """Owner-facing view of a link — NEVER the body snapshot (only the title, for the list tile)."""
+    return {
+        "id": str(link.id),
+        "token": link.token,
+        "url_path": f"/l/{link.token}",
+        "title": link.title_snapshot or "",
+        "tag_id": str(link.tag_id) if link.tag_id else None,
+        "tag_name": getattr(tag, "name", None),
+        "tag_border_color": getattr(tag, "border_color", None),
+        "tag_icon": getattr(tag, "icon", None),
+        "secret_kind": link.secret_kind,
+        "expires_at": link.expires_at.isoformat() if link.expires_at else None,
+        "max_uses": link.max_uses,
+        "use_count": link.use_count,
+        "view_count": link.view_count,
+        "last_viewed_at": link.last_viewed_at.isoformat() if link.last_viewed_at else None,
+        "revoked": bool(link.revoked),
+        "status": _notelink_status(link),
+        "created_at": link.created_at.isoformat() if link.created_at else None,
+    }
+
+
+def _notelink_fail_key(token: str) -> str:
+    return f"notelink:fail:{token}"
+
+
+def _notelink_locked(token: str) -> bool:
+    """True if this link is in failed-secret lockout. Raises on a Redis outage so the caller fails
+    CLOSED (503) — a link's lockout must never silently lift because the store is unreachable."""
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is None:
+        raise RuntimeError("rate-limit store unavailable")
+    n = r.get(_notelink_fail_key(token))
+    return n is not None and int(n) >= _NOTELINK_FAIL_MAX
+
+
+def _notelink_record_fail(token: str) -> int:
+    """Count one wrong-secret attempt; returns the running count. Best-effort — a store outage is
+    handled by the redemption rate-limit gate (which fails closed) before we get here."""
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is None:
+        return _NOTELINK_FAIL_MAX
+    try:
+        n = int(r.incr(_notelink_fail_key(token)))
+        if n == 1:
+            r.expire(_notelink_fail_key(token), _NOTELINK_FAIL_WINDOW)
+        return n
+    except Exception:
+        return _NOTELINK_FAIL_MAX
+
+
+def _notelink_clear_fails(token: str) -> None:
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is not None:
+        try:
+            r.delete(_notelink_fail_key(token))
+        except Exception:
+            pass
+
+
+class NoteLinkCreate(BaseModel):
+    note_id: uuid.UUID
+    tag_id: uuid.UUID
+    token_len: Optional[int] = None
+    secret_kind: Optional[str] = None
+    pin: Optional[str] = None
+    password: Optional[str] = None
+    ttl_hours: Optional[int] = None
+    max_uses: Optional[int] = None
+
+
+class NoteLinkRedeem(BaseModel):
+    secret: Optional[str] = None
+
+
+@app.post("/note-links")
+async def create_note_link(
+    payload: NoteLinkCreate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a PUBLIC snapshot link for one of MY notes, under a note-link tag I'm allowed to use.
+    The tag is a security FLOOR; my overrides may only TIGHTEN it (note_link_policy.resolve_link_policy).
+    The title/body are FROZEN here. Feature-gated, allowlisted, per-user capped, audited."""
+    from sqlalchemy import func as _f, or_ as _or
+    from app.core.security import hash_password
+    from app.core.models import Note
+
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    if not note_link_policy.public_note_links_enabled(_global_settings_blob(db)):
+        raise HTTPException(status_code=403, detail="Public note links are disabled on this deployment.")
+
+    note = db.query(Note).filter(Note.id == payload.note_id, Note.owner_id == current_user.id).first()
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+
+    tag = db.query(NoteLinkTag).filter(NoteLinkTag.id == payload.tag_id).first()
+    if not tag or not tag.is_active:
+        raise HTTPException(status_code=404, detail="Note-link tag not found")
+
+    # Create-allowlist (same engine as vault share tags): fail closed.
+    user_gids = [str(r[0]) for r in db.query(user_groups.c.group_id)
+                 .filter(user_groups.c.user_id == current_user.id).all()]
+    allowlist = {"is_active": tag.is_active, "blocked_user_ids": tag.blocked_user_ids,
+                 "allowed_user_ids": tag.allowed_user_ids,
+                 "allowed_department_ids": tag.allowed_department_ids,
+                 "auto_enroll_new_users": tag.auto_enroll_new_users}
+    if not sharing_policy.user_can_create_with_tag(allowlist, current_user.id, user_gids):
+        raise HTTPException(status_code=403, detail="You are not permitted to create links with this tag.")
+
+    # Per-user active-link cap (anti-abuse). "Active" = not revoked, not expired, not exhausted.
+    now = datetime.utcnow()
+    cap = note_link_policy.public_note_link_user_cap(_global_settings_blob(db))
+    active = db.query(_f.count(NoteLink.id)).filter(
+        NoteLink.owner_id == current_user.id, NoteLink.revoked.is_(False),
+        _or(NoteLink.expires_at.is_(None), NoteLink.expires_at > now),
+        _or(NoteLink.max_uses.is_(None), NoteLink.use_count < NoteLink.max_uses)).scalar() or 0
+    if active >= cap:
+        raise HTTPException(status_code=409,
+                            detail=f"You have reached your limit of {cap} active links. Revoke one first.")
+
+    # Merge the tag floor with my overrides (tighten-only). resolve_link_policy raises on any loosen.
+    overrides = payload.model_dump(exclude_unset=True)
+    for k in ("note_id", "tag_id"):
+        overrides.pop(k, None)
+    try:
+        pol = note_link_policy.resolve_link_policy(tag, overrides)
+    except note_link_policy.PolicyViolation as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    password_hash = hash_password(pol["secret_value"]) if pol["secret_value"] is not None else None
+    expires_at = (now + timedelta(hours=pol["ttl_hours"])) if pol["ttl_hours"] else None
+
+    # Allocate a unique token (high entropy; the unique index is the real backstop).
+    token = None
+    for _ in range(8):
+        cand = _notelink_gen_token(pol["token_len"])
+        if not db.query(NoteLink.id).filter(NoteLink.token == cand).first():
+            token = cand
+            break
+    if token is None:
+        raise HTTPException(status_code=500, detail="Could not allocate a link token; try again.")
+
+    link = NoteLink(
+        owner_id=current_user.id, tag_id=tag.id, token=token, token_len=pol["token_len"],
+        title_snapshot=note.title or "", body_snapshot=note.body or "",
+        secret_kind=pol["secret_kind"], password_hash=password_hash,
+        expires_at=expires_at, max_uses=pol["max_uses"])
+    db.add(link)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Link token collision; please try again.")
+    db.refresh(link)
+    try:
+        AuditLogger(db).log_action(
+            action="note_link_create", status="success", user=current_user,
+            resource_type="note_link", resource_id=str(link.id),
+            details={"note_id": str(note.id), "tag": tag.name, "secret_kind": link.secret_kind,
+                     "token_len": link.token_len, "has_expiry": bool(expires_at),
+                     "max_uses": link.max_uses},
+            ip_address=get_client_ip(request))
+    except Exception:
+        pass
+    return _notelink_public_dict(link, tag)
+
+
+@app.get("/note-links")
+async def list_note_links(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List MY public note links (newest first) with each tag's tile colour/icon."""
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    links = db.query(NoteLink).filter(NoteLink.owner_id == current_user.id)\
+        .order_by(NoteLink.created_at.desc()).all()
+    tag_ids = {l.tag_id for l in links if l.tag_id}
+    tags = {t.id: t for t in db.query(NoteLinkTag).filter(NoteLinkTag.id.in_(tag_ids)).all()} if tag_ids else {}
+    return {"links": [_notelink_public_dict(l, tags.get(l.tag_id)) for l in links]}
+
+
+@app.post("/note-links/{link_id}/revoke")
+async def revoke_note_link(
+    link_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Revoke one of MY links (immediate; the snapshot stops being reachable)."""
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    link = db.query(NoteLink).filter(NoteLink.id == link_id, NoteLink.owner_id == current_user.id).first()
+    if not link:
+        raise HTTPException(status_code=404, detail="Link not found")
+    if not link.revoked:
+        link.revoked = True
+        db.commit()
+        try:
+            AuditLogger(db).log_action(
+                action="note_link_revoke", status="success", user=current_user,
+                resource_type="note_link", resource_id=str(link.id),
+                ip_address=get_client_ip(request))
+        except Exception:
+            pass
+    return {"ok": True, "id": str(link.id), "revoked": True}
+
+
+@app.delete("/note-links/{link_id}")
+async def delete_note_link(
+    link_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete one of MY links (removes the snapshot row entirely)."""
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    link = db.query(NoteLink).filter(NoteLink.id == link_id, NoteLink.owner_id == current_user.id).first()
+    if not link:
+        raise HTTPException(status_code=404, detail="Link not found")
+    db.delete(link)
+    db.commit()
+    try:
+        AuditLogger(db).log_action(
+            action="note_link_delete", status="success", user=current_user,
+            resource_type="note_link", resource_id=str(link_id),
+            ip_address=get_client_ip(request))
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+@app.get("/l/{token}")
+async def note_link_page(token: str):
+    """PUBLIC: serve the anonymous redemption page. It reads the token from the URL and POSTs to
+    /note-links/{token}/redeem (prompting for a PIN/password only if the link needs one)."""
+    static_dir = str(PROJECT_ROOT / "static")
+    page = os.path.join(static_dir, "note-link.html")
+    if not os.path.exists(page):
+        raise HTTPException(status_code=404, detail="Not found")
+    resp = FileResponse(page)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    return resp
+
+
+@app.post("/note-links/{token}/redeem")
+async def redeem_note_link(
+    token: str,
+    payload: NoteLinkRedeem,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """PUBLIC: redeem a snapshot link. Rate-limited per IP AND per token (fail-closed); a secret-gated
+    link prompts for its PIN/password with a per-link lockout after repeated wrong attempts; expiry,
+    max-uses and revocation are enforced atomically; every outcome is audited. Returns the frozen
+    snapshot on success."""
+    import time as _t
+    from sqlalchemy import update as _sa_update, or_ as _or
+    from app.core.security import verify_password
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+
+    client_ip = get_client_ip(request)
+    if not token or len(token) > _NOTELINK_TOKEN_MAX_INPUT:
+        raise HTTPException(status_code=404, detail="This link is not available.")
+
+    # (1) Redemption rate limit — 10 requests / minute per (IP, link), fail-closed (anonymous
+    # surface). Keying on IP+token means one IP may open many different links, but is throttled on
+    # any single one; the global middleware caps a single IP's overall rate, and the per-token
+    # lockout below stops distributed secret-guessing on one link.
+    try:
+        allowed, _, reset = _rl.check_rate_limit(
+            identifier=f"{client_ip}:{token}", limit=_NOTELINK_REDEEM_LIMIT,
+            window=_NOTELINK_REDEEM_WINDOW, prefix="notelink_redeem", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Too many requests.",
+                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+
+    def _audit(status, reason=None, link_id=None):
+        try:
+            AuditLogger(db).log_action(
+                action="note_link_redeem", status=status, resource_type="note_link",
+                resource_id=str(link_id) if link_id else None,
+                details={"reason": reason} if reason else None, ip_address=client_ip)
+        except Exception:
+            pass
+
+    # Disabling the feature is a KILL SWITCH for the anonymous read path, not just for creation: an
+    # admin turning it off (e.g. abuse response) must stop already-minted links from serving too.
+    # Same generic 404 as any other unavailable state (no oracle).
+    if not note_link_policy.public_note_links_enabled(_global_settings_blob(db)):
+        _audit("failure", reason="feature_disabled")
+        raise HTTPException(status_code=404, detail="This link is not available.")
+
+    link = db.query(NoteLink).filter(NoteLink.token == token).first()
+    # A missing OR unusable link returns the SAME 404 (no revoked/expired/exhausted oracle).
+    if not link or _notelink_status(link) != "active":
+        _audit("failure", reason="not_available", link_id=(link.id if link else None))
+        raise HTTPException(status_code=404, detail="This link is not available.")
+
+    if link.secret_kind != "none":
+        # Lockout peek first — a locked link refuses everything, including the correct secret.
+        try:
+            locked = _notelink_locked(token)
+        except Exception:
+            raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+        if locked:
+            _audit("failure", reason="locked_out", link_id=link.id)
+            raise HTTPException(status_code=429, detail="Too many incorrect attempts. Try again later.",
+                                headers={"Retry-After": str(_NOTELINK_FAIL_WINDOW)})
+        raw = (payload.secret if payload else None) or ""
+        if not raw.strip():
+            # The page needs to know which prompt to show; no consume, no failure recorded.
+            raise HTTPException(status_code=401,
+                                detail={"error": "secret_required", "secret_kind": link.secret_kind})
+        # A PIN carries no meaningful whitespace (and is stored stripped); a password is verbatim, so
+        # the two ends agree. Bound the length before argon2 on this anonymous surface — an over-long
+        # secret is simply treated as wrong (never hashed).
+        secret = raw.strip() if link.secret_kind == "pin" else raw
+        if len(secret) > _NOTELINK_SECRET_MAX or not link.password_hash \
+                or not verify_password(secret, link.password_hash):
+            n = _notelink_record_fail(token)
+            _audit("failure", reason="wrong_secret", link_id=link.id)
+            if n >= _NOTELINK_FAIL_MAX:
+                raise HTTPException(status_code=429, detail="Too many incorrect attempts. Try again later.",
+                                    headers={"Retry-After": str(_NOTELINK_FAIL_WINDOW)})
+            raise HTTPException(status_code=401,
+                                detail={"error": "wrong_secret", "secret_kind": link.secret_kind})
+        _notelink_clear_fails(token)
+
+    # (2) Atomically consume one use under a WHERE guard so max-uses/expiry/revoke can't be raced.
+    now = datetime.utcnow()
+    stmt = (_sa_update(NoteLink)
+            .where(NoteLink.id == link.id, NoteLink.revoked.is_(False),
+                   _or(NoteLink.max_uses.is_(None), NoteLink.use_count < NoteLink.max_uses),
+                   _or(NoteLink.expires_at.is_(None), NoteLink.expires_at > now))
+            .values(use_count=NoteLink.use_count + 1, view_count=NoteLink.view_count + 1,
+                    last_viewed_at=now))
+    res = db.execute(stmt)
+    db.commit()
+    if res.rowcount == 0:
+        _audit("failure", reason="not_available", link_id=link.id)
+        raise HTTPException(status_code=404, detail="This link is not available.")
+    _audit("success", link_id=link.id)
+    return {"title": link.title_snapshot or "", "body": link.body_snapshot or "",
+            "secret_kind": link.secret_kind}
 
 
 @app.get("/share-policy")
