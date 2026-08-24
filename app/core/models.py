@@ -1214,6 +1214,50 @@ class Note(Base):
     )
 
 
+class NoteLinkTag(Base):
+    """Admin-owned policy template for a PUBLIC note link ("Links" feature).
+
+    A tag is a security FLOOR: a user creating a public link with it may only TIGHTEN each axis
+    (longer token, sooner expiry, fewer uses, add a secret) — never loosen it (a tag that requires a
+    password can't have it removed). Public note links are anonymous, so the tag governs how hard the
+    link is to reach. A WHOLE NEW TABLE, created by create_all (additive; no migration). The
+    create-allowlist mirrors ShareTag and is evaluated LIVE via sharing_policy.user_can_create_with_tag.
+    """
+    __tablename__ = 'note_link_tags'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(120), nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    # Presentation for the "Shared (by me)" tiles.
+    border_color = Column(String(20), nullable=True)   # e.g. 'indigo' / a hex
+    icon = Column(String(40), nullable=True)           # an i-* icon name
+
+    # --- Link policy (the FLOOR) ---
+    # Token length: floor on the URL id. 6 is the "easy" minimum; the default tier uses 10-12.
+    min_token_len = Column(Integer, nullable=False, default=10)
+    # Expiry ceiling/default in hours. NULL default_ttl = no default expiry; NULL max_ttl = no ceiling.
+    default_ttl_hours = Column(Integer, nullable=True)
+    max_ttl_hours = Column(Integer, nullable=True)
+    # Secret requirement: 'none' (user MAY add one), 'pin', or 'password' (mandated — user can't remove).
+    require_secret = Column(String(16), nullable=False, default='none')
+    min_pin_len = Column(Integer, nullable=False, default=4)          # 4 | 6 | 8
+    password_min_len = Column(Integer, nullable=False, default=8)
+    password_require_alnum = Column(Boolean, nullable=False, default=False)
+    # Max redemptions cap. NULL = unlimited (within the tag).
+    max_uses_cap = Column(Integer, nullable=True)
+
+    # --- Create-allowlist (LIVE; who may create a public link with this tag) — mirrors ShareTag ---
+    allowed_department_ids = Column(JSON, nullable=False, default=list)
+    allowed_user_ids = Column(JSON, nullable=False, default=list)
+    blocked_user_ids = Column(JSON, nullable=False, default=list)
+    auto_enroll_new_users = Column(Boolean, nullable=False, default=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+
+
 class RateLimitRecord(Base):
     """Track rate limiting for login attempts."""
     __tablename__ = 'rate_limit_records'

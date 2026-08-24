@@ -37,8 +37,9 @@ from app.core.config import bootstrap_entrypoint
 bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
-from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep
+from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag
 from app.core import sharing_policy
+from app.core import note_link_policy
 from app.core import storage_quota
 from app.core.email_identity import (
     EMAIL_LOWER_UNIQUE_INDEX, email_in_use, find_email_collisions, normalize_email,
@@ -2676,6 +2677,12 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
         if bool_key in payload and not isinstance(payload[bool_key], bool):
             raise HTTPException(status_code=400, detail=f"{bool_key} must be true or false")
 
+    # Public note-link settings (feature toggle + the per-user active-link cap).
+    try:
+        note_link_policy.validate_settings(payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     # Where a decrypted download is written. Refused here rather than tolerated, because the read
     # path deliberately falls back on anything it cannot parse -- so a typo would silently mean
     # "user_choice" and an administrator would believe they had required something.
@@ -2839,6 +2846,10 @@ async def get_settings(
     data["zk_idle_lock_minutes"] = _zk_idle_lock_minutes(db)
     # Effective Sharing master switch (default OFF) so the Settings -> Sharing toggle reflects reality.
     data["sharing_enabled"] = _sharing_enabled(db)
+    # Public note-link master switch (default OFF) + the per-user active-link cap (anti-abuse).
+    _blob = _global_settings_blob(db)
+    data["public_note_links_enabled"] = note_link_policy.public_note_links_enabled(_blob)
+    data["public_note_link_user_cap"] = note_link_policy.public_note_link_user_cap(_blob)
     # Effective account-onboarding policy (email requirement, invitation + signup switches, domain
     # gate, login identifier) with defaults filled in, so the Accounts & Access tab renders the real
     # posture and a whole-object save can't persist an unchecked default.
@@ -6633,6 +6644,190 @@ async def deactivate_share_tag(
     db.commit()
     _audit_share_tag(db, request, current_user, "share_tag_deactivated", tag)
     return {"message": f"Tag '{tag.name}' deactivated", "id": str(tag.id), "is_active": False}
+
+
+# ---------------------------------------------------------------------------
+# Note-link tags — admin policy templates for PUBLIC note links ("Links"). A
+# tag is a security FLOOR; a user creating a link may only tighten it (enforced
+# in a later phase). Anonymous, so the tag governs how hard the link is to reach.
+# ---------------------------------------------------------------------------
+_NOTE_LINK_TAG_NOT_NULLABLE = (
+    "name", "is_active", "min_token_len", "require_secret", "min_pin_len",
+    "password_min_len", "password_require_alnum",
+    "allowed_department_ids", "allowed_user_ids", "blocked_user_ids", "auto_enroll_new_users",
+)
+
+
+class NoteLinkTagCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    is_active: bool = True
+    border_color: Optional[str] = None
+    icon: Optional[str] = None
+    min_token_len: int = 10
+    default_ttl_hours: Optional[int] = None
+    max_ttl_hours: Optional[int] = None
+    require_secret: str = "none"
+    min_pin_len: int = 4
+    password_min_len: int = 8
+    password_require_alnum: bool = False
+    max_uses_cap: Optional[int] = None
+    allowed_department_ids: list = Field(default_factory=list)
+    allowed_user_ids: list = Field(default_factory=list)
+    blocked_user_ids: list = Field(default_factory=list)
+    auto_enroll_new_users: bool = False
+
+
+class NoteLinkTagUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+    border_color: Optional[str] = None
+    icon: Optional[str] = None
+    min_token_len: Optional[int] = None
+    default_ttl_hours: Optional[int] = None
+    max_ttl_hours: Optional[int] = None
+    require_secret: Optional[str] = None
+    min_pin_len: Optional[int] = None
+    password_min_len: Optional[int] = None
+    password_require_alnum: Optional[bool] = None
+    max_uses_cap: Optional[int] = None
+    allowed_department_ids: Optional[list] = None
+    allowed_user_ids: Optional[list] = None
+    blocked_user_ids: Optional[list] = None
+    auto_enroll_new_users: Optional[bool] = None
+
+
+def _note_link_tag_dict(t: NoteLinkTag) -> dict:
+    return {
+        "id": str(t.id), "name": t.name, "description": t.description, "is_active": bool(t.is_active),
+        "border_color": t.border_color, "icon": t.icon,
+        "min_token_len": t.min_token_len,
+        "default_ttl_hours": t.default_ttl_hours, "max_ttl_hours": t.max_ttl_hours,
+        "require_secret": t.require_secret, "min_pin_len": t.min_pin_len,
+        "password_min_len": t.password_min_len, "password_require_alnum": bool(t.password_require_alnum),
+        "max_uses_cap": t.max_uses_cap,
+        "allowed_department_ids": t.allowed_department_ids or [],
+        "allowed_user_ids": t.allowed_user_ids or [],
+        "blocked_user_ids": t.blocked_user_ids or [],
+        "auto_enroll_new_users": bool(t.auto_enroll_new_users),
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+    }
+
+
+def _audit_note_link_tag(db, request, user, action, tag):
+    try:
+        AuditLogger(db).log_action(action=action, status="success", user=user,
+                                   resource_type="note_link_tag", resource_id=str(tag.id),
+                                   details={"name": tag.name}, ip_address=get_client_ip(request))
+    except Exception:
+        pass
+
+
+@app.get("/note-link-tags")
+async def list_note_link_tags(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """List all note-link tags (active AND inactive) for the admin manager."""
+    tags = db.query(NoteLinkTag).order_by(NoteLinkTag.name).all()
+    return [_note_link_tag_dict(t) for t in tags]
+
+
+@app.post("/note-link-tags")
+async def create_note_link_tag(
+    payload: NoteLinkTagCreate,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Create a note-link tag (interactive-admin). Name unique; policy validated against the floor rules."""
+    data = payload.model_dump()
+    data["name"] = (data.get("name") or "").strip()
+    for k in ("allowed_department_ids", "allowed_user_ids", "blocked_user_ids"):
+        data[k] = [str(x) for x in (data.get(k) or [])]
+    try:
+        note_link_policy.validate_tag_fields(data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    existing = db.query(NoteLinkTag).filter(NoteLinkTag.name == data["name"]).first()
+    if existing:
+        raise HTTPException(status_code=400,
+                            detail="A note-link tag with that name already exists"
+                            if existing.is_active else
+                            "A deactivated tag already uses this name — reactivate it or choose another")
+    tag = NoteLinkTag(created_by=current_user.id, **data)
+    db.add(tag)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="A note-link tag with that name already exists")
+    db.refresh(tag)
+    _audit_note_link_tag(db, request, current_user, "note_link_tag_created", tag)
+    return _note_link_tag_dict(tag)
+
+
+@app.patch("/note-link-tags/{tag_id}")
+async def update_note_link_tag(
+    tag_id: uuid.UUID,
+    payload: NoteLinkTagUpdate,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Update a note-link tag (interactive-admin). Only PROVIDED keys change."""
+    tag = db.query(NoteLinkTag).filter(NoteLinkTag.id == tag_id).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Note-link tag not found")
+    data = payload.model_dump(exclude_unset=True)
+    for k in _NOTE_LINK_TAG_NOT_NULLABLE:
+        if k in data and data[k] is None:
+            raise HTTPException(status_code=400, detail=f"{k} cannot be null")
+    if "name" in data:
+        data["name"] = (data["name"] or "").strip()
+        if not data["name"]:
+            raise HTTPException(status_code=400, detail="Tag name cannot be empty")
+        if db.query(NoteLinkTag).filter(NoteLinkTag.name == data["name"], NoteLinkTag.id != tag_id).first():
+            raise HTTPException(status_code=400, detail="A note-link tag with that name already exists")
+    for k in ("allowed_department_ids", "allowed_user_ids", "blocked_user_ids"):
+        if k in data:
+            data[k] = [str(x) for x in (data[k] or [])]
+    eff = _note_link_tag_dict(tag)
+    eff.update(data)
+    try:
+        note_link_policy.validate_tag_fields(eff)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    for k, v in data.items():
+        setattr(tag, k, v)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="A note-link tag with that name already exists")
+    db.refresh(tag)
+    _audit_note_link_tag(db, request, current_user, "note_link_tag_updated", tag)
+    return _note_link_tag_dict(tag)
+
+
+@app.delete("/note-link-tags/{tag_id}")
+async def deactivate_note_link_tag(
+    tag_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Soft-deactivate a note-link tag (interactive-admin) — stops NEW links; existing links keep
+    their snapshot policy. Reactivate via PATCH is_active=true."""
+    tag = db.query(NoteLinkTag).filter(NoteLinkTag.id == tag_id).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Note-link tag not found")
+    tag.is_active = False
+    db.commit()
+    _audit_note_link_tag(db, request, current_user, "note_link_tag_deactivated", tag)
+    return {"message": f"Note-link tag '{tag.name}' deactivated", "id": str(tag.id), "is_active": False}
 
 
 @app.get("/share-policy")
@@ -14167,6 +14362,27 @@ def _seed_default_share_tags():
         print(f"⚠ Default share-tag seeding skipped: {e}")
 
 
+def _seed_default_note_link_tags():
+    """Seed the starter public-note-link tags (Open / Restricted / Confidential) on a fresh deployment
+    only — no tags AND public links not already enabled — mirroring the share-tag seed. Inert until an
+    admin turns public note links on. Best-effort; never bricks startup."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.models import NoteLinkTag, User, RoleEnum
+        with get_db_context() as db:
+            has_tags = db.query(NoteLinkTag).first() is not None
+            enabled = note_link_policy.public_note_links_enabled(_global_settings_blob(db))
+            if not note_link_policy.should_seed_default_note_link_tags(has_tags, enabled):
+                return
+            admin = db.query(User).filter(User.role == RoleEnum.ADMIN).first()
+            created_by = admin.id if admin else None
+            for spec in note_link_policy.DEFAULT_NOTE_LINK_TAGS:
+                db.add(NoteLinkTag(created_by=created_by, **spec))
+            print(f"[OK] Seeded {len(note_link_policy.DEFAULT_NOTE_LINK_TAGS)} default note-link tags")
+    except Exception as e:
+        print(f"⚠ Default note-link-tag seeding skipped: {e}")
+
+
 def _backfill_default_permissions():
     """Grant role-default endpoint permissions to existing non-admin users
     (idempotent). Picks up newly-added defaults such as temp-credential
@@ -14897,6 +15113,7 @@ async def lifespan(app: FastAPI):
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
     _seed_admin_user()
     _seed_default_share_tags()  # after the admin exists, so seed tags can record it as creator
+    _seed_default_note_link_tags()  # public-note-link starter tags (inert until enabled)
     _backfill_default_permissions()
     _seed_default_email_profile()
 
