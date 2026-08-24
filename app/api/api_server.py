@@ -5030,6 +5030,41 @@ async def storage_stats(
 # WebSocket Endpoint for Live Monitoring
 # ==============================================================================
 
+def _ws_session_invalid(session_token: str, user_id: str, is_temporary: bool) -> bool:
+    """Re-check, on a LIVE /ws/monitor socket, whether the session has since been revoked, so the
+    socket can be closed promptly (the handshake only validates at CONNECT). Covers logout, admin
+    terminate-sessions, account lock/deactivate, and temp-credential invalidation -- all of which
+    either denylist the token or flip the session/account state. Returns True when the socket should
+    be torn down. Fails OPEN (returns False) on a transient error so a DB blip can't drop every live
+    socket at once; the next cycle re-checks."""
+    try:
+        from app.core.database import SessionLocal
+        from app.services.auth_service import is_token_denylisted, account_locked
+        from app.core.models import ActiveSession as _AS, User as _U
+        if is_token_denylisted(session_token):
+            return True
+        db = SessionLocal()
+        try:
+            row = db.query(_AS.revoked, _AS.is_active).filter(
+                _AS.session_token == session_token).first()
+            if row is None:
+                return True  # session row gone -> treat as terminated
+            revoked, is_active = row
+            if revoked:
+                return True
+            if is_temporary and not is_active:
+                return True  # temp credential invalidated (_revoke_sessions flips is_active)
+            u = db.query(_U).filter(_U.id == uuid.UUID(user_id)).first()
+            if not u or not u.is_active or account_locked(u):
+                return True
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[WS] periodic session re-check error (ignored): {e}")
+        return False
+    return False
+
+
 @app.websocket("/ws/monitor")
 async def websocket_monitor_endpoint(websocket: WebSocket):
     """
@@ -5203,9 +5238,16 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             is_admin_conn = False
 
         def _event_visible_to_conn(ev):
+            inner = ev.get('event', ev) if isinstance(ev, dict) else {}
+            # A temp / scoped-temp connection must NEVER receive notification nudges: they belong to
+            # the PARENT account, and a scoped credential (handed to an external party) has no business
+            # seeing the owner's live notification metadata. The JS client already ignores them; this
+            # keeps them off the wire too. (Checked before the admin short-circuit: an admin acting via
+            # a temp credential is not a full admin here.)
+            if is_temporary and inner.get('type') == 'notification':
+                return False
             if is_admin_conn:
                 return True
-            inner = ev.get('event', ev) if isinstance(ev, dict) else {}
             owner = inner.get('owner_user_id')
             return owner is not None and str(owner) == str(user_id)
 
@@ -5218,21 +5260,35 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
         # Create tasks for sending and receiving
         async def send_events():
             """Forward Redis pub/sub events to WebSocket client."""
+            # The handshake validates the session once; this socket is now app-wide and long-lived
+            # (its whole session, up to the token's exp), so re-check revocation periodically and tear
+            # it down promptly when the session is logged out / terminated / locked. Without this a
+            # revoked session (an admin's, streaming the whole fleet feed) would keep receiving events
+            # until natural expiry, and the "terminate sessions" control would not cut the live socket.
+            loops = 0
             while True:
                 try:
+                    loops += 1
+                    if loops >= 45:  # each loop ~0.11s -> re-check about every 5s
+                        loops = 0
+                        revoked = await asyncio.get_event_loop().run_in_executor(
+                            None, _ws_session_invalid, session_token, user_id, is_temporary)
+                        if revoked:
+                            print("[WS] session revoked/terminated; closing live socket")
+                            break
                     # Get message from Redis (non-blocking with timeout)
                     message = await asyncio.get_event_loop().run_in_executor(
                         None, pubsub.get_message, True, 0.1
                     )
-                    
+
                     if message and message['type'] == 'message':
                         # Parse and forward the event (filtered per connection)
                         event_data = json.loads(message['data'])
                         if _event_visible_to_conn(event_data):
                             await websocket.send_json(event_data)
-                    
+
                     await asyncio.sleep(0.01)  # Small delay to prevent busy loop
-                    
+
                 except Exception as e:
                     print(f"Error forwarding event: {e}")
                     break
@@ -7946,6 +8002,7 @@ def _notify_users(user_ids, ntype: str, title: str, body: str = None,
     ids = [str(u) for u in dict.fromkeys(user_ids) if u]  # de-dup + drop falsy, preserve order
     if not ids:
         return
+    notified = []
     try:
         with get_db_context() as db:
             for uid in ids:
@@ -7954,8 +8011,21 @@ def _notify_users(user_ids, ntype: str, title: str, body: str = None,
                     with db.begin_nested():
                         db.add(Notification(user_id=uid, type=ntype, title=title, body=body,
                                             target=target, dedup_key=dedup))
+                    notified.append(uid)
                 except IntegrityError:
                     pass  # dedup collision -> this user was already notified for this event
+        # Live nudge over the activity socket so the recipient's bell (and an open target section,
+        # e.g. Notes) updates WITHOUT a page refresh. One event per recipient, owner_user_id set to
+        # them, so the /ws/monitor per-user filter delivers it only to that recipient. The nudge
+        # carries NO title/body — the client re-fetches via its authenticated endpoints — so it is
+        # safe even on the admin-visible feed. Best-effort: a broadcast failure never affects callers.
+        for uid in notified:
+            try:
+                broadcast_event({"event": {"type": "notification", "notification_type": ntype,
+                                           "target": target, "owner_user_id": str(uid)}},
+                                include_metrics=False)
+            except Exception:
+                pass
     except Exception as e:
         print(f"⚠ notification write skipped: {e}")
 

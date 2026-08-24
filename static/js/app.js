@@ -5581,6 +5581,22 @@ function handleMonitorEvent(data) {
         return;
     }
 
+    // Live notification nudge: the server broadcasts one per recipient when it writes an in-app
+    // notification, so the bell (and an open target section, e.g. Notes) updates without a refresh.
+    // It carries no content — re-fetch via the authenticated endpoints. NEVER render it in the
+    // activity feed (an admin's socket sees every recipient's nudge; act only on my own).
+    if (ev && ev.type === 'notification') {
+        if (currentUser && String(ev.owner_user_id) === String(currentUser.id) && !isScopedTemp) {
+            try { refreshNotifUnread(); } catch (_) {}
+            // Refresh the notes lists so a newly-received note appears live. Cheap + safe when the
+            // Notes section isn't the visible one (it just repopulates hidden lists + the badge).
+            if (ev.target === '#notes' && typeof loadNotes === 'function') {
+                try { loadNotes(); } catch (_) {}
+            }
+        }
+        return;
+    }
+
     // Owner notification: a temporary credential I created just signed in.
     if (ev && ev.type === 'login' && ev.is_temporary && currentUser &&
         String(ev.owner_user_id) === String(currentUser.id)) {
@@ -5941,11 +5957,23 @@ function attachMonitorListeners() {
     }
 }
 
-// Cleanup monitor on navigation away
+// Cleanup monitor (on LOGOUT). The socket is app-wide, so this is intentionally NOT called on
+// ordinary navigation any more -- only when the session ends.
 function cleanupMonitor() {
     if (monitorWebSocket) {
         monitorWebSocket.close();
         monitorWebSocket = null;
+    }
+}
+
+// (Re)open the app-wide activity socket if it isn't currently open. A cheap no-op when it's already
+// connected; covers a socket that dropped while the user was on a page that doesn't manage it, so
+// live notifications keep working across navigation.
+function ensureMonitorSocket() {
+    if (!authToken) return;
+    const ws = monitorWebSocket;
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        connectMonitorWebSocket();
     }
 }
 
@@ -14773,9 +14801,12 @@ function copyToClipboard(elementId) {
 function cleanupPreviousView(newSection) {
     console.log('Cleaning up resources before switching to:', newSection);
     
-    // Cleanup monitor (disconnect WebSocket, clear intervals)
+    // The activity socket is app-wide (it delivers live notifications on ANY page, e.g. a note you
+    // were just sent), so navigation must NOT close it -- it is torn down only on logout. Previously
+    // this closed it on every non-monitor navigation, which silently disabled live notifications
+    // after the first page change. Just make sure it's connected in case a prior drop left it closed.
     if (newSection !== 'monitor') {
-        cleanupMonitor();
+        ensureMonitorSocket();
     }
     
     // Cleanup temp creds refresh intervals
