@@ -38,6 +38,52 @@ def _open_tag(admin):
     return next(t for t in admin.get("/note-link-tags").json() if t["name"] == "Open")
 
 
+def test_note_link_policy_reader(admin, links_enabled):
+    # The non-admin reader returns the feature flag, the per-user cap, and the tags the caller may
+    # use — with floor fields only, NEVER the create-allowlist internals.
+    p = admin.get("/note-link-policy").json()
+    assert p["enabled"] is True
+    assert isinstance(p["user_cap"], int) and p["user_cap"] >= 1
+    names = {t["name"] for t in p["tags"]}
+    assert {"Open", "Restricted", "Confidential"} <= names, names
+    open_tag = next(t for t in p["tags"] if t["name"] == "Open")
+    for floor_field in ("min_token_len", "require_secret", "min_pin_len", "password_min_len",
+                        "max_ttl_hours", "max_uses_cap", "border_color", "icon"):
+        assert floor_field in open_tag, floor_field
+    # allowlist internals must never be exposed
+    for leak in ("allowed_user_ids", "blocked_user_ids", "allowed_department_ids", "auto_enroll_new_users"):
+        assert leak not in open_tag, f"leaked {leak}"
+
+
+def test_note_link_policy_off_returns_no_tags(admin):
+    before = admin.get("/settings").json().get("public_note_links_enabled")
+    admin.put("/settings", json={"public_note_links_enabled": False})
+    try:
+        p = admin.get("/note-link-policy").json()
+        assert p["enabled"] is False and p["tags"] == []
+    finally:
+        admin.put("/settings", json={"public_note_links_enabled": bool(before)})
+
+
+def test_note_link_policy_filters_by_allowlist_and_temp(admin, links_enabled):
+    u = admin.create_user(role="user")
+    user = admin.clone_anonymous(); user.login(u["_username"], u["_password"])
+    # A tag that auto-enrolls nobody: the user does not see it; an auto-enroll tag: they do.
+    denied = _mk_tag(admin, auto_enroll_new_users=False)
+    allowed = _mk_tag(admin, auto_enroll_new_users=True)
+    tc = admin.post("/auth/temp-credentials", json={"validity_minutes": 30}).json()
+    temp = ApiClient(BASE_URL); temp.login(tc["temp_username"], tc["credential"])
+    try:
+        names = {t["name"] for t in user.get("/note-link-policy").json()["tags"]}
+        assert allowed["name"] in names
+        assert denied["name"] not in names
+        # A temp session can never create links -> no tags.
+        assert temp.get("/note-link-policy").json()["tags"] == []
+    finally:
+        admin.post(f"/temp-creds/{tc['temp_username']}/delete")
+        admin.delete_user(u["id"])
+
+
 def test_feature_gate_off_blocks_create(admin):
     # Ensure OFF, then a create attempt is 403.
     before = admin.get("/settings").json().get("public_note_links_enabled")

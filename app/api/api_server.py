@@ -7105,6 +7105,47 @@ async def list_note_links(
     return {"links": [_notelink_public_dict(l, tags.get(l.tag_id)) for l in links]}
 
 
+@app.get("/note-link-policy")
+async def get_note_link_policy(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Effective PUBLIC-note-link policy for the CURRENT user — non-admin readable (like /share-policy),
+    so the Share modal's Public tile can shape its controls without the admin-only /note-link-tags.
+    Returns whether public links are enabled, the per-user active-link cap, and ONLY the tags this user
+    may create links with — each carrying its FLOOR fields + tile colour/icon so the UI can render the
+    floor and permit tightening. The create-allowlist internals are NEVER exposed.
+
+    FAIL-CLOSED: feature off -> no tags; a temp-credential session can't create links -> no tags; a
+    user not permitted by a tag's create-allowlist never sees that tag."""
+    blob = _global_settings_blob(db)
+    enabled = note_link_policy.public_note_links_enabled(blob)
+    cap = note_link_policy.public_note_link_user_cap(blob)
+    if not enabled or _notes_denied_for_temp(current_user):
+        return {"enabled": enabled, "user_cap": cap, "tags": []}
+    user_gids = [str(r[0]) for r in db.query(user_groups.c.group_id)
+                 .filter(user_groups.c.user_id == current_user.id).all()]
+    tags = []
+    for t in db.query(NoteLinkTag).filter(NoteLinkTag.is_active.is_(True)).order_by(NoteLinkTag.name).all():
+        allowlist = {"is_active": t.is_active, "blocked_user_ids": t.blocked_user_ids,
+                     "allowed_user_ids": t.allowed_user_ids,
+                     "allowed_department_ids": t.allowed_department_ids,
+                     "auto_enroll_new_users": t.auto_enroll_new_users}
+        if not sharing_policy.user_can_create_with_tag(allowlist, current_user.id, user_gids):
+            continue
+        tags.append({
+            "id": str(t.id), "name": t.name, "description": t.description,
+            "border_color": t.border_color, "icon": t.icon,
+            "min_token_len": t.min_token_len,
+            "default_ttl_hours": t.default_ttl_hours, "max_ttl_hours": t.max_ttl_hours,
+            "require_secret": t.require_secret, "min_pin_len": t.min_pin_len,
+            "password_min_len": t.password_min_len,
+            "password_require_alnum": bool(t.password_require_alnum),
+            "max_uses_cap": t.max_uses_cap,
+        })
+    return {"enabled": True, "user_cap": cap, "tags": tags}
+
+
 @app.post("/note-links/{link_id}/revoke")
 async def revoke_note_link(
     link_id: uuid.UUID,

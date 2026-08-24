@@ -940,6 +940,23 @@ button.vault-sort-dir {
 .icon-choice.selected { box-shadow: 0 0 0 1px var(--surface-0), 0 0 0 3px var(--text-primary); }
 .icon-choice:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 
+/* Share chooser: two big tiles (Send to a member / Public link). */
+.share-tiles { display: flex; gap: var(--space-md); flex-wrap: wrap; }
+.share-tile {
+    flex: 1 1 200px; min-width: 0;
+    display: flex; flex-direction: column; align-items: flex-start; gap: .35rem;
+    text-align: left; cursor: pointer;
+    padding: var(--space-md); border-radius: var(--radius-lg);
+    background: var(--surface-1); border: 1px solid var(--surface-3); color: var(--text-primary);
+    transition: border-color var(--transition-fast, .15s), background var(--transition-fast, .15s);
+}
+.share-tile:hover:not(:disabled) { background: var(--surface-2); border-color: var(--brand-accent, var(--text-tertiary)); }
+.share-tile:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.share-tile:disabled { opacity: .5; cursor: not-allowed; }
+.share-tile .icon { color: var(--text-secondary); }
+.share-tile-title { font-weight: 600; font-size: var(--text-base); }
+.share-tile-sub { font-size: var(--text-sm); color: var(--text-secondary); white-space: normal; }
+
 .profile-dropdown-header {
     padding: var(--space-md);
     display: flex;

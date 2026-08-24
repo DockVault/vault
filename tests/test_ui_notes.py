@@ -44,7 +44,9 @@ def test_create_favourite_and_edit_a_note(page: Page, admin, admin_creds):
     expect(page.locator("#note-editor-modal")).to_be_visible()
     page.fill("#note-editor-body-input", "edited body")
     page.click("#note-editor-save")
-    expect(page.locator("#notes-list .note-body", has_text="edited body")).to_be_visible(timeout=10000)
+    # Scope to THIS note's card (title is unique) so the assertion is robust to other notes that
+    # happen to share the "edited body" text.
+    expect(page.locator("#notes-list .card", has_text=title).locator(".note-body", has_text="edited body")).to_be_visible(timeout=10000)
 
 
 def test_hide_text_masks_the_body(page: Page, admin, admin_creds):
@@ -67,7 +69,10 @@ def test_send_note_then_recipient_receives_and_adopts(page: Page, admin, admin_c
     _login(page, admin_creds["username"], admin_creds["password"])
     _open_notes(page)
     _create_note(page, title, "sent body")
-    page.locator("#notes-list .card", has_text=title).get_by_role("button", name="Send", exact=True).click()
+    # The card's Share button opens a chooser; the "Send to a member" tile opens the send-copy flow.
+    page.locator("#notes-list .card", has_text=title).get_by_role("button", name="Share", exact=True).click()
+    expect(page.locator("#note-share-modal")).to_be_visible()
+    page.click("#note-share-internal")
     expect(page.locator("#note-send-modal")).to_be_visible()
     page.fill("#note-send-search", recipient["_username"][:8])
     # Pick the recipient from the results, then send.
