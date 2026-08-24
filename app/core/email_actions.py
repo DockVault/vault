@@ -197,6 +197,21 @@ def seed_email_actions(db: Session) -> int:
     return created
 
 
+def _fallback_body_if_missing_required_token(category, body_tpl, spec):
+    """A SYSTEM security action's built-in body carries a required token ({{action.code}} or
+    {{action.link}}). If the chosen (admin-bound/customized) body OMITS it, return the built-in body
+    instead, so a misconfigured template can never silently drop the verification code / reset or
+    invite link. Non-system actions, or bodies that already carry the token, are returned unchanged.
+    Matched on the token KEY, so a whitespace variant like ``{{ action.code }}`` still counts."""
+    if category != SYSTEM or not body_tpl:
+        return body_tpl
+    default_body = (spec or {}).get("default_body_html", "") or ""
+    for key_tok in ("action.code", "action.link"):
+        if key_tok in default_body and key_tok not in body_tpl:
+            return default_body
+    return body_tpl
+
+
 # --------------------------------------------------------------------------------------------------
 # Central send helper
 # --------------------------------------------------------------------------------------------------
@@ -237,6 +252,12 @@ def send_action_email(db: Session, key: str, *, recipient: dict,
         body_tpl = spec.get("default_body_html", "")
     if not (subject_tpl or body_tpl):
         return False
+
+    # Fail-safe for SYSTEM security actions: the built-in body carries a required token
+    # ({{action.code}} or {{action.link}}). If an admin binds/customizes a template that OMITS it,
+    # the mail would send WITHOUT the verification code / reset or invite link — a silent security
+    # drop that still reports success. Fall back to the built-in body so the payload is never lost.
+    body_tpl = _fallback_body_if_missing_required_token(category, body_tpl, spec)
 
     # Resolve the sending config: the template's profile if usable, else the default profile.
     cfg = None
