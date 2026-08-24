@@ -43,8 +43,8 @@ def test_open_renders_note_and_rail_switches(page: Page, admin):
     try:
         _login(page, user["_username"], user["_password"])
         _open_notes(page)
-        # Open note A.
-        page.locator("#notes-list .card", has_text=a["title"]).get_by_role("button", name="Open").click()
+        # Open note A by clicking its title (the whole tile is clickable; the title is the a11y control).
+        page.locator("#notes-list .card", has_text=a["title"]).locator(".note-open-title").click()
         expect(page.locator("#note-view-modal")).to_be_visible()
         expect(page.locator("#note-view-title")).to_have_text(a["title"])
         expect(page.locator("#note-view-content-body")).to_have_text("alpha body text")
@@ -72,8 +72,8 @@ def test_preview_received_note_then_adopt(page: Page, admin):
         page.click('.tab-btn[data-notes-tab="received"]')
         card = page.locator("#notes-received-list .card", has_text=note["title"])
         expect(card).to_be_visible(timeout=10000)
-        # Preview shows the body BEFORE adopting.
-        card.get_by_role("button", name="Preview").click()
+        # Clicking the tile previews the body BEFORE adopting.
+        card.locator(".note-open-title").click()
         expect(page.locator("#note-view-modal")).to_be_visible()
         expect(page.locator("#note-view-content-body")).to_have_text("secret shared body")
         # Adopt from the modal.
@@ -95,7 +95,7 @@ def test_no_console_errors_opening_a_note(page: Page, admin):
     try:
         _login(page, user["_username"], user["_password"])
         _open_notes(page)
-        page.locator("#notes-list .card").first.get_by_role("button", name="Open").click()
+        page.locator("#notes-list .card").first.locator(".note-open-title").click()
         expect(page.locator("#note-view-modal")).to_be_visible()
         page.wait_for_timeout(500)
         assert not errors, f"console errors opening a note: {errors}"

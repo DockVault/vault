@@ -10,7 +10,7 @@
     <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
     <link rel="apple-touch-icon" href="/static/assets/logo.png?v=1">
     <link rel="stylesheet" href="/static/css/theme.css?v=20260822a">
-    <link rel="stylesheet" href="/static/css/components.css?v=20260824b">
+    <link rel="stylesheet" href="/static/css/components.css?v=20260824c">
     <link rel="stylesheet" href="/static/css/utilities.css?v=20251015c">
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-sans-500.woff2" crossorigin>
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-mono-500.woff2" crossorigin>
@@ -865,10 +865,10 @@
                         <button class="tab-btn" data-notes-tab="received" type="button">Sent to me <span id="notes-received-count" class="badge badge-secondary" hidden>0</span></button>
                     </div>
                     <div id="notes-tab-mine">
-                        <div id="notes-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--space-md);"></div>
+                        <div id="notes-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--space-md); align-items: start;"></div>
                     </div>
                     <div id="notes-tab-received" style="display:none;">
-                        <div id="notes-received-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--space-md);"></div>
+                        <div id="notes-received-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--space-md); align-items: start;"></div>
                     </div>
                 </div>
 
@@ -2029,31 +2029,28 @@
                                             <label for="nl-tag-description">Description</label>
                                             <input type="text" id="nl-tag-description" class="form-control" placeholder="Optional">
                                         </div>
-                                        <div class="flex gap-sm">
-                                            <div class="form-group">
-                                                <label for="nl-tag-color">Tile colour</label>
-                                                <select id="nl-tag-color" class="form-control" style="max-width:160px;">
-                                                    <option value="">None</option>
-                                                    <option value="green">Green</option>
-                                                    <option value="amber">Amber</option>
-                                                    <option value="red">Red</option>
-                                                    <option value="indigo">Indigo</option>
-                                                    <option value="teal">Teal</option>
-                                                    <option value="sky">Sky</option>
-                                                    <option value="violet">Violet</option>
-                                                </select>
+                                        <div class="form-group">
+                                            <label>Tile colour</label>
+                                            <input type="hidden" id="nl-tag-color" value="">
+                                            <div class="accent-swatches" id="nl-tag-color-swatches">
+                                                <button type="button" class="accent-swatch" data-color="" style="background:var(--surface-4)" title="None" aria-label="No colour"></button>
+                                                <button type="button" class="accent-swatch" data-color="green" style="background:#16a34a" title="Green" aria-label="Green"></button>
+                                                <button type="button" class="accent-swatch" data-color="teal" style="background:#0d9488" title="Teal" aria-label="Teal"></button>
+                                                <button type="button" class="accent-swatch" data-color="emerald" style="background:#059669" title="Emerald" aria-label="Emerald"></button>
+                                                <button type="button" class="accent-swatch" data-color="sky" style="background:#0284c7" title="Sky" aria-label="Sky"></button>
+                                                <button type="button" class="accent-swatch" data-color="indigo" style="background:#4f46e5" title="Indigo" aria-label="Indigo"></button>
+                                                <button type="button" class="accent-swatch" data-color="violet" style="background:#7c3aed" title="Violet" aria-label="Violet"></button>
+                                                <button type="button" class="accent-swatch" data-color="amber" style="background:#d97706" title="Amber" aria-label="Amber"></button>
+                                                <button type="button" class="accent-swatch" data-color="orange" style="background:#ea580c" title="Orange" aria-label="Orange"></button>
+                                                <button type="button" class="accent-swatch" data-color="rose" style="background:#e11d48" title="Rose" aria-label="Rose"></button>
+                                                <button type="button" class="accent-swatch" data-color="red" style="background:#dc2626" title="Red" aria-label="Red"></button>
+                                                <input type="color" id="nl-tag-color-custom" class="color-custom" value="#0d9488" title="Custom colour" aria-label="Custom colour">
                                             </div>
-                                            <div class="form-group">
-                                                <label for="nl-tag-icon">Icon</label>
-                                                <select id="nl-tag-icon" class="form-control" style="max-width:160px;">
-                                                    <option value="">Default</option>
-                                                    <option value="globe">Globe</option>
-                                                    <option value="clock">Clock</option>
-                                                    <option value="lock">Lock</option>
-                                                    <option value="link">Link</option>
-                                                    <option value="shield">Shield</option>
-                                                </select>
-                                            </div>
+                                        </div>
+                                        <div class="form-group">
+                                            <label>Icon</label>
+                                            <input type="hidden" id="nl-tag-icon" value="">
+                                            <div class="icon-grid" id="nl-tag-icon-grid"></div>
                                         </div>
                                         <div class="form-group mt-md">
                                             <label for="nl-tag-min-token-len">Minimum link length (characters, ≥ 6)</label>
@@ -3207,7 +3204,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260824g"></script>
+    <script src="/static/js/app.js?v=20260824h"></script>
 </body>
 </html>
 
