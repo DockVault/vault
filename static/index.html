@@ -10,7 +10,7 @@
     <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
     <link rel="apple-touch-icon" href="/static/assets/logo.png?v=1">
     <link rel="stylesheet" href="/static/css/theme.css?v=20260822a">
-    <link rel="stylesheet" href="/static/css/components.css?v=20260824a">
+    <link rel="stylesheet" href="/static/css/components.css?v=20260824b">
     <link rel="stylesheet" href="/static/css/utilities.css?v=20251015c">
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-sans-500.woff2" crossorigin>
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-mono-500.woff2" crossorigin>
@@ -918,6 +918,27 @@
                             <button class="btn btn-ghost" type="button" data-note-send-close>Cancel</button>
                             <button id="note-send-confirm" class="btn btn-primary" type="button" disabled>Send</button>
                         </div>
+                    </div>
+                </div>
+
+                <!-- Note read modal: renders a note, with a left rail to switch between notes.
+                     Used by "Open" (my notes) and "Preview" (received notes, before adopting). The
+                     body is rendered with textContent (pre-wrap), never as HTML. -->
+                <div id="note-view-modal" class="modal" role="dialog" aria-modal="true">
+                    <div class="modal-overlay" data-note-view-close></div>
+                    <div class="modal-content note-view-content" style="max-width: 900px; width: 92vw;">
+                        <div class="modal-header">
+                            <h3 id="note-view-title" class="text-xl font-bold">Note</h3>
+                            <button class="modal-close" type="button" data-note-view-close aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body note-view-body">
+                            <aside id="note-view-rail" class="note-view-rail" aria-label="Notes"></aside>
+                            <div class="note-view-main">
+                                <div id="note-view-meta" class="text-secondary text-sm mb-sm" style="display:none;"></div>
+                                <div id="note-view-content-body" class="note-view-text"></div>
+                            </div>
+                        </div>
+                        <div class="modal-footer" id="note-view-actions"></div>
                     </div>
                 </div>
 
@@ -3071,7 +3092,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260824e"></script>
+    <script src="/static/js/app.js?v=20260824f"></script>
 </body>
 </html>
 
