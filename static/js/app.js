@@ -8278,6 +8278,11 @@ function renderEmailActions(actions, templates) {
     actions.forEach(a => list.appendChild(buildActionRow(a, templates)));
 }
 
+function _earNotifyLabel(cb) {
+    if (cb.checked) return 'Notify by email · On';
+    return cb.disabled ? 'Notify by email · pick a template' : 'Notify by email · Off';
+}
+
 function buildActionRow(a, templates) {
     const row = document.createElement('div');
     row.className = 'email-action-row'; row.setAttribute('role', 'listitem'); row.dataset.actionKey = a.key;
@@ -8306,16 +8311,45 @@ function buildActionRow(a, templates) {
         if (a.template_id === t.id) o.selected = true;
         sel.appendChild(o);
     });
-    sel.addEventListener('change', () => saveAction(a.key, { template_id: sel.value || null }));
+    sel.addEventListener('change', () => {
+        const picked = sel.value || null;
+        // Only reflect the SAFE direction immediately: no template => the switch turns off + disables.
+        // Re-ENABLING waits for the reload after the bind is saved, so a click can't race the template
+        // PUT and fire a premature enable (which the server would 400). The reload is server-authoritative.
+        if (!picked) {
+            const swCb = controls.querySelector('.ear-notify input');
+            if (swCb) {
+                swCb.checked = false; swCb.disabled = true;
+                const st = controls.querySelector('.ear-notify-state');
+                if (st) st.textContent = _earNotifyLabel(swCb);
+            }
+        }
+        saveAction(a.key, { template_id: picked });
+    });
     tplWrap.appendChild(sel); controls.appendChild(tplWrap);
 
-    // notify toggle (optional actions only)
+    // Notify switch (optional actions only): a clear on/off, DISABLED until a template is chosen —
+    // an email with no template has nothing to send, so it can't be turned on.
     if (a.category !== 'system') {
-        const tog = document.createElement('label'); tog.className = 'checkbox-label ear-notify';
-        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!a.enabled;
-        cb.addEventListener('change', () => saveAction(a.key, { enabled: cb.checked }));
-        tog.appendChild(cb); tog.appendChild(document.createTextNode(' Notify by email'));
-        controls.appendChild(tog);
+        const hasTpl = !!a.template_id;
+        const field = document.createElement('div'); field.className = 'ear-notify';
+        const sw = document.createElement('label'); sw.className = 'dv-switch';
+        const cb = document.createElement('input'); cb.type = 'checkbox';
+        cb.checked = !!a.enabled && hasTpl; cb.disabled = !hasTpl;
+        cb.setAttribute('aria-label', 'Notify by email for ' + a.name);
+        const track = document.createElement('span'); track.className = 'dv-switch-track'; track.setAttribute('aria-hidden', 'true');
+        sw.appendChild(cb); sw.appendChild(track);
+        const state = document.createElement('span'); state.className = 'ear-notify-state';
+        state.id = 'ear-state-' + a.key; cb.setAttribute('aria-describedby', state.id);   // expose the reason to AT
+        state.textContent = _earNotifyLabel(cb);
+        sw.title = cb.disabled ? 'Choose a template to enable this email' : (cb.checked ? 'On — this email will send' : 'Off');
+        cb.addEventListener('change', () => {
+            state.textContent = _earNotifyLabel(cb);
+            sw.title = cb.checked ? 'On — this email will send' : 'Off';
+            saveAction(a.key, { enabled: cb.checked });
+        });
+        field.appendChild(sw); field.appendChild(state);
+        controls.appendChild(field);
     }
 
     const test = document.createElement('button'); test.type = 'button';

@@ -356,6 +356,12 @@ def send_action_email(db: Session, key: str, *, recipient: dict,
         return False
 
     template = action.template if action is not None else None
+    # Defense in depth: an optional action with no bound template has nothing to send. The write paths
+    # (update_action's force-off + the delete guard) already prevent enabling one, but guard at the point
+    # of use too — so even a direct DB write that left (enabled=True, template_id=NULL) can't cause an
+    # unexpected default-body send. A forced test send may still render the catalog default for preview.
+    if category == OPTIONAL and template is None and not force:
+        return False
     if template is not None and (template.body_html or template.subject):
         subject_tpl = template.subject or spec.get("default_subject", "")
         body_tpl = template.body_html

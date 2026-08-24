@@ -438,6 +438,21 @@
 .et-loadfrom-item:hover { background: var(--surface-2); }
 .et-loadfrom-sep { border-top: 1px solid var(--surface-3); margin: 4px 0; }
 .et-loadfrom-empty { padding: 4px 10px 6px; color: var(--text-tertiary); font-size: var(--text-xs); }
+
+/* Reusable on/off switch: a real focusable checkbox overlaid (opacity 0) on a painted track, so it
+   stays keyboard-accessible and hit-testable while the track shows the state. */
+.dv-switch { position: relative; display: inline-block; width: 36px; height: 20px; flex: none; cursor: pointer; }
+.dv-switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; z-index: 1; }
+.dv-switch input:disabled { cursor: not-allowed; }
+.dv-switch-track { position: absolute; inset: 0; border-radius: 999px; background: var(--surface-3); pointer-events: none; transition: background var(--transition-base, .15s); }
+.dv-switch-track::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--surface-0); border: 1px solid var(--surface-3); box-shadow: var(--shadow-sm); transition: transform var(--transition-base, .15s); }
+.dv-switch input:checked + .dv-switch-track::after { border-color: transparent; }
+.dv-switch input:checked + .dv-switch-track { background: var(--success, #16a34a); }
+.dv-switch input:checked + .dv-switch-track::after { transform: translateX(16px); }
+.dv-switch input:focus-visible + .dv-switch-track { outline: 2px solid var(--primary, #6366f1); outline-offset: 2px; }
+.dv-switch input:disabled + .dv-switch-track { opacity: .45; }
+.ear-notify { display: inline-flex; align-items: center; gap: 8px; margin: 0; }
+.ear-notify-state { font-size: var(--text-xs); color: var(--text-secondary); white-space: nowrap; }
 .et-panes { display: grid; gap: var(--space-md); }
 .et-panes.et-view-code { grid-template-columns: 1fr; }
 .et-panes.et-view-render { grid-template-columns: 1fr; }
@@ -480,7 +495,6 @@
 .ear-controls { display: flex; align-items: flex-end; flex-wrap: wrap; gap: var(--space-md); }
 .ear-field { display: flex; flex-direction: column; gap: 2px; font-size: var(--text-xs); color: var(--text-secondary); }
 .ear-template { min-width: 220px; width: auto; }
-.ear-notify { margin: 0; }
 .ear-msg { min-width: 60px; }
 .epc-badge { font-size: var(--text-xs); padding: 1px 7px; border-radius: 999px; margin-left: 6px; }
 .epc-badge-system { background: color-mix(in srgb, var(--info) 18%, transparent); color: var(--info); }

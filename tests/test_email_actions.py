@@ -104,6 +104,29 @@ def test_bind_template_and_toggle_optional_action(admin):
         admin.delete(f"/email/templates/{t['id']}")
 
 
+def test_optional_action_cannot_be_enabled_without_a_template(admin):
+    # unbound (the _clean baseline) -> enabling is refused with a clear message
+    admin.put(f"/email/actions/{_OPTIONAL_SAMPLE}", json={"template_id": None, "enabled": False})
+    r = admin.put(f"/email/actions/{_OPTIONAL_SAMPLE}", json={"enabled": True})
+    assert r.status_code == 400 and "template" in r.json()["detail"].lower()
+    assert _actions(admin)[_OPTIONAL_SAMPLE]["enabled"] is False        # still off
+
+
+def test_unbinding_an_enabled_optional_action_forces_it_off(admin):
+    t = _new_template(admin)
+    try:
+        # bind + enable in one request works (template present)
+        r = admin.put(f"/email/actions/{_OPTIONAL_SAMPLE}", json={"template_id": t["id"], "enabled": True})
+        assert r.status_code == 200 and r.json()["enabled"] is True
+        # set the template back to "none" -> the action can no longer send, so it is forced off
+        r2 = admin.put(f"/email/actions/{_OPTIONAL_SAMPLE}", json={"template_id": None})
+        assert r2.status_code == 200
+        assert r2.json()["template_id"] is None and r2.json()["enabled"] is False
+    finally:
+        admin.put(f"/email/actions/{_OPTIONAL_SAMPLE}", json={"template_id": None, "enabled": False})
+        admin.delete(f"/email/templates/{t['id']}")
+
+
 def test_system_action_binds_and_resets_but_stays_enabled(admin):
     t = _new_template(admin)
     # bind a custom template to a system action

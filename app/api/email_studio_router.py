@@ -738,8 +738,17 @@ async def update_action(key: str, payload: ActionUpdateIn, request: Request,
 
     if action.category == "system":
         action.enabled = True                            # system actions are always on
-    elif payload.enabled is not None:
-        action.enabled = bool(payload.enabled)
+    else:
+        # An optional email can be enabled only with a bound template — one with no template has nothing
+        # to send. Refuse an explicit enable-without-template, and force it off if it ends up unbound
+        # (e.g. the template was set to "none" in this same request).
+        if payload.enabled is not None:
+            if payload.enabled and action.template_id is None:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail="Choose a template for this email before turning it on.")
+            action.enabled = bool(payload.enabled)
+        if action.template_id is None:
+            action.enabled = False
 
     db.commit()
     _audit(db, request, admin, "email_action_updated", action_key=key,

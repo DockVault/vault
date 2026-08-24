@@ -50,9 +50,9 @@ def test_automated_emails_section_lists_actions_with_badges(admin_page: Page):
     expect(sys_row.locator(".ear-badge-system")).to_have_text("System")
     opt_row = page.locator('.email-action-row[data-action-key="share_created"]')
     expect(opt_row.locator(".ear-badge-optional")).to_have_text("Optional")
-    # a system action shows no notify toggle (always on); an optional one does
+    # a system action shows no notify switch (always on); an optional one shows the on/off switch
     expect(sys_row.locator(".ear-notify")).to_have_count(0)
-    expect(opt_row.locator(".ear-notify input")).to_be_visible()
+    expect(opt_row.locator(".ear-notify .dv-switch-track")).to_be_visible()
 
 
 def test_bind_template_to_action_persists_and_badges_the_template(admin_page: Page, admin):
@@ -78,10 +78,16 @@ def test_bind_template_to_action_persists_and_badges_the_template(admin_page: Pa
 
 
 def test_toggle_notify_by_email_on_optional_action(admin_page: Page, admin):
+    # An optional email needs a bound template before it can be turned on, so bind one first.
+    t = admin.post("/email/templates", json={"name": "Notify tpl", "subject": "s",
+                                             "body_html": "<p>hi {{user.username}}</p>"}).json()
+    admin.put("/email/actions/vault_member_added", json={"template_id": t["id"]})
     page = admin_page
     _open_email_tab(page)
     row = page.locator('.email-action-row[data-action-key="vault_member_added"]')
-    row.locator(".ear-notify input").check()
+    sw = row.locator(".ear-notify input")
+    expect(sw).to_be_enabled()           # a template is bound, so the switch is live
+    sw.check()
 
     def enabled():
         acts = {a["key"]: a for a in admin.get("/email/actions").json()["actions"]}
@@ -91,3 +97,13 @@ def test_toggle_notify_by_email_on_optional_action(admin_page: Page, admin):
     while time.time() < deadline and not enabled():
         page.wait_for_timeout(200)
     assert enabled() is True
+
+
+def test_notify_switch_is_disabled_without_a_template(admin_page: Page, admin):
+    # No template bound -> the switch is disabled (an email with nothing to send can't be turned on).
+    admin.put("/email/actions/vault_member_added", json={"template_id": None, "enabled": False})
+    page = admin_page
+    _open_email_tab(page)
+    row = page.locator('.email-action-row[data-action-key="vault_member_added"]')
+    expect(row.locator(".ear-notify input")).to_be_disabled()
+    expect(row.locator(".ear-notify-state")).to_contain_text("pick a template")
