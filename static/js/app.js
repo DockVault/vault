@@ -11447,6 +11447,7 @@ function setupImageZoom(img, wrap, controls) {
                scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15));
     }, { passive: false });
     wrap.addEventListener('dblclick', (e) => {
+        if (e.target.closest && e.target.closest('.preview-zoom-controls')) return;
         const r = wrap.getBoundingClientRect();
         if (scale > 1) { scale = 1; tx = 0; ty = 0; apply(); }
         else zoomAt(e.clientX - r.left - r.width / 2, e.clientY - r.top - r.height / 2, 2.5);
@@ -11461,10 +11462,17 @@ function setupImageZoom(img, wrap, controls) {
         return { x: (p[0].x + p[1].x) / 2 - r.left - r.width / 2, y: (p[0].y + p[1].y) / 2 - r.top - r.height / 2 };
     };
     wrap.addEventListener('pointerdown', (e) => {
-        try { wrap.setPointerCapture(e.pointerId); } catch (_) {}
+        // Let the zoom buttons get their own clicks. Capturing the pointer on the wrap retargets
+        // pointerup (and therefore the click) to the wrap, which would swallow a button press.
+        if (e.target.closest && e.target.closest('.preview-zoom-controls')) return;
         pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-        if (pointers.size === 2) { pinchDist = dist(); panLast = null; wrap.classList.remove('panning'); }
-        else if (scale > 1) { panLast = { x: e.clientX, y: e.clientY }; wrap.classList.add('panning'); }
+        if (pointers.size === 2) {
+            pinchDist = dist(); panLast = null; wrap.classList.remove('panning');
+            for (const id of pointers.keys()) { try { wrap.setPointerCapture(id); } catch (_) {} }
+        } else if (scale > 1) {
+            panLast = { x: e.clientX, y: e.clientY }; wrap.classList.add('panning');
+            try { wrap.setPointerCapture(e.pointerId); } catch (_) {}
+        }
     });
     wrap.addEventListener('pointermove', (e) => {
         if (!pointers.has(e.pointerId)) return;
