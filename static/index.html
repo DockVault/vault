@@ -10,7 +10,7 @@
     <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
     <link rel="apple-touch-icon" href="/static/assets/logo.png?v=1">
     <link rel="stylesheet" href="/static/css/theme.css?v=20260822a">
-    <link rel="stylesheet" href="/static/css/components.css?v=20260824c">
+    <link rel="stylesheet" href="/static/css/components.css?v=20260824d">
     <link rel="stylesheet" href="/static/css/utilities.css?v=20251015c">
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-sans-500.woff2" crossorigin>
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-mono-500.woff2" crossorigin>
@@ -917,6 +917,101 @@
                         <div class="modal-footer">
                             <button class="btn btn-ghost" type="button" data-note-send-close>Cancel</button>
                             <button id="note-send-confirm" class="btn btn-primary" type="button" disabled>Send</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Share note: a two-tile chooser (Send to a member / Public link). -->
+                <div id="note-share-modal" class="modal" role="dialog" aria-modal="true">
+                    <div class="modal-overlay" data-note-share-close></div>
+                    <div class="modal-content" style="max-width: 560px;">
+                        <div class="modal-header">
+                            <h3 class="text-xl font-bold">Share this note</h3>
+                            <button class="modal-close" type="button" data-note-share-close aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <div class="share-tiles">
+                                <button type="button" class="share-tile" id="note-share-internal">
+                                    <svg class="icon icon-lg" aria-hidden="true"><use href="#i-users"/></svg>
+                                    <span class="share-tile-title">Send to a member</span>
+                                    <span class="share-tile-sub">Give another user their own copy of this note.</span>
+                                </button>
+                                <button type="button" class="share-tile" id="note-share-public">
+                                    <svg class="icon icon-lg" aria-hidden="true"><use href="#i-globe"/></svg>
+                                    <span class="share-tile-title">Public link</span>
+                                    <span class="share-tile-sub">A link anyone can open — optionally behind a code, with an expiry.</span>
+                                </button>
+                            </div>
+                            <p id="note-share-public-disabled" class="text-tertiary text-sm mt-md" hidden>
+                                Public links are turned off on this deployment.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Create a public note link (the Public tile of Share). The tag is a security FLOOR;
+                     the controls only let the user TIGHTEN it. -->
+                <div id="note-public-link-modal" class="modal" role="dialog" aria-modal="true">
+                    <div class="modal-overlay" data-note-public-close></div>
+                    <div class="modal-content" style="max-width: 560px;">
+                        <div class="modal-header">
+                            <h3 class="text-xl font-bold">Create a public link</h3>
+                            <button class="modal-close" type="button" data-note-public-close aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <div id="note-public-form">
+                                <p class="text-secondary mb-sm">Anyone with the link reads a snapshot of this note. You can make a link stricter than its type allows, never looser.</p>
+                                <div class="form-group">
+                                    <label for="note-public-tag">Link type</label>
+                                    <select id="note-public-tag" class="form-control"></select>
+                                    <small id="note-public-tag-floor" class="form-help"></small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="note-public-token-len">Link length (characters)</label>
+                                    <input type="number" id="note-public-token-len" class="form-control" min="6" max="64" style="max-width:160px;">
+                                </div>
+                                <div class="form-group">
+                                    <label for="note-public-secret">Protect with</label>
+                                    <select id="note-public-secret" class="form-control" style="max-width:200px;">
+                                        <option value="none">No code</option>
+                                        <option value="pin">PIN</option>
+                                        <option value="password">Password</option>
+                                    </select>
+                                </div>
+                                <div class="form-group" id="note-public-pin-group" hidden>
+                                    <label for="note-public-pin">PIN</label>
+                                    <select id="note-public-pin-len" class="form-control" style="max-width:140px;"></select>
+                                    <input type="text" id="note-public-pin" class="form-control" inputmode="numeric" autocomplete="off" placeholder="digits only" style="margin-top:.4rem; max-width:200px;">
+                                </div>
+                                <div class="form-group" id="note-public-password-group" hidden>
+                                    <label for="note-public-password">Password</label>
+                                    <input type="password" id="note-public-password" class="form-control" autocomplete="new-password" style="max-width:280px;">
+                                    <small id="note-public-password-help" class="form-help"></small>
+                                </div>
+                                <div class="form-group" id="note-public-expiry-group">
+                                    <label for="note-public-ttl">Expires in (hours)</label>
+                                    <input type="number" id="note-public-ttl" class="form-control" min="1" style="max-width:160px;">
+                                    <label class="checkbox-label" id="note-public-never-group" style="margin-top:.35rem;" hidden>
+                                        <input type="checkbox" id="note-public-never"><span>Never expires</span>
+                                    </label>
+                                </div>
+                                <div class="form-group">
+                                    <label for="note-public-max-uses">Maximum views</label>
+                                    <input type="number" id="note-public-max-uses" class="form-control" min="1" placeholder="unlimited" style="max-width:160px;">
+                                </div>
+                                <p id="note-public-error" class="text-sm" style="color:var(--danger,#dc2626);" hidden></p>
+                            </div>
+                            <div id="note-public-result" hidden>
+                                <p class="text-secondary mb-sm">Your public link is ready — copy it now.</p>
+                                <div class="form-group">
+                                    <input type="text" id="note-public-link-value" class="form-control" readonly>
+                                </div>
+                                <button type="button" class="btn btn-secondary btn-sm" id="note-public-copy">Copy link</button>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button class="btn btn-ghost" type="button" data-note-public-close>Cancel</button>
+                            <button id="note-public-back" class="btn btn-ghost" type="button" hidden>&larr; Back</button>
+                            <button id="note-public-create" class="btn btn-primary" type="button">Create link</button>
                         </div>
                     </div>
                 </div>
@@ -3204,7 +3299,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260824i"></script>
+    <script src="/static/js/app.js?v=20260824j"></script>
 </body>
 </html>
 

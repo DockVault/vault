@@ -14523,10 +14523,10 @@ function _noteCard(n, received) {
         edit.type = 'button';
         edit.addEventListener('click', () => openNoteEditor(n));
         actions.appendChild(edit);
-        const send = _el('button', 'btn btn-ghost btn-sm', 'Send');
-        send.type = 'button';
-        send.addEventListener('click', () => openSendNote(n.id));
-        actions.appendChild(send);
+        const share = _el('button', 'btn btn-ghost btn-sm', 'Share');
+        share.type = 'button';
+        share.addEventListener('click', () => openNoteShare(n.id));
+        actions.appendChild(share);
         const del = _el('button', 'btn btn-ghost btn-sm', 'Delete');
         del.type = 'button';
         del.addEventListener('click', () => deleteNoteItem(n.id, n.title));
@@ -14596,10 +14596,10 @@ function renderNoteView() {
             edit.type = 'button';
             edit.addEventListener('click', () => { closeModal(); openNoteEditor(cur); });
             actions.appendChild(edit);
-            const send = _el('button', 'btn btn-ghost', 'Send');
-            send.type = 'button';
-            send.addEventListener('click', () => { closeModal(); openSendNote(cur.id); });
-            actions.appendChild(send);
+            const share = _el('button', 'btn btn-ghost', 'Share');
+            share.type = 'button';
+            share.addEventListener('click', () => { closeModal(); openNoteShare(cur.id); });
+            actions.appendChild(share);
         }
         const close = _el('button', 'btn btn-ghost', 'Close');
         close.type = 'button';
@@ -14718,6 +14718,179 @@ async function confirmSendNote() {
     } catch (e) { showError((e && e.message) || 'Could not send the note'); if (btn) btn.disabled = false; }
 }
 
+// ---- Share note: a two-tile chooser (Send to a member / Public link) -------------------------
+function openNoteShare(id) {
+    state.shareNoteId = id;
+    const pubTile = document.getElementById('note-share-public');
+    const disabledNote = document.getElementById('note-share-public-disabled');
+    if (pubTile) pubTile.disabled = false;          // refined once the policy loads
+    if (disabledNote) disabledNote.hidden = true;
+    openModal('note-share-modal');
+    // Learn whether public links are enabled + which tags this user may create with.
+    apiRequest('/note-link-policy', { silent: true }).then(p => {
+        state._noteLinkPolicy = p || { enabled: false, tags: [] };
+        const enabled = !!(p && p.enabled);
+        if (pubTile) pubTile.disabled = !enabled;
+        if (disabledNote) disabledNote.hidden = enabled;
+    }).catch(() => {
+        state._noteLinkPolicy = { enabled: false, tags: [] };
+        if (pubTile) pubTile.disabled = true;
+        if (disabledNote) disabledNote.hidden = false;
+    });
+}
+
+function _npEl(id) { return document.getElementById(id); }
+
+async function openNotePublicLink(id) {
+    state.shareNoteId = id;
+    if (!state._noteLinkPolicy) {
+        try { state._noteLinkPolicy = await apiRequest('/note-link-policy', { silent: true }); }
+        catch (_) { state._noteLinkPolicy = { enabled: false, tags: [] }; }
+    }
+    const policy = state._noteLinkPolicy || { enabled: false, tags: [] };
+    _npEl('note-public-form').hidden = false;
+    _npEl('note-public-result').hidden = true;
+    _npEl('note-public-create').hidden = false;
+    const err = _npEl('note-public-error'); if (err) err.hidden = true;
+    const sel = _npEl('note-public-tag');
+    sel.replaceChildren();
+    const tags = policy.tags || [];
+    if (!tags.length) {
+        const o = _el('option', '', policy.enabled ? 'No link types available to you' : 'Public links are turned off');
+        o.value = '';
+        sel.appendChild(o);
+        _npEl('note-public-create').disabled = true;
+    } else {
+        _npEl('note-public-create').disabled = false;
+        tags.forEach(t => { const o = _el('option', '', t.name); o.value = t.id; sel.appendChild(o); });
+    }
+    openModal('note-public-link-modal');
+    onNotePublicTagChange();
+}
+
+function _notePublicSelectedTag() {
+    const sel = _npEl('note-public-tag');
+    const id = sel ? sel.value : '';
+    return (((state._noteLinkPolicy || {}).tags) || []).find(t => t.id === id) || null;
+}
+
+function _npSecretPhrase(kind) {
+    return kind === 'password' ? 'a password' : (kind === 'pin' ? 'a PIN' : 'no code');
+}
+
+const _NP_SECRET_STRENGTH = { none: 0, pin: 1, password: 2 };
+
+function onNotePublicTagChange() {
+    const t = _notePublicSelectedTag();
+    const floor = _npEl('note-public-tag-floor');
+    if (!t) { if (floor) floor.textContent = ''; return; }
+    const ttlTxt = t.max_ttl_hours ? ('expires within ' + t.max_ttl_hours + 'h') : 'no expiry required';
+    const useTxt = t.max_uses_cap ? ('up to ' + t.max_uses_cap + ' view(s)') : 'unlimited views';
+    if (floor) floor.textContent = 'This type requires at least: a ' + t.min_token_len + '-char link, '
+        + _npSecretPhrase(t.require_secret) + ', ' + ttlTxt + ', ' + useTxt + '. You can only make it stricter.';
+    // Token length floor.
+    const tok = _npEl('note-public-token-len');
+    tok.min = t.min_token_len; tok.value = t.min_token_len;
+    // Secret: disable anything weaker than the floor; default to the floor.
+    const secret = _npEl('note-public-secret');
+    Array.from(secret.options).forEach(o => {
+        o.disabled = (_NP_SECRET_STRENGTH[o.value] || 0) < (_NP_SECRET_STRENGTH[t.require_secret] || 0);
+    });
+    secret.value = t.require_secret;
+    onNotePublicSecretChange();
+    // PIN length options >= the floor.
+    const pinLen = _npEl('note-public-pin-len');
+    pinLen.replaceChildren();
+    [4, 6, 8].filter(n => n >= (t.min_pin_len || 4)).forEach(n => {
+        const o = _el('option', '', n + ' digits'); o.value = String(n); pinLen.appendChild(o);
+    });
+    const pwHelp = _npEl('note-public-password-help');
+    if (pwHelp) pwHelp.textContent = 'At least ' + (t.password_min_len || 8) + ' characters'
+        + (t.password_require_alnum ? ', including letters and numbers.' : '.');
+    // Expiry: the tag's max is the ceiling; "never" only when the tag sets no ceiling.
+    const ttl = _npEl('note-public-ttl');
+    const neverGroup = _npEl('note-public-never-group');
+    const never = _npEl('note-public-never');
+    if (t.max_ttl_hours) {
+        ttl.max = t.max_ttl_hours;
+        ttl.value = t.default_ttl_hours || t.max_ttl_hours;
+        ttl.disabled = false;
+        if (neverGroup) neverGroup.hidden = true;
+        if (never) never.checked = false;
+    } else {
+        ttl.removeAttribute('max');
+        if (neverGroup) neverGroup.hidden = false;
+        if (t.default_ttl_hours) { ttl.value = t.default_ttl_hours; if (never) never.checked = false; ttl.disabled = false; }
+        else { if (never) never.checked = true; ttl.value = ''; ttl.disabled = true; }
+    }
+    // Max uses: the tag's cap is the ceiling; unlimited only when the tag sets no cap.
+    const uses = _npEl('note-public-max-uses');
+    if (t.max_uses_cap) { uses.max = t.max_uses_cap; uses.value = t.max_uses_cap; uses.placeholder = 'up to ' + t.max_uses_cap; }
+    else { uses.removeAttribute('max'); uses.value = ''; uses.placeholder = 'unlimited'; }
+}
+
+function onNotePublicSecretChange() {
+    const kind = _npEl('note-public-secret').value;
+    _npEl('note-public-pin-group').hidden = (kind !== 'pin');
+    _npEl('note-public-password-group').hidden = (kind !== 'password');
+}
+
+function _npNeverChecked() {
+    const n = _npEl('note-public-never');
+    const g = _npEl('note-public-never-group');
+    return !!(n && g && !g.hidden && n.checked);
+}
+
+function _notePublicPayload() {
+    const t = _notePublicSelectedTag();
+    const p = { note_id: state.shareNoteId, tag_id: t.id };
+    const tok = parseInt(_npEl('note-public-token-len').value, 10);
+    if (Number.isFinite(tok)) p.token_len = tok;
+    const kind = _npEl('note-public-secret').value;
+    p.secret_kind = kind;
+    if (kind === 'pin') p.pin = (_npEl('note-public-pin').value || '').trim();
+    if (kind === 'password') p.password = _npEl('note-public-password').value || '';
+    if (_npNeverChecked()) { p.ttl_hours = null; }
+    else { const h = parseInt(_npEl('note-public-ttl').value, 10); if (Number.isFinite(h)) p.ttl_hours = h; }
+    const mu = parseInt(_npEl('note-public-max-uses').value, 10);
+    p.max_uses = Number.isFinite(mu) ? mu : null;
+    return p;
+}
+
+async function submitNotePublicLink() {
+    const t = _notePublicSelectedTag();
+    const err = _npEl('note-public-error');
+    if (err) err.hidden = true;
+    if (!t) { if (err) { err.textContent = 'Choose a link type first.'; err.hidden = false; } return; }
+    const btn = _npEl('note-public-create');
+    btn.disabled = true;
+    try {
+        const link = await apiRequest('/note-links', { method: 'POST', body: JSON.stringify(_notePublicPayload()) });
+        const url = window.location.origin + (link.url_path || ('/l/' + link.token));
+        state._lastPublicLinkUrl = url;
+        _npEl('note-public-form').hidden = true;
+        _npEl('note-public-result').hidden = false;
+        _npEl('note-public-link-value').value = url;
+        btn.hidden = true;
+    } catch (e) {
+        if (err) { err.textContent = (e && e.message) || 'Could not create the link.'; err.hidden = false; }
+        btn.disabled = false;
+    }
+}
+
+function copyNotePublicLink() {
+    const inp = _npEl('note-public-link-value');
+    const val = (inp && inp.value) || state._lastPublicLinkUrl || '';
+    if (!val) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(val).then(() => showSuccess('Link copied'))
+            .catch(() => { if (inp) { inp.select(); } showError('Copy failed — select the link and copy it.'); });
+    } else if (inp) {
+        inp.select();
+        try { document.execCommand('copy'); showSuccess('Link copied'); } catch (_) { showError('Copy failed.'); }
+    }
+}
+
 function wireNotesOnce() {
     if (state._notesWired) return;
     state._notesWired = true;
@@ -14738,7 +14911,26 @@ function wireNotesOnce() {
     if (sendConfirm) sendConfirm.addEventListener('click', confirmSendNote);
     const sendSearch = document.getElementById('note-send-search');
     if (sendSearch) sendSearch.addEventListener('input', onNoteRecipientSearch);
-    document.querySelectorAll('[data-note-close], [data-note-send-close], [data-note-view-close]').forEach(el =>
+    // Share chooser tiles.
+    const shareInternal = document.getElementById('note-share-internal');
+    if (shareInternal) shareInternal.addEventListener('click', () => { closeModal(); openSendNote(state.shareNoteId); });
+    const sharePublic = document.getElementById('note-share-public');
+    if (sharePublic) sharePublic.addEventListener('click', () => { closeModal(); openNotePublicLink(state.shareNoteId); });
+    // Public-link form.
+    const pubTag = document.getElementById('note-public-tag');
+    if (pubTag) pubTag.addEventListener('change', onNotePublicTagChange);
+    const pubSecret = document.getElementById('note-public-secret');
+    if (pubSecret) pubSecret.addEventListener('change', onNotePublicSecretChange);
+    const pubNever = document.getElementById('note-public-never');
+    if (pubNever) pubNever.addEventListener('change', () => {
+        const ttl = document.getElementById('note-public-ttl'); if (ttl) ttl.disabled = pubNever.checked;
+    });
+    const pubCreate = document.getElementById('note-public-create');
+    if (pubCreate) pubCreate.addEventListener('click', submitNotePublicLink);
+    const pubCopy = document.getElementById('note-public-copy');
+    if (pubCopy) pubCopy.addEventListener('click', copyNotePublicLink);
+    document.querySelectorAll('[data-note-close], [data-note-send-close], [data-note-view-close], '
+        + '[data-note-share-close], [data-note-public-close]').forEach(el =>
         el.addEventListener('click', closeModal));
 }
 
