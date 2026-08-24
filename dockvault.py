@@ -166,7 +166,8 @@ def ask(prompt, pal, default=None):
     suffix = " [%s]" % default if default not in (None, "") else ""
     try:
         raw = input(pal.paint("%s%s: " % (prompt, suffix), "cyan"))
-    except EOFError:
+    except (EOFError, OSError):
+        # EOF (piped/closed) or an unreadable stdin (non-TTY, captured) -> take the default.
         raw = ""
     return raw.strip() or (default or "")
 
@@ -176,7 +177,7 @@ def confirm(prompt, pal, default=True):
     while True:
         try:
             raw = input(pal.paint("%s [%s]: " % (prompt, hint), "yellow"))
-        except EOFError:
+        except (EOFError, OSError):
             return default
         res = parse_yes_no(raw, default)
         if res is not None:
@@ -188,7 +189,7 @@ def ask_secret(prompt, pal):
     import getpass
     try:
         return getpass.getpass(pal.paint("%s: " % prompt, "cyan"))
-    except EOFError:
+    except (EOFError, OSError):
         return ""
 
 
@@ -1371,6 +1372,41 @@ def uses_release_image(env):
     return image.startswith(GHCR_IMAGE + ":") or image.startswith(GHCR_IMAGE + "@")
 
 
+def describe_image_mode(env):
+    """One-line, operator-facing description of which image THIS .env runs: a pinned published
+    release, or a local build of the checkout. Used so a setup re-run is never silent about the
+    mode it is about to (re)start in."""
+    if uses_release_image(env):
+        return "published release %s" % (env.get("DOCKVAULT_IMAGE") or "").strip()
+    img = (env.get("DOCKVAULT_IMAGE") or "").strip()
+    return "local build of this checkout (%s)" % (img or LOCAL_IMAGE)
+
+
+def rerun_image_target(existing_env, choice, version):
+    """For a setup RE-RUN over an existing .env, decide what DOCKVAULT_IMAGE should become given the
+    operator's image-source `choice`. Pure (no I/O) so it is unit-testable. Returns (action, value):
+
+      * ('keep', None)       -> leave .env unchanged (already in the requested mode, or no choice)
+      * ('set', <image>)     -> repoint DOCKVAULT_IMAGE to <image>
+
+    'build' points .env at LOCAL_IMAGE so `compose up --build` runs the code you have checked out
+    right now (the fix for "I git-pulled but setup keeps pulling the old release"). 'release' points
+    it at this checkout's published GHCR ref; with no usable VERSION it degrades to 'keep' so a
+    re-run never writes a broken pin. An empty/None choice keeps whatever the .env already says —
+    a plain restart must not silently switch modes."""
+    c = (choice or "").strip().lower()
+    if c == "build":
+        # Already building (unset, LOCAL_IMAGE, or any non-GHCR value) -> nothing to change.
+        return ("keep", None) if not uses_release_image(existing_env) else ("set", LOCAL_IMAGE)
+    if c == "release":
+        ref = release_image_ref(version)
+        if not ref:
+            return ("keep", None)
+        cur = (existing_env.get("DOCKVAULT_IMAGE") or "").strip()
+        return ("keep", None) if cur == ref else ("set", ref)
+    return ("keep", None)
+
+
 def parse_semver(v):
     """('v1.2.3-rc1' | '1.2.3') -> (1,2,3); pre-release/build suffix ignored; None if unparseable.
     Mirrors the app's update-check parser so the tool ranks versions the same way."""
@@ -2340,6 +2376,11 @@ class DockVault:
         if not port_free(web_port) and not self._port_is_ours(web_port):
             print(pal.paint("  WARNING: host port %d is already in use; the web container may fail to bind "
                             "it. Free it first (e.g. sudo ss -ltnp 'sport = :%d')." % (web_port, web_port), "yellow"))
+        # Re-run only: confirm/switch the image mode (a fresh install already chose in Settings, via
+        # _resolve_setup_image). This is what lets a re-run BUILD freshly-pulled source instead of
+        # silently re-pulling the release the first install pinned.
+        if reusing:
+            self._resolve_rerun_image_source(env_path, args, interactive)
         tracker.advance(); tracker.show()               # -> Start
         if not self._start_secure_stack():
             shown = self._tail_logs(self._web_service(profiles))
@@ -2376,8 +2417,8 @@ class DockVault:
     def _resolve_setup_image(self, args, interactive):
         """Decide whether a FRESH install runs the published release image or builds this checkout.
         Returns the DOCKVAULT_IMAGE value to author, or '' to leave it unset (the compose default,
-        i.e. a local build). Only ever consulted when authoring a new .env — a re-run keeps whatever
-        the existing .env already says.
+        i.e. a local build). Only for a NEW .env; a re-run over an existing .env resolves its image
+        mode in _resolve_rerun_image_source (keep / build-this-checkout / pull-release).
 
         The two modes default differently, deliberately. An interactive operator is installing the
         product and should get the release CI built, scanned and attested — no build toolchain, no
@@ -2574,6 +2615,47 @@ class DockVault:
         if capture:
             kw.setdefault("capture_output", True)
         return subprocess.run(self._dc(*args), stdin=subprocess.DEVNULL, **kw)
+
+    def _resolve_rerun_image_source(self, env_path, args, interactive):
+        """On a setup RE-RUN, let the operator confirm or CHANGE the image mode (pull the published
+        release vs. build the current checkout), then repoint .env accordingly.
+
+        This closes the "I git-pulled new code, re-ran setup, and it still ran the old release" gap:
+        a re-run previously kept the first install's choice with no way to switch and no visibility.
+        Honors --image-source in any mode; interactive runs also offer a keep/build/release prompt
+        (default keep, so a plain restart is one Enter). Prints the effective mode either way."""
+        pal = self.pal
+        env = parse_env(open(env_path, encoding="utf-8").read()) if os.path.exists(env_path) else {}
+        version = read_version_file(self.root)
+        choice = ((getattr(args, "image_source", None) if args else None) or "").strip().lower()
+        if interactive and not choice:
+            print(pal.paint("\n  Image source (current: %s):" % describe_image_mode(env), "cyan"))
+            print("    1) Keep current")
+            print("    2) Build from this checkout - run the code you have now (e.g. after git pull)")
+            print("    3) Pull the published release image")
+            choice = {"2": "build", "3": "release"}.get(ask("Choose 1/2/3", pal, "1").strip(), "")
+        # A "release" switch must not repoint .env at a tag that was never published (a checkout
+        # ahead of the last release) - the pull would then fail with a broken pin left behind. Guard
+        # exactly like _resolve_setup_image: no VERSION, or a tag GitHub doesn't list, downgrades to
+        # keep. An unreachable API returns [] -> proceed, and let the pull report any real failure.
+        if choice == "release":
+            candidate = release_image_ref(version)
+            if not candidate:
+                print(pal.paint("  No usable VERSION to match a published release; keeping %s."
+                                % describe_image_mode(env), "yellow"))
+                choice = ""
+            else:
+                tags = fetch_release_tags()
+                if tags and candidate.rsplit(":", 1)[1] not in tags:
+                    print(pal.paint("  %s is not published (this checkout is ahead of the latest "
+                                    "release); keeping %s." % (candidate, describe_image_mode(env)), "yellow"))
+                    choice = ""
+        action, value = rerun_image_target(env, choice, version)
+        if action == "set":
+            self._set_env_key(env_path, "DOCKVAULT_IMAGE", value)
+            env = parse_env(open(env_path, encoding="utf-8").read())
+            print(pal.paint("  Image source switched -> now %s." % describe_image_mode(env), "green"))
+        print(pal.paint("  Image: %s." % describe_image_mode(env), "cyan"))
 
     def _start_secure_stack(self):
         """Start/recreate the deployment the current .env describes.
@@ -3830,8 +3912,10 @@ def build_parser():
     sp.add_argument("--enable-sftp", dest="enable_sftp", action="store_true", help="also serve SFTP")
     sp.add_argument("--split", dest="split", action="store_true", help="two containers (vault-api + vault-sftp)")
     sp.add_argument("--image-source", dest="image_source", choices=("release", "build"),
-                    help="release = pull the published GHCR image | build = build this checkout "
-                         "(default with --non-interactive; interactive setup asks)")
+                    help="release = pull the published GHCR image | build = build this checkout. "
+                         "Honored on a re-run too: `setup --image-source build` repoints an existing "
+                         "deployment to run freshly-pulled source (default with --non-interactive on "
+                         "a fresh install; interactive setup asks)")
     sp.add_argument("--max-storage-gb", dest="max_storage_gb", type=float,
                     help="deployment storage ceiling in GB (-1 = unlimited, the default)")
     sp.add_argument("--max-concurrent-transfers", dest="max_concurrent_transfers", type=int,

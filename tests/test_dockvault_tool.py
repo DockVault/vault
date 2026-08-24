@@ -1678,6 +1678,101 @@ def test_setup_image_source_release_proceeds_when_github_is_unreachable(tmp_path
     assert tool._resolve_setup_image(args, interactive=False) == "ghcr.io/dockvault/vault:v0.9.0"
 
 
+def test_describe_image_mode_reads_release_vs_local():
+    assert "published release" in dv.describe_image_mode({"DOCKVAULT_IMAGE": "ghcr.io/dockvault/vault:v0.14.0"})
+    assert dv.describe_image_mode({"DOCKVAULT_IMAGE": "ghcr.io/dockvault/vault:v0.14.0"}).endswith("v0.14.0")
+    assert "local build" in dv.describe_image_mode({"DOCKVAULT_IMAGE": dv.LOCAL_IMAGE})
+    assert "local build" in dv.describe_image_mode({}), "an unset image is a local build"
+
+
+def test_rerun_image_target_build_repoints_a_release_pin_to_local():
+    # THE gap: a release-pinned deployment asked to `build` must switch to the local image so a
+    # re-run runs freshly-pulled source instead of re-pulling the old release.
+    env = {"DOCKVAULT_IMAGE": "ghcr.io/dockvault/vault:v0.14.0"}
+    assert dv.rerun_image_target(env, "build", "0.15.0") == ("set", dv.LOCAL_IMAGE)
+
+
+def test_rerun_image_target_build_is_a_noop_when_already_local():
+    assert dv.rerun_image_target({"DOCKVAULT_IMAGE": dv.LOCAL_IMAGE}, "build", "0.15.0") == ("keep", None)
+    assert dv.rerun_image_target({}, "build", "0.15.0") == ("keep", None)
+
+
+def test_rerun_image_target_release_pins_and_is_noop_when_matching():
+    # switching a local build back to a published release
+    assert dv.rerun_image_target({"DOCKVAULT_IMAGE": dv.LOCAL_IMAGE}, "release", "0.14.0") == \
+        ("set", "ghcr.io/dockvault/vault:v0.14.0")
+    # already on that exact release -> no rewrite
+    assert dv.rerun_image_target({"DOCKVAULT_IMAGE": "ghcr.io/dockvault/vault:v0.14.0"}, "release", "0.14.0") == \
+        ("keep", None)
+
+
+def test_rerun_image_target_release_with_no_version_keeps():
+    # No usable VERSION -> never author a broken pin.
+    assert dv.rerun_image_target({"DOCKVAULT_IMAGE": dv.LOCAL_IMAGE}, "release", "") == ("keep", None)
+
+
+def test_rerun_image_target_empty_choice_keeps_current_mode():
+    # A plain restart (no --image-source, Enter=keep) must not silently switch modes.
+    for env in ({"DOCKVAULT_IMAGE": "ghcr.io/dockvault/vault:v0.14.0"}, {"DOCKVAULT_IMAGE": dv.LOCAL_IMAGE}, {}):
+        assert dv.rerun_image_target(env, "", "0.15.0") == ("keep", None)
+        assert dv.rerun_image_target(env, None, "0.15.0") == ("keep", None)
+
+
+def test_resolve_rerun_image_source_build_flag_repoints_env(tmp_path):
+    # End to end: a release-pinned .env + `setup --image-source build` (non-interactive) repoints
+    # DOCKVAULT_IMAGE to the local build so _start_secure_stack will build the checkout.
+    (tmp_path / "VERSION").write_text("0.15.0\n", encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.14.0\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    args = argparse.Namespace(image_source="build")
+    tool._resolve_rerun_image_source(str(env_path), args, interactive=False)
+    env = dv.parse_env(env_path.read_text(encoding="utf-8"))
+    assert env["DOCKVAULT_IMAGE"] == dv.LOCAL_IMAGE
+    assert not dv.uses_release_image(env)
+
+
+def test_resolve_rerun_image_source_default_keeps_current(tmp_path, monkeypatch):
+    # Interactive re-run, operator presses Enter (keep) -> .env unchanged.
+    (tmp_path / "VERSION").write_text("0.15.0\n", encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.14.0\n", encoding="utf-8")
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: "1")  # "Keep current"
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    args = argparse.Namespace(image_source=None)
+    tool._resolve_rerun_image_source(str(env_path), args, interactive=True)
+    env = dv.parse_env(env_path.read_text(encoding="utf-8"))
+    assert env["DOCKVAULT_IMAGE"] == "ghcr.io/dockvault/vault:v0.14.0"
+
+
+def test_resolve_rerun_image_source_release_unpublished_keeps_env(tmp_path, monkeypatch, capsys):
+    # Switching to "release" when this checkout is ahead of the last published release must NOT
+    # repoint .env to an unpublished tag (the pull would fail with a broken pin left behind).
+    (tmp_path / "VERSION").write_text("0.99.0\n", encoding="utf-8")
+    monkeypatch.setattr(dv, "fetch_release_tags", lambda *a, **k: ["v0.14.0", "v0.13.0"])
+    env_path = tmp_path / ".env"
+    env_path.write_text("DOCKVAULT_IMAGE=%s\n" % dv.LOCAL_IMAGE, encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    args = argparse.Namespace(image_source="release")
+    tool._resolve_rerun_image_source(str(env_path), args, interactive=False)
+    env = dv.parse_env(env_path.read_text(encoding="utf-8"))
+    assert env["DOCKVAULT_IMAGE"] == dv.LOCAL_IMAGE, "must not pin an unpublished release on a re-run"
+    assert "not published" in capsys.readouterr().out
+
+
+def test_resolve_rerun_image_source_interactive_build_choice_repoints(tmp_path, monkeypatch):
+    # Interactive re-run, operator picks "2) Build from this checkout" -> repoints to local build.
+    (tmp_path / "VERSION").write_text("0.15.0\n", encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.14.0\n", encoding="utf-8")
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: "2")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    args = argparse.Namespace(image_source=None)
+    tool._resolve_rerun_image_source(str(env_path), args, interactive=True)
+    env = dv.parse_env(env_path.read_text(encoding="utf-8"))
+    assert env["DOCKVAULT_IMAGE"] == dv.LOCAL_IMAGE
+
+
 def test_interactive_setup_offers_the_release_and_accepts_the_default(tmp_path, monkeypatch):
     (tmp_path / "VERSION").write_text("0.9.0\n", encoding="utf-8")
     monkeypatch.setattr(dv, "fetch_release_tags", lambda *a, **k: ["v0.9.0"])
