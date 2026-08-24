@@ -1258,6 +1258,52 @@ class NoteLinkTag(Base):
     created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
 
 
+class NoteLink(Base):
+    """A PUBLIC, anonymous, tokenized SNAPSHOT of one note ("Links" feature).
+
+    The platform's first anonymous read path. Reachable by anyone holding the token (no login),
+    optionally behind a PIN/password, so the title/body are FROZEN at creation (title_snapshot/
+    body_snapshot) — the link never reflects later edits to the source note, and revoking/deleting
+    the note leaves the snapshot intact. Notes are Standard/server-side, so the server renders the
+    snapshot directly (never a ZK vault). The effective policy is resolved at creation from the
+    NoteLinkTag floor + the owner's tightening (note_link_policy.resolve_link_policy) and PERSISTED
+    here, so a later tag edit/delete never changes an existing link. A whole new table, created by
+    create_all (additive; no migration).
+    """
+    __tablename__ = 'note_public_links'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    # The tag it was created under (for the "Shared (by me)" tile colour/icon). SET NULL so an admin
+    # can delete a tag without destroying links — the frozen policy below still governs the link.
+    tag_id = Column(UUID(as_uuid=True), ForeignKey('note_link_tags.id', ondelete='SET NULL'), nullable=True)
+
+    # The opaque URL id. base62, length == token_len (>= the tag's min_token_len). Unique + indexed.
+    token = Column(String(64), nullable=False, unique=True, index=True)
+    token_len = Column(Integer, nullable=False)
+
+    # Frozen content snapshot.
+    title_snapshot = Column(String(255), nullable=False, default='')
+    body_snapshot = Column(Text, nullable=False, default='')
+
+    # Frozen effective policy (resolved from the tag floor + owner tightening at creation).
+    secret_kind = Column(String(16), nullable=False, default='none')   # none | pin | password
+    password_hash = Column(String(255), nullable=True)                 # Argon2 of the PIN/password
+    expires_at = Column(DateTime, nullable=True)                       # NULL = no expiry
+    max_uses = Column(Integer, nullable=True)                          # NULL = unlimited
+
+    use_count = Column(Integer, nullable=False, default=0)             # counts toward max_uses
+    view_count = Column(Integer, nullable=False, default=0)            # total successful views
+    last_viewed_at = Column(DateTime, nullable=True)
+    revoked = Column(Boolean, nullable=False, default=False)
+
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_note_link_owner', 'owner_id'),
+    )
+
+
 class RateLimitRecord(Base):
     """Track rate limiting for login attempts."""
     __tablename__ = 'rate_limit_records'
