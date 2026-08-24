@@ -6325,6 +6325,7 @@ function setupSettingsTabs() {
             }
             if (tabId === 'logs') { loadLogSettings(); }  // refresh on tab open
             if (tabId === 'sharing') { setupShareTagsUI(); loadShareTags(); }  // wire (idempotent) + refresh
+            if (tabId === 'notelinks') { setupNoteLinkTagsUI(); loadNoteLinkTags(); }  // wire + refresh
             if (tabId === 'accounts') { setupAccountsPolicyUI(); refreshAccountsPolicyUI(); }  // wire + reflect deps
             if (tabId === 'email') { loadEmailProfiles(); loadEmailTemplates(); loadEmailActions(); }  // refresh profiles + templates + actions on tab open
         });
@@ -7127,6 +7128,14 @@ async function loadSettings() {
         setupShareTagsUI();
         loadShareTags();
 
+        // Note Links: master switch + per-user cap + the note-link tag manager
+        const nlEn = document.getElementById('setting-public-note-links-enabled');
+        if (nlEn) nlEn.checked = settings.public_note_links_enabled === true;
+        const nlCap = document.getElementById('setting-public-note-link-user-cap');
+        if (nlCap) nlCap.value = settings.public_note_link_user_cap != null ? settings.public_note_link_user_cap : 50;
+        setupNoteLinkTagsUI();
+        loadNoteLinkTags();
+
         // Accounts & Access: the org-onboarding policy block.
         populateAccountsPolicy(settings);
 
@@ -7235,6 +7244,12 @@ async function saveAllSettings() {
         // Sharing master switch (the per-tag policy lives in the Share Tags manager, not here)
         const shEnEl = document.getElementById('setting-sharing-enabled');
         if (shEnEl) settings.sharing_enabled = shEnEl.checked;
+
+        // Note Links master switch + per-user cap (tag policy lives in the Note-link tag manager)
+        const nlEnEl = document.getElementById('setting-public-note-links-enabled');
+        if (nlEnEl) settings.public_note_links_enabled = nlEnEl.checked;
+        const nlCapEl = document.getElementById('setting-public-note-link-user-cap');
+        if (nlCapEl && nlCapEl.value !== '') settings.public_note_link_user_cap = parseInt(nlCapEl.value, 10);
 
         // Accounts & Access: the org-onboarding policy block.
         collectAccountsPolicy(settings);
@@ -14129,6 +14144,146 @@ async function loadUsersForPermission() {
 
 // Open a modal by id (several handlers referenced openModal but it was undefined,
 // so vault settings/permission buttons silently threw and did nothing).
+// ---- Note-link tags manager (admin Settings -> Note Links) --------------------------------------
+// Admin CRUD for the public-note-link policy tags (GET/POST/PATCH/DELETE /note-link-tags). A tag is a
+// security FLOOR. This editor covers the policy + the "everyone may use" auto-enroll switch; granular
+// per-user/department allowlists are API-managed for now. All controls build via DOM (no innerHTML).
+let noteLinkTagsCache = [];
+let noteLinkTagsUIWired = false;
+
+function _nlEl(id) { return document.getElementById(id); }
+function _nlNumOrNull(id) {
+    const e = _nlEl(id);
+    if (!e || e.value === '' || e.value == null) return null;
+    const n = parseInt(e.value, 10);
+    return Number.isFinite(n) ? n : null;
+}
+
+function setupNoteLinkTagsUI() {
+    if (noteLinkTagsUIWired) return;
+    const add = _nlEl('nl-tag-add-btn'), save = _nlEl('nl-tag-save-btn'), cancel = _nlEl('nl-tag-cancel-btn');
+    if (!add || !save || !cancel) return;  // tab markup not present
+    add.addEventListener('click', () => openNoteLinkTagEditor(null));
+    save.addEventListener('click', saveNoteLinkTag);
+    cancel.addEventListener('click', () => { const ed = _nlEl('nl-tag-editor'); if (ed) ed.style.display = 'none'; });
+    noteLinkTagsUIWired = true;
+}
+
+async function loadNoteLinkTags() {
+    const host = _nlEl('nl-tags-list');
+    if (!host) return;
+    try {
+        const tags = await apiRequest('/note-link-tags', { silent: true });
+        noteLinkTagsCache = Array.isArray(tags) ? tags : [];
+    } catch (_) { noteLinkTagsCache = []; }
+    renderNoteLinkTagsList();
+}
+
+function _nlSecretLabel(t) {
+    if (t.require_secret === 'password') return 'password required';
+    if (t.require_secret === 'pin') return 'PIN required (' + t.min_pin_len + ')';
+    return 'no secret';
+}
+
+function renderNoteLinkTagsList() {
+    const host = _nlEl('nl-tags-list');
+    if (!host) return;
+    host.replaceChildren();
+    if (!noteLinkTagsCache.length) {
+        host.appendChild(_el('p', 'text-tertiary text-sm', 'No note-link tags yet. Add one to let users create public links.'));
+        return;
+    }
+    noteLinkTagsCache.slice().sort((a, b) => a.name.localeCompare(b.name)).forEach(tag => {
+        const row = _el('div', 'share-tag-row flex justify-between items-center mb-sm');
+        const left = _el('div');
+        const title = _el('span', 'font-medium', tag.name + (tag.is_active ? '' : ' (inactive)'));
+        left.appendChild(title);
+        const ttl = tag.max_ttl_hours ? (tag.max_ttl_hours + 'h max') : 'no expiry';
+        const uses = tag.max_uses_cap ? (tag.max_uses_cap + ' views') : 'unlimited views';
+        left.appendChild(_el('div', 'text-secondary text-sm',
+            `token ≥ ${tag.min_token_len} · ${_nlSecretLabel(tag)} · ${ttl} · ${uses}`));
+        row.appendChild(left);
+        const actions = _el('div', 'flex gap-sm');
+        const edit = _el('button', 'btn btn-ghost btn-sm', 'Edit'); edit.type = 'button';
+        edit.addEventListener('click', () => openNoteLinkTagEditor(tag));
+        actions.appendChild(edit);
+        if (tag.is_active) {
+            const del = _el('button', 'btn btn-ghost btn-sm', 'Deactivate'); del.type = 'button';
+            del.addEventListener('click', () => deactivateNoteLinkTag(tag));
+            actions.appendChild(del);
+        }
+        row.appendChild(actions);
+        host.appendChild(row);
+    });
+}
+
+function openNoteLinkTagEditor(tag) {
+    const ed = _nlEl('nl-tag-editor');
+    if (!ed) return;
+    const t = tag || {};
+    _nlEl('nl-tag-editor-id').value = t.id || '';
+    _nlEl('nl-tag-editor-title').textContent = tag ? 'Edit tag' : 'Add tag';
+    _nlEl('nl-tag-name').value = t.name || '';
+    _nlEl('nl-tag-description').value = t.description || '';
+    _nlEl('nl-tag-color').value = t.border_color || '';
+    _nlEl('nl-tag-icon').value = t.icon || '';
+    _nlEl('nl-tag-min-token-len').value = t.min_token_len != null ? t.min_token_len : 10;
+    _nlEl('nl-tag-max-ttl').value = t.max_ttl_hours != null ? t.max_ttl_hours : '';
+    _nlEl('nl-tag-default-ttl').value = t.default_ttl_hours != null ? t.default_ttl_hours : '';
+    _nlEl('nl-tag-require-secret').value = t.require_secret || 'none';
+    _nlEl('nl-tag-min-pin-len').value = String(t.min_pin_len || 4);
+    _nlEl('nl-tag-password-min-len').value = t.password_min_len != null ? t.password_min_len : 8;
+    _nlEl('nl-tag-password-alnum').checked = t.password_require_alnum === true;
+    _nlEl('nl-tag-max-uses').value = t.max_uses_cap != null ? t.max_uses_cap : '';
+    _nlEl('nl-tag-auto-enroll').checked = tag ? (t.auto_enroll_new_users === true) : true;
+    _nlEl('nl-tag-active').checked = tag ? (t.is_active !== false) : true;
+    const err = _nlEl('nl-tag-editor-error'); if (err) err.style.display = 'none';
+    ed.style.display = '';
+}
+
+function _nlEditorPayload() {
+    return {
+        name: (_nlEl('nl-tag-name').value || '').trim(),
+        description: (_nlEl('nl-tag-description').value || '').trim() || null,
+        border_color: _nlEl('nl-tag-color').value || null,
+        icon: _nlEl('nl-tag-icon').value || null,
+        min_token_len: _nlNumOrNull('nl-tag-min-token-len') != null ? _nlNumOrNull('nl-tag-min-token-len') : 10,
+        max_ttl_hours: _nlNumOrNull('nl-tag-max-ttl'),
+        default_ttl_hours: _nlNumOrNull('nl-tag-default-ttl'),
+        require_secret: _nlEl('nl-tag-require-secret').value || 'none',
+        min_pin_len: parseInt(_nlEl('nl-tag-min-pin-len').value, 10) || 4,
+        password_min_len: _nlNumOrNull('nl-tag-password-min-len') != null ? _nlNumOrNull('nl-tag-password-min-len') : 8,
+        password_require_alnum: _nlEl('nl-tag-password-alnum').checked,
+        max_uses_cap: _nlNumOrNull('nl-tag-max-uses'),
+        auto_enroll_new_users: _nlEl('nl-tag-auto-enroll').checked,
+        is_active: _nlEl('nl-tag-active').checked,
+    };
+}
+
+async function saveNoteLinkTag() {
+    const id = _nlEl('nl-tag-editor-id').value;
+    const err = _nlEl('nl-tag-editor-error');
+    const payload = _nlEditorPayload();
+    if (!payload.name) { if (err) { err.textContent = 'Name is required'; err.style.display = ''; } return; }
+    try {
+        if (id) await apiRequest('/note-link-tags/' + id, { method: 'PATCH', body: JSON.stringify(payload) });
+        else await apiRequest('/note-link-tags', { method: 'POST', body: JSON.stringify(payload) });
+        const ed = _nlEl('nl-tag-editor'); if (ed) ed.style.display = 'none';
+        showSuccess('Note-link tag saved');
+        await loadNoteLinkTags();
+    } catch (e) {
+        if (err) { err.textContent = (e && e.message) || 'Could not save the tag'; err.style.display = ''; }
+    }
+}
+
+async function deactivateNoteLinkTag(tag) {
+    const ok = await showConfirm(`Deactivate note-link tag "${tag.name}"? New links can't use it; existing links keep their policy.`);
+    if (!ok) return;
+    try { await apiRequest('/note-link-tags/' + tag.id, { method: 'DELETE' }); showSuccess('Tag deactivated'); await loadNoteLinkTags(); }
+    catch (e) { showError((e && e.message) || 'Could not deactivate the tag'); }
+}
+
+
 // ================= Notes =====================================================================
 // Personal server-side notes + "send note" (a snapshot copy to another user). Note text can be
 // masked with the "Hide note text" toggle (a local privacy screen, remembered per browser); the

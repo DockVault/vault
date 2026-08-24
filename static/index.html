@@ -1154,6 +1154,7 @@
                         <button class="tab-btn" data-tab="email">Email</button>
                         <button class="tab-btn" data-tab="sftp">SFTP &amp; Encryption</button>
                         <button class="tab-btn" data-tab="sharing">Sharing</button>
+                        <button class="tab-btn" data-tab="notelinks">Note Links</button>
                         <button class="tab-btn" data-tab="accounts">Accounts &amp; Access</button>
                         <button class="tab-btn" data-tab="logs">Log access</button>
                         <button class="tab-btn" data-tab="audit">Audit Log</button>
@@ -1982,6 +1983,120 @@
                                         <div class="flex gap-sm mt-lg">
                                             <button type="button" id="share-tag-save-btn" class="btn btn-primary">Save tag</button>
                                             <button type="button" id="share-tag-cancel-btn" class="btn btn-secondary">Cancel</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Note Links Tab: public-link sharing of notes (anonymous, snapshot). -->
+                    <div id="settings-tab-notelinks" class="settings-tab-content">
+                        <div class="card">
+                            <div class="card-header"><h3>Public note links</h3></div>
+                            <div class="p-lg">
+                                <label class="flex items-center gap-sm">
+                                    <input type="checkbox" id="setting-public-note-links-enabled">
+                                    <span>Allow users to create public note links</span>
+                                </label>
+                                <p class="text-secondary text-sm mt-sm">When enabled, users may turn a note into a shareable link that anyone with the link can open (no sign-in). Each link is a <strong>snapshot</strong> — later edits don't change what a link shows — governed by the tags below. Leave off to disable public note links entirely (internal member-to-member sharing is unaffected).</p>
+                                <div class="form-group mt-md" style="max-width:280px;">
+                                    <label for="setting-public-note-link-user-cap">Maximum active links per user</label>
+                                    <input type="number" id="setting-public-note-link-user-cap" class="form-control" min="1" max="10000" step="1">
+                                    <p class="text-secondary text-sm mt-sm">An anti-abuse cap on how many active public links one user may hold.</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header flex justify-between items-center">
+                                <h3>Note-link tags</h3>
+                                <button type="button" id="nl-tag-add-btn" class="btn btn-secondary">Add tag</button>
+                            </div>
+                            <div class="p-lg">
+                                <p class="text-secondary text-sm mb-md">A tag is a security <strong>floor</strong> for a link (token length, expiry, whether a password/PIN is required, how many views). A user creating a link may only make it <em>stronger</em> than its tag, never weaker. Deactivating a tag stops new links under it; existing links keep the policy they were created with. Granular per-user/per-department allowlists are managed via the API for now.</p>
+                                <div id="nl-tags-list"></div>
+
+                                <div id="nl-tag-editor" class="card mt-lg" style="display:none;">
+                                    <div class="card-header"><h4 id="nl-tag-editor-title">Add tag</h4></div>
+                                    <div class="p-lg">
+                                        <input type="hidden" id="nl-tag-editor-id">
+                                        <div class="form-group">
+                                            <label for="nl-tag-name">Name</label>
+                                            <input type="text" id="nl-tag-name" class="form-control" maxlength="120" placeholder="e.g. Confidential">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="nl-tag-description">Description</label>
+                                            <input type="text" id="nl-tag-description" class="form-control" placeholder="Optional">
+                                        </div>
+                                        <div class="flex gap-sm">
+                                            <div class="form-group">
+                                                <label for="nl-tag-color">Tile colour</label>
+                                                <select id="nl-tag-color" class="form-control" style="max-width:160px;">
+                                                    <option value="">None</option>
+                                                    <option value="green">Green</option>
+                                                    <option value="amber">Amber</option>
+                                                    <option value="red">Red</option>
+                                                    <option value="indigo">Indigo</option>
+                                                    <option value="teal">Teal</option>
+                                                    <option value="sky">Sky</option>
+                                                    <option value="violet">Violet</option>
+                                                </select>
+                                            </div>
+                                            <div class="form-group">
+                                                <label for="nl-tag-icon">Icon</label>
+                                                <select id="nl-tag-icon" class="form-control" style="max-width:160px;">
+                                                    <option value="">Default</option>
+                                                    <option value="globe">Globe</option>
+                                                    <option value="clock">Clock</option>
+                                                    <option value="lock">Lock</option>
+                                                    <option value="link">Link</option>
+                                                    <option value="shield">Shield</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <div class="form-group mt-md">
+                                            <label for="nl-tag-min-token-len">Minimum link length (characters, ≥ 6)</label>
+                                            <input type="number" id="nl-tag-min-token-len" class="form-control" min="6" max="64" step="1" style="max-width:160px;">
+                                            <p class="text-secondary text-sm mt-sm">6 is a short "easy" link; 20+ is effectively unguessable. Redemption is always rate-limited.</p>
+                                        </div>
+                                        <div class="form-group mt-md">
+                                            <label>Expiry (hours, blank = none)</label>
+                                            <div class="flex gap-sm">
+                                                <div><label class="text-sm text-secondary" for="nl-tag-max-ttl">Maximum</label><input type="number" id="nl-tag-max-ttl" class="form-control" min="1" style="max-width:160px;"></div>
+                                                <div><label class="text-sm text-secondary" for="nl-tag-default-ttl">Default</label><input type="number" id="nl-tag-default-ttl" class="form-control" min="1" style="max-width:160px;"></div>
+                                            </div>
+                                            <p class="text-secondary text-sm mt-sm">The default must not exceed the maximum.</p>
+                                        </div>
+                                        <div class="form-group mt-md">
+                                            <label for="nl-tag-require-secret">Password / PIN requirement</label>
+                                            <select id="nl-tag-require-secret" class="form-control" style="max-width:220px;">
+                                                <option value="none">None (user may add one)</option>
+                                                <option value="pin">Require a PIN</option>
+                                                <option value="password">Require a password</option>
+                                            </select>
+                                            <div class="flex gap-sm mt-sm">
+                                                <div><label class="text-sm text-secondary" for="nl-tag-min-pin-len">PIN length</label>
+                                                    <select id="nl-tag-min-pin-len" class="form-control" style="max-width:120px;">
+                                                        <option value="4">4</option><option value="6">6</option><option value="8">8</option>
+                                                    </select>
+                                                </div>
+                                                <div><label class="text-sm text-secondary" for="nl-tag-password-min-len">Password min length</label><input type="number" id="nl-tag-password-min-len" class="form-control" min="1" max="256" style="max-width:140px;"></div>
+                                            </div>
+                                            <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="nl-tag-password-alnum"><span>Password must mix letters &amp; numbers</span></label>
+                                        </div>
+                                        <div class="form-group mt-md" style="max-width:280px;">
+                                            <label for="nl-tag-max-uses">Maximum views (blank = unlimited)</label>
+                                            <input type="number" id="nl-tag-max-uses" class="form-control" min="1" style="max-width:160px;">
+                                        </div>
+                                        <div class="form-group mt-md">
+                                            <label class="flex items-center gap-sm"><input type="checkbox" id="nl-tag-auto-enroll"><span>Everyone may create links with this tag</span></label>
+                                            <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="nl-tag-active"><span>Active</span></label>
+                                        </div>
+                                        <div id="nl-tag-editor-error" class="alert alert-error" style="display:none;"></div>
+                                        <div class="flex gap-sm mt-md">
+                                            <button type="button" id="nl-tag-save-btn" class="btn btn-primary">Save tag</button>
+                                            <button type="button" id="nl-tag-cancel-btn" class="btn btn-secondary">Cancel</button>
                                         </div>
                                     </div>
                                 </div>
@@ -3092,7 +3207,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260824f"></script>
+    <script src="/static/js/app.js?v=20260824g"></script>
 </body>
 </html>
 
