@@ -14243,11 +14243,20 @@ function _noteCard(n, received) {
 
     const actions = _el('div', 'flex gap-sm mt-md');
     if (received) {
+        // Preview lets the recipient READ a received note before deciding to adopt it.
+        const preview = _el('button', 'btn btn-secondary btn-sm', 'Preview');
+        preview.type = 'button';
+        preview.addEventListener('click', () => openNoteView(n.id, 'received'));
+        actions.appendChild(preview);
         const adopt = _el('button', 'btn btn-primary btn-sm', 'Add to my notes');
         adopt.type = 'button';
         adopt.addEventListener('click', () => adoptNote(n.id));
         actions.appendChild(adopt);
     } else {
+        const open = _el('button', 'btn btn-primary btn-sm', 'Open');
+        open.type = 'button';
+        open.addEventListener('click', () => openNoteView(n.id, 'mine'));
+        actions.appendChild(open);
         const edit = _el('button', 'btn btn-secondary btn-sm', 'Edit');
         edit.type = 'button';
         edit.addEventListener('click', () => openNoteEditor(n));
@@ -14264,6 +14273,77 @@ function _noteCard(n, received) {
     bodyWrap.appendChild(actions);
     card.appendChild(bodyWrap);
     return card;
+}
+
+// ---- Note read modal (rendered note + a left rail to switch between notes) --------------------
+// One modal serves both "my notes" (source='mine') and received notes (source='received', shown
+// with a Preview button before adopting). The rail lists the notes from the same source so the
+// reader can jump between them without closing. Body renders with textContent (pre-wrap) — the
+// note text is server-side plaintext and must never be interpreted as HTML.
+function _noteViewList() {
+    return state.noteViewSource === 'received' ? (state.notesReceived || []) : (state.notes || []);
+}
+
+function openNoteView(id, source) {
+    _notesState();
+    state.noteViewSource = source === 'received' ? 'received' : 'mine';
+    state.noteViewId = id;
+    openModal('note-view-modal');
+    renderNoteView();
+}
+
+function renderNoteView() {
+    const list = _noteViewList();
+    const cur = list.find(n => n.id === state.noteViewId) || list[0] || null;
+    if (cur) state.noteViewId = cur.id;
+    // Left rail: every note from this source, current one highlighted.
+    const rail = document.getElementById('note-view-rail');
+    if (rail) {
+        rail.replaceChildren();
+        list.forEach(n => {
+            const item = _el('button', 'note-view-rail-item' + (cur && n.id === cur.id ? ' active' : ''),
+                             n.title || 'Untitled note');
+            item.type = 'button';
+            item.addEventListener('click', () => { state.noteViewId = n.id; renderNoteView(); });
+            rail.appendChild(item);
+        });
+        if (!list.length) rail.appendChild(_el('p', 'text-tertiary text-sm p-sm', 'No notes'));
+    }
+    const titleEl = document.getElementById('note-view-title');
+    if (titleEl) titleEl.textContent = cur ? (cur.title || 'Untitled note') : 'Note';
+    const meta = document.getElementById('note-view-meta');
+    if (meta) {
+        meta.textContent = (cur && state.noteViewSource === 'received' && cur.sent_from)
+            ? ('Sent from ' + cur.sent_from) : '';
+        meta.style.display = meta.textContent ? '' : 'none';
+    }
+    const bodyEl = document.getElementById('note-view-content-body');
+    if (bodyEl) bodyEl.textContent = cur ? (cur.body || '') : '';
+    // Footer actions depend on the source.
+    const actions = document.getElementById('note-view-actions');
+    if (actions) {
+        actions.replaceChildren();
+        if (!cur) return;
+        if (state.noteViewSource === 'received') {
+            const adopt = _el('button', 'btn btn-primary', 'Add to my notes');
+            adopt.type = 'button';
+            adopt.addEventListener('click', async () => { await adoptNote(cur.id); closeModal(); });
+            actions.appendChild(adopt);
+        } else {
+            const edit = _el('button', 'btn btn-secondary', 'Edit');
+            edit.type = 'button';
+            edit.addEventListener('click', () => { closeModal(); openNoteEditor(cur); });
+            actions.appendChild(edit);
+            const send = _el('button', 'btn btn-ghost', 'Send');
+            send.type = 'button';
+            send.addEventListener('click', () => { closeModal(); openSendNote(cur.id); });
+            actions.appendChild(send);
+        }
+        const close = _el('button', 'btn btn-ghost', 'Close');
+        close.type = 'button';
+        close.addEventListener('click', closeModal);
+        actions.appendChild(close);
+    }
 }
 
 function openNoteEditor(note) {
@@ -14396,7 +14476,7 @@ function wireNotesOnce() {
     if (sendConfirm) sendConfirm.addEventListener('click', confirmSendNote);
     const sendSearch = document.getElementById('note-send-search');
     if (sendSearch) sendSearch.addEventListener('input', onNoteRecipientSearch);
-    document.querySelectorAll('[data-note-close], [data-note-send-close]').forEach(el =>
+    document.querySelectorAll('[data-note-close], [data-note-send-close], [data-note-view-close]').forEach(el =>
         el.addEventListener('click', closeModal));
 }
 

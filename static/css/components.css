@@ -882,6 +882,30 @@ button.vault-sort-dir {
     padding: var(--space-lg) var(--space-md); text-align: center; font-size: var(--text-sm);
 }
 
+/* Note read modal: a left rail of notes beside the rendered note body. Shared by both skins. */
+.note-view-body { display: flex; gap: var(--space-md); align-items: stretch; }
+.note-view-rail {
+    flex: 0 0 220px; max-height: 60vh; overflow-y: auto;
+    border-right: 1px solid var(--border-color); padding-right: var(--space-sm);
+}
+.note-view-main { flex: 1; min-width: 0; max-height: 60vh; overflow-y: auto; }
+.note-view-text {
+    white-space: pre-wrap; word-break: break-word; font-size: var(--text-sm);
+    color: var(--text-primary); line-height: 1.6;
+}
+.note-view-rail-item {
+    display: block; width: 100%; text-align: left; padding: var(--space-sm);
+    background: none; border: none; cursor: pointer; color: var(--text-primary);
+    font: inherit; border-radius: var(--radius-sm); white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; transition: background var(--transition-base);
+}
+.note-view-rail-item:hover { background: var(--surface-2); }
+.note-view-rail-item.active { background: color-mix(in srgb, var(--brand-accent) 12%, transparent); font-weight: 600; }
+@media (max-width: 640px) {
+    .note-view-body { flex-direction: column; }
+    .note-view-rail { flex-basis: auto; max-height: 30vh; border-right: none; border-bottom: 1px solid var(--border-color); padding-right: 0; }
+}
+
 .profile-dropdown-header {
     padding: var(--space-md);
     display: flex;
