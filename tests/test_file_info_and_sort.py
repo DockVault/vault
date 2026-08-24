@@ -22,10 +22,14 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _upload(client, vault_id, name, content, folder_id=None, password=None):
-    files = {"file": (name, content, "application/octet-stream")}
+    """Upload one file and return its id. The endpoint takes the `files` (plural) multipart field
+    and answers {"files": [{"id": ...}]}."""
+    files = [("files", (name, content, "application/octet-stream"))]
     params = {"folder_id": folder_id} if folder_id else None
     headers = {"X-Vault-Password": password} if password else None
-    return client.post(f"/vaults/{vault_id}/files", files=files, params=params, headers=headers)
+    r = client.post(f"/vaults/{vault_id}/files", files=files, params=params, headers=headers)
+    assert r.status_code in (200, 201), r.text
+    return r.json()["files"][0]["id"]
 
 
 # --------------------------------------------------------------------------- unit lane
@@ -67,7 +71,7 @@ def test_info_checksum_is_the_classic_plaintext_sha256(admin, temp_vault):
     """The Show-hash value must be exactly what `sha256sum` of the file yields (Standard vault)."""
     vid = temp_vault["id"]
     content = b"the quick brown fox jumps over the lazy dog\n"
-    fid = _upload(admin, vid, unique("hash") + ".txt", content).json()["id"]
+    fid = _upload(admin, vid, unique("hash") + ".txt", content)
 
     info = admin.get(f"/vaults/{vid}/files/{fid}/info")
     assert info.status_code == 200, info.text
@@ -87,7 +91,7 @@ def test_info_404_for_a_missing_file(admin, temp_vault):
 
 def test_listing_carries_modified_by_name(admin, temp_vault):
     vid = temp_vault["id"]
-    fid = _upload(admin, vid, unique("mbn") + ".txt", b"x").json()["id"]
+    fid = _upload(admin, vid, unique("mbn") + ".txt", b"x")
     items = admin.get(f"/vaults/{vid}/files").json()["items"]
     entry = next(i for i in items if i["id"] == fid)
     # never renamed -> last modifier is the uploader.
@@ -98,7 +102,7 @@ def test_modified_by_tracks_the_renamer_not_the_uploader(admin, temp_vault, temp
     """The whole point of the column: created_by stays the uploader while modified_by becomes whoever
     renamed it last. Uploaded by admin, renamed by a second user."""
     vid = temp_vault["id"]
-    fid = _upload(admin, vid, unique("mb") + ".txt", b"track me").json()["id"]
+    fid = _upload(admin, vid, unique("mb") + ".txt", b"track me")
 
     uid = temp_user["id"]
     # FILE_DELETE (with its transitive FILE_VIEW) lets the user reach the rename endpoint; a vault
@@ -151,7 +155,7 @@ def test_share_recipient_does_not_see_member_usernames(admin, temp_user_client):
     v = admin.create_vault(name=unique("mbshare"))
     try:
         content = b"shared-and-owned"
-        fid = _upload(admin, v["id"], "shared.txt", content).json()["id"]
+        fid = _upload(admin, v["id"], "shared.txt", content)
         share = _make_share(admin, v, _share_tag(admin))
         assert temp_user_client.post("/shares/claim", json={"token": share["link_token"]}).status_code == 200
 
@@ -175,7 +179,7 @@ def test_view_only_share_recipient_gets_no_hash(admin, temp_user_client):
     _enable_sharing(admin, True)
     v = admin.create_vault(name=unique("vohash"))
     try:
-        fid = _upload(admin, v["id"], "vo.txt", b"view only bytes").json()["id"]
+        fid = _upload(admin, v["id"], "vo.txt", b"view only bytes")
         tag = _share_tag(admin, allow_view_only=True)
         share = _make_share(admin, v, tag, view_only=True)
         assert temp_user_client.post("/shares/claim", json={"token": share["link_token"]}).status_code == 200
