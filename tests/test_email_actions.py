@@ -44,6 +44,8 @@ def _clean(admin):
             admin.put(f"/email/actions/{a['key']}",
                       json={"template_id": None, "enabled": (a["category"] == "system")})
         for t in admin.get("/email/templates").json().get("templates", []):
+            if t.get("is_default"):
+                continue                       # built-in defaults are permanent (undeletable)
             admin.delete(f"/email/templates/{t['id']}")
         # also drop any (Mailpit) profile a send test created, so a leftover default profile doesn't
         # make _smtp_configured true for the email-change tests that expect no SMTP.
@@ -66,8 +68,12 @@ def test_seed_catalog_is_present_and_shaped(admin):
         assert a["enabled"] is True                 # system actions are always on
     opt = acts[_OPTIONAL_SAMPLE]
     assert opt["category"] == "optional" and opt["enabled"] is False   # opt-in, off by default
-    # seeded without a DB template (built-in default body) so the user template grid stays empty
-    assert admin.get("/email/templates").json()["templates"] == []
+    # Every action ships with a built-in DEFAULT template (seeded as a real row, is_default + permanent).
+    # There is one default per action and nothing else after _clean (which drops user templates only).
+    from app.core.email_actions import ACTION_CATALOG
+    tpls = admin.get("/email/templates").json()["templates"]
+    assert all(t["is_default"] for t in tpls), "only built-in defaults should remain after _clean"
+    assert {t["default_key"] for t in tpls} == {a["key"] for a in ACTION_CATALOG}   # one per action
 
 
 def test_seed_created_exactly_the_catalog_no_duplicates(admin):

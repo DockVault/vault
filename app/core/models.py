@@ -1959,6 +1959,13 @@ class EmailTemplate(Base):
                         ForeignKey('email_profiles.id', ondelete='SET NULL'), nullable=True)
     subject = Column(String(255), nullable=False, default='')
     body_html = Column(Text, nullable=False, default='')
+    # NULL for a user-authored template; set to the action key (e.g. 'password_reset') for a built-in
+    # default template seeded at boot. A seeded default is protected from deletion and badged "Default";
+    # editing it customizes it, and "Load From" restores the code default. Additive column: create_all
+    # builds it on a fresh DB, the boot DDL list ADDs it on an existing one. At most one row per key,
+    # enforced by the partial unique index below (Postgres treats NULLs as distinct, so user templates
+    # are unconstrained) — a hard backstop against a concurrent first-boot seeding two defaults for a key.
+    default_key = Column(String(64), nullable=True)
     created_by = Column(UUID(as_uuid=True),
                         ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     updated_by = Column(UUID(as_uuid=True),
@@ -1974,6 +1981,11 @@ class EmailTemplate(Base):
 
     __table_args__ = (
         Index('idx_email_template_profile', 'profile_id'),
+        # One default template per action key. Partial (NULLs excluded) so user templates — the vast
+        # majority — carry no uniqueness constraint. Same create_all-portable pattern as the
+        # email_profiles single-default index above.
+        Index('idx_email_template_default_key', 'default_key',
+              unique=True, postgresql_where=text('default_key IS NOT NULL')),
     )
 
 

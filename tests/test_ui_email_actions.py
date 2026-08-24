@@ -34,6 +34,8 @@ def _clean(admin):
             admin.put(f"/email/actions/{a['key']}",
                       json={"template_id": None, "enabled": (a["category"] == "system")})
         for t in admin.get("/email/templates").json().get("templates", []):
+            if t.get("is_default"):
+                continue                       # built-in defaults are permanent (undeletable)
             admin.delete(f"/email/templates/{t['id']}")
     reset()
     yield

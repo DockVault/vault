@@ -8190,6 +8190,7 @@ async function deleteEmailProfile(p) {
 let _editingTemplateId = null;
 let _sendTemplateId = null;
 let _etPreviewTimer = null;
+let _loadFromDefaults = null;   // cached GET /email/default-templates payload
 
 async function loadEmailTemplates() {
     const grid = document.getElementById('email-templates-grid');
@@ -8219,6 +8220,12 @@ function buildEmailTemplateCard(t) {
     card.className = 'email-profile-card'; card.setAttribute('role', 'listitem'); card.dataset.templateId = t.id;
     const title = document.createElement('div'); title.className = 'epc-title';
     const name = document.createElement('span'); name.textContent = t.name || '(untitled)'; title.appendChild(name);
+    if (t.is_default) {
+        const db = document.createElement('span');
+        db.className = 'epc-badge epc-badge-default'; db.textContent = 'Default';
+        db.title = 'A built-in default template. Edit it to customize; use “Load From” to reset it.';
+        title.appendChild(db);
+    }
     if (t.bound_action) {
         const isSys = t.bound_action.category === 'system';
         const badge = document.createElement('span');
@@ -8241,7 +8248,8 @@ function buildEmailTemplateCard(t) {
     const actions = document.createElement('div'); actions.className = 'epc-actions';
     const rowDefs = [['Edit', 'etc-edit', () => openTemplateEditor(t)],
                      ['Send', 'etc-send', () => openSendModal(t)]];
-    if (!t.bound_action) rowDefs.push(['Delete', 'etc-delete', () => deleteTemplate(t)]);   // bound = non-removable
+    // Non-removable when bound to an action OR a built-in default (both refuse deletion server-side).
+    if (!t.bound_action && !t.is_default) rowDefs.push(['Delete', 'etc-delete', () => deleteTemplate(t)]);
     for (const [label, cls, fn] of rowDefs) {
         const b = document.createElement('button'); b.type = 'button';
         b.className = 'btn btn-secondary btn-sm ' + cls; b.textContent = label;
@@ -8393,6 +8401,7 @@ function closeTemplateEditor() {
     document.getElementById('email-template-editor').hidden = true;
     _editingTemplateId = null;
     closeDynMenu();   // dismiss the body-level flyout submenu so it can't orphan
+    closeLoadFromMenu();
 }
 
 function setEditorView(view) {
@@ -8535,6 +8544,7 @@ async function toggleDynamicMenu() {
     const menu = document.getElementById('et-dyn-menu');
     const btn = document.getElementById('et-add-dynamic');
     if (!menu.hidden) { closeDynMenu(); return; }
+    closeLoadFromMenu();   // don't leave the other toolbar dropdown open behind this one
     menu.replaceChildren();
     _closeDynSubmenu();
     try {
@@ -8590,6 +8600,81 @@ function _positionDynSubmenu(sub, row) {
     if (top + sh > vh - m) top = Math.max(m, rr.bottom - sh);       // no room below -> flip up
     sub.style.left = Math.round(left) + 'px';
     sub.style.top = Math.round(top) + 'px';
+}
+
+// ---- Load From (reset to a default template, or copy an existing one) ----------------------------
+function closeLoadFromMenu() {
+    const menu = document.getElementById('et-loadfrom-menu');
+    if (menu) menu.hidden = true;
+    const btn = document.getElementById('et-load-from');
+    if (btn) btn.setAttribute('aria-expanded', 'false');
+}
+
+function _loadFromRow(label, onPick) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'et-loadfrom-item'; b.setAttribute('role', 'menuitem');
+    b.textContent = label;
+    b.addEventListener('click', (e) => { e.stopPropagation(); onPick(); });
+    return b;
+}
+
+function _loadFromApply(name, subject, body) {
+    // Replacing the current editor content is destructive, so confirm first.
+    if (!confirm('Replace the current subject and body with “' + name + '”?')) return;
+    document.getElementById('et-subject').value = subject || '';
+    document.getElementById('et-body').value = body || '';
+    closeLoadFromMenu();
+    refreshTemplatePreview();
+    const msg = document.getElementById('et-editor-msg');
+    if (msg) { msg.textContent = 'Loaded “' + name + '”. Review, then Save to keep it.'; msg.style.color = 'var(--text-secondary)'; }
+}
+
+function _loadFromSection(menu, label) {
+    const h = document.createElement('div'); h.className = 'et-loadfrom-section'; h.textContent = label;
+    menu.appendChild(h);
+}
+
+async function toggleLoadFromMenu() {
+    const menu = document.getElementById('et-loadfrom-menu');
+    const btn = document.getElementById('et-load-from');
+    if (!menu.hidden) { closeLoadFromMenu(); return; }
+    closeDynMenu();   // don't leave the other toolbar dropdown open behind this one
+    menu.replaceChildren();
+    // 1) Default templates (from code — always available, even after a seeded row was edited).
+    try {
+        if (!_loadFromDefaults) {
+            const d = await apiRequest('/email/default-templates', { silent: true });
+            _loadFromDefaults = (d && d.templates) || [];
+        }
+    } catch (e) { _loadFromDefaults = _loadFromDefaults || []; }
+    _loadFromSection(menu, 'Default templates');
+    if (_loadFromDefaults.length) {
+        _loadFromDefaults.forEach(t => menu.appendChild(
+            _loadFromRow(t.name || t.key, () => _loadFromApply(t.name || t.key, t.subject, t.body_html))));
+    } else {
+        const e = document.createElement('div'); e.className = 'et-loadfrom-empty'; e.textContent = 'None available'; menu.appendChild(e);
+    }
+    // 2) Your templates (existing rows; exclude built-in defaults — already listed above — and the one
+    // being edited, since loading itself is a no-op).
+    let mine = [];
+    try {
+        const r = await apiRequest('/email/templates', { silent: true });
+        mine = ((r && r.templates) || []).filter(t => !t.is_default && t.id !== _editingTemplateId);
+    } catch (e) {}
+    const sep = document.createElement('div'); sep.className = 'et-loadfrom-sep'; menu.appendChild(sep);
+    _loadFromSection(menu, 'Your templates');
+    if (mine.length) {
+        mine.forEach(t => menu.appendChild(_loadFromRow(t.name || '(untitled)', async () => {
+            // The list omits the body; fetch the full row before applying.
+            let full = null;
+            try { full = await apiRequest('/email/templates/' + t.id, { silent: true }); } catch (e) {}
+            if (!full) { showError('Could not load that template.'); return; }
+            _loadFromApply(t.name || '(untitled)', full.subject, full.body_html);
+        })));
+    } else {
+        const e = document.createElement('div'); e.className = 'et-loadfrom-empty'; e.textContent = 'No other templates yet'; menu.appendChild(e);
+    }
+    menu.hidden = false; btn.setAttribute('aria-expanded', 'true');
 }
 
 async function openImagePicker() {
@@ -8925,6 +9010,8 @@ function attachSettingsListeners() {
         if (etAddImg) etAddImg.addEventListener('click', openImagePicker);
         const etAddDyn = document.getElementById('et-add-dynamic');
         if (etAddDyn) etAddDyn.addEventListener('click', (e) => { e.stopPropagation(); toggleDynamicMenu(); });
+        const etLoadFrom = document.getElementById('et-load-from');
+        if (etLoadFrom) etLoadFrom.addEventListener('click', (e) => { e.stopPropagation(); toggleLoadFromMenu(); });
         const etImgUpload = document.getElementById('et-image-upload');
         if (etImgUpload) etImgUpload.addEventListener('change', (e) => { if (e.target.files[0]) uploadImageResource(e.target.files[0]); });
         const etImgSize = document.getElementById('et-image-size');
@@ -8939,6 +9026,10 @@ function attachSettingsListeners() {
             const menu = document.getElementById('et-dyn-menu');
             if (menu && !menu.hidden && !e.target.closest('.et-dyn-wrap') && !e.target.closest('#et-dyn-submenu')) {
                 closeDynMenu();
+            }
+            const lf = document.getElementById('et-loadfrom-menu');
+            if (lf && !lf.hidden && !e.target.closest('.et-loadfrom-wrap')) {
+                closeLoadFromMenu();
             }
         });
         // The flyout submenu is position:fixed, so a scroll/resize would detach it from its row —

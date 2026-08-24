@@ -57,6 +57,10 @@
     "0.14.0": {
       "released": "2026-08-24",
       "notes": "Adds six additive tables (email_profiles, email_templates, email_resources for the Email Studio; notifications; notes; email_actions), all created automatically and idempotently at boot by create_all and unused by 0.13.0, so a rollback is clean -- take a backup before upgrading. Features: Email Studio (branded HTML email templates with grouped substitution tokens and automated-email actions that route the verification-code / password-reset / invitation emails through the template mechanism, with a fail-safe that never sends a system security email missing its code or link token); an in-app notification bell plus a reworked three-lane non-admin dashboard (What's waiting for you / Favourites / Most recent); move and copy for files and folders, within a vault and across Standard vaults (re-encrypting content under the destination binding; zero-knowledge cross-vault deferred); personal server-side notes with a snapshot 'send note' to other users; and a rate-limiter split giving per-chunk uploads and polled reads their own generous budgets so large uploads and normal polling are no longer throttled."
+    },
+    "0.15.0": {
+      "released": "2026-08-25",
+      "notes": "Email templates and automation (feature work landing across several changes; this note is extended as each lands). Schema so far: one additive nullable column, email_templates.default_key (created by create_all on a fresh DB, and by the boot DDL ADD COLUMN IF NOT EXISTS on an existing one), plus a partial-unique index over it. It marks a template as the built-in default for an automated-email action; boot seeds a default template per action and pre-binds each action to its default (idempotent, never overwriting an admin's own template or 'none' choice). The column is unused by 0.14.0 and the seed only adds rows, so a rollback is clean -- take a backup before upgrading. Later changes in this release build the automated-email delivery flows, a one-time-code (OTP) mechanism, and a password-reset flow on the same substrate; any additive tables those introduce are declared here when they land."
     }
   },
   "edges": [
@@ -71,7 +75,8 @@
     { "from": "0.11.1", "to": "0.11.2", "kind": "direct", "reversible": true, "requires_backup": false },
     { "from": "0.11.2", "to": "0.12.0", "kind": "direct", "reversible": true, "requires_backup": false },
     { "from": "0.12.0", "to": "0.13.0", "kind": "direct", "reversible": true, "requires_backup": true },
-    { "from": "0.13.0", "to": "0.14.0", "kind": "direct", "reversible": true, "requires_backup": true }
+    { "from": "0.13.0", "to": "0.14.0", "kind": "direct", "reversible": true, "requires_backup": true },
+    { "from": "0.14.0", "to": "0.15.0", "kind": "direct", "reversible": true, "requires_backup": true }
   ],
   "waivers": []
 }

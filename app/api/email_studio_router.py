@@ -103,6 +103,19 @@ async def list_dynamic_actions(
     }
 
 
+@router.get("/default-templates")
+async def list_default_templates(
+    _admin: User = Depends(require_interactive_admin),
+):
+    """The built-in default templates the editor's "Load From → Default templates" section offers.
+
+    Server-owned and always available (kept in code), so an admin can reset a template to its original
+    content — or copy a default as a starting point — even after the seeded row was edited. Bodies are
+    already sanitized (byte-identical to the seeded row's stored body)."""
+    from app.core.email_actions import default_template_payloads
+    return {"templates": default_template_payloads()}
+
+
 # --------------------------------------------------------------------------------------------------
 # Sending profiles
 # --------------------------------------------------------------------------------------------------
@@ -480,6 +493,10 @@ def _template_out(t: EmailTemplate, *, include_body: bool = False, action_map: O
         "description": t.description,
         "profile_id": str(t.profile_id) if t.profile_id else None,
         "subject": t.subject,
+        # Built-in default templates are seeded + pre-bound and can't be deleted (they're recoverable
+        # via "Load From"); the grid badges them and the editor treats them accordingly.
+        "default_key": t.default_key,
+        "is_default": bool(t.default_key),
         "created_at": t.created_at.isoformat() if t.created_at else None,
         "updated_at": t.updated_at.isoformat() if t.updated_at else None,
     }
@@ -584,6 +601,13 @@ async def delete_template(template_id: uuid.UUID, request: Request,
     t = db.get(EmailTemplate, template_id)
     if t is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found.")
+    # A built-in default template is permanent: deleting it would let a re-seed silently rebind an
+    # action an admin had set to a different template (or "none"). Customize it in place instead, or
+    # use "Load From" to reset it to the original.
+    if t.default_key:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="This is a built-in default template and can't be deleted. Edit it, "
+                                   "or use “Load From” to reset it to the original.")
     # A template bound to an automated email is protected: a SYSTEM action's template is non-removable
     # (the vault must be able to send it); an OPTIONAL action's must be re-pointed first. This is what
     # makes the seeded system templates "non-removable" without adding a column to email_templates.

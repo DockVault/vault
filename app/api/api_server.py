@@ -14865,13 +14865,18 @@ def _seed_default_email_profile():
     try:
         from app.core.database import get_db_context
         from app.core import email_send
-        from app.core.email_actions import seed_email_actions
+        from app.core.email_actions import seed_email_actions, seed_default_templates
         with get_db_context() as db:
             if email_send.seed_default_profile(db):
                 print("[OK] Seeded default email sending profile from legacy SMTP config")
             n = seed_email_actions(db)
             if n:
                 print(f"[OK] Seeded {n} automated-email action(s)")
+            # Materialize each action's built-in default template and pre-bind it (idempotent; never
+            # overwrites an admin's own template choice). Runs after the actions exist so it can bind.
+            t = seed_default_templates(db)
+            if t:
+                print(f"[OK] Seeded {t} default email template(s)")
     except Exception as e:
         print(f"⚠ Default email profile seed skipped: {e}")
 
@@ -15267,6 +15272,15 @@ def _run_lightweight_migrations():
             # idempotent; the table always exists by now because init_db()/create_all ran first.
             "ALTER TABLE email_profiles ADD COLUMN IF NOT EXISTS "
             "smtp_allow_insecure_tls BOOLEAN NOT NULL DEFAULT FALSE",
+            # Email Studio: mark a template as the built-in default for an action key (NULL = user
+            # template). Additive + idempotent; create_all builds it on a fresh DB, this ADDs it on an
+            # INTERMEDIATE deployment that created email_templates before the column existed.
+            "ALTER TABLE email_templates ADD COLUMN IF NOT EXISTS default_key VARCHAR(64)",
+            # Partial unique: at most one default template per action key (NULLs — user templates —
+            # unconstrained). Safe to create on upgrade: the column is brand-new (all NULL) until the
+            # boot seed, which runs after migrations, so no duplicate can exist at index-creation time.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_email_template_default_key "
+            "ON email_templates (default_key) WHERE default_key IS NOT NULL",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)
