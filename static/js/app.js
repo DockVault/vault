@@ -6353,7 +6353,7 @@ function setupSettingsTabs() {
             }
             if (tabId === 'logs') { loadLogSettings(); }  // refresh on tab open
             if (tabId === 'sharing') { setupShareTagsUI(); loadShareTags(); }  // wire (idempotent) + refresh
-            if (tabId === 'notelinks') { setupNoteLinkTagsUI(); loadNoteLinkTags(); }  // wire + refresh
+            if (tabId === 'notelinks') { setupNoteLinkTagsUI(); loadNoteLinkTags(); loadAdminNoteLinks(); }  // wire + refresh
             if (tabId === 'accounts') { setupAccountsPolicyUI(); refreshAccountsPolicyUI(); }  // wire + reflect deps
             if (tabId === 'email') { loadEmailProfiles(); loadEmailTemplates(); loadEmailActions(); }  // refresh profiles + templates + actions on tab open
         });
@@ -14207,7 +14207,88 @@ function setupNoteLinkTagsUI() {
         const b = e.target.closest('.icon-choice');
         if (b) { e.preventDefault(); setNoteLinkTagIcon(b.getAttribute('data-icon') || ''); }
     });
+    const refresh = _nlEl('nl-admin-refresh');
+    if (refresh) refresh.addEventListener('click', loadAdminNoteLinks);
+    const revokeAll = _nlEl('nl-admin-revoke-all');
+    if (revokeAll) revokeAll.addEventListener('click', adminRevokeAllNoteLinks);
     noteLinkTagsUIWired = true;
+}
+
+// ---- Admin oversight: all public links across users (Settings -> Note Links) -----------------
+async function loadAdminNoteLinks() {
+    const host = _nlEl('nl-admin-links');
+    const summary = _nlEl('nl-admin-summary');
+    if (!host) return;
+    host.replaceChildren(_el('div', 'spinner'));
+    try {
+        const data = await apiRequest('/admin/note-links', { silent: true });
+        renderAdminNoteLinks(data || { links: [] });
+        if (summary) {
+            const total = (data && data.total) || 0, active = (data && data.active_count) || 0;
+            summary.textContent = total + ' link(s), ' + active + ' active'
+                + (data && data.capped ? ' (showing the newest 1000)' : '');
+        }
+    } catch (e) {
+        host.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load links: ' + ((e && e.message) || '')));
+    }
+}
+
+function renderAdminNoteLinks(data) {
+    const host = _nlEl('nl-admin-links');
+    if (!host) return;
+    const links = (data && data.links) || [];
+    if (!links.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', 'No public links exist.')); return; }
+    const table = _el('table', 'data-table');
+    const thead = _el('thead');
+    const hr = _el('tr');
+    ['Owner', 'Type', 'Note', 'Status', 'Protection', 'Expires', 'Views', ''].forEach(h => hr.appendChild(_el('th', '', h)));
+    thead.appendChild(hr); table.appendChild(thead);
+    const tb = _el('tbody');
+    links.forEach(l => {
+        const tr = _el('tr');
+        tr.appendChild(_el('td', '', l.owner || '—'));
+        const typeTd = _el('td', 'nl-tag-idlead');
+        const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
+        if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
+        typeTd.appendChild(_el('span', '', l.tag_name || '—'));
+        tr.appendChild(typeTd);
+        tr.appendChild(_el('td', '', l.title || 'Untitled note'));
+        tr.appendChild(_el('td', '', _NOTE_LINK_STATUS_LABEL[l.status] || l.status));
+        tr.appendChild(_el('td', '', l.secret_kind === 'password' ? 'Password' : (l.secret_kind === 'pin' ? 'PIN' : 'None')));
+        tr.appendChild(_el('td', '', l.expires_at ? _fmtLinkExpiry(l.expires_at).replace(/^Expires /, '') : 'Never'));
+        tr.appendChild(_el('td', '', (l.max_uses != null) ? (l.view_count + '/' + l.max_uses) : String(l.view_count)));
+        const actTd = _el('td');
+        if (l.status === 'active') {
+            const rv = _el('button', 'btn btn-ghost btn-sm', 'Revoke');
+            rv.type = 'button';
+            rv.addEventListener('click', () => adminRevokeNoteLink(l.id));
+            actTd.appendChild(rv);
+        }
+        tr.appendChild(actTd);
+        tb.appendChild(tr);
+    });
+    table.appendChild(tb);
+    host.replaceChildren(table);
+}
+
+async function adminRevokeNoteLink(id) {
+    const ok = await showConfirm('Revoke this public link? Anyone holding it will no longer be able to open it.');
+    if (!ok) return;
+    try {
+        await apiRequest('/admin/note-links/' + id + '/revoke', { method: 'POST' });
+        showSuccess('Link revoked');
+        await loadAdminNoteLinks();
+    } catch (e) { showError((e && e.message) || 'Could not revoke the link'); }
+}
+
+async function adminRevokeAllNoteLinks() {
+    const ok = await showConfirm('Revoke ALL currently-active public links across every user? This cannot be undone.');
+    if (!ok) return;
+    try {
+        const r = await apiRequest('/admin/note-links/revoke-all', { method: 'POST' });
+        showSuccess('Revoked ' + ((r && r.revoked_count) || 0) + ' link(s)');
+        await loadAdminNoteLinks();
+    } catch (e) { showError((e && e.message) || 'Could not revoke links'); }
 }
 
 // Named tile colours for note-link tags -> hex (also accepts a raw #hex). Superset of the seeded
@@ -14405,9 +14486,15 @@ async function loadNotes() {
     const mine = document.getElementById('notes-list');
     if (mine) mine.replaceChildren(_el('div', 'spinner'));
     try {
-        const [a, b] = await Promise.all([apiRequest('/notes'), apiRequest('/notes/received')]);
+        // Public links are best-effort: if the endpoint is unavailable the notes still render.
+        const [a, b, c] = await Promise.all([
+            apiRequest('/notes'),
+            apiRequest('/notes/received'),
+            apiRequest('/note-links', { silent: true }).catch(() => ({ links: [] })),
+        ]);
         state.notes = (a && a.notes) || [];
         state.notesReceived = (b && b.notes) || [];
+        state.noteLinks = (c && c.links) || [];
         renderNotes();
     } catch (e) {
         if (mine) mine.replaceChildren(_el('div', 'alert alert-error', 'Failed to load notes: ' + ((e && e.message) || '')));
@@ -14423,13 +14510,32 @@ function renderNotes() {
         b => b.classList.toggle('active', b.getAttribute('data-notes-tab') === state.notesTab));
     const mineTab = document.getElementById('notes-tab-mine');
     const recvTab = document.getElementById('notes-tab-received');
+    const sharedTab = document.getElementById('notes-tab-shared');
     if (mineTab) mineTab.style.display = state.notesTab === 'mine' ? '' : 'none';
     if (recvTab) recvTab.style.display = state.notesTab === 'received' ? '' : 'none';
+    if (sharedTab) sharedTab.style.display = state.notesTab === 'shared' ? '' : 'none';
     // Received count badge
     const badge = document.getElementById('notes-received-count');
     if (badge) {
         badge.textContent = String(state.notesReceived.length);
         badge.hidden = state.notesReceived.length === 0;
+    }
+    // Shared (active links) count badge
+    const links = state.noteLinks || [];
+    const sharedBadge = document.getElementById('notes-shared-count');
+    if (sharedBadge) {
+        const activeLinks = links.filter(l => l.status === 'active').length;
+        sharedBadge.textContent = String(activeLinks);
+        sharedBadge.hidden = activeLinks === 0;
+    }
+    // Shared (by me)
+    const shared = document.getElementById('notes-shared-list');
+    if (shared) {
+        if (!links.length) {
+            shared.replaceChildren(_el('p', 'text-secondary p-md', 'No public links yet. Use Share → Public link on a note to create one.'));
+        } else {
+            shared.replaceChildren(...links.map(_noteLinkCard));
+        }
     }
     // My notes
     const mine = document.getElementById('notes-list');
@@ -14535,6 +14641,85 @@ function _noteCard(n, received) {
     bodyWrap.appendChild(actions);
     card.appendChild(bodyWrap);
     return card;
+}
+
+// ---- "Shared (by me)" tab: a card per public note link ---------------------------------------
+const _NOTE_LINK_STATUS_LABEL = { active: 'Active', revoked: 'Revoked', expired: 'Expired', exhausted: 'Used up' };
+
+function _fmtLinkExpiry(iso) {
+    // parseServerTime reads the API's UTC timestamp correctly (the bare Date constructor would
+    // misread it as local time — and the offline UI-time guard test forbids that).
+    const d = parseServerTime(iso);
+    if (!d || isNaN(d)) return 'No expiry';
+    return 'Expires ' + d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+function _noteLinkCard(l) {
+    const card = _el('div', 'card note-link-card');
+    const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
+    if (hex) card.style.borderLeft = '4px solid ' + hex;
+    const body = _el('div', 'card-body');
+    const head = _el('div', 'flex justify-between items-center gap-sm');
+    const lead = _el('div', 'nl-tag-idlead');
+    if (l.tag_icon) lead.appendChild(_svgIcon(l.tag_icon, 'icon-sm'));
+    lead.appendChild(_el('span', 'text-secondary text-sm', l.tag_name || 'Link'));
+    head.appendChild(lead);
+    head.appendChild(_el('span', 'badge ' + (l.status === 'active' ? 'badge-success' : 'badge-secondary'),
+        _NOTE_LINK_STATUS_LABEL[l.status] || l.status));
+    body.appendChild(head);
+    body.appendChild(_el('h3', 'text-base font-bold mt-sm note-link-title', l.title || 'Untitled note'));
+    const secret = l.secret_kind === 'password' ? 'Password' : (l.secret_kind === 'pin' ? 'PIN' : 'No code');
+    const exp = l.expires_at ? _fmtLinkExpiry(l.expires_at) : 'No expiry';
+    const views = (l.max_uses != null) ? (l.view_count + ' / ' + l.max_uses + ' views') : (l.view_count + ' views');
+    body.appendChild(_el('div', 'text-secondary text-sm mt-sm', secret + ' · ' + exp + ' · ' + views));
+    const actions = _el('div', 'flex gap-sm mt-md flex-wrap note-actions');
+    if (l.status === 'active') {
+        const copy = _el('button', 'btn btn-secondary btn-sm', 'Copy link');
+        copy.type = 'button';
+        copy.addEventListener('click', () => copyNoteLinkUrl(l));
+        actions.appendChild(copy);
+        const revoke = _el('button', 'btn btn-ghost btn-sm', 'Revoke');
+        revoke.type = 'button';
+        revoke.addEventListener('click', () => revokeNoteLink(l.id));
+        actions.appendChild(revoke);
+    }
+    const del = _el('button', 'btn btn-ghost btn-sm', 'Delete');
+    del.type = 'button';
+    del.addEventListener('click', () => deleteNoteLink(l.id));
+    actions.appendChild(del);
+    body.appendChild(actions);
+    card.appendChild(body);
+    return card;
+}
+
+function copyNoteLinkUrl(l) {
+    const url = window.location.origin + (l.url_path || ('/l/' + l.token));
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(() => showSuccess('Link copied'))
+            .catch(() => showError('Copy failed — ' + url));
+    } else {
+        showError('Copy not supported — ' + url);
+    }
+}
+
+async function revokeNoteLink(id) {
+    const ok = await showConfirm('Revoke this link? Anyone holding it will no longer be able to open it.');
+    if (!ok) return;
+    try {
+        await apiRequest('/note-links/' + id + '/revoke', { method: 'POST' });
+        showSuccess('Link revoked');
+        await loadNotes();
+    } catch (e) { showError((e && e.message) || 'Could not revoke the link'); }
+}
+
+async function deleteNoteLink(id) {
+    const ok = await showConfirm('Delete this link permanently? This removes the shared snapshot.');
+    if (!ok) return;
+    try {
+        await apiRequest('/note-links/' + id, { method: 'DELETE' });
+        showSuccess('Link deleted');
+        await loadNotes();
+    } catch (e) { showError((e && e.message) || 'Could not delete the link'); }
 }
 
 // ---- Note read modal (rendered note + a left rail to switch between notes) --------------------

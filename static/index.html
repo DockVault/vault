@@ -10,7 +10,7 @@
     <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
     <link rel="apple-touch-icon" href="/static/assets/logo.png?v=1">
     <link rel="stylesheet" href="/static/css/theme.css?v=20260822a">
-    <link rel="stylesheet" href="/static/css/components.css?v=20260824d">
+    <link rel="stylesheet" href="/static/css/components.css?v=20260824e">
     <link rel="stylesheet" href="/static/css/utilities.css?v=20251015c">
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-sans-500.woff2" crossorigin>
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-mono-500.woff2" crossorigin>
@@ -863,12 +863,17 @@
                     <div class="tabs mb-md" role="tablist">
                         <button class="tab-btn active" data-notes-tab="mine" type="button">My notes</button>
                         <button class="tab-btn" data-notes-tab="received" type="button">Sent to me <span id="notes-received-count" class="badge badge-secondary" hidden>0</span></button>
+                        <button class="tab-btn" data-notes-tab="shared" type="button">Shared <span id="notes-shared-count" class="badge badge-secondary" hidden>0</span></button>
                     </div>
                     <div id="notes-tab-mine">
                         <div id="notes-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--space-md); align-items: start;"></div>
                     </div>
                     <div id="notes-tab-received" style="display:none;">
                         <div id="notes-received-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--space-md); align-items: start;"></div>
+                    </div>
+                    <div id="notes-tab-shared" style="display:none;">
+                        <p class="text-secondary text-sm mb-sm">Public links you've created. Anyone with a link can read a snapshot until it expires, is used up, or you revoke it.</p>
+                        <div id="notes-shared-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: var(--space-md); align-items: start;"></div>
                     </div>
                 </div>
 
@@ -2194,6 +2199,21 @@
                                 </div>
                             </div>
                         </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header flex justify-between items-center">
+                                <h3>All public links</h3>
+                                <div class="flex gap-sm">
+                                    <button type="button" id="nl-admin-refresh" class="btn btn-secondary btn-sm">Refresh</button>
+                                    <button type="button" id="nl-admin-revoke-all" class="btn btn-ghost btn-sm">Revoke all active</button>
+                                </div>
+                            </div>
+                            <div class="p-lg">
+                                <p class="text-secondary text-sm mb-md">Every public note link across all users. Revoke any link (or all active links at once) without turning the whole feature off. Snapshots are not shown here.</p>
+                                <div id="nl-admin-summary" class="text-secondary text-sm mb-sm"></div>
+                                <div id="nl-admin-links" style="overflow-x:auto;"></div>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Accounts & Access Tab -->
@@ -3299,7 +3319,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260824j"></script>
+    <script src="/static/js/app.js?v=20260824k"></script>
 </body>
 </html>
 

@@ -302,6 +302,60 @@ def test_overlong_secret_rejected(admin, links_enabled):
     assert r.status_code == 400, r.text
 
 
+def test_admin_lists_all_links_with_owner_and_revokes(admin, links_enabled):
+    u = admin.create_user(role="user")
+    user = admin.clone_anonymous(); user.login(u["_username"], u["_password"])
+    try:
+        note_id = _mk_note(user, body="owned by the user")
+        tag = _mk_tag(admin, auto_enroll_new_users=True)
+        link = user.post("/note-links", json={"note_id": note_id, "tag_id": tag["id"]}).json()
+        # Admin sees the link across users, with the owner attributed + no body snapshot.
+        data = admin.get("/admin/note-links").json()
+        row = next((x for x in data["links"] if x["id"] == link["id"]), None)
+        assert row is not None, "admin should see the user's link"
+        assert row["owner"] == u["_username"]
+        assert "body" not in row and "body_snapshot" not in row
+        # The admin list must not expose the redeemable token / URL.
+        assert "token" not in row and "url_path" not in row
+        assert data["active_count"] >= 1
+        # Admin revokes it -> anonymous redeem now 404.
+        assert admin.post(f"/admin/note-links/{link['id']}/revoke").status_code == 200
+        anon = admin.clone_anonymous()
+        assert anon.post(f"/note-links/{link['token']}/redeem", json={}).status_code == 404
+    finally:
+        admin.delete_user(u["id"])
+
+
+def test_admin_revoke_all_active(admin, links_enabled):
+    u = admin.create_user(role="user")
+    user = admin.clone_anonymous(); user.login(u["_username"], u["_password"])
+    try:
+        note_id = _mk_note(user)
+        tag = _mk_tag(admin, auto_enroll_new_users=True)
+        t1 = user.post("/note-links", json={"note_id": note_id, "tag_id": tag["id"]}).json()["token"]
+        t2 = user.post("/note-links", json={"note_id": note_id, "tag_id": tag["id"]}).json()["token"]
+        r = admin.post("/admin/note-links/revoke-all")
+        assert r.status_code == 200 and r.json()["revoked_count"] >= 2
+        anon = admin.clone_anonymous()
+        assert anon.post(f"/note-links/{t1}/redeem", json={}).status_code == 404
+        assert anon.post(f"/note-links/{t2}/redeem", json={}).status_code == 404
+    finally:
+        admin.delete_user(u["id"])
+
+
+def test_admin_note_link_endpoints_require_admin(admin, links_enabled):
+    u = admin.create_user(role="user")
+    user = admin.clone_anonymous(); user.login(u["_username"], u["_password"])
+    try:
+        assert user.get("/admin/note-links").status_code == 403
+        assert user.post("/admin/note-links/revoke-all").status_code == 403
+        # a random id: still 403 for a non-admin (auth gate before lookup)
+        import uuid as _uuid
+        assert user.post(f"/admin/note-links/{_uuid.uuid4()}/revoke").status_code == 403
+    finally:
+        admin.delete_user(u["id"])
+
+
 def test_temp_session_cannot_create(admin, links_enabled):
     note_id = _mk_note(admin)
     tag = _open_tag(admin)

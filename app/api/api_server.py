@@ -7197,6 +7197,89 @@ async def delete_note_link(
     return {"ok": True}
 
 
+# --- Admin oversight of public note links (the review-flagged gap: admins had no way to see or stop
+# OTHER users' public links besides the feature kill-switch). ---------------------------------------
+def _notelink_admin_dict(link, tag, owner) -> dict:
+    d = _notelink_public_dict(link, tag)
+    # Don't hand the admin list a redeemable token: it would let an admin read a no-secret snapshot
+    # via GET /l/{token}, defeating the "no body snapshot here" intent. Admin revoke uses the id.
+    d.pop("token", None)
+    d.pop("url_path", None)
+    d["owner_id"] = str(link.owner_id)
+    d["owner"] = (getattr(owner, "username", None) or getattr(owner, "email", None)) if owner else None
+    return d
+
+
+@app.get("/admin/note-links")
+async def admin_list_note_links(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """List ALL public note links across every user (interactive-admin), so an admin can audit and
+    revoke exposures. Newest first, capped; each row carries the owner + tag + status (NEVER the body
+    snapshot)."""
+    _CAP = 1000
+    links = db.query(NoteLink).order_by(NoteLink.created_at.desc()).limit(_CAP).all()
+    tag_ids = {l.tag_id for l in links if l.tag_id}
+    owner_ids = {l.owner_id for l in links}
+    tags = {t.id: t for t in db.query(NoteLinkTag).filter(NoteLinkTag.id.in_(tag_ids)).all()} if tag_ids else {}
+    owners = {u.id: u for u in db.query(User).filter(User.id.in_(owner_ids)).all()} if owner_ids else {}
+    active = sum(1 for l in links if _notelink_status(l) == "active")
+    return {"links": [_notelink_admin_dict(l, tags.get(l.tag_id), owners.get(l.owner_id)) for l in links],
+            "active_count": active, "total": len(links), "capped": len(links) >= _CAP}
+
+
+@app.post("/admin/note-links/{link_id}/revoke")
+async def admin_revoke_note_link(
+    link_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin-revoke ANY user's public link (immediate)."""
+    link = db.query(NoteLink).filter(NoteLink.id == link_id).first()
+    if not link:
+        raise HTTPException(status_code=404, detail="Link not found")
+    if not link.revoked:
+        link.revoked = True
+        db.commit()
+        try:
+            AuditLogger(db).log_action(
+                action="note_link_admin_revoke", status="success", user=current_user,
+                resource_type="note_link", resource_id=str(link.id),
+                details={"owner_id": str(link.owner_id)}, ip_address=get_client_ip(request))
+        except Exception:
+            pass
+    return {"ok": True, "id": str(link.id), "revoked": True}
+
+
+@app.post("/admin/note-links/revoke-all")
+async def admin_revoke_all_note_links(
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin bulk-revoke: revoke EVERY currently-active public link (a surgical stop that leaves the
+    feature enabled, unlike the settings kill-switch). Returns how many were revoked."""
+    from sqlalchemy import update as _sa_update, or_ as _or
+    now = datetime.utcnow()
+    stmt = (_sa_update(NoteLink)
+            .where(NoteLink.revoked.is_(False),
+                   _or(NoteLink.expires_at.is_(None), NoteLink.expires_at > now),
+                   _or(NoteLink.max_uses.is_(None), NoteLink.use_count < NoteLink.max_uses))
+            .values(revoked=True))
+    res = db.execute(stmt)
+    db.commit()
+    n = res.rowcount or 0
+    try:
+        AuditLogger(db).log_action(
+            action="note_link_admin_revoke_all", status="success", user=current_user,
+            resource_type="note_link", details={"revoked_count": n}, ip_address=get_client_ip(request))
+    except Exception:
+        pass
+    return {"ok": True, "revoked_count": n}
+
+
 @app.get("/l/{token}")
 async def note_link_page(token: str):
     """PUBLIC: serve the anonymous redemption page. It reads the token from the URL and POSTs to
