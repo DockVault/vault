@@ -40,7 +40,7 @@ def test_create_favourite_and_edit_a_note(page: Page, admin, admin_creds):
     card.locator(".note-fav").click()
     expect(page.locator("#notes-list .card", has_text=title).locator(".note-fav.is-fav")).to_be_visible(timeout=10000)
     # Edit it.
-    card.get_by_role("button", name="Edit").click()
+    card.get_by_role("button", name="Edit", exact=True).click()
     expect(page.locator("#note-editor-modal")).to_be_visible()
     page.fill("#note-editor-body-input", "edited body")
     page.click("#note-editor-save")
@@ -67,7 +67,7 @@ def test_send_note_then_recipient_receives_and_adopts(page: Page, admin, admin_c
     _login(page, admin_creds["username"], admin_creds["password"])
     _open_notes(page)
     _create_note(page, title, "sent body")
-    page.locator("#notes-list .card", has_text=title).get_by_role("button", name="Send").click()
+    page.locator("#notes-list .card", has_text=title).get_by_role("button", name="Send", exact=True).click()
     expect(page.locator("#note-send-modal")).to_be_visible()
     page.fill("#note-send-search", recipient["_username"][:8])
     # Pick the recipient from the results, then send.

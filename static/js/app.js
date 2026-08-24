@@ -14166,7 +14166,73 @@ function setupNoteLinkTagsUI() {
     add.addEventListener('click', () => openNoteLinkTagEditor(null));
     save.addEventListener('click', saveNoteLinkTag);
     cancel.addEventListener('click', () => { const ed = _nlEl('nl-tag-editor'); if (ed) ed.style.display = 'none'; });
+    // Colour swatches + custom picker + icon grid (mirrors the share-tag colour picker).
+    const sw = _nlEl('nl-tag-color-swatches');
+    if (sw) sw.addEventListener('click', (e) => {
+        const b = e.target.closest('.accent-swatch');
+        if (b) { e.preventDefault(); setNoteLinkTagColor(b.getAttribute('data-color') || ''); }
+    });
+    const cu = _nlEl('nl-tag-color-custom');
+    if (cu) cu.addEventListener('input', () => setNoteLinkTagColor(cu.value));
+    const ig = _nlEl('nl-tag-icon-grid');
+    if (ig) ig.addEventListener('click', (e) => {
+        const b = e.target.closest('.icon-choice');
+        if (b) { e.preventDefault(); setNoteLinkTagIcon(b.getAttribute('data-icon') || ''); }
+    });
     noteLinkTagsUIWired = true;
+}
+
+// Named tile colours for note-link tags -> hex (also accepts a raw #hex). Superset of the seeded
+// green/amber/red plus the shared chip palette, so a seeded tag's colour resolves in the list.
+const NOTELINK_TILE_COLORS = {
+    green: '#16a34a', amber: '#d97706', red: '#dc2626', teal: '#0d9488', emerald: '#059669',
+    sky: '#0284c7', indigo: '#4f46e5', violet: '#7c3aed', rose: '#e11d48', orange: '#ea580c',
+};
+function noteLinkColorHex(c) {
+    if (!c) return '';
+    if (c.charAt(0) === '#') return /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(c) ? c : '';
+    return NOTELINK_TILE_COLORS[c] || '';
+}
+// Icons offered in the editor grid (sprite names; '' = no icon). All exist in the #i-* sprite.
+const _NL_ICON_CHOICES = ['globe', 'clock', 'lock', 'link', 'shield', 'key', 'eye', 'unlock',
+                          'file-text', 'star', 'calendar', 'bell', 'info'];
+
+function setNoteLinkTagColor(color) {
+    const hidden = _nlEl('nl-tag-color');
+    if (hidden) hidden.value = color || '';
+    document.querySelectorAll('#nl-tag-color-swatches .accent-swatch').forEach(s => {
+        s.classList.toggle('selected', (s.getAttribute('data-color') || '') === (color || ''));
+    });
+    const custom = _nlEl('nl-tag-color-custom');
+    if (custom && color && color.charAt(0) === '#') custom.value = color;
+}
+
+function _nlBuildIconGrid() {
+    const grid = _nlEl('nl-tag-icon-grid');
+    if (!grid || grid._built) return;
+    grid.replaceChildren();
+    const none = _el('button', 'icon-choice', 'None');
+    none.type = 'button'; none.setAttribute('data-icon', ''); none.setAttribute('title', 'No icon');
+    none.style.fontSize = '11px';
+    grid.appendChild(none);
+    _NL_ICON_CHOICES.forEach(name => {
+        const b = _el('button', 'icon-choice');
+        b.type = 'button';
+        b.setAttribute('data-icon', name);
+        b.setAttribute('title', name);
+        b.setAttribute('aria-label', name);
+        b.appendChild(_svgIcon(name, 'icon-sm'));
+        grid.appendChild(b);
+    });
+    grid._built = true;
+}
+
+function setNoteLinkTagIcon(icon) {
+    const hidden = _nlEl('nl-tag-icon');
+    if (hidden) hidden.value = icon || '';
+    document.querySelectorAll('#nl-tag-icon-grid .icon-choice').forEach(c => {
+        c.classList.toggle('selected', (c.getAttribute('data-icon') || '') === (icon || ''));
+    });
 }
 
 async function loadNoteLinkTags() {
@@ -14196,8 +14262,13 @@ function renderNoteLinkTagsList() {
     noteLinkTagsCache.slice().sort((a, b) => a.name.localeCompare(b.name)).forEach(tag => {
         const row = _el('div', 'share-tag-row flex justify-between items-center mb-sm');
         const left = _el('div');
-        const title = _el('span', 'font-medium', tag.name + (tag.is_active ? '' : ' (inactive)'));
-        left.appendChild(title);
+        // Colour dot + icon + name (the tile's presentation, so an admin sees it at a glance).
+        const lead = _el('div', 'nl-tag-idlead');
+        const hex = noteLinkColorHex(tag.border_color);
+        if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; lead.appendChild(dot); }
+        if (tag.icon) lead.appendChild(_svgIcon(tag.icon, 'icon-sm'));
+        lead.appendChild(_el('span', 'font-medium', tag.name + (tag.is_active ? '' : ' (inactive)')));
+        left.appendChild(lead);
         const ttl = tag.max_ttl_hours ? (tag.max_ttl_hours + 'h max') : 'no expiry';
         const uses = tag.max_uses_cap ? (tag.max_uses_cap + ' views') : 'unlimited views';
         left.appendChild(_el('div', 'text-secondary text-sm',
@@ -14225,8 +14296,9 @@ function openNoteLinkTagEditor(tag) {
     _nlEl('nl-tag-editor-title').textContent = tag ? 'Edit tag' : 'Add tag';
     _nlEl('nl-tag-name').value = t.name || '';
     _nlEl('nl-tag-description').value = t.description || '';
-    _nlEl('nl-tag-color').value = t.border_color || '';
-    _nlEl('nl-tag-icon').value = t.icon || '';
+    _nlBuildIconGrid();
+    setNoteLinkTagColor(t.border_color || '');
+    setNoteLinkTagIcon(t.icon || '');
     _nlEl('nl-tag-min-token-len').value = t.min_token_len != null ? t.min_token_len : 10;
     _nlEl('nl-tag-max-ttl').value = t.max_ttl_hours != null ? t.max_ttl_hours : '';
     _nlEl('nl-tag-default-ttl').value = t.default_ttl_hours != null ? t.default_ttl_hours : '';
@@ -14352,10 +14424,25 @@ function renderNotes() {
 }
 
 function _noteCard(n, received) {
-    const card = _el('div', 'card');
+    const source = received ? 'received' : 'mine';
+    const card = _el('div', 'card note-card');
+    // The whole tile opens the note. Ignore clicks that land on an inner control (the action
+    // buttons / star / eye) so those keep their own behaviour.
+    card.addEventListener('click', (e) => {
+        if (e.target.closest('button')) return;
+        openNoteView(n.id, source);
+    });
     const bodyWrap = _el('div', 'card-body');
     const head = _el('div', 'flex justify-between items-center gap-sm');
-    head.appendChild(_el('h3', 'text-lg font-bold', n.title || 'Untitled note'));
+    // The title is the accessible open control (keyboard users tab to it); the card click above is
+    // a mouse convenience. A heading wrapping a button keeps both semantics and focusability without
+    // making the whole card a (nested-interactive) button.
+    const titleH = _el('h3', 'text-lg font-bold note-title');
+    const titleBtn = _el('button', 'note-open-title', n.title || 'Untitled note');
+    titleBtn.type = 'button';
+    titleBtn.addEventListener('click', () => openNoteView(n.id, source));
+    titleH.appendChild(titleBtn);
+    head.appendChild(titleH);
     if (!received) {
         // A plain inline button (NOT .vault-fav, which is position:absolute and would escape the
         // card). The gold fill on the star marks the favourited state; the is-fav class is a hook.
@@ -14396,22 +14483,14 @@ function _noteCard(n, received) {
     }
     bodyWrap.appendChild(bodyRow);
 
-    const actions = _el('div', 'flex gap-sm mt-md');
+    const actions = _el('div', 'flex gap-sm mt-md note-actions');
     if (received) {
-        // Preview lets the recipient READ a received note before deciding to adopt it.
-        const preview = _el('button', 'btn btn-secondary btn-sm', 'Preview');
-        preview.type = 'button';
-        preview.addEventListener('click', () => openNoteView(n.id, 'received'));
-        actions.appendChild(preview);
+        // The tile itself opens the read modal (where the recipient reads before adopting).
         const adopt = _el('button', 'btn btn-primary btn-sm', 'Add to my notes');
         adopt.type = 'button';
         adopt.addEventListener('click', () => adoptNote(n.id));
         actions.appendChild(adopt);
     } else {
-        const open = _el('button', 'btn btn-primary btn-sm', 'Open');
-        open.type = 'button';
-        open.addEventListener('click', () => openNoteView(n.id, 'mine'));
-        actions.appendChild(open);
         const edit = _el('button', 'btn btn-secondary btn-sm', 'Edit');
         edit.type = 'button';
         edit.addEventListener('click', () => openNoteEditor(n));
