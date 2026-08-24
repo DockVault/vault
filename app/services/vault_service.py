@@ -2023,6 +2023,231 @@ class VaultService:
             except Exception as e:
                 safe_event('expired-blob.remove.failed', e)
     
+    # ---- Move / Copy (files + folders) --------------------------------------------------------
+    # Semantics (Phase E, Standard vaults + within-vault):
+    #   * A within-vault MOVE is a cheap reparent. The at-rest AAD is bound to (vault_id, id) and the
+    #     folder is not part of it, so relocating within one vault needs no re-encryption (this is the
+    #     one case _guard_no_cross_vault_move explicitly permits).
+    #   * A COPY always creates a NEW id, so it re-encrypts (new AAD). A CROSS-vault move/copy also
+    #     re-encrypts (new vault_id). Re-encryption reuses the tested download-decrypt and
+    #     streaming-upload-encrypt paths — no bespoke crypto lives here.
+    #   * Zero-knowledge vaults hold client ciphertext the server cannot re-encrypt, so a COPY or any
+    #     CROSS-vault operation involving a ZK vault is refused. A within-ZK MOVE (reparent) is fine.
+    #   * Cross-vault FOLDER move/copy is deferred (a folder tree spanning vaults would re-encrypt
+    #     every descendant); the endpoints return a clean error pointing the caller at file-level ops.
+    _COPY_MAX_ITEMS = 1000  # guard a recursive folder copy against an unbounded tree
+
+    def _require_standard(self, vault, role: str) -> None:
+        if getattr(vault, 'type', 'standard') != 'standard':
+            raise FileServiceError(
+                f"This operation is not supported for zero-knowledge vaults ({role})."
+            )
+
+    def _dest_folder_or_raise(self, dest_vault_id, dest_folder_id):
+        """Resolve a destination folder id and prove it belongs to the destination vault."""
+        if dest_folder_id is None:
+            return None
+        folder = self.db.query(Folder).filter(Folder.id == dest_folder_id).first()
+        if not folder or folder.vault_id != dest_vault_id:
+            raise FolderNotFoundError("Destination folder not found in the destination vault")
+        return folder
+
+    def _assert_not_into_self_or_descendant(self, folder_id, candidate_parent_id):
+        """Refuse to move/copy a folder into itself or one of its own descendants (a cycle)."""
+        if candidate_parent_id is None:
+            return
+        if str(candidate_parent_id) == str(folder_id):
+            raise FileServiceError("Cannot move or copy a folder into itself.")
+        seen = 0
+        node = self.db.query(Folder).filter(Folder.id == candidate_parent_id).first()
+        while node is not None:
+            if str(node.id) == str(folder_id):
+                raise FileServiceError("Cannot move or copy a folder into one of its own subfolders.")
+            seen += 1
+            if seen > self._COPY_MAX_ITEMS:  # defence against a pre-existing cycle in the data
+                raise FileServiceError("Folder hierarchy too deep to move or copy safely.")
+            node = (self.db.query(Folder).filter(Folder.id == node.parent_folder_id).first()
+                    if node.parent_folder_id else None)
+
+    def _stream_copy_file_record(self, source_file, user, dest_vault_id, dest_folder_id, *,
+                                 source_file_password=None, replace_same_name=False):
+        """Re-encrypt one file's content + name into dest as a NEW file; returns the new File.
+
+        Content is read through open_download_stream (decrypts under the deployment key + the source
+        AAD) and written through upload_file_streaming (re-encrypts under the deployment key + the
+        NEW (dest_vault_id, new file_id) AAD). Name/MIME (decrypted in-memory on load for a Standard
+        vault) are handed to the upload path, which re-seals them for the destination. The caller has
+        already resolved vaults and checked ZK and the destination folder.
+        """
+        import hashlib
+        # Quota: the destination gains a full copy of the bytes, so enforce the SAME two limits every
+        # upload path does — the per-vault size_limit AND the deployment-wide stored-bytes cap. Doing
+        # it here covers every re-encrypt caller (file copy, cross-vault move, recursive folder copy),
+        # so none can bypass a limit the normal upload honours.
+        add_bytes = source_file.size_bytes or 0
+        dest_vault = self.db.query(Vault).filter(Vault.id == dest_vault_id).first()
+        if (dest_vault is not None and dest_vault.size_limit
+                and (dest_vault.total_size_bytes or 0) + add_bytes > dest_vault.size_limit):
+            raise FileTooLargeError("The copy would exceed the destination vault's size limit")
+        exceeds, _used, _cap = would_exceed_deployment_storage(self.db, add_bytes)
+        if exceeds:
+            raise FileTooLargeError("The destination is out of storage")
+        name = source_file.original_name or source_file.name
+        mime = source_file.mime_type
+        # Open the decrypting reader first: this authorizes READ on the source vault and enforces any
+        # per-file password, so a copier who cannot read the source never reaches the write.
+        reader = self.open_download_stream(source_file.id, user,
+                                           file_password=source_file_password, allow_share=False)
+        try:
+            file_info, ctx = self.upload_file_streaming(
+                dest_vault_id, name, user, folder_id=dest_folder_id, mime_type=mime,
+            )
+            hasher = hashlib.sha256()
+            with ctx:
+                for chunk in reader.chunks():
+                    hasher.update(chunk)
+                    ctx.write_chunk(chunk)
+            total = ctx.total_bytes
+        finally:
+            reader.close()
+        new_file = self.finalize_streaming_upload(
+            file_info, total, hasher.hexdigest(), replace_same_name=replace_same_name,
+        )
+        # Preserve a file-level password on the copy (same hash → same protection). The reader above
+        # already proved the caller can read the source, so this grants no new access.
+        if source_file.password_hash:
+            new_file.password_hash = source_file.password_hash
+            self.db.commit()
+            self.db.refresh(new_file)
+        return new_file
+
+    def copy_file(self, file_id, user, dest_vault_id, dest_folder_id=None, *,
+                  source_file_password=None, replace_same_name=False):
+        """Copy a file into dest_vault_id/dest_folder_id, leaving the original in place. Standard
+        vaults only (server cannot re-encrypt a ZK blob). Returns the new File."""
+        src_file = self.db.query(File).filter(File.id == file_id).first()
+        if not src_file:
+            raise FileNotFoundError(f"File not found: {file_id}")
+        src_vault = self.db.query(Vault).filter(Vault.id == src_file.vault_id).first()
+        dest_vault = self.db.query(Vault).filter(Vault.id == dest_vault_id).first()
+        if not dest_vault:
+            raise VaultNotFoundError("Destination vault not found")
+        self._require_standard(src_vault, "source")
+        self._require_standard(dest_vault, "destination")
+        self._dest_folder_or_raise(dest_vault_id, dest_folder_id)
+        # Quota (per-vault size_limit + deployment cap) is enforced in _stream_copy_file_record so
+        # every re-encrypt path shares one check.
+        return self._stream_copy_file_record(
+            src_file, user, dest_vault_id, dest_folder_id,
+            source_file_password=source_file_password, replace_same_name=replace_same_name,
+        )
+
+    def move_file(self, file_id, user, dest_vault_id, dest_folder_id=None, *,
+                  source_file_password=None, replace_same_name=False):
+        """Move a file. Within the same vault this is a reparent (no re-encryption). Across vaults it
+        re-encrypts into the destination (Standard↔Standard) and then deletes the source."""
+        src_file = self.db.query(File).filter(File.id == file_id).first()
+        if not src_file:
+            raise FileNotFoundError(f"File not found: {file_id}")
+        dest_vault = self.db.query(Vault).filter(Vault.id == dest_vault_id).first()
+        if not dest_vault:
+            raise VaultNotFoundError("Destination vault not found")
+        self._dest_folder_or_raise(dest_vault_id, dest_folder_id)
+
+        if str(dest_vault_id) == str(src_file.vault_id):
+            # Within-vault reparent — AAD-safe, allowed by _guard_no_cross_vault_move. Needs WRITE.
+            self.permission_service.require_vault_permission(
+                user, src_file.vault_id, VaultPermissionEnum.WRITE)
+            if str(src_file.folder_id or '') == str(dest_folder_id or ''):
+                return src_file  # already there
+            src_file.folder_id = dest_folder_id
+            src_file.updated_at = datetime.now(timezone.utc)
+            try:
+                self.db.commit()
+            except IntegrityError:
+                self.db.rollback()
+                raise DuplicateNameError("A file with that name already exists in the destination.")
+            self.db.refresh(src_file)
+            return src_file
+
+        # Cross-vault move = re-encrypt into the destination, then delete the source. Standard only.
+        src_vault = self.db.query(Vault).filter(Vault.id == src_file.vault_id).first()
+        self._require_standard(src_vault, "source")
+        self._require_standard(dest_vault, "destination")
+        # Removing the source is a DELETE; the destination write authorizes WRITE inside the copy.
+        self.permission_service.require_vault_permission(
+            user, src_file.vault_id, VaultPermissionEnum.DELETE)
+        # Quota is enforced in _stream_copy_file_record (per-vault size_limit + deployment cap).
+        new_file = self._stream_copy_file_record(
+            src_file, user, dest_vault_id, dest_folder_id,
+            source_file_password=source_file_password, replace_same_name=replace_same_name,
+        )
+        # Copy is durable before the source is removed: a failure here leaves a copy (safe), never a
+        # hole. delete_file re-checks DELETE and securely destroys the source blob.
+        self.delete_file(file_id, user)
+        return new_file
+
+    def move_folder(self, folder_id, user, dest_vault_id, dest_parent_folder_id=None):
+        """Move a folder within its vault (a reparent). Cross-vault folder moves are not supported."""
+        folder = self.db.query(Folder).filter(Folder.id == folder_id).first()
+        if not folder:
+            raise FolderNotFoundError(f"Folder not found: {folder_id}")
+        if str(dest_vault_id) != str(folder.vault_id):
+            raise FileServiceError(
+                "Moving a folder to a different vault is not supported yet; move its files instead.")
+        self.permission_service.require_vault_permission(
+            user, folder.vault_id, VaultPermissionEnum.WRITE)
+        self._dest_folder_or_raise(dest_vault_id, dest_parent_folder_id)
+        self._assert_not_into_self_or_descendant(folder_id, dest_parent_folder_id)
+        if str(folder.parent_folder_id or '') == str(dest_parent_folder_id or ''):
+            return folder  # already there
+        folder.parent_folder_id = dest_parent_folder_id
+        folder.updated_at = datetime.now(timezone.utc)
+        try:
+            self.db.commit()
+        except IntegrityError:
+            self.db.rollback()
+            raise DuplicateNameError("A folder with that name already exists in the destination.")
+        self.db.refresh(folder)
+        return folder
+
+    def copy_folder(self, folder_id, user, dest_vault_id, dest_parent_folder_id=None):
+        """Recursively copy a folder (and its files + subfolders) within one vault. Standard vaults
+        only; cross-vault folder copies are not supported (copy the files instead)."""
+        folder = self.db.query(Folder).filter(Folder.id == folder_id).first()
+        if not folder:
+            raise FolderNotFoundError(f"Folder not found: {folder_id}")
+        if str(dest_vault_id) != str(folder.vault_id):
+            raise FileServiceError(
+                "Copying a folder to a different vault is not supported yet; copy its files instead.")
+        vault = self.db.query(Vault).filter(Vault.id == folder.vault_id).first()
+        self._require_standard(vault, "source")
+        self._dest_folder_or_raise(dest_vault_id, dest_parent_folder_id)
+        self._assert_not_into_self_or_descendant(folder_id, dest_parent_folder_id)
+        counter = [0]
+        return self._copy_folder_recursive(folder, user, dest_vault_id, dest_parent_folder_id, counter)
+
+    def _copy_folder_recursive(self, folder, user, dest_vault_id, dest_parent_folder_id, counter):
+        counter[0] += 1
+        if counter[0] > self._COPY_MAX_ITEMS:
+            raise FileServiceError("Folder is too large to copy (item limit reached).")
+        new_folder = self.create_folder(
+            dest_vault_id, folder.name, user, parent_folder_id=dest_parent_folder_id)
+        # Copy the files directly under this folder.
+        child_files = self.db.query(File).filter(
+            File.vault_id == folder.vault_id, File.folder_id == folder.id).all()
+        for f in child_files:
+            counter[0] += 1
+            if counter[0] > self._COPY_MAX_ITEMS:
+                raise FileServiceError("Folder is too large to copy (item limit reached).")
+            self._stream_copy_file_record(f, user, dest_vault_id, new_folder.id)
+        # Recurse into subfolders.
+        child_folders = self.db.query(Folder).filter(
+            Folder.vault_id == folder.vault_id, Folder.parent_folder_id == folder.id).all()
+        for sub in child_folders:
+            self._copy_folder_recursive(sub, user, dest_vault_id, new_folder.id, counter)
+        return new_folder
+
     def _get_vault_path(self, vault_id: uuid.UUID) -> Path:
         """Get physical path for vault directory."""
         return self.storage_path / str(vault_id)

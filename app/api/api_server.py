@@ -458,7 +458,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
         return response
 
-_RATE_LIMIT_API_CATEGORIES = ("default", "auth", "upload", "download")
+_RATE_LIMIT_API_CATEGORIES = ("default", "auth", "upload", "upload_chunk", "download", "poll")
 _RATE_LIMIT_API_SETTING_KEYS = tuple(
     key
     for category in _RATE_LIMIT_API_CATEGORIES
@@ -516,8 +516,12 @@ if getattr(settings, 'rate_limit_api_enabled', True):
         auth_window=settings.rate_limit_api_auth_window,
         upload_limit=settings.rate_limit_api_upload,
         upload_window=settings.rate_limit_api_upload_window,
+        upload_chunk_limit=settings.rate_limit_api_upload_chunk,
+        upload_chunk_window=settings.rate_limit_api_upload_chunk_window,
         download_limit=settings.rate_limit_api_download,
         download_window=settings.rate_limit_api_download_window,
+        poll_limit=settings.rate_limit_api_poll,
+        poll_window=settings.rate_limit_api_poll_window,
         policy_provider=_api_rate_limit_policy_cache.get,
         exclude_paths=["/health", "/static", "/favicon.ico", "/brand-assets",
                        "/docs", "/redoc", "/openapi.json"],
@@ -5508,10 +5512,21 @@ async def request_email_change(
             code_hash=hash_code(code, settings.jwt_secret_key),
             expires_at=datetime.utcnow() + timedelta(minutes=CODE_TTL_MINUTES)))
         db.commit()
-        _send_email(db, to_addr=new_email, subject="Confirm your new email address",
-                    body=(f"Enter this code to confirm your new email address:\n\n    {code}\n\n"
-                          f"The code expires in {CODE_TTL_MINUTES} minutes. "
-                          f"If you didn't request this change, you can ignore this email."))
+        # Route through the central action helper so this uses the admin-customizable "email_change"
+        # template (its {{action.code}} / {{action.expires}} tokens). raise_errors preserves the prior
+        # behavior: a clean 400/502 on a config/transport failure rather than a silent miss.
+        from app.core.email_actions import send_action_email
+        from app.core import email_send as _es
+        try:
+            send_action_email(
+                db, "email_change",
+                recipient={"email": new_email, "username": user.username},
+                action_context={"code": code, "expires": f"in {CODE_TTL_MINUTES} minutes"},
+                raise_errors=True)
+        except _es.EmailSendError as e:
+            code_status = (status.HTTP_400_BAD_REQUEST if e.category == "config"
+                           else status.HTTP_502_BAD_GATEWAY)
+            raise HTTPException(status_code=code_status, detail=e.message)
     try:
         AuditLogger(db).log_action(action="email_change_requested", status="success", user=user,
                                    ip_address=get_client_ip(request), details={})
@@ -7467,6 +7482,224 @@ async def dismiss_notification(
         raise HTTPException(status_code=404, detail="Notification not found")
     db.delete(n)
     db.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Notes — personal server-side notes (title + text). "Send note" is a snapshot
+# COPY to another user (no live share, no cascade): the recipient gets their own
+# row and can adopt it into their notes. Personal data: every query is scoped to
+# the requesting account (owner_id); a temporary-credential session is excluded.
+# ---------------------------------------------------------------------------
+_NOTE_TITLE_MAX = 255
+_NOTE_BODY_MAX = 100_000
+
+
+class NoteIn(BaseModel):
+    title: str = ""
+    body: str = ""
+
+
+class NoteUpdate(BaseModel):
+    title: Optional[str] = None
+    body: Optional[str] = None
+    is_favorite: Optional[bool] = None
+
+
+class NoteSend(BaseModel):
+    recipient_user_id: uuid.UUID
+
+
+def _notes_denied_for_temp(current_user) -> bool:
+    # Notes belong to the underlying account; a least-privilege temp session must not read or write
+    # them (matches the notification bell). The temp-account note model is a deferred follow-up.
+    return bool(getattr(current_user, "_is_temp_session", False))
+
+
+def _clean_note_fields(title, body):
+    title = (title or "").strip()
+    # Drop control chars (CR/LF etc.): the title also lands in a notification title on send.
+    title = ''.join(c for c in title if ord(c) >= 32 and ord(c) != 127)
+    if len(title) > _NOTE_TITLE_MAX:
+        raise HTTPException(status_code=400, detail=f"Title is too long (max {_NOTE_TITLE_MAX} characters)")
+    body = body or ""
+    if len(body) > _NOTE_BODY_MAX:
+        raise HTTPException(status_code=400,
+                            detail=f"Note is too long (max {_NOTE_BODY_MAX} characters)")
+    return title, body
+
+
+def _note_dict(n) -> dict:
+    return {
+        "id": str(n.id),
+        "title": n.title or "",
+        "body": n.body or "",
+        "is_favorite": bool(n.is_favorite),
+        "adopted": bool(n.adopted),
+        "sent_from": n.sent_from_name if n.sent_from_user_id else None,
+        "created_at": n.created_at.isoformat() if n.created_at else None,
+        "updated_at": n.updated_at.isoformat() if n.updated_at else None,
+    }
+
+
+def _get_owned_note(db, current_user, note_id):
+    from app.core.models import Note
+    n = db.query(Note).filter(Note.id == note_id, Note.owner_id == current_user.id).first()
+    if not n:
+        raise HTTPException(status_code=404, detail="Note not found")
+    return n
+
+
+@app.get("/notes")
+async def list_notes(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """My notes: the ones I authored plus received copies I have adopted. Favourites first."""
+    from app.core.models import Note
+    if _notes_denied_for_temp(current_user):
+        return {"notes": []}
+    rows = (db.query(Note)
+            .filter(Note.owner_id == current_user.id, Note.adopted.is_(True))
+            .order_by(Note.is_favorite.desc(), Note.updated_at.desc())
+            .all())
+    return {"notes": [_note_dict(n) for n in rows]}
+
+
+@app.get("/notes/received")
+async def list_received_notes(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Notes other users sent me that I have not adopted yet ("sent to me")."""
+    from app.core.models import Note
+    if _notes_denied_for_temp(current_user):
+        return {"notes": []}
+    rows = (db.query(Note)
+            .filter(Note.owner_id == current_user.id, Note.adopted.is_(False))
+            .order_by(Note.created_at.desc())
+            .all())
+    return {"notes": [_note_dict(n) for n in rows]}
+
+
+@app.post("/notes")
+async def create_note(
+    body: NoteIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from app.core.models import Note
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    title, text = _clean_note_fields(body.title, body.body)
+    if not title and not text:
+        raise HTTPException(status_code=400, detail="A note needs a title or some text")
+    n = Note(owner_id=current_user.id, title=title, body=text, adopted=True)
+    db.add(n)
+    db.commit()
+    db.refresh(n)
+    return _note_dict(n)
+
+
+@app.get("/notes/{note_id}")
+async def get_note(
+    note_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    return _note_dict(_get_owned_note(db, current_user, note_id))
+
+
+@app.patch("/notes/{note_id}")
+async def update_note(
+    note_id: uuid.UUID,
+    body: NoteUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    n = _get_owned_note(db, current_user, note_id)
+    if body.title is not None or body.body is not None:
+        title, text = _clean_note_fields(
+            n.title if body.title is None else body.title,
+            n.body if body.body is None else body.body)
+        n.title = title
+        n.body = text
+    if body.is_favorite is not None:
+        n.is_favorite = bool(body.is_favorite)
+    db.commit()
+    db.refresh(n)
+    return _note_dict(n)
+
+
+@app.delete("/notes/{note_id}")
+async def delete_note(
+    note_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    n = _get_owned_note(db, current_user, note_id)
+    db.delete(n)
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/notes/{note_id}/adopt")
+async def adopt_note(
+    note_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Add a received note to my own notes (it becomes a normal, editable note of mine)."""
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    n = _get_owned_note(db, current_user, note_id)
+    n.adopted = True
+    db.commit()
+    db.refresh(n)
+    return _note_dict(n)
+
+
+@app.post("/notes/{note_id}/send")
+async def send_note(
+    note_id: uuid.UUID,
+    body: NoteSend,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Send a SNAPSHOT COPY of my note to another user. They get their own editable copy under
+    "sent to me" (no live link, no cascade) and an in-app notification."""
+    from app.core.models import Note
+    if _notes_denied_for_temp(current_user):
+        raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
+    src = _get_owned_note(db, current_user, note_id)
+    if str(body.recipient_user_id) == str(current_user.id):
+        raise HTTPException(status_code=400, detail="You cannot send a note to yourself")
+    recipient = db.query(User).filter(User.id == body.recipient_user_id).first()
+    if not recipient or not recipient.is_active or recipient.role == RoleEnum.EXTERNAL:
+        raise HTTPException(status_code=404, detail="Recipient not found")
+    sender_name = current_user.username or (current_user.email or "Someone")
+    copy = Note(owner_id=recipient.id, title=src.title, body=src.body,
+                sent_from_user_id=current_user.id, sent_from_name=sender_name, adopted=False)
+    db.add(copy)
+    db.commit()
+    # Best-effort in-app notification (separate session; never fails the send).
+    _notify_users([str(recipient.id)], "note_received", f"{sender_name} sent you a note",
+                  body=(src.title or "Untitled note"), target="#notes")
+    try:
+        AuditLogger(db).log_action(
+            action='note_send', status='success', user=current_user, resource_type='note',
+            resource_id=str(note_id),
+            details={'recipient_user_id': str(recipient.id)},
+            ip_address=get_client_ip(request))
+    except Exception:
+        pass
     return {"ok": True}
 
 
@@ -12539,6 +12772,231 @@ async def rename_file(
         )
 
 
+class ItemMoveCopy(BaseModel):
+    """Destination for a file move/copy. dest_folder_id None means the destination vault root."""
+    dest_vault_id: uuid.UUID
+    dest_folder_id: Optional[uuid.UUID] = None
+    replace_same_name: bool = False
+
+
+class FolderMoveCopy(BaseModel):
+    """Destination for a folder move/copy. dest_parent_folder_id None means the vault root."""
+    dest_vault_id: uuid.UUID
+    dest_parent_folder_id: Optional[uuid.UUID] = None
+
+
+def _gate_move_copy_destination(db, vault_service, current_user, dest_vault_id, dest_folder_id,
+                                dest_password, caps):
+    """Shared destination gate for move/copy: prove access + password to the destination vault, the
+    scoped-temp caps hold on the destination, and (for a scoped temp) the destination folder — INCLUDING
+    the vault root — is in scope. Returns the destination vault."""
+    from app.core.temp_scope import require_cap
+    dest_vault = vault_service.get_vault(dest_vault_id, current_user, dest_password,
+                                         require_password=True)
+    for cap in caps:
+        require_cap(current_user, dest_vault_id, cap)
+    # Unconditional (NOT `if dest_folder_id is not None`): require_folder_scope denies the vault ROOT
+    # (folder_id None) for an id-scoped principal — a scoped temp must not deposit an item at the root,
+    # outside its granted subtree — and is a no-op for a non-scoped / whole-vault principal.
+    require_folder_scope(db, current_user, dest_vault_id, dest_folder_id)
+    return dest_vault
+
+
+@app.post("/vaults/{vault_id}/files/{file_id}/copy")
+@require_endpoint_permission("FILE_DOWNLOAD")
+@require_vault_cap("file.download")
+async def copy_file_endpoint(
+    vault_id: uuid.UUID,
+    file_id: uuid.UUID,
+    body: ItemMoveCopy,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    x_vault_password: Optional[str] = Header(None),
+    x_dest_vault_password: Optional[str] = Header(None),
+    x_file_password: Optional[str] = Header(None),
+):
+    """Copy a file to another folder/vault, leaving the original. Standard vaults only (the server
+    cannot re-encrypt a zero-knowledge blob). Requires read on the source and write on the
+    destination; each vault's password is gated when it is password-protected."""
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    audit_logger = AuditLogger(db)
+    try:
+        # Source: access + password on the path vault, the file belongs to it, item in scope.
+        vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+        if not db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id).first():
+            raise HTTPException(status_code=404, detail="File not found in this vault")
+        require_item_scope(db, current_user, vault_id, file_id)
+        # Destination: access + password + the write cap + folder scope.
+        _gate_move_copy_destination(db, vault_service, current_user, body.dest_vault_id,
+                                    body.dest_folder_id, x_dest_vault_password, ["file.upload"])
+        # Overwriting a same-name file in the destination DELETES it, so it needs delete authority on
+        # the DESTINATION vault — the client flag alone must not let an upload-only principal destroy
+        # another user's file (same rule as every other replace path, _principal_can_replace_file).
+        replace = body.replace_same_name and _principal_can_replace_file(db, current_user, body.dest_vault_id)
+        new_file = vault_service.copy_file(
+            file_id, current_user, body.dest_vault_id, body.dest_folder_id,
+            source_file_password=x_file_password, replace_same_name=replace)
+        audit_logger.log_action(
+            action='file_copy', status='success', user=current_user, resource_type='file',
+            resource_id=str(file_id),
+            details={'source_vault_id': str(vault_id), 'dest_vault_id': str(body.dest_vault_id),
+                     'dest_folder_id': str(body.dest_folder_id) if body.dest_folder_id else None,
+                     'new_file_id': str(new_file.id)},
+            ip_address=get_client_ip(request))
+        return {'message': 'File copied', 'id': str(new_file.id)}
+    except DuplicateNameError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except HTTPException:
+        raise
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="A file with that name already exists in the destination")
+
+
+@app.post("/vaults/{vault_id}/files/{file_id}/move")
+@require_endpoint_permission("FILE_DELETE")
+@require_vault_cap("file.delete")
+async def move_file_endpoint(
+    vault_id: uuid.UUID,
+    file_id: uuid.UUID,
+    body: ItemMoveCopy,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    x_vault_password: Optional[str] = Header(None),
+    x_dest_vault_password: Optional[str] = Header(None),
+    x_file_password: Optional[str] = Header(None),
+):
+    """Move a file. Within one vault this is a reparent (no re-encryption); across vaults it
+    re-encrypts into the destination (Standard↔Standard) and deletes the source. Requires the delete
+    capability on the source and the upload capability on the destination."""
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    audit_logger = AuditLogger(db)
+    try:
+        vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+        if not db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id).first():
+            raise HTTPException(status_code=404, detail="File not found in this vault")
+        require_item_scope(db, current_user, vault_id, file_id)
+        _gate_move_copy_destination(db, vault_service, current_user, body.dest_vault_id,
+                                    body.dest_folder_id, x_dest_vault_password, ["file.upload"])
+        # Same rule as copy: overwriting a same-name file in the destination needs delete authority
+        # there, not just the client flag.
+        replace = body.replace_same_name and _principal_can_replace_file(db, current_user, body.dest_vault_id)
+        new_file = vault_service.move_file(
+            file_id, current_user, body.dest_vault_id, body.dest_folder_id,
+            source_file_password=x_file_password, replace_same_name=replace)
+        audit_logger.log_action(
+            action='file_move', status='success', user=current_user, resource_type='file',
+            resource_id=str(file_id),
+            details={'source_vault_id': str(vault_id), 'dest_vault_id': str(body.dest_vault_id),
+                     'dest_folder_id': str(body.dest_folder_id) if body.dest_folder_id else None,
+                     'new_file_id': str(new_file.id)},
+            ip_address=get_client_ip(request))
+        return {'message': 'File moved', 'id': str(new_file.id)}
+    except DuplicateNameError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except HTTPException:
+        raise
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="A file with that name already exists in the destination")
+
+
+@app.post("/vaults/{vault_id}/folders/{folder_id}/move")
+@require_endpoint_permission("FOLDER_MANAGE")
+@require_vault_cap("folder.create")
+async def move_folder_endpoint(
+    vault_id: uuid.UUID,
+    folder_id: uuid.UUID,
+    body: FolderMoveCopy,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    x_vault_password: Optional[str] = Header(None),
+):
+    """Move a folder within its vault (a reparent). Cross-vault folder moves are not supported yet."""
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    audit_logger = AuditLogger(db)
+    try:
+        vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+        if not db.query(Folder.id).filter(Folder.id == folder_id, Folder.vault_id == vault_id).first():
+            raise HTTPException(status_code=404, detail="Folder not found in this vault")
+        require_item_scope(db, current_user, vault_id, folder_id)
+        # Unconditional: denies the vault ROOT for an id-scoped temp (a no-op otherwise).
+        require_folder_scope(db, current_user, vault_id, body.dest_parent_folder_id)
+        folder = vault_service.move_folder(
+            folder_id, current_user, body.dest_vault_id, body.dest_parent_folder_id)
+        audit_logger.log_action(
+            action='folder_move', status='success', user=current_user, resource_type='folder',
+            resource_id=str(folder_id),
+            details={'vault_id': str(vault_id),
+                     'dest_parent_folder_id': str(body.dest_parent_folder_id) if body.dest_parent_folder_id else None},
+            ip_address=get_client_ip(request))
+        return {'message': 'Folder moved', 'id': str(folder.id)}
+    except DuplicateNameError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except HTTPException:
+        raise
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="A folder with that name already exists in the destination")
+
+
+@app.post("/vaults/{vault_id}/folders/{folder_id}/copy")
+@require_endpoint_permission("FOLDER_MANAGE")
+@require_vault_cap("folder.create")
+async def copy_folder_endpoint(
+    vault_id: uuid.UUID,
+    folder_id: uuid.UUID,
+    body: FolderMoveCopy,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    x_vault_password: Optional[str] = Header(None),
+):
+    """Recursively copy a folder (its files + subfolders) within its vault. Standard vaults only;
+    cross-vault folder copies are not supported yet."""
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    audit_logger = AuditLogger(db)
+    try:
+        from app.core.temp_scope import require_cap
+        vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+        if not db.query(Folder.id).filter(Folder.id == folder_id, Folder.vault_id == vault_id).first():
+            raise HTTPException(status_code=404, detail="Folder not found in this vault")
+        require_item_scope(db, current_user, vault_id, folder_id)
+        # Unconditional: denies the vault ROOT for an id-scoped temp (a no-op otherwise).
+        require_folder_scope(db, current_user, vault_id, body.dest_parent_folder_id)
+        # A recursive copy reads every descendant file and writes a duplicate, so a scoped temp needs
+        # the read + write caps too (all within the one vault).
+        require_cap(current_user, vault_id, "file.download")
+        require_cap(current_user, vault_id, "file.upload")
+        folder = vault_service.copy_folder(
+            folder_id, current_user, body.dest_vault_id, body.dest_parent_folder_id)
+        audit_logger.log_action(
+            action='folder_copy', status='success', user=current_user, resource_type='folder',
+            resource_id=str(folder_id),
+            details={'vault_id': str(vault_id), 'new_folder_id': str(folder.id),
+                     'dest_parent_folder_id': str(body.dest_parent_folder_id) if body.dest_parent_folder_id else None},
+            ip_address=get_client_ip(request))
+        return {'message': 'Folder copied', 'id': str(folder.id)}
+    except DuplicateNameError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except HTTPException:
+        raise
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="A folder with that name already exists in the destination")
+
+
 @app.post("/vaults/{vault_id}/folders")
 @require_endpoint_permission("FOLDER_MANAGE")
 @require_vault_cap("folder.create")
@@ -13733,9 +14191,13 @@ def _seed_default_email_profile():
     try:
         from app.core.database import get_db_context
         from app.core import email_send
+        from app.core.email_actions import seed_email_actions
         with get_db_context() as db:
             if email_send.seed_default_profile(db):
                 print("[OK] Seeded default email sending profile from legacy SMTP config")
+            n = seed_email_actions(db)
+            if n:
+                print(f"[OK] Seeded {n} automated-email action(s)")
     except Exception as e:
         print(f"⚠ Default email profile seed skipped: {e}")
 
@@ -14124,6 +14586,13 @@ def _run_lightweight_migrations():
                            ADD CONSTRAINT uq_vault_members_vault_user UNIQUE (vault_id, user_id);
                    END IF;
                END $$;""",
+            # Email Studio: the per-profile "allow insecure TLS" opt-out. email_profiles is a whole
+            # new table (create_all builds it with this column on a fresh DB), but a deployment that
+            # created email_profiles on an INTERMEDIATE build before the column was added would not
+            # get it from create_all (which never ALTERs) — so back it in here on upgrade. Additive +
+            # idempotent; the table always exists by now because init_db()/create_all ran first.
+            "ALTER TABLE email_profiles ADD COLUMN IF NOT EXISTS "
+            "smtp_allow_insecure_tls BOOLEAN NOT NULL DEFAULT FALSE",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)

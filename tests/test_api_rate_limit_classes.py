@@ -21,8 +21,12 @@ RATE_KEYS = (
     "rate_limit_api_auth_window",
     "rate_limit_api_upload",
     "rate_limit_api_upload_window",
+    "rate_limit_api_upload_chunk",
+    "rate_limit_api_upload_chunk_window",
     "rate_limit_api_download",
     "rate_limit_api_download_window",
+    "rate_limit_api_poll",
+    "rate_limit_api_poll_window",
 )
 
 
@@ -68,6 +72,14 @@ def test_live_class_budgets_are_independent_and_update_without_restart(admin):
         _assert_budget(traffic, "get", "/users/me", 2)
         _assert_budget(traffic, "get", "/auth/session", 2)
         _assert_budget(traffic, "post", f"/vaults/{fake_vault}/uploads", 2)
+        # The per-chunk PUT bucket is INDEPENDENT of the operation-level 'upload' bucket above — this
+        # separation is what stops a large upload from throttling itself mid-transfer.
+        _assert_budget(
+            traffic, "put",
+            f"/vaults/{fake_vault}/uploads/{uuid.uuid4()}/chunks/0", 2,
+        )
+        # Polled reads (security events / notifications / audit / monitor) are their own bucket.
+        _assert_budget(traffic, "get", "/notifications/unread-count", 2)
         _assert_budget(
             traffic,
             "get",
@@ -92,6 +104,15 @@ def test_live_class_budgets_are_independent_and_update_without_restart(admin):
         assert restored.status_code == 200, restored.text
         admin.delete_user(traffic_user["id"])
         admin.delete_user(editor_user["id"])
+
+
+def test_upload_chunk_and_poll_defaults_are_generous(admin):
+    """The fix: per-chunk PUTs and polled reads have their own HIGH default budgets, so a big upload
+    or normal polling never trips them (chunk PUTs used to share the 20/min operation 'upload' cap)."""
+    dd = admin.get("/settings").json()["rate_limit_api_deployment_defaults"]
+    assert dd["rate_limit_api_upload_chunk"] >= 1000, dd   # ~15 GB/min at 5 MiB chunks
+    assert dd["rate_limit_api_poll"] >= 300, dd
+    assert dd["rate_limit_api_upload"] >= 60, dd            # operation-level, no longer a tiny 20
 
 
 def test_rate_limit_settings_validate_bounds_and_are_audited(admin):

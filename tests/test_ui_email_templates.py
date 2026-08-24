@@ -120,8 +120,27 @@ def test_add_dynamic_action_inserts_token(admin_page: Page):
     _new_template(page, name="Dyn", body="")
     page.click("#et-add-dynamic")
     expect(page.locator("#et-dyn-menu")).to_be_visible()
-    page.locator('#et-dyn-menu button:has-text("Recipient username")').click()
+    # Two-level menu: pick the group, then the token in its flyout submenu.
+    page.locator('.et-dyn-group:has-text("Recipient")').click()
+    sub = page.locator("#et-dyn-submenu")
+    expect(sub).to_be_visible()
+    sub.locator('button:has-text("Username")').first.click()
     expect(page.locator("#et-body")).to_have_value("{{user.username}}")
+
+
+def test_dynamic_menu_groups_and_new_tokens(admin_page: Page, admin):
+    # The menu is grouped, and the new Sender / Branding / Automated-action groups + tokens are present.
+    groups = {g["group"] for g in admin.get("/email/dynamic-actions").json()["groups"]}
+    assert {"Recipient", "Sender", "Branding", "Date & time", "Automated action"} <= groups
+    page = admin_page
+    _open_email_tab(page)
+    _new_template(page, name="Grp", body="")
+    page.click("#et-add-dynamic")
+    expect(page.locator('.et-dyn-group:has-text("Automated action")')).to_be_visible()
+    page.locator('.et-dyn-group:has-text("Automated action")').click()
+    sub = page.locator("#et-dyn-submenu")
+    sub.locator('button:has-text("Action link")').first.click()
+    expect(page.locator("#et-body")).to_have_value("{{action.link}}")
 
 
 def test_add_image_inserts_data_resource_id(admin_page: Page, admin):
@@ -132,9 +151,34 @@ def test_add_image_inserts_data_resource_id(admin_page: Page, admin):
     page.click("#et-add-image")
     expect(page.locator("#email-image-modal")).to_have_class(re.compile(r"\bactive\b"))
     page.locator(f'.et-image-item:has-text("logo.png")').click()
-    expect(page.locator("#et-body")).to_have_value(f'<img data-resource-id="{res["id"]}">')
-    # the reference is a UUID; no path/URL appears in the source
+    # default size is Medium (320): UUID-only reference + a width, never a path/URL.
+    expect(page.locator("#et-body")).to_have_value(f'<img data-resource-id="{res["id"]}" width="320">')
     assert "/email/resources/" not in page.locator("#et-body").input_value()
+
+
+def test_add_image_size_presets_and_custom(admin_page: Page, admin):
+    res = admin.post("/email/resources", files={"file": ("logo.png", PNG, "application/octet-stream")}).json()
+    rid = res["id"]
+    page = admin_page
+    _open_email_tab(page)
+    _new_template(page, name="Sized", body="")
+
+    def insert(size_value, custom=None):
+        page.fill("#et-body", "")
+        page.click("#et-add-image")
+        expect(page.locator("#email-image-modal")).to_have_class(re.compile(r"\bactive\b"))
+        page.select_option("#et-image-size", size_value)
+        if custom is not None:
+            expect(page.locator("#et-image-custom-width")).to_be_visible()   # revealed only for custom
+            page.fill("#et-image-custom-width", str(custom))
+        page.locator('.et-image-item:has-text("logo.png")').click()
+
+    insert("480")
+    expect(page.locator("#et-body")).to_have_value(f'<img data-resource-id="{rid}" width="480">')
+    insert("0")                                                              # Original -> no width
+    expect(page.locator("#et-body")).to_have_value(f'<img data-resource-id="{rid}">')
+    insert("custom", custom=225)
+    expect(page.locator("#et-body")).to_have_value(f'<img data-resource-id="{rid}" width="225">')
 
 
 def test_client_script_pre_check_blocks_save(admin_page: Page, admin):
@@ -272,6 +316,50 @@ def test_edit_refuses_to_open_when_body_fetch_fails(admin_page: Page, admin):
         page.locator('.email-profile-card:has-text("Vanishing") .etc-edit').click()
     assert resp.value.status == 404
     expect(page.locator("#email-template-editor")).to_be_hidden()   # must not open blank
+
+
+def test_email_hints_flow_as_text_not_scattered_flex(admin_page: Page):
+    # The hint boxes must be `.email-hint` (block flow), NOT `.alert` (whose flex layout scatters the
+    # inline <strong>/<em> into separate columns).
+    page = admin_page
+    _open_email_tab(page)
+    hint = page.locator("#settings-tab-email .email-hint").first
+    expect(hint).to_be_visible()
+    assert hint.evaluate("el => getComputedStyle(el).display") == "block"
+    assert page.locator("#settings-tab-email .alert-info").count() == 0
+
+
+def test_editor_code_pane_has_adequate_height(admin_page: Page):
+    page = admin_page
+    _open_email_tab(page)
+    _new_template(page, name="Tall")
+    mh = page.locator("#et-body").evaluate("el => parseFloat(getComputedStyle(el).minHeight)")
+    assert mh >= 400, f"code textarea min-height too small: {mh}px"
+
+
+def test_dynamic_menu_is_not_clipped(admin_page: Page):
+    # The editor card must not clip the flyout submenu, and the submenu must stay within the viewport
+    # (flip-up/left keeps every token reachable without scrolling the page).
+    page = admin_page
+    _open_email_tab(page)
+    _new_template(page, name="Menu", body="")
+    page.click("#et-add-dynamic")
+    menu = page.locator("#et-dyn-menu")
+    expect(menu).to_be_visible()
+    groups = menu.locator(".et-dyn-group")
+    assert groups.count() >= 4
+    # Pin the overflow fix directly (bounding-box/visibility checks are insensitive to an ancestor's
+    # overflow:hidden).
+    assert page.locator("#email-template-editor").evaluate(
+        "el => getComputedStyle(el).overflowX") == "visible"
+    # Open the LAST group (closest to the bottom) — its submenu must sit fully within the viewport.
+    groups.last.click()
+    sub = page.locator("#et-dyn-submenu")
+    expect(sub).to_be_visible()
+    within = sub.evaluate(
+        "el => { const r = el.getBoundingClientRect();"
+        " return r.bottom <= window.innerHeight + 1 && r.right <= window.innerWidth + 1 && r.top >= -1 && r.left >= -1; }")
+    assert within is True
 
 
 @pytest.mark.skipif(not (MAILPIT_URL and MAILPIT_SMTP_HOST),

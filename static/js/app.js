@@ -227,7 +227,7 @@ function updateUIForPermissions() {
 // Sidebar sections a SCOPED temp credential can never access (temp_scope maps
 // these endpoint groups to '__deny__'). Hidden the moment we know it's a scoped
 // temp session, so a slow/failed /auth/session probe can't leave them painted.
-const TEMP_FORBIDDEN_SECTIONS = ['users', 'groups', 'settings', 'monitor', 'roles'];
+const TEMP_FORBIDDEN_SECTIONS = ['users', 'groups', 'settings', 'monitor', 'roles', 'notes'];
 function hideAdminNavForTempSession() {
     if (!isScopedTemp) return;
     TEMP_FORBIDDEN_SECTIONS.forEach(sec => {
@@ -1467,14 +1467,141 @@ async function loadDashboardStats() {
             }
         }
         
+        // Personal lanes (shown to every account). The vault list is already in hand; pull the
+        // shared-with-me list too (silent — the endpoint is fine for any account). Notifications
+        // come from the global bell state loaded at login. A failure here must not blank the rest
+        // of the dashboard, so it is caught inside renderDashboardLanes.
+        let sharedWithMe = [];
+        try {
+            sharedWithMe = await apiRequest('/shares/shared-with-me', { silent: true }) || [];
+        } catch (error) {
+            console.log('Shared-with-me not available:', error);
+        }
+        renderDashboardLanes(vaults, sharedWithMe);
+
         // Update system status (the gating also runs at profile-render time, before first paint;
         // repeating it here keeps the card correct if the dashboard is re-entered later.)
         applyDashboardAdminGating();
         updateSystemStatus();
-        
+
     } catch (error) {
         console.error('Failed to load dashboard stats:', error);
     }
+}
+
+// ---- Dashboard personal lanes ----------------------------------------------------------------
+// Three at-a-glance lists for the signed-in account: what has been shared with you and still needs
+// action, your favourite vaults, and the vaults you opened most recently. All rows are built with
+// createElement + textContent (via _el), so a vault name or another user's name is never HTML.
+// Notes join these lanes when the Notes feature ships.
+const _DASHBOARD_LANE_LIMIT = 6;
+
+function renderDashboardLanes(vaults, sharedWithMe) {
+    try {
+        const list = Array.isArray(vaults) ? vaults.slice() : [];
+        // Last-opened first; a vault never opened (no last_viewed_at) sorts to the end.
+        const byViewed = (a, b) => {
+            const ta = parseServerTime(a.last_viewed_at);
+            const tb = parseServerTime(b.last_viewed_at);
+            return (tb ? tb.getTime() : 0) - (ta ? ta.getTime() : 0);
+        };
+        const favourites = list.filter(v => v.is_favorite).sort(byViewed);
+        const recent = list.filter(v => !v.is_favorite).sort(byViewed).slice(0, _DASHBOARD_LANE_LIMIT);
+
+        _fillLane('lane-favourites', favourites.slice(0, _DASHBOARD_LANE_LIMIT).map(_laneVaultRow),
+                  'No favourites yet. Tap the star on a vault to pin it here.');
+        _fillLane('lane-recent', recent.map(_laneVaultRow),
+                  'Vaults you open will show up here.');
+        renderWaitingLane(sharedWithMe);
+    } catch (error) {
+        console.error('Failed to render dashboard lanes:', error);
+    }
+}
+
+// "What's waiting for you": unread notifications (who shared with you), then any items pushed to you
+// that still need claiming, then items already shared with you that you can open — capped together.
+function renderWaitingLane(sharedWithMe) {
+    const rows = [];
+    const unread = (typeof notifItems !== 'undefined' && Array.isArray(notifItems))
+        ? notifItems.filter(n => !n.is_read) : [];
+    unread.slice(0, _DASHBOARD_LANE_LIMIT).forEach(n => rows.push(_laneNotifRow(n)));
+
+    const shared = Array.isArray(sharedWithMe) ? sharedWithMe : [];
+    const remaining = () => _DASHBOARD_LANE_LIMIT - rows.length;
+    if (remaining() > 0) {
+        shared.filter(s => s.status === 'available').slice(0, remaining())
+              .forEach(s => rows.push(_laneSharedRow(s)));
+    }
+    if (remaining() > 0) {
+        shared.filter(s => s.status === 'active').slice(0, remaining())
+              .forEach(s => rows.push(_laneSharedRow(s)));
+    }
+    _fillLane('lane-waiting', rows, "You're all caught up.");
+}
+
+function _fillLane(id, rows, emptyText) {
+    const box = document.getElementById(id);
+    if (!box) return;
+    if (!rows.length) { box.replaceChildren(_laneEmpty(emptyText)); return; }
+    box.replaceChildren(...rows);
+}
+
+function _laneEmpty(text) {
+    return _el('p', 'dashboard-lane-empty text-secondary', text);
+}
+
+// A clickable vault row (favourites / most-recent lanes) — opens the vault browser.
+function _laneVaultRow(v) {
+    const row = _el('button', 'dashboard-lane-item');
+    row.type = 'button';
+    const icon = _el('span', 'dashboard-lane-icon');
+    icon.appendChild(_svgIcon('vault', 'icon-sm'));
+    row.appendChild(icon);
+    const main = _el('div', 'dashboard-lane-main');
+    main.appendChild(_el('div', 'dashboard-lane-title', v.name || 'Vault'));
+    const t = parseServerTime(v.last_viewed_at);
+    main.appendChild(_el('div', 'dashboard-lane-sub text-secondary',
+        t ? ('Last opened ' + formatTimeAgo(v.last_viewed_at)) : 'Not opened yet'));
+    row.appendChild(main);
+    row.addEventListener('click', () => openVault(v.id));
+    return row;
+}
+
+// A notification row — opens the target section (mirrors the bell panel's onNotifClick).
+function _laneNotifRow(n) {
+    const row = _el('button', 'dashboard-lane-item' + (n.is_read ? '' : ' unread'));
+    row.type = 'button';
+    const icon = _el('span', 'dashboard-lane-icon');
+    icon.appendChild(_svgIcon('bell', 'icon-sm'));
+    row.appendChild(icon);
+    const main = _el('div', 'dashboard-lane-main');
+    main.appendChild(_el('div', 'dashboard-lane-title', n.title || ''));
+    if (n.body) main.appendChild(_el('div', 'dashboard-lane-sub text-secondary', n.body));
+    row.appendChild(main);
+    row.addEventListener('click', () => onNotifClick(n));
+    return row;
+}
+
+// A shared-with-me row — Open (active) or lands you in the Shared section to claim (available).
+function _laneSharedRow(s) {
+    const row = _el('button', 'dashboard-lane-item');
+    row.type = 'button';
+    const icon = _el('span', 'dashboard-lane-icon');
+    icon.appendChild(_svgIcon(s.target_type === 'file' ? 'file' : (s.target_type === 'folder' ? 'folder' : 'vault'), 'icon-sm'));
+    row.appendChild(icon);
+    const main = _el('div', 'dashboard-lane-main');
+    const title = s.target_type === 'vault' ? (s.vault_name || 'Shared vault')
+        : (s.target_name || 'Shared item');
+    main.appendChild(_el('div', 'dashboard-lane-title', title));
+    main.appendChild(_el('div', 'dashboard-lane-sub text-secondary',
+        s.status === 'available' ? 'Shared with you — claim to open' : 'Shared with you'));
+    row.appendChild(main);
+    if (s.status === 'available') {
+        row.addEventListener('click', () => { const el = document.querySelector('.sidebar-item[data-section="shared"]'); if (el) el.click(); });
+    } else {
+        row.addEventListener('click', () => openSharedItem(s.vault_id, s.target_folder_id || ''));
+    }
+    return row;
 }
 
 // Pick an icon for a dashboard audit event. Audit action strings vary
@@ -1572,9 +1699,18 @@ function canSeeSystemStatus() {
 function applyDashboardAdminGating() {
     const card = document.getElementById('dashboard-system-status');
     const grid = document.getElementById('dashboard-lower-grid');
+    const usersCard = document.getElementById('dashboard-users-card');
     const show = canSeeSystemStatus();
+    // The Active Users tile and the whole Recent-Events/System-Status row are administrator ops
+    // content. Reveal them only for an interactive admin; a non-admin (or a scoped temp session
+    // reading as its admin owner) sees the personal lanes instead. Both branches set display
+    // explicitly so the same tab moving between accounts never strands the previous layout.
+    if (usersCard) usersCard.style.display = show ? '' : 'none';
     if (card) card.style.display = show ? '' : 'none';
-    if (grid) grid.style.gridTemplateColumns = show ? '2fr 1fr' : '1fr';
+    if (grid) {
+        grid.style.display = show ? '' : 'none';
+        grid.style.gridTemplateColumns = show ? '2fr 1fr' : '1fr';
+    }
 }
 
 // Update system status indicators
@@ -5822,7 +5958,7 @@ let notifUnread = 0;
 
 // Map a server-supplied notification target to an in-app section. Targets are short server-controlled
 // tokens, and we only ever navigate to a KNOWN sidebar section — never inject an arbitrary href.
-const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds', '#vaults': 'vaults' };
+const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds', '#vaults': 'vaults', '#notes': 'notes' };
 
 async function initNotifications() {
     // Idempotent — called on login AND on refresh-restore. A temp session owns no notifications.
@@ -6190,7 +6326,7 @@ function setupSettingsTabs() {
             if (tabId === 'logs') { loadLogSettings(); }  // refresh on tab open
             if (tabId === 'sharing') { setupShareTagsUI(); loadShareTags(); }  // wire (idempotent) + refresh
             if (tabId === 'accounts') { setupAccountsPolicyUI(); refreshAccountsPolicyUI(); }  // wire + reflect deps
-            if (tabId === 'email') { loadEmailProfiles(); loadEmailTemplates(); }  // refresh profiles + templates on tab open
+            if (tabId === 'email') { loadEmailProfiles(); loadEmailTemplates(); loadEmailActions(); }  // refresh profiles + templates + actions on tab open
         });
     });
 }
@@ -6899,8 +7035,12 @@ async function loadSettings() {
             ['rate_limit_api_auth_window', 'setting-rate-limit-api-auth-window'],
             ['rate_limit_api_upload', 'setting-rate-limit-api-upload'],
             ['rate_limit_api_upload_window', 'setting-rate-limit-api-upload-window'],
+            ['rate_limit_api_upload_chunk', 'setting-rate-limit-api-upload-chunk'],
+            ['rate_limit_api_upload_chunk_window', 'setting-rate-limit-api-upload-chunk-window'],
             ['rate_limit_api_download', 'setting-rate-limit-api-download'],
             ['rate_limit_api_download_window', 'setting-rate-limit-api-download-window'],
+            ['rate_limit_api_poll', 'setting-rate-limit-api-poll'],
+            ['rate_limit_api_poll_window', 'setting-rate-limit-api-poll-window'],
         ];
         for (const [key, id] of apiRateFields) {
             const el = document.getElementById(id);
@@ -7030,8 +7170,12 @@ async function saveAllSettings() {
             rate_limit_api_auth_window: parseInt(document.getElementById('setting-rate-limit-api-auth-window').value) || 0,
             rate_limit_api_upload: parseInt(document.getElementById('setting-rate-limit-api-upload').value) || 0,
             rate_limit_api_upload_window: parseInt(document.getElementById('setting-rate-limit-api-upload-window').value) || 0,
+            rate_limit_api_upload_chunk: parseInt(document.getElementById('setting-rate-limit-api-upload-chunk').value) || 0,
+            rate_limit_api_upload_chunk_window: parseInt(document.getElementById('setting-rate-limit-api-upload-chunk-window').value) || 0,
             rate_limit_api_download: parseInt(document.getElementById('setting-rate-limit-api-download').value) || 0,
             rate_limit_api_download_window: parseInt(document.getElementById('setting-rate-limit-api-download-window').value) || 0,
+            rate_limit_api_poll: parseInt(document.getElementById('setting-rate-limit-api-poll').value) || 0,
+            rate_limit_api_poll_window: parseInt(document.getElementById('setting-rate-limit-api-poll-window').value) || 0,
             
             // Storage
             // Blank -> 0 (unlimited); the backend enforces a positive value and ignores 0.
@@ -8032,6 +8176,15 @@ function buildEmailTemplateCard(t) {
     card.className = 'email-profile-card'; card.setAttribute('role', 'listitem'); card.dataset.templateId = t.id;
     const title = document.createElement('div'); title.className = 'epc-title';
     const name = document.createElement('span'); name.textContent = t.name || '(untitled)'; title.appendChild(name);
+    if (t.bound_action) {
+        const isSys = t.bound_action.category === 'system';
+        const badge = document.createElement('span');
+        badge.className = 'epc-badge ' + (isSys ? 'epc-badge-system' : 'epc-badge-inuse');
+        badge.textContent = isSys ? 'System' : 'In use';
+        badge.title = 'Used by the ' + (isSys ? 'system' : 'automated') + ' email “' + t.bound_action.name +
+            '” — change that action first to delete this template.';
+        title.appendChild(badge);
+    }
     card.appendChild(title);
     const desc = document.createElement('div'); desc.className = 'epc-desc'; desc.textContent = t.description || ''; card.appendChild(desc);
     const meta = document.createElement('div'); meta.className = 'epc-meta';
@@ -8043,15 +8196,110 @@ function buildEmailTemplateCard(t) {
     }
     card.appendChild(meta);
     const actions = document.createElement('div'); actions.className = 'epc-actions';
-    for (const [label, cls, fn] of [['Edit', 'etc-edit', () => openTemplateEditor(t)],
-                                    ['Send', 'etc-send', () => openSendModal(t)],
-                                    ['Delete', 'etc-delete', () => deleteTemplate(t)]]) {
+    const rowDefs = [['Edit', 'etc-edit', () => openTemplateEditor(t)],
+                     ['Send', 'etc-send', () => openSendModal(t)]];
+    if (!t.bound_action) rowDefs.push(['Delete', 'etc-delete', () => deleteTemplate(t)]);   // bound = non-removable
+    for (const [label, cls, fn] of rowDefs) {
         const b = document.createElement('button'); b.type = 'button';
         b.className = 'btn btn-secondary btn-sm ' + cls; b.textContent = label;
         b.addEventListener('click', fn); actions.appendChild(b);
     }
     card.appendChild(actions);
     return card;
+}
+
+// ---- Automated emails (actions) ------------------------------------------------------------------
+async function loadEmailActions() {
+    const list = document.getElementById('email-actions-list');
+    if (!list) return;
+    try {
+        const [actions, templates] = await Promise.all([
+            apiRequest('/email/actions', { silent: true }),
+            apiRequest('/email/templates', { silent: true }),
+        ]);
+        renderEmailActions((actions && actions.actions) || [], (templates && templates.templates) || []);
+    } catch (e) { list.replaceChildren(); }
+}
+
+function renderEmailActions(actions, templates) {
+    const list = document.getElementById('email-actions-list');
+    list.replaceChildren();
+    actions.forEach(a => list.appendChild(buildActionRow(a, templates)));
+}
+
+function buildActionRow(a, templates) {
+    const row = document.createElement('div');
+    row.className = 'email-action-row'; row.setAttribute('role', 'listitem'); row.dataset.actionKey = a.key;
+
+    const head = document.createElement('div'); head.className = 'ear-head';
+    const nm = document.createElement('span'); nm.className = 'ear-name'; nm.textContent = a.name; head.appendChild(nm);
+    const badge = document.createElement('span');
+    badge.className = 'ear-badge ' + (a.category === 'system' ? 'ear-badge-system' : 'ear-badge-optional');
+    badge.textContent = a.category === 'system' ? 'System' : 'Optional';
+    head.appendChild(badge);
+    row.appendChild(head);
+
+    const desc = document.createElement('div'); desc.className = 'ear-desc'; desc.textContent = a.description || ''; row.appendChild(desc);
+
+    const controls = document.createElement('div'); controls.className = 'ear-controls';
+    // template picker
+    const tplWrap = document.createElement('label'); tplWrap.className = 'ear-field';
+    tplWrap.appendChild(document.createTextNode('Template'));
+    const sel = document.createElement('select'); sel.className = 'form-control ear-template';
+    const optDefault = document.createElement('option');
+    optDefault.value = '';
+    optDefault.textContent = a.category === 'system' ? 'Built-in default' : '(none — don’t send)';
+    sel.appendChild(optDefault);
+    templates.forEach(t => {
+        const o = document.createElement('option'); o.value = t.id; o.textContent = t.name || '(untitled)';
+        if (a.template_id === t.id) o.selected = true;
+        sel.appendChild(o);
+    });
+    sel.addEventListener('change', () => saveAction(a.key, { template_id: sel.value || null }));
+    tplWrap.appendChild(sel); controls.appendChild(tplWrap);
+
+    // notify toggle (optional actions only)
+    if (a.category !== 'system') {
+        const tog = document.createElement('label'); tog.className = 'checkbox-label ear-notify';
+        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!a.enabled;
+        cb.addEventListener('change', () => saveAction(a.key, { enabled: cb.checked }));
+        tog.appendChild(cb); tog.appendChild(document.createTextNode(' Notify by email'));
+        controls.appendChild(tog);
+    }
+
+    const test = document.createElement('button'); test.type = 'button';
+    test.className = 'btn btn-secondary btn-sm ear-test'; test.textContent = '📧 Send test';
+    test.addEventListener('click', () => testAction(a.key, row));
+    controls.appendChild(test);
+
+    const msg = document.createElement('span'); msg.className = 'ear-msg text-sm'; msg.setAttribute('role', 'status'); controls.appendChild(msg);
+    row.appendChild(controls);
+    return row;
+}
+
+async function saveAction(key, patch) {
+    try {
+        await apiRequest('/email/actions/' + encodeURIComponent(key), { method: 'PUT', body: JSON.stringify(patch) });
+        await loadEmailActions();          // reflect the new binding + re-badge templates
+        await loadEmailTemplates();
+    } catch (e) {
+        showError((e && e.message) || 'Could not update the automated email.');
+        await loadEmailActions();          // revert the control to the stored state
+    }
+}
+
+async function testAction(key, row) {
+    const msg = row.querySelector('.ear-msg');
+    const to = prompt('Send a test of this email to which address?');
+    if (to === null) return;
+    if (msg) { msg.textContent = 'Sending…'; msg.style.color = 'var(--text-secondary)'; }
+    try {
+        const r = await apiRequest('/email/actions/' + encodeURIComponent(key) + '/test',
+            { method: 'POST', body: JSON.stringify({ to_addr: (to || '').trim() }) });
+        if (msg) { msg.textContent = '✓ ' + ((r && r.message) || 'Test sent'); msg.style.color = 'var(--success)'; }
+    } catch (e) {
+        if (msg) { msg.textContent = '✗ ' + ((e && e.message) || 'Test failed'); msg.style.color = 'var(--error)'; }
+    }
 }
 
 async function openTemplateEditor(t) {
@@ -8101,6 +8349,7 @@ async function openTemplateEditor(t) {
 function closeTemplateEditor() {
     document.getElementById('email-template-editor').hidden = true;
     _editingTemplateId = null;
+    closeDynMenu();   // dismiss the body-level flyout submenu so it can't orphan
 }
 
 function setEditorView(view) {
@@ -8218,25 +8467,86 @@ function applyEditorFormat(fmt) {
     if (m) _etWrap(m[0], m[1], m[2]);
 }
 
+let _dynGroups = null;   // cached [{group, actions:[{token,label,description}]}]
+
+function _groupsFromFlat(data) {
+    // Fallback if the server returns only the flat `actions` list (older backend).
+    return [{ group: 'Tokens', actions: (data && data.actions) || [] }];
+}
+
+function closeDynMenu() {
+    const menu = document.getElementById('et-dyn-menu');
+    if (menu) menu.hidden = true;
+    const btn = document.getElementById('et-add-dynamic');
+    if (btn) btn.setAttribute('aria-expanded', 'false');
+    _closeDynSubmenu();
+}
+
+function _closeDynSubmenu() {
+    const sub = document.getElementById('et-dyn-submenu');
+    if (sub) sub.remove();
+    document.querySelectorAll('.et-dyn-group.active').forEach(r => r.classList.remove('active'));
+}
+
 async function toggleDynamicMenu() {
     const menu = document.getElementById('et-dyn-menu');
     const btn = document.getElementById('et-add-dynamic');
-    if (!menu.hidden) { menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); return; }
+    if (!menu.hidden) { closeDynMenu(); return; }
     menu.replaceChildren();
+    _closeDynSubmenu();
     try {
-        const data = await apiRequest('/email/dynamic-actions', { silent: true });
-        (data && data.actions || []).forEach(a => {
-            const b = document.createElement('button'); b.type = 'button'; b.setAttribute('role', 'menuitem');
-            const lbl = document.createElement('div'); lbl.textContent = a.label;
-            const tok = document.createElement('div'); tok.className = 'et-dyn-token'; tok.textContent = '{{' + a.token + '}}';
-            b.appendChild(lbl); b.appendChild(tok);
-            b.addEventListener('click', () => {
-                _etInsertText('{{' + a.token + '}}'); menu.hidden = true; btn.setAttribute('aria-expanded', 'false');
-            });
-            menu.appendChild(b);
+        if (!_dynGroups) {
+            const data = await apiRequest('/email/dynamic-actions', { silent: true });
+            _dynGroups = (data && Array.isArray(data.groups) && data.groups.length) ? data.groups : _groupsFromFlat(data);
+        }
+        _dynGroups.forEach(g => {
+            const row = document.createElement('button');
+            row.type = 'button'; row.className = 'et-dyn-group'; row.setAttribute('role', 'menuitem');
+            row.setAttribute('aria-haspopup', 'true'); row.setAttribute('aria-expanded', 'false');
+            const name = document.createElement('span'); name.textContent = g.group;
+            const chev = document.createElement('span'); chev.className = 'et-dyn-chevron'; chev.textContent = '▸';
+            row.appendChild(name); row.appendChild(chev);
+            row.addEventListener('click', (e) => { e.stopPropagation(); openDynGroupSubmenu(row, g); });
+            menu.appendChild(row);
         });
     } catch (e) {}
     menu.hidden = false; btn.setAttribute('aria-expanded', 'true');
+}
+
+function openDynGroupSubmenu(row, group) {
+    const existing = document.getElementById('et-dyn-submenu');
+    if (existing && existing.dataset.group === group.group) { _closeDynSubmenu(); return; }  // toggle
+    _closeDynSubmenu();
+    const sub = document.createElement('div');
+    sub.id = 'et-dyn-submenu'; sub.className = 'et-dyn-submenu'; sub.dataset.group = group.group;
+    sub.setAttribute('role', 'menu');
+    (group.actions || []).forEach(a => {
+        const b = document.createElement('button'); b.type = 'button'; b.setAttribute('role', 'menuitem');
+        if (a.description) b.title = a.description;
+        const lbl = document.createElement('div'); lbl.textContent = a.label;
+        const tok = document.createElement('div'); tok.className = 'et-dyn-token'; tok.textContent = '{{' + a.token + '}}';
+        b.appendChild(lbl); b.appendChild(tok);
+        b.addEventListener('click', (e) => { e.stopPropagation(); _etInsertText('{{' + a.token + '}}'); closeDynMenu(); });
+        sub.appendChild(b);
+    });
+    document.body.appendChild(sub);     // body-level so no ancestor overflow can clip it
+    row.classList.add('active'); row.setAttribute('aria-expanded', 'true');
+    _positionDynSubmenu(sub, row);
+}
+
+function _positionDynSubmenu(sub, row) {
+    // Flyout beside the group row; flip LEFT if it would overflow the right edge, and flip UP
+    // (bottom-align to the row) if it would overflow the viewport bottom. position:fixed => the
+    // getBoundingClientRect coordinates are already viewport-relative.
+    const rr = row.getBoundingClientRect();
+    const sw = sub.offsetWidth, sh = sub.offsetHeight;
+    const vw = window.innerWidth, vh = window.innerHeight, m = 8;
+    let left = rr.right + 4;
+    if (left + sw > vw - m) left = Math.max(m, rr.left - sw - 4);   // no room right -> go left
+    let top = rr.top;
+    if (top + sh > vh - m) top = Math.max(m, rr.bottom - sh);       // no room below -> flip up
+    sub.style.left = Math.round(left) + 'px';
+    sub.style.top = Math.round(top) + 'px';
 }
 
 async function openImagePicker() {
@@ -8277,8 +8587,29 @@ async function buildImageThumb(res) {
     const name = document.createElement('div'); name.className = 'et-image-name'; name.textContent = res.filename || res.id;
     item.appendChild(img); item.appendChild(name);
     // Insert only the UUID reference (no path/URL); alt is added by the admin if wanted.
-    item.addEventListener('click', () => { _etInsertText('<img data-resource-id="' + res.id + '">'); closeModal(); });
+    item.addEventListener('click', () => { _etInsertText(_etImageMarkup(res.id)); closeModal(); });
     return item;
+}
+
+// Build the <img> markup for an inserted resource, honoring the size picker. Emits a `width` (which
+// the sanitizer allows and the preview/send both render) unless "Original" (0) is chosen. Never emits
+// a path/URL — only the UUID reference.
+function _etImageMarkup(resourceId) {
+    let w = 0;
+    const sizeSel = document.getElementById('et-image-size');
+    if (sizeSel) {
+        if (sizeSel.value === 'custom') {
+            const c = document.getElementById('et-image-custom-width');
+            w = c ? parseInt(c.value, 10) : 0;
+        } else {
+            w = parseInt(sizeSel.value, 10);
+        }
+    }
+    if (Number.isFinite(w) && w > 0) {
+        w = Math.min(2000, Math.max(1, w));
+        return '<img data-resource-id="' + resourceId + '" width="' + w + '">';
+    }
+    return '<img data-resource-id="' + resourceId + '">';
 }
 
 async function uploadImageResource(file) {
@@ -8553,17 +8884,24 @@ function attachSettingsListeners() {
         if (etAddDyn) etAddDyn.addEventListener('click', (e) => { e.stopPropagation(); toggleDynamicMenu(); });
         const etImgUpload = document.getElementById('et-image-upload');
         if (etImgUpload) etImgUpload.addEventListener('change', (e) => { if (e.target.files[0]) uploadImageResource(e.target.files[0]); });
+        const etImgSize = document.getElementById('et-image-size');
+        if (etImgSize) etImgSize.addEventListener('change', () => {
+            const c = document.getElementById('et-image-custom-width');
+            if (c) c.hidden = (etImgSize.value !== 'custom');
+        });
         const etSendGo = document.getElementById('et-send-go');
         if (etSendGo) etSendGo.addEventListener('click', sendTemplateNow);
-        // Close the dynamic-action menu on an outside click.
+        // Close the dynamic-action menu (and its body-level flyout submenu) on an outside click.
         document.addEventListener('click', (e) => {
             const menu = document.getElementById('et-dyn-menu');
-            if (menu && !menu.hidden && !e.target.closest('.et-dyn-wrap')) {
-                menu.hidden = true;
-                const b = document.getElementById('et-add-dynamic');
-                if (b) b.setAttribute('aria-expanded', 'false');
+            if (menu && !menu.hidden && !e.target.closest('.et-dyn-wrap') && !e.target.closest('#et-dyn-submenu')) {
+                closeDynMenu();
             }
         });
+        // The flyout submenu is position:fixed, so a scroll/resize would detach it from its row —
+        // close it (the admin reopens with one click). Capture-phase catches scrolls in any container.
+        window.addEventListener('resize', _closeDynSubmenu);
+        window.addEventListener('scroll', _closeDynSubmenu, true);
     }
     
     // Audit log buttons
@@ -8910,6 +9248,7 @@ function renderVaultFiles() {
 
     setupFilesViewControls();
     updateFilesBulkBar();
+    updateMoveCopyBar();
 }
 
 function filesEmptyStateHtml(grid) {
@@ -8944,8 +9283,13 @@ function fileActionButtons(item, canWrite, opts) {
     if (isFolder) {
         const canRename = canWrite && vaultCapAllowed('file.rename');
         const canDelete = canWrite && vaultCapAllowed('folder.delete');
+        // Copy/Move a folder needs folder.create (the structural cap); a recursive copy also
+        // reads + writes files, gated server-side. Mirrors require_vault_cap on the endpoints.
+        const canStructure = canWrite && vaultCapAllowed('folder.create');
         if (slot !== 'primary') {  // folders have no download -> primary (left) is empty
             if (canRename) out.push(btn('rename-folder', 'edit', 'Rename'));
+            if (canStructure) out.push(btn('copy-folder', 'copy', 'Copy'));
+            if (canStructure) out.push(btn('move-folder', 'move', 'Move'));
             if (canDelete) out.push(btn('delete-folder', 'trash', 'Delete', true));
             if (vaultShareable()) out.push(btn('share-folder', 'link', 'Share'));
         }
@@ -8956,6 +9300,10 @@ function fileActionButtons(item, canWrite, opts) {
         const canDelete = canWrite && vaultCapAllowed('file.delete');
         if (slot !== 'primary') {
             if (canRename) out.push(btn('rename-file', 'edit', 'Rename'));
+            // Copy needs read (file.download); Move removes from the source (file.delete). The
+            // destination write is authorized at paste time, matching the endpoints.
+            if (canDownload) out.push(btn('copy-file', 'copy', 'Copy'));
+            if (canDelete) out.push(btn('move-file', 'move', 'Move'));
             if (canDelete) out.push(btn('delete-file', 'trash', 'Delete', true));
             if (vaultShareable()) out.push(btn('share-file', 'link', 'Share'));
             // Download last so it renders on the far RIGHT of the action cluster (grid + table).
@@ -9069,6 +9417,10 @@ function wireFileItemHandlers(container) {
             else if (action === 'rename-file' || action === 'rename-folder') renameVaultItem(id, name, action === 'rename-folder' ? 'folder' : 'file');
             else if (action === 'delete-file' || action === 'delete-folder') deleteVaultItem(id, name, action === 'delete-folder' ? 'folder' : 'file');
             else if (action === 'share-file' || action === 'share-folder') openCreateShareModal(action === 'share-folder' ? 'folder' : 'file', id, name);
+            else if (action === 'copy-file' || action === 'move-file')
+                stageForMoveCopy(id, name, 'file', action === 'move-file' ? 'move' : 'copy');
+            else if (action === 'copy-folder' || action === 'move-folder')
+                stageForMoveCopy(id, name, 'folder', action === 'move-folder' ? 'move' : 'copy');
         });
     });
     container.querySelectorAll('.file-check').forEach(cb => {
@@ -9108,6 +9460,90 @@ function updateFilesBulkBar() {
     }
 }
 
+// ---- Move / Copy clipboard --------------------------------------------------------------------
+// A small staging list: Copy/Move on an item adds it here (remembering which vault it came from);
+// "Paste here" drops the staged items into the vault + folder currently open. Copies stay staged so
+// they can be pasted in several places; moves leave once relocated. The source and destination vault
+// passwords are pulled from the per-vault remembered-unlock cache, so a paste into or out of a
+// password-protected vault works while it is unlocked (and fails cleanly with a prompt otherwise).
+function _moveCopyClip() {
+    if (!Array.isArray(state.moveCopyClip)) state.moveCopyClip = [];
+    return state.moveCopyClip;
+}
+
+function stageForMoveCopy(id, name, type, action) {
+    const clip = _moveCopyClip();
+    // Re-staging the same item replaces its pending action (Copy then Move, or vice-versa).
+    const existing = clip.find(e => e.id === id);
+    if (existing) { existing.action = action; existing.name = name; existing.type = type; }
+    else clip.push({ id, name, type, action, sourceVaultId: state.currentVaultId });
+    updateMoveCopyBar();
+    showToast(`${action === 'move' ? 'Moving' : 'Copying'}: ${name}. Open a folder or vault and Paste here.`, 'info');
+}
+
+function clearMoveCopy() {
+    state.moveCopyClip = [];
+    updateMoveCopyBar();
+}
+
+function updateMoveCopyBar() {
+    const clip = _moveCopyClip();
+    const bar = document.getElementById('move-copy-bar');
+    const countEl = document.getElementById('move-copy-count');
+    if (countEl) countEl.textContent = clip.length;
+    if (bar) bar.hidden = clip.length === 0;
+}
+
+function _vaultPasswordFor(vaultId) {
+    // The current vault's live password, else any per-vault remembered unlock (null if neither).
+    if (vaultId && state.currentVaultId && String(vaultId) === String(state.currentVaultId)) {
+        return state.vaultPassword || state.getRememberedVaultPassword(vaultId) || null;
+    }
+    return state.getRememberedVaultPassword(vaultId) || null;
+}
+
+async function pasteMoveCopy() {
+    const clip = _moveCopyClip();
+    if (!clip.length) return;
+    const destVaultId = state.currentVaultId;
+    if (!destVaultId) { showError('Open a vault to paste into.'); return; }
+    const destFolderId = state.currentFolderId || null;
+    const destPassword = _vaultPasswordFor(destVaultId);
+    const pasteBtn = document.getElementById('move-copy-paste');
+    if (pasteBtn) pasteBtn.disabled = true;
+
+    let ok = 0;
+    const failures = [];
+    const relocated = new Set();  // moved items that succeeded (leave the clipboard)
+    for (const entry of clip) {
+        const isFolder = entry.type === 'folder';
+        const verb = entry.action;  // 'copy' | 'move'
+        const base = `/vaults/${entry.sourceVaultId}/${isFolder ? 'folders' : 'files'}/${entry.id}/${verb}`;
+        const body = isFolder
+            ? { dest_vault_id: destVaultId, dest_parent_folder_id: destFolderId }
+            : { dest_vault_id: destVaultId, dest_folder_id: destFolderId };
+        const headers = {};
+        const srcPw = _vaultPasswordFor(entry.sourceVaultId);
+        if (srcPw) headers['X-Vault-Password'] = srcPw;
+        if (destPassword) headers['X-Dest-Vault-Password'] = destPassword;
+        try {
+            await apiRequest(base, { method: 'POST', body: JSON.stringify(body), headers, silent: true });
+            ok++;
+            if (verb === 'move') relocated.add(entry.id);
+        } catch (e) {
+            failures.push(`${entry.name}: ${(e && e.message) || 'failed'}`);
+        }
+    }
+
+    // Copies stay staged (paste again elsewhere); successful moves leave; failures stay.
+    state.moveCopyClip = clip.filter(e => !relocated.has(e.id));
+    updateMoveCopyBar();
+    if (pasteBtn) pasteBtn.disabled = false;
+    if (ok) showSuccess(`Pasted ${ok} item${ok > 1 ? 's' : ''}`);
+    if (failures.length) showError(`Could not paste ${failures.length}: ${failures.slice(0, 3).join('; ')}`);
+    await loadVaultFiles();
+}
+
 // Wire the view-switch, select-all and bulk-bar controls exactly once.
 function setupFilesViewControls() {
     if (state._filesCtrlWired) return;
@@ -9133,6 +9569,10 @@ function setupFilesViewControls() {
     if (del) del.addEventListener('click', bulkDeleteFiles);
     const clear = document.getElementById('files-bulk-clear');
     if (clear) clear.addEventListener('click', () => { if (state.selectedFileIds) state.selectedFileIds.clear(); renderVaultFiles(); });
+    const paste = document.getElementById('move-copy-paste');
+    if (paste) paste.addEventListener('click', pasteMoveCopy);
+    const clipClear = document.getElementById('move-copy-clear');
+    if (clipClear) clipClear.addEventListener('click', clearMoveCopy);
 }
 
 async function bulkDownloadFiles() {
@@ -13689,6 +14129,277 @@ async function loadUsersForPermission() {
 
 // Open a modal by id (several handlers referenced openModal but it was undefined,
 // so vault settings/permission buttons silently threw and did nothing).
+// ================= Notes =====================================================================
+// Personal server-side notes + "send note" (a snapshot copy to another user). Note text can be
+// masked with the "Hide note text" toggle (a local privacy screen, remembered per browser); the
+// per-note eye reveals one. All names/text render via _el (textContent) — never HTML.
+function _notesState() {
+    if (!state.notes) state.notes = [];
+    if (!state.notesReceived) state.notesReceived = [];
+    if (!(state.notesRevealed instanceof Set)) state.notesRevealed = new Set();
+    if (typeof state.notesHideText !== 'boolean') {
+        try { state.notesHideText = localStorage.getItem('notesHideText') === '1'; }
+        catch (_) { state.notesHideText = false; }
+    }
+    if (!state.notesTab) state.notesTab = 'mine';
+}
+
+async function loadNotes() {
+    _notesState();
+    wireNotesOnce();
+    const mine = document.getElementById('notes-list');
+    if (mine) mine.replaceChildren(_el('div', 'spinner'));
+    try {
+        const [a, b] = await Promise.all([apiRequest('/notes'), apiRequest('/notes/received')]);
+        state.notes = (a && a.notes) || [];
+        state.notesReceived = (b && b.notes) || [];
+        renderNotes();
+    } catch (e) {
+        if (mine) mine.replaceChildren(_el('div', 'alert alert-error', 'Failed to load notes: ' + ((e && e.message) || '')));
+    }
+}
+
+function renderNotes() {
+    _notesState();
+    const hideToggle = document.getElementById('notes-hide-toggle');
+    if (hideToggle) hideToggle.checked = state.notesHideText;
+    // Tabs
+    document.querySelectorAll('#notes-section .tab-btn[data-notes-tab]').forEach(
+        b => b.classList.toggle('active', b.getAttribute('data-notes-tab') === state.notesTab));
+    const mineTab = document.getElementById('notes-tab-mine');
+    const recvTab = document.getElementById('notes-tab-received');
+    if (mineTab) mineTab.style.display = state.notesTab === 'mine' ? '' : 'none';
+    if (recvTab) recvTab.style.display = state.notesTab === 'received' ? '' : 'none';
+    // Received count badge
+    const badge = document.getElementById('notes-received-count');
+    if (badge) {
+        badge.textContent = String(state.notesReceived.length);
+        badge.hidden = state.notesReceived.length === 0;
+    }
+    // My notes
+    const mine = document.getElementById('notes-list');
+    if (mine) {
+        if (!state.notes.length) {
+            mine.replaceChildren(_el('p', 'text-secondary p-md', 'No notes yet. Create one to get started.'));
+        } else {
+            mine.replaceChildren(...state.notes.map(n => _noteCard(n, false)));
+        }
+    }
+    // Received
+    const recv = document.getElementById('notes-received-list');
+    if (recv) {
+        if (!state.notesReceived.length) {
+            recv.replaceChildren(_el('p', 'text-secondary p-md', 'Notes other people send you will appear here.'));
+        } else {
+            recv.replaceChildren(...state.notesReceived.map(n => _noteCard(n, true)));
+        }
+    }
+}
+
+function _noteCard(n, received) {
+    const card = _el('div', 'card');
+    const bodyWrap = _el('div', 'card-body');
+    const head = _el('div', 'flex justify-between items-center gap-sm');
+    head.appendChild(_el('h3', 'text-lg font-bold', n.title || 'Untitled note'));
+    if (!received) {
+        // A plain inline button (NOT .vault-fav, which is position:absolute and would escape the
+        // card). The gold fill on the star marks the favourited state; the is-fav class is a hook.
+        const star = _el('button', 'btn btn-ghost btn-sm note-fav' + (n.is_favorite ? ' is-fav' : ''));
+        star.type = 'button';
+        star.setAttribute('aria-label', n.is_favorite ? 'Remove from favourites' : 'Add to favourites');
+        const ic = _svgIcon('star', 'icon-sm');
+        if (n.is_favorite) { ic.style.fill = '#f5b301'; ic.style.stroke = '#f5b301'; }
+        star.appendChild(ic);
+        star.addEventListener('click', () => toggleNoteFavorite(n.id, !n.is_favorite));
+        head.appendChild(star);
+    }
+    bodyWrap.appendChild(head);
+
+    if (received && n.sent_from) {
+        bodyWrap.appendChild(_el('div', 'text-secondary text-sm', 'Sent from ' + n.sent_from));
+    }
+
+    // Body — masked when the global hide is on and this note isn't individually revealed.
+    const masked = state.notesHideText && !state.notesRevealed.has(n.id);
+    const bodyRow = _el('div', 'flex items-center gap-sm mt-sm');
+    if (masked) {
+        bodyRow.appendChild(_el('span', 'text-tertiary', '•••••• hidden'));
+    } else {
+        bodyRow.appendChild(_el('div', 'note-body', n.body || ''));
+    }
+    if (state.notesHideText) {
+        const eye = _el('button', 'btn btn-ghost btn-sm');
+        eye.type = 'button';
+        eye.setAttribute('aria-label', masked ? 'Show note text' : 'Hide note text');
+        eye.appendChild(_svgIcon('eye', 'icon-sm'));
+        eye.addEventListener('click', () => {
+            if (state.notesRevealed.has(n.id)) state.notesRevealed.delete(n.id);
+            else state.notesRevealed.add(n.id);
+            renderNotes();
+        });
+        bodyRow.appendChild(eye);
+    }
+    bodyWrap.appendChild(bodyRow);
+
+    const actions = _el('div', 'flex gap-sm mt-md');
+    if (received) {
+        const adopt = _el('button', 'btn btn-primary btn-sm', 'Add to my notes');
+        adopt.type = 'button';
+        adopt.addEventListener('click', () => adoptNote(n.id));
+        actions.appendChild(adopt);
+    } else {
+        const edit = _el('button', 'btn btn-secondary btn-sm', 'Edit');
+        edit.type = 'button';
+        edit.addEventListener('click', () => openNoteEditor(n));
+        actions.appendChild(edit);
+        const send = _el('button', 'btn btn-ghost btn-sm', 'Send');
+        send.type = 'button';
+        send.addEventListener('click', () => openSendNote(n.id));
+        actions.appendChild(send);
+        const del = _el('button', 'btn btn-ghost btn-sm', 'Delete');
+        del.type = 'button';
+        del.addEventListener('click', () => deleteNoteItem(n.id, n.title));
+        actions.appendChild(del);
+    }
+    bodyWrap.appendChild(actions);
+    card.appendChild(bodyWrap);
+    return card;
+}
+
+function openNoteEditor(note) {
+    _notesState();
+    state.editingNoteId = note ? note.id : null;
+    const t = document.getElementById('note-editor-title-input');
+    const b = document.getElementById('note-editor-body-input');
+    const h = document.getElementById('note-editor-title');
+    if (t) t.value = note ? (note.title || '') : '';
+    if (b) b.value = note ? (note.body || '') : '';
+    if (h) h.textContent = note ? 'Edit note' : 'New note';
+    openModal('note-editor-modal');
+    if (t) t.focus();
+}
+
+async function saveNote() {
+    const t = document.getElementById('note-editor-title-input');
+    const b = document.getElementById('note-editor-body-input');
+    const title = (t && t.value) || '';
+    const body = (b && b.value) || '';
+    if (!title.trim() && !body.trim()) { showError('A note needs a title or some text'); return; }
+    try {
+        if (state.editingNoteId) {
+            await apiRequest('/notes/' + state.editingNoteId, { method: 'PATCH', body: JSON.stringify({ title, body }) });
+        } else {
+            await apiRequest('/notes', { method: 'POST', body: JSON.stringify({ title, body }) });
+        }
+        closeModal();
+        showSuccess('Note saved');
+        await loadNotes();
+    } catch (e) { showError((e && e.message) || 'Could not save the note'); }
+}
+
+async function toggleNoteFavorite(id, on) {
+    const n = (state.notes || []).find(x => x.id === id);
+    if (n) n.is_favorite = on;   // optimistic
+    renderNotes();
+    try { await apiRequest('/notes/' + id, { method: 'PATCH', body: JSON.stringify({ is_favorite: on }) }); await loadNotes(); }
+    catch (e) { if (n) n.is_favorite = !on; renderNotes(); showError((e && e.message) || 'Could not update the note'); }
+}
+
+async function deleteNoteItem(id, title) {
+    const ok = await showConfirm(`Delete note "${title || 'Untitled'}"? This cannot be undone.`);
+    if (!ok) return;
+    try { await apiRequest('/notes/' + id, { method: 'DELETE' }); showSuccess('Note deleted'); await loadNotes(); }
+    catch (e) { showError((e && e.message) || 'Could not delete the note'); }
+}
+
+async function adoptNote(id) {
+    try { await apiRequest('/notes/' + id + '/adopt', { method: 'POST' }); showSuccess('Added to your notes'); await loadNotes(); }
+    catch (e) { showError((e && e.message) || 'Could not add the note'); }
+}
+
+function openSendNote(id) {
+    state.sendingNoteId = id;
+    state.sendRecipientId = null;
+    const search = document.getElementById('note-send-search');
+    const results = document.getElementById('note-send-results');
+    const chosen = document.getElementById('note-send-chosen');
+    const confirm = document.getElementById('note-send-confirm');
+    if (search) search.value = '';
+    if (results) results.replaceChildren();
+    if (chosen) { chosen.hidden = true; chosen.textContent = ''; }
+    if (confirm) confirm.disabled = true;
+    openModal('note-send-modal');
+    if (search) search.focus();
+}
+
+let _noteSearchTimer = null;
+function onNoteRecipientSearch() {
+    const search = document.getElementById('note-send-search');
+    const results = document.getElementById('note-send-results');
+    if (!search || !results) return;
+    const q = search.value.trim();
+    if (_noteSearchTimer) clearTimeout(_noteSearchTimer);
+    if (q.length < 2) { results.replaceChildren(); return; }
+    _noteSearchTimer = setTimeout(async () => {
+        try {
+            const users = await apiRequest('/users/search?q=' + encodeURIComponent(q), { silent: true });
+            results.replaceChildren();
+            (users || []).slice(0, 8).forEach(u => {
+                const row = _el('button', 'btn btn-ghost btn-sm', u.username || u.email || u.id);
+                row.type = 'button';
+                row.style.display = 'block';
+                row.style.width = '100%';
+                row.style.textAlign = 'left';
+                row.addEventListener('click', () => {
+                    state.sendRecipientId = u.id;
+                    const chosen = document.getElementById('note-send-chosen');
+                    if (chosen) { chosen.hidden = false; chosen.textContent = 'Sending to: ' + (u.username || u.email || u.id); }
+                    const confirm = document.getElementById('note-send-confirm');
+                    if (confirm) confirm.disabled = false;
+                });
+                results.appendChild(row);
+            });
+            if (!users || !users.length) results.replaceChildren(_el('p', 'text-tertiary text-sm', 'No matching users'));
+        } catch (e) { results.replaceChildren(_el('p', 'text-tertiary text-sm', 'Search unavailable')); }
+    }, 250);
+}
+
+async function confirmSendNote() {
+    if (!state.sendingNoteId || !state.sendRecipientId) return;
+    const btn = document.getElementById('note-send-confirm');
+    if (btn) btn.disabled = true;
+    try {
+        await apiRequest('/notes/' + state.sendingNoteId + '/send',
+            { method: 'POST', body: JSON.stringify({ recipient_user_id: state.sendRecipientId }) });
+        closeModal();
+        showSuccess('Note sent');
+    } catch (e) { showError((e && e.message) || 'Could not send the note'); if (btn) btn.disabled = false; }
+}
+
+function wireNotesOnce() {
+    if (state._notesWired) return;
+    state._notesWired = true;
+    const nw = document.getElementById('note-new-btn');
+    if (nw) nw.addEventListener('click', () => openNoteEditor(null));
+    document.querySelectorAll('#notes-section .tab-btn[data-notes-tab]').forEach(b =>
+        b.addEventListener('click', () => { state.notesTab = b.getAttribute('data-notes-tab'); renderNotes(); }));
+    const hide = document.getElementById('notes-hide-toggle');
+    if (hide) hide.addEventListener('change', () => {
+        state.notesHideText = hide.checked;
+        try { localStorage.setItem('notesHideText', hide.checked ? '1' : '0'); } catch (_) {}
+        state.notesRevealed = new Set();  // a fresh mask reveals nothing
+        renderNotes();
+    });
+    const save = document.getElementById('note-editor-save');
+    if (save) save.addEventListener('click', saveNote);
+    const sendConfirm = document.getElementById('note-send-confirm');
+    if (sendConfirm) sendConfirm.addEventListener('click', confirmSendNote);
+    const sendSearch = document.getElementById('note-send-search');
+    if (sendSearch) sendSearch.addEventListener('input', onNoteRecipientSearch);
+    document.querySelectorAll('[data-note-close], [data-note-send-close]').forEach(el =>
+        el.addEventListener('click', closeModal));
+}
+
 function openModal(id) {
     const modal = document.getElementById(id);
     if (modal) modal.classList.add('active');
@@ -14086,6 +14797,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     loadVaults().catch(err => console.error('Failed to load vaults:', err));
                 } else if (section === 'shared') {
                     loadShared().catch(err => console.error('Failed to load shared items:', err));
+                } else if (section === 'notes') {
+                    loadNotes().catch(err => console.error('Failed to load notes:', err));
                 } else if (section === 'temp-creds') {
                     loadTempCreds().catch(err => console.error('Failed to load temp creds:', err));
                 } else if (section === 'users') {

@@ -1177,6 +1177,43 @@ class Notification(Base):
     )
 
 
+class Note(Base):
+    """A personal note (title + free text), owned by ONE account.
+
+    A WHOLE NEW TABLE, so init_db()'s create_all() builds it on already-deployed vaults without a
+    lightweight-migration entry (create_all never ALTERs). Notes are Standard/server-side (Q1 = a):
+    the server can read them; "hidden" is a UI privacy mask, not encryption. Every read/write MUST be
+    filtered to the requesting account (owner_id), and the FK cascades so deleting a user takes their
+    notes with it.
+
+    "Send note" is a SNAPSHOT COPY, never a live share (Q2b): sending note N to user B inserts a NEW
+    row owned by B with sent_from_user_id/-_name set and adopted=False — it appears in B's "sent to
+    me" list. B may edit their copy freely (it is theirs) and "add to my notes" flips adopted=True so
+    it joins B's own notes. No cascade, no revoke: the sender's later edits never touch B's copy.
+    """
+    __tablename__ = 'notes'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    title = Column(String(255), nullable=False, default='')
+    body = Column(Text, nullable=False, default='')
+    is_favorite = Column(Boolean, nullable=False, default=False)
+    # A received copy carries who sent it; a self-authored note leaves these NULL. sent_from_user_id
+    # SET NULL on the sender's deletion keeps the recipient's copy (only the attribution is lost).
+    sent_from_user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'),
+                               nullable=True)
+    sent_from_name = Column(String(255), nullable=True)
+    # False on a freshly-received copy (shows under "sent to me"); True once the recipient adopts it
+    # (or always True for a self-authored note). "My notes" = adopted rows; "sent to me" = the rest.
+    adopted = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_note_owner_adopted', 'owner_id', 'adopted'),
+    )
+
+
 class RateLimitRecord(Base):
     """Track rate limiting for login attempts."""
     __tablename__ = 'rate_limit_records'
@@ -1873,4 +1910,36 @@ class EmailResource(Base):
 
     __table_args__ = (
         Index('idx_email_resource_created', 'created_at'),
+    )
+
+
+class EmailAction(Base):
+    """A cataloged case where the vault sends an email (e.g. a password reset, an account invitation,
+    or an optional "notify on share" event), associated with the template used for it.
+
+    The catalog is SEEDED (never created/deleted through the API): ``key`` is a stable identifier the
+    application code references. A ``system`` action is one the vault must be able to send (its bound
+    template can't be removed and it's always on); an ``optional`` action is opt-in per admin via
+    ``enabled`` (the "notify by email" switch a future trigger consults). Delivery and dynamic-token
+    injection stay central — a trigger only calls the shared send helper with the action key.
+
+    This is a NEW table, so create_all() adds it cleanly on an existing deployment.
+    """
+    __tablename__ = 'email_actions'
+
+    key = Column(String(64), primary_key=True)          # stable code identifier, e.g. 'password_reset'
+    name = Column(String(120), nullable=False)
+    description = Column(String(500), nullable=False, default='')
+    category = Column(String(16), nullable=False, default='optional')   # 'system' | 'optional'
+    template_id = Column(UUID(as_uuid=True),
+                         ForeignKey('email_templates.id', ondelete='SET NULL'), nullable=True)
+    enabled = Column(Boolean, nullable=False, default=False)             # optional actions: the notify switch
+    updated_at = Column(DateTime, nullable=False,
+                        server_default=text("(now() AT TIME ZONE 'utc')"),
+                        default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    template = relationship("EmailTemplate")
+
+    __table_args__ = (
+        Index('idx_email_action_template', 'template_id'),
     )

@@ -53,6 +53,10 @@
     "0.13.0": {
       "released": "2026-08-23",
       "notes": "Account onboarding. Adds two tables (account_invitations, email_change_codes), created automatically and idempotently at boot by create_all; both are additive and unused by 0.12.0, so a rollback is clean -- take a backup before upgrading. Verified live: a 0.12.0 stack upgraded to 0.13.0 over the same volume creates both tables (schema complete) and self-signup works. Features: admin account invitations (mint / list / revoke, plus a public single-use accept link); public self-signup gated by an org policy (email requirement, signup domain allow/deny, login identifier username/email/either); self-service email change with an emailed one-time verification code; a last-admin-email lockout guard; and log-access fixes (web log-pull in the split-container shape plus a settings-tab overflow fix)."
+    },
+    "0.14.0": {
+      "released": "2026-08-24",
+      "notes": "Adds six additive tables (email_profiles, email_templates, email_resources for the Email Studio; notifications; notes; email_actions), all created automatically and idempotently at boot by create_all and unused by 0.13.0, so a rollback is clean -- take a backup before upgrading. Features: Email Studio (branded HTML email templates with grouped substitution tokens and automated-email actions that route the verification-code / password-reset / invitation emails through the template mechanism, with a fail-safe that never sends a system security email missing its code or link token); an in-app notification bell plus a reworked three-lane non-admin dashboard (What's waiting for you / Favourites / Most recent); move and copy for files and folders, within a vault and across Standard vaults (re-encrypting content under the destination binding; zero-knowledge cross-vault deferred); personal server-side notes with a snapshot 'send note' to other users; and a rate-limiter split giving per-chunk uploads and polled reads their own generous budgets so large uploads and normal polling are no longer throttled."
     }
   },
   "edges": [
@@ -66,7 +70,8 @@
     { "from": "0.11.0", "to": "0.11.1", "kind": "direct", "reversible": true, "requires_backup": false },
     { "from": "0.11.1", "to": "0.11.2", "kind": "direct", "reversible": true, "requires_backup": false },
     { "from": "0.11.2", "to": "0.12.0", "kind": "direct", "reversible": true, "requires_backup": false },
-    { "from": "0.12.0", "to": "0.13.0", "kind": "direct", "reversible": true, "requires_backup": true }
+    { "from": "0.12.0", "to": "0.13.0", "kind": "direct", "reversible": true, "requires_backup": true },
+    { "from": "0.13.0", "to": "0.14.0", "kind": "direct", "reversible": true, "requires_backup": true }
   ],
   "waivers": []
 }
