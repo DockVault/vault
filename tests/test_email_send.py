@@ -187,20 +187,68 @@ def test_auth_error_maps_to_auth_category(fake_smtp):
     assert ei.value.category == "auth"
 
 
-def test_transport_error_message_is_generic(fake_smtp):
+def test_profile_to_cfg_decrypts_the_stored_password(monkeypatch):
+    # System mail resolves its config through _profile_to_cfg; it MUST hand smtp_send the decrypted
+    # password (not the at-rest Fernet token), or an authenticated relay rejects every system email.
+    from cryptography.fernet import Fernet
+    from app.core import security
+    key = Fernet.generate_key().decode()
+    monkeypatch.setattr(security, "_runtime_settings", lambda: type("S", (), {"encryption_key": key})())
+    token = security.encrypt_secret("Auth-Pw-77")
+    assert token and token != "Auth-Pw-77"                       # genuinely encrypted at rest
+
+    class _P:
+        smtp_server = "relay.example.com"; smtp_port = 587; smtp_username = "svc"
+        smtp_password = token; from_email = "no-reply@example.com"; from_name = "V"
+        smtp_allow_insecure_tls = True
+
+    cfg = es._profile_to_cfg(_P())
+    assert cfg["smtp_password"] == "Auth-Pw-77"                   # decrypted for use
+    assert cfg["smtp_allow_insecure_tls"] is True                # per-profile TLS opt-out is carried
+
+
+def test_profile_to_cfg_passes_through_legacy_plaintext_password(monkeypatch):
+    # A profile written before at-rest encryption stores plaintext; decrypt_secret returns it as-is.
+    from cryptography.fernet import Fernet
+    from app.core import security
+    monkeypatch.setattr(security, "_runtime_settings",
+                        lambda: type("S", (), {"encryption_key": Fernet.generate_key().decode()})())
+
+    class _P:
+        smtp_server = "s"; smtp_port = 587; smtp_username = "u"
+        smtp_password = "legacy-plaintext-pw"; from_email = "f@x.test"; from_name = "N"
+        smtp_allow_insecure_tls = False
+
+    assert es._profile_to_cfg(_P())["smtp_password"] == "legacy-plaintext-pw"
+
+
+def _transport_message_for(exc):
     cfg = _cfg(smtp_port=465)
     orig = smtplib.SMTP_SSL
     def _mk(host, port, timeout=None, context=None):
         inst = orig(host, port, timeout)
-        inst.send_exc = ConnectionRefusedError("Connection refused to 10.0.0.1:22")
+        inst.send_exc = exc
         return inst
     smtplib.SMTP_SSL = _mk
-    with pytest.raises(es.EmailSendError) as ei:
-        es.smtp_send(cfg, _msg(cfg))
-    assert ei.value.category == "transport"
-    # The response must not distinguish the failure (no class name / host / detail) -> SSRF oracle.
-    assert "ConnectionRefused" not in ei.value.message
-    assert "10.0.0.1" not in ei.value.message
+    try:
+        with pytest.raises(es.EmailSendError) as ei:
+            es.smtp_send(cfg, _msg(cfg))
+        return ei.value
+    finally:
+        smtplib.SMTP_SSL = orig
+
+
+def test_transport_error_message_leaks_no_detail_and_gives_no_oracle(fake_smtp):
+    refused = _transport_message_for(ConnectionRefusedError("Connection refused to 10.0.0.1:22"))
+    filtered = _transport_message_for(smtplib.SMTPServerDisconnected("service not available"))
+    assert refused.category == "transport" and filtered.category == "transport"
+    # The message may echo the admin's OWN configured host:port (helpful), but must not leak the
+    # exception class/detail...
+    for m in (refused.message, filtered.message):
+        assert "ConnectionRefused" not in m and "SMTPServerDisconnected" not in m
+        assert "10.0.0.1" not in m and "not available" not in m
+    # ...and must be IDENTICAL across failure modes, so it can't be used to probe internal ports.
+    assert refused.message == filtered.message
 
 
 def test_missing_server_raises_config(fake_smtp):

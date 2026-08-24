@@ -1911,3 +1911,35 @@ class EmailResource(Base):
     __table_args__ = (
         Index('idx_email_resource_created', 'created_at'),
     )
+
+
+class EmailAction(Base):
+    """A cataloged case where the vault sends an email (e.g. a password reset, an account invitation,
+    or an optional "notify on share" event), associated with the template used for it.
+
+    The catalog is SEEDED (never created/deleted through the API): ``key`` is a stable identifier the
+    application code references. A ``system`` action is one the vault must be able to send (its bound
+    template can't be removed and it's always on); an ``optional`` action is opt-in per admin via
+    ``enabled`` (the "notify by email" switch a future trigger consults). Delivery and dynamic-token
+    injection stay central — a trigger only calls the shared send helper with the action key.
+
+    This is a NEW table, so create_all() adds it cleanly on an existing deployment.
+    """
+    __tablename__ = 'email_actions'
+
+    key = Column(String(64), primary_key=True)          # stable code identifier, e.g. 'password_reset'
+    name = Column(String(120), nullable=False)
+    description = Column(String(500), nullable=False, default='')
+    category = Column(String(16), nullable=False, default='optional')   # 'system' | 'optional'
+    template_id = Column(UUID(as_uuid=True),
+                         ForeignKey('email_templates.id', ondelete='SET NULL'), nullable=True)
+    enabled = Column(Boolean, nullable=False, default=False)             # optional actions: the notify switch
+    updated_at = Column(DateTime, nullable=False,
+                        server_default=text("(now() AT TIME ZONE 'utc')"),
+                        default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    template = relationship("EmailTemplate")
+
+    __table_args__ = (
+        Index('idx_email_action_template', 'template_id'),
+    )

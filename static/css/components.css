@@ -422,9 +422,15 @@
 .et-view.active { background: var(--surface-3); color: var(--text-primary); }
 .et-dyn-wrap { position: relative; display: inline-block; }
 .et-dyn-menu { position: absolute; top: 100%; left: 0; z-index: 20; min-width: 220px; background: var(--surface-0); border: 1px solid var(--surface-3); border-radius: var(--radius-md); box-shadow: var(--shadow-lg); padding: var(--space-xs); }
-.et-dyn-menu button { display: block; width: 100%; text-align: left; background: none; border: none; padding: 6px 10px; border-radius: var(--radius-sm); color: var(--text-primary); cursor: pointer; font-size: var(--text-sm); }
-.et-dyn-menu button:hover { background: var(--surface-2); }
-.et-dyn-menu .et-dyn-token { color: var(--text-tertiary); font-size: var(--text-xs); }
+/* The dynamic-action menu is a two-level list: a scrollable list of GROUP rows, each opening a
+   flyout submenu of tokens (positioned in JS, viewport-aware so it flips up/left near an edge). */
+.et-dyn-group { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; text-align: left; background: none; border: none; padding: 7px 10px; border-radius: var(--radius-sm); color: var(--text-primary); cursor: pointer; font-size: var(--text-sm); }
+.et-dyn-group:hover, .et-dyn-group.active { background: var(--surface-2); }
+.et-dyn-chevron { color: var(--text-tertiary); font-size: var(--text-xs); }
+.et-dyn-submenu { position: fixed; z-index: 70; min-width: 230px; max-height: 60vh; overflow-y: auto; background: var(--surface-0); border: 1px solid var(--surface-3); border-radius: var(--radius-md); box-shadow: var(--shadow-lg); padding: var(--space-xs); }
+.et-dyn-submenu button { display: block; width: 100%; text-align: left; background: none; border: none; padding: 5px 10px; border-radius: var(--radius-sm); color: var(--text-primary); cursor: pointer; font-size: var(--text-sm); }
+.et-dyn-submenu button:hover { background: var(--surface-2); }
+.et-dyn-submenu .et-dyn-token { color: var(--text-tertiary); font-size: var(--text-xs); }
 .et-panes { display: grid; gap: var(--space-md); }
 .et-panes.et-view-code { grid-template-columns: 1fr; }
 .et-panes.et-view-render { grid-template-columns: 1fr; }
@@ -438,6 +444,52 @@
 .et-image-item:hover { border-color: var(--text-secondary); }
 .et-image-item img { width: 100%; height: 72px; object-fit: contain; background: #fff; border-radius: var(--radius-sm); }
 .et-image-item .et-image-name { font-size: var(--text-xs); color: var(--text-tertiary); overflow-wrap: anywhere; text-align: center; max-width: 100%; }
+.et-image-size-row { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-sm); margin-top: var(--space-sm); }
+.et-image-size-row label { font-size: var(--text-sm); color: var(--text-secondary); }
+.et-image-size-row select { width: auto; min-width: 150px; }
+.et-image-size-row input[type="number"] { width: auto; min-width: 110px; }
+
+/* An info/help box that flows as normal text. Deliberately NOT `.alert`, whose flex layout scatters
+   inline <strong>/<em> into separate flex items. */
+.email-hint {
+    font-size: var(--text-sm); line-height: 1.55; color: var(--text-secondary);
+    background: color-mix(in srgb, var(--info) 8%, var(--surface-1));
+    border: 1px solid color-mix(in srgb, var(--info) 22%, transparent);
+    border-left: 3px solid var(--info);
+    border-radius: var(--radius-md); padding: var(--space-sm) var(--space-md);
+    margin-bottom: var(--space-md);
+}
+.email-hint strong { color: var(--text-primary); font-weight: 600; }
+.email-hint code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .92em; background: var(--surface-3); padding: 0 4px; border-radius: var(--radius-sm); }
+
+/* Automated-email (action) rows + the "bound to an action" badge on a template card. */
+.email-action-row { border: 1px solid var(--surface-3); border-radius: var(--radius-md); padding: var(--space-md); margin-bottom: var(--space-sm); background: var(--surface-1); }
+.ear-head { display: flex; align-items: center; gap: var(--space-sm); }
+.ear-name { font-weight: 600; color: var(--text-primary); }
+.ear-badge { font-size: var(--text-xs); padding: 1px 8px; border-radius: 999px; }
+.ear-badge-system { background: color-mix(in srgb, var(--info) 18%, transparent); color: var(--info); }
+.ear-badge-optional { background: var(--surface-3); color: var(--text-secondary); }
+.ear-desc { font-size: var(--text-sm); color: var(--text-secondary); margin: 4px 0 8px; }
+.ear-controls { display: flex; align-items: flex-end; flex-wrap: wrap; gap: var(--space-md); }
+.ear-field { display: flex; flex-direction: column; gap: 2px; font-size: var(--text-xs); color: var(--text-secondary); }
+.ear-template { min-width: 220px; width: auto; }
+.ear-notify { margin: 0; }
+.ear-msg { min-width: 60px; }
+.epc-badge { font-size: var(--text-xs); padding: 1px 7px; border-radius: 999px; margin-left: 6px; }
+.epc-badge-system { background: color-mix(in srgb, var(--info) 18%, transparent); color: var(--info); }
+.epc-badge-inuse { background: var(--surface-3); color: var(--text-secondary); }
+
+/* The editor card must let the dynamic-action dropdown escape (it otherwise clips against the card's
+   `overflow:hidden`); the ID beats `.card`. */
+#email-template-editor { overflow: visible; }
+/* Group list scrolls after ~4 rows (5 groups today), so the top-level menu stays compact. */
+.et-dyn-menu { z-index: 60; max-height: 168px; overflow-y: auto; min-width: 200px; }
+
+/* Give the code textarea and render iframe an adequate, EQUAL min-height so switching Code/Render
+   doesn't jump. The ID+2-class selector beats `#settings-section .form-control`, which otherwise caps
+   the textarea at 32px. */
+#email-template-editor .et-panes .et-code,
+#email-template-editor .et-panes .et-render { min-height: 480px; }
 
 @keyframes slideUp {
     from {

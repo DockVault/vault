@@ -5512,10 +5512,21 @@ async def request_email_change(
             code_hash=hash_code(code, settings.jwt_secret_key),
             expires_at=datetime.utcnow() + timedelta(minutes=CODE_TTL_MINUTES)))
         db.commit()
-        _send_email(db, to_addr=new_email, subject="Confirm your new email address",
-                    body=(f"Enter this code to confirm your new email address:\n\n    {code}\n\n"
-                          f"The code expires in {CODE_TTL_MINUTES} minutes. "
-                          f"If you didn't request this change, you can ignore this email."))
+        # Route through the central action helper so this uses the admin-customizable "email_change"
+        # template (its {{action.code}} / {{action.expires}} tokens). raise_errors preserves the prior
+        # behavior: a clean 400/502 on a config/transport failure rather than a silent miss.
+        from app.core.email_actions import send_action_email
+        from app.core import email_send as _es
+        try:
+            send_action_email(
+                db, "email_change",
+                recipient={"email": new_email, "username": user.username},
+                action_context={"code": code, "expires": f"in {CODE_TTL_MINUTES} minutes"},
+                raise_errors=True)
+        except _es.EmailSendError as e:
+            code_status = (status.HTTP_400_BAD_REQUEST if e.category == "config"
+                           else status.HTTP_502_BAD_GATEWAY)
+            raise HTTPException(status_code=code_status, detail=e.message)
     try:
         AuditLogger(db).log_action(action="email_change_requested", status="success", user=user,
                                    ip_address=get_client_ip(request), details={})
@@ -14180,9 +14191,13 @@ def _seed_default_email_profile():
     try:
         from app.core.database import get_db_context
         from app.core import email_send
+        from app.core.email_actions import seed_email_actions
         with get_db_context() as db:
             if email_send.seed_default_profile(db):
                 print("[OK] Seeded default email sending profile from legacy SMTP config")
+            n = seed_email_actions(db)
+            if n:
+                print(f"[OK] Seeded {n} automated-email action(s)")
     except Exception as e:
         print(f"⚠ Default email profile seed skipped: {e}")
 

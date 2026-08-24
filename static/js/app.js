@@ -6326,7 +6326,7 @@ function setupSettingsTabs() {
             if (tabId === 'logs') { loadLogSettings(); }  // refresh on tab open
             if (tabId === 'sharing') { setupShareTagsUI(); loadShareTags(); }  // wire (idempotent) + refresh
             if (tabId === 'accounts') { setupAccountsPolicyUI(); refreshAccountsPolicyUI(); }  // wire + reflect deps
-            if (tabId === 'email') { loadEmailProfiles(); loadEmailTemplates(); }  // refresh profiles + templates on tab open
+            if (tabId === 'email') { loadEmailProfiles(); loadEmailTemplates(); loadEmailActions(); }  // refresh profiles + templates + actions on tab open
         });
     });
 }
@@ -8176,6 +8176,15 @@ function buildEmailTemplateCard(t) {
     card.className = 'email-profile-card'; card.setAttribute('role', 'listitem'); card.dataset.templateId = t.id;
     const title = document.createElement('div'); title.className = 'epc-title';
     const name = document.createElement('span'); name.textContent = t.name || '(untitled)'; title.appendChild(name);
+    if (t.bound_action) {
+        const isSys = t.bound_action.category === 'system';
+        const badge = document.createElement('span');
+        badge.className = 'epc-badge ' + (isSys ? 'epc-badge-system' : 'epc-badge-inuse');
+        badge.textContent = isSys ? 'System' : 'In use';
+        badge.title = 'Used by the ' + (isSys ? 'system' : 'automated') + ' email “' + t.bound_action.name +
+            '” — change that action first to delete this template.';
+        title.appendChild(badge);
+    }
     card.appendChild(title);
     const desc = document.createElement('div'); desc.className = 'epc-desc'; desc.textContent = t.description || ''; card.appendChild(desc);
     const meta = document.createElement('div'); meta.className = 'epc-meta';
@@ -8187,15 +8196,110 @@ function buildEmailTemplateCard(t) {
     }
     card.appendChild(meta);
     const actions = document.createElement('div'); actions.className = 'epc-actions';
-    for (const [label, cls, fn] of [['Edit', 'etc-edit', () => openTemplateEditor(t)],
-                                    ['Send', 'etc-send', () => openSendModal(t)],
-                                    ['Delete', 'etc-delete', () => deleteTemplate(t)]]) {
+    const rowDefs = [['Edit', 'etc-edit', () => openTemplateEditor(t)],
+                     ['Send', 'etc-send', () => openSendModal(t)]];
+    if (!t.bound_action) rowDefs.push(['Delete', 'etc-delete', () => deleteTemplate(t)]);   // bound = non-removable
+    for (const [label, cls, fn] of rowDefs) {
         const b = document.createElement('button'); b.type = 'button';
         b.className = 'btn btn-secondary btn-sm ' + cls; b.textContent = label;
         b.addEventListener('click', fn); actions.appendChild(b);
     }
     card.appendChild(actions);
     return card;
+}
+
+// ---- Automated emails (actions) ------------------------------------------------------------------
+async function loadEmailActions() {
+    const list = document.getElementById('email-actions-list');
+    if (!list) return;
+    try {
+        const [actions, templates] = await Promise.all([
+            apiRequest('/email/actions', { silent: true }),
+            apiRequest('/email/templates', { silent: true }),
+        ]);
+        renderEmailActions((actions && actions.actions) || [], (templates && templates.templates) || []);
+    } catch (e) { list.replaceChildren(); }
+}
+
+function renderEmailActions(actions, templates) {
+    const list = document.getElementById('email-actions-list');
+    list.replaceChildren();
+    actions.forEach(a => list.appendChild(buildActionRow(a, templates)));
+}
+
+function buildActionRow(a, templates) {
+    const row = document.createElement('div');
+    row.className = 'email-action-row'; row.setAttribute('role', 'listitem'); row.dataset.actionKey = a.key;
+
+    const head = document.createElement('div'); head.className = 'ear-head';
+    const nm = document.createElement('span'); nm.className = 'ear-name'; nm.textContent = a.name; head.appendChild(nm);
+    const badge = document.createElement('span');
+    badge.className = 'ear-badge ' + (a.category === 'system' ? 'ear-badge-system' : 'ear-badge-optional');
+    badge.textContent = a.category === 'system' ? 'System' : 'Optional';
+    head.appendChild(badge);
+    row.appendChild(head);
+
+    const desc = document.createElement('div'); desc.className = 'ear-desc'; desc.textContent = a.description || ''; row.appendChild(desc);
+
+    const controls = document.createElement('div'); controls.className = 'ear-controls';
+    // template picker
+    const tplWrap = document.createElement('label'); tplWrap.className = 'ear-field';
+    tplWrap.appendChild(document.createTextNode('Template'));
+    const sel = document.createElement('select'); sel.className = 'form-control ear-template';
+    const optDefault = document.createElement('option');
+    optDefault.value = '';
+    optDefault.textContent = a.category === 'system' ? 'Built-in default' : '(none — don’t send)';
+    sel.appendChild(optDefault);
+    templates.forEach(t => {
+        const o = document.createElement('option'); o.value = t.id; o.textContent = t.name || '(untitled)';
+        if (a.template_id === t.id) o.selected = true;
+        sel.appendChild(o);
+    });
+    sel.addEventListener('change', () => saveAction(a.key, { template_id: sel.value || null }));
+    tplWrap.appendChild(sel); controls.appendChild(tplWrap);
+
+    // notify toggle (optional actions only)
+    if (a.category !== 'system') {
+        const tog = document.createElement('label'); tog.className = 'checkbox-label ear-notify';
+        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!a.enabled;
+        cb.addEventListener('change', () => saveAction(a.key, { enabled: cb.checked }));
+        tog.appendChild(cb); tog.appendChild(document.createTextNode(' Notify by email'));
+        controls.appendChild(tog);
+    }
+
+    const test = document.createElement('button'); test.type = 'button';
+    test.className = 'btn btn-secondary btn-sm ear-test'; test.textContent = '📧 Send test';
+    test.addEventListener('click', () => testAction(a.key, row));
+    controls.appendChild(test);
+
+    const msg = document.createElement('span'); msg.className = 'ear-msg text-sm'; msg.setAttribute('role', 'status'); controls.appendChild(msg);
+    row.appendChild(controls);
+    return row;
+}
+
+async function saveAction(key, patch) {
+    try {
+        await apiRequest('/email/actions/' + encodeURIComponent(key), { method: 'PUT', body: JSON.stringify(patch) });
+        await loadEmailActions();          // reflect the new binding + re-badge templates
+        await loadEmailTemplates();
+    } catch (e) {
+        showError((e && e.message) || 'Could not update the automated email.');
+        await loadEmailActions();          // revert the control to the stored state
+    }
+}
+
+async function testAction(key, row) {
+    const msg = row.querySelector('.ear-msg');
+    const to = prompt('Send a test of this email to which address?');
+    if (to === null) return;
+    if (msg) { msg.textContent = 'Sending…'; msg.style.color = 'var(--text-secondary)'; }
+    try {
+        const r = await apiRequest('/email/actions/' + encodeURIComponent(key) + '/test',
+            { method: 'POST', body: JSON.stringify({ to_addr: (to || '').trim() }) });
+        if (msg) { msg.textContent = '✓ ' + ((r && r.message) || 'Test sent'); msg.style.color = 'var(--success)'; }
+    } catch (e) {
+        if (msg) { msg.textContent = '✗ ' + ((e && e.message) || 'Test failed'); msg.style.color = 'var(--error)'; }
+    }
 }
 
 async function openTemplateEditor(t) {
@@ -8245,6 +8349,7 @@ async function openTemplateEditor(t) {
 function closeTemplateEditor() {
     document.getElementById('email-template-editor').hidden = true;
     _editingTemplateId = null;
+    closeDynMenu();   // dismiss the body-level flyout submenu so it can't orphan
 }
 
 function setEditorView(view) {
@@ -8362,25 +8467,86 @@ function applyEditorFormat(fmt) {
     if (m) _etWrap(m[0], m[1], m[2]);
 }
 
+let _dynGroups = null;   // cached [{group, actions:[{token,label,description}]}]
+
+function _groupsFromFlat(data) {
+    // Fallback if the server returns only the flat `actions` list (older backend).
+    return [{ group: 'Tokens', actions: (data && data.actions) || [] }];
+}
+
+function closeDynMenu() {
+    const menu = document.getElementById('et-dyn-menu');
+    if (menu) menu.hidden = true;
+    const btn = document.getElementById('et-add-dynamic');
+    if (btn) btn.setAttribute('aria-expanded', 'false');
+    _closeDynSubmenu();
+}
+
+function _closeDynSubmenu() {
+    const sub = document.getElementById('et-dyn-submenu');
+    if (sub) sub.remove();
+    document.querySelectorAll('.et-dyn-group.active').forEach(r => r.classList.remove('active'));
+}
+
 async function toggleDynamicMenu() {
     const menu = document.getElementById('et-dyn-menu');
     const btn = document.getElementById('et-add-dynamic');
-    if (!menu.hidden) { menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); return; }
+    if (!menu.hidden) { closeDynMenu(); return; }
     menu.replaceChildren();
+    _closeDynSubmenu();
     try {
-        const data = await apiRequest('/email/dynamic-actions', { silent: true });
-        (data && data.actions || []).forEach(a => {
-            const b = document.createElement('button'); b.type = 'button'; b.setAttribute('role', 'menuitem');
-            const lbl = document.createElement('div'); lbl.textContent = a.label;
-            const tok = document.createElement('div'); tok.className = 'et-dyn-token'; tok.textContent = '{{' + a.token + '}}';
-            b.appendChild(lbl); b.appendChild(tok);
-            b.addEventListener('click', () => {
-                _etInsertText('{{' + a.token + '}}'); menu.hidden = true; btn.setAttribute('aria-expanded', 'false');
-            });
-            menu.appendChild(b);
+        if (!_dynGroups) {
+            const data = await apiRequest('/email/dynamic-actions', { silent: true });
+            _dynGroups = (data && Array.isArray(data.groups) && data.groups.length) ? data.groups : _groupsFromFlat(data);
+        }
+        _dynGroups.forEach(g => {
+            const row = document.createElement('button');
+            row.type = 'button'; row.className = 'et-dyn-group'; row.setAttribute('role', 'menuitem');
+            row.setAttribute('aria-haspopup', 'true'); row.setAttribute('aria-expanded', 'false');
+            const name = document.createElement('span'); name.textContent = g.group;
+            const chev = document.createElement('span'); chev.className = 'et-dyn-chevron'; chev.textContent = '▸';
+            row.appendChild(name); row.appendChild(chev);
+            row.addEventListener('click', (e) => { e.stopPropagation(); openDynGroupSubmenu(row, g); });
+            menu.appendChild(row);
         });
     } catch (e) {}
     menu.hidden = false; btn.setAttribute('aria-expanded', 'true');
+}
+
+function openDynGroupSubmenu(row, group) {
+    const existing = document.getElementById('et-dyn-submenu');
+    if (existing && existing.dataset.group === group.group) { _closeDynSubmenu(); return; }  // toggle
+    _closeDynSubmenu();
+    const sub = document.createElement('div');
+    sub.id = 'et-dyn-submenu'; sub.className = 'et-dyn-submenu'; sub.dataset.group = group.group;
+    sub.setAttribute('role', 'menu');
+    (group.actions || []).forEach(a => {
+        const b = document.createElement('button'); b.type = 'button'; b.setAttribute('role', 'menuitem');
+        if (a.description) b.title = a.description;
+        const lbl = document.createElement('div'); lbl.textContent = a.label;
+        const tok = document.createElement('div'); tok.className = 'et-dyn-token'; tok.textContent = '{{' + a.token + '}}';
+        b.appendChild(lbl); b.appendChild(tok);
+        b.addEventListener('click', (e) => { e.stopPropagation(); _etInsertText('{{' + a.token + '}}'); closeDynMenu(); });
+        sub.appendChild(b);
+    });
+    document.body.appendChild(sub);     // body-level so no ancestor overflow can clip it
+    row.classList.add('active'); row.setAttribute('aria-expanded', 'true');
+    _positionDynSubmenu(sub, row);
+}
+
+function _positionDynSubmenu(sub, row) {
+    // Flyout beside the group row; flip LEFT if it would overflow the right edge, and flip UP
+    // (bottom-align to the row) if it would overflow the viewport bottom. position:fixed => the
+    // getBoundingClientRect coordinates are already viewport-relative.
+    const rr = row.getBoundingClientRect();
+    const sw = sub.offsetWidth, sh = sub.offsetHeight;
+    const vw = window.innerWidth, vh = window.innerHeight, m = 8;
+    let left = rr.right + 4;
+    if (left + sw > vw - m) left = Math.max(m, rr.left - sw - 4);   // no room right -> go left
+    let top = rr.top;
+    if (top + sh > vh - m) top = Math.max(m, rr.bottom - sh);       // no room below -> flip up
+    sub.style.left = Math.round(left) + 'px';
+    sub.style.top = Math.round(top) + 'px';
 }
 
 async function openImagePicker() {
@@ -8421,8 +8587,29 @@ async function buildImageThumb(res) {
     const name = document.createElement('div'); name.className = 'et-image-name'; name.textContent = res.filename || res.id;
     item.appendChild(img); item.appendChild(name);
     // Insert only the UUID reference (no path/URL); alt is added by the admin if wanted.
-    item.addEventListener('click', () => { _etInsertText('<img data-resource-id="' + res.id + '">'); closeModal(); });
+    item.addEventListener('click', () => { _etInsertText(_etImageMarkup(res.id)); closeModal(); });
     return item;
+}
+
+// Build the <img> markup for an inserted resource, honoring the size picker. Emits a `width` (which
+// the sanitizer allows and the preview/send both render) unless "Original" (0) is chosen. Never emits
+// a path/URL — only the UUID reference.
+function _etImageMarkup(resourceId) {
+    let w = 0;
+    const sizeSel = document.getElementById('et-image-size');
+    if (sizeSel) {
+        if (sizeSel.value === 'custom') {
+            const c = document.getElementById('et-image-custom-width');
+            w = c ? parseInt(c.value, 10) : 0;
+        } else {
+            w = parseInt(sizeSel.value, 10);
+        }
+    }
+    if (Number.isFinite(w) && w > 0) {
+        w = Math.min(2000, Math.max(1, w));
+        return '<img data-resource-id="' + resourceId + '" width="' + w + '">';
+    }
+    return '<img data-resource-id="' + resourceId + '">';
 }
 
 async function uploadImageResource(file) {
@@ -8697,17 +8884,24 @@ function attachSettingsListeners() {
         if (etAddDyn) etAddDyn.addEventListener('click', (e) => { e.stopPropagation(); toggleDynamicMenu(); });
         const etImgUpload = document.getElementById('et-image-upload');
         if (etImgUpload) etImgUpload.addEventListener('change', (e) => { if (e.target.files[0]) uploadImageResource(e.target.files[0]); });
+        const etImgSize = document.getElementById('et-image-size');
+        if (etImgSize) etImgSize.addEventListener('change', () => {
+            const c = document.getElementById('et-image-custom-width');
+            if (c) c.hidden = (etImgSize.value !== 'custom');
+        });
         const etSendGo = document.getElementById('et-send-go');
         if (etSendGo) etSendGo.addEventListener('click', sendTemplateNow);
-        // Close the dynamic-action menu on an outside click.
+        // Close the dynamic-action menu (and its body-level flyout submenu) on an outside click.
         document.addEventListener('click', (e) => {
             const menu = document.getElementById('et-dyn-menu');
-            if (menu && !menu.hidden && !e.target.closest('.et-dyn-wrap')) {
-                menu.hidden = true;
-                const b = document.getElementById('et-add-dynamic');
-                if (b) b.setAttribute('aria-expanded', 'false');
+            if (menu && !menu.hidden && !e.target.closest('.et-dyn-wrap') && !e.target.closest('#et-dyn-submenu')) {
+                closeDynMenu();
             }
         });
+        // The flyout submenu is position:fixed, so a scroll/resize would detach it from its row —
+        // close it (the admin reopens with one click). Capture-phase catches scrolls in any container.
+        window.addEventListener('resize', _closeDynSubmenu);
+        window.addEventListener('scroll', _closeDynSubmenu, true);
     }
     
     // Audit log buttons
