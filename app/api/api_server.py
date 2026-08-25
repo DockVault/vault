@@ -15196,34 +15196,27 @@ async def cleanup_expired_sessions():
         except Exception as e:
             print(f"❌ Error in session cleanup task: {e}")
 
-def _seed_admin_user():
-    """
-    Bootstrap an admin user from ADMIN_USERNAME/ADMIN_PASSWORD when no users
-    exist yet. This lets env-configured deployments log in without manual database
-    bootstrap. No-op if an admin already exists or
-    no admin password is configured.
+def _seed_admin_user(db=None):
+    """Bootstrap the FIRST admin from ADMIN_USERNAME/ADMIN_PASSWORD, exactly ONCE per deployment.
+
+    The logic lives in app.core.admin_bootstrap (side-effect-free, so it is unit-testable against a
+    throwaway database). Seed-once is enforced by an ``admin_bootstrap`` marker in ``system_settings``:
+    once bootstrapped, or once any admin exists, this refuses to seed again - so a later ADMIN_USERNAME
+    change in ``.env`` can no longer mint a new admin. No-op if already bootstrapped / an admin exists
+    / no password is configured. ``db`` is an injection seam for tests; production passes None and a
+    session is opened here.
     """
     try:
-        from app.core.database import get_db_context
-        from app.services.auth_service import AuthService
-        from app.core.models import RoleEnum, User
+        from app.core.admin_bootstrap import bootstrap_admin
 
-        # Match the app/core/config.py guard's emptiness definition: a whitespace-only value is "blank"
-        # (the post-bootstrap no-op state), not a credential to seed.
-        if not (settings.admin_password or "").strip():
-            return
-        with get_db_context() as db:
-            if db.query(User).filter(User.username == settings.admin_username).first():
-                return
-            AuthService(db).create_user(
-                username=settings.admin_username,
-                email=settings.admin_email or "admin@local",
-                password=settings.admin_password,
-                role=RoleEnum.ADMIN,
-            )
-            print(f"[OK] Bootstrapped admin user '{settings.admin_username}' from environment")
+        if db is not None:
+            return bootstrap_admin(db)
+        from app.core.database import get_db_context
+        with get_db_context() as session:
+            return bootstrap_admin(session)
     except Exception as e:
         print(f"⚠ Admin bootstrap skipped: {e}")
+        return "error"
 
 
 # Starter share-tag set seeded onto a FRESH deployment so sharing is usable out of the box. The
