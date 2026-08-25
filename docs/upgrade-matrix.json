@@ -65,6 +65,10 @@
     "0.16.0": {
       "released": "2026-08-25",
       "notes": "Email templates & automation, plus notes-UX fixes. Schema: one additive nullable column, email_templates.default_key (created by create_all on a fresh DB, and by the boot DDL ADD COLUMN IF NOT EXISTS on an existing one), plus a partial-unique index over it -- marks a template as the built-in default for an automated-email action; boot seeds a default template per action and pre-binds each action to its default (idempotent, never overwriting an admin's own template or 'none' choice). Two additive tables: otp_codes (the durable fallback for a generalized one-time-code service -- codes live in Redis first, this table when Redis is down; it supersedes email_change_codes, which is retained but no longer written) and password_reset_tokens (single-use, hashed-at-rest tokens for self-service and admin-triggered password-reset links). All additive and unused by 0.15.0, so a rollback is clean -- take a backup before upgrading. Features: a generalized OTP service backing email verification and password reset; self-service + admin-triggered password reset via emailed links; default email templates seeded with 'Load from default' in the Email Studio; and log redaction of sensitive values. Also folds in notes follow-up fixes: the sidebar no longer collapses when a very long note is present; the public-link creator gains a working Done button and disables 'never expires' under a lifetime-capped tag; the Shared tab refreshes live and can view a link's frozen snapshot; the active Notes tab persists across reload; a My-notes count badge; and a new admin 'maximum note size' setting."
+    },
+    "0.16.1": {
+      "released": "2026-08-25",
+      "notes": "No schema change; same physical schema as 0.16.0. Fix: an automated-email SYSTEM action (password reset / account invite / email change) whose built-in default template existed but was left unbound is now bound to it at boot, so editing that template in the Email Studio applies to the sent email instead of being a silent no-op (the send path reads the bound template; an unbound system action previously fell back to the built-in body). Only SYSTEM actions are self-healed -- their 'none' equals the built-in body the default template already carries, so binding never changes what is sent; OPTIONAL actions keep an admin's explicit 'none', and an admin's own custom binding is never overwritten. A rollback is clean and needs no backup."
     }
   },
   "edges": [
@@ -81,7 +85,8 @@
     { "from": "0.12.0", "to": "0.13.0", "kind": "direct", "reversible": true, "requires_backup": true },
     { "from": "0.13.0", "to": "0.14.0", "kind": "direct", "reversible": true, "requires_backup": true },
     { "from": "0.14.0", "to": "0.15.0", "kind": "direct", "reversible": true, "requires_backup": true },
-    { "from": "0.15.0", "to": "0.16.0", "kind": "direct", "reversible": true, "requires_backup": true }
+    { "from": "0.15.0", "to": "0.16.0", "kind": "direct", "reversible": true, "requires_backup": true },
+    { "from": "0.16.0", "to": "0.16.1", "kind": "direct", "reversible": true, "requires_backup": false }
   ],
   "waivers": []
 }

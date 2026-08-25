@@ -149,9 +149,11 @@ def test_default_template_payloads_match_the_catalog():
 # rules (create-if-missing, bind-only-when-unbound, never-recreate) are pinned without a live DB.
 # ------------------------------------------------------------------------------------------------
 class _FakeAction:
-    def __init__(self, key, template_id=None):
+    def __init__(self, key, template_id=None, category=None):
         self.key = key
         self.template_id = template_id
+        # Real category drives the self-heal (SYSTEM actions bind to their default when unbound).
+        self.category = category if category is not None else ea.SPEC_BY_KEY.get(key, {}).get("category", ea.OPTIONAL)
 
 
 class _FakeQuery:
@@ -232,12 +234,42 @@ def test_seed_creates_all_defaults_and_binds_unbound_actions():
 
 
 def test_seed_is_idempotent_when_defaults_already_exist():
-    # Existing default rows for every key -> nothing created, nothing re-bound.
+    # Existing default rows for every key -> nothing CREATED. Unbound SYSTEM actions are self-healed
+    # (bound to their existing default); OPTIONAL actions keep their "none".
     existing = {k: _FakeTemplate(default_key=k) for k in ea.DEFAULT_TEMPLATES}
     sess = _FakeSession(existing_templates=existing, actions=_all_actions_unbound())
     n = ea.seed_default_templates(sess)
-    assert n == 0
-    assert all(a.template_id is None for a in sess.actions.values())   # untouched on a re-seed
+    assert n == 0                                                     # no new rows
+    for key in ea.DEFAULT_TEMPLATES:
+        if ea.SPEC_BY_KEY[key]["category"] == ea.SYSTEM:
+            assert sess.actions[key].template_id == existing[key].id  # SYSTEM: self-healed
+        else:
+            assert sess.actions[key].template_id is None             # OPTIONAL: untouched
+
+
+def test_seed_self_heals_only_unbound_system_actions_when_defaults_exist():
+    # The reported bug: default rows exist but the actions were never bound (created before the action
+    # rows). A re-seed must bind the SYSTEM actions so editing their default template actually applies,
+    # while leaving an OPTIONAL action's explicit "none" alone.
+    existing = {k: _FakeTemplate(default_key=k) for k in ea.DEFAULT_TEMPLATES}
+    sess = _FakeSession(existing_templates=existing, actions=_all_actions_unbound())
+    ea.seed_default_templates(sess)
+    for sys_key in ("password_reset", "account_invite", "email_change"):
+        assert sess.actions[sys_key].template_id == existing[sys_key].id
+    for opt_key in ("login_alert", "share_created", "account_welcome"):
+        assert sess.actions[opt_key].template_id is None
+
+
+def test_seed_self_heal_does_not_override_admin_custom_system_binding():
+    # A SYSTEM action the admin bound to their OWN template is left alone (not reset to the default).
+    import uuid
+    existing = {k: _FakeTemplate(default_key=k) for k in ea.DEFAULT_TEMPLATES}
+    actions = _all_actions_unbound()
+    chosen = uuid.uuid4()
+    actions["password_reset"].template_id = chosen
+    sess = _FakeSession(existing_templates=existing, actions=actions)
+    ea.seed_default_templates(sess)
+    assert sess.actions["password_reset"].template_id == chosen       # admin's choice respected
 
 
 def test_seed_never_rebinds_an_action_the_admin_already_set():

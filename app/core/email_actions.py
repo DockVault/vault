@@ -274,10 +274,23 @@ def seed_default_templates(db: Session) -> int:
     from app.core import email_sanitize
 
     created = 0
+    healed = 0
     for key, spec in DEFAULT_TEMPLATES.items():
-        # A default row already exists (this boot or a prior one) -> leave it and its binding alone,
-        # so an admin's later customization / "none" choice is never revived by a re-seed.
-        if db.query(EmailTemplate).filter(EmailTemplate.default_key == key).first() is not None:
+        # A default row already exists (this boot or a prior one) -> leave the ROW alone (never revive an
+        # admin's customization), but SELF-HEAL a SYSTEM action that is still unbound: bind it to its
+        # existing default so editing that template actually changes the sent email. Without this, a boot
+        # that created the default row before the action row existed leaves the action unbound forever,
+        # and editing the "Default" template is a silent no-op (the send path reads action.template, and
+        # an unbound system action falls back to the built-in body). Restricted to SYSTEM actions: their
+        # "none" is equivalent to the built-in body, which the default template already is, so binding
+        # never changes what is sent -- it only makes the binding editable. OPTIONAL actions keep an
+        # admin's explicit "none" (and stay off until explicitly configured).
+        existing = db.query(EmailTemplate).filter(EmailTemplate.default_key == key).first()
+        if existing is not None:
+            action = db.get(EmailAction, key)
+            if action is not None and action.template_id is None and action.category == SYSTEM:
+                action.template_id = existing.id
+                healed += 1
             continue
         tpl = EmailTemplate(
             name=spec["name"],
@@ -302,7 +315,7 @@ def seed_default_templates(db: Session) -> int:
         action = db.get(EmailAction, key)
         if action is not None and action.template_id is None:
             action.template_id = tpl.id
-    if created:
+    if created or healed:
         db.commit()
     return created
 

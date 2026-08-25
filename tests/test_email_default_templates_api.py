@@ -19,6 +19,36 @@ def _defaults(admin):
     return {t["default_key"]: t for t in admin.get("/email/templates").json()["templates"] if t["is_default"]}
 
 
+def _actions(admin):
+    d = admin.get("/email/actions").json()
+    acts = d.get("actions", d) if isinstance(d, dict) else d
+    return {a["key"]: a for a in acts}
+
+
+def test_editing_a_bound_system_template_applies_to_the_action(admin):
+    # The owner's requirement: when a system action is bound to a template, editing that template
+    # applies to the emails it sends (the send path reads action.template). Self-contained + order-
+    # independent: bind password_reset to its default HERE (other suite tests may leave it unbound),
+    # edit the template, confirm the action reflects the edit, then restore.
+    default = _defaults(admin)["password_reset"]
+    tid = default["id"]
+    orig_body = admin.get(f"/email/templates/{tid}").json().get("body_html") or ""
+    admin.put("/email/actions/password_reset", json={"template_id": tid})
+    marker = unique("resetedit")
+    try:
+        r = admin.put(f"/email/templates/{tid}", json={
+            "name": default["name"], "subject": default.get("subject") or "Reset your password",
+            "body_html": f"<p>{marker} {{{{action.link}}}}</p>"})
+        assert r.status_code == 200, r.text
+        # Action still bound to that template AND the template carries the edit -> the send path
+        # (template = action.template; body = template.body_html) will use the customized body.
+        assert _actions(admin)["password_reset"].get("template_id") == tid
+        assert marker in admin.get(f"/email/templates/{tid}").json()["body_html"]
+    finally:
+        admin.put(f"/email/templates/{tid}", json={
+            "name": default["name"], "subject": default.get("subject") or "", "body_html": orig_body})
+
+
 def test_defaults_are_seeded_as_rows_one_per_action(admin):
     by_key = _defaults(admin)
     # exactly one default template per action key
