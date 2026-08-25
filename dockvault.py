@@ -1361,6 +1361,87 @@ def clear_volume(volume, run=subprocess.run):
     return getattr(r, "returncode", 1) == 0
 
 
+# --- backup directory resolution -------------------------------------------------------------
+# Backups used to land in <repo>/backups (the script's own directory), so a clone under Downloads put
+# every secret-bearing bundle under Downloads. They now default to a per-OS application-data directory
+# and the location is overridable + can name SEVERAL directories.
+def _writable_dir(path):
+    """True if `path` exists-or-can-be-created AND a probe file can be written there (creating it 0700
+    on POSIX as a side effect, then removing the probe). Picking the first WRITABLE candidate stops a
+    full / read-only / disconnected-network location from silently swallowing a backup."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        if os.name != "nt":
+            try:
+                os.chmod(path, 0o700)
+            except OSError:
+                pass
+        probe = os.path.join(path, ".dockvault_write_probe")
+        try:
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("")
+        finally:
+            try:
+                os.remove(probe)        # always clean up, even if the write raised mid-way
+            except OSError:
+                pass
+        return True
+    except OSError:
+        return False
+
+
+def _app_data_backup_root():
+    """The per-OS application-data backup directory (a PATH only - not created, not probed). Windows:
+    %LOCALAPPDATA% (non-roaming, because bundles are large and hold ENCRYPTION_KEY so they must not
+    sync) then %APPDATA%. macOS: ~/Library/Application Support. Linux/other: $XDG_DATA_HOME then
+    ~/.local/share. All under DockVault/backups."""
+    home = os.path.expanduser("~")
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or home
+    elif sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share")
+    return os.path.join(base, "DockVault", "backups")
+
+
+def parse_backup_dirs(raw):
+    """Split a backup-location value into an ordered list of paths. Accepts a single path OR several
+    separated by os.pathsep (';' Windows, ':' POSIX) or newlines, so DOCKVAULT_BACKUP_DIR / --backup-dir
+    can name MULTIPLE locations. Expands ~; drops blanks. Returns [] for empty/None."""
+    if not raw:
+        return []
+    out = []
+    for chunk in str(raw).replace("\n", os.pathsep).split(os.pathsep):
+        chunk = chunk.strip()
+        if chunk:
+            out.append(os.path.expanduser(chunk))
+    return out
+
+
+def _default_backup_candidates():
+    """The ordered default write-target candidates when no --backup-dir is given: DOCKVAULT_BACKUP_DIR
+    (which may list several), then the per-OS app-data dir, then ~/DockVault/backups, then
+    ~/Downloads/DockVault/backups. PURE - computes paths only, never probes or creates (so a
+    read-only listing can display them without side effects)."""
+    home = os.path.expanduser("~")
+    return parse_backup_dirs(os.environ.get("DOCKVAULT_BACKUP_DIR")) + [
+        _app_data_backup_root(),
+        os.path.join(home, "DockVault", "backups"),
+        os.path.join(home, "Downloads", "DockVault", "backups"),
+    ]
+
+
+def default_backup_dir():
+    """The directory NEW bundles are written to when no --backup-dir is given: the first WRITABLE
+    default candidate (created as a side effect), else the app-data path (a later mkdir then surfaces
+    the error) so a backup never silently vanishes into an unwritable location."""
+    for cand in _default_backup_candidates():
+        if _writable_dir(cand):
+            return cand
+    return _app_data_backup_root()
+
+
 # --- update (release list + upgrade/downgrade) -----------------------------------------------
 RELEASES_URL = "https://api.github.com/repos/DockVault/vault/releases"
 GHCR_IMAGE = "ghcr.io/dockvault/vault"
@@ -3086,25 +3167,101 @@ class DockVault:
         print(pal.paint("===================================================================\n", "blue"))
 
     def backup(self, args=None):
-        """Backup & Restore menu: dump the current set ({.env + volumes}) into one bundle, or restore a
-        bundle back. Interactive by default; arg-mode via args.backup_action (backup|restore)."""
+        """Backup & Restore menu: dump the current set ({.env + volumes}) into one bundle, restore a
+        bundle back, or LIST the bundles found across every backup location. Interactive by default;
+        arg-mode via args.backup_action (backup|restore|list) or --list."""
         pal = self.pal
-        ok, msg = docker_available()
-        if not ok:
-            self._fail(msg)
         interactive = not (args and getattr(args, "non_interactive", False))
         action = getattr(args, "backup_action", None) if args else None
+        if args and getattr(args, "list", False):
+            action = "list"
         if not action and interactive:
-            print(pal.paint("\n  1) Backup the current set   2) Restore a bundle (STOPS + REPLACES current data)", "cyan"))
-            action = {"2": "restore"}.get(ask("Choose 1/2", pal, "1").strip(), "backup")
-        if (action or "backup") == "restore":
+            print(pal.paint("\n  1) Backup the current set   2) Restore a bundle (STOPS + REPLACES "
+                            "current data)   3) List backups", "cyan"))
+            action = {"2": "restore", "3": "list"}.get(ask("Choose 1/2/3", pal, "1").strip(), "backup")
+        if action == "list":
+            self._list_backups(args)             # host-side; no docker needed
+            return
+        ok, msg = docker_available()             # backup + restore drive docker volumes
+        if not ok:
+            self._fail(msg)
+        if action == "restore":
             self._do_restore(args)
         else:
             self._do_backup(self._load_env(), args)
 
+    def _write_candidates(self, args):
+        """Ordered candidate directories a NEW backup would be written to (first writable wins): an
+        explicit --backup-dir list, else the default candidates. PURE - no probing/creation, so it is
+        safe to use for display + search."""
+        explicit = parse_backup_dirs(getattr(args, "backup_dir", None) if args else None)
+        return explicit if explicit else _default_backup_candidates()
+
     def _backup_root(self, args):
-        d = (getattr(args, "backup_dir", None) if args else None)
-        return d or os.path.join(self.root, "backups")
+        """The directory NEW bundles are WRITTEN to: the first WRITABLE candidate (created here), else
+        the first candidate (a later mkdir surfaces the error) so a backup never silently vanishes."""
+        cands = self._write_candidates(args)
+        for c in cands:
+            if _writable_dir(c):
+                return c
+        return cands[0] if cands else _app_data_backup_root()
+
+    def _backup_search_roots(self, args):
+        """Every EXISTING directory to search when listing / restoring: the write candidates, ALWAYS
+        plus the legacy <root>/backups so bundles written by an older version (or under the repo) are
+        never orphaned when the default moves. Deduped by absolute path, existing dirs only (a search
+        never creates one), order preserved."""
+        roots = list(self._write_candidates(args))
+        roots.append(os.path.join(self.root, "backups"))        # legacy in-repo location
+        seen, out = set(), []
+        for r in roots:
+            rr = os.path.abspath(os.path.expanduser(r))
+            if rr in seen:
+                continue
+            seen.add(rr)
+            if os.path.isdir(rr):
+                out.append(rr)
+        return out
+
+    def _list_bundles(self, args):
+        """Bundle directories found across every search root, NEWEST FIRST, deduped by absolute path.
+        Returns FULL paths - a same-name bundle can exist in more than one root, so the basename alone
+        is ambiguous. mtime is captured right where existence was just checked, so a bundle that
+        disappears mid-scan is skipped rather than crashing the sort."""
+        found, seen = [], set()
+        for root in self._backup_search_roots(args):
+            for c in glob.glob(os.path.join(root, "dockvault-*")):
+                if not os.path.isdir(c):
+                    continue
+                ap = os.path.abspath(c)
+                if ap in seen:
+                    continue
+                try:
+                    mtime = os.path.getmtime(c)
+                except OSError:
+                    continue                    # vanished between glob and stat - skip it
+                seen.add(ap)
+                found.append((mtime, ap))
+        found.sort(key=lambda t: t[0], reverse=True)
+        return [ap for _, ap in found]
+
+    def _list_backups(self, args):
+        """Print WHERE new bundles will be written + every existing bundle across all search roots
+        (newest first, full paths). Host-side and READ-ONLY: unlike a real backup it never creates a
+        directory, so it only NAMES the write candidates rather than resolving (and creating) one."""
+        pal = self.pal
+        cands = self._write_candidates(args)
+        print(pal.paint("\n  New backups go to the first writable of (created when you back up):", "cyan"))
+        for c in cands:
+            print("    %s" % c)
+        bundles = self._list_bundles(args)
+        if not bundles:
+            print(pal.paint("\n  No backups found yet.\n", "yellow"))
+            return
+        print(pal.paint("\n  Backups (newest first):", "green"))
+        for c in bundles:
+            print("    %s" % c)
+        print()
 
     def _fail_backup(self, bundle, msg):
         """Abort a backup: DELETE the partial bundle first (it already holds a mode-600 copy of .env
@@ -3134,6 +3291,7 @@ class DockVault:
         while os.path.exists(bundle):
             bundle = os.path.join(root, "dockvault-%s-%s-%d" % (prefix, ts, suffix))
             suffix += 1
+        print(pal.paint("  Backup will be written under: %s" % root, "cyan"))
         try:
             os.makedirs(bundle)
             # Restrict the whole bundle dir to the owner (makedirs' mode is umask-masked): the volume
@@ -3196,13 +3354,14 @@ class DockVault:
         interactive = not (args and getattr(args, "non_interactive", False))
         bundle = getattr(args, "bundle_dir", None) if args else None
         if not bundle and interactive:
-            root = self._backup_root(args)
-            cands = sorted(glob.glob(os.path.join(root, "dockvault-*")))
+            cands = self._list_bundles(args)     # every search root, newest first, full paths
             if not cands:
-                self._fail("no backups found under %s (pass --bundle-dir)" % root)
-            print(pal.paint("\n  Backups:", "cyan"))
+                roots = self._backup_search_roots(args)
+                self._fail("no backups found under: %s (pass --bundle-dir)"
+                           % (", ".join(roots) if roots else "(no backup directory yet)"))
+            print(pal.paint("\n  Backups (newest first):", "cyan"))
             for i, c in enumerate(cands, 1):
-                print("    %d) %s" % (i, os.path.basename(c)))
+                print("    %d) %s" % (i, c))      # full path disambiguates same-name bundles across roots
             sel = ask("Which backup number", pal).strip()
             if not (sel.isdigit() and 1 <= int(sel) <= len(cands)):
                 self._fail("not a listed backup")
@@ -4037,9 +4196,14 @@ def build_parser():
     rp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
 
     bp = parsers["backup"]
-    bp.add_argument("--action", dest="backup_action", choices=("backup", "restore"),
-                    help="backup the current set | restore a bundle")
-    bp.add_argument("--backup-dir", dest="backup_dir", help="directory to write/list bundles (default <root>/backups)")
+    bp.add_argument("--action", dest="backup_action", choices=("backup", "restore", "list"),
+                    help="backup the current set | restore a bundle | list found bundles")
+    bp.add_argument("--list", dest="list", action="store_true",
+                    help="list backups found across all locations + where new ones are written (no docker needed)")
+    bp.add_argument("--backup-dir", dest="backup_dir",
+                    help="directory to write/search bundles (default: per-OS app data, e.g. "
+                         "%%LOCALAPPDATA%%\\DockVault\\backups). May name SEVERAL, separated by the OS "
+                         "path separator; also settable via DOCKVAULT_BACKUP_DIR. The legacy <root>/backups is always searched too")
     bp.add_argument("--bundle-dir", dest="bundle_dir", help="restore: the bundle directory to restore")
     bp.add_argument("--force", dest="force", action="store_true", help="restore: REPLACE existing target volumes with the backup (stops the stack; current data discarded)")
     bp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")

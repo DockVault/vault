@@ -1602,6 +1602,86 @@ def test_restore_aborts_if_database_still_running_after_stop(tmp_path, monkeypat
     assert "clear" not in touched and "untar" not in touched, "must not wipe a volume under a live DB"
 
 
+# --- backup directory resolution ---------------------------------------------------------
+def test_parse_backup_dirs_single_list_and_blanks():
+    assert dv.parse_backup_dirs(None) == [] and dv.parse_backup_dirs("") == []
+    assert dv.parse_backup_dirs("/a/b") == ["/a/b"]
+    assert dv.parse_backup_dirs(os.pathsep.join(["/a", " /b ", ""])) == ["/a", "/b"]   # list + blanks
+    assert dv.parse_backup_dirs("/a\n/b") == ["/a", "/b"]                              # newline-separated
+    expanded = dv.parse_backup_dirs("~/x")[0]                                          # ~ is expanded
+    assert "~" not in expanded and expanded.startswith(os.path.expanduser("~"))
+
+
+def test_app_data_backup_root_per_platform(monkeypatch):
+    home = os.path.expanduser("~")
+    monkeypatch.setattr(dv.os, "name", "nt")
+    monkeypatch.setenv("LOCALAPPDATA", os.path.join("C:", "Local"))
+    assert dv._app_data_backup_root() == os.path.join("C:", "Local", "DockVault", "backups")
+    monkeypatch.setattr(dv.os, "name", "posix")
+    monkeypatch.setattr(dv.sys, "platform", "darwin")
+    assert dv._app_data_backup_root() == os.path.join(home, "Library", "Application Support", "DockVault", "backups")
+    monkeypatch.setattr(dv.sys, "platform", "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", os.path.join("/", "xdg"))
+    assert dv._app_data_backup_root() == os.path.join("/", "xdg", "DockVault", "backups")
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    assert dv._app_data_backup_root() == os.path.join(home, ".local", "share", "DockVault", "backups")
+
+
+def test_default_backup_dir_precedence_and_fallback(tmp_path, monkeypatch):
+    good = tmp_path / "envdir"; good.mkdir()
+    (tmp_path / "nope").write_text("iamafile", encoding="utf-8")     # a FILE, so <file>/x is unwritable
+    monkeypatch.setenv("DOCKVAULT_BACKUP_DIR", os.pathsep.join([str(tmp_path / "nope" / "x"), str(good)]))
+    assert dv.default_backup_dir() == str(good)                       # first WRITABLE of the env list
+    monkeypatch.delenv("DOCKVAULT_BACKUP_DIR", raising=False)
+    appdir = tmp_path / "appdata"
+    monkeypatch.setattr(dv, "_app_data_backup_root", lambda: str(appdir))
+    assert dv.default_backup_dir() == str(appdir) and appdir.is_dir()  # falls to the per-OS app-data dir
+
+
+def test_backup_root_explicit_list_picks_first_writable(tmp_path):
+    (tmp_path / "b1file").write_text("x", encoding="utf-8")           # a FILE -> <file>/sub unwritable
+    good = tmp_path / "b2"
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    args = argparse.Namespace(backup_dir=os.pathsep.join([str(tmp_path / "b1file" / "sub"), str(good)]))
+    assert tool._backup_root(args) == str(good) and good.is_dir()
+
+
+def test_backup_search_roots_includes_legacy(tmp_path, monkeypatch):
+    monkeypatch.delenv("DOCKVAULT_BACKUP_DIR", raising=False)
+    legacy = tmp_path / "backups"; legacy.mkdir()                     # the historical <root>/backups
+    appdir = tmp_path / "app"; appdir.mkdir()
+    monkeypatch.setattr(dv, "_app_data_backup_root", lambda: str(appdir))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    roots = tool._backup_search_roots(argparse.Namespace(backup_dir=None))
+    assert os.path.abspath(str(legacy)) in roots, "the legacy <root>/backups must always be searched"
+    assert os.path.abspath(str(appdir)) in roots
+
+
+def test_list_bundles_newest_first_and_legacy_not_orphaned(tmp_path, monkeypatch):
+    monkeypatch.delenv("DOCKVAULT_BACKUP_DIR", raising=False)
+    r1 = tmp_path / "loc1"; r1.mkdir()
+    legacy = tmp_path / "backups"; legacy.mkdir()
+    monkeypatch.setattr(dv, "_app_data_backup_root", lambda: str(r1))
+    older = legacy / "dockvault-set-20260101-000000"; older.mkdir()
+    newer = r1 / "dockvault-set-20260102-000000"; newer.mkdir()
+    os.utime(older, (1000, 1000)); os.utime(newer, (2000, 2000))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    got = tool._list_bundles(argparse.Namespace(backup_dir=None))
+    assert got and got[0] == os.path.abspath(str(newer)), "newest bundle must be listed first"
+    assert os.path.abspath(str(older)) in got, "a bundle in the legacy dir must not be orphaned"
+
+
+def test_list_backups_shows_candidates_without_creating(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("DOCKVAULT_BACKUP_DIR", raising=False)
+    appdir = tmp_path / "app"            # deliberately NOT pre-created
+    monkeypatch.setattr(dv, "_app_data_backup_root", lambda: str(appdir))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    tool._list_backups(argparse.Namespace(backup_dir=None))
+    out = capsys.readouterr().out
+    assert str(appdir) in out                                   # the write candidate is shown
+    assert not appdir.exists(), "listing must NOT create the backup directory (it is read-only)"
+
+
 # --- update + logs helpers ----------------------------------------------------------------
 def test_update_version_helpers():
     assert dv.parse_semver("v0.6.0") == (0, 6, 0) and dv.parse_semver("1.2.3-rc1") == (1, 2, 3)
