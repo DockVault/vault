@@ -6,6 +6,9 @@ defaults" source. This file pins the catalog itself (no DB / no live instance): 
 default, the bodies survive sanitization with their tokens intact, and the payload the editor loads is
 byte-identical to what would be stored.
 """
+import re
+from pathlib import Path
+
 import pytest
 
 from app.core import email_actions as ea
@@ -45,6 +48,68 @@ def test_system_security_bodies_carry_their_required_token(key, token):
     raw = ea.DEFAULT_TEMPLATES[key]["body_html"]
     assert token in raw
     assert token in es.sanitize_email_html(raw)
+
+
+@pytest.mark.parametrize("key,token", list(_REQUIRED_TOKEN.items()))
+def test_system_failsafe_restores_default_when_body_is_empty(key, token):
+    # An admin who clears a SYSTEM template's body (but keeps a subject) must NOT ship a code/link-less
+    # email: the fail-safe treats an empty body as the missing-token case and substitutes the built-in
+    # default (which carries the required token). Would regress if the guard short-circuited on `not body`.
+    spec = ea.SPEC_BY_KEY[key]
+    for empty in ("", None, "   "):
+        out = ea._fallback_body_if_missing_required_token(ea.SYSTEM, empty, spec)
+        assert token in out, f"{key}: empty body did not fall back to the token-bearing default"
+    # a body that DROPS the token also falls back; one that KEEPS it is returned unchanged
+    assert token in ea._fallback_body_if_missing_required_token(ea.SYSTEM, "<p>no token here</p>", spec)
+    kept = f"<p>{{{{{token}}}}}</p>"
+    assert ea._fallback_body_if_missing_required_token(ea.SYSTEM, kept, spec) == kept
+
+
+class _FakeReq:
+    def __init__(self, base):
+        self.base_url = base
+
+
+def test_public_base_url_prefers_configured_host_over_request(monkeypatch):
+    # A configured trusted host (from ALLOWED_HOSTS via vault_url) must win over the request's own —
+    # attacker-controllable — Host header, so an emailed reset/invite token can't be pointed elsewhere.
+    monkeypatch.setattr(ea, "vault_url", lambda: "https://vault.example.com")
+    assert ea.public_base_url(_FakeReq("http://evil.tld/")) == "https://vault.example.com"
+
+
+def test_public_base_url_falls_back_to_request_host_when_unconfigured(monkeypatch):
+    # With no trusted host configured the vault already trusts the request host everywhere, so fall back
+    # to it (feature keeps working on a default LAN deploy); a None request yields "" without raising.
+    monkeypatch.setattr(ea, "vault_url", lambda: "")
+    assert ea.public_base_url(_FakeReq("https://myvault.lan/")) == "https://myvault.lan"
+    assert ea.public_base_url(None) == ""
+
+
+def test_tokened_email_links_are_wired_through_public_base_url():
+    # Regression guard for the Host-header link-poisoning fix. The reset/invite links carry a single-use
+    # token in the URL, so each must build its base via _public_base_url(request) (which prefers the
+    # configured host over a spoofed Host header) — never str(request.base_url) directly. The
+    # ea.public_base_url unit tests above cover the helper's logic; this pins the CALL-SITE wiring, so
+    # reverting one site back to the request Host can't slip through green (re-opening poisoning for an
+    # ALLOWED_HOSTS-configured deployment).
+    src = (Path(__file__).resolve().parent.parent / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    norm = re.sub(r"\s+", " ", src)
+    assert "_mint_and_send_reset_async(user.id, _public_base_url(request))" in norm     # public forgot-password
+    assert "_mint_and_send_reset(db, user, _public_base_url(request)," in norm           # admin send-reset-link
+    assert 'base = _public_base_url(request) if request is not None else ""' in norm     # invitation mint
+    # the tokened links still exist AND are never assembled straight from the request Host
+    assert "/?reset=" in norm and "/?invite=" in norm
+    assert "str(request.base_url)}/?reset=" not in norm
+    assert "str(request.base_url)}/?invite=" not in norm
+
+
+def test_optional_action_has_no_failsafe_fallback():
+    # Only SYSTEM security actions get the token fail-safe; an optional action's (possibly empty) body
+    # is returned as-is (normalized to a string), never replaced with a default.
+    spec = ea.SPEC_BY_KEY["share_created"]
+    assert ea._fallback_body_if_missing_required_token(ea.OPTIONAL, "", spec) == ""
+    assert ea._fallback_body_if_missing_required_token(ea.OPTIONAL, None, spec) == ""
+    assert ea._fallback_body_if_missing_required_token(ea.OPTIONAL, "<p>hi</p>", spec) == "<p>hi</p>"
 
 
 def test_default_bodies_sanitize_without_loss_of_structure():

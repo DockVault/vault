@@ -260,58 +260,22 @@ _MAX_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024  # 64 MiB
 _MAX_REQUEST_BODY_BYTES = 4 * _MAX_UPLOAD_CHUNK_BYTES  # 256 MiB
 
 
-# Path segments that are replayable SECRETS, not identifiers: the invitation token and the share-claim
-# secret both travel in the URL PATH. The web log-pull serves request paths to a `web`-scoped token
-# holder (a less-privileged consumer), and redact_log_text does not catch these (no key= separator,
-# not JWT-shaped), so mask them at the source before they reach the sink. Add any new secret-in-path
-# route here.
-_LOG_PATH_SECRET_SUBS = [
-    (re.compile(r"^(/invites/)[^/]+"), r"\1<redacted>"),           # GET/POST /invites/{token}[/accept]
-    (re.compile(r"^(/reset/)[^/]+"), r"\1<redacted>"),             # GET/POST /reset/{password-reset-token}
-    (re.compile(r"^(/shares/)[^/]+(/claim)"), r"\1<redacted>\2"),  # /shares/{claim-secret}/claim
-]
+# The URL-secret redaction (invite/reset/share tokens in the path or landing-page query) lives in a
+# small stdlib-only module so it is unit-testable offline and shared by the in-app sink AND the uvicorn
+# access-log filter below. Add new secret-bearing routes in app/core/log_redaction.py.
+from app.core.log_redaction import (  # noqa: E402
+    redact_log_path as _redact_log_path,
+    redact_access_path as _redact_access_path,
+    AccessLogRedactFilter as _AccessLogRedactFilter,
+)
 
 
-def _redact_log_path(path: str) -> str:
-    """Mask replayable secrets carried in a URL path before it is written to the log-pull sink."""
-    for rx, repl in _LOG_PATH_SECRET_SUBS:
-        path = rx.sub(repl, path)
-    return path
-
-
-# Covers both the /?invite=<token> and /?reset=<token> landing links (the token rides the query on the
-# initial page load, before the client strips it from the address bar).
-_INVITE_QUERY_RE = re.compile(r"(?i)([?&](?:invite|reset)=)[^&#]+")
-
-
-def _redact_access_path(full_path: str) -> str:
-    """Redact secrets from a full request target (path + optional query) for the uvicorn access log:
-    mask the invite/share token in the PATH and the ?invite=<token> QUERY the landing page carries."""
-    path, sep, query = full_path.partition("?")
-    path = _redact_log_path(path)
-    if not sep:
-        return path
-    query = _INVITE_QUERY_RE.sub(r"\1<redacted>", "?" + query)[1:]
-    return path + "?" + query
-
-
-class _AccessLogRedactFilter(logging.Filter):
-    """Scrub the invite/share tokens out of uvicorn's access log. Those single-use tokens travel in the
-    URL (a path segment on the invite endpoints, the ?invite= query on the landing page), so uvicorn's
-    default access log would otherwise write the raw token on every request — the leak the app's other
-    bearer tokens avoid by being header-only. Rewrites the request-target arg in place; never raises,
-    never drops a line."""
-    def filter(self, record):  # noqa: A003
-        try:
-            args = record.args
-            if (isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str)
-                    and ("/invites/" in args[2] or "/shares/" in args[2] or "invite=" in args[2])):
-                lst = list(args)
-                lst[2] = _redact_access_path(args[2])
-                record.args = tuple(lst)
-        except Exception:  # noqa: BLE001 — logging must never raise
-            pass
-        return True
+def _public_base_url(request) -> str:
+    """Absolute base URL for the tokened links we email (reset/invite). Delegates to
+    ``email_actions.public_base_url`` (offline-testable): prefer the configured public host so a spoofed
+    ``Host`` header can't poison an emailed token, else fall back to the request host."""
+    from app.core.email_actions import public_base_url
+    return public_base_url(request)
 
 
 def _install_access_log_redaction() -> None:
@@ -2585,7 +2549,7 @@ def _fire_action_email_bulk(db: Session, key: str, recipients, action_context=No
     try:
         from app.core.models import EmailAction
         a = db.get(EmailAction, key)
-        # An optional action only sends when explicitly enabled AND bound to a template (the P2 rule).
+        # An optional action only sends when explicitly enabled AND bound to a template.
         if not (a is not None and a.enabled and a.template_id is not None):
             return
         pairs = [((e or "").strip(), u) for (e, u) in recipients if (e or "").strip()]
@@ -3504,7 +3468,7 @@ async def create_invite(
     except Exception:
         pass
 
-    base = str(request.base_url).rstrip("/") if request is not None else ""
+    base = _public_base_url(request) if request is not None else ""
     invite_url = f"{base}/?invite={plaintext}"
 
     # Send the invitation email carrying the freshly-minted link (the {{action.link}} token). This is
@@ -4008,8 +3972,9 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request, db: Ses
         user = _resolve_reset_user(db, body.identifier)
         if user is not None:
             # Background the mint+send so a resolved identifier can't be told apart from an unknown one
-            # by response timing (both do only the resolution query on the request path).
-            _mint_and_send_reset_async(user.id, str(request.base_url))
+            # by response timing (both do only the resolution query on the request path). The link base
+            # prefers the configured public host so a spoofed Host header can't poison the emailed token.
+            _mint_and_send_reset_async(user.id, _public_base_url(request))
     try:
         AuditLogger(db).log_action(action="password_reset_requested", status="success", user=None,
                                    ip_address=ip, details={})
@@ -4035,7 +4000,7 @@ async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
     if not _smtp_configured(db):
         raise HTTPException(status_code=400,
                             detail="Email is not configured. Add a sending profile in Settings -> Email first.")
-    sent = _mint_and_send_reset(db, user, str(request.base_url), created_by_id=current_user.id)
+    sent = _mint_and_send_reset(db, user, _public_base_url(request), created_by_id=current_user.id)
     try:
         AuditLogger(db).log_action(action="password_reset_link_sent", status="success", user=current_user,
                                    ip_address=get_client_ip(request),

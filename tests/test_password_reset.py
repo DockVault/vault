@@ -57,6 +57,8 @@ def _purge(uid):
 
 
 def _mp_clear():
+    if not MAILPIT_URL:   # no Mailpit sink in this environment (e.g. CI) — nothing to clear
+        return
     requests.delete(f"{MAILPIT_URL}/api/v1/messages", timeout=10)
 
 
@@ -170,6 +172,25 @@ def test_weak_password_does_not_burn_the_token(admin, restore_reset):
         assert _anon().post(f"/reset/{token}", json={"new_password": "short"}).status_code in (400, 422)
         # the token is still valid — a strong password now succeeds
         assert _anon().post(f"/reset/{token}", json={"new_password": "Strong!Pass99"}).status_code == 200
+    finally:
+        _purge(u["id"]); admin.delete_user(u["id"])
+
+
+def test_reset_revokes_existing_sessions(admin, restore_reset):
+    """A completed reset must durably revoke the user's live sessions, so a hijacked/still-open session
+    can't outlive the password change. Would FAIL if the _revoke_sessions call in do_reset were removed."""
+    u = admin.create_user()
+    try:
+        # log the user in and prove the session is live
+        sess = ApiClient(BASE_URL)
+        sess.login(u["_username"], u["_password"])
+        assert sess.get("/users/me").status_code == 200
+        # redeem a reset for a new password (seeded token, no email needed)
+        token, _ = mint_reset_token()
+        _seed_token(u["id"], token)
+        assert _anon().post(f"/reset/{token}", json={"new_password": "Strong!Pass99"}).status_code == 200
+        # the pre-existing session is now rejected (durable revocation, not just Redis)
+        assert sess.get("/users/me").status_code in (401, 403), "old session survived the reset"
     finally:
         _purge(u["id"]); admin.delete_user(u["id"])
 

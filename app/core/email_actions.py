@@ -206,6 +206,21 @@ def vault_url() -> str:
     return ""
 
 
+def public_base_url(request) -> str:
+    """Absolute base URL for links we EMAIL that carry a single-use token in the URL (password-reset,
+    invitation). Prefer the operator-configured public host (``vault_url()`` from ``ALLOWED_HOSTS``) so
+    a spoofed ``Host`` header can't poison an emailed token; fall back to the request's own host only
+    when no trusted host is configured. When ``ALLOWED_HOSTS`` is set (the posture an internet-facing
+    vault should adopt — it also enables ``TrustedHostMiddleware``) the emailed link is pinned to the
+    canonical host regardless of the incoming ``Host`` header, closing reset/invite-link poisoning;
+    when unset the vault already trusts the request host everywhere, so this adds no new assumption.
+    Mirrors the ``share_created`` pattern. ``request`` may be None (returns the configured host or "")."""
+    configured = (vault_url() or "").rstrip("/")
+    if configured:
+        return configured
+    return str(getattr(request, "base_url", "") or "").rstrip("/")
+
+
 def _load_resource(db: Session, rid: str):
     from app.core.models import EmailResource
     import uuid as _uuid
@@ -314,8 +329,11 @@ def _fallback_body_if_missing_required_token(category, body_tpl, spec):
     {{action.link}}). If the chosen (admin-bound/customized) body OMITS it, return the built-in body
     instead, so a misconfigured template can never silently drop the verification code / reset or
     invite link. Non-system actions, or bodies that already carry the token, are returned unchanged.
-    Matched on the token KEY, so a whitespace variant like ``{{ action.code }}`` still counts."""
-    if category != SYSTEM or not body_tpl:
+    Matched on the token KEY, so a whitespace variant like ``{{ action.code }}`` still counts.
+    An EMPTY body on a system action is itself the 'required token missing' case (an admin who cleared
+    the body but kept a subject), so it must fall through to the default body — not short-circuit."""
+    body_tpl = body_tpl or ""   # a None/blank body is the missing-token case for a system action
+    if category != SYSTEM:
         return body_tpl
     default_body = (spec or {}).get("default_body_html", "") or ""
     for key_tok in ("action.code", "action.link"):

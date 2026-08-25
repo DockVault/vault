@@ -260,6 +260,10 @@ def test_only_the_hash_is_stored_never_the_plaintext():
     code = o.issue(db, purpose="email_change", user_id="d4", destination="d", ttl_minutes=5, pepper=PEP, redis=down)
     assert db.rows[0].code_hash != code and db.rows[0].code_hash == o.hash_code(code, PEP)
     r = FakeRedis()
-    o.issue(db, purpose="pw", user_id="d5", destination="d", ttl_minutes=5, pepper=PEP, redis=r)
+    code2 = o.issue(db, purpose="pw", user_id="d5", destination="d", ttl_minutes=5, pepper=PEP, redis=r)
     stored = r.h[o.redis_key("pw", "d5")]
-    assert "code_hash" in stored and all(str(v) not in stored.values() for v in [])  # plaintext never present
+    # the PRIMARY (Redis) store keeps only the peppered hash — never the plaintext code, anywhere
+    stored_vals = [str(v) for v in stored.values()]
+    assert stored.get("code_hash") == o.hash_code(code2, PEP)
+    assert code2 not in stored_vals and code2 not in stored             # plaintext absent from values AND keys
+    assert not any(code2 in v for v in stored_vals)                     # not embedded in any stored field
