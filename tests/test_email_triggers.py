@@ -202,3 +202,48 @@ def test_share_created_emails_the_recipient(admin, mailpit_profile, welcome_off)
             admin.put("/settings", json={"sharing_enabled": orig_sharing})
         admin.delete_vault(vault["id"])
         admin.delete_user(recipient["id"])
+
+
+@_mailpit
+def test_invitation_email_sent_on_mint_carries_the_link(admin, mailpit_profile):
+    # account_invite is a SYSTEM action (always on): minting an invite with an email sends it, with the
+    # freshly-minted link injected as {{action.link}}. The link is also returned for the admin to copy.
+    _mp_clear()
+    orig = admin.get("/settings").json()
+    admin.put("/settings", json={"invite_enabled": True, "invite_ttl_hours": 48})
+    email = f"invitee-{unique('u')}@example.com"
+    inv_id = None
+    try:
+        r = admin.post("/invites", json={"username": unique("inv"), "email": email, "role": "user"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        inv_id = body["id"]
+        assert body.get("email_sent") is True and body.get("invite_url")
+        m, full = _mp_wait(email)
+        assert m is not None, "the invitation email was not delivered"
+        assert "invit" in (m.get("Subject") or "").lower()
+        # the dynamic link the server just minted is in the email body (proves {{action.link}} injection)
+        assert body["token"] in full.get("HTML", ""), "the minted invite link was not injected into the email"
+    finally:
+        if inv_id:
+            admin.delete(f"/invites/{inv_id}")
+        admin.put("/settings", json={"invite_enabled": orig.get("invite_enabled", False),
+                                     "invite_ttl_hours": orig.get("invite_ttl_hours", 24)})
+
+
+def test_invitation_without_email_reports_not_sent(admin):
+    # An invite with no email (email-optional policy) creates the link but sends nothing.
+    orig = admin.get("/settings").json()
+    admin.put("/settings", json={"invite_enabled": True, "email_requirement": "optional"})
+    inv_id = None
+    try:
+        r = admin.post("/invites", json={"username": unique("inv"), "role": "user"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        inv_id = body["id"]
+        assert body.get("email_sent") is False and body.get("invite_url")
+    finally:
+        if inv_id:
+            admin.delete(f"/invites/{inv_id}")
+        admin.put("/settings", json={"invite_enabled": orig.get("invite_enabled", False),
+                                     "email_requirement": orig.get("email_requirement", "required")})

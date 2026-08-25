@@ -3494,11 +3494,29 @@ async def create_invite(
         pass
 
     base = str(request.base_url).rstrip("/") if request is not None else ""
+    invite_url = f"{base}/?invite={plaintext}"
+
+    # Send the invitation email carrying the freshly-minted link (the {{action.link}} token). This is
+    # the SYSTEM "account_invite" action (always on), so it sends whenever the invite carries an email
+    # and SMTP is configured. The link is ALSO returned below for the admin to copy, so a mail failure
+    # (or an invite with no email) never blocks the invite — email_sent just tells the UI which to show.
+    email_sent = False
+    if email:
+        try:
+            from app.core.email_actions import send_action_email
+            _ttl_h = int(pol.get("invite_ttl_hours") or 24)
+            email_sent = bool(send_action_email(
+                db, "account_invite", recipient={"email": email, "username": username},
+                action_context={"link": invite_url, "expires": f"in {_ttl_h} hours"}))
+        except Exception:  # noqa: BLE001 — the link is still returned; never fail the mint on mail trouble
+            email_sent = False
+
     return {
         "id": str(inv.id), "username": username, "email": email, "role": role,
         "status": "pending", "expires_at": inv.expires_at.isoformat(), "token_prefix": prefix,
         "token": plaintext,                       # shown ONCE — never stored, never re-returned
-        "invite_url": f"{base}/?invite={plaintext}",
+        "invite_url": invite_url,
+        "email_sent": email_sent,
     }
 
 

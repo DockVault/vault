@@ -4245,8 +4245,13 @@ async function submitInvite(e) {
         const res = await apiRequest('/invites', { method: 'POST', body: JSON.stringify(payload) });
         _lastInviteLink = res.invite_url || res.token;
         document.getElementById('invite-link-value').textContent = _lastInviteLink;
-        document.getElementById('invite-link-expiry').textContent =
-            'This link expires ' + formatServerTime(res.expires_at) + '.';
+        let _inviteNote = 'This link expires ' + formatServerTime(res.expires_at) + '.';
+        if (email) {
+            _inviteNote += res.email_sent
+                ? ' We emailed the invitation to ' + email + '.'
+                : ' We couldn’t email it — copy the link above and send it yourself.';
+        }
+        document.getElementById('invite-link-expiry').textContent = _inviteNote;
         document.getElementById('invite-user-fields').style.display = 'none';
         document.getElementById('invite-user-footer').style.display = 'none';
         document.getElementById('invite-link-result').style.display = '';
