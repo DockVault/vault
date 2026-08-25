@@ -133,7 +133,7 @@ jobs:
           platforms: arm64
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           # The builder runs in its own container, so it needs the runner's network to reach the
           # staging registry, and permission to speak plain HTTP to it. The registry is a loopback
