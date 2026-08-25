@@ -45,6 +45,11 @@ DEFAULTS = {
     # How long the email-change verification code stays valid, in minutes (bounded 1..60). Short by
     # default so a code read from an inbox can't be replayed hours later.
     "email_change_otp_ttl_minutes": 5,
+    # Public self-service "forgot password" flow. OFF by default — an admin can always send a reset
+    # link (a separate, permission-gated action); this switch only opens the unauthenticated endpoint.
+    "password_reset_enabled": False,
+    # How long a password-reset link stays valid, in minutes (bounded 1..60). Short by default.
+    "password_reset_ttl_minutes": 5,
 }
 ACCOUNT_POLICY_KEYS = tuple(DEFAULTS.keys())
 
@@ -214,7 +219,7 @@ def validate_account_policy(payload: dict, *, email_login_locks_out_all_admins: 
             raise AccountPolicyError("email_requirement must be 'required' or 'optional'")
         normalized["email_requirement"] = v
 
-    for bool_key in ("invite_enabled", "signup_enabled"):
+    for bool_key in ("invite_enabled", "signup_enabled", "password_reset_enabled"):
         if bool_key in payload and not isinstance(payload[bool_key], bool):
             raise AccountPolicyError(f"{bool_key} must be true or false")
 
@@ -230,6 +235,12 @@ def validate_account_policy(payload: dict, *, email_login_locks_out_all_admins: 
         if isinstance(v, bool) or not isinstance(v, int) or not (MIN_OTP_TTL_MINUTES <= v <= MAX_OTP_TTL_MINUTES):
             raise AccountPolicyError(
                 f"email_change_otp_ttl_minutes must be an integer from {MIN_OTP_TTL_MINUTES} to {MAX_OTP_TTL_MINUTES}")
+
+    if "password_reset_ttl_minutes" in payload:
+        v = payload["password_reset_ttl_minutes"]
+        if isinstance(v, bool) or not isinstance(v, int) or not (MIN_OTP_TTL_MINUTES <= v <= MAX_OTP_TTL_MINUTES):
+            raise AccountPolicyError(
+                f"password_reset_ttl_minutes must be an integer from {MIN_OTP_TTL_MINUTES} to {MAX_OTP_TTL_MINUTES}")
 
     if "signup_email_domain_mode" in payload:
         v = payload["signup_email_domain_mode"]

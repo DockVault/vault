@@ -969,9 +969,51 @@ async function applyLoginPolicyLabel() {
             }
         }
         _initSignupAffordance(policy);
+        _initForgotAffordance(policy);
     } catch (_) { /* keep the static fallback */ }
 }
 applyLoginPolicyLabel();
+
+// ---- Forgot password (public self-service; the link shows only when the org enabled it) ----------
+let _forgotWired = false;
+
+function _initForgotAffordance(policy) {
+    const toggle = document.getElementById('forgot-toggle');
+    const form = document.getElementById('forgot-form');
+    if (!toggle || !form) return;
+    if (!policy || !policy.password_reset_enabled) { toggle.style.display = 'none'; form.style.display = 'none'; return; }
+    toggle.style.display = '';
+    if (_forgotWired) return;
+    _forgotWired = true;
+    const showLink = document.getElementById('show-forgot-link');
+    const backLink = document.getElementById('forgot-back-link');
+    const loginForm = document.getElementById('login-form');
+    const msg = document.getElementById('forgot-message');
+    const showForgot = (on) => {
+        form.style.display = on ? '' : 'none';
+        if (loginForm) loginForm.style.display = on ? 'none' : '';
+        toggle.style.display = on ? 'none' : '';
+        if (msg) { msg.style.display = 'none'; msg.textContent = ''; }
+    };
+    if (showLink) showLink.addEventListener('click', (e) => {
+        e.preventDefault(); showForgot(true);
+        const i = document.getElementById('forgot-identifier'); if (i) i.focus();
+    });
+    if (backLink) backLink.addEventListener('click', (e) => { e.preventDefault(); showForgot(false); });
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const ident = ((document.getElementById('forgot-identifier') || {}).value || '').trim();
+        const btn = form.querySelector('button[type=submit]');
+        if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+        try {
+            await fetch(`${API_BASE}/auth/forgot-password`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ identifier: ident }) });
+        } catch (_) { /* enumeration-safe: show the same message regardless */ }
+        if (msg) { msg.textContent = 'If an account matches, a reset link has been sent to its email.'; msg.style.display = 'block'; }
+        if (btn) { btn.disabled = false; btn.textContent = 'Send reset link'; }
+    });
+}
 
 // ---- Self-signup (public, unauthenticated) --------------------------------
 // The toggle + form are hidden until /auth/policy confirms signup_enabled. Email presence/required
@@ -1221,6 +1263,85 @@ function _inviteAccepted(username) {
         body.appendChild(_el('h2', 'text-xl font-bold mb-sm', 'Account created'));
         body.appendChild(_el('p', 'text-secondary mb-lg',
             'Your account is ready. Sign in with your new password to continue.'));
+        const go = _el('button', 'btn btn-primary btn-block', 'Go to sign in');
+        go.addEventListener('click', () => showScreen('login-screen'));
+        body.appendChild(go);
+    }
+    setTimeout(() => { showScreen('login-screen'); }, 2500);
+}
+
+// Reached via /?reset=<token>. Bare fetch only; DOM built with _el/textContent; every failure shows
+// ONE generic message so the page can't probe which tokens are valid; success does NOT sign the
+// visitor in — it routes to login.
+const _RESET_GENERIC_ERROR = 'This reset link is invalid or has expired.';
+
+function _resetCard() { return document.getElementById('reset-card-body'); }
+
+function _resetMessage(text, kind) {
+    const body = _resetCard(); if (!body) return;
+    body.replaceChildren(); body.appendChild(_el('div', 'alert alert-' + (kind || 'error'), text));
+}
+
+async function initResetFlow(token) {
+    showScreen('reset-screen');
+    let info;
+    try {
+        const res = await fetch(`${API_BASE}/reset/${encodeURIComponent(token)}`, { headers: { Accept: 'application/json' } });
+        if (!res.ok) { _resetMessage(_RESET_GENERIC_ERROR); return; }
+        info = await res.json();
+    } catch (_) { _resetMessage(_RESET_GENERIC_ERROR); return; }
+    _renderResetForm(token, info);
+}
+
+function _renderResetForm(token, info) {
+    const body = _resetCard(); if (!body) return;
+    body.replaceChildren();
+    body.appendChild(_el('h2', 'text-xl font-bold mb-sm', 'Set a new password'));
+    const sub = _el('p', 'text-secondary mb-lg');
+    if (info && info.username) {
+        sub.appendChild(document.createTextNode('For the account '));
+        sub.appendChild(_el('strong', null, info.username));
+        sub.appendChild(document.createTextNode('.'));
+    } else { sub.textContent = 'Choose a new password to finish.'; }
+    body.appendChild(sub);
+
+    const form = _el('form');
+    const pg = _el('div', 'form-group');
+    pg.appendChild(_el('label', null, 'New password'));
+    const pw = _el('input', 'form-control'); pw.type = 'password'; pw.required = true;
+    pw.setAttribute('autocomplete', 'new-password');
+    pg.appendChild(pw); form.appendChild(pg);
+    const err = _el('div', 'alert alert-error mt-md'); err.style.display = 'none'; form.appendChild(err);
+    const btn = _el('button', 'btn btn-primary btn-block', 'Set password'); btn.type = 'submit'; form.appendChild(btn);
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault(); err.style.display = 'none'; btn.disabled = true; btn.textContent = 'Saving…';
+        try {
+            const res = await fetch(`${API_BASE}/reset/${encodeURIComponent(token)}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ new_password: pw.value }) });
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                err.textContent = data.detail || _RESET_GENERIC_ERROR; err.style.display = 'block';
+                btn.disabled = false; btn.textContent = 'Set password'; return;
+            }
+            _resetDone();
+        } catch (_) {
+            err.textContent = _RESET_GENERIC_ERROR; err.style.display = 'block';
+            btn.disabled = false; btn.textContent = 'Set password';
+        }
+    });
+    body.appendChild(form); pw.focus();
+}
+
+function _resetDone() {
+    try { history.replaceState(null, '', location.pathname); } catch (_) {}
+    document.documentElement.removeAttribute('data-reset');
+    const body = _resetCard();
+    if (body) {
+        body.replaceChildren();
+        body.appendChild(_el('h2', 'text-xl font-bold mb-sm', 'Password updated'));
+        body.appendChild(_el('p', 'text-secondary mb-lg',
+            'Your password has been changed. Sign in with your new password to continue.'));
         const go = _el('button', 'btn btn-primary btn-block', 'Go to sign in');
         go.addEventListener('click', () => showScreen('login-screen'));
         body.appendChild(go);
@@ -4483,6 +4604,7 @@ function renderUserDetail(u) {
                     ? `<button class="btn btn-sm btn-success unlock-user-btn" data-user-id="${u.id}">${iconSvg('unlock', 'icon-sm')} Unlock</button>`
                     : `<button class="btn btn-sm btn-warning lock-user-btn" data-user-id="${u.id}">${iconSvg('lock', 'icon-sm')} Lock</button>`}
                 <button class="btn btn-sm btn-secondary change-password-btn" data-user-id="${u.id}">${iconSvg('key', 'icon-sm')} Change Password</button>
+                ${u.email ? `<button class="btn btn-sm btn-secondary send-reset-link-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('key', 'icon-sm')} Send reset link</button>` : ''}
                 ${currentUser.role === 'admin' && u.role !== 'admin' ? `<button class="btn btn-sm btn-secondary manage-perms-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('shield', 'icon-sm')} Permissions</button>` : ''}
                 ${currentUser.role === 'admin' && u.username !== currentUser.username ? `<button class="btn btn-sm btn-warning terminate-user-sessions-btn" data-user-id="${u.id}">${iconSvg('alert-triangle', 'icon-sm')} Terminate Sessions</button>` : ''}
                 ${u.username !== currentUser.username ? `<button class="btn btn-sm btn-danger delete-user-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('trash', 'icon-sm')} Delete</button>` : ''}
@@ -4818,6 +4940,23 @@ function attachUserListeners() {
         btn.addEventListener('click', () => {
             const userId = btn.getAttribute('data-user-id');
             showEditUserModal(userId);
+        });
+    });
+
+    // Send password-reset link buttons
+    document.querySelectorAll('.send-reset-link-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const userId = btn.getAttribute('data-user-id');
+            const username = btn.getAttribute('data-username') || 'this user';
+            if (!confirm('Email a password-reset link to ' + username + '?')) return;
+            btn.disabled = true;
+            try {
+                const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/send-reset-link', { method: 'POST' });
+                if (r && r.email_sent) showSuccess('Reset link sent to ' + username + '.');
+                else showError('Could not send the reset link (check email configuration).');
+            } catch (e) {
+                showError('Could not send the reset link: ' + (e.message || ''));
+            } finally { btn.disabled = false; }
         });
     });
     
@@ -15203,6 +15342,16 @@ document.addEventListener('DOMContentLoaded', () => {
         try { history.replaceState(null, '', location.pathname); } catch (_) {}
         document.documentElement.removeAttribute('data-auth');
         initInviteFlow(inviteToken);
+        return;
+    }
+
+    // A /?reset=<token> link is the password-reset flow: set a new password, then route to login. Like
+    // invite, it takes precedence over any cached session and strips the token from the URL first.
+    const resetToken = new URLSearchParams(location.search).get('reset');
+    if (resetToken) {
+        try { history.replaceState(null, '', location.pathname); } catch (_) {}
+        document.documentElement.removeAttribute('data-auth');
+        initResetFlow(resetToken);
         return;
     }
 

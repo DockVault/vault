@@ -76,3 +76,19 @@ def test_web_log_pull_redacts_path_secrets(admin):
     assert invite_lines, "expected the /invites request to appear in the web pull"
     assert any("/invites/<redacted>" in l for l in invite_lines), invite_lines[:3]
     assert not any(secret in l for l in lines), "the raw invite token leaked into the web log pull"
+
+    # A password-reset token in the path is masked the same way.
+    reset_secret = "RESETSECRET" + unique("tok").replace("-", "")
+    requests.get(f"{BASE}/reset/{reset_secret}", timeout=15)  # 4xx fine — the middleware logs it either way
+    rlines = []
+    for _ in range(40):
+        pull = requests.get(f"{BASE}/logs", params={"service": "web"},
+                            headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        rlines = pull.json().get("lines", [])
+        if any("/reset/" in l for l in rlines):
+            break
+        time.sleep(0.25)
+    reset_lines = [l for l in rlines if "/reset/" in l]
+    assert reset_lines, "expected the /reset request to appear in the web pull"
+    assert any("/reset/<redacted>" in l for l in reset_lines), reset_lines[:3]
+    assert not any(reset_secret in l for l in rlines), "the raw reset token leaked into the web log pull"

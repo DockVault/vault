@@ -267,6 +267,7 @@ _MAX_REQUEST_BODY_BYTES = 4 * _MAX_UPLOAD_CHUNK_BYTES  # 256 MiB
 # route here.
 _LOG_PATH_SECRET_SUBS = [
     (re.compile(r"^(/invites/)[^/]+"), r"\1<redacted>"),           # GET/POST /invites/{token}[/accept]
+    (re.compile(r"^(/reset/)[^/]+"), r"\1<redacted>"),             # GET/POST /reset/{password-reset-token}
     (re.compile(r"^(/shares/)[^/]+(/claim)"), r"\1<redacted>\2"),  # /shares/{claim-secret}/claim
 ]
 
@@ -278,7 +279,9 @@ def _redact_log_path(path: str) -> str:
     return path
 
 
-_INVITE_QUERY_RE = re.compile(r"(?i)([?&]invite=)[^&#]+")
+# Covers both the /?invite=<token> and /?reset=<token> landing links (the token rides the query on the
+# initial page load, before the client strips it from the address bar).
+_INVITE_QUERY_RE = re.compile(r"(?i)([?&](?:invite|reset)=)[^&#]+")
 
 
 def _redact_access_path(full_path: str) -> str:
@@ -3832,6 +3835,7 @@ async def auth_policy(db: Session = Depends(get_db)):
     pol = _account_policy(db)
     return {
         "signup_enabled": bool(pol.get("signup_enabled")),
+        "password_reset_enabled": bool(pol.get("password_reset_enabled")),
         "login_identifier": pol.get("login_identifier"),
         "email_requirement": pol.get("email_requirement"),
         "password_policy": _password_policy_view(db),
@@ -3867,6 +3871,259 @@ def _audit_signup_failure(db: Session, username: str, ip: str, reason: str) -> N
             details={"username": (username or "")[:64], "reason": reason})
     except Exception:
         pass
+
+
+# ============ Password reset (self-service, gated OFF by default, + admin-triggered) ============
+class ForgotPasswordRequest(BaseModel):
+    identifier: str          # a username or an email address
+
+
+class ResetPasswordRequest(BaseModel):
+    # min_length mirrors the sibling password models (the server also enforces HARD_FLOOR=8); max_length
+    # bounds the input so a pathologically large body can't be hashed.
+    new_password: str = Field(..., min_length=8, max_length=1024)
+
+
+def _password_reset_policy(db: Session):
+    """(enabled, ttl_minutes) — self-service switch + link lifetime, from effective account policy."""
+    pol = _account_policy(db)
+    return bool(pol.get("password_reset_enabled")), int(pol.get("password_reset_ttl_minutes") or 5)
+
+
+def _reset_pepper() -> str:
+    from app.core.password_reset import reset_pepper
+    return reset_pepper(settings.jwt_secret_key)
+
+
+def _resolve_reset_user(db: Session, identifier: str):
+    """Resolve a username OR email to an ACTIVE user, or None. Case-insensitive."""
+    ident = (identifier or "").strip()
+    if not ident:
+        return None
+    from sqlalchemy import func as _f
+    from app.core.email_identity import find_user_by_email
+    u = db.query(User).filter(User.is_active.is_(True),
+                              _f.lower(User.username) == ident.lower()).first()
+    if u is None and "@" in ident:
+        # Reuse the canonical email resolver (SQL-folds both sides, exactly like the unique index), then
+        # honour the active-only rule.
+        cand = find_user_by_email(db, ident)
+        if cand is not None and getattr(cand, "is_active", True):
+            u = cand
+    return u
+
+
+def _mint_and_send_reset(db: Session, user, base_url: str, *, created_by_id) -> bool:
+    """Mint a single-use reset token (invalidating any prior unconsumed one), email it through the
+    password_reset action with the freshly-minted {{action.link}}, and return whether it was sent.
+    Never raises — the caller (public or admin) must not fail on mail trouble."""
+    from app.core.password_reset import mint_reset_token, hash_reset_token, pepper_ok
+    from app.core.models import PasswordResetToken
+    from app.core.email_actions import send_action_email
+    pepper = _reset_pepper()
+    email = (getattr(user, "email", "") or "").strip()
+    if not pepper_ok(pepper) or not email:
+        return False
+    _, ttl = _password_reset_policy(db)
+    try:
+        db.query(PasswordResetToken).filter(
+            PasswordResetToken.user_id == user.id,
+            PasswordResetToken.consumed_at.is_(None)).delete(synchronize_session=False)
+        plaintext, prefix = mint_reset_token()
+        db.add(PasswordResetToken(
+            user_id=user.id, token_prefix=prefix, token_hash=hash_reset_token(plaintext, pepper),
+            expires_at=datetime.utcnow() + timedelta(minutes=ttl), created_by=created_by_id))
+        db.commit()
+    except Exception:
+        db.rollback()
+        return False
+    link = f"{(base_url or '').rstrip('/')}/?reset={plaintext}"
+    try:
+        return bool(send_action_email(db, "password_reset",
+                                      recipient={"email": email, "username": user.username},
+                                      action_context={"link": link, "expires": f"in {ttl} minutes"}))
+    except Exception:
+        return False
+
+
+def _mint_and_send_reset_async(user_id, base_url: str) -> None:
+    """Fire-and-forget the self-service reset mint+send on a daemon thread in its OWN session, so a
+    resolved identifier doesn't respond measurably slower than an unknown one (a timing enumeration
+    oracle). The 202 has already been returned by the time this runs."""
+    def _run():
+        try:
+            from app.core.database import get_db_context
+            with get_db_context() as s:
+                u = s.query(User).filter(User.id == user_id).first()
+                if u is not None:
+                    _mint_and_send_reset(s, u, base_url, created_by_id=None)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        threading.Thread(target=_run, daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _resolve_valid_reset_token(db: Session, token: str):
+    """The valid, unconsumed, unexpired PasswordResetToken for a presented token, or None. Fails closed
+    and never enumerates: lifecycle is checked in Python AFTER a constant-time hash match, so an
+    expired/consumed token is indistinguishable from one that never existed."""
+    from app.core.password_reset import token_prefix, reset_tokens_match, pepper_ok
+    from app.core.models import PasswordResetToken
+    try:
+        pepper = _reset_pepper()
+        if not pepper_ok(pepper):
+            return None
+        now = datetime.utcnow()
+        for r in db.query(PasswordResetToken).filter(
+                PasswordResetToken.token_prefix == token_prefix(token)).all():
+            if reset_tokens_match(token, pepper, r.token_hash):
+                return r if (r.consumed_at is None and r.expires_at > now) else None
+    except Exception:
+        return None
+    return None
+
+
+@app.post("/auth/forgot-password")
+async def forgot_password(body: ForgotPasswordRequest, request: Request, db: Session = Depends(get_db)):
+    """Public self-service password-reset request. ALWAYS returns 202 (enumeration-safe). A link is
+    minted+sent only when self-service is enabled AND the identifier resolves to an active account with
+    an email AND SMTP is configured. Rate-limited fail-closed per client IP."""
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    ip = get_client_ip(request)
+    try:
+        allowed, _, reset = _rl.check_rate_limit(
+            identifier=ip, limit=settings.rate_limit_api_auth, window=settings.rate_limit_api_auth_window,
+            prefix="forgot_password_ip", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable. Please try again shortly.")
+    if not allowed:
+        import time as _t
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many requests; please wait a few minutes.",
+                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    enabled, _ttl = _password_reset_policy(db)
+    if enabled and _smtp_configured(db):
+        user = _resolve_reset_user(db, body.identifier)
+        if user is not None:
+            # Background the mint+send so a resolved identifier can't be told apart from an unknown one
+            # by response timing (both do only the resolution query on the request path).
+            _mint_and_send_reset_async(user.id, str(request.base_url))
+    try:
+        AuditLogger(db).log_action(action="password_reset_requested", status="success", user=None,
+                                   ip_address=ip, details={})
+    except Exception:  # noqa: BLE001
+        pass
+    return JSONResponse(status_code=202, content={
+        "message": "If an account matches and self-service reset is enabled, a reset link has been sent."})
+
+
+@app.post("/users/{user_id}/send-reset-link")
+@require_endpoint_permission("USER_MANAGE")
+async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
+                                current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Admin action: email a password-reset link to a user. Always available (independent of the public
+    self-service switch), interactive-admin only."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage users.")
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not (user.email or "").strip():
+        raise HTTPException(status_code=400, detail="That user has no email address to send a reset link to.")
+    if not _smtp_configured(db):
+        raise HTTPException(status_code=400,
+                            detail="Email is not configured. Add a sending profile in Settings -> Email first.")
+    sent = _mint_and_send_reset(db, user, str(request.base_url), created_by_id=current_user.id)
+    try:
+        AuditLogger(db).log_action(action="password_reset_link_sent", status="success", user=current_user,
+                                   ip_address=get_client_ip(request),
+                                   details={"target_user_id": str(user_id), "email_sent": bool(sent)})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"email_sent": bool(sent)}
+
+
+@app.get("/reset/{token}")
+async def get_reset(token: str, request: Request, db: Session = Depends(get_db)):
+    """Public: validate a reset token and return the minimal info the reset form needs. Generic 404 for
+    any unusable token (no enumeration). Rate-limited fail-closed per IP."""
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    ip = get_client_ip(request)
+    try:
+        allowed, _, _ = _rl.check_rate_limit(
+            identifier=ip, limit=settings.rate_limit_api_auth, window=settings.rate_limit_api_auth_window,
+            prefix="reset_lookup_ip", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+    if not allowed:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many requests; please wait.")
+    r = _resolve_valid_reset_token(db, token)
+    if r is None:
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    user = db.query(User).filter(User.id == r.user_id).first()
+    return {"username": (user.username if user else None)}
+
+
+@app.post("/reset/{token}")
+async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db: Session = Depends(get_db)):
+    """Public: set a new password using a valid reset token. Single-use (atomic claim); revokes the
+    user's sessions so a stolen session can't outlive the reset. Rate-limited fail-closed per IP AND
+    per token-prefix."""
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    from app.core.password_reset import token_prefix
+    from app.core.security import hash_password
+    from app.core.models import PasswordResetToken
+    ip = get_client_ip(request)
+    prefix = token_prefix(token)
+    # Two fail-closed limits: a generous per-IP cap (many users can share one address) and a tight
+    # per-token-prefix cap that bounds repeated attempts against ONE known prefix (e.g. a leaked one).
+    # Whole-space brute force is already infeasible against the 256-bit token and bounded by the per-IP cap.
+    try:
+        for ident, pfx, lim, win in (
+                (ip, "reset_do_ip", settings.rate_limit_api_auth, settings.rate_limit_api_auth_window),
+                (prefix or "none", "reset_do_prefix", 5, 60)):
+            allowed, _, reset = _rl.check_rate_limit(identifier=ident, limit=lim, window=win, prefix=pfx, fail_open=False)
+            if not allowed:
+                import time as _t
+                raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                                    detail="Too many attempts; please wait.",
+                                    headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+    r = _resolve_valid_reset_token(db, token)
+    if r is None:
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    _validate_password_policy(db, body.new_password)     # 400 on a weak password BEFORE the token is burned
+    user = db.query(User).filter(User.id == r.user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    # Atomic single-use claim: only the request that flips consumed_at proceeds.
+    claimed = db.query(PasswordResetToken).filter(
+        PasswordResetToken.id == r.id, PasswordResetToken.consumed_at.is_(None)).update(
+        {"consumed_at": datetime.utcnow()}, synchronize_session=False)
+    if not claimed:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    user.password_hash = hash_password(body.new_password)
+    db.commit()
+    try:
+        # _revoke_sessions mutates session rows but does NOT commit — commit it ourselves so the durable
+        # DB-level revocation persists (a hijacked session must not outlive the reset).
+        _revoke_sessions(db, user_id=user.id, actor_username="password-reset")   # force re-login everywhere
+        db.commit()
+    except Exception:  # noqa: BLE001
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    try:
+        AuditLogger(db).log_action(action="password_reset_completed", status="success", user=user,
+                                   ip_address=ip, details={})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True}
 
 
 @app.post("/auth/signup")

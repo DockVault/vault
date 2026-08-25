@@ -1172,6 +1172,34 @@ class AccountInvitation(Base):
     )
 
 
+class PasswordResetToken(Base):
+    """Single-use, short-lived proof used to reset a forgotten password via a link.
+
+    Same token discipline as AccountInvitation: secrets.token_urlsafe(32) plaintext shown/emailed once,
+    a short indexed prefix for lookup, and only a peppered HMAC-SHA256 stored at rest. Minting a new
+    token invalidates any prior unconsumed one for the user (one active link at a time). A WHOLE NEW
+    TABLE — created by create_all(), so it needs no lightweight-migration entry. ``created_by`` records
+    the admin who triggered it (NULL for a self-service 'forgot password' request)."""
+    __tablename__ = 'password_reset_tokens'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # No column-level index=True on user_id/token_prefix: the explicit named indexes below cover them
+    # (a column index=True would create a redundant second index).
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    token_prefix = Column(String(16), nullable=False)                        # public lookup handle
+    token_hash = Column(String(64), unique=True, nullable=False, index=True)  # HMAC-SHA256 hex
+    expires_at = Column(DateTime, nullable=False)                             # short-lived (<= a few min)
+    consumed_at = Column(DateTime, nullable=True)                             # single-use: set on redeem
+    created_at = Column(DateTime, default=datetime.utcnow)
+    created_by = Column(UUID(as_uuid=True),
+                        ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+
+    __table_args__ = (
+        Index('idx_pwreset_prefix', 'token_prefix'),
+        Index('idx_pwreset_user', 'user_id'),
+    )
+
+
 class Notification(Base):
     """Per-user in-app notification (the bell + the Dashboard "What's waiting for you" lane).
 

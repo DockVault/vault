@@ -90,7 +90,8 @@ def test_auth_policy_minimal_keys_and_no_leak(admin, restore_settings):
 
     # EXACT key-set (not just a denylist): any future key added to the response — sensitive or not —
     # trips this and forces a review of the public surface.
-    assert set(body) == {"signup_enabled", "login_identifier", "email_requirement", "password_policy"}
+    assert set(body) == {"signup_enabled", "password_reset_enabled", "login_identifier",
+                         "email_requirement", "password_policy"}
     assert set(pp) == {"min_length", "require_uppercase", "require_lowercase",
                        "require_numbers", "require_special"}
 

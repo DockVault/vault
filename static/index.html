@@ -115,6 +115,20 @@
                     
                     <div id="login-error" class="alert alert-error mt-md" style="display: none;"></div>
 
+                    <!-- Forgot password: link hidden until /auth/policy confirms self-service reset is on. -->
+                    <div id="forgot-toggle" class="mt-sm" style="display: none;">
+                        <a href="#" id="show-forgot-link" role="button" style="font-size: 0.9em;">Forgot your password?</a>
+                    </div>
+                    <form id="forgot-form" style="display: none;">
+                        <div class="form-group">
+                            <label for="forgot-identifier">Username or email</label>
+                            <input type="text" id="forgot-identifier" class="form-control" autocomplete="username">
+                        </div>
+                        <button type="submit" class="btn btn-primary btn-block">Send reset link</button>
+                        <div id="forgot-message" class="alert alert-info mt-md" style="display: none;" role="status"></div>
+                        <div class="mt-md"><a href="#" id="forgot-back-link" role="button">&larr; Back to sign in</a></div>
+                    </form>
+
                     <!-- Self-signup: the toggle link and the form are BOTH hidden until the pre-auth
                          policy fetch (app.js applyLoginPolicyLabel -> /auth/policy) confirms signup is
                          enabled. The email group's presence/required state is driven by the same policy
@@ -174,6 +188,17 @@
         <div class="flex items-center justify-center" style="min-height: 100vh; width: 100%; padding: var(--space-lg);">
             <div class="card" style="max-width: 420px; width: 100%;">
                 <div class="card-body" id="invite-card-body">
+                    <div class="loading-spinner" style="margin: var(--space-lg) auto;" aria-hidden="true"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Password reset (reached via /?reset=<token>) -->
+    <div id="reset-screen" class="screen">
+        <div class="flex items-center justify-center" style="min-height: 100vh; width: 100%; padding: var(--space-lg);">
+            <div class="card" style="max-width: 420px; width: 100%;">
+                <div class="card-body" id="reset-card-body">
                     <div class="loading-spinner" style="margin: var(--space-lg) auto;" aria-hidden="true"></div>
                 </div>
             </div>
