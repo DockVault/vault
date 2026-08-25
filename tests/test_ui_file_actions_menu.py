@@ -94,7 +94,8 @@ def test_right_click_opens_a_gated_context_menu(page: Page, admin, admin_creds):
         row = page.locator("#vault-files-table-body tr").first
         expect(row).to_be_visible(timeout=15000)
 
-        row.click(button="right")
+        # Open the menu via the "more" button (a reliable left-click in headless Chromium).
+        row.locator('button[data-action="more"]').click()
         menu = page.locator("#file-context-menu")
         expect(menu).to_be_visible()
         # a permitted set of actions for an admin on a Standard vault.
@@ -107,9 +108,14 @@ def test_right_click_opens_a_gated_context_menu(page: Page, admin, admin_creds):
         expect(page.locator("#file-info-modal")).to_be_visible(timeout=8000)
         page.locator("#file-info-modal .close-modal-btn").click()
 
-        # Escape dismisses the menu.
-        row.click(button="right")
+        # A right-click (contextmenu) on the row ALSO opens the menu -- exercise the handler directly
+        # via a dispatched contextmenu event (headless Chromium's synthetic right-click is unreliable).
+        page.evaluate(
+            "() => { const r = document.querySelector('#vault-files-table-body tr');"
+            " r.dispatchEvent(new MouseEvent('contextmenu', {bubbles: true, clientX: 120, clientY: 120})); }"
+        )
         expect(menu).to_be_visible()
+        # Escape dismisses the menu.
         page.keyboard.press("Escape")
         expect(menu).to_be_hidden()
     finally:

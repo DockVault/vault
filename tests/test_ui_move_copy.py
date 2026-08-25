@@ -42,8 +42,8 @@ def _mkfolder(client, vault_id, name):
 
 def _stage(page: Page, fid: str, action: str):
     """Stage a file for move/copy. The copy/move buttons now live in a hover cluster that is hidden
-    at rest, so drive it through the always-visible right-click context menu instead."""
-    page.locator(f'tr:has(.file-name[data-file-id="{fid}"])').first.click(button="right")
+    at rest, so drive it through the "more" button, which opens the same context menu."""
+    page.locator(f'tr:has(.file-name[data-file-id="{fid}"]) button[data-action="more"]').first.click()
     page.locator(f'#file-context-menu button[data-action="{action}"]').click()
 
 
