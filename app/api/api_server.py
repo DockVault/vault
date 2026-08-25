@@ -15342,7 +15342,8 @@ def _seed_default_email_profile():
             if n:
                 print(f"[OK] Seeded {n} automated-email action(s)")
             # Materialize each action's built-in default template and pre-bind it (idempotent; never
-            # overwrites an admin's own template choice). Runs after the actions exist so it can bind.
+            # overwrites an admin's own template choice). Runs after the actions exist so it can bind,
+            # and self-heals an unbound SYSTEM action against an existing default (see seed_default_templates).
             t = seed_default_templates(db)
             if t:
                 print(f"[OK] Seeded {t} default email template(s)")
