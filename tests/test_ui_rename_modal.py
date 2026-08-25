@@ -71,7 +71,9 @@ def test_rename_fields_caret_and_extension_warning(page: Page, admin, admin_cred
                              files=[{"name": "doc.txt", "mimeType": "text/plain", "buffer": b"x"}])
         row = page.locator("#vault-files-table-body tr").first
         expect(row).to_be_visible(timeout=15000)
-        row.locator('button[data-action="rename-file"]').click()
+        # Rename lives in the hover cluster / right-click menu now; drive it via the menu.
+        row.click(button="right")
+        page.locator('#file-context-menu button[data-action="rename-file"]').click()
 
         expect(page.locator("#rename-modal")).to_be_visible()
         # separate fields split at the last dot; the extension is read-only to start.
@@ -92,7 +94,8 @@ def test_rename_fields_caret_and_extension_warning(page: Page, admin, admin_cred
         expect(page.locator("#vault-files-table-body")).to_contain_text("renamed.txt")
 
         # now change the EXTENSION -> a warning; the warning must not be visible before saving.
-        page.locator("#vault-files-table-body tr").first.locator('button[data-action="rename-file"]').click()
+        page.locator("#vault-files-table-body tr").first.click(button="right")
+        page.locator('#file-context-menu button[data-action="rename-file"]').click()
         expect(page.locator("#rename-modal")).to_be_visible()
         expect(page.locator("#rename-warning")).to_be_hidden()  # gated: hidden until an ext change is saved
         page.locator("#rename-ext-input").dblclick()
@@ -130,7 +133,8 @@ def test_rename_folder_has_no_extension_field(page: Page, admin, admin_creds):
         _open_vault_table(page, v["id"])
         folder_row = page.locator("#vault-files-table-body tr", has=page.locator(".file-name[data-folder-id]")).first
         expect(folder_row).to_be_visible(timeout=15000)
-        folder_row.locator('button[data-action="rename-folder"]').click()
+        folder_row.click(button="right")
+        page.locator('#file-context-menu button[data-action="rename-folder"]').click()
         expect(page.locator("#rename-modal")).to_be_visible()
         expect(page.locator("#rename-name-input")).to_have_value("myfolder")
         expect(page.locator("#rename-ext-wrap")).to_be_hidden()  # folders have no extension field

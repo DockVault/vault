@@ -40,6 +40,13 @@ def _mkfolder(client, vault_id, name):
     return r.json()["folder"]["id"]
 
 
+def _stage(page: Page, fid: str, action: str):
+    """Stage a file for move/copy. The copy/move buttons now live in a hover cluster that is hidden
+    at rest, so drive it through the always-visible right-click context menu instead."""
+    page.locator(f'tr:has(.file-name[data-file-id="{fid}"])').first.click(button="right")
+    page.locator(f'#file-context-menu button[data-action="{action}"]').click()
+
+
 def test_copy_file_via_clipboard_keeps_original(page: Page, admin, admin_creds):
     v = admin.create_vault(name=unique("uicp"))
     vid = v["id"]
@@ -49,7 +56,7 @@ def test_copy_file_via_clipboard_keeps_original(page: Page, admin, admin_creds):
         _login(page, admin_creds["username"], admin_creds["password"])
         _open_vault(page, vid)
         # Stage the file for copy.
-        page.click(f'button[data-action="copy-file"][data-id="{fid}"]')
+        _stage(page, fid, "copy-file")
         expect(page.locator("#move-copy-bar")).to_be_visible()
         expect(page.locator("#move-copy-count")).to_have_text("1")
         # Enter the destination folder and paste.
@@ -74,7 +81,7 @@ def test_move_file_via_clipboard_relocates_and_clears(page: Page, admin, admin_c
     try:
         _login(page, admin_creds["username"], admin_creds["password"])
         _open_vault(page, vid)
-        page.click(f'button[data-action="move-file"][data-id="{fid}"]')
+        _stage(page, fid, "move-file")
         expect(page.locator("#move-copy-bar")).to_be_visible()
         page.click(f'.file-name[data-folder-id="{folder}"]')
         page.click("#move-copy-paste")
@@ -99,7 +106,7 @@ def test_no_console_errors_when_staging(page: Page, admin, admin_creds):
     try:
         _login(page, admin_creds["username"], admin_creds["password"])
         _open_vault(page, vid)
-        page.click(f'button[data-action="copy-file"][data-id="{fid}"]')
+        _stage(page, fid, "copy-file")
         expect(page.locator("#move-copy-bar")).to_be_visible()
         page.wait_for_timeout(500)
         assert not errors, f"console errors while staging a copy: {errors}"

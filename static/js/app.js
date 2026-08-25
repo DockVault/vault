@@ -9447,47 +9447,51 @@ function fileActionButtons(item, canWrite, opts) {
     const id = item.id;
     const nm = escapeHtml(item.name);
     const slot = opts && opts.slot;
+    // The left cluster of a grid tile holds only the checkbox (added by the caller).
+    if (slot === 'primary') return '';
     const btn = (action, icon, label, danger) =>
-        `<button class="action-btn${danger ? ' action-btn-danger' : ''}" data-action="${action}" data-id="${id}" data-name="${nm}" title="${label}" aria-label="${label}">${iconSvg(icon, 'icon-sm')}</button>`;
-    // vaultCapAllowed() is a no-op (true) for non-scoped sessions; for a scoped temp
-    // credential it gates each action by the cap its scope grants on this vault,
-    // matching require_vault_cap server-side (rename=file.rename, delete=file.delete,
-    // folder delete=folder.delete, download=file.download). The same gate applies in
-    // every slot, so splitting the cluster never grants an affordance the scope lacks.
-    const out = [];
+        `<button type="button" class="action-btn${danger ? ' action-btn-danger' : ''}" data-action="${action}" data-id="${id}" data-name="${nm}" title="${label}" aria-label="${label}">${iconSvg(icon, 'icon-sm')}</button>`;
+    // vaultCapAllowed() is a no-op (true) for non-scoped sessions; for a scoped temp credential it
+    // gates each action by the cap its scope grants on this vault, matching require_vault_cap
+    // server-side. The resting row shows at most [more][share][download]; edit/copy/move/delete live
+    // in a hover cluster behind the "more" button (Info + Show-hash live in the right-click menu),
+    // which keeps a tile from overflowing with five-plus icons.
+    const cluster = [];   // revealed on hovering "more"
+    const trailing = [];  // always-visible: share, then download (far right)
     if (isFolder) {
         const canRename = canWrite && vaultCapAllowed('file.rename');
         const canDelete = canWrite && vaultCapAllowed('folder.delete');
-        // Copy/Move a folder needs folder.create (the structural cap); a recursive copy also
-        // reads + writes files, gated server-side. Mirrors require_vault_cap on the endpoints.
+        // Copy/Move a folder needs folder.create (the structural cap); a recursive copy also reads +
+        // writes files, gated server-side. Mirrors require_vault_cap on the endpoints.
         const canStructure = canWrite && vaultCapAllowed('folder.create');
-        if (slot !== 'primary') {  // folders have no download -> primary (left) is empty
-            if (canRename) out.push(btn('rename-folder', 'edit', 'Rename'));
-            if (canStructure) out.push(btn('copy-folder', 'copy', 'Copy'));
-            if (canStructure) out.push(btn('move-folder', 'move', 'Move'));
-            if (canDelete) out.push(btn('delete-folder', 'trash', 'Delete', true));
-            if (vaultShareable()) out.push(btn('share-folder', 'link', 'Share'));
-        }
-        if (out.length === 0 && !slot && (!opts || !opts.grid)) out.push('<span class="text-tertiary text-sm">—</span>');
+        if (canRename) cluster.push(btn('rename-folder', 'edit', 'Rename'));
+        if (canStructure) cluster.push(btn('copy-folder', 'copy', 'Copy'));
+        if (canStructure) cluster.push(btn('move-folder', 'move', 'Move'));
+        if (canDelete) cluster.push(btn('delete-folder', 'trash', 'Delete', true));
+        if (vaultShareable()) trailing.push(btn('share-folder', 'link', 'Share'));
     } else {
         const canDownload = vaultCapAllowed('file.download');
         const canRename = canWrite && vaultCapAllowed('file.rename');
         const canDelete = canWrite && vaultCapAllowed('file.delete');
-        if (slot !== 'primary') {
-            if (canRename) out.push(btn('rename-file', 'edit', 'Rename'));
-            // Copy needs read (file.download); Move removes from the source (file.delete). The
-            // destination write is authorized at paste time, matching the endpoints.
-            if (canDownload) out.push(btn('copy-file', 'copy', 'Copy'));
-            if (canDelete) out.push(btn('move-file', 'move', 'Move'));
-            if (canDelete) out.push(btn('delete-file', 'trash', 'Delete', true));
-            if (vaultShareable()) out.push(btn('share-file', 'link', 'Share'));
-            // Info (dates / who / size / hash). Anyone who can list files can read it.
-            if (vaultCapAllowed('vault.see_files')) out.push(btn('file-info', 'info', 'Info'));
-            // Download last so it renders on the far RIGHT of the action cluster (grid + table).
-            if (canDownload) out.push(btn('download', 'download', 'Download'));
-        }
+        if (canRename) cluster.push(btn('rename-file', 'edit', 'Rename'));
+        // Copy needs read (file.download); Move removes from the source (file.delete).
+        if (canDownload) cluster.push(btn('copy-file', 'copy', 'Copy'));
+        if (canDelete) cluster.push(btn('move-file', 'move', 'Move'));
+        if (canDelete) cluster.push(btn('delete-file', 'trash', 'Delete', true));
+        if (vaultShareable()) trailing.push(btn('share-file', 'link', 'Share'));
+        // Download last so it renders on the far RIGHT of the action row (grid + table).
+        if (canDownload) trailing.push(btn('download', 'download', 'Download'));
     }
-    return out.join('');
+    let html = '';
+    if (cluster.length) {
+        html += '<div class="action-more-wrap">'
+            + `<div class="action-cluster" role="group" aria-label="More actions">${cluster.join('')}</div>`
+            + `<button type="button" class="action-btn action-more" data-action="more" aria-haspopup="true" aria-label="More actions" title="More actions">${iconSvg('more', 'icon-sm')}</button>`
+            + '</div>';
+    }
+    html += trailing.join('');
+    if (!html && !slot && (!opts || !opts.grid)) html = '<span class="text-tertiary text-sm">—</span>';
+    return html;
 }
 
 function renderFilesTable(items, canWrite, tbody) {
@@ -9555,6 +9559,121 @@ function renderFilesGrid(items, canWrite, grid) {
     }).join('');
 }
 
+// Run a file/folder action by its data-action verb. Shared by the row buttons AND the right-click
+// context menu, so the two can never drift.
+function runFileAction(action, id, name) {
+    if (action === 'preview') {
+        const it = (state.currentFiles || []).find(i => i.id === id);
+        openFilePreview(id, name, (it && it.mime_type) || '');
+    }
+    else if (action === 'open-folder') openFolder(id, name);
+    else if (action === 'download') downloadFile(id, name);
+    else if (action === 'rename-file' || action === 'rename-folder') renameVaultItem(id, name, action === 'rename-folder' ? 'folder' : 'file');
+    else if (action === 'delete-file' || action === 'delete-folder') deleteVaultItem(id, name, action === 'delete-folder' ? 'folder' : 'file');
+    else if (action === 'share-file' || action === 'share-folder') openCreateShareModal(action === 'share-folder' ? 'folder' : 'file', id, name);
+    else if (action === 'file-info') openFileInfo(id, name);
+    else if (action === 'copy-sha256') copyFileHash(id, name);
+    else if (action === 'copy-file' || action === 'move-file') stageForMoveCopy(id, name, 'file', action === 'move-file' ? 'move' : 'copy');
+    else if (action === 'copy-folder' || action === 'move-folder') stageForMoveCopy(id, name, 'folder', action === 'move-folder' ? 'move' : 'copy');
+}
+
+// Copy a file's SHA-256 straight to the clipboard (Standard vaults; a zero-knowledge vault has no
+// server-side content hash). Reuses the gated /info endpoint.
+async function copyFileHash(fileId, fileName) {
+    try {
+        const headers = {};
+        if (state.currentVault && state.currentVault.has_password && state.vaultPassword) headers['X-Vault-Password'] = state.vaultPassword;
+        const info = await apiRequest(`/vaults/${state.currentVault.id}/files/${fileId}/info`, { headers });
+        if (info.checksum_sha256) { await navigator.clipboard.writeText(info.checksum_sha256); showToast('SHA-256 copied to clipboard', 'success'); }
+        else showToast(info.is_zero_knowledge ? 'Hash is unavailable for a zero-knowledge vault.' : 'Hash is unavailable for this file.', 'info');
+    } catch (_) { showToast('Could not read the file hash.', 'error'); }
+}
+
+// A right-click context menu for a file/folder row/tile. One reusable floating element; every entry
+// is permission-gated exactly like the row buttons, and labels are set via textContent (XSS-safe).
+let _ctxMenuEl = null;
+function _svgUse(name, cls) {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('class', 'icon ' + (cls || 'icon-sm'));
+    svg.setAttribute('aria-hidden', 'true');
+    const use = document.createElementNS(NS, 'use');
+    use.setAttribute('href', '#i-' + name);
+    svg.appendChild(use);
+    return svg;
+}
+function _ctxOutside(e) { if (_ctxMenuEl && !_ctxMenuEl.contains(e.target)) closeContextMenu(); }
+function _ctxKey(e) { if (e.key === 'Escape') closeContextMenu(); }
+function closeContextMenu() {
+    if (_ctxMenuEl) { _ctxMenuEl.hidden = true; _ctxMenuEl.replaceChildren(); }
+    document.removeEventListener('click', _ctxOutside, true);
+    document.removeEventListener('keydown', _ctxKey, true);
+    window.removeEventListener('scroll', closeContextMenu, true);
+    window.removeEventListener('resize', closeContextMenu, true);
+}
+function openContextMenu(item, x, y) {
+    if (!item) return;
+    if (!_ctxMenuEl) {
+        _ctxMenuEl = document.createElement('div');
+        _ctxMenuEl.id = 'file-context-menu';
+        _ctxMenuEl.className = 'context-menu';
+        _ctxMenuEl.setAttribute('role', 'menu');
+        _ctxMenuEl.hidden = true;
+        document.body.appendChild(_ctxMenuEl);
+    }
+    const isFolder = item.type === 'folder';
+    const canWrite = state.canWriteCurrentVault !== false;
+    const clipHas = (state.moveCopyClip || []).length > 0;
+    const entries = [];
+    const add = (label, icon, action, danger) => entries.push({ label, icon, action, danger });
+    if (isFolder) {
+        add('Open', 'folder', 'open-folder');
+        if (canWrite && vaultCapAllowed('file.rename')) add('Rename', 'edit', 'rename-folder');
+        if (canWrite && vaultCapAllowed('folder.create')) add(clipHas ? 'Add to copy list' : 'Copy', 'copy', 'copy-folder');
+        if (canWrite && vaultCapAllowed('folder.create')) add(clipHas ? 'Add to move list' : 'Move', 'move', 'move-folder');
+        if (vaultShareable()) add('Share', 'link', 'share-folder');
+        if (canWrite && vaultCapAllowed('folder.delete')) add('Delete', 'trash', 'delete-folder', true);
+    } else {
+        const canDownload = vaultCapAllowed('file.download');
+        add('Preview', 'eye', 'preview');
+        if (canWrite && vaultCapAllowed('file.rename')) add('Rename', 'edit', 'rename-file');
+        if (canDownload) add(clipHas ? 'Add to copy list' : 'Copy', 'copy', 'copy-file');
+        if (canWrite && vaultCapAllowed('file.delete')) add(clipHas ? 'Add to move list' : 'Move', 'move', 'move-file');
+        if (vaultShareable()) add('Share', 'link', 'share-file');
+        if (canDownload) add('Download', 'download', 'download');
+        if (vaultCapAllowed('vault.see_files')) add('File info', 'info', 'file-info');
+        // The hash is content-derived, so only offer "Copy SHA-256" to a principal who can download
+        // the file (mirrors the server, which withholds the checksum otherwise) -- and Standard only.
+        if (vaultCapAllowed('vault.see_files') && canDownload && !isZkVault(state.currentVault)) add('Copy SHA-256', 'hash', 'copy-sha256');
+        if (canWrite && vaultCapAllowed('file.delete')) add('Delete', 'trash', 'delete-file', true);
+    }
+    const menu = _ctxMenuEl;
+    menu.replaceChildren();
+    entries.forEach(en => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'context-menu-item' + (en.danger ? ' danger' : '');
+        b.setAttribute('role', 'menuitem');
+        b.setAttribute('data-action', en.action);
+        const lbl = document.createElement('span');
+        lbl.textContent = en.label;
+        b.append(_svgUse(en.icon), lbl);
+        b.addEventListener('click', () => { closeContextMenu(); runFileAction(en.action, item.id, item.name); });
+        menu.appendChild(b);
+    });
+    menu.hidden = false;
+    // Position, clamped to the viewport.
+    const r = menu.getBoundingClientRect();
+    const left = Math.max(4, Math.min(x, window.innerWidth - r.width - 8));
+    const top = Math.max(4, Math.min(y, window.innerHeight - r.height - 8));
+    menu.style.left = left + 'px';
+    menu.style.top = top + 'px';
+    document.addEventListener('click', _ctxOutside, true);
+    document.addEventListener('keydown', _ctxKey, true);
+    window.addEventListener('scroll', closeContextMenu, true);
+    window.addEventListener('resize', closeContextMenu, true);
+}
+
 // Wire file-name / folder / action / checkbox handlers within a container
 // (called fresh after each render of either view).
 function wireFileItemHandlers(container) {
@@ -9589,19 +9708,34 @@ function wireFileItemHandlers(container) {
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
             const action = btn.getAttribute('data-action');
-            const id = btn.getAttribute('data-id');
-            const name = btn.getAttribute('data-name');
-            if (action === 'download') downloadFile(id, name);
-            else if (action === 'rename-file' || action === 'rename-folder') renameVaultItem(id, name, action === 'rename-folder' ? 'folder' : 'file');
-            else if (action === 'delete-file' || action === 'delete-folder') deleteVaultItem(id, name, action === 'delete-folder' ? 'folder' : 'file');
-            else if (action === 'share-file' || action === 'share-folder') openCreateShareModal(action === 'share-folder' ? 'folder' : 'file', id, name);
-            else if (action === 'file-info') openFileInfo(id, name);
-            else if (action === 'copy-file' || action === 'move-file')
-                stageForMoveCopy(id, name, 'file', action === 'move-file' ? 'move' : 'copy');
-            else if (action === 'copy-folder' || action === 'move-folder')
-                stageForMoveCopy(id, name, 'folder', action === 'move-folder' ? 'move' : 'copy');
+            if (action === 'more') {
+                // The "more" button opens the full context menu -- a touch/keyboard path to the same
+                // actions the hover cluster reveals. Anchor it to the button.
+                const row = btn.closest('tr, .file-tile');
+                const fn = row && row.querySelector('.file-name');
+                const fid = fn && (fn.getAttribute('data-file-id') || fn.getAttribute('data-folder-id'));
+                const item = fid && (state.currentFiles || []).find(i => i.id === fid);
+                if (item) { const r = btn.getBoundingClientRect(); openContextMenu(item, r.left, r.bottom + 2); }
+                return;
+            }
+            runFileAction(action, btn.getAttribute('data-id'), btn.getAttribute('data-name'));
         });
     });
+    // Right-click a row/tile -> the context menu with every permitted action. Delegated + wired ONCE
+    // per container (the tbody/grid element persists across the 5s re-render, so re-wiring would stack).
+    if (!container.dataset.ctxWired) {
+        container.dataset.ctxWired = '1';
+        container.addEventListener('contextmenu', (e) => {
+            const row = e.target.closest('tr, .file-tile');
+            const fn = row && row.querySelector('.file-name');
+            const fid = fn && (fn.getAttribute('data-file-id') || fn.getAttribute('data-folder-id'));
+            if (!fid) return;   // right-click on empty space / a header: leave the native menu
+            const item = (state.currentFiles || []).find(i => i.id === fid);
+            if (!item) return;
+            e.preventDefault();
+            openContextMenu(item, e.clientX, e.clientY);
+        });
+    }
     container.querySelectorAll('.file-check').forEach(cb => {
         cb.addEventListener('click', (e) => e.stopPropagation());
         cb.addEventListener('change', () => toggleFileSelected(cb.getAttribute('data-id'), cb.checked));

@@ -221,7 +221,9 @@ def test_info_modal_shows_metadata_hash_and_copy(page: Page, admin, admin_creds)
                              files=[{"name": "doc.txt", "mimeType": "text/plain", "buffer": b"hello info"}])
         row = page.locator("#vault-files-table-body tr").first
         expect(row).to_be_visible(timeout=15000)
-        row.locator('button[data-action="file-info"]').click()
+        # Info lives in the right-click context menu now (not an inline row button).
+        row.click(button="right")
+        page.locator('#file-context-menu button[data-action="file-info"]').click()
 
         expect(page.locator("#file-info-modal")).to_be_visible(timeout=8000)
         expect(page.locator("#file-info-body .file-info-dl")).to_be_visible()

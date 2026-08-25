@@ -1936,6 +1936,72 @@ details summary:hover {
 #rename-error[hidden], #rename-warning[hidden] { display: none; }
 
 /* ============================================================================
+   File-row action hover cluster + right-click context menu (shared by both skins)
+   Resting state shows [more][share][download]; hovering "more" slides the
+   edit/copy/move/delete cluster out to the LEFT. This keeps a grid tile from
+   overflowing with five-plus action icons.
+   ============================================================================ */
+.action-more-wrap { position: relative; display: inline-flex; align-items: center; }
+.action-cluster {
+    position: absolute;
+    right: 100%;                                   /* to the LEFT of the "more" button */
+    top: 50%;
+    transform: translateY(-50%) translateX(6px);   /* start nudged right -> slides left into place */
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 4px;
+    margin-right: 2px;
+    background: var(--surface-1);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: opacity .12s ease, transform .12s ease, visibility .12s;
+    z-index: 5;
+    white-space: nowrap;
+}
+.action-more-wrap:hover .action-cluster,
+.action-more-wrap:focus-within .action-cluster {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateY(-50%) translateX(0);
+}
+
+.context-menu {
+    position: fixed;
+    min-width: 190px;
+    max-width: 260px;
+    max-height: calc(100vh - 12px);
+    overflow-y: auto;
+    background: var(--surface-1);
+    border: 1px solid var(--surface-3);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lg);
+    padding: 4px;
+    z-index: 2000;
+}
+.context-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 7px 10px;
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-size: var(--text-sm);
+    text-align: left;
+    cursor: pointer;
+}
+.context-menu-item:hover, .context-menu-item:focus-visible { background: var(--surface-2); outline: none; }
+.context-menu-item.danger { color: var(--error); }
+.context-menu-item .icon { flex: 0 0 auto; }
+
+/* ============================================================================
    CONTINUED IN NEXT FILE...
    ============================================================================ */
 
