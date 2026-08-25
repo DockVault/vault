@@ -9784,27 +9784,198 @@ function _moveCopyClip() {
     return state.moveCopyClip;
 }
 
+function _ciCurrentPath() {
+    return ['Root'].concat((state.currentPath || []).map(f => f.name || '…')).join(' / ');
+}
+
 function stageForMoveCopy(id, name, type, action) {
     const clip = _moveCopyClip();
-    // Re-staging the same item replaces its pending action (Copy then Move, or vice-versa).
+    const src = (state.currentFiles || []).find(e => e.id === id) || {};
+    const meta = {
+        id, name, type, action,
+        sourceVaultId: state.currentVaultId,
+        sourceVaultName: (state.currentVault && state.currentVault.name) || '',
+        sourcePath: _ciCurrentPath(),
+        size: src.size || 0,
+        modified: src.modified || null,
+    };
+    // Re-staging the same item refreshes its action + metadata; keepAfter resets to the action's
+    // default (copy keeps so you can paste into many folders; move leaves once relocated).
     const existing = clip.find(e => e.id === id);
-    if (existing) { existing.action = action; existing.name = name; existing.type = type; }
-    else clip.push({ id, name, type, action, sourceVaultId: state.currentVaultId });
-    updateMoveCopyBar();
-    showToast(`${action === 'move' ? 'Moving' : 'Copying'}: ${name}. Open a folder or vault and Paste here.`, 'info');
+    if (existing) { Object.assign(existing, meta); existing.keepAfter = (action === 'copy'); }
+    else clip.push(Object.assign(meta, { keepAfter: action === 'copy', selected: false }));
+    updateCopiedItemsButton();
+    if (_ciPanelOpen()) renderCopiedItems();
+    showToast(`${action === 'move' ? 'Cut' : 'Copied'}: ${name}. Open "Copied Items" to paste.`, 'info');
 }
 
 function clearMoveCopy() {
     state.moveCopyClip = [];
-    updateMoveCopyBar();
+    updateCopiedItemsButton();
+    if (_ciPanelOpen()) renderCopiedItems();
 }
 
-function updateMoveCopyBar() {
+// The "Copied Items" toolbar button (+ count) replaces the old always-visible bar.
+function updateCopiedItemsButton() {
     const clip = _moveCopyClip();
-    const bar = document.getElementById('move-copy-bar');
-    const countEl = document.getElementById('move-copy-count');
-    if (countEl) countEl.textContent = clip.length;
-    if (bar) bar.hidden = clip.length === 0;
+    const btn = document.getElementById('copied-items-btn');
+    const count = document.getElementById('copied-items-count');
+    if (count) count.textContent = clip.length;
+    if (btn) btn.hidden = clip.length === 0;
+    if (clip.length === 0) closeCopiedItems();
+}
+// Back-compat: loadVaultFiles/renderVaultFiles still call this.
+function updateMoveCopyBar() { updateCopiedItemsButton(); if (_ciPanelOpen()) renderCopiedItems(); }
+
+// ---- Copied Items panel ----------------------------------------------------------------------
+function _ciPanelOpen() { const p = document.getElementById('copied-items-panel'); return !!(p && !p.hidden); }
+function openCopiedItems() { const p = document.getElementById('copied-items-panel'); if (p) { p.hidden = false; renderCopiedItems(); } }
+function closeCopiedItems() { const p = document.getElementById('copied-items-panel'); if (p) p.hidden = true; }
+function toggleCopiedItems() { if (_ciPanelOpen()) closeCopiedItems(); else openCopiedItems(); }
+
+function _ciFiltered() {
+    const clip = _moveCopyClip();
+    const f = state.moveCopyFilter || 'all';
+    return f === 'all' ? clip.slice() : clip.filter(e => e.action === f);
+}
+function _ciSelected() { return _moveCopyClip().filter(e => e.selected); }
+function _ciSetFilter(f) {
+    // Switching the copy/cut filter starts a fresh selection context (so "select all" acts per
+    // type and an action never runs on now-hidden items).
+    _moveCopyClip().forEach(e => { e.selected = false; });
+    state.moveCopyFilter = f;
+    renderCopiedItems();
+}
+
+function renderCopiedItems() {
+    const clip = _moveCopyClip();
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    set('ci-count-all', clip.length);
+    set('ci-count-copy', clip.filter(e => e.action === 'copy').length);
+    set('ci-count-move', clip.filter(e => e.action === 'move').length);
+    document.querySelectorAll('.ci-filter[data-ci-filter]').forEach(b =>
+        b.classList.toggle('active', b.getAttribute('data-ci-filter') === (state.moveCopyFilter || 'all')));
+
+    const list = document.getElementById('ci-list');
+    const empty = document.getElementById('ci-empty');
+    if (empty) empty.hidden = clip.length !== 0;
+    if (!list) return;
+    const shown = _ciFiltered();
+    list.replaceChildren();
+    shown.forEach(e => list.appendChild(_ciItemNode(e)));
+    _ciSyncSelectAll();
+    _ciRenderActions();
+}
+
+function _ciItemNode(e) {
+    const row = document.createElement('div');
+    row.className = 'ci-item ' + (e.keepAfter ? 'ci-keep' : 'ci-remove') + (e.selected ? ' ci-sel' : '');
+    row.setAttribute('data-ci-id', e.id);
+    const check = document.createElement('input');
+    check.type = 'checkbox'; check.className = 'ci-check'; check.checked = !!e.selected;
+    check.setAttribute('aria-label', 'Select ' + e.name);
+    check.addEventListener('change', () => {
+        e.selected = check.checked;
+        row.classList.toggle('ci-sel', e.selected);
+        _ciSyncSelectAll();
+        _ciRenderActions();
+    });
+    const badge = document.createElement('span');
+    badge.className = 'ci-badge ' + (e.action === 'move' ? 'ci-badge-move' : 'ci-badge-copy');
+    badge.textContent = e.action === 'move' ? 'Cut' : 'Copy';
+    const main = document.createElement('div'); main.className = 'ci-item-main';
+    const nm = document.createElement('div'); nm.className = 'ci-item-name'; nm.textContent = e.name;
+    const loc = document.createElement('div'); loc.className = 'ci-item-loc';
+    loc.textContent = (e.sourceVaultName || 'Vault') + ' · ' + (e.sourcePath || 'Root');
+    const meta = document.createElement('div'); meta.className = 'ci-item-meta';
+    meta.textContent = (e.type === 'folder' ? 'Folder' : formatBytes(e.size || 0)) + (e.modified ? ' · ' + formatModified(e.modified) : '');
+    main.append(nm, loc, meta);
+    row.append(check, badge, main);
+    return row;
+}
+
+function _ciSyncSelectAll() {
+    const selAll = document.getElementById('ci-select-all');
+    if (!selAll) return;
+    const shown = _ciFiltered();
+    const n = shown.filter(e => e.selected).length;
+    selAll.checked = shown.length > 0 && n === shown.length;
+    selAll.indeterminate = n > 0 && n < shown.length;
+}
+function _ciToggleSelectAll(on) { _ciFiltered().forEach(e => { e.selected = on; }); renderCopiedItems(); }
+function _ciSetKeepAfter(keep) { _ciSelected().forEach(e => { e.keepAfter = keep; }); renderCopiedItems(); }
+function _ciDeleteSelected() {
+    const ids = new Set(_ciSelected().map(e => e.id));
+    state.moveCopyClip = _moveCopyClip().filter(e => !ids.has(e.id));
+    updateCopiedItemsButton();
+    renderCopiedItems();
+}
+
+// Build the Paste / Move / Paste-Move + Delete + keep/remove settings from the current selection.
+function _ciRenderActions() {
+    const sel = _ciSelected();
+    const actions = document.getElementById('ci-actions');
+    const row = document.getElementById('ci-action-buttons');
+    const settings = document.getElementById('ci-settings');
+    if (!actions || !row) return;
+    actions.hidden = sel.length === 0;
+    row.replaceChildren();
+    if (sel.length === 0) { if (settings) settings.hidden = true; return; }
+    const nCopy = sel.filter(e => e.action === 'copy').length;
+    const nMove = sel.filter(e => e.action === 'move').length;
+    const mk = (label, cls, on, disabled) => {
+        const b = document.createElement('button'); b.type = 'button'; b.className = 'btn btn-sm ' + cls;
+        b.textContent = label;
+        if (disabled) b.disabled = true; else b.addEventListener('click', on);
+        return b;
+    };
+    if (nCopy > 0 && nMove > 0) {
+        row.appendChild(mk(`Paste/Move (${sel.length})`, 'btn-primary', _ciShowMixedModal));
+    } else {
+        row.appendChild(mk(`Paste (${nCopy})`, 'btn-primary', () => pasteMoveCopy('copy'), nCopy === 0));
+        row.appendChild(mk(`Move (${nMove})`, 'btn-secondary', () => pasteMoveCopy('move'), nMove === 0));
+    }
+    row.appendChild(mk(`Delete from list (${sel.length})`, 'btn-danger', _ciDeleteSelected));
+    // Keep/remove-after-action: show only the toggle(s) that would change something; a mixed
+    // selection shows both.
+    if (settings) {
+        const allKeep = sel.every(e => e.keepAfter);
+        const allRemove = sel.every(e => !e.keepAfter);
+        settings.hidden = false;
+        const keepBtn = document.getElementById('ci-keep');
+        const remBtn = document.getElementById('ci-remove');
+        if (keepBtn) keepBtn.hidden = allKeep;    // already all-keep -> nothing to change
+        if (remBtn) remBtn.hidden = allRemove;    // already all-remove -> nothing to change
+    }
+}
+
+function _ciShowMixedModal() {
+    // Close the panel first: it sits above the modal (a taller z-index), so a long staged list
+    // would otherwise cover the modal's confirm button. The selection lives on the entries, so the
+    // confirm still pastes/moves the right subset.
+    closeCopiedItems();
+    const sel = _ciSelected();
+    const copies = sel.filter(e => e.action === 'copy');
+    const moves = sel.filter(e => e.action === 'move');
+    const body = document.getElementById('ci-mixed-body');
+    if (!body) return;
+    body.replaceChildren();
+    const dest = document.createElement('p');
+    dest.className = 'text-sm text-secondary';
+    dest.textContent = `Into ${(state.currentVault && state.currentVault.name) || 'this vault'} · ${_ciCurrentPath()}`;
+    body.appendChild(dest);
+    const section = (title, items) => {
+        if (!items.length) return;
+        const h = document.createElement('div'); h.className = 'ci-mixed-h'; h.textContent = title;
+        const ul = document.createElement('ul'); ul.className = 'ci-mixed-list';
+        items.forEach(e => { const li = document.createElement('li'); li.textContent = e.name; ul.appendChild(li); });
+        body.append(h, ul);
+    };
+    section(`These will be copied (${copies.length})`, copies);
+    section(`These will be moved (${moves.length})`, moves);
+    const confirm = document.getElementById('ci-mixed-confirm');
+    if (confirm) confirm.onclick = () => { closeModal(); pasteMoveCopy('both'); };
+    openModal('ci-mixed-modal');
 }
 
 function _vaultPasswordFor(vaultId) {
@@ -9815,23 +9986,36 @@ function _vaultPasswordFor(vaultId) {
     return state.getRememberedVaultPassword(vaultId) || null;
 }
 
-async function pasteMoveCopy() {
+// Paste/move the selected staged items into the CURRENT vault+folder. verb: 'copy' (only the
+// selected copy items), 'move' (only the selected move items), 'both' (all selected), or 'all'
+// (every staged item, ignoring selection). Each entry either stays staged (keepAfter) or leaves
+// after it succeeds -- so a KEPT copy can be pasted into many folders, and a single item can be
+// removed from the list without clearing the rest.
+async function pasteMoveCopy(verb) {
+    verb = verb || 'both';
     const clip = _moveCopyClip();
-    if (!clip.length) return;
+    let targets;
+    if (verb === 'all') targets = clip.slice();
+    else {
+        const sel = _ciSelected();
+        targets = verb === 'copy' ? sel.filter(e => e.action === 'copy')
+                : verb === 'move' ? sel.filter(e => e.action === 'move')
+                : sel.slice();
+    }
+    if (!targets.length) return;
     const destVaultId = state.currentVaultId;
     if (!destVaultId) { showError('Open a vault to paste into.'); return; }
     const destFolderId = state.currentFolderId || null;
     const destPassword = _vaultPasswordFor(destVaultId);
-    const pasteBtn = document.getElementById('move-copy-paste');
-    if (pasteBtn) pasteBtn.disabled = true;
+    const destPath = _ciCurrentPath();
+    const destName = (state.currentVault && state.currentVault.name) || '';
 
     let ok = 0;
     const failures = [];
-    const relocated = new Set();  // moved items that succeeded (leave the clipboard)
-    for (const entry of clip) {
+    const remove = new Set();  // succeeded AND not kept -> leave the list
+    for (const entry of targets) {
         const isFolder = entry.type === 'folder';
-        const verb = entry.action;  // 'copy' | 'move'
-        const base = `/vaults/${entry.sourceVaultId}/${isFolder ? 'folders' : 'files'}/${entry.id}/${verb}`;
+        const base = `/vaults/${entry.sourceVaultId}/${isFolder ? 'folders' : 'files'}/${entry.id}/${entry.action}`;
         const body = isFolder
             ? { dest_vault_id: destVaultId, dest_parent_folder_id: destFolderId }
             : { dest_vault_id: destVaultId, dest_folder_id: destFolderId };
@@ -9840,18 +10024,28 @@ async function pasteMoveCopy() {
         if (srcPw) headers['X-Vault-Password'] = srcPw;
         if (destPassword) headers['X-Dest-Vault-Password'] = destPassword;
         try {
-            await apiRequest(base, { method: 'POST', body: JSON.stringify(body), headers, silent: true });
+            const resp = await apiRequest(base, { method: 'POST', body: JSON.stringify(body), headers, silent: true });
             ok++;
-            if (verb === 'move') relocated.add(entry.id);
+            if (entry.keepAfter) {
+                // A KEPT move relocated the file, so re-point the entry at its new home for the next
+                // paste -- a CROSS-VAULT move mints a NEW id, so adopt the id the endpoint returns.
+                // (A kept copy left the original where it was, so it keeps its id and location.)
+                if (entry.action === 'move') {
+                    if (resp && resp.id) entry.id = resp.id;
+                    entry.sourceVaultId = destVaultId;
+                    entry.sourceVaultName = destName || entry.sourceVaultName;
+                    entry.sourcePath = destPath;
+                }
+            } else {
+                remove.add(entry.id);
+            }
         } catch (e) {
             failures.push(`${entry.name}: ${(e && e.message) || 'failed'}`);
         }
     }
-
-    // Copies stay staged (paste again elsewhere); successful moves leave; failures stay.
-    state.moveCopyClip = clip.filter(e => !relocated.has(e.id));
-    updateMoveCopyBar();
-    if (pasteBtn) pasteBtn.disabled = false;
+    if (remove.size) state.moveCopyClip = clip.filter(e => !remove.has(e.id));
+    updateCopiedItemsButton();
+    if (_ciPanelOpen()) renderCopiedItems();
     if (ok) showSuccess(`Pasted ${ok} item${ok > 1 ? 's' : ''}`);
     if (failures.length) showError(`Could not paste ${failures.length}: ${failures.slice(0, 3).join('; ')}`);
     await loadVaultFiles();
@@ -9882,10 +10076,19 @@ function setupFilesViewControls() {
     if (del) del.addEventListener('click', bulkDeleteFiles);
     const clear = document.getElementById('files-bulk-clear');
     if (clear) clear.addEventListener('click', () => { if (state.selectedFileIds) state.selectedFileIds.clear(); renderVaultFiles(); });
-    const paste = document.getElementById('move-copy-paste');
-    if (paste) paste.addEventListener('click', pasteMoveCopy);
-    const clipClear = document.getElementById('move-copy-clear');
-    if (clipClear) clipClear.addEventListener('click', clearMoveCopy);
+    // Copied Items staging panel.
+    const ciBtn = document.getElementById('copied-items-btn');
+    if (ciBtn) ciBtn.addEventListener('click', toggleCopiedItems);
+    const ciClose = document.getElementById('copied-items-close');
+    if (ciClose) ciClose.addEventListener('click', closeCopiedItems);
+    document.querySelectorAll('.ci-filter[data-ci-filter]').forEach(b =>
+        b.addEventListener('click', () => _ciSetFilter(b.getAttribute('data-ci-filter'))));
+    const ciSelAll = document.getElementById('ci-select-all');
+    if (ciSelAll) ciSelAll.addEventListener('change', () => _ciToggleSelectAll(ciSelAll.checked));
+    const ciKeep = document.getElementById('ci-keep');
+    if (ciKeep) ciKeep.addEventListener('click', () => _ciSetKeepAfter(true));
+    const ciRem = document.getElementById('ci-remove');
+    if (ciRem) ciRem.addEventListener('click', () => _ciSetKeepAfter(false));
 }
 
 async function bulkDownloadFiles() {

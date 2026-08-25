@@ -2002,6 +2002,70 @@ details summary:hover {
 .context-menu-item .icon { flex: 0 0 auto; }
 
 /* ============================================================================
+   Copied Items staging panel (Move/Copy) — shared by both skins
+   ============================================================================ */
+.ci-badge-count {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 18px; height: 18px; padding: 0 5px; margin-left: 4px;
+    border-radius: 9px; background: var(--surface-3); color: var(--text-primary);
+    font-size: var(--text-xs); font-variant-numeric: tabular-nums;
+}
+.ci-panel {
+    position: fixed;
+    top: 72px;
+    right: 8px;
+    width: min(420px, 92vw);
+    max-height: calc(100vh - 90px);
+    display: flex;
+    flex-direction: column;
+    background: var(--surface-1);
+    border: 1px solid var(--surface-3);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lg);
+    z-index: 1500;
+    overflow: hidden;
+}
+.ci-head { display: flex; align-items: center; justify-content: space-between; padding: var(--space-sm) var(--space-md); border-bottom: 1px solid var(--surface-3); }
+.ci-title { margin: 0; font-size: var(--text-base); }
+.ci-close { background: transparent; border: none; color: var(--text-secondary); font-size: 22px; line-height: 1; cursor: pointer; }
+.ci-close:hover { color: var(--text-primary); }
+.ci-filters { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: var(--space-sm) var(--space-md); border-bottom: 1px solid var(--surface-3); }
+.ci-filter { background: transparent; border: 1px solid var(--surface-3); border-radius: var(--radius-full, 999px); padding: 2px 10px; color: var(--text-secondary); font-size: var(--text-xs); cursor: pointer; }
+.ci-filter.active { background: var(--surface-3); color: var(--text-primary); }
+.ci-selall { margin-left: auto; display: inline-flex; align-items: center; gap: 5px; font-size: var(--text-xs); color: var(--text-secondary); }
+.ci-list { overflow-y: auto; flex: 1 1 auto; min-height: 40px; padding: var(--space-sm); }
+.ci-empty { padding: var(--space-lg) var(--space-md); color: var(--text-secondary); font-size: var(--text-sm); text-align: center; }
+.ci-item {
+    display: grid;
+    grid-template-columns: auto auto 1fr;
+    align-items: start;
+    gap: 8px;
+    padding: 8px 10px;
+    margin-bottom: 6px;
+    border: 1px solid var(--surface-3);
+    border-left: 3px solid var(--surface-3);
+    border-radius: var(--radius-sm);
+    background: var(--surface-0, var(--surface-1));
+}
+.ci-item.ci-keep   { border-left-color: var(--success, #2ea043); }   /* stays after pasting */
+.ci-item.ci-remove { border-left-color: var(--warning, #d29922); }   /* leaves after pasting */
+.ci-item.ci-sel { background: var(--surface-2); }
+.ci-check { margin-top: 3px; }
+.ci-badge { align-self: start; margin-top: 1px; padding: 1px 7px; border-radius: var(--radius-full, 999px); font-size: 10px; font-weight: 600; letter-spacing: .02em; text-transform: uppercase; }
+.ci-badge-copy { background: rgba(46,160,67,.18); color: var(--success, #2ea043); }
+.ci-badge-move { background: rgba(210,153,34,.18); color: var(--warning, #d29922); }
+.ci-item-main { min-width: 0; }
+.ci-item-name { font-size: var(--text-sm); color: var(--text-primary); word-break: break-word; }
+.ci-item-loc, .ci-item-meta { font-size: var(--text-xs); color: var(--text-secondary); word-break: break-word; }
+.ci-actions { border-top: 1px solid var(--surface-3); padding: var(--space-sm) var(--space-md); display: flex; flex-direction: column; gap: 8px; }
+.ci-action-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.ci-settings-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.ci-settings-label { font-size: var(--text-xs); color: var(--text-secondary); }
+.ci-mixed-h { font-size: var(--text-sm); font-weight: 600; margin: var(--space-sm) 0 4px 0; color: var(--text-primary); }
+.ci-mixed-list { margin: 0 0 var(--space-sm) 0; padding-left: 20px; max-height: 30vh; overflow-y: auto; }
+.ci-mixed-list li { font-size: var(--text-sm); color: var(--text-secondary); word-break: break-word; }
+
+/* ============================================================================
    CONTINUED IN NEXT FILE...
    ============================================================================ */
 

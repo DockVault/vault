@@ -563,6 +563,7 @@
                                 <button id="upload-file-btn" class="btn btn-primary btn-sm"><svg class="icon icon-sm"><use href="#i-upload"/></svg> Upload File</button>
                                 <button id="create-folder-btn" class="btn btn-secondary btn-sm"><svg class="icon icon-sm"><use href="#i-folder"/></svg> New Folder</button>
                                 <button id="share-vault-btn" class="btn btn-secondary btn-sm"><svg class="icon icon-sm"><use href="#i-link"/></svg> Share</button>
+                                <button id="copied-items-btn" class="btn btn-secondary btn-sm" type="button" hidden aria-haspopup="true"><svg class="icon icon-sm"><use href="#i-copy"/></svg> Copied Items <span class="ci-badge-count" id="copied-items-count">0</span></button>
                             </div>
                         </div>
 
@@ -576,16 +577,47 @@
                             </div>
                         </div>
 
-                        <!-- Move/Copy clipboard. Shown while items are staged (via each item's Copy/
-                             Move action). "Paste here" drops them into the current vault + folder;
-                             copied items stay staged so you can paste them in several places, moved
-                             items leave the clipboard once relocated. Rows are rendered with
-                             textContent, so a staged item's name is never HTML. -->
-                        <div id="move-copy-bar" class="bulk-bar" hidden>
-                            <span class="bulk-bar-count"><strong id="move-copy-count">0</strong> item(s) ready to paste</span>
-                            <div class="bulk-bar-actions">
-                                <button id="move-copy-paste" class="btn btn-sm btn-primary" type="button"><svg class="icon icon-sm"><use href="#i-copy"/></svg> Paste here</button>
-                                <button id="move-copy-clear" class="btn btn-sm btn-ghost" type="button">Clear</button>
+                        <!-- Copied Items staging panel. Opened from the "Copied Items" toolbar button.
+                             Lists each staged file/folder (source location, size, date), lets you
+                             select a subset and Paste (copies) / Move (cuts) them into the CURRENT
+                             vault+folder, or Delete-from-list. A copied item can be KEPT after pasting
+                             (paste it into many folders); a per-item border shows keep vs remove.
+                             All names/locations are rendered with textContent -- never HTML. -->
+                        <aside id="copied-items-panel" class="ci-panel" hidden aria-label="Copied items">
+                            <div class="ci-head">
+                                <h3 class="ci-title">Copied Items</h3>
+                                <button class="ci-close" id="copied-items-close" type="button" aria-label="Close">&times;</button>
+                            </div>
+                            <div class="ci-filters" role="group" aria-label="Filter by action">
+                                <button class="ci-filter active" type="button" data-ci-filter="all">All <span id="ci-count-all">0</span></button>
+                                <button class="ci-filter" type="button" data-ci-filter="copy">Copy <span id="ci-count-copy">0</span></button>
+                                <button class="ci-filter" type="button" data-ci-filter="move">Cut <span id="ci-count-move">0</span></button>
+                                <label class="ci-selall"><input type="checkbox" id="ci-select-all"> Select all</label>
+                            </div>
+                            <div class="ci-list" id="ci-list"></div>
+                            <div class="ci-empty" id="ci-empty" hidden>Nothing staged. Right-click a file and choose Copy or Move.</div>
+                            <div class="ci-actions" id="ci-actions" hidden>
+                                <div class="ci-action-row" id="ci-action-buttons"></div>
+                                <div class="ci-settings-row" id="ci-settings" hidden>
+                                    <span class="ci-settings-label">After pasting:</span>
+                                    <button class="btn btn-sm btn-ghost" type="button" id="ci-keep">Keep after</button>
+                                    <button class="btn btn-sm btn-ghost" type="button" id="ci-remove">Remove after</button>
+                                </div>
+                            </div>
+                        </aside>
+
+                        <!-- Mixed Paste/Move confirmation (a selection with both copies and cuts) -->
+                        <div id="ci-mixed-modal" class="modal">
+                            <div class="modal-content" style="max-width: 520px;">
+                                <div class="modal-header">
+                                    <h3>Paste and Move</h3>
+                                    <button class="close-modal-btn modal-close" aria-label="Close">&times;</button>
+                                </div>
+                                <div class="modal-body" id="ci-mixed-body"></div>
+                                <div class="modal-footer">
+                                    <button class="close-modal-btn btn btn-secondary" type="button">Cancel</button>
+                                    <button class="btn btn-primary" type="button" id="ci-mixed-confirm">Paste &amp; Move</button>
+                                </div>
                             </div>
                         </div>
 
