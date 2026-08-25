@@ -22,8 +22,8 @@
          still blocks render, so there is no unstyled flash either way).
          To adopt v2 permanently: keep only ui-v2.css, delete redesign.css +
          ui-boot.js + the Interface switcher in the profile dropdown. -->
-    <link rel="stylesheet" href="/static/css/redesign.css?v=20260703a" id="skin-v1" disabled>
-    <link rel="stylesheet" href="/static/css/ui-v2.css?v=20260703a" id="skin-v2">
+    <link rel="stylesheet" href="/static/css/redesign.css?v=20260825a" id="skin-v1" disabled>
+    <link rel="stylesheet" href="/static/css/ui-v2.css?v=20260825a" id="skin-v2">
     <script src="/static/js/ui-boot.js?v=20260703a"></script>
     <!-- Auth boot: picks the first-paint screen from whether a session token is
          cached, so an expired/logged-out load never flashes the app shell. See
@@ -861,7 +861,7 @@
                         </div>
                     </div>
                     <div class="tabs mb-md" role="tablist">
-                        <button class="tab-btn active" data-notes-tab="mine" type="button">My notes</button>
+                        <button class="tab-btn active" data-notes-tab="mine" type="button">My notes <span id="notes-mine-count" class="badge badge-secondary" hidden>0</span></button>
                         <button class="tab-btn" data-notes-tab="received" type="button">Sent to me <span id="notes-received-count" class="badge badge-secondary" hidden>0</span></button>
                         <button class="tab-btn" data-notes-tab="shared" type="button">Shared <span id="notes-shared-count" class="badge badge-secondary" hidden>0</span></button>
                     </div>
@@ -995,7 +995,7 @@
                                 <div class="form-group" id="note-public-expiry-group">
                                     <label for="note-public-ttl">Expires in (hours)</label>
                                     <input type="number" id="note-public-ttl" class="form-control" min="1" style="max-width:160px;">
-                                    <label class="checkbox-label" id="note-public-never-group" style="margin-top:.35rem;" hidden>
+                                    <label class="checkbox-label" id="note-public-never-group" style="margin-top:.35rem;">
                                         <input type="checkbox" id="note-public-never"><span>Never expires</span>
                                     </label>
                                 </div>
@@ -1014,9 +1014,27 @@
                             </div>
                         </div>
                         <div class="modal-footer">
-                            <button class="btn btn-ghost" type="button" data-note-public-close>Cancel</button>
-                            <button id="note-public-back" class="btn btn-ghost" type="button" hidden>&larr; Back</button>
+                            <button id="note-public-cancel" class="btn btn-ghost" type="button" data-note-public-close>Cancel</button>
                             <button id="note-public-create" class="btn btn-primary" type="button">Create link</button>
+                            <button id="note-public-done" class="btn btn-primary" type="button" data-note-public-close hidden>Done</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- View a public link's frozen snapshot (from the Shared tab) — read-only title + body. -->
+                <div id="note-link-snapshot-modal" class="modal" role="dialog" aria-modal="true">
+                    <div class="modal-overlay" data-note-snapshot-close></div>
+                    <div class="modal-content" style="max-width: 720px; width: 90vw;">
+                        <div class="modal-header">
+                            <h3 id="note-link-snapshot-title" class="text-xl font-bold">Shared snapshot</h3>
+                            <button class="modal-close" type="button" data-note-snapshot-close aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <p class="text-secondary text-sm mb-sm">This is the frozen snapshot this link shows — it does not change when you edit the original note.</p>
+                            <pre id="note-link-snapshot-body" class="note-view-text"></pre>
+                        </div>
+                        <div class="modal-footer">
+                            <button class="btn btn-ghost" type="button" data-note-snapshot-close>Close</button>
                         </div>
                     </div>
                 </div>
@@ -2093,6 +2111,17 @@
                     <!-- Note Links Tab: public-link sharing of notes (anonymous, snapshot). -->
                     <div id="settings-tab-notelinks" class="settings-tab-content">
                         <div class="card">
+                            <div class="card-header"><h3>Notes</h3></div>
+                            <div class="p-lg">
+                                <div class="form-group" style="max-width:280px;">
+                                    <label for="setting-note-max-chars">Maximum note size (characters)</label>
+                                    <input type="number" id="setting-note-max-chars" class="form-control" min="100" max="1000000" step="100">
+                                    <p class="text-secondary text-sm mt-sm">The largest a single note's text may be (100–1,000,000). Applies to all notes.</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
                             <div class="card-header"><h3>Public note links</h3></div>
                             <div class="p-lg">
                                 <label class="flex items-center gap-sm">
@@ -3319,7 +3348,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260824k"></script>
+    <script src="/static/js/app.js?v=20260824l"></script>
 </body>
 </html>
 

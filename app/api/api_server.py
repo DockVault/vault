@@ -2683,6 +2683,13 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # Max note size (chars).
+    if "note_max_chars" in payload:
+        v = payload["note_max_chars"]
+        if isinstance(v, bool) or not isinstance(v, int) or not (_NOTE_BODY_MAX_FLOOR <= v <= _NOTE_BODY_MAX_CEILING):
+            raise HTTPException(status_code=400,
+                                detail=f"note_max_chars must be an integer {_NOTE_BODY_MAX_FLOOR}..{_NOTE_BODY_MAX_CEILING}")
+
     # Where a decrypted download is written. Refused here rather than tolerated, because the read
     # path deliberately falls back on anything it cannot parse -- so a typo would silently mean
     # "user_choice" and an administrator would believe they had required something.
@@ -2850,6 +2857,7 @@ async def get_settings(
     _blob = _global_settings_blob(db)
     data["public_note_links_enabled"] = note_link_policy.public_note_links_enabled(_blob)
     data["public_note_link_user_cap"] = note_link_policy.public_note_link_user_cap(_blob)
+    data["note_max_chars"] = _note_max_chars(db)
     # Effective account-onboarding policy (email requirement, invitation + signup switches, domain
     # gate, login identifier) with defaults filled in, so the Accounts & Access tab renders the real
     # posture and a whole-object save can't persist an unchecked default.
@@ -6917,12 +6925,15 @@ def _notelink_status(link, now=None) -> str:
 
 
 def _notelink_public_dict(link, tag=None) -> dict:
-    """Owner-facing view of a link — NEVER the body snapshot (only the title, for the list tile)."""
+    """Owner-facing view of a link. Includes the frozen title + body SNAPSHOT so the owner can recall
+    what a link contains from the Shared tab (it is their OWN note's content). The admin-oversight
+    variant (_notelink_admin_dict) strips body + token — an admin must not read others' content."""
     return {
         "id": str(link.id),
         "token": link.token,
         "url_path": f"/l/{link.token}",
         "title": link.title_snapshot or "",
+        "body": link.body_snapshot or "",
         "tag_id": str(link.tag_id) if link.tag_id else None,
         "tag_name": getattr(tag, "name", None),
         "tag_border_color": getattr(tag, "border_color", None),
@@ -7201,8 +7212,9 @@ async def delete_note_link(
 # OTHER users' public links besides the feature kill-switch). ---------------------------------------
 def _notelink_admin_dict(link, tag, owner) -> dict:
     d = _notelink_public_dict(link, tag)
-    # Don't hand the admin list a redeemable token: it would let an admin read a no-secret snapshot
-    # via GET /l/{token}, defeating the "no body snapshot here" intent. Admin revoke uses the id.
+    # Admin oversight must not expose others' note CONTENT or a redeemable token: drop the body
+    # snapshot, the token, and the URL. Admins see owner/title/status metadata only; revoke uses the id.
+    d.pop("body", None)
     d.pop("token", None)
     d.pop("url_path", None)
     d["owner_id"] = str(link.owner_id)
@@ -8293,16 +8305,31 @@ def _notes_denied_for_temp(current_user) -> bool:
     return bool(getattr(current_user, "_is_temp_session", False))
 
 
-def _clean_note_fields(title, body):
+_NOTE_BODY_MAX_FLOOR = 100         # smallest an admin may set the note-size cap to
+_NOTE_BODY_MAX_CEILING = 1_000_000  # largest (guards memory / payload size)
+
+
+def _note_max_chars(db) -> int:
+    """The admin-configured maximum note-body length (chars). Defaults to _NOTE_BODY_MAX; clamped to
+    a sane range so a bad stored value can't disable or explode the limit."""
+    try:
+        raw = _global_settings_blob(db).get("note_max_chars", _NOTE_BODY_MAX)
+        v = int(raw)
+    except (TypeError, ValueError):
+        return _NOTE_BODY_MAX
+    return v if _NOTE_BODY_MAX_FLOOR <= v <= _NOTE_BODY_MAX_CEILING else _NOTE_BODY_MAX
+
+
+def _clean_note_fields(title, body, max_body=_NOTE_BODY_MAX):
     title = (title or "").strip()
     # Drop control chars (CR/LF etc.): the title also lands in a notification title on send.
     title = ''.join(c for c in title if ord(c) >= 32 and ord(c) != 127)
     if len(title) > _NOTE_TITLE_MAX:
         raise HTTPException(status_code=400, detail=f"Title is too long (max {_NOTE_TITLE_MAX} characters)")
     body = body or ""
-    if len(body) > _NOTE_BODY_MAX:
+    if len(body) > max_body:
         raise HTTPException(status_code=400,
-                            detail=f"Note is too long (max {_NOTE_BODY_MAX} characters)")
+                            detail=f"Note is too long (max {max_body} characters)")
     return title, body
 
 
@@ -8368,7 +8395,7 @@ async def create_note(
     from app.core.models import Note
     if _notes_denied_for_temp(current_user):
         raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
-    title, text = _clean_note_fields(body.title, body.body)
+    title, text = _clean_note_fields(body.title, body.body, _note_max_chars(db))
     if not title and not text:
         raise HTTPException(status_code=400, detail="A note needs a title or some text")
     n = Note(owner_id=current_user.id, title=title, body=text, adopted=True)
@@ -8402,7 +8429,8 @@ async def update_note(
     if body.title is not None or body.body is not None:
         title, text = _clean_note_fields(
             n.title if body.title is None else body.title,
-            n.body if body.body is None else body.body)
+            n.body if body.body is None else body.body,
+            _note_max_chars(db))
         n.title = title
         n.body = text
     if body.is_favorite is not None:

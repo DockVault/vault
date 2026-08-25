@@ -181,7 +181,9 @@ code { background: color-mix(in srgb, var(--brand-secondary) 12%, var(--surface-
     overflow: visible;
 }
 .sidebar {
+    flex: 0 0 var(--sidebar-width);   /* pin the rail so wide main content can't squeeze it */
     width: var(--sidebar-width);
+    min-width: var(--sidebar-width);
     padding: var(--space-lg) var(--space-md);
     border-right: 1px solid color-mix(in srgb, var(--surface-3) 70%, transparent);
     background: color-mix(in srgb, var(--surface-0) 35%, transparent);
