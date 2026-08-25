@@ -15,7 +15,10 @@ _UUID = "11111111-1111-1111-1111-111111111111"
 
 
 def _delete_all_templates(admin):
+    # Built-in default templates (is_default) are permanent — skip them; only user templates are cleared.
     for t in admin.get("/email/templates").json().get("templates", []):
+        if t.get("is_default"):
+            continue
         admin.delete(f"/email/templates/{t['id']}")
 
 

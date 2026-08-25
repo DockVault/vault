@@ -115,6 +115,20 @@
                     
                     <div id="login-error" class="alert alert-error mt-md" style="display: none;"></div>
 
+                    <!-- Forgot password: link hidden until /auth/policy confirms self-service reset is on. -->
+                    <div id="forgot-toggle" class="mt-sm" style="display: none;">
+                        <a href="#" id="show-forgot-link" role="button" style="font-size: 0.9em;">Forgot your password?</a>
+                    </div>
+                    <form id="forgot-form" style="display: none;">
+                        <div class="form-group">
+                            <label for="forgot-identifier">Username or email</label>
+                            <input type="text" id="forgot-identifier" class="form-control" autocomplete="username">
+                        </div>
+                        <button type="submit" class="btn btn-primary btn-block">Send reset link</button>
+                        <div id="forgot-message" class="alert alert-info mt-md" style="display: none;" role="status"></div>
+                        <div class="mt-md"><a href="#" id="forgot-back-link" role="button">&larr; Back to sign in</a></div>
+                    </form>
+
                     <!-- Self-signup: the toggle link and the form are BOTH hidden until the pre-auth
                          policy fetch (app.js applyLoginPolicyLabel -> /auth/policy) confirms signup is
                          enabled. The email group's presence/required state is driven by the same policy
@@ -174,6 +188,17 @@
         <div class="flex items-center justify-center" style="min-height: 100vh; width: 100%; padding: var(--space-lg);">
             <div class="card" style="max-width: 420px; width: 100%;">
                 <div class="card-body" id="invite-card-body">
+                    <div class="loading-spinner" style="margin: var(--space-lg) auto;" aria-hidden="true"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Password reset (reached via /?reset=<token>) -->
+    <div id="reset-screen" class="screen">
+        <div class="flex items-center justify-center" style="min-height: 100vh; width: 100%; padding: var(--space-lg);">
+            <div class="card" style="max-width: 420px; width: 100%;">
+                <div class="card-body" id="reset-card-body">
                     <div class="loading-spinner" style="margin: var(--space-lg) auto;" aria-hidden="true"></div>
                 </div>
             </div>
@@ -1763,6 +1788,10 @@
                                         <button type="button" class="btn btn-secondary btn-sm" id="et-add-dynamic" aria-haspopup="true" aria-expanded="false">＋ Dynamic action ▾</button>
                                         <div id="et-dyn-menu" class="et-dyn-menu" hidden role="menu"></div>
                                     </span>
+                                    <span class="et-dyn-wrap et-loadfrom-wrap">
+                                        <button type="button" class="btn btn-secondary btn-sm" id="et-load-from" aria-haspopup="true" aria-expanded="false" title="Replace the subject and body with a default or an existing template">⤓ Load from ▾</button>
+                                        <div id="et-loadfrom-menu" class="et-dyn-menu et-loadfrom-menu" hidden role="menu"></div>
+                                    </span>
                                     <span class="et-view-toggle" role="tablist" aria-label="Editor view">
                                         <button type="button" class="btn btn-secondary btn-sm et-view active" data-view="code">Code</button>
                                         <button type="button" class="btn btn-secondary btn-sm et-view" data-view="render">Render</button>
@@ -1825,6 +1854,31 @@
                                 <div class="modal-footer">
                                     <button type="button" class="btn btn-secondary close-modal-btn">Cancel</button>
                                     <button type="button" class="btn btn-primary" id="et-send-go">Send</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Send a test of an automated email -->
+                        <div id="email-test-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="email-test-modal-title">
+                            <div class="modal-content">
+                                <div class="modal-header"><h3 id="email-test-modal-title">Send a test email</h3></div>
+                                <div class="modal-body">
+                                    <p class="text-sm text-secondary">This sends the email with sample data, clearly marked as a test.</p>
+                                    <div class="form-group">
+                                        <label for="et-test-search">Send to a user</label>
+                                        <input type="text" id="et-test-search" class="form-control" placeholder="Search by username or email…" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="et-test-results" autocomplete="off">
+                                        <div id="et-test-results" class="et-test-results" role="listbox" aria-label="Matching users"></div>
+                                        <div id="et-test-selected" class="et-test-selected" role="status" aria-live="polite" hidden></div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="et-test-addr">Or send to a specific address</label>
+                                        <input type="email" id="et-test-addr" class="form-control" placeholder="you@example.com">
+                                    </div>
+                                    <div id="et-test-msg" class="text-sm" role="status" aria-live="polite"></div>
+                                </div>
+                                <div class="modal-footer">
+                                    <button type="button" class="btn btn-secondary close-modal-btn">Cancel</button>
+                                    <button type="button" class="btn btn-primary" id="et-test-send">Send test</button>
                                 </div>
                             </div>
                         </div>
@@ -2324,6 +2378,27 @@
                                     <span>Require a verification code to change one’s own email</span>
                                 </label>
                                 <p class="text-secondary text-sm mt-sm" id="accounts-email-verify-help">A user changing their own email must confirm a one-time code sent to the new address; administrators setting an email are exempt. Requires email (SMTP) to be configured — set it up on the Email tab first.</p>
+                                <div class="form-group mt-md">
+                                    <label for="setting-email-change-otp-ttl-minutes">Verification code lifetime (minutes)</label>
+                                    <input type="number" id="setting-email-change-otp-ttl-minutes" class="form-control" min="1" max="60" step="1">
+                                    <p class="text-secondary text-sm mt-sm">How long the email-change verification code stays valid — from 1 to 60 minutes.</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header"><h3>Password reset</h3></div>
+                            <div class="p-lg">
+                                <label class="flex items-center gap-sm">
+                                    <input type="checkbox" id="setting-password-reset-enabled">
+                                    <span>Let people reset their own password</span>
+                                </label>
+                                <p class="text-secondary text-sm mt-sm">When on, a “Forgot password?” link appears on the sign-in screen and emails a one-time reset link. An administrator can always send a reset link from the Users page, regardless of this switch. Off by default. Requires email (SMTP) configured.</p>
+                                <div class="form-group mt-md">
+                                    <label for="setting-password-reset-ttl-minutes">Reset link lifetime (minutes)</label>
+                                    <input type="number" id="setting-password-reset-ttl-minutes" class="form-control" min="1" max="60" step="1">
+                                    <p class="text-secondary text-sm mt-sm">How long a password-reset link stays valid — from 1 to 60 minutes.</p>
+                                </div>
                             </div>
                         </div>
 

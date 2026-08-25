@@ -37,10 +37,18 @@ def admin_page(page: Page, admin_creds):
     return page
 
 
+def _user_templates(admin):
+    # Built-in default templates (is_default) are seeded + permanent; the tests here work with the
+    # user-authored templates only.
+    return [t for t in admin.get("/email/templates").json().get("templates", []) if not t.get("is_default")]
+
+
 @pytest.fixture(autouse=True)
 def _clean(admin):
     def wipe():
         for t in admin.get("/email/templates").json().get("templates", []):
+            if t.get("is_default"):
+                continue                       # defaults are permanent (undeletable)
             admin.delete(f"/email/templates/{t['id']}")
         for r in admin.get("/email/resources").json().get("resources", []):
             admin.delete(f"/email/resources/{r['id']}")
@@ -70,14 +78,15 @@ def test_create_template_and_card_shows_profile_preview(admin_page: Page, admin)
                                                "from_name": "Sender"}).json()
     page = admin_page
     _open_email_tab(page)
-    _new_template(page, name="Welcome")
+    # A name that does NOT substring-collide with any built-in default template name (e.g. "Welcome email").
+    _new_template(page, name="Profiled Card")
     page.select_option("#et-profile", prof["id"])
     page.click("#et-save")
-    card = page.locator('.email-profile-card:has-text("Welcome")')
+    card = page.locator('.email-profile-card:has-text("Profiled Card")')
     expect(card).to_be_visible(timeout=10000)
     expect(card.locator(".epc-meta")).to_contain_text("from@example.com")
     expect(card.locator(".epc-meta")).to_contain_text("smtp.example.com")
-    assert len(admin.get("/email/templates").json()["templates"]) == 1
+    assert len(_user_templates(admin)) == 1
 
 
 def test_editor_view_toggle_code_render_split(admin_page: Page):
@@ -188,7 +197,7 @@ def test_client_script_pre_check_blocks_save(admin_page: Page, admin):
     page.click("#et-save")
     expect(page.locator("#et-editor-msg")).to_contain_text("not allowed")
     expect(page.locator("#email-template-editor")).to_be_visible()      # editor stays open
-    assert admin.get("/email/templates").json()["templates"] == []      # nothing saved
+    assert _user_templates(admin) == []      # nothing saved
 
 
 def test_delete_template(admin_page: Page, admin):
@@ -216,7 +225,7 @@ def test_edit_loads_full_body_and_saves_via_put(admin_page: Page, admin):
     page.fill("#et-body", "<p>edited body</p>")
     page.click("#et-save")
     expect(page.locator("#email-template-editor")).to_be_hidden(timeout=10000)
-    rows = admin.get("/email/templates").json()["templates"]
+    rows = _user_templates(admin)
     assert len(rows) == 1 and rows[0]["id"] == t["id"]                       # PUT, not a new row
     assert admin.get(f"/email/templates/{t['id']}").json()["body_html"] == "<p>edited body</p>"
 
@@ -244,7 +253,7 @@ def test_cancel_editor_saves_nothing(admin_page: Page, admin):
     _new_template(page, name="Discarded")
     page.click("#et-cancel")
     expect(page.locator("#email-template-editor")).to_be_hidden()
-    assert admin.get("/email/templates").json()["templates"] == []
+    assert _user_templates(admin) == []
 
 
 def test_upload_via_file_input_adds_a_resource(admin_page: Page, admin):

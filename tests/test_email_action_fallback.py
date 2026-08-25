@@ -47,7 +47,14 @@ def test_optional_action_is_never_overridden():
     assert fb(OPTIONAL, custom, spec) == custom
 
 
-def test_empty_body_is_passed_through():
+def test_empty_or_blank_system_body_falls_back_to_the_builtin():
+    # An empty / blank / None body on a SYSTEM action is itself the missing-token case (an admin who
+    # cleared the body but kept a subject): it MUST fall back to the built-in body carrying the required
+    # token, never ship a code/link-less email. Regression guard — the old code short-circuited on
+    # `not body` and returned the empty body, sending a linkless reset/verify/invite mail as "success".
     spec = SPEC_BY_KEY["email_change"]
-    assert fb(SYSTEM, "", spec) == ""
-    assert fb(SYSTEM, None, spec) is None
+    for empty in ("", "   ", None):
+        assert fb(SYSTEM, empty, spec) == spec["default_body_html"]
+    # a non-system action has no fail-safe: an empty body stays empty (normalized to a string)
+    assert fb(OPTIONAL, "", spec) == ""
+    assert fb(OPTIONAL, None, spec) == ""

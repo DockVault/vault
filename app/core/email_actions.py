@@ -9,6 +9,12 @@ future trigger (file share, vault-member add, …) consults before sending.
 Delivery and dynamic-token injection live in ONE place — :func:`send_action_email`. A trigger only
 supplies the action key, the recipient, and any per-send context (a link / code / expiry). No trigger
 builds SMTP config or renders HTML itself.
+
+Each action also has a built-in DEFAULT TEMPLATE (:data:`DEFAULT_TEMPLATES`) — a polished, ready-to-send
+HTML body using only allowlisted tags + dynamic tokens. :func:`seed_default_templates` materializes these
+as real :class:`EmailTemplate` rows and pre-binds each action to its default on first boot, so the
+Automated-emails grid ships usable out of the box. The same bodies remain in code as the send-time
+fallback and as the "Load From → defaults" source, so a default is always recoverable.
 """
 from __future__ import annotations
 
@@ -20,110 +26,153 @@ SYSTEM = "system"
 OPTIONAL = "optional"
 
 # --------------------------------------------------------------------------------------------------
-# The seeded catalog. `default_subject` / `default_body_html` seed a system action's template on first
-# init and are the built-in fallback if a system action is ever left without one. Bodies use only
-# allowlisted tags + dynamic tokens (no inline style — the sanitizer strips it).
+# Built-in default templates. `name`/`subject`/`body_html` seed a real EmailTemplate row per action
+# (seed_default_templates) AND are the send-time fallback body when an action is left unbound. Bodies
+# use ONLY allowlisted tags (h1-h2, p, strong, a, hr, small — no inline style/class; the sanitizer
+# strips those) + dynamic tokens. A SYSTEM security action's body MUST carry its required token
+# ({{action.code}} for email_change, {{action.link}} for password_reset/account_invite) — the send
+# helper falls back to the built-in body if a customized template ever drops it.
 # --------------------------------------------------------------------------------------------------
-ACTION_CATALOG: tuple[dict, ...] = (
-    {
-        "key": "email_change",
+DEFAULT_TEMPLATES: dict[str, dict] = {
+    "email_change": {
         "name": "Email change verification",
-        "description": "Sent to a new address when a user changes their email — carries the confirmation code.",
-        "category": SYSTEM,
-        "default_subject": "Confirm your new email address",
-        "default_body_html": (
+        "subject": "Confirm your new email address",
+        "body_html": (
+            "<h2>Confirm your new email address</h2>"
             "<p>Hi {{user.username}},</p>"
             "<p>Use this code to confirm your new email address for <strong>{{vault.name}}</strong>:</p>"
-            "<h2>{{action.code}}</h2>"
-            "<p>The code expires {{action.expires}}. If you didn't request this change, you can ignore this email.</p>"
+            "<h1>{{action.code}}</h1>"
+            "<p>This code expires {{action.expires}}. If you didn't request this change, you can safely "
+            "ignore this email — your address won't be changed.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
-    {
-        "key": "password_reset",
+    "password_reset": {
         "name": "Password reset",
-        "description": "Sent when a user requests a password reset — carries the reset link.",
-        "category": SYSTEM,
-        "default_subject": "Reset your password",
-        "default_body_html": (
+        "subject": "Reset your password",
+        "body_html": (
+            "<h2>Reset your password</h2>"
             "<p>Hi {{user.username}},</p>"
-            "<p>We received a request to reset your <strong>{{vault.name}}</strong> password.</p>"
-            "<p><a href=\"{{action.link}}\">Reset your password</a></p>"
-            "<p>This link expires {{action.expires}}. If you didn't request a reset, you can ignore this email.</p>"
+            "<p>We received a request to reset the password for your <strong>{{vault.name}}</strong> account.</p>"
+            "<p><a href=\"{{action.link}}\">Choose a new password</a></p>"
+            "<p>This link expires {{action.expires}} and can be used once. If you didn't request a reset, "
+            "you can ignore this email — your password won't change.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
-    {
-        "key": "account_invite",
+    "account_invite": {
         "name": "Account invitation",
-        "description": "Sent when an admin invites someone to create an account — carries the invitation link.",
-        "category": SYSTEM,
-        "default_subject": "You're invited to {{vault.name}}",
-        "default_body_html": (
+        "subject": "You're invited to {{vault.name}}",
+        "body_html": (
+            "<h2>You're invited to {{vault.name}}</h2>"
             "<p>Hi {{user.username}},</p>"
             "<p>You've been invited to create an account on <strong>{{vault.name}}</strong>.</p>"
             "<p><a href=\"{{action.link}}\">Accept your invitation</a></p>"
             "<p>This invitation expires {{action.expires}}.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
-    {
-        "key": "account_welcome",
+    "account_welcome": {
         "name": "Welcome email",
-        "description": "Optional — sent after an account is created.",
-        "category": OPTIONAL,
-        "default_subject": "Welcome to {{vault.name}}",
-        "default_body_html": (
+        "subject": "Welcome to {{vault.name}}",
+        "body_html": (
+            "<h2>Welcome to {{vault.name}}</h2>"
             "<p>Hi {{user.username}},</p>"
-            "<p>Your account on <strong>{{vault.name}}</strong> is ready.</p>"
+            "<p>Your account on <strong>{{vault.name}}</strong> is ready to use.</p>"
             "<p><a href=\"{{vault.url}}\">Open {{vault.name}}</a></p>"
+            "<p>If you have any questions, reply to this email or contact your administrator.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
-    {
-        "key": "login_alert",
+    "login_alert": {
         "name": "New sign-in alert",
-        "description": "Optional — notify a user when their account signs in.",
-        "category": OPTIONAL,
-        "default_subject": "New sign-in to your {{vault.name}} account",
-        "default_body_html": (
+        "subject": "New sign-in to your {{vault.name}} account",
+        "body_html": (
+            "<h2>New sign-in to your account</h2>"
             "<p>Hi {{user.username}},</p>"
-            "<p>Your <strong>{{vault.name}}</strong> account was signed in to on {{current_datetime}} UTC.</p>"
-            "<p>If this wasn't you, change your password.</p>"
+            "<p>Your <strong>{{vault.name}}</strong> account was signed in to on {{current_datetime}} (UTC).</p>"
+            "<p>If this was you, no action is needed. If you don't recognize this sign-in, change your "
+            "password right away.</p>"
+            "<p><a href=\"{{vault.url}}\">Open {{vault.name}}</a></p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
-    {
-        "key": "share_created",
+    "share_created": {
         "name": "File / folder shared",
-        "description": "Optional — notify a recipient when something is shared with them.",
-        "category": OPTIONAL,
-        "default_subject": "Something was shared with you on {{vault.name}}",
-        "default_body_html": (
+        "subject": "Something was shared with you on {{vault.name}}",
+        "body_html": (
+            "<h2>Something was shared with you</h2>"
             "<p>Hi {{user.username}},</p>"
-            "<p>Something was shared with you on <strong>{{vault.name}}</strong>.</p>"
-            "<p><a href=\"{{action.link}}\">Open the share</a></p>"
+            "<p>A file or folder was shared with you on <strong>{{vault.name}}</strong>.</p>"
+            "<p><a href=\"{{action.link}}\">Open your shared items</a></p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
-    {
-        "key": "vault_member_added",
+    "vault_member_added": {
         "name": "Added to a vault",
-        "description": "Optional — notify a user when they're added to a vault or team.",
-        "category": OPTIONAL,
-        "default_subject": "You were added to a vault on {{vault.name}}",
-        "default_body_html": (
+        "subject": "You were added to a vault on {{vault.name}}",
+        "body_html": (
+            "<h2>You were added to a vault</h2>"
             "<p>Hi {{user.username}},</p>"
             "<p>You've been given access to a vault on <strong>{{vault.name}}</strong>.</p>"
             "<p><a href=\"{{vault.url}}\">Open {{vault.name}}</a></p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
-    {
-        "key": "temp_credential_issued",
+    "temp_credential_issued": {
         "name": "Temporary credential issued",
-        "description": "Optional — notify a user when a temporary access credential is created for them.",
-        "category": OPTIONAL,
-        "default_subject": "A temporary access credential was issued",
-        "default_body_html": (
+        "subject": "A temporary access credential was issued",
+        "body_html": (
+            "<h2>A temporary access credential was issued</h2>"
             "<p>Hi {{user.username}},</p>"
-            "<p>A temporary access credential was issued for your <strong>{{vault.name}}</strong> access.</p>"
-            "<p>It expires {{action.expires}}.</p>"
+            "<p>A temporary access credential was issued for your <strong>{{vault.name}}</strong> access. "
+            "It expires {{action.expires}}.</p>"
+            "<p>If you didn't request this, contact your administrator.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+}
+
+# (key, name, description, category) for each cataloged action. Subject/body come from DEFAULT_TEMPLATES
+# above, so the seeded template, the send-time fallback, and the "Load From" source are one and the same.
+_ACTION_META: tuple[tuple[str, str, str, str], ...] = (
+    ("email_change", "Email change verification",
+     "Sent to a new address when a user changes their email — carries the confirmation code.", SYSTEM),
+    ("password_reset", "Password reset",
+     "Sent when a user requests a password reset — carries the reset link.", SYSTEM),
+    ("account_invite", "Account invitation",
+     "Sent when an admin invites someone to create an account — carries the invitation link.", SYSTEM),
+    ("account_welcome", "Welcome email",
+     "Optional — sent after an account is created.", OPTIONAL),
+    ("login_alert", "New sign-in alert",
+     "Optional — notify a user when their account signs in.", OPTIONAL),
+    ("share_created", "File / folder shared",
+     "Optional — notify a recipient when something is shared with them.", OPTIONAL),
+    ("vault_member_added", "Added to a vault",
+     "Optional — notify a user when they're added to a vault or team.", OPTIONAL),
+    ("temp_credential_issued", "Temporary credential issued",
+     "Optional — notify a user when a temporary access credential is created for them.", OPTIONAL),
+)
+
+ACTION_CATALOG: tuple[dict, ...] = tuple(
+    {
+        "key": key,
+        "name": name,
+        "description": description,
+        "category": category,
+        "default_subject": DEFAULT_TEMPLATES[key]["subject"],
+        "default_body_html": DEFAULT_TEMPLATES[key]["body_html"],
+        "default_template_name": DEFAULT_TEMPLATES[key]["name"],
+    }
+    for (key, name, description, category) in _ACTION_META
 )
 
 SPEC_BY_KEY: dict[str, dict] = {a["key"]: a for a in ACTION_CATALOG}
@@ -157,6 +206,21 @@ def vault_url() -> str:
     return ""
 
 
+def public_base_url(request) -> str:
+    """Absolute base URL for links we EMAIL that carry a single-use token in the URL (password-reset,
+    invitation). Prefer the operator-configured public host (``vault_url()`` from ``ALLOWED_HOSTS``) so
+    a spoofed ``Host`` header can't poison an emailed token; fall back to the request's own host only
+    when no trusted host is configured. When ``ALLOWED_HOSTS`` is set (the posture an internet-facing
+    vault should adopt — it also enables ``TrustedHostMiddleware``) the emailed link is pinned to the
+    canonical host regardless of the incoming ``Host`` header, closing reset/invite-link poisoning;
+    when unset the vault already trusts the request host everywhere, so this adds no new assumption.
+    Mirrors the ``share_created`` pattern. ``request`` may be None (returns the configured host or "")."""
+    configured = (vault_url() or "").rstrip("/")
+    if configured:
+        return configured
+    return str(getattr(request, "base_url", "") or "").rstrip("/")
+
+
 def _load_resource(db: Session, rid: str):
     from app.core.models import EmailResource
     import uuid as _uuid
@@ -172,12 +236,11 @@ def _load_resource(db: Session, rid: str):
 # Seed
 # --------------------------------------------------------------------------------------------------
 def seed_email_actions(db: Session) -> int:
-    """Idempotently ensure every cataloged action exists. Actions are seeded WITHOUT a bound template:
-    a system action sends with its built-in default body until an admin binds a custom template, and
-    an optional action is seeded disabled. This keeps the user-facing template grid empty by default
-    (the built-in bodies live in code, not the DB, so there is nothing to accidentally delete). System
-    actions are seeded enabled. Metadata is refreshed from the catalog; an admin's template/enabled
-    choices are never overwritten. Returns the number of actions created."""
+    """Idempotently ensure every cataloged action exists. Actions are seeded WITHOUT a bound template
+    here; :func:`seed_default_templates` (called right after) materializes each action's default
+    template and pre-binds it. System actions are seeded enabled; optional ones disabled. Metadata is
+    refreshed from the catalog; an admin's template/enabled choices are never overwritten. Returns the
+    number of actions created."""
     from app.core.models import EmailAction
 
     created = 0
@@ -197,13 +260,80 @@ def seed_email_actions(db: Session) -> int:
     return created
 
 
+def seed_default_templates(db: Session) -> int:
+    """Idempotently materialize each action's built-in default template as an EmailTemplate row
+    (identified by ``default_key``) and PRE-BIND the action to it when the action has no template yet.
+
+    Runs after :func:`seed_email_actions` (the action rows must exist to bind). A default row is created
+    only if one doesn't already exist for that key — so an admin's later customization of the default is
+    never overwritten (the pristine code body stays available via "Load From"). Binding happens only at
+    first creation and only when the action is currently unbound, so an admin's own template choice (or
+    an explicit "none") is respected on every subsequent boot. Returns the number of templates created."""
+    from sqlalchemy.exc import IntegrityError
+    from app.core.models import EmailAction, EmailTemplate
+    from app.core import email_sanitize
+
+    created = 0
+    for key, spec in DEFAULT_TEMPLATES.items():
+        # A default row already exists (this boot or a prior one) -> leave it and its binding alone,
+        # so an admin's later customization / "none" choice is never revived by a re-seed.
+        if db.query(EmailTemplate).filter(EmailTemplate.default_key == key).first() is not None:
+            continue
+        tpl = EmailTemplate(
+            name=spec["name"],
+            description="Built-in default template.",
+            subject=spec["subject"],
+            body_html=email_sanitize.sanitize_email_html(spec["body_html"]),   # store only sanitized
+            default_key=key,
+        )
+        try:
+            # A SAVEPOINT so a conflict rolls back only this insert, not the templates already created
+            # earlier in the loop. db.flush() assigns tpl.id for binding below.
+            with db.begin_nested():
+                db.add(tpl)
+                db.flush()
+        except IntegrityError:
+            # A concurrent first boot won the partial-unique race on default_key; it will bind the
+            # action — skip here so we don't double-bind.
+            continue
+        created += 1
+        # Pre-bind the action to its brand-new default, but only when the admin hasn't already chosen a
+        # template (or explicitly left it "none").
+        action = db.get(EmailAction, key)
+        if action is not None and action.template_id is None:
+            action.template_id = tpl.id
+    if created:
+        db.commit()
+    return created
+
+
+def default_template_payloads() -> list[dict]:
+    """The built-in default templates, sanitized, for the editor's "Load From → defaults" section.
+    Returns one entry per action key in catalog order: ``{key, name, subject, body_html}`` where
+    ``body_html`` is the sanitized default (byte-identical to the seeded row's stored body)."""
+    from app.core import email_sanitize
+    out: list[dict] = []
+    for key, _n, _d, _c in _ACTION_META:
+        spec = DEFAULT_TEMPLATES[key]
+        out.append({
+            "key": key,
+            "name": spec["name"],
+            "subject": spec["subject"],
+            "body_html": email_sanitize.sanitize_email_html(spec["body_html"]),
+        })
+    return out
+
+
 def _fallback_body_if_missing_required_token(category, body_tpl, spec):
     """A SYSTEM security action's built-in body carries a required token ({{action.code}} or
     {{action.link}}). If the chosen (admin-bound/customized) body OMITS it, return the built-in body
     instead, so a misconfigured template can never silently drop the verification code / reset or
     invite link. Non-system actions, or bodies that already carry the token, are returned unchanged.
-    Matched on the token KEY, so a whitespace variant like ``{{ action.code }}`` still counts."""
-    if category != SYSTEM or not body_tpl:
+    Matched on the token KEY, so a whitespace variant like ``{{ action.code }}`` still counts.
+    An EMPTY body on a system action is itself the 'required token missing' case (an admin who cleared
+    the body but kept a subject), so it must fall through to the default body — not short-circuit."""
+    body_tpl = body_tpl or ""   # a None/blank body is the missing-token case for a system action
+    if category != SYSTEM:
         return body_tpl
     default_body = (spec or {}).get("default_body_html", "") or ""
     for key_tok in ("action.code", "action.link"):
@@ -217,7 +347,8 @@ def _fallback_body_if_missing_required_token(category, body_tpl, spec):
 # --------------------------------------------------------------------------------------------------
 def send_action_email(db: Session, key: str, *, recipient: dict,
                       action_context: Optional[dict] = None, force: bool = False,
-                      raise_errors: bool = False) -> bool:
+                      raise_errors: bool = False, subject_prefix: str = "",
+                      footer_html: str = "") -> bool:
     """Send the email for a cataloged action. ``recipient`` = ``{email, username?, display_name?}``.
     Returns True if a message was handed to SMTP. By default NEVER raises for a delivery/config problem
     — it logs and returns False, so a caller flow (signup, share, …) isn't broken by mail trouble. A
@@ -244,6 +375,12 @@ def send_action_email(db: Session, key: str, *, recipient: dict,
         return False
 
     template = action.template if action is not None else None
+    # Defense in depth: an optional action with no bound template has nothing to send. The write paths
+    # (update_action's force-off + the delete guard) already prevent enabling one, but guard at the point
+    # of use too — so even a direct DB write that left (enabled=True, template_id=NULL) can't cause an
+    # unexpected default-body send. A forced test send may still render the catalog default for preview.
+    if category == OPTIONAL and template is None and not force:
+        return False
     if template is not None and (template.body_html or template.subject):
         subject_tpl = template.subject or spec.get("default_subject", "")
         body_tpl = template.body_html
@@ -282,9 +419,11 @@ def send_action_email(db: Session, key: str, *, recipient: dict,
             recipient=recipient, brand_name=brand_name(db), vault_url=vault_url(),
             sender={"from_name": cfg.get("from_name") or "", "from_email": cfg.get("from_email") or ""},
             action=action_context or {})
-        subject = email_sanitize.render_subject(subject_tpl, ctx)
+        subject = email_sanitize.render_subject(subject_prefix + subject_tpl, ctx)
         html, inline = email_sanitize.render_for_send(
             body_tpl, context=ctx, load_resource=lambda rid: _load_resource(db, rid))
+        if footer_html:                                    # e.g. a "this is a test" banner on test sends
+            html = html + email_sanitize.sanitize_email_html(footer_html)
         text = email_sanitize.render_plaintext_fallback(html)
         msg = email_send.build_message(cfg, to_addr=to_addr, subject=subject,
                                        text_body=text, html_body=html, inline_images=inline)

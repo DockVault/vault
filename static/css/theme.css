@@ -311,6 +311,12 @@ html[data-invite] #login-screen.active { display: none !important; }
 html[data-invite] #boot-screen { display: none !important; }
 html[data-invite] #invite-screen { display: flex !important; }
 
+/* Password reset: an /?reset=... link (auth-boot.js sets data-reset pre-paint) shows the dedicated
+   #reset-screen instead of the login screen or app shell. */
+html[data-reset] #login-screen.active { display: none !important; }
+html[data-reset] #boot-screen { display: none !important; }
+html[data-reset] #reset-screen { display: flex !important; }
+
 /* ============================================================================
    CONTINUED IN NEXT MESSAGE...
    ============================================================================ */

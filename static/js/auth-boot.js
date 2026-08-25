@@ -24,6 +24,12 @@
             document.documentElement.setAttribute('data-invite', '1');
             return;
         }
+        // A password-reset link (/?reset=...) likewise takes precedence over any cached session: the
+        // visitor must land on the set-new-password screen, not the app shell or a stale login.
+        if (/[?&]reset=/.test(location.search)) {
+            document.documentElement.setAttribute('data-reset', '1');
+            return;
+        }
         var t = localStorage.getItem('authToken') || sessionStorage.getItem('authToken');
         if (t) document.documentElement.setAttribute('data-auth', 'pending');
     } catch (e) { /* storage blocked -> treat as logged out (login screen shows) */ }

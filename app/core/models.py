@@ -1105,6 +1105,36 @@ class EmailChangeCode(Base):
     )
 
 
+class OtpCode(Base):
+    """Durable fallback store for the generalized one-time-code (OTP) service.
+
+    OTPs live in Redis first (fast, auto-expiring); a row is written here only when Redis is
+    unavailable at issue time, and verify consults both stores. A row is bound to one (purpose,
+    user_id) — a new issue for that pair invalidates any prior row — and carries the action's
+    destination (e.g. a pending new email) so a code can't be redeemed for a different target. Only a
+    peppered HMAC-SHA256 hash of the code is stored, never the plaintext. Single-use (consumed_at) with
+    a 3-strike attempt counter. A WHOLE NEW TABLE — created by create_all(), so it needs no
+    lightweight-migration entry (create_all builds it on already-deployed vaults). This supersedes
+    email_change_codes (kept for now, but no longer written)."""
+    __tablename__ = 'otp_codes'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    purpose = Column(String(64), nullable=False)                           # e.g. 'email_change'
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'),
+                     nullable=False, index=True)
+    destination = Column(String(255), nullable=True)                       # e.g. the pending new email
+    code_hash = Column(String(64), nullable=False)                         # peppered HMAC-SHA256 hex
+    attempts = Column(Integer, nullable=False, default=0)                  # wrong-guess counter
+    max_attempts = Column(Integer, nullable=False, default=3)             # invalidate after this many
+    expires_at = Column(DateTime, nullable=False)
+    consumed_at = Column(DateTime, nullable=True)                          # single-use: set on redeem
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_otpcode_purpose_user', 'purpose', 'user_id'),
+    )
+
+
 class AccountInvitation(Base):
     """Admin-minted account invitation.
 
@@ -1139,6 +1169,34 @@ class AccountInvitation(Base):
     __table_args__ = (
         Index('idx_account_invitation_prefix', 'token_prefix'),
         Index('idx_account_invitation_username', 'username'),
+    )
+
+
+class PasswordResetToken(Base):
+    """Single-use, short-lived proof used to reset a forgotten password via a link.
+
+    Same token discipline as AccountInvitation: secrets.token_urlsafe(32) plaintext shown/emailed once,
+    a short indexed prefix for lookup, and only a peppered HMAC-SHA256 stored at rest. Minting a new
+    token invalidates any prior unconsumed one for the user (one active link at a time). A WHOLE NEW
+    TABLE — created by create_all(), so it needs no lightweight-migration entry. ``created_by`` records
+    the admin who triggered it (NULL for a self-service 'forgot password' request)."""
+    __tablename__ = 'password_reset_tokens'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # No column-level index=True on user_id/token_prefix: the explicit named indexes below cover them
+    # (a column index=True would create a redundant second index).
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    token_prefix = Column(String(16), nullable=False)                        # public lookup handle
+    token_hash = Column(String(64), unique=True, nullable=False, index=True)  # HMAC-SHA256 hex
+    expires_at = Column(DateTime, nullable=False)                             # short-lived (<= a few min)
+    consumed_at = Column(DateTime, nullable=True)                             # single-use: set on redeem
+    created_at = Column(DateTime, default=datetime.utcnow)
+    created_by = Column(UUID(as_uuid=True),
+                        ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+
+    __table_args__ = (
+        Index('idx_pwreset_prefix', 'token_prefix'),
+        Index('idx_pwreset_user', 'user_id'),
     )
 
 
@@ -1959,6 +2017,13 @@ class EmailTemplate(Base):
                         ForeignKey('email_profiles.id', ondelete='SET NULL'), nullable=True)
     subject = Column(String(255), nullable=False, default='')
     body_html = Column(Text, nullable=False, default='')
+    # NULL for a user-authored template; set to the action key (e.g. 'password_reset') for a built-in
+    # default template seeded at boot. A seeded default is protected from deletion and badged "Default";
+    # editing it customizes it, and "Load From" restores the code default. Additive column: create_all
+    # builds it on a fresh DB, the boot DDL list ADDs it on an existing one. At most one row per key,
+    # enforced by the partial unique index below (Postgres treats NULLs as distinct, so user templates
+    # are unconstrained) — a hard backstop against a concurrent first-boot seeding two defaults for a key.
+    default_key = Column(String(64), nullable=True)
     created_by = Column(UUID(as_uuid=True),
                         ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     updated_by = Column(UUID(as_uuid=True),
@@ -1974,6 +2039,11 @@ class EmailTemplate(Base):
 
     __table_args__ = (
         Index('idx_email_template_profile', 'profile_id'),
+        # One default template per action key. Partial (NULLs excluded) so user templates — the vast
+        # majority — carry no uniqueness constraint. Same create_all-portable pattern as the
+        # email_profiles single-default index above.
+        Index('idx_email_template_default_key', 'default_key',
+              unique=True, postgresql_where=text('default_key IS NOT NULL')),
     )
 
 

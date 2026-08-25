@@ -260,55 +260,22 @@ _MAX_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024  # 64 MiB
 _MAX_REQUEST_BODY_BYTES = 4 * _MAX_UPLOAD_CHUNK_BYTES  # 256 MiB
 
 
-# Path segments that are replayable SECRETS, not identifiers: the invitation token and the share-claim
-# secret both travel in the URL PATH. The web log-pull serves request paths to a `web`-scoped token
-# holder (a less-privileged consumer), and redact_log_text does not catch these (no key= separator,
-# not JWT-shaped), so mask them at the source before they reach the sink. Add any new secret-in-path
-# route here.
-_LOG_PATH_SECRET_SUBS = [
-    (re.compile(r"^(/invites/)[^/]+"), r"\1<redacted>"),           # GET/POST /invites/{token}[/accept]
-    (re.compile(r"^(/shares/)[^/]+(/claim)"), r"\1<redacted>\2"),  # /shares/{claim-secret}/claim
-]
+# The URL-secret redaction (invite/reset/share tokens in the path or landing-page query) lives in a
+# small stdlib-only module so it is unit-testable offline and shared by the in-app sink AND the uvicorn
+# access-log filter below. Add new secret-bearing routes in app/core/log_redaction.py.
+from app.core.log_redaction import (  # noqa: E402
+    redact_log_path as _redact_log_path,
+    redact_access_path as _redact_access_path,
+    AccessLogRedactFilter as _AccessLogRedactFilter,
+)
 
 
-def _redact_log_path(path: str) -> str:
-    """Mask replayable secrets carried in a URL path before it is written to the log-pull sink."""
-    for rx, repl in _LOG_PATH_SECRET_SUBS:
-        path = rx.sub(repl, path)
-    return path
-
-
-_INVITE_QUERY_RE = re.compile(r"(?i)([?&]invite=)[^&#]+")
-
-
-def _redact_access_path(full_path: str) -> str:
-    """Redact secrets from a full request target (path + optional query) for the uvicorn access log:
-    mask the invite/share token in the PATH and the ?invite=<token> QUERY the landing page carries."""
-    path, sep, query = full_path.partition("?")
-    path = _redact_log_path(path)
-    if not sep:
-        return path
-    query = _INVITE_QUERY_RE.sub(r"\1<redacted>", "?" + query)[1:]
-    return path + "?" + query
-
-
-class _AccessLogRedactFilter(logging.Filter):
-    """Scrub the invite/share tokens out of uvicorn's access log. Those single-use tokens travel in the
-    URL (a path segment on the invite endpoints, the ?invite= query on the landing page), so uvicorn's
-    default access log would otherwise write the raw token on every request — the leak the app's other
-    bearer tokens avoid by being header-only. Rewrites the request-target arg in place; never raises,
-    never drops a line."""
-    def filter(self, record):  # noqa: A003
-        try:
-            args = record.args
-            if (isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str)
-                    and ("/invites/" in args[2] or "/shares/" in args[2] or "invite=" in args[2])):
-                lst = list(args)
-                lst[2] = _redact_access_path(args[2])
-                record.args = tuple(lst)
-        except Exception:  # noqa: BLE001 — logging must never raise
-            pass
-        return True
+def _public_base_url(request) -> str:
+    """Absolute base URL for the tokened links we email (reset/invite). Delegates to
+    ``email_actions.public_base_url`` (offline-testable): prefer the configured public host so a spoofed
+    ``Host`` header can't poison an emailed token, else fall back to the request host."""
+    from app.core.email_actions import public_base_url
+    return public_base_url(request)
 
 
 def _install_access_log_redaction() -> None:
@@ -2571,12 +2538,59 @@ def _smtp_configured(db: Session) -> bool:
     return email_send.smtp_configured(db)
 
 
+def _fire_action_email_bulk(db: Session, key: str, recipients, action_context=None) -> None:
+    """Best-effort trigger for an OPTIONAL automated email to one or more recipients.
+
+    Uses the request ``db`` ONLY for a fast enabled-check, so a disabled action (the default) costs a
+    single indexed lookup on the hot path and spawns nothing. When the action is on and bound, the
+    render + SMTP fan-out runs on a daemon thread in its OWN session, so mail latency never delays the
+    triggering request (a sign-in, a share, a member add …) and a mail failure can't touch its
+    transaction. ``recipients`` is an iterable of ``(email, username)``. Never raises."""
+    try:
+        from app.core.models import EmailAction
+        a = db.get(EmailAction, key)
+        # An optional action only sends when explicitly enabled AND bound to a template.
+        if not (a is not None and a.enabled and a.template_id is not None):
+            return
+        pairs = [((e or "").strip(), u) for (e, u) in recipients if (e or "").strip()]
+        if not pairs:
+            return
+        ctx = dict(action_context or {})
+
+        def _run(k, pp, c):
+            try:
+                from app.core.database import get_db_context
+                from app.core.email_actions import send_action_email
+                with get_db_context() as s:
+                    for em, un in pp:
+                        send_action_email(s, k, recipient={"email": em, "username": un}, action_context=c)
+            except Exception:  # noqa: BLE001 — a courtesy notification must never surface anywhere
+                pass
+
+        threading.Thread(target=_run, args=(key, pairs, ctx), daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _fire_action_email(db: Session, key: str, *, email, username=None, action_context=None) -> None:
+    """Single-recipient convenience wrapper over :func:`_fire_action_email_bulk`."""
+    _fire_action_email_bulk(db, key, [(email, username)], action_context)
+
+
 def _email_change_requires_verification(db: Session) -> bool:
     """Effective org policy: does a self-service email change require an emailed one-time code?"""
     from app.core.models import SystemSetting
     from app.core.account_policy import effective_account_policy
     row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
     return bool(effective_account_policy(row.value if row else None)["email_change_requires_verification"])
+
+
+def _email_change_otp_ttl_minutes(db: Session) -> int:
+    """Configured lifetime (minutes) of the email-change verification code; effective policy default 5."""
+    from app.core.models import SystemSetting
+    from app.core.account_policy import effective_account_policy
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    return int(effective_account_policy(row.value if row else None)["email_change_otp_ttl_minutes"])
 
 
 def _login_identifier(db: Session) -> str:
@@ -3462,12 +3476,30 @@ async def create_invite(
     except Exception:
         pass
 
-    base = str(request.base_url).rstrip("/") if request is not None else ""
+    base = _public_base_url(request) if request is not None else ""
+    invite_url = f"{base}/?invite={plaintext}"
+
+    # Send the invitation email carrying the freshly-minted link (the {{action.link}} token). This is
+    # the SYSTEM "account_invite" action (always on), so it sends whenever the invite carries an email
+    # and SMTP is configured. The link is ALSO returned below for the admin to copy, so a mail failure
+    # (or an invite with no email) never blocks the invite — email_sent just tells the UI which to show.
+    email_sent = False
+    if email:
+        try:
+            from app.core.email_actions import send_action_email
+            _ttl_h = int(pol.get("invite_ttl_hours") or 24)
+            email_sent = bool(send_action_email(
+                db, "account_invite", recipient={"email": email, "username": username},
+                action_context={"link": invite_url, "expires": f"in {_ttl_h} hours"}))
+        except Exception:  # noqa: BLE001 — the link is still returned; never fail the mint on mail trouble
+            email_sent = False
+
     return {
         "id": str(inv.id), "username": username, "email": email, "role": role,
         "status": "pending", "expires_at": inv.expires_at.isoformat(), "token_prefix": prefix,
         "token": plaintext,                       # shown ONCE — never stored, never re-returned
-        "invite_url": f"{base}/?invite={plaintext}",
+        "invite_url": invite_url,
+        "email_sent": email_sent,
     }
 
 
@@ -3756,6 +3788,9 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
     except Exception:
         pass
 
+    # Optionally welcome the freshly-created account by email (opt-in). Best-effort.
+    _fire_action_email(db, "account_welcome", email=user.email, username=user.username)
+
     # Deliberately NOT auto-logged-in and NO token returned: an invitation link sitting in a mail
     # client's history must not become a live session.
     return {"ok": True, "username": inv.username}
@@ -3772,6 +3807,7 @@ async def auth_policy(db: Session = Depends(get_db)):
     pol = _account_policy(db)
     return {
         "signup_enabled": bool(pol.get("signup_enabled")),
+        "password_reset_enabled": bool(pol.get("password_reset_enabled")),
         "login_identifier": pol.get("login_identifier"),
         "email_requirement": pol.get("email_requirement"),
         "password_policy": _password_policy_view(db),
@@ -3807,6 +3843,260 @@ def _audit_signup_failure(db: Session, username: str, ip: str, reason: str) -> N
             details={"username": (username or "")[:64], "reason": reason})
     except Exception:
         pass
+
+
+# ============ Password reset (self-service, gated OFF by default, + admin-triggered) ============
+class ForgotPasswordRequest(BaseModel):
+    identifier: str          # a username or an email address
+
+
+class ResetPasswordRequest(BaseModel):
+    # min_length mirrors the sibling password models (the server also enforces HARD_FLOOR=8); max_length
+    # bounds the input so a pathologically large body can't be hashed.
+    new_password: str = Field(..., min_length=8, max_length=1024)
+
+
+def _password_reset_policy(db: Session):
+    """(enabled, ttl_minutes) — self-service switch + link lifetime, from effective account policy."""
+    pol = _account_policy(db)
+    return bool(pol.get("password_reset_enabled")), int(pol.get("password_reset_ttl_minutes") or 5)
+
+
+def _reset_pepper() -> str:
+    from app.core.password_reset import reset_pepper
+    return reset_pepper(settings.jwt_secret_key)
+
+
+def _resolve_reset_user(db: Session, identifier: str):
+    """Resolve a username OR email to an ACTIVE user, or None. Case-insensitive."""
+    ident = (identifier or "").strip()
+    if not ident:
+        return None
+    from sqlalchemy import func as _f
+    from app.core.email_identity import find_user_by_email
+    u = db.query(User).filter(User.is_active.is_(True),
+                              _f.lower(User.username) == ident.lower()).first()
+    if u is None and "@" in ident:
+        # Reuse the canonical email resolver (SQL-folds both sides, exactly like the unique index), then
+        # honour the active-only rule.
+        cand = find_user_by_email(db, ident)
+        if cand is not None and getattr(cand, "is_active", True):
+            u = cand
+    return u
+
+
+def _mint_and_send_reset(db: Session, user, base_url: str, *, created_by_id) -> bool:
+    """Mint a single-use reset token (invalidating any prior unconsumed one), email it through the
+    password_reset action with the freshly-minted {{action.link}}, and return whether it was sent.
+    Never raises — the caller (public or admin) must not fail on mail trouble."""
+    from app.core.password_reset import mint_reset_token, hash_reset_token, pepper_ok
+    from app.core.models import PasswordResetToken
+    from app.core.email_actions import send_action_email
+    pepper = _reset_pepper()
+    email = (getattr(user, "email", "") or "").strip()
+    if not pepper_ok(pepper) or not email:
+        return False
+    _, ttl = _password_reset_policy(db)
+    try:
+        db.query(PasswordResetToken).filter(
+            PasswordResetToken.user_id == user.id,
+            PasswordResetToken.consumed_at.is_(None)).delete(synchronize_session=False)
+        plaintext, prefix = mint_reset_token()
+        db.add(PasswordResetToken(
+            user_id=user.id, token_prefix=prefix, token_hash=hash_reset_token(plaintext, pepper),
+            expires_at=datetime.utcnow() + timedelta(minutes=ttl), created_by=created_by_id))
+        db.commit()
+    except Exception:
+        db.rollback()
+        return False
+    link = f"{(base_url or '').rstrip('/')}/?reset={plaintext}"
+    try:
+        return bool(send_action_email(db, "password_reset",
+                                      recipient={"email": email, "username": user.username},
+                                      action_context={"link": link, "expires": f"in {ttl} minutes"}))
+    except Exception:
+        return False
+
+
+def _mint_and_send_reset_async(user_id, base_url: str) -> None:
+    """Fire-and-forget the self-service reset mint+send on a daemon thread in its OWN session, so a
+    resolved identifier doesn't respond measurably slower than an unknown one (a timing enumeration
+    oracle). The 202 has already been returned by the time this runs."""
+    def _run():
+        try:
+            from app.core.database import get_db_context
+            with get_db_context() as s:
+                u = s.query(User).filter(User.id == user_id).first()
+                if u is not None:
+                    _mint_and_send_reset(s, u, base_url, created_by_id=None)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        threading.Thread(target=_run, daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _resolve_valid_reset_token(db: Session, token: str):
+    """The valid, unconsumed, unexpired PasswordResetToken for a presented token, or None. Fails closed
+    and never enumerates: lifecycle is checked in Python AFTER a constant-time hash match, so an
+    expired/consumed token is indistinguishable from one that never existed."""
+    from app.core.password_reset import token_prefix, reset_tokens_match, pepper_ok
+    from app.core.models import PasswordResetToken
+    try:
+        pepper = _reset_pepper()
+        if not pepper_ok(pepper):
+            return None
+        now = datetime.utcnow()
+        for r in db.query(PasswordResetToken).filter(
+                PasswordResetToken.token_prefix == token_prefix(token)).all():
+            if reset_tokens_match(token, pepper, r.token_hash):
+                return r if (r.consumed_at is None and r.expires_at > now) else None
+    except Exception:
+        return None
+    return None
+
+
+@app.post("/auth/forgot-password")
+async def forgot_password(body: ForgotPasswordRequest, request: Request, db: Session = Depends(get_db)):
+    """Public self-service password-reset request. ALWAYS returns 202 (enumeration-safe). A link is
+    minted+sent only when self-service is enabled AND the identifier resolves to an active account with
+    an email AND SMTP is configured. Rate-limited fail-closed per client IP."""
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    ip = get_client_ip(request)
+    try:
+        allowed, _, reset = _rl.check_rate_limit(
+            identifier=ip, limit=settings.rate_limit_api_auth, window=settings.rate_limit_api_auth_window,
+            prefix="forgot_password_ip", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable. Please try again shortly.")
+    if not allowed:
+        import time as _t
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many requests; please wait a few minutes.",
+                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    enabled, _ttl = _password_reset_policy(db)
+    if enabled and _smtp_configured(db):
+        user = _resolve_reset_user(db, body.identifier)
+        if user is not None:
+            # Background the mint+send so a resolved identifier can't be told apart from an unknown one
+            # by response timing (both do only the resolution query on the request path). The link base
+            # prefers the configured public host so a spoofed Host header can't poison the emailed token.
+            _mint_and_send_reset_async(user.id, _public_base_url(request))
+    try:
+        AuditLogger(db).log_action(action="password_reset_requested", status="success", user=None,
+                                   ip_address=ip, details={})
+    except Exception:  # noqa: BLE001
+        pass
+    return JSONResponse(status_code=202, content={
+        "message": "If an account matches and self-service reset is enabled, a reset link has been sent."})
+
+
+@app.post("/users/{user_id}/send-reset-link")
+@require_endpoint_permission("USER_MANAGE")
+async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
+                                current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Admin action: email a password-reset link to a user. Always available (independent of the public
+    self-service switch), interactive-admin only."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage users.")
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not (user.email or "").strip():
+        raise HTTPException(status_code=400, detail="That user has no email address to send a reset link to.")
+    if not _smtp_configured(db):
+        raise HTTPException(status_code=400,
+                            detail="Email is not configured. Add a sending profile in Settings -> Email first.")
+    sent = _mint_and_send_reset(db, user, _public_base_url(request), created_by_id=current_user.id)
+    try:
+        AuditLogger(db).log_action(action="password_reset_link_sent", status="success", user=current_user,
+                                   ip_address=get_client_ip(request),
+                                   details={"target_user_id": str(user_id), "email_sent": bool(sent)})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"email_sent": bool(sent)}
+
+
+@app.get("/reset/{token}")
+async def get_reset(token: str, request: Request, db: Session = Depends(get_db)):
+    """Public: validate a reset token and return the minimal info the reset form needs. Generic 404 for
+    any unusable token (no enumeration). Rate-limited fail-closed per IP."""
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    ip = get_client_ip(request)
+    try:
+        allowed, _, _ = _rl.check_rate_limit(
+            identifier=ip, limit=settings.rate_limit_api_auth, window=settings.rate_limit_api_auth_window,
+            prefix="reset_lookup_ip", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+    if not allowed:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many requests; please wait.")
+    r = _resolve_valid_reset_token(db, token)
+    if r is None:
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    user = db.query(User).filter(User.id == r.user_id).first()
+    return {"username": (user.username if user else None)}
+
+
+@app.post("/reset/{token}")
+async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db: Session = Depends(get_db)):
+    """Public: set a new password using a valid reset token. Single-use (atomic claim); revokes the
+    user's sessions so a stolen session can't outlive the reset. Rate-limited fail-closed per IP AND
+    per token-prefix."""
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    from app.core.password_reset import token_prefix
+    from app.core.security import hash_password
+    from app.core.models import PasswordResetToken
+    ip = get_client_ip(request)
+    prefix = token_prefix(token)
+    # Two fail-closed limits: a generous per-IP cap (many users can share one address) and a tight
+    # per-token-prefix cap that bounds repeated attempts against ONE known prefix (e.g. a leaked one).
+    # Whole-space brute force is already infeasible against the 256-bit token and bounded by the per-IP cap.
+    try:
+        for ident, pfx, lim, win in (
+                (ip, "reset_do_ip", settings.rate_limit_api_auth, settings.rate_limit_api_auth_window),
+                (prefix or "none", "reset_do_prefix", 5, 60)):
+            allowed, _, reset = _rl.check_rate_limit(identifier=ident, limit=lim, window=win, prefix=pfx, fail_open=False)
+            if not allowed:
+                import time as _t
+                raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                                    detail="Too many attempts; please wait.",
+                                    headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+    r = _resolve_valid_reset_token(db, token)
+    if r is None:
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    _validate_password_policy(db, body.new_password)     # 400 on a weak password BEFORE the token is burned
+    user = db.query(User).filter(User.id == r.user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    # Atomic single-use claim: only the request that flips consumed_at proceeds.
+    claimed = db.query(PasswordResetToken).filter(
+        PasswordResetToken.id == r.id, PasswordResetToken.consumed_at.is_(None)).update(
+        {"consumed_at": datetime.utcnow()}, synchronize_session=False)
+    if not claimed:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    user.password_hash = hash_password(body.new_password)
+    db.commit()
+    try:
+        # _revoke_sessions mutates session rows but does NOT commit — commit it ourselves so the durable
+        # DB-level revocation persists (a hijacked session must not outlive the reset).
+        _revoke_sessions(db, user_id=user.id, actor_username="password-reset")   # force re-login everywhere
+        db.commit()
+    except Exception:  # noqa: BLE001
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    try:
+        AuditLogger(db).log_action(action="password_reset_completed", status="success", user=user,
+                                   ip_address=ip, details={})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True}
 
 
 @app.post("/auth/signup")
@@ -3935,6 +4225,9 @@ async def self_signup(payload: SignupRequest, request: Request, db: Session = De
             resource_type="user", resource_id=str(user.id), details={"username": uname})
     except Exception:
         pass
+
+    # Optionally welcome the freshly-created account by email (opt-in). Best-effort.
+    _fire_action_email(db, "account_welcome", email=user.email, username=user.username)
 
     # Not auto-logged-in and no token returned — success returns the visitor to the sign-in form.
     return {"ok": True, "username": uname}
@@ -4340,6 +4633,10 @@ async def login(
                 body=f"{login_request.username} signed in" + (f" from {client_ip}" if client_ip else ""),
                 target="#temp-creds",
             )
+        else:
+            # A real account sign-in optionally emails the owner a "New sign-in alert" (opt-in; the
+            # default template uses {{current_datetime}}, so no action_context is required). Best-effort.
+            _fire_action_email(db, "login_alert", email=user.email, username=user.username)
 
         from app.core.temp_scope import is_scoped as _is_scoped
         return LoginResponse(
@@ -4593,6 +4890,12 @@ async def create_temp_credentials(
             current_user, client_ip, temp_creds['passcodes'],
             same_for_all=bool(payload.passcode_same_for_all) if payload else False,
         )
+
+    # Optionally email the account owner that a temporary credential was issued for their access
+    # (opt-in). NEVER include the credential plaintext — only that one exists + when it expires.
+    _lifetime = temp_creds.get('total_lifetime_minutes')
+    _fire_action_email(db, "temp_credential_issued", email=current_user.email, username=current_user.username,
+                       action_context={"expires": f"in {_lifetime} minutes"} if _lifetime else {})
 
     return TempCredentialResponse(**temp_creds)
 
@@ -5404,7 +5707,10 @@ async def create_user(
         grant_default_permissions_for_role(str(new_user.id), new_user.role, db)
         
         audit_logger.log_user_created(new_user, current_user, client_ip)
-        
+
+        # Optionally send the new account a welcome email (opt-in). Best-effort.
+        _fire_action_email(db, "account_welcome", email=new_user.email, username=new_user.username)
+
         return UserResponse.model_validate(new_user)
     
     except ValueError as e:
@@ -5547,9 +5853,8 @@ async def request_email_change(
     one-time code to the NEW address. The account email is not touched until the code is confirmed.
     Enumeration-safe: an address already in use (or unchanged) gets the same 202 and no usable code."""
     from app.core.security import verify_password
-    from app.core.email_change import generate_code, hash_code, CODE_TTL_MINUTES
+    from app.core import otp_service
     from app.core.rate_limiter import rate_limiter as _rl
-    from app.core.models import EmailChangeCode
 
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot change account settings.")
@@ -5576,17 +5881,12 @@ async def request_email_change(
     # Mint + send only for a genuinely new, unused address; otherwise return the same 202 with no
     # usable code, so this endpoint can't be used to probe which addresses are registered.
     if new_email and new_email != user.email and not email_in_use(db, new_email, exclude_user_id=user.id):
-        # One pending change at a time: drop any prior unconsumed codes for this user.
-        db.query(EmailChangeCode).filter(
-            EmailChangeCode.user_id == user.id,
-            EmailChangeCode.consumed_at.is_(None),
-        ).delete()
-        code = generate_code()
-        db.add(EmailChangeCode(
-            user_id=user.id, new_email=new_email,
-            code_hash=hash_code(code, settings.jwt_secret_key),
-            expires_at=datetime.utcnow() + timedelta(minutes=CODE_TTL_MINUTES)))
-        db.commit()
+        # Mint a one-time code bound to (email_change, this user, the new address). Redis-primary with a
+        # durable DB fallback; issuing invalidates any prior code (one pending change at a time). TTL is
+        # org-configurable (default 5 minutes).
+        ttl = _email_change_otp_ttl_minutes(db)
+        code = otp_service.issue(db, purpose="email_change", user_id=user.id, destination=new_email,
+                                 ttl_minutes=ttl, pepper=settings.jwt_secret_key)
         # Route through the central action helper so this uses the admin-customizable "email_change"
         # template (its {{action.code}} / {{action.expires}} tokens). raise_errors preserves the prior
         # behavior: a clean 400/502 on a config/transport failure rather than a silent miss.
@@ -5596,7 +5896,7 @@ async def request_email_change(
             send_action_email(
                 db, "email_change",
                 recipient={"email": new_email, "username": user.username},
-                action_context={"code": code, "expires": f"in {CODE_TTL_MINUTES} minutes"},
+                action_context={"code": code, "expires": f"in {ttl} minutes"},
                 raise_errors=True)
         except _es.EmailSendError as e:
             code_status = (status.HTTP_400_BAD_REQUEST if e.category == "config"
@@ -5620,16 +5920,16 @@ async def confirm_email_change(
 ):
     """Complete a verified email change by presenting the code sent to the new address. On success
     the account's email becomes the new address and the code is consumed (single-use)."""
-    from app.core.email_change import code_matches
+    from app.core import otp_service
     from app.core.rate_limiter import rate_limiter as _rl
-    from app.core.models import EmailChangeCode
 
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot change account settings.")
     user = db.query(User).filter(User.id == current_user.id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
-    # Cap confirm attempts — a brute-force guard on the code space.
+    # Cap confirm attempts — an OUTER brute-force guard on the code space (the OTP service also
+    # invalidates the code after 3 wrong tries).
     allowed, _, reset = _rl.check_rate_limit(identifier=str(user.id), limit=10, window=300,
                                              prefix="email_change_confirm")
     if not allowed:
@@ -5637,26 +5937,22 @@ async def confirm_email_change(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="Too many attempts; please wait a few minutes.",
                             headers={"Retry-After": str(max(1, reset - int(_t.time())))})
-    now = datetime.utcnow()
-    rec = db.query(EmailChangeCode).filter(
-        EmailChangeCode.user_id == user.id,
-        EmailChangeCode.consumed_at.is_(None),
-        EmailChangeCode.expires_at > now,
-    ).order_by(EmailChangeCode.created_at.desc()).first()
-    if rec is None or not code_matches(body.code, settings.jwt_secret_key, rec.code_hash):
+    result = otp_service.verify(db, purpose="email_change", user_id=user.id, code=body.code,
+                                pepper=settings.jwt_secret_key)
+    if not result.ok or not result.destination:
         raise HTTPException(status_code=400, detail="That code is invalid or has expired.")
+    new_email = result.destination
     # Re-check uniqueness at apply time — the address may have been taken since the request.
-    if email_in_use(db, rec.new_email, exclude_user_id=user.id):
+    if email_in_use(db, new_email, exclude_user_id=user.id):
         raise HTTPException(status_code=400, detail="That email address is now in use.")
     old_email = user.email
-    user.email = rec.new_email
-    rec.consumed_at = now
+    user.email = new_email
     db.commit()
     db.refresh(user)
     try:
         AuditLogger(db).log_action(action="email_change_confirmed", status="success", user=user,
                                    ip_address=get_client_ip(request),
-                                   details={"old": old_email, "new": rec.new_email})
+                                   details={"old": old_email, "new": new_email})
     except Exception:  # noqa: BLE001
         pass
     return UserResponse.model_validate(user)
@@ -7718,6 +8014,16 @@ async def create_share(
                 target="#shared",
                 dedup_prefix=f"share:{share.id}",
             )
+            # Optionally ALSO email each recipient the "File / folder shared" notice (opt-in). Resolve
+            # addresses now (one query), then fan the SMTP out on a background thread. NEVER email the
+            # link_token (the bearer secret for anyone_internal shares) — link into "Shared with me".
+            from app.core.email_actions import vault_url as _email_vault_url
+            _base = (_email_vault_url() or str(request.base_url).rstrip("/"))
+            _share_ctx = {"link": (_base.rstrip("/") + "/#shared") if _base else "",
+                          "expires": (f"until {share.expires_at.strftime('%Y-%m-%d')} UTC" if share.expires_at else "")}
+            _share_pairs = [(u.email, u.username) for u in
+                            db.query(User).filter(User.id.in_([str(x) for x in recipient_ids])).all()]
+            _fire_action_email_bulk(db, "share_created", _share_pairs, _share_ctx)
     except Exception as e:
         print(f"⚠ share notification skipped: {e}")
     out["link_token"] = link_token  # SHOW ONCE — only the hash is stored; this is never returned again
@@ -10030,6 +10336,12 @@ async def grant_vault_permission(
         from app.core.models import vault_members
         from sqlalchemy.dialects.postgresql import insert as _pg_insert
 
+        # Was this user already a member? The upsert below is idempotent (on_conflict_do_update), so a
+        # re-grant that only changes a permission level must NOT fire the "added to a vault" email.
+        _already_member = db.query(vault_members).filter(
+            vault_members.c.vault_id == vault_id,
+            vault_members.c.user_id == permission.user_id).first() is not None
+
         # Set permissions based on level. 'manage' implies full read/write/delete.
         manage_perm = permission.level == 'manage'
         read_perm = permission.level in ['read', 'write', 'delete', 'manage']
@@ -10059,7 +10371,12 @@ async def grant_vault_permission(
             },
         ))
         db.commit()
-        
+
+        # Optionally email a genuinely-new member that they were added to a vault (opt-in). Best-effort;
+        # the default template uses {{vault.name}}/{{vault.url}}, so no action_context is required.
+        if not _already_member:
+            _fire_action_email(db, "vault_member_added", email=user.email, username=user.username)
+
         return {
             "message": f"Permission '{permission.level}' granted to user {user.username}",
             "user_id": str(permission.user_id),
@@ -15017,13 +15334,18 @@ def _seed_default_email_profile():
     try:
         from app.core.database import get_db_context
         from app.core import email_send
-        from app.core.email_actions import seed_email_actions
+        from app.core.email_actions import seed_email_actions, seed_default_templates
         with get_db_context() as db:
             if email_send.seed_default_profile(db):
                 print("[OK] Seeded default email sending profile from legacy SMTP config")
             n = seed_email_actions(db)
             if n:
                 print(f"[OK] Seeded {n} automated-email action(s)")
+            # Materialize each action's built-in default template and pre-bind it (idempotent; never
+            # overwrites an admin's own template choice). Runs after the actions exist so it can bind.
+            t = seed_default_templates(db)
+            if t:
+                print(f"[OK] Seeded {t} default email template(s)")
     except Exception as e:
         print(f"⚠ Default email profile seed skipped: {e}")
 
@@ -15419,6 +15741,15 @@ def _run_lightweight_migrations():
             # idempotent; the table always exists by now because init_db()/create_all ran first.
             "ALTER TABLE email_profiles ADD COLUMN IF NOT EXISTS "
             "smtp_allow_insecure_tls BOOLEAN NOT NULL DEFAULT FALSE",
+            # Email Studio: mark a template as the built-in default for an action key (NULL = user
+            # template). Additive + idempotent; create_all builds it on a fresh DB, this ADDs it on an
+            # INTERMEDIATE deployment that created email_templates before the column existed.
+            "ALTER TABLE email_templates ADD COLUMN IF NOT EXISTS default_key VARCHAR(64)",
+            # Partial unique: at most one default template per action key (NULLs — user templates —
+            # unconstrained). Safe to create on upgrade: the column is brand-new (all NULL) until the
+            # boot seed, which runs after migrations, so no duplicate can exist at index-creation time.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_email_template_default_key "
+            "ON email_templates (default_key) WHERE default_key IS NOT NULL",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)

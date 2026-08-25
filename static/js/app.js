@@ -969,9 +969,51 @@ async function applyLoginPolicyLabel() {
             }
         }
         _initSignupAffordance(policy);
+        _initForgotAffordance(policy);
     } catch (_) { /* keep the static fallback */ }
 }
 applyLoginPolicyLabel();
+
+// ---- Forgot password (public self-service; the link shows only when the org enabled it) ----------
+let _forgotWired = false;
+
+function _initForgotAffordance(policy) {
+    const toggle = document.getElementById('forgot-toggle');
+    const form = document.getElementById('forgot-form');
+    if (!toggle || !form) return;
+    if (!policy || !policy.password_reset_enabled) { toggle.style.display = 'none'; form.style.display = 'none'; return; }
+    toggle.style.display = '';
+    if (_forgotWired) return;
+    _forgotWired = true;
+    const showLink = document.getElementById('show-forgot-link');
+    const backLink = document.getElementById('forgot-back-link');
+    const loginForm = document.getElementById('login-form');
+    const msg = document.getElementById('forgot-message');
+    const showForgot = (on) => {
+        form.style.display = on ? '' : 'none';
+        if (loginForm) loginForm.style.display = on ? 'none' : '';
+        toggle.style.display = on ? 'none' : '';
+        if (msg) { msg.style.display = 'none'; msg.textContent = ''; }
+    };
+    if (showLink) showLink.addEventListener('click', (e) => {
+        e.preventDefault(); showForgot(true);
+        const i = document.getElementById('forgot-identifier'); if (i) i.focus();
+    });
+    if (backLink) backLink.addEventListener('click', (e) => { e.preventDefault(); showForgot(false); });
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const ident = ((document.getElementById('forgot-identifier') || {}).value || '').trim();
+        const btn = form.querySelector('button[type=submit]');
+        if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+        try {
+            await fetch(`${API_BASE}/auth/forgot-password`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ identifier: ident }) });
+        } catch (_) { /* enumeration-safe: show the same message regardless */ }
+        if (msg) { msg.textContent = 'If an account matches, a reset link has been sent to its email.'; msg.style.display = 'block'; }
+        if (btn) { btn.disabled = false; btn.textContent = 'Send reset link'; }
+    });
+}
 
 // ---- Self-signup (public, unauthenticated) --------------------------------
 // The toggle + form are hidden until /auth/policy confirms signup_enabled. Email presence/required
@@ -1221,6 +1263,85 @@ function _inviteAccepted(username) {
         body.appendChild(_el('h2', 'text-xl font-bold mb-sm', 'Account created'));
         body.appendChild(_el('p', 'text-secondary mb-lg',
             'Your account is ready. Sign in with your new password to continue.'));
+        const go = _el('button', 'btn btn-primary btn-block', 'Go to sign in');
+        go.addEventListener('click', () => showScreen('login-screen'));
+        body.appendChild(go);
+    }
+    setTimeout(() => { showScreen('login-screen'); }, 2500);
+}
+
+// Reached via /?reset=<token>. Bare fetch only; DOM built with _el/textContent; every failure shows
+// ONE generic message so the page can't probe which tokens are valid; success does NOT sign the
+// visitor in — it routes to login.
+const _RESET_GENERIC_ERROR = 'This reset link is invalid or has expired.';
+
+function _resetCard() { return document.getElementById('reset-card-body'); }
+
+function _resetMessage(text, kind) {
+    const body = _resetCard(); if (!body) return;
+    body.replaceChildren(); body.appendChild(_el('div', 'alert alert-' + (kind || 'error'), text));
+}
+
+async function initResetFlow(token) {
+    showScreen('reset-screen');
+    let info;
+    try {
+        const res = await fetch(`${API_BASE}/reset/${encodeURIComponent(token)}`, { headers: { Accept: 'application/json' } });
+        if (!res.ok) { _resetMessage(_RESET_GENERIC_ERROR); return; }
+        info = await res.json();
+    } catch (_) { _resetMessage(_RESET_GENERIC_ERROR); return; }
+    _renderResetForm(token, info);
+}
+
+function _renderResetForm(token, info) {
+    const body = _resetCard(); if (!body) return;
+    body.replaceChildren();
+    body.appendChild(_el('h2', 'text-xl font-bold mb-sm', 'Set a new password'));
+    const sub = _el('p', 'text-secondary mb-lg');
+    if (info && info.username) {
+        sub.appendChild(document.createTextNode('For the account '));
+        sub.appendChild(_el('strong', null, info.username));
+        sub.appendChild(document.createTextNode('.'));
+    } else { sub.textContent = 'Choose a new password to finish.'; }
+    body.appendChild(sub);
+
+    const form = _el('form');
+    const pg = _el('div', 'form-group');
+    pg.appendChild(_el('label', null, 'New password'));
+    const pw = _el('input', 'form-control'); pw.type = 'password'; pw.required = true;
+    pw.setAttribute('autocomplete', 'new-password');
+    pg.appendChild(pw); form.appendChild(pg);
+    const err = _el('div', 'alert alert-error mt-md'); err.style.display = 'none'; form.appendChild(err);
+    const btn = _el('button', 'btn btn-primary btn-block', 'Set password'); btn.type = 'submit'; form.appendChild(btn);
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault(); err.style.display = 'none'; btn.disabled = true; btn.textContent = 'Saving…';
+        try {
+            const res = await fetch(`${API_BASE}/reset/${encodeURIComponent(token)}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ new_password: pw.value }) });
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                err.textContent = data.detail || _RESET_GENERIC_ERROR; err.style.display = 'block';
+                btn.disabled = false; btn.textContent = 'Set password'; return;
+            }
+            _resetDone();
+        } catch (_) {
+            err.textContent = _RESET_GENERIC_ERROR; err.style.display = 'block';
+            btn.disabled = false; btn.textContent = 'Set password';
+        }
+    });
+    body.appendChild(form); pw.focus();
+}
+
+function _resetDone() {
+    try { history.replaceState(null, '', location.pathname); } catch (_) {}
+    document.documentElement.removeAttribute('data-reset');
+    const body = _resetCard();
+    if (body) {
+        body.replaceChildren();
+        body.appendChild(_el('h2', 'text-xl font-bold mb-sm', 'Password updated'));
+        body.appendChild(_el('p', 'text-secondary mb-lg',
+            'Your password has been changed. Sign in with your new password to continue.'));
         const go = _el('button', 'btn btn-primary btn-block', 'Go to sign in');
         go.addEventListener('click', () => showScreen('login-screen'));
         body.appendChild(go);
@@ -4245,8 +4366,13 @@ async function submitInvite(e) {
         const res = await apiRequest('/invites', { method: 'POST', body: JSON.stringify(payload) });
         _lastInviteLink = res.invite_url || res.token;
         document.getElementById('invite-link-value').textContent = _lastInviteLink;
-        document.getElementById('invite-link-expiry').textContent =
-            'This link expires ' + formatServerTime(res.expires_at) + '.';
+        let _inviteNote = 'This link expires ' + formatServerTime(res.expires_at) + '.';
+        if (email) {
+            _inviteNote += res.email_sent
+                ? ' We emailed the invitation to ' + email + '.'
+                : ' We couldn’t email it — copy the link above and send it yourself.';
+        }
+        document.getElementById('invite-link-expiry').textContent = _inviteNote;
         document.getElementById('invite-user-fields').style.display = 'none';
         document.getElementById('invite-user-footer').style.display = 'none';
         document.getElementById('invite-link-result').style.display = '';
@@ -4478,6 +4604,7 @@ function renderUserDetail(u) {
                     ? `<button class="btn btn-sm btn-success unlock-user-btn" data-user-id="${u.id}">${iconSvg('unlock', 'icon-sm')} Unlock</button>`
                     : `<button class="btn btn-sm btn-warning lock-user-btn" data-user-id="${u.id}">${iconSvg('lock', 'icon-sm')} Lock</button>`}
                 <button class="btn btn-sm btn-secondary change-password-btn" data-user-id="${u.id}">${iconSvg('key', 'icon-sm')} Change Password</button>
+                ${u.email ? `<button class="btn btn-sm btn-secondary send-reset-link-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('key', 'icon-sm')} Send reset link</button>` : ''}
                 ${currentUser.role === 'admin' && u.role !== 'admin' ? `<button class="btn btn-sm btn-secondary manage-perms-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('shield', 'icon-sm')} Permissions</button>` : ''}
                 ${currentUser.role === 'admin' && u.username !== currentUser.username ? `<button class="btn btn-sm btn-warning terminate-user-sessions-btn" data-user-id="${u.id}">${iconSvg('alert-triangle', 'icon-sm')} Terminate Sessions</button>` : ''}
                 ${u.username !== currentUser.username ? `<button class="btn btn-sm btn-danger delete-user-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('trash', 'icon-sm')} Delete</button>` : ''}
@@ -4813,6 +4940,23 @@ function attachUserListeners() {
         btn.addEventListener('click', () => {
             const userId = btn.getAttribute('data-user-id');
             showEditUserModal(userId);
+        });
+    });
+
+    // Send password-reset link buttons
+    document.querySelectorAll('.send-reset-link-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const userId = btn.getAttribute('data-user-id');
+            const username = btn.getAttribute('data-username') || 'this user';
+            if (!confirm('Email a password-reset link to ' + username + '?')) return;
+            btn.disabled = true;
+            try {
+                const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/send-reset-link', { method: 'POST' });
+                if (r && r.email_sent) showSuccess('Reset link sent to ' + username + '.');
+                else showError('Could not send the reset link (check email configuration).');
+            } catch (e) {
+                showError('Could not send the reset link: ' + (e.message || ''));
+            } finally { btn.disabled = false; }
         });
     });
     
@@ -6982,6 +7126,9 @@ function populateAccountsPolicy(settings) {
     setVal('setting-email-requirement', settings.email_requirement || 'required');
     setVal('setting-login-identifier', settings.login_identifier || 'username');
     setChk('setting-email-change-verification', settings.email_change_requires_verification);
+    setVal('setting-email-change-otp-ttl-minutes', settings.email_change_otp_ttl_minutes != null ? settings.email_change_otp_ttl_minutes : 5);
+    setChk('setting-password-reset-enabled', settings.password_reset_enabled);
+    setVal('setting-password-reset-ttl-minutes', settings.password_reset_ttl_minutes != null ? settings.password_reset_ttl_minutes : 5);
     accountsDomains = Array.isArray(settings.signup_email_domains) ? settings.signup_email_domains.slice() : [];
     // Profile-aware: the backend reports whether a usable sending profile (or legacy config) exists.
     accountsSmtpConfigured = settings.smtp_configured === true;
@@ -7007,6 +7154,11 @@ function collectAccountsPolicy(settings) {
     if (accountsSmtpConfigured) {
         settings.email_change_requires_verification = on('setting-email-change-verification');
     }
+    const otpTtl = parseInt(val('setting-email-change-otp-ttl-minutes'), 10);
+    if (!Number.isNaN(otpTtl)) settings.email_change_otp_ttl_minutes = otpTtl;
+    settings.password_reset_enabled = on('setting-password-reset-enabled');
+    const prTtl = parseInt(val('setting-password-reset-ttl-minutes'), 10);
+    if (!Number.isNaN(prTtl)) settings.password_reset_ttl_minutes = prTtl;
 }
 
 async function loadSettings() {
@@ -8194,6 +8346,7 @@ async function deleteEmailProfile(p) {
 let _editingTemplateId = null;
 let _sendTemplateId = null;
 let _etPreviewTimer = null;
+let _loadFromDefaults = null;   // cached GET /email/default-templates payload
 
 async function loadEmailTemplates() {
     const grid = document.getElementById('email-templates-grid');
@@ -8223,6 +8376,12 @@ function buildEmailTemplateCard(t) {
     card.className = 'email-profile-card'; card.setAttribute('role', 'listitem'); card.dataset.templateId = t.id;
     const title = document.createElement('div'); title.className = 'epc-title';
     const name = document.createElement('span'); name.textContent = t.name || '(untitled)'; title.appendChild(name);
+    if (t.is_default) {
+        const db = document.createElement('span');
+        db.className = 'epc-badge epc-badge-default'; db.textContent = 'Default';
+        db.title = 'A built-in default template. Edit it to customize; use “Load From” to reset it.';
+        title.appendChild(db);
+    }
     if (t.bound_action) {
         const isSys = t.bound_action.category === 'system';
         const badge = document.createElement('span');
@@ -8245,7 +8404,8 @@ function buildEmailTemplateCard(t) {
     const actions = document.createElement('div'); actions.className = 'epc-actions';
     const rowDefs = [['Edit', 'etc-edit', () => openTemplateEditor(t)],
                      ['Send', 'etc-send', () => openSendModal(t)]];
-    if (!t.bound_action) rowDefs.push(['Delete', 'etc-delete', () => deleteTemplate(t)]);   // bound = non-removable
+    // Non-removable when bound to an action OR a built-in default (both refuse deletion server-side).
+    if (!t.bound_action && !t.is_default) rowDefs.push(['Delete', 'etc-delete', () => deleteTemplate(t)]);
     for (const [label, cls, fn] of rowDefs) {
         const b = document.createElement('button'); b.type = 'button';
         b.className = 'btn btn-secondary btn-sm ' + cls; b.textContent = label;
@@ -8272,6 +8432,11 @@ function renderEmailActions(actions, templates) {
     const list = document.getElementById('email-actions-list');
     list.replaceChildren();
     actions.forEach(a => list.appendChild(buildActionRow(a, templates)));
+}
+
+function _earNotifyLabel(cb) {
+    if (cb.checked) return 'Notify by email · On';
+    return cb.disabled ? 'Notify by email · pick a template' : 'Notify by email · Off';
 }
 
 function buildActionRow(a, templates) {
@@ -8302,21 +8467,50 @@ function buildActionRow(a, templates) {
         if (a.template_id === t.id) o.selected = true;
         sel.appendChild(o);
     });
-    sel.addEventListener('change', () => saveAction(a.key, { template_id: sel.value || null }));
+    sel.addEventListener('change', () => {
+        const picked = sel.value || null;
+        // Only reflect the SAFE direction immediately: no template => the switch turns off + disables.
+        // Re-ENABLING waits for the reload after the bind is saved, so a click can't race the template
+        // PUT and fire a premature enable (which the server would 400). The reload is server-authoritative.
+        if (!picked) {
+            const swCb = controls.querySelector('.ear-notify input');
+            if (swCb) {
+                swCb.checked = false; swCb.disabled = true;
+                const st = controls.querySelector('.ear-notify-state');
+                if (st) st.textContent = _earNotifyLabel(swCb);
+            }
+        }
+        saveAction(a.key, { template_id: picked });
+    });
     tplWrap.appendChild(sel); controls.appendChild(tplWrap);
 
-    // notify toggle (optional actions only)
+    // Notify switch (optional actions only): a clear on/off, DISABLED until a template is chosen —
+    // an email with no template has nothing to send, so it can't be turned on.
     if (a.category !== 'system') {
-        const tog = document.createElement('label'); tog.className = 'checkbox-label ear-notify';
-        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!a.enabled;
-        cb.addEventListener('change', () => saveAction(a.key, { enabled: cb.checked }));
-        tog.appendChild(cb); tog.appendChild(document.createTextNode(' Notify by email'));
-        controls.appendChild(tog);
+        const hasTpl = !!a.template_id;
+        const field = document.createElement('div'); field.className = 'ear-notify';
+        const sw = document.createElement('label'); sw.className = 'dv-switch';
+        const cb = document.createElement('input'); cb.type = 'checkbox';
+        cb.checked = !!a.enabled && hasTpl; cb.disabled = !hasTpl;
+        cb.setAttribute('aria-label', 'Notify by email for ' + a.name);
+        const track = document.createElement('span'); track.className = 'dv-switch-track'; track.setAttribute('aria-hidden', 'true');
+        sw.appendChild(cb); sw.appendChild(track);
+        const state = document.createElement('span'); state.className = 'ear-notify-state';
+        state.id = 'ear-state-' + a.key; cb.setAttribute('aria-describedby', state.id);   // expose the reason to AT
+        state.textContent = _earNotifyLabel(cb);
+        sw.title = cb.disabled ? 'Choose a template to enable this email' : (cb.checked ? 'On — this email will send' : 'Off');
+        cb.addEventListener('change', () => {
+            state.textContent = _earNotifyLabel(cb);
+            sw.title = cb.checked ? 'On — this email will send' : 'Off';
+            saveAction(a.key, { enabled: cb.checked });
+        });
+        field.appendChild(sw); field.appendChild(state);
+        controls.appendChild(field);
     }
 
     const test = document.createElement('button'); test.type = 'button';
     test.className = 'btn btn-secondary btn-sm ear-test'; test.textContent = '📧 Send test';
-    test.addEventListener('click', () => testAction(a.key, row));
+    test.addEventListener('click', () => openTestModal(a.key, a.name));
     controls.appendChild(test);
 
     const msg = document.createElement('span'); msg.className = 'ear-msg text-sm'; msg.setAttribute('role', 'status'); controls.appendChild(msg);
@@ -8335,18 +8529,79 @@ async function saveAction(key, patch) {
     }
 }
 
-async function testAction(key, row) {
-    const msg = row.querySelector('.ear-msg');
-    const to = prompt('Send a test of this email to which address?');
-    if (to === null) return;
-    if (msg) { msg.textContent = 'Sending…'; msg.style.color = 'var(--text-secondary)'; }
+// ---- Send-test modal (styled recipient picker: search a user, or type an address) ----------------
+let _testActionKey = null;
+let _testUserId = null;
+let _testSearchTimer = null;
+let _testSearchSeq = 0;
+
+function openTestModal(key, name) {
+    _testActionKey = key; _testUserId = null;
+    clearTimeout(_testSearchTimer); _testSearchSeq++;   // cancel any pending/in-flight search from a prior open
+    document.getElementById('email-test-modal-title').textContent = 'Send a test: ' + name;
+    document.getElementById('et-test-search').value = '';
+    document.getElementById('et-test-addr').value = '';
+    document.getElementById('et-test-results').replaceChildren();
+    const sel = document.getElementById('et-test-selected'); sel.hidden = true; sel.replaceChildren();
+    document.getElementById('et-test-msg').textContent = '';
+    document.getElementById('email-test-modal').classList.add('active');
+    document.getElementById('et-test-search').focus();
+}
+
+async function _testUserSearch(q) {
+    const results = document.getElementById('et-test-results');
+    const search = document.getElementById('et-test-search');
+    q = (q || '').trim();
+    if (q.length < 2) { results.replaceChildren(); search.setAttribute('aria-expanded', 'false'); return; }
+    const seq = ++_testSearchSeq;
     try {
-        const r = await apiRequest('/email/actions/' + encodeURIComponent(key) + '/test',
-            { method: 'POST', body: JSON.stringify({ to_addr: (to || '').trim() }) });
-        if (msg) { msg.textContent = '✓ ' + ((r && r.message) || 'Test sent'); msg.style.color = 'var(--success)'; }
+        const data = await apiRequest('/users/search?q=' + encodeURIComponent(q), { silent: true });
+        if (seq !== _testSearchSeq) return;   // drop a stale/out-of-order response
+        results.replaceChildren();
+        (data || []).slice(0, 8).forEach(u => {
+            const b = document.createElement('button'); b.type = 'button'; b.className = 'pick-row';
+            b.setAttribute('role', 'option'); b.textContent = u.username;
+            b.addEventListener('click', () => _testSelectUser(u.id, u.username));
+            results.appendChild(b);
+        });
+        search.setAttribute('aria-expanded', results.childElementCount ? 'true' : 'false');
+    } catch (e) {}
+}
+
+function _testSelectUser(id, username) {
+    _testUserId = id;
+    clearTimeout(_testSearchTimer); _testSearchSeq++;   // a pending search must not re-open the dropdown
+    document.getElementById('et-test-results').replaceChildren();
+    document.getElementById('et-test-search').value = username;
+    document.getElementById('et-test-search').setAttribute('aria-expanded', 'false');
+    document.getElementById('et-test-addr').value = '';           // user + address are mutually exclusive
+    const sel = document.getElementById('et-test-selected'); sel.hidden = false; sel.replaceChildren();
+    const txt = document.createElement('span');
+    txt.textContent = 'Will send to ' + username + '’s email address. ';
+    const change = document.createElement('button'); change.type = 'button';
+    change.className = 'btn btn-secondary btn-sm'; change.textContent = 'Change';
+    change.addEventListener('click', () => {
+        _testUserId = null; clearTimeout(_testSearchTimer); sel.hidden = true; sel.replaceChildren();
+        const s = document.getElementById('et-test-search'); s.value = ''; s.focus();
+    });
+    sel.appendChild(txt); sel.appendChild(change);
+}
+
+async function sendActionTest() {
+    if (!_testActionKey) return;
+    const msg = document.getElementById('et-test-msg');
+    const addr = document.getElementById('et-test-addr').value.trim();
+    // Picked user wins; else a typed address; else the server falls back to the admin's own email.
+    const body = _testUserId ? { to_user_id: _testUserId } : (addr ? { to_addr: addr } : {});
+    const btn = document.getElementById('et-test-send');
+    try {
+        btn.disabled = true; msg.textContent = 'Sending…'; msg.style.color = 'var(--text-secondary)';
+        const r = await apiRequest('/email/actions/' + encodeURIComponent(_testActionKey) + '/test',
+            { method: 'POST', body: JSON.stringify(body) });
+        msg.textContent = '✓ ' + ((r && r.message) || 'Test sent'); msg.style.color = 'var(--success)';
     } catch (e) {
-        if (msg) { msg.textContent = '✗ ' + ((e && e.message) || 'Test failed'); msg.style.color = 'var(--error)'; }
-    }
+        msg.textContent = '✗ ' + ((e && e.message) || 'Test failed'); msg.style.color = 'var(--error)';
+    } finally { btn.disabled = false; }
 }
 
 async function openTemplateEditor(t) {
@@ -8397,6 +8652,7 @@ function closeTemplateEditor() {
     document.getElementById('email-template-editor').hidden = true;
     _editingTemplateId = null;
     closeDynMenu();   // dismiss the body-level flyout submenu so it can't orphan
+    closeLoadFromMenu();
 }
 
 function setEditorView(view) {
@@ -8539,6 +8795,7 @@ async function toggleDynamicMenu() {
     const menu = document.getElementById('et-dyn-menu');
     const btn = document.getElementById('et-add-dynamic');
     if (!menu.hidden) { closeDynMenu(); return; }
+    closeLoadFromMenu();   // don't leave the other toolbar dropdown open behind this one
     menu.replaceChildren();
     _closeDynSubmenu();
     try {
@@ -8594,6 +8851,81 @@ function _positionDynSubmenu(sub, row) {
     if (top + sh > vh - m) top = Math.max(m, rr.bottom - sh);       // no room below -> flip up
     sub.style.left = Math.round(left) + 'px';
     sub.style.top = Math.round(top) + 'px';
+}
+
+// ---- Load From (reset to a default template, or copy an existing one) ----------------------------
+function closeLoadFromMenu() {
+    const menu = document.getElementById('et-loadfrom-menu');
+    if (menu) menu.hidden = true;
+    const btn = document.getElementById('et-load-from');
+    if (btn) btn.setAttribute('aria-expanded', 'false');
+}
+
+function _loadFromRow(label, onPick) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'et-loadfrom-item'; b.setAttribute('role', 'menuitem');
+    b.textContent = label;
+    b.addEventListener('click', (e) => { e.stopPropagation(); onPick(); });
+    return b;
+}
+
+function _loadFromApply(name, subject, body) {
+    // Replacing the current editor content is destructive, so confirm first.
+    if (!confirm('Replace the current subject and body with “' + name + '”?')) return;
+    document.getElementById('et-subject').value = subject || '';
+    document.getElementById('et-body').value = body || '';
+    closeLoadFromMenu();
+    refreshTemplatePreview();
+    const msg = document.getElementById('et-editor-msg');
+    if (msg) { msg.textContent = 'Loaded “' + name + '”. Review, then Save to keep it.'; msg.style.color = 'var(--text-secondary)'; }
+}
+
+function _loadFromSection(menu, label) {
+    const h = document.createElement('div'); h.className = 'et-loadfrom-section'; h.textContent = label;
+    menu.appendChild(h);
+}
+
+async function toggleLoadFromMenu() {
+    const menu = document.getElementById('et-loadfrom-menu');
+    const btn = document.getElementById('et-load-from');
+    if (!menu.hidden) { closeLoadFromMenu(); return; }
+    closeDynMenu();   // don't leave the other toolbar dropdown open behind this one
+    menu.replaceChildren();
+    // 1) Default templates (from code — always available, even after a seeded row was edited).
+    try {
+        if (!_loadFromDefaults) {
+            const d = await apiRequest('/email/default-templates', { silent: true });
+            _loadFromDefaults = (d && d.templates) || [];
+        }
+    } catch (e) { _loadFromDefaults = _loadFromDefaults || []; }
+    _loadFromSection(menu, 'Default templates');
+    if (_loadFromDefaults.length) {
+        _loadFromDefaults.forEach(t => menu.appendChild(
+            _loadFromRow(t.name || t.key, () => _loadFromApply(t.name || t.key, t.subject, t.body_html))));
+    } else {
+        const e = document.createElement('div'); e.className = 'et-loadfrom-empty'; e.textContent = 'None available'; menu.appendChild(e);
+    }
+    // 2) Your templates (existing rows; exclude built-in defaults — already listed above — and the one
+    // being edited, since loading itself is a no-op).
+    let mine = [];
+    try {
+        const r = await apiRequest('/email/templates', { silent: true });
+        mine = ((r && r.templates) || []).filter(t => !t.is_default && t.id !== _editingTemplateId);
+    } catch (e) {}
+    const sep = document.createElement('div'); sep.className = 'et-loadfrom-sep'; menu.appendChild(sep);
+    _loadFromSection(menu, 'Your templates');
+    if (mine.length) {
+        mine.forEach(t => menu.appendChild(_loadFromRow(t.name || '(untitled)', async () => {
+            // The list omits the body; fetch the full row before applying.
+            let full = null;
+            try { full = await apiRequest('/email/templates/' + t.id, { silent: true }); } catch (e) {}
+            if (!full) { showError('Could not load that template.'); return; }
+            _loadFromApply(t.name || '(untitled)', full.subject, full.body_html);
+        })));
+    } else {
+        const e = document.createElement('div'); e.className = 'et-loadfrom-empty'; e.textContent = 'No other templates yet'; menu.appendChild(e);
+    }
+    menu.hidden = false; btn.setAttribute('aria-expanded', 'true');
 }
 
 async function openImagePicker() {
@@ -8929,6 +9261,8 @@ function attachSettingsListeners() {
         if (etAddImg) etAddImg.addEventListener('click', openImagePicker);
         const etAddDyn = document.getElementById('et-add-dynamic');
         if (etAddDyn) etAddDyn.addEventListener('click', (e) => { e.stopPropagation(); toggleDynamicMenu(); });
+        const etLoadFrom = document.getElementById('et-load-from');
+        if (etLoadFrom) etLoadFrom.addEventListener('click', (e) => { e.stopPropagation(); toggleLoadFromMenu(); });
         const etImgUpload = document.getElementById('et-image-upload');
         if (etImgUpload) etImgUpload.addEventListener('change', (e) => { if (e.target.files[0]) uploadImageResource(e.target.files[0]); });
         const etImgSize = document.getElementById('et-image-size');
@@ -8938,11 +9272,34 @@ function attachSettingsListeners() {
         });
         const etSendGo = document.getElementById('et-send-go');
         if (etSendGo) etSendGo.addEventListener('click', sendTemplateNow);
+        // Send-test modal: debounced user search + send.
+        const etTestSearch = document.getElementById('et-test-search');
+        if (etTestSearch) etTestSearch.addEventListener('input', () => {
+            _testUserId = null;                  // typing = re-searching, so drop any prior selection
+            const sel = document.getElementById('et-test-selected'); if (sel) { sel.hidden = true; sel.replaceChildren(); }
+            clearTimeout(_testSearchTimer);
+            _testSearchTimer = setTimeout(() => _testUserSearch(etTestSearch.value), 250);
+        });
+        const etTestAddr = document.getElementById('et-test-addr');
+        if (etTestAddr) etTestAddr.addEventListener('input', () => {
+            // Typing a specific address supersedes a picked user (they're mutually exclusive), so clear
+            // the selection + banner rather than silently ignoring the typed address.
+            if (etTestAddr.value.trim()) {
+                _testUserId = null;
+                const sel = document.getElementById('et-test-selected'); if (sel) { sel.hidden = true; sel.replaceChildren(); }
+            }
+        });
+        const etTestSend = document.getElementById('et-test-send');
+        if (etTestSend) etTestSend.addEventListener('click', sendActionTest);
         // Close the dynamic-action menu (and its body-level flyout submenu) on an outside click.
         document.addEventListener('click', (e) => {
             const menu = document.getElementById('et-dyn-menu');
             if (menu && !menu.hidden && !e.target.closest('.et-dyn-wrap') && !e.target.closest('#et-dyn-submenu')) {
                 closeDynMenu();
+            }
+            const lf = document.getElementById('et-loadfrom-menu');
+            if (lf && !lf.hidden && !e.target.closest('.et-loadfrom-wrap')) {
+                closeLoadFromMenu();
             }
         });
         // The flyout submenu is position:fixed, so a scroll/resize would detach it from its row —
@@ -15408,6 +15765,16 @@ document.addEventListener('DOMContentLoaded', () => {
         try { history.replaceState(null, '', location.pathname); } catch (_) {}
         document.documentElement.removeAttribute('data-auth');
         initInviteFlow(inviteToken);
+        return;
+    }
+
+    // A /?reset=<token> link is the password-reset flow: set a new password, then route to login. Like
+    // invite, it takes precedence over any cached session and strips the token from the URL first.
+    const resetToken = new URLSearchParams(location.search).get('reset');
+    if (resetToken) {
+        try { history.replaceState(null, '', location.pathname); } catch (_) {}
+        document.documentElement.removeAttribute('data-auth');
+        initResetFlow(resetToken);
         return;
     }
 
