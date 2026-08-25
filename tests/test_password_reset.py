@@ -195,14 +195,25 @@ def test_reset_revokes_existing_sessions(admin, restore_reset):
         _purge(u["id"]); admin.delete_user(u["id"])
 
 
+@_mailpit
 def test_a_new_link_invalidates_the_prior_one(admin, restore_reset, mailpit_profile):
+    # Needs a configured mail path: the public re-mint only fires when SMTP is configured (so it's
+    # gated on a real sink, present locally / absent in CI). The mint runs on a daemon thread and
+    # commits the invalidation BEFORE the (best-effort) send, so poll for the old link to go dead
+    # rather than racing the background thread.
     admin.put("/settings", json={"password_reset_enabled": True})
     u = admin.create_user()
     try:
         old, _ = mint_reset_token()
         _seed_token(u["id"], old)
         assert _anon().post("/auth/forgot-password", json={"identifier": u["_username"]}).status_code == 202  # re-mint
-        assert _anon().get(f"/reset/{old}").status_code == 404   # the seeded (old) link is now dead
+        dead = False
+        for _ in range(40):                                  # the re-mint is backgrounded; give it a moment
+            if _anon().get(f"/reset/{old}").status_code == 404:
+                dead = True
+                break
+            time.sleep(0.25)
+        assert dead, "a newly minted reset link did not invalidate the prior one"
     finally:
         _purge(u["id"]); admin.delete_user(u["id"])
 
