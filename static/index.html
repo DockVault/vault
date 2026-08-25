@@ -2234,6 +2234,27 @@
                                     <span>Require a verification code to change one’s own email</span>
                                 </label>
                                 <p class="text-secondary text-sm mt-sm" id="accounts-email-verify-help">A user changing their own email must confirm a one-time code sent to the new address; administrators setting an email are exempt. Requires email (SMTP) to be configured — set it up on the Email tab first.</p>
+                                <div class="form-group mt-md">
+                                    <label for="setting-email-change-otp-ttl-minutes">Verification code lifetime (minutes)</label>
+                                    <input type="number" id="setting-email-change-otp-ttl-minutes" class="form-control" min="1" max="60" step="1">
+                                    <p class="text-secondary text-sm mt-sm">How long the email-change verification code stays valid — from 1 to 60 minutes.</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header"><h3>Password reset</h3></div>
+                            <div class="p-lg">
+                                <label class="flex items-center gap-sm">
+                                    <input type="checkbox" id="setting-password-reset-enabled">
+                                    <span>Let people reset their own password</span>
+                                </label>
+                                <p class="text-secondary text-sm mt-sm">When on, a “Forgot password?” link appears on the sign-in screen and emails a one-time reset link. An administrator can always send a reset link from the Users page, regardless of this switch. Off by default. Requires email (SMTP) configured.</p>
+                                <div class="form-group mt-md">
+                                    <label for="setting-password-reset-ttl-minutes">Reset link lifetime (minutes)</label>
+                                    <input type="number" id="setting-password-reset-ttl-minutes" class="form-control" min="1" max="60" step="1">
+                                    <p class="text-secondary text-sm mt-sm">How long a password-reset link stays valid — from 1 to 60 minutes.</p>
+                                </div>
                             </div>
                         </div>
 

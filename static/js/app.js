@@ -7126,6 +7126,9 @@ function populateAccountsPolicy(settings) {
     setVal('setting-email-requirement', settings.email_requirement || 'required');
     setVal('setting-login-identifier', settings.login_identifier || 'username');
     setChk('setting-email-change-verification', settings.email_change_requires_verification);
+    setVal('setting-email-change-otp-ttl-minutes', settings.email_change_otp_ttl_minutes != null ? settings.email_change_otp_ttl_minutes : 5);
+    setChk('setting-password-reset-enabled', settings.password_reset_enabled);
+    setVal('setting-password-reset-ttl-minutes', settings.password_reset_ttl_minutes != null ? settings.password_reset_ttl_minutes : 5);
     accountsDomains = Array.isArray(settings.signup_email_domains) ? settings.signup_email_domains.slice() : [];
     // Profile-aware: the backend reports whether a usable sending profile (or legacy config) exists.
     accountsSmtpConfigured = settings.smtp_configured === true;
@@ -7151,6 +7154,11 @@ function collectAccountsPolicy(settings) {
     if (accountsSmtpConfigured) {
         settings.email_change_requires_verification = on('setting-email-change-verification');
     }
+    const otpTtl = parseInt(val('setting-email-change-otp-ttl-minutes'), 10);
+    if (!Number.isNaN(otpTtl)) settings.email_change_otp_ttl_minutes = otpTtl;
+    settings.password_reset_enabled = on('setting-password-reset-enabled');
+    const prTtl = parseInt(val('setting-password-reset-ttl-minutes'), 10);
+    if (!Number.isNaN(prTtl)) settings.password_reset_ttl_minutes = prTtl;
 }
 
 async function loadSettings() {
