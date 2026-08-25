@@ -2571,6 +2571,45 @@ def _smtp_configured(db: Session) -> bool:
     return email_send.smtp_configured(db)
 
 
+def _fire_action_email_bulk(db: Session, key: str, recipients, action_context=None) -> None:
+    """Best-effort trigger for an OPTIONAL automated email to one or more recipients.
+
+    Uses the request ``db`` ONLY for a fast enabled-check, so a disabled action (the default) costs a
+    single indexed lookup on the hot path and spawns nothing. When the action is on and bound, the
+    render + SMTP fan-out runs on a daemon thread in its OWN session, so mail latency never delays the
+    triggering request (a sign-in, a share, a member add …) and a mail failure can't touch its
+    transaction. ``recipients`` is an iterable of ``(email, username)``. Never raises."""
+    try:
+        from app.core.models import EmailAction
+        a = db.get(EmailAction, key)
+        # An optional action only sends when explicitly enabled AND bound to a template (the P2 rule).
+        if not (a is not None and a.enabled and a.template_id is not None):
+            return
+        pairs = [((e or "").strip(), u) for (e, u) in recipients if (e or "").strip()]
+        if not pairs:
+            return
+        ctx = dict(action_context or {})
+
+        def _run(k, pp, c):
+            try:
+                from app.core.database import get_db_context
+                from app.core.email_actions import send_action_email
+                with get_db_context() as s:
+                    for em, un in pp:
+                        send_action_email(s, k, recipient={"email": em, "username": un}, action_context=c)
+            except Exception:  # noqa: BLE001 — a courtesy notification must never surface anywhere
+                pass
+
+        threading.Thread(target=_run, args=(key, pairs, ctx), daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _fire_action_email(db: Session, key: str, *, email, username=None, action_context=None) -> None:
+    """Single-recipient convenience wrapper over :func:`_fire_action_email_bulk`."""
+    _fire_action_email_bulk(db, key, [(email, username)], action_context)
+
+
 def _email_change_requires_verification(db: Session) -> bool:
     """Effective org policy: does a self-service email change require an emailed one-time code?"""
     from app.core.models import SystemSetting
@@ -3748,6 +3787,9 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
     except Exception:
         pass
 
+    # Optionally welcome the freshly-created account by email (opt-in). Best-effort.
+    _fire_action_email(db, "account_welcome", email=user.email, username=user.username)
+
     # Deliberately NOT auto-logged-in and NO token returned: an invitation link sitting in a mail
     # client's history must not become a live session.
     return {"ok": True, "username": inv.username}
@@ -3927,6 +3969,9 @@ async def self_signup(payload: SignupRequest, request: Request, db: Session = De
             resource_type="user", resource_id=str(user.id), details={"username": uname})
     except Exception:
         pass
+
+    # Optionally welcome the freshly-created account by email (opt-in). Best-effort.
+    _fire_action_email(db, "account_welcome", email=user.email, username=user.username)
 
     # Not auto-logged-in and no token returned — success returns the visitor to the sign-in form.
     return {"ok": True, "username": uname}
@@ -4332,6 +4377,10 @@ async def login(
                 body=f"{login_request.username} signed in" + (f" from {client_ip}" if client_ip else ""),
                 target="#temp-creds",
             )
+        else:
+            # A real account sign-in optionally emails the owner a "New sign-in alert" (opt-in; the
+            # default template uses {{current_datetime}}, so no action_context is required). Best-effort.
+            _fire_action_email(db, "login_alert", email=user.email, username=user.username)
 
         from app.core.temp_scope import is_scoped as _is_scoped
         return LoginResponse(
@@ -4585,6 +4634,12 @@ async def create_temp_credentials(
             current_user, client_ip, temp_creds['passcodes'],
             same_for_all=bool(payload.passcode_same_for_all) if payload else False,
         )
+
+    # Optionally email the account owner that a temporary credential was issued for their access
+    # (opt-in). NEVER include the credential plaintext — only that one exists + when it expires.
+    _lifetime = temp_creds.get('total_lifetime_minutes')
+    _fire_action_email(db, "temp_credential_issued", email=current_user.email, username=current_user.username,
+                       action_context={"expires": f"in {_lifetime} minutes"} if _lifetime else {})
 
     return TempCredentialResponse(**temp_creds)
 
@@ -5396,7 +5451,10 @@ async def create_user(
         grant_default_permissions_for_role(str(new_user.id), new_user.role, db)
         
         audit_logger.log_user_created(new_user, current_user, client_ip)
-        
+
+        # Optionally send the new account a welcome email (opt-in). Best-effort.
+        _fire_action_email(db, "account_welcome", email=new_user.email, username=new_user.username)
+
         return UserResponse.model_validate(new_user)
     
     except ValueError as e:
@@ -7582,6 +7640,16 @@ async def create_share(
                 target="#shared",
                 dedup_prefix=f"share:{share.id}",
             )
+            # Optionally ALSO email each recipient the "File / folder shared" notice (opt-in). Resolve
+            # addresses now (one query), then fan the SMTP out on a background thread. NEVER email the
+            # link_token (the bearer secret for anyone_internal shares) — link into "Shared with me".
+            from app.core.email_actions import vault_url as _email_vault_url
+            _base = (_email_vault_url() or str(request.base_url).rstrip("/"))
+            _share_ctx = {"link": (_base.rstrip("/") + "/#shared") if _base else "",
+                          "expires": (f"until {share.expires_at.strftime('%Y-%m-%d')} UTC" if share.expires_at else "")}
+            _share_pairs = [(u.email, u.username) for u in
+                            db.query(User).filter(User.id.in_([str(x) for x in recipient_ids])).all()]
+            _fire_action_email_bulk(db, "share_created", _share_pairs, _share_ctx)
     except Exception as e:
         print(f"⚠ share notification skipped: {e}")
     out["link_token"] = link_token  # SHOW ONCE — only the hash is stored; this is never returned again
@@ -9878,6 +9946,12 @@ async def grant_vault_permission(
         from app.core.models import vault_members
         from sqlalchemy.dialects.postgresql import insert as _pg_insert
 
+        # Was this user already a member? The upsert below is idempotent (on_conflict_do_update), so a
+        # re-grant that only changes a permission level must NOT fire the "added to a vault" email.
+        _already_member = db.query(vault_members).filter(
+            vault_members.c.vault_id == vault_id,
+            vault_members.c.user_id == permission.user_id).first() is not None
+
         # Set permissions based on level. 'manage' implies full read/write/delete.
         manage_perm = permission.level == 'manage'
         read_perm = permission.level in ['read', 'write', 'delete', 'manage']
@@ -9907,7 +9981,12 @@ async def grant_vault_permission(
             },
         ))
         db.commit()
-        
+
+        # Optionally email a genuinely-new member that they were added to a vault (opt-in). Best-effort;
+        # the default template uses {{vault.name}}/{{vault.url}}, so no action_context is required.
+        if not _already_member:
+            _fire_action_email(db, "vault_member_added", email=user.email, username=user.username)
+
         return {
             "message": f"Permission '{permission.level}' granted to user {user.username}",
             "user_id": str(permission.user_id),
