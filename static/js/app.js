@@ -12864,16 +12864,6 @@ const uploadManager = {
 
     _newId() { return `up_${Date.now()}_${++this.seq}`; },
 
-    // Self-contained inline icons (the main SPA has no svgIcon sprite loaded).
-    _icon(n) {
-        const P = {
-            pause: '<rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>',
-            play: '<path d="M7 4v16l13-8Z"/>',
-            x: '<path d="M18 6 6 18M6 6l12 12"/>',
-        };
-        return `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[n] || ''}</svg>`;
-    },
-
     // Enqueue freshly-picked File objects for the current vault/folder.
     enqueueFiles(files) {
         if (!files || !files.length || !state.currentVault) return;
@@ -13460,102 +13450,161 @@ const uploadManager = {
         return Math.round(it.percent || 0);
     },
 
+    // Build a control icon as a DOM element (not a markup sink) so a per-tick patch can leave the
+    // buttons untouched.
+    _iconEl(n) {
+        const NS = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(NS, 'svg');
+        svg.setAttribute('width', '15'); svg.setAttribute('height', '15'); svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('fill', 'none'); svg.setAttribute('stroke', 'currentColor'); svg.setAttribute('stroke-width', '2');
+        svg.setAttribute('stroke-linecap', 'round'); svg.setAttribute('stroke-linejoin', 'round'); svg.setAttribute('aria-hidden', 'true');
+        const shapes = {
+            pause: [['rect', { x: 6, y: 5, width: 4, height: 14, rx: 1 }], ['rect', { x: 14, y: 5, width: 4, height: 14, rx: 1 }]],
+            play: [['path', { d: 'M7 4v16l13-8Z' }]],
+            x: [['path', { d: 'M18 6 6 18M6 6l12 12' }]],
+        };
+        (shapes[n] || []).forEach(([tag, attrs]) => {
+            const el = document.createElementNS(NS, tag);
+            for (const k in attrs) el.setAttribute(k, attrs[k]);
+            svg.appendChild(el);
+        });
+        return svg;
+    },
+    _statusLabel(status) {
+        return { queued: 'Queued', uploading: 'Uploading', pausing: 'Pausing…', paused: 'Paused',
+                 completing: 'Finalising…', done: 'Done', error: 'Failed', 'needs-file': 'Resumable' }[status] || status;
+    },
+    // Which control buttons a row should show, as a stable signature. The buttons are rebuilt ONLY
+    // when this changes (a status transition) -- never per progress tick -- so a persisting Resume
+    // button keeps its identity, hover and focus instead of flickering as it did when the whole tray
+    // was re-rendered on every received chunk.
+    _controlSig(it) {
+        const s = [];
+        if (it.status === 'uploading' || it.status === 'queued' || it.status === 'completing' || it.status === 'pausing') s.push('pause');
+        if (it.status === 'paused' || it.status === 'error') s.push('resume');
+        if (it.status === 'needs-file' && !it.isZk) s.push('resume-text');
+        if (it.status !== 'done') s.push('cancel');
+        return s.join(',');
+    },
+    _buildControls(el, it) {
+        el.replaceChildren();
+        const add = (action, iconName, title, text) => {
+            const b = document.createElement('button');
+            b.className = 'up-btn' + (text ? ' up-btn-text' : '');
+            b.setAttribute('data-up-action', action);
+            b.setAttribute('data-up-id', it.id);
+            if (title) { b.title = title; b.setAttribute('aria-label', title); }
+            if (text) b.textContent = text; else b.appendChild(this._iconEl(iconName));
+            b.addEventListener('click', () => {
+                if (action === 'pause') this.pause(it.id);
+                else if (action === 'resume') this.resume(it.id);
+                else if (action === 'cancel') this.cancel(it.id);
+            });
+            el.appendChild(b);
+        };
+        const st = it.status;
+        if (st === 'uploading' || st === 'queued' || st === 'completing' || st === 'pausing') add('pause', 'pause', 'Pause');
+        if (st === 'paused' || st === 'error') add('resume', 'play', 'Resume');
+        // Standard vaults resume by re-selecting the file; a ZK item with no local ciphertext offers
+        // only Cancel (+ the note below).
+        if (st === 'needs-file' && !it.isZk) add('resume', null, null, 'Resume…');
+        if (st !== 'done') add('cancel', 'x', 'Cancel');
+    },
+    _renderSub(sub, it) {
+        const pct = this._percent(it);
+        const size = formatBytes ? formatBytes(it.totalSize) : `${it.totalSize} B`;
+        if (it.status === 'error') { sub.className = 'up-error'; sub.replaceChildren(document.createTextNode(it.error || 'Upload failed')); return; }
+        sub.className = 'up-sub';
+        if (it.status === 'needs-file') {
+            sub.replaceChildren(document.createTextNode(it.isZk
+                ? 'Encrypted data isn\'t on this device — cancel and upload again'
+                : 'Paused — click Resume and re-select the file'));
+            return;
+        }
+        const parts = [document.createTextNode(`${this._statusLabel(it.status)} · ${pct}% · ${size}`)];
+        // A resumed upload that found some chunks no longer match says so.
+        if (it.changedLocally) {
+            parts.push(document.createTextNode(' · '));
+            const w = document.createElement('span'); w.className = 'up-warn';
+            w.textContent = `file changed, re-sending ${it.changedLocally} part${it.changedLocally === 1 ? '' : 's'}`;
+            parts.push(w);
+        }
+        // A ZK upload whose ciphertext couldn't be persisted won't survive a reload.
+        const noResume = it.isZk && it.resumePersisted === false && it.resumeWarning
+            && it.status !== 'done' && it.status !== 'error' && it.status !== 'needs-file';
+        if (noResume) {
+            parts.push(document.createTextNode(' · '));
+            const w = document.createElement('span'); w.className = 'up-warn'; w.textContent = 'not resumable';
+            parts.push(w);
+        }
+        sub.replaceChildren(...parts);
+    },
+    _buildRow(it) {
+        const row = document.createElement('div');
+        row.className = 'up-row'; row.setAttribute('data-up-row', it.id);
+        const main = document.createElement('div'); main.className = 'up-main';
+        const name = document.createElement('div'); name.className = 'up-name'; name.textContent = it.fileName; name.title = it.fileName;
+        const sub = document.createElement('div'); sub.className = 'up-sub';
+        const bar = document.createElement('div'); bar.className = 'up-bar';
+        const fill = document.createElement('div'); fill.className = 'up-bar-fill'; bar.appendChild(fill);
+        main.append(name, sub, bar);
+        const controls = document.createElement('div'); controls.className = 'up-controls';
+        row.append(main, controls);
+        row._sub = sub; row._fill = fill; row._controls = controls; row._sig = null;
+        return row;
+    },
+    _patchRow(row, it) {
+        const pct = this._percent(it);
+        row._fill.style.width = pct + '%';
+        row._fill.className = 'up-bar-fill' + (it.status === 'error' ? ' error' : it.status === 'done' ? ' done' : '');
+        this._renderSub(row._sub, it);
+        const sig = this._controlSig(it);
+        if (sig !== row._sig) { row._sig = sig; this._buildControls(row._controls, it); }
+    },
+    _clearFinished() {
+        for (const [id, it] of this.items) {
+            const finished = it.status === 'done' || it.status === 'needs-file' || it.status === 'error';
+            // Keep a row whose server session is still open, even when it looks finished.
+            const stillOnServer = it.status !== 'done' && it.sessionId;
+            if (finished && !stillOnServer) this.items.delete(id);
+        }
+        this.render();
+    },
+    // Keyed in-place reconcile: the tray header + body are built once, and each render only patches
+    // the bar width / sub text (and rebuilds a row's controls on a status change). Nothing that is
+    // unchanged is recreated, so a per-chunk render can no longer flicker the Resume button.
     render() {
         let tray = document.getElementById('upload-tray');
-        if (!tray) {
-            tray = document.createElement('div');
-            tray.id = 'upload-tray';
-            document.body.appendChild(tray);
-        }
+        if (!tray) { tray = document.createElement('div'); tray.id = 'upload-tray'; document.body.appendChild(tray); }
         const items = [...this.items.values()];
-        if (!items.length) { tray.classList.remove('show'); tray.innerHTML = ''; return; }
+        if (!items.length) { tray.classList.remove('show'); tray.replaceChildren(); tray._body = null; return; }
         tray.classList.add('show');
-
-        const rows = items.map(it => {
-            const pct = this._percent(it);
-            const size = formatBytes ? formatBytes(it.totalSize) : `${it.totalSize} B`;
-            const statusLabel = {
-                queued: 'Queued', uploading: 'Uploading', pausing: 'Pausing…',
-                paused: 'Paused', completing: 'Finalising…', done: 'Done',
-                error: 'Failed', 'needs-file': 'Resumable',
-            }[it.status] || it.status;
-
-            let controls = '';
-            if (it.status === 'uploading' || it.status === 'queued' || it.status === 'completing' || it.status === 'pausing') {
-                controls += `<button class="up-btn" data-up-action="pause" data-up-id="${it.id}" title="Pause">${this._icon('pause')}</button>`;
-            }
-            if (it.status === 'paused' || it.status === 'error') {
-                controls += `<button class="up-btn" data-up-action="resume" data-up-id="${it.id}" title="Resume">${this._icon('play')}</button>`;
-            }
-            if (it.status === 'needs-file' && !it.isZk) {
-                // Standard vaults resume by re-selecting the file; a ZK item with no local
-                // ciphertext can't be replayed here, so it offers only Cancel (+ the note below).
-                controls += `<button class="up-btn up-btn-text" data-up-action="resume" data-up-id="${it.id}">Resume…</button>`;
-            }
-            if (it.status !== 'done') {
-                controls += `<button class="up-btn" data-up-action="cancel" data-up-id="${it.id}" title="Cancel">${this._icon('x')}</button>`;
-            }
-
-            const barClass = it.status === 'error' ? 'up-bar-fill error'
-                : it.status === 'done' ? 'up-bar-fill done' : 'up-bar-fill';
-            // For a ZK upload whose ciphertext couldn't be persisted (storage full / write
-            // failure), flag that it won't survive a reload while it's still in flight.
-            const noResume = it.isZk && it.resumePersisted === false && it.resumeWarning
-                && it.status !== 'done' && it.status !== 'error' && it.status !== 'needs-file';
-            // A resumed upload that found some of its chunks no longer match says so. It is
-            // the only signal that the file changed since the interruption, and without it
-            // the re-upload looks like an ordinary slow resume.
-            const changed = it.changedLocally
-                ? ` · <span class="up-warn">file changed, re-sending ${it.changedLocally} part${it.changedLocally === 1 ? '' : 's'}</span>`
-                : '';
-            const sub = it.status === 'error' ? `<div class="up-error">${escapeHtml(it.error || 'Upload failed')}</div>`
-                : it.status === 'needs-file' ? `<div class="up-sub">${it.isZk ? 'Encrypted data isn\'t on this device — cancel and upload again' : 'Paused — click Resume and re-select the file'}</div>`
-                : `<div class="up-sub">${statusLabel} · ${pct}% · ${size}${changed}${noResume ? ' · <span class="up-warn">not resumable</span>' : ''}</div>`;
-
-            return `
-              <div class="up-row" data-up-row="${it.id}">
-                <div class="up-main">
-                  <div class="up-name" title="${escapeHtml(it.fileName)}">${escapeHtml(it.fileName)}</div>
-                  ${sub}
-                  <div class="up-bar"><div class="${barClass}" style="width:${pct}%"></div></div>
-                </div>
-                <div class="up-controls">${controls}</div>
-              </div>`;
-        }).join('');
-
-        // A failed item (e.g. a rejected 0-byte upload) is finished, not active — exclude 'error'
-        // so it doesn't stick in the tray header as "N active" forever.
-        const active = items.filter(i => i.status !== 'done' && i.status !== 'needs-file'
-            && i.status !== 'error').length;
-        tray.innerHTML = `
-          <div class="up-tray-head">
-            <span>Uploads${active ? ` · ${active} active` : ''}</span>
-            <button class="up-btn" id="up-tray-clear" title="Clear finished">${this._icon('x')}</button>
-          </div>
-          <div class="up-tray-body">${rows}</div>`;
-
-        tray.querySelectorAll('button[data-up-action]').forEach(b => {
-            b.addEventListener('click', () => {
-                const a = b.getAttribute('data-up-action');
-                const id = b.getAttribute('data-up-id');
-                if (a === 'pause') this.pause(id);
-                else if (a === 'resume') this.resume(id);
-                else if (a === 'cancel') this.cancel(id);
-            });
-        });
-        const clear = tray.querySelector('#up-tray-clear');
-        if (clear) clear.addEventListener('click', () => {
-            for (const [id, it] of this.items) {
-                const finished = it.status === 'done' || it.status === 'needs-file'
-                    || it.status === 'error';
-                // Keep a row whose server session is still open, even when it looks finished.
-                // Dropping it hid an upload that still existed, and the next attempt at the same
-                // file was refused by a session the user could no longer see or act on.
-                const stillOnServer = it.status !== 'done' && it.sessionId;
-                if (finished && !stillOnServer) this.items.delete(id);
-            }
-            this.render();
-        });
+        if (!tray._body) {
+            tray.replaceChildren();
+            const head = document.createElement('div'); head.className = 'up-tray-head';
+            const label = document.createElement('span');
+            const clear = document.createElement('button'); clear.className = 'up-btn'; clear.id = 'up-tray-clear';
+            clear.title = 'Clear finished'; clear.setAttribute('aria-label', 'Clear finished');
+            clear.appendChild(this._iconEl('x'));
+            clear.addEventListener('click', () => this._clearFinished());
+            head.append(label, clear);
+            const body = document.createElement('div'); body.className = 'up-tray-body';
+            tray.append(head, body);
+            tray._label = label; tray._body = body;
+        }
+        // A failed item is finished, not active -- exclude 'error' from the header count.
+        const active = items.filter(i => i.status !== 'done' && i.status !== 'needs-file' && i.status !== 'error').length;
+        tray._label.textContent = active ? `Uploads · ${active} active` : 'Uploads';
+        const body = tray._body;
+        const esc = (window.CSS && CSS.escape) ? (s) => CSS.escape(s) : (s) => s;
+        const seen = new Set();
+        for (const it of items) {
+            seen.add(String(it.id));
+            let row = body.querySelector(`.up-row[data-up-row="${esc(String(it.id))}"]`);
+            if (!row) { row = this._buildRow(it); body.appendChild(row); }
+            this._patchRow(row, it);
+        }
+        body.querySelectorAll('.up-row').forEach(row => { if (!seen.has(row.getAttribute('data-up-row'))) row.remove(); });
     },
 };
 
@@ -13628,8 +13677,30 @@ async function uploadFiles(files) {
 
     const existing = new Set((state.currentFiles || []).filter(i => i.type !== 'folder').map(i => i.name));
     const idByName = new Map((state.currentFiles || []).filter(i => i.type !== 'folder').map(i => [i.name, i.id]));
+    // A name that is CURRENTLY UPLOADING into THIS folder is taken too. Without this, a second pick
+    // of the same file races the first and both land (the reported "uploaded twice"), and a single
+    // re-pick while the first is still in flight wouldn't prompt because the name isn't in the file
+    // list yet — the bug where a single-file re-upload silently added a duplicate while a multi-file
+    // batch (which also dedupes within itself) appeared to "always prompt". The in-flight item
+    // carries the plaintext name the user chose, so this also covers zero-knowledge vaults, where
+    // the server never sees the name. An in-flight name has no committed id to delete: choosing
+    // "replace" for one cancels that in-flight upload and uploads the new file in its place (see
+    // toCancelInFlight below), rather than pushing a second copy that would race the first.
+    //
+    // Only NOT-YET-COMMITTED statuses count. A finished ('done') upload has already refreshed the
+    // file list (loadVaultFiles runs on completion), so its name is in state.currentFiles if it is
+    // still there — and NOT here, so a re-upload after that file was deleted is correctly free.
+    const _curFolder = state.currentFolderId || null;
+    const _pendingUpload = (it) => it.status !== 'error' && it.status !== 'done' && !it.cancelled;
+    for (const it of uploadManager.items.values()) {
+        if (it.vaultId !== state.currentVault.id) continue;
+        if ((it.folderId || null) !== _curFolder) continue;
+        if (!_pendingUpload(it)) continue;
+        if (it.fileName) existing.add(it.fileName);
+    }
     let toUpload = [];   // {file, name}
     const toDelete = [];   // existing file ids to remove (overwrite)
+    const toCancelInFlight = new Set();   // in-flight upload names to cancel before re-uploading
     let blanket = null;    // {action} once "apply to all" is chosen
 
     for (const file of arr) {
@@ -13649,7 +13720,14 @@ async function uploadFiles(files) {
             const id = idByName.get(file.name);
             // The name travels with the id: if the delete fails, the replacement that would have
             // taken this name has to be dropped, and it is identified by name rather than id.
-            if (id) toDelete.push({ id, name: file.name });
+            if (id) {
+                toDelete.push({ id, name: file.name });
+            } else {
+                // No committed row -- the name is held by an upload still IN FLIGHT. "Replace"
+                // means replace THAT upload: cancel it (below) before enqueuing this one, so a
+                // second copy of the same name can't race it and both land.
+                toCancelInFlight.add(file.name);
+            }
             toUpload.push({ file, name: file.name });
         } else {
             let name = (choice.action === 'rename' && choice.name) ? choice.name : autoName;
@@ -13657,6 +13735,21 @@ async function uploadFiles(files) {
             toUpload.push({ file, name });
             existing.add(name);
         }
+    }
+
+    // Cancel any in-flight uploads the user chose to REPLACE, before enqueuing their replacements,
+    // so the old and new copies of a name can't both finish. Re-scanned here (the modal ran async,
+    // so the live set may have changed) and matched by vault + folder + name; cancel() deletes the
+    // server session, so the replacement uploads cleanly.
+    if (toCancelInFlight.size) {
+        const victims = [];
+        for (const it of uploadManager.items.values()) {
+            if (it.vaultId !== state.currentVault.id) continue;
+            if ((it.folderId || null) !== _curFolder) continue;
+            if (!_pendingUpload(it)) continue;
+            if (toCancelInFlight.has(it.fileName)) victims.push(it.id);
+        }
+        for (const vid of victims) { try { await uploadManager.cancel(vid); } catch (_) { /* best effort */ } }
     }
 
     if (toUpload.length) {
