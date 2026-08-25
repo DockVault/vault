@@ -2618,6 +2618,14 @@ def _email_change_requires_verification(db: Session) -> bool:
     return bool(effective_account_policy(row.value if row else None)["email_change_requires_verification"])
 
 
+def _email_change_otp_ttl_minutes(db: Session) -> int:
+    """Configured lifetime (minutes) of the email-change verification code; effective policy default 5."""
+    from app.core.models import SystemSetting
+    from app.core.account_policy import effective_account_policy
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    return int(effective_account_policy(row.value if row else None)["email_change_otp_ttl_minutes"])
+
+
 def _login_identifier(db: Session) -> str:
     """Effective org policy: which identifier the login form accepts — 'username', 'email', or
     'either'. Always resolved through effective_account_policy so a settings hiccup or a hand-edited
@@ -5615,9 +5623,8 @@ async def request_email_change(
     one-time code to the NEW address. The account email is not touched until the code is confirmed.
     Enumeration-safe: an address already in use (or unchanged) gets the same 202 and no usable code."""
     from app.core.security import verify_password
-    from app.core.email_change import generate_code, hash_code, CODE_TTL_MINUTES
+    from app.core import otp_service
     from app.core.rate_limiter import rate_limiter as _rl
-    from app.core.models import EmailChangeCode
 
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot change account settings.")
@@ -5644,17 +5651,12 @@ async def request_email_change(
     # Mint + send only for a genuinely new, unused address; otherwise return the same 202 with no
     # usable code, so this endpoint can't be used to probe which addresses are registered.
     if new_email and new_email != user.email and not email_in_use(db, new_email, exclude_user_id=user.id):
-        # One pending change at a time: drop any prior unconsumed codes for this user.
-        db.query(EmailChangeCode).filter(
-            EmailChangeCode.user_id == user.id,
-            EmailChangeCode.consumed_at.is_(None),
-        ).delete()
-        code = generate_code()
-        db.add(EmailChangeCode(
-            user_id=user.id, new_email=new_email,
-            code_hash=hash_code(code, settings.jwt_secret_key),
-            expires_at=datetime.utcnow() + timedelta(minutes=CODE_TTL_MINUTES)))
-        db.commit()
+        # Mint a one-time code bound to (email_change, this user, the new address). Redis-primary with a
+        # durable DB fallback; issuing invalidates any prior code (one pending change at a time). TTL is
+        # org-configurable (default 5 minutes).
+        ttl = _email_change_otp_ttl_minutes(db)
+        code = otp_service.issue(db, purpose="email_change", user_id=user.id, destination=new_email,
+                                 ttl_minutes=ttl, pepper=settings.jwt_secret_key)
         # Route through the central action helper so this uses the admin-customizable "email_change"
         # template (its {{action.code}} / {{action.expires}} tokens). raise_errors preserves the prior
         # behavior: a clean 400/502 on a config/transport failure rather than a silent miss.
@@ -5664,7 +5666,7 @@ async def request_email_change(
             send_action_email(
                 db, "email_change",
                 recipient={"email": new_email, "username": user.username},
-                action_context={"code": code, "expires": f"in {CODE_TTL_MINUTES} minutes"},
+                action_context={"code": code, "expires": f"in {ttl} minutes"},
                 raise_errors=True)
         except _es.EmailSendError as e:
             code_status = (status.HTTP_400_BAD_REQUEST if e.category == "config"
@@ -5688,16 +5690,16 @@ async def confirm_email_change(
 ):
     """Complete a verified email change by presenting the code sent to the new address. On success
     the account's email becomes the new address and the code is consumed (single-use)."""
-    from app.core.email_change import code_matches
+    from app.core import otp_service
     from app.core.rate_limiter import rate_limiter as _rl
-    from app.core.models import EmailChangeCode
 
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot change account settings.")
     user = db.query(User).filter(User.id == current_user.id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
-    # Cap confirm attempts — a brute-force guard on the code space.
+    # Cap confirm attempts — an OUTER brute-force guard on the code space (the OTP service also
+    # invalidates the code after 3 wrong tries).
     allowed, _, reset = _rl.check_rate_limit(identifier=str(user.id), limit=10, window=300,
                                              prefix="email_change_confirm")
     if not allowed:
@@ -5705,26 +5707,22 @@ async def confirm_email_change(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="Too many attempts; please wait a few minutes.",
                             headers={"Retry-After": str(max(1, reset - int(_t.time())))})
-    now = datetime.utcnow()
-    rec = db.query(EmailChangeCode).filter(
-        EmailChangeCode.user_id == user.id,
-        EmailChangeCode.consumed_at.is_(None),
-        EmailChangeCode.expires_at > now,
-    ).order_by(EmailChangeCode.created_at.desc()).first()
-    if rec is None or not code_matches(body.code, settings.jwt_secret_key, rec.code_hash):
+    result = otp_service.verify(db, purpose="email_change", user_id=user.id, code=body.code,
+                                pepper=settings.jwt_secret_key)
+    if not result.ok or not result.destination:
         raise HTTPException(status_code=400, detail="That code is invalid or has expired.")
+    new_email = result.destination
     # Re-check uniqueness at apply time — the address may have been taken since the request.
-    if email_in_use(db, rec.new_email, exclude_user_id=user.id):
+    if email_in_use(db, new_email, exclude_user_id=user.id):
         raise HTTPException(status_code=400, detail="That email address is now in use.")
     old_email = user.email
-    user.email = rec.new_email
-    rec.consumed_at = now
+    user.email = new_email
     db.commit()
     db.refresh(user)
     try:
         AuditLogger(db).log_action(action="email_change_confirmed", status="success", user=user,
                                    ip_address=get_client_ip(request),
-                                   details={"old": old_email, "new": rec.new_email})
+                                   details={"old": old_email, "new": new_email})
     except Exception:  # noqa: BLE001
         pass
     return UserResponse.model_validate(user)

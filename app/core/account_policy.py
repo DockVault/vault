@@ -20,6 +20,8 @@ DOMAIN_MODE_VALUES = ("off", "allowlist", "denylist")
 
 MIN_INVITE_TTL_HOURS = 1
 MAX_INVITE_TTL_HOURS = 720          # 30 days
+MIN_OTP_TTL_MINUTES = 1
+MAX_OTP_TTL_MINUTES = 60            # a verification code is meant to be short-lived
 MAX_SIGNUP_DOMAINS = 100
 MAX_DOMAIN_LENGTH = 253             # RFC 1035 total length ceiling
 # Hard ceiling on the RAW list length, checked before the per-entry loop so a pathologically large
@@ -40,6 +42,9 @@ DEFAULTS = {
     # to it. That needs SMTP, so this can only be turned on once email sending is configured (the
     # PUT /settings handler supplies that fact). Off by default. Admin-set emails are exempt.
     "email_change_requires_verification": False,
+    # How long the email-change verification code stays valid, in minutes (bounded 1..60). Short by
+    # default so a code read from an inbox can't be replayed hours later.
+    "email_change_otp_ttl_minutes": 5,
 }
 ACCOUNT_POLICY_KEYS = tuple(DEFAULTS.keys())
 
@@ -219,6 +224,12 @@ def validate_account_policy(payload: dict, *, email_login_locks_out_all_admins: 
         if isinstance(v, bool) or not isinstance(v, int) or not (MIN_INVITE_TTL_HOURS <= v <= MAX_INVITE_TTL_HOURS):
             raise AccountPolicyError(
                 f"invite_ttl_hours must be an integer from {MIN_INVITE_TTL_HOURS} to {MAX_INVITE_TTL_HOURS}")
+
+    if "email_change_otp_ttl_minutes" in payload:
+        v = payload["email_change_otp_ttl_minutes"]
+        if isinstance(v, bool) or not isinstance(v, int) or not (MIN_OTP_TTL_MINUTES <= v <= MAX_OTP_TTL_MINUTES):
+            raise AccountPolicyError(
+                f"email_change_otp_ttl_minutes must be an integer from {MIN_OTP_TTL_MINUTES} to {MAX_OTP_TTL_MINUTES}")
 
     if "signup_email_domain_mode" in payload:
         v = payload["signup_email_domain_mode"]
