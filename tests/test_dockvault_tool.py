@@ -1743,6 +1743,59 @@ def test_status_no_warning_when_locked_and_no_container(tmp_path, monkeypatch, c
     assert "STILL in Docker" not in capsys.readouterr().out
 
 
+# --- admin password retirement after confirmed bootstrap ----------------------------------
+def test_bootstrap_marker_present_parses_query():
+    def ok(cmd, **k):
+        if "hostname" in cmd:
+            return type("R", (), {"returncode": 0, "stdout": "172.30.0.2\n", "stderr": ""})()
+        return type("R", (), {"returncode": 0, "stdout": "1\n", "stderr": ""})()
+    assert dv.bootstrap_marker_present("vault-db", "u", "d", "pw", run=ok) is True
+
+    def empty(cmd, **k):
+        if "hostname" in cmd:
+            return type("R", (), {"returncode": 0, "stdout": "172.30.0.2\n", "stderr": ""})()
+        return type("R", (), {"returncode": 0, "stdout": "\n", "stderr": ""})()
+    assert dv.bootstrap_marker_present("vault-db", "u", "d", "pw", run=empty) is False
+
+    def boom(cmd, **k):
+        raise OSError("docker down")
+    assert dv.bootstrap_marker_present("vault-db", "u", "d", "pw", run=boom) is False   # fail-safe
+
+
+def test_admin_password_retired_only_when_marker_present(tmp_path, monkeypatch):
+    import secrets as _secrets
+    adminpw, dbpw = _secrets.token_hex(8), _secrets.token_hex(8)
+    (tmp_path / ".env").write_text("ADMIN_PASSWORD=%s\nVAULT_DB_PASSWORD=%s\n" % (adminpw, dbpw),
+                                   encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    # Marker ABSENT -> keep the password (fail-safe: never wipe before bootstrap is confirmed).
+    monkeypatch.setattr(dv, "bootstrap_marker_present", lambda *a, **k: False)
+    tool._retire_admin_password_if_bootstrapped()
+    assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["ADMIN_PASSWORD"] == adminpw
+    # Marker PRESENT -> blank ADMIN_PASSWORD, preserve the rest of .env.
+    monkeypatch.setattr(dv, "bootstrap_marker_present", lambda *a, **k: True)
+    tool._retire_admin_password_if_bootstrapped()
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert env.get("ADMIN_PASSWORD", "") == "" and env["VAULT_DB_PASSWORD"] == dbpw
+
+
+def test_admin_password_retire_early_guards_skip_db_query(tmp_path, monkeypatch):
+    import secrets as _secrets
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    queried = []
+    monkeypatch.setattr(dv, "bootstrap_marker_present", lambda *a, **k: queried.append(True) or True)
+    # Already blank -> return before ever querying the DB.
+    (tmp_path / ".env").write_text("ADMIN_PASSWORD=\n", encoding="utf-8")
+    tool._retire_admin_password_if_bootstrapped()
+    assert queried == [], "an already-blank ADMIN_PASSWORD must not query the DB"
+    # Set but no VAULT_DB_PASSWORD to query with -> keep it, don't blank blindly.
+    pw = _secrets.token_hex(6)
+    (tmp_path / ".env").write_text("ADMIN_PASSWORD=%s\n" % pw, encoding="utf-8")
+    tool._retire_admin_password_if_bootstrapped()
+    assert queried == []
+    assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["ADMIN_PASSWORD"] == pw
+
+
 # --- update + logs helpers ----------------------------------------------------------------
 def test_update_version_helpers():
     assert dv.parse_semver("v0.6.0") == (0, 6, 0) and dv.parse_semver("1.2.3-rc1") == (1, 2, 3)

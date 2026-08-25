@@ -1849,6 +1849,32 @@ def probe_pg_password(container, user, db, password, run=subprocess.run):
     return classify_pg_probe(getattr(r, "returncode", 1), getattr(r, "stderr", ""))
 
 
+def bootstrap_marker_present(container, user, db, password, run=subprocess.run):
+    """True iff the app has recorded that admin bootstrap completed (the `admin_bootstrap` row in
+    system_settings). Queried over the container's own IP with PGPASSWORD, exactly like
+    probe_pg_password. Returns False on ANY docker/exec/query error - fail-safe, so an inability to
+    confirm bootstrap never causes the admin password to be blanked prematurely."""
+    try:
+        ipr = run(["docker", "exec", container, "hostname", "-i"],
+                  capture_output=True, text=True, timeout=20)
+        if getattr(ipr, "returncode", 1) != 0:
+            return False
+        parts = (getattr(ipr, "stdout", "") or "").split()
+        if not parts:
+            return False
+        ip = parts[0]
+        r = run(["docker", "exec", "-e", "PGPASSWORD", container,
+                 "psql", "-h", ip, "-U", user, "-d", db, "-tAc",
+                 "SELECT 1 FROM system_settings WHERE key='admin_bootstrap' LIMIT 1"],
+                capture_output=True, text=True, timeout=30,
+                env=dict(os.environ, PGPASSWORD=password))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    if getattr(r, "returncode", 1) != 0:
+        return False
+    return (getattr(r, "stdout", "") or "").strip() == "1"
+
+
 def db_guard_decision(volume_exists_flag, probe_result):
     """The pure guardrail decision: 'proceed' | 'refuse'. A fresh (non-existent) volume always
     proceeds (the .env password is baked in on first init). An existing volume proceeds ONLY on a
@@ -2541,6 +2567,8 @@ class DockVault:
                        else "see the docker output above"))
         tracker.advance(); tracker.show()               # -> Health check
         healthy = self._wait_secure_healthy(profiles)
+        if healthy:
+            self._retire_admin_password_if_bootstrapped()
         logs_shown = False if healthy else self._tail_logs(self._web_service(profiles))
         self._print_setup_summary(summary, healthy, logs_shown)
         # NOTE: the coupling stamp is written ONLY where a pairing has been PROVEN - after a
@@ -3197,6 +3225,25 @@ class DockVault:
                 return False
             time.sleep(3)
         return False
+
+    def _retire_admin_password_if_bootstrapped(self):
+        """After a healthy start, if the app CONFIRMS admin bootstrap completed (the `admin_bootstrap`
+        marker in the DB), blank the now-dead ADMIN_PASSWORD in .env so it stops persisting. The app
+        seeds the admin exactly once, so after that the password is never used again. Gated on the
+        marker (fail-safe): if bootstrap can't be confirmed - a failed seed, or the DB not reachable -
+        the password is LEFT in place so the next boot can still bootstrap. Manage the admin password
+        from the app afterwards, not from .env."""
+        env = self._load_env()
+        if not (env.get("ADMIN_PASSWORD") or "").strip():
+            return                                          # already blank / not set
+        db_password = env.get("VAULT_DB_PASSWORD") or ""
+        if not db_password:
+            return                                          # can't query the DB without its password
+        if not bootstrap_marker_present(DB_CONTAINER, PG_USER, PG_DB, db_password):
+            return                                          # bootstrap not confirmed -> keep the password
+        self._set_env_key(self._env_path(), "ADMIN_PASSWORD", "")
+        print(self.pal.paint("  ADMIN_PASSWORD retired from .env (the admin is bootstrapped; change the "
+                             "password in the app). Manage users in the app, not .env.", "cyan"))
 
     def _print_setup_summary(self, summary, healthy, logs_shown=False):
         pal = self.pal
