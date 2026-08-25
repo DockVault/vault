@@ -654,13 +654,10 @@ Collected from the per-finding notes. The Tier-A PRs (1–5) need none of these.
 10. **DV-RESTORE** — auto-restart after restore or leave stopped? Atomic swap? Confirm style.
 11. **DV-STORAGE** — `%LOCALAPPDATA%` + subdir name; flag-vs-env precedence.
 
-## 7. Out of scope (tracked separately)
+## 7. Out of scope
 
-The review also flagged, outside this repository, that a **separate deployment component (the
-provisioning control plane)** writes vault master-key values into container logs during provisioning.
-That is not part of `DockVault/vault` and is being tracked in the control-plane repository, not here.
-It is the same *class* of exposure as C1 and should be remediated there (redact secret values from
-provisioning logs + a regression test).
+The review also noted one item outside this repository entirely — in a separate deployment component
+that is not part of `DockVault/vault`. It is tracked separately and is not addressed by this plan.
 
 ---
 
