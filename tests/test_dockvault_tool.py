@@ -1682,6 +1682,67 @@ def test_list_backups_shows_candidates_without_creating(tmp_path, monkeypatch, c
     assert not appdir.exists(), "listing must NOT create the backup directory (it is read-only)"
 
 
+# --- stop / down / lock secret-hygiene ----------------------------------------------------
+def _dc_recorder(calls):
+    return lambda *a, **k: (calls.append(a), type("R", (), {"returncode": 0})())[1]
+
+
+def test_stop_removes_containers_and_never_passes_v(tmp_path, monkeypatch):
+    # `stop` must run `compose down` (removing the containers clears their secrets from Docker's
+    # on-disk config) and MUST NEVER pass -v (data volumes must survive).
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    calls = []
+    monkeypatch.setattr(tool, "_run_dc", _dc_recorder(calls))
+    tool.stop(argparse.Namespace(lock=False))
+    assert calls and calls[0][0] == "down", "stop must run `compose down`"
+    assert "-v" not in calls[0], "stop must NEVER pass -v"
+
+
+def test_down_keeps_containers_via_compose_stop(tmp_path, monkeypatch):
+    # `down` keeps the (stopped) containers -> `compose stop`, not `down`.
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    calls = []
+    monkeypatch.setattr(tool, "_run_dc", _dc_recorder(calls))
+    tool.down(argparse.Namespace(lock=False))
+    assert calls and calls[0][0] == "stop" and "down" not in calls[0], "down must keep containers (compose stop)"
+
+
+def test_stop_and_down_lock_seal_env(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    monkeypatch.setattr(tool, "_run_dc", _dc_recorder([]))
+    locked = []
+    monkeypatch.setattr(tool, "lock", lambda args=None: locked.append(True))
+    tool.stop(argparse.Namespace(lock=True))
+    tool.down(argparse.Namespace(lock=True))
+    assert locked == [True, True], "both stop --lock and down --lock must seal .env"
+
+
+def test_status_warns_when_locked_but_container_exists(tmp_path, monkeypatch, capsys):
+    # LOCKED (.env absent) but a container still exists -> warn the secrets remain in Docker's config.
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_is_locked", lambda: True)
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    monkeypatch.setattr(dv, "container_exists", lambda name, **k: True)
+    tool._print_status("combined")            # tmp_path has no .env -> the locked branch
+    out = capsys.readouterr().out
+    assert "STILL in Docker" in out, "status must warn that a lingering container still holds the secrets"
+
+
+def test_status_no_warning_when_locked_and_no_container(tmp_path, monkeypatch, capsys):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_is_locked", lambda: True)
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    monkeypatch.setattr(dv, "container_exists", lambda name, **k: False)
+    tool._print_status("combined")
+    assert "STILL in Docker" not in capsys.readouterr().out
+
+
 # --- update + logs helpers ----------------------------------------------------------------
 def test_update_version_helpers():
     assert dv.parse_semver("v0.6.0") == (0, 6, 0) and dv.parse_semver("1.2.3-rc1") == (1, 2, 3)

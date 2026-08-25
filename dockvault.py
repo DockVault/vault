@@ -38,7 +38,8 @@ APP_ROOT = os.environ.get("DOCKVAULT_ROOT") or os.path.dirname(os.path.abspath(_
 MENU = [
     ("setup",   "Setup - configure + start the vault"),
     ("start",   "Start - bring the deployment up (health-checked)"),
-    ("stop",    "Stop - stop the deployment (data volumes kept)"),
+    ("stop",    "Stop - stop + REMOVE containers (clears secrets from Docker; data volumes kept)"),
+    ("down",    "Down - stop but KEEP containers (faster restart; secrets remain until 'stop')"),
     ("restart", "Restart - stop then start (health-checked)"),
     ("status",  "Status - containers, health, ports, lock state"),
     ("lock",    "Lock - seal .env into an encrypted .env.enc"),
@@ -1757,6 +1758,18 @@ def container_running(name, run=subprocess.run):
     return (getattr(r, "stdout", "") or "").strip() == "true"
 
 
+def container_exists(name, run=subprocess.run):
+    """True if a container named `name` exists at all - RUNNING OR STOPPED. A stopped container still
+    holds its environment in Docker's on-disk config, so this (not container_running) is what tells an
+    operator whether the deployment's secrets still sit in Docker while .env is sealed. Best-effort:
+    any docker error answers False."""
+    try:
+        r = run(["docker", "container", "inspect", name], capture_output=True, text=True, timeout=20)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return getattr(r, "returncode", 1) == 0
+
+
 def container_mounts(name, run=subprocess.run):
     """The named volumes a container has mounted, or None if docker could not be asked. Bind
     mounts have no .Name and come back blank, so they are dropped."""
@@ -2285,7 +2298,12 @@ class DockVault:
         self._print_status(profiles)
 
     def stop(self, args=None):
-        """Stop the deployment's containers. Data volumes are untouched (never `down -v`)."""
+        """Stop the deployment and REMOVE its containers (`compose down`, never `-v` - data volumes are
+        kept). Removing the containers also removes Docker's on-disk copy of their environment, so the
+        deployment's secrets stop sitting in /var/lib/docker/containers/<id>/config.v2.json while it is
+        down. To keep the (stopped) containers for a faster restart instead, use `down`. --lock also
+        seals .env into .env.enc afterwards (which by itself does NOT clear the container copy - that is
+        why stop removes the containers)."""
         pal = self.pal
         ok, _ = docker_available()
         if not ok:
@@ -2295,13 +2313,42 @@ class DockVault:
             # compose needs .env for the ${VAR:?} interpolation even to address the stack.
             print(pal.paint("  .env is not present (locked?); nothing to stop by this tool.", "yellow"))
         else:
-            print(pal.paint("  Stopping the deployment (data volumes are kept) ...", "cyan"))
+            print(pal.paint("  Stopping the deployment and removing its containers (data volumes are "
+                            "kept) ...", "cyan"))
+            try:
+                self._run_dc("down", "--remove-orphans", capture=False, timeout=120)
+            except (OSError, subprocess.SubprocessError) as exc:
+                print(pal.paint("  Stop failed: %s" % exc, "red"))
+                raise SystemExit(1)
+            print(pal.paint("  Stopped and removed - the deployment's secrets are no longer held in "
+                            "Docker's container config.", "green"))
+        if getattr(args, "lock", False) and os.path.exists(self._env_path()):
+            self.lock(args)
+
+    def down(self, args=None):
+        """Stop the deployment but KEEP its (stopped) containers, for a faster restart and to retain
+        `docker logs`. WARNING: a stopped container STILL holds the deployment's secrets in Docker's
+        on-disk config (/var/lib/docker/containers/<id>/config.v2.json) and via `docker inspect`, so
+        this does NOT remove them from disk - run `stop` for that. --lock also seals .env into
+        .env.enc (which alone does not clear the container copy)."""
+        pal = self.pal
+        ok, _ = docker_available()
+        if not ok:
+            print(pal.paint("  Docker is not available.", "red"))
+            raise SystemExit(2)
+        if not os.path.exists(self._env_path()):
+            print(pal.paint("  .env is not present (locked?); nothing to stop by this tool.", "yellow"))
+        else:
+            print(pal.paint("  Stopping the deployment, keeping its containers (data volumes kept) ...",
+                            "cyan"))
             try:
                 self._run_dc("stop", capture=False, timeout=120)
             except (OSError, subprocess.SubprocessError) as exc:
                 print(pal.paint("  Stop failed: %s" % exc, "red"))
                 raise SystemExit(1)
-            print(pal.paint("  Stopped.", "green"))
+            print(pal.paint("  Stopped (containers kept). NOTE: the stopped containers STILL hold the "
+                            "deployment secrets in Docker's config - run 'stop' to remove them.",
+                            "yellow"))
         if getattr(args, "lock", False) and os.path.exists(self._env_path()):
             self.lock(args)
 
@@ -2328,6 +2375,12 @@ class DockVault:
             print(pal.paint("  Docker is not available.", "yellow"))
             return
         if not os.path.exists(self._env_path()):
+            if container_exists(DB_CONTAINER):
+                # 'stop' needs .env to address the stack, so while sealed it is a no-op: guide the
+                # operator to unlock first, then stop (which removes the containers + their secrets).
+                print(pal.paint("  WARNING: the deployment's containers still exist, so its secrets are "
+                                "STILL in Docker's on-disk config even though .env is sealed - run "
+                                "'unlock' then 'stop' to remove them.", "red"))
             print(pal.paint("  (containers not listed while .env is locked - unlock first)", "yellow"))
             return
         try:
@@ -4247,6 +4300,8 @@ def build_parser():
 
     parsers["stop"].add_argument("--lock", dest="lock", action="store_true",
                                  help="also seal .env into .env.enc after stopping")
+    parsers["down"].add_argument("--lock", dest="lock", action="store_true",
+                                 help="also seal .env into .env.enc after stopping (containers kept)")
     return p
 
 
