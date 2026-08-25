@@ -11728,6 +11728,128 @@ function closeFilePreview() {
 }
 
 // Rename vault item (file or folder)
+// Split a file name into its name + extension at the LAST dot. Folders have no extension; a
+// leading-dot dotfile (.env, .gitignore) or a no-dot / trailing-dot name is all-name (ext null).
+// "archive.tar.gz" -> {name:"archive.tar", ext:"gz"}.
+function _splitNameExt(fullName, isFolder) {
+    if (isFolder) return { name: fullName, ext: null };
+    const dot = fullName.lastIndexOf('.');
+    if (dot <= 0 || dot === fullName.length - 1) return { name: fullName, ext: null };
+    return { name: fullName.slice(0, dot), ext: fullName.slice(dot + 1) };
+}
+
+// A dedicated rename dialog with separate name + extension fields. The extension field is
+// read-only until double-clicked; changing it warns (Windows-style) before saving, and the
+// warning's "Keep extension" returns to the dialog rather than closing it. Resolves with the
+// recombined new name, or null on cancel. Mirrors showPrompt's active-class + backdrop/Esc
+// handling so a backdrop dismissal (closed by the global modal handler) still settles the promise.
+function showRenameDialog(currentName, type) {
+    return new Promise((resolve) => {
+        const modal = document.getElementById('rename-modal');
+        if (!modal) { resolve(null); return; }
+        const isFolder = type === 'folder';
+        const { name, ext } = _splitNameExt(currentName, isFolder);
+        const hasExt = !isFolder && ext !== null;
+
+        const titleEl = document.getElementById('rename-modal-title');
+        const nameInput = document.getElementById('rename-name-input');
+        const extWrap = document.getElementById('rename-ext-wrap');
+        const extInput = document.getElementById('rename-ext-input');
+        const extHint = document.getElementById('rename-ext-hint');
+        const errorEl = document.getElementById('rename-error');
+        const warnEl = document.getElementById('rename-warning');
+        const saveBtn = document.getElementById('rename-save');
+        const cancelBtn = document.getElementById('rename-cancel');
+        const closeBtn = document.getElementById('rename-close-btn');
+        const warnKeep = document.getElementById('rename-warn-keep');
+        const warnProceed = document.getElementById('rename-warn-proceed');
+
+        titleEl.textContent = isFolder ? 'Rename folder' : 'Rename file';
+        nameInput.value = name;
+        errorEl.hidden = true; errorEl.textContent = '';
+        warnEl.hidden = true;
+        extWrap.hidden = !hasExt;
+        if (hasExt) {
+            extInput.value = ext;
+            extInput.readOnly = true;
+            extHint.hidden = false;
+        }
+
+        const recombined = () => (hasExt ? `${nameInput.value.trim()}.${extInput.value.trim()}` : nameInput.value.trim());
+        const extChanged = () => hasExt && extInput.value.trim() !== ext;
+
+        let settled = false;
+        const cleanup = () => {
+            modal.classList.remove('active');
+            saveBtn.removeEventListener('click', onSave);
+            cancelBtn.removeEventListener('click', onCancel);
+            closeBtn.removeEventListener('click', onCancel);
+            extInput.removeEventListener('dblclick', onExtDbl);
+            warnKeep.removeEventListener('click', onWarnKeep);
+            warnProceed.removeEventListener('click', onWarnProceed);
+            document.removeEventListener('keydown', onKey);
+            modal.removeEventListener('click', onBackdrop);
+        };
+        const finish = (val) => { if (settled) return; settled = true; cleanup(); resolve(val); };
+
+        const doSave = () => {
+            const nm = nameInput.value.trim();
+            if (!nm) { errorEl.textContent = 'The name cannot be empty.'; errorEl.hidden = false; nameInput.focus(); return; }
+            if (hasExt && !extInput.value.trim()) {
+                errorEl.textContent = 'The extension cannot be empty. Double-click to edit it, or keep it as it is.';
+                errorEl.hidden = false; return;
+            }
+            if (recombined() === currentName) { finish(null); return; }  // no actual change
+            if (extChanged()) {
+                errorEl.hidden = true;
+                warnEl.hidden = false;   // its "Keep extension" returns here; "Change it anyway" proceeds
+                warnProceed.focus();
+                return;
+            }
+            finish(recombined());
+        };
+        const onSave = () => doSave();
+        const onCancel = () => finish(null);
+        // "Keep extension" reverts the extension to its original value and re-locks the field, then
+        // returns to the (still-open) dialog -- so the label is accurate and a following save of a
+        // name-only change proceeds without re-warning.
+        const onWarnKeep = () => {
+            warnEl.hidden = true;
+            if (hasExt) { extInput.value = ext; extInput.readOnly = true; extHint.hidden = false; }
+            nameInput.focus();
+        };
+        const onWarnProceed = () => finish(recombined());
+        const onExtDbl = () => { extInput.readOnly = false; extHint.hidden = true; extInput.focus(); extInput.select(); };
+        const onKey = (e) => {
+            if (e.key === 'Escape') { e.preventDefault(); finish(null); }
+            else if (e.key === 'Enter') {
+                e.preventDefault();
+                if (!warnEl.hidden) onWarnProceed(); else doSave();
+            }
+        };
+        // A backdrop click is closed by the global modal handler; treat it as cancel so the
+        // promise always settles (same reason as showPrompt).
+        const onBackdrop = (e) => { if (e.target === modal) onCancel(); };
+
+        saveBtn.addEventListener('click', onSave);
+        cancelBtn.addEventListener('click', onCancel);
+        closeBtn.addEventListener('click', onCancel);
+        extInput.addEventListener('dblclick', onExtDbl);
+        warnKeep.addEventListener('click', onWarnKeep);
+        warnProceed.addEventListener('click', onWarnProceed);
+        document.addEventListener('keydown', onKey);
+        modal.addEventListener('click', onBackdrop);
+
+        modal.classList.add('active');
+        // Focus the name field with the caret at the END of the name part.
+        setTimeout(() => {
+            nameInput.focus();
+            const len = nameInput.value.length;
+            try { nameInput.setSelectionRange(len, len); } catch (_) {}
+        }, 40);
+    });
+}
+
 async function renameVaultItem(itemId, currentName, type) {
     // A zero-knowledge item whose name we couldn't decrypt (we lack its DEK epoch) can't
     // be renamed here — we'd have to encrypt under a key we don't hold.
@@ -11736,11 +11858,7 @@ async function renameVaultItem(itemId, currentName, type) {
         showError("This item's name is encrypted under a key version you don't have, so it can't be renamed here.");
         return;
     }
-    const newName = await showPrompt(
-        `Enter a new name for this ${type}.`,
-        'Rename item',
-        { placeholder: 'New name', defaultValue: currentName }
-    );
+    const newName = await showRenameDialog(currentName, type);
     if (newName === null || !newName.trim() || newName === currentName) {
         return;
     }

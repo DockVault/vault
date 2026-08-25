@@ -1924,6 +1924,18 @@ details summary:hover {
 .file-info-hash-value { display: block; font-family: var(--font-mono); font-size: var(--text-xs); word-break: break-all; background: var(--surface-1); padding: var(--space-sm); border-radius: var(--radius-sm); color: var(--text-primary); }
 
 /* ============================================================================
+   Rename (edit filename) modal — separate name + extension fields
+   ============================================================================ */
+.rename-ext-row { display: flex; align-items: center; gap: 4px; }
+.rename-dot { color: var(--text-secondary); font-family: var(--font-mono); font-size: var(--text-base); }
+/* The extension is read-only until double-clicked, so dim it to signal that. */
+#rename-ext-input[readonly] { opacity: .6; cursor: default; }
+.rename-ext-row .form-control { flex: 1 1 auto; min-width: 0; }
+/* .alert sets display:flex, which beats the UA [hidden]{display:none}; restore hiding so the
+   error bar and the extension-change warning stay gated behind their `hidden` toggles. */
+#rename-error[hidden], #rename-warning[hidden] { display: none; }
+
+/* ============================================================================
    CONTINUED IN NEXT FILE...
    ============================================================================ */
 
