@@ -1342,6 +1342,25 @@ def untar_volume(volume, src_dir, archive_name, run=subprocess.run):
     return getattr(r, "returncode", 1) == 0
 
 
+def clear_volume(volume, run=subprocess.run):
+    """Empty a docker volume's contents IN PLACE via a throwaway busybox (read-write mount), so a
+    restore REPLACES rather than merges. Clears dotfiles + regular entries but keeps the volume
+    OBJECT (and its DockVault labels) - unlike `docker volume rm`, which would drop the labels the
+    volume manager groups sets by. The volume must not be in use (the caller stops the stack first);
+    the -v mount creates it if absent (then the clear is a no-op on the empty dir). Returns True on
+    success, False on a real failure - which the caller MUST honour rather than extracting on top (a
+    partial clear + extract is the merge this exists to prevent). No trailing `; true`: the rm globs
+    already exit 0 on an empty volume (rm -f ignores a non-matching literal), so keeping the real exit
+    code lets a genuine failure (permission / read-only / I/O) surface as False."""
+    try:
+        r = run(["docker", "run", "--rm", "-v", "%s:/v" % volume, "busybox", "sh", "-c",
+                 "rm -rf /v/..?* /v/.[!.]* /v/* 2>/dev/null"],
+                capture_output=True, text=True, timeout=300)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return getattr(r, "returncode", 1) == 0
+
+
 # --- update (release list + upgrade/downgrade) -----------------------------------------------
 RELEASES_URL = "https://api.github.com/repos/DockVault/vault/releases"
 GHCR_IMAGE = "ghcr.io/dockvault/vault"
@@ -3076,7 +3095,7 @@ class DockVault:
         interactive = not (args and getattr(args, "non_interactive", False))
         action = getattr(args, "backup_action", None) if args else None
         if not action and interactive:
-            print(pal.paint("\n  1) Backup the current set   2) Restore a bundle", "cyan"))
+            print(pal.paint("\n  1) Backup the current set   2) Restore a bundle (STOPS + REPLACES current data)", "cyan"))
             action = {"2": "restore"}.get(ask("Choose 1/2", pal, "1").strip(), "backup")
         if (action or "backup") == "restore":
             self._do_restore(args)
@@ -3169,8 +3188,10 @@ class DockVault:
 
     def _do_restore(self, args=None):
         """Restore a bundle: verify the bundle's .env matches its volumes (coupling fingerprint),
-        recreate the volumes, and install the paired .env. Refuses a mismatched bundle, a bundle
-        missing its .env/manifest, or clobbering existing volumes (unless --force)."""
+        then STOP the stack, REPLACE each target volume's contents from the backup, install the
+        paired .env, and restart + health-check. Refuses a mismatched bundle, a bundle missing its
+        .env/manifest, or clobbering existing volumes without --force; confirms an over-existing
+        interactive restore with a typed set-name gate."""
         pal = self.pal
         interactive = not (args and getattr(args, "non_interactive", False))
         bundle = getattr(args, "bundle_dir", None) if args else None
@@ -3218,18 +3239,76 @@ class DockVault:
         existing = [v for v, _ in plan if volume_exists(v)]
         if existing and not force:
             self._fail("these target volumes already exist: %s - Reset them first, or pass --force to "
-                       "overwrite (this replaces their contents)." % ", ".join(existing))
+                       "REPLACE their contents from this backup." % ", ".join(existing))
+        # Verify every archive is present BEFORE we stop the stack or clear a single volume, so a
+        # missing-file bundle can never leave a half-restored (stopped, partly-wiped) deployment.
         for vol, archive in plan:
             if not os.path.exists(os.path.join(bundle, archive)):
                 self._fail("the bundle is missing %s (for volume %s) - refusing to restore" % (archive, vol))
-            print(pal.paint("  restoring %s ..." % vol, "cyan"))
+        # Restore REPLACES the current data with the backup. Confirm loudly for an interactive
+        # over-existing restore (mirrors the Reset typed-name gate); --non-interactive --force skips it.
+        if existing and interactive:
+            print(pal.paint(
+                "\n  RESTORE will STOP the deployment and REPLACE the current data of set '%s' with "
+                "this backup.\n  The current stored files, database and keys are DISCARDED and cannot "
+                "be recovered without another backup." % prefix, "red"))
+            typed = ask("Type the set name '%s' to confirm (anything else cancels)" % prefix, pal).strip()
+            if typed != prefix:
+                print(pal.paint("  Cancelled - nothing was changed.\n", "yellow"))
+                return
+        # Stop the stack FIRST: extracting pg_data under a live Postgres both fails to take effect (the
+        # running server keeps serving its cached state - the "restored, saw the same files" trap) and
+        # risks corrupting the cluster. down (no -v) removes the containers but KEEPS every volume,
+        # which we then overwrite in place.
+        current_prefix = volume_prefix(self._load_env())
+        if current_prefix and current_prefix != prefix and container_running(DB_CONTAINER):
+            print(pal.paint("  Note: a different deployment (set '%s') is running and will be stopped "
+                            "to restore set '%s' (its data is kept)." % (current_prefix, prefix), "yellow"))
+        print(pal.paint("  Stopping the deployment before restore (data volumes are kept) ...", "cyan"))
+        self._stop_stack()
+        # `down` can fail or time out (e.g. a slow Postgres checkpoint) and _stop_stack swallows that.
+        # NEVER clear a volume out from under a live container: if the database is still up after the
+        # stop attempt, abort with the data intact (a fresh-host restore has no container, so this is
+        # skipped there).
+        if container_running(DB_CONTAINER):
+            self._fail("could not stop the running deployment before restore (the database is still "
+                       "up) - aborting; your data is intact. Stop the stack and retry.")
+        # REPLACE each volume: clear it IN PLACE (keeps the volume + its DockVault labels) then extract
+        # the archive. Strictly the RECONSTRUCTED names[role] - never a manifest-supplied name.
+        for vol, archive in plan:
+            print(pal.paint("  restoring %s (replacing current contents) ..." % vol, "cyan"))
+            # If the clear fails (e.g. the volume is still held), do NOT extract on top - that would
+            # silently degrade to the old MERGE (the exact "restored, saw the same files" trap). The
+            # stack is already stopped, so aborting loudly is the safe state.
+            if not clear_volume(vol):
+                self._fail("could not clear volume %s before restore - the deployment is stopped; free "
+                           "the volume and retry (refusing to merge the backup over stale data)." % vol)
             if not untar_volume(vol, bundle, archive):
-                self._fail("failed to restore volume %s from %s" % (vol, archive))
-        # install the paired .env (mode-600) so the set is whole again.
+                self._fail("failed to restore volume %s from %s - the deployment is stopped; fix the "
+                           "bundle and retry." % (vol, archive))
+        # install the paired .env (mode-600) so the restored set is whole again.
         _copy_secret(env_path, self._env_path())
         tighten_secret_file(self._env_path())
         print(pal.paint("\n  Restored set '%s' (%d volume(s)) + its .env." % (prefix, len(plan)), "green"))
-        print(pal.paint("  Run Setup to start it (the secret check will confirm the pairing).\n", "cyan"))
+        # Bring the restored set back up on ITS .env and health-check, so restore leaves a RUNNING
+        # deployment serving the restored state (not a stopped stack the operator must remember to
+        # start, which is what let the old no-op behaviour hide).
+        ok, _ = docker_available()
+        if not ok:
+            print(pal.paint("  Docker is not available - start the restored set later with Start.\n",
+                            "yellow"))
+            return
+        print(pal.paint("  Starting the restored deployment ...", "cyan"))
+        profiles = self._load_env().get("COMPOSE_PROFILES", "combined")
+        if not self._start_secure_stack():
+            self._tail_logs(self._web_service(profiles))
+            self._fail("restored, but the stack did not start - the last log lines are above.")
+        if not self._wait_secure_healthy(profiles):
+            self._tail_logs(self._web_service(profiles))
+            print(pal.paint("  Restored and started, but the vault did NOT report healthy yet - "
+                            "logs above.\n", "red"))
+        else:
+            print(pal.paint("  Restored and healthy.\n", "green"))
 
     def _load_env(self):
         """Parse the current .env (best-effort: {} if absent or unreadable)."""
@@ -3962,7 +4041,7 @@ def build_parser():
                     help="backup the current set | restore a bundle")
     bp.add_argument("--backup-dir", dest="backup_dir", help="directory to write/list bundles (default <root>/backups)")
     bp.add_argument("--bundle-dir", dest="bundle_dir", help="restore: the bundle directory to restore")
-    bp.add_argument("--force", dest="force", action="store_true", help="restore: overwrite existing target volumes")
+    bp.add_argument("--force", dest="force", action="store_true", help="restore: REPLACE existing target volumes with the backup (stops the stack; current data discarded)")
     bp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
 
     up = parsers["update"]

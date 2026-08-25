@@ -1477,13 +1477,24 @@ def test_backup_writes_env_600_and_manifest_without_secret(tmp_path, monkeypatch
 
 
 @pytest.mark.docker
-def test_backup_restore_round_trip_live(tmp_path):
+def test_backup_restore_round_trip_live(tmp_path, monkeypatch):
     if shutil.which("docker") is None:
         pytest.skip("docker not available")
-    prefix = "dvbaklive"
+    prefix = "dvbakreplace"
     cfg = dict(_reusable_env_cfg(), volume_prefix=prefix, deployment_id="live")
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    # Isolate the volume-REPLACE round trip from the stack lifecycle: restore now stops the stack
+    # before and starts it after, but this bare test dir has no compose file/Dockerfile, so stub the
+    # three lifecycle calls (each covered by its own test) and record that they ran in the right order.
+    calls = []
+    monkeypatch.setattr(tool, "_stop_stack", lambda: calls.append("stop"))
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: (calls.append("start"), True)[1])
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    # Isolate from the fixed-name liveness guard: this test drives only its own volumes with a stubbed
+    # lifecycle, so pretend no `vault-db` is up (a real one on the dev host is unrelated to this set).
+    # The guard itself is covered by test_restore_aborts_if_database_still_running_after_stop.
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
     names = dv.set_volume_names(prefix)
     vols = [names["pg"], names["storage"], names["keys"]]
 
@@ -1506,17 +1517,89 @@ def test_backup_restore_round_trip_live(tmp_path):
         assert len(bundles) == 1
         bundle = bundles[0]
         assert cfg["encryption_key"] not in (bundle / "manifest.json").read_text(encoding="utf-8")
-        # simulate a down -v: destroy the volumes, then restore
-        for v in vols:
-            run("docker", "volume", "rm", "-f", v)
-        assert not any(dv.volume_exists(v) for v in vols)
-        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=False))
+        # Change the live data AFTER the backup: delete the backed-up file, add a NEW one. A correct
+        # restore must REPLACE (bring the marker back, DROP the new file), not MERGE (which used to
+        # leave the post-backup file in place -- the "restored, saw the same files" bug).
+        run("docker", "run", "--rm", "-v", names["keys"] + ":/d", "busybox", "sh", "-c",
+            "rm -f /d/marker.txt && echo POST-BACKUP > /d/added_after.txt")
+        # The volumes exist now -> restore needs --force; non-interactive --force skips the typed confirm.
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=True))
         got = run("docker", "run", "--rm", "-v", names["keys"] + ":/d:ro", "busybox", "cat", "/d/marker.txt")
-        assert "SECRET-DATA-42" in got.stdout, "the restored volume must contain the original file"
+        assert "SECRET-DATA-42" in got.stdout, "restore must bring back the backed-up file"
+        leftover = run("docker", "run", "--rm", "-v", names["keys"] + ":/d:ro", "busybox",
+                       "sh", "-c", "ls /d/added_after.txt 2>&1 || echo GONE")
+        assert "GONE" in leftover.stdout, "restore must REPLACE not merge: the post-backup file must be gone"
+        assert calls and calls[0] == "stop" and "start" in calls, "restore must stop before and start after"
         assert (tmp_path / ".env").exists()          # the paired .env was installed
     finally:
         for v in vols:
             run("docker", "volume", "rm", "-f", v)
+
+
+def test_restore_stops_before_replacing_and_starts_after(tmp_path, monkeypatch):
+    # No docker: prove _do_restore STOPS the stack before it clears/extracts a volume and STARTS +
+    # health-checks after, in that order -- the fix for extracting pg_data under a live Postgres
+    # (which never took effect and risked corruption).
+    cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-ord", deployment_id="ord")
+    entries = [{"role": "pg", "name": "dockvault-vault-ord_vault_pg_data", "archive": "vault_pg_data.tar.gz"}]
+    bundle = _write_bundle(tmp_path, cfg, entries, name="bord")
+    (bundle / "vault_pg_data.tar.gz").write_bytes(b"dummy")     # pre-flight archive-existence check
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    order = []
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: False)          # no clobber gate
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)      # nothing live to stop
+    monkeypatch.setattr(dv, "clear_volume", lambda vol, **k: order.append("clear") or True)
+    monkeypatch.setattr(dv, "untar_volume", lambda vol, *a, **k: order.append("untar") or True)
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    monkeypatch.setattr(dv, "_copy_secret", lambda *a, **k: None)
+    monkeypatch.setattr(dv, "tighten_secret_file", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_stop_stack", lambda: order.append("stop"))
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: (order.append("start"), True)[1])
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=False))
+    assert order.index("stop") < order.index("clear") < order.index("untar") < order.index("start"), order
+
+
+def test_restore_interactive_over_existing_requires_typed_confirm(tmp_path, monkeypatch):
+    # An interactive restore OVER existing volumes must be gated by a typed set-name confirm; a wrong
+    # answer cancels before anything is stopped, cleared or extracted.
+    cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-cfm", deployment_id="cfm")
+    entries = [{"role": "pg", "name": "dockvault-vault-cfm_vault_pg_data", "archive": "vault_pg_data.tar.gz"}]
+    bundle = _write_bundle(tmp_path, cfg, entries, name="bcfm")
+    (bundle / "vault_pg_data.tar.gz").write_bytes(b"dummy")
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    touched = []
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)           # over-existing
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: "not-the-set")              # wrong confirmation
+    monkeypatch.setattr(dv, "clear_volume", lambda *a, **k: touched.append("clear") or True)
+    monkeypatch.setattr(dv, "untar_volume", lambda *a, **k: touched.append("untar") or True)
+    monkeypatch.setattr(tool, "_stop_stack", lambda: touched.append("stop"))
+    # interactive (no non_interactive) + force so it clears the clobber gate and reaches the confirm.
+    tool._do_restore(argparse.Namespace(bundle_dir=str(bundle), force=True))
+    assert touched == [], "a wrong typed confirm must cancel before stopping/clearing/extracting"
+
+
+def test_restore_aborts_if_database_still_running_after_stop(tmp_path, monkeypatch):
+    # If the stop failed/timed out and the database is still up, restore must ABORT before clearing
+    # any volume - never wipe pg_data out from under a live Postgres.
+    cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-live", deployment_id="live")
+    entries = [{"role": "pg", "name": "dockvault-vault-live_vault_pg_data", "archive": "vault_pg_data.tar.gz"}]
+    bundle = _write_bundle(tmp_path, cfg, entries, name="blive")
+    (bundle / "vault_pg_data.tar.gz").write_bytes(b"dummy")
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    touched = []
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: False)          # no clobber gate
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: True)       # DB stays up after stop
+    monkeypatch.setattr(dv, "clear_volume", lambda *a, **k: touched.append("clear") or True)
+    monkeypatch.setattr(dv, "untar_volume", lambda *a, **k: touched.append("untar") or True)
+    monkeypatch.setattr(tool, "_stop_stack", lambda: touched.append("stop"))
+    with pytest.raises(SystemExit):
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=False))
+    assert "clear" not in touched and "untar" not in touched, "must not wipe a volume under a live DB"
 
 
 # --- update + logs helpers ----------------------------------------------------------------
