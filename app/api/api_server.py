@@ -9227,7 +9227,9 @@ async def create_vault(
         _description = None                       # the real description is sealed in enc_description
     else:
         if _name is None:
-            raise HTTPException(status_code=400, detail="Vault name is required.")
+            # 422 (not 400): a missing required field is a validation error, matching the status the
+            # schema returned before `name` became optional (so a ZK vault can send only enc_name).
+            raise HTTPException(status_code=422, detail="Vault name is required.")
         _enc_name = None                          # a standard vault never carries browser seals
         _enc_description = None
 
