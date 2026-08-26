@@ -172,7 +172,9 @@ def test_the_audit_still_scrubs_names_and_no_longer_stores_exception_text() -> N
     anyone who can read a backup.
     """
     audit = (ROOT / "app" / "services" / "audit_logger.py").read_text(encoding="utf-8")
-    assert '_name_keys = ("file_name", "folder_name", "old_name", "new_name")' in audit
+    # vault_name joins the redacted names: a vault's name is a plaintext label (and the residual
+    # name for a zero-knowledge vault); resource_id still identifies the vault by UUID.
+    assert '_name_keys = ("file_name", "folder_name", "old_name", "new_name", "vault_name")' in audit
     assert "k not in _name_keys" in audit
 
     sftp = SFTP_SRC.read_text(encoding="utf-8")
