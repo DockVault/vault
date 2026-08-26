@@ -86,11 +86,16 @@ def _seal_vault_name(vault, name):
     in-memory, so a caller that reads it right after sealing must refresh() the object first (every
     write site here commits + refreshes). No-op for ZK vaults (name browser-sealed later), for a
     vault without an id yet, and for a None name.
+
+    The standard-only guard comes FIRST, before any assignment: a zero-knowledge vault seals its name
+    in the browser and sets its non-secret label directly at creation, so this helper must NEVER
+    write a plaintext name onto a non-standard vault -- a mis-call with a real name could otherwise
+    land it in the clear (the server is the enforcement boundary for the ZK guarantee).
     """
-    vault.name = name
     if getattr(vault, 'type', 'standard') != 'standard' or getattr(vault, 'id', None) is None \
             or name is None:
         return
+    vault.name = name
     from app.core.security import encrypt_object_field
     vault.enc_name = encrypt_object_field(vault.id, vault.id, name, 'name')
     vault.name = None

@@ -9781,8 +9781,17 @@ async def update_vault_info(
                 detail="Only vault owner can edit vault information"
             )
         
-        # Update fields if provided
-        if 'name' in vault_update:
+        # Update fields if provided. A plaintext name/description is a STANDARD-vault concern only:
+        # a zero-knowledge vault's real name/description are sealed in the browser (enc_name/
+        # enc_description below), and the server -- the enforcement boundary for the ZK guarantee --
+        # must REFUSE a plaintext one so a naive/buggy/hostile caller can never store the real value
+        # in the clear (its label is set at creation).
+        if 'name' in vault_update and vault_update['name'] is not None:
+            if vault.type == 'zero_knowledge':
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="A zero-knowledge vault name must be sealed in the browser (send enc_name)."
+                )
             new_name = vault_update['name']
             if not new_name or len(new_name.strip()) == 0:
                 raise HTTPException(
@@ -9798,15 +9807,26 @@ async def update_vault_info(
             # plaintext into vault.name so the response echoes it correctly.
             from app.services.vault_service import _seal_vault_name
             _seal_vault_name(vault, new_name.strip())
-        
+
         if 'description' in vault_update:
-            description = vault_update['description']
-            if description and len(description) > 1000:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Vault description too long (max 1000 characters)"
-                )
-            vault.description = description.strip() if description else None
+            if vault.type == 'zero_knowledge':
+                # A ZK vault never stores a plaintext description. A truthy one is refused; an empty
+                # /null value is accepted only to CLEAR it (the sealed enc_description carries the
+                # real one).
+                if vault_update['description']:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="A zero-knowledge vault description must be sealed in the browser (send enc_description)."
+                    )
+                vault.description = None
+            else:
+                description = vault_update['description']
+                if description and len(description) > 1000:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Vault description too long (max 1000 characters)"
+                    )
+                vault.description = description.strip() if description else None
 
         # Zero-knowledge rename: the browser sends the sealed name/description (zk2: blobs the server
         # cannot read). Store them and leave the non-secret label (vault.name) untouched; the

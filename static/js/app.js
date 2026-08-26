@@ -9394,9 +9394,28 @@ async function openVault(vaultId) {
         state.currentVaultId = vaultId;
         state.currentFolderId = null;  // Start at root
         state.currentPath = [];  // Empty path array (root)
-        
+
+        // Zero-knowledge: the server returns the non-secret label as `name`. Capture it (so a later
+        // lock can restore it to the header) and, if the account key is unlocked, decrypt the real
+        // name/description for the header. While locked the header shows the label / placeholder.
+        if (vault.type === 'zero_knowledge' && vault.enc_name) {
+            if (vault._zkLabel === undefined) vault._zkLabel = vault.name || null;
+            if (zkKeyUnlocked()) {
+                try {
+                    const dek = await zkGetVaultDek(vault.id, 1);
+                    vault.name = await eccLib().decryptName(vault.enc_name, dek, vault.id, 'name', 1, vault.id);
+                    if (vault.enc_description) {
+                        try { vault.description = await eccLib().decryptName(vault.enc_description, dek, vault.id, 'description', 1, vault.id); }
+                        catch (_) { vault.description = null; }
+                    }
+                } catch (_) { vault.name = vault._zkLabel; }   // fall back to the label
+            } else {
+                vault.name = vault._zkLabel;
+            }
+        }
+
         // Update vault view header
-        document.getElementById('vault-view-title').textContent = vault.name;
+        document.getElementById('vault-view-title').textContent = vaultDisplayName(vault);
         const descEl = document.getElementById('vault-view-description');
         if (descEl) {
             descEl.textContent = vault.description || '';
@@ -10183,6 +10202,7 @@ function zkIdleLock() {
     // lock control back to locked, so the idle timeout is visible rather than leaving stale plaintext.
     try {
         zkRelockVaultNames(state.allVaults);
+        if (typeof zkRelockOpenDetail === 'function') zkRelockOpenDetail();
         if (typeof updateZkLockControl === 'function') updateZkLockControl();
         if (typeof renderVaults === 'function') renderVaults();
     } catch (_) { /* re-hide is best effort */ }
@@ -11552,9 +11572,29 @@ async function zkSealLegacyVaultNames() {
 function zkLockAllVaults() {
     zkResetKeys();                           // forget the account key + cached DEKs
     zkRelockVaultNames(state.allVaults);
+    zkRelockOpenDetail();                    // also re-hide the OPEN vault's detail header/description
     updateZkLockControl();
     renderVaults();
     try { showInfo('Zero-knowledge vaults locked.'); } catch (_) {}
+}
+
+// After a lock, the OPEN vault's detail header may still show a decrypted ZK name/description (e.g.
+// typed into the edit form during an in-session rename). Reset it to the non-secret label /
+// placeholder so a lock removes decrypted ZK metadata from the screen, not just from the list.
+function zkRelockOpenDetail() {
+    const cv = state.currentVault;
+    if (!cv || cv.type !== 'zero_knowledge' || !cv.enc_name) return;
+    let label = cv._zkLabel;
+    if (label === undefined) {               // not captured on this object -> borrow the list's
+        const lv = (state.allVaults || []).find(v => v && String(v.id) === String(cv.id));
+        label = lv ? (lv._zkLabel !== undefined ? lv._zkLabel : lv.name) : null;
+    }
+    cv.name = (label != null ? label : null);
+    cv.description = null;
+    const title = document.getElementById('vault-view-title');
+    if (title) title.textContent = vaultDisplayName(cv);
+    const descEl = document.getElementById('vault-view-description');
+    if (descEl) { descEl.textContent = ''; descEl.style.display = 'none'; }
 }
 
 function toggleZkLock() {

@@ -119,10 +119,12 @@ def _raw(engine, field, vault_id):
 
 
 def _mk_vault(session, owner, name, vtype="standard"):
+    # Mirror create_vault: the constructor sets `name` (for a ZK vault this is the non-secret label),
+    # then _seal_vault_name seals it for a Standard vault and is a no-op for a ZK one.
     from app.core.models import Vault
     from app.services.vault_service import _seal_vault_name
-    v = Vault(id=uuid.uuid4(), owner_id=owner.id, type=vtype)
-    _seal_vault_name(v, name)                 # seals (Standard) or leaves plaintext (ZK)
+    v = Vault(id=uuid.uuid4(), owner_id=owner.id, type=vtype, name=name)
+    _seal_vault_name(v, name)                 # seals (Standard) or no-op (ZK: label stays)
     session.add(v); session.commit(); return v
 
 
@@ -269,6 +271,31 @@ def test_a_zk_vault_with_no_label_reads_back_a_null_name(_pg):
         assert _raw(_pg, "name", vid) is None
         s.expire_all()
         assert s.get(Vault, vid).name is None, "the label-less ZK vault reads back NULL, not a marker"
+    finally:
+        s.close()
+
+
+@pytest.mark.docker
+def test_seal_vault_name_never_writes_plaintext_to_a_zk_vault(_pg):
+    """Defense in depth for the PATCH leak the review caught: _seal_vault_name must NEVER assign a
+    plaintext name to a zero-knowledge vault. Even a mis-call with the real name must leave the
+    server-side `name` column as the label (the real name only ever lives in enc_name, browser-set)."""
+    from app.core.models import Vault
+    from app.services.vault_service import _seal_vault_name
+    s = _session(_pg)
+    try:
+        u = _a_user(s)
+        v = Vault(id=uuid.uuid4(), owner_id=u.id, type="zero_knowledge", name="Work",
+                  enc_name="zk2:" + "A" * 40)
+        s.add(v)
+        s.commit()
+        vid = v.id
+        # A mis-call passing the REAL name must not land it in the plaintext column.
+        _seal_vault_name(v, "Top Secret Real Name")
+        s.commit()
+        got = _raw(_pg, "name", vid)
+        assert got == "Work", "the label is untouched"
+        assert "Top Secret" not in (got or ""), "the real name never reaches the plaintext column"
     finally:
         s.close()
 
