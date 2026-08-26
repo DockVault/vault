@@ -1561,6 +1561,80 @@ def test_backup_restore_round_trip_live(tmp_path, monkeypatch):
             run("docker", "volume", "rm", "-f", v)
 
 
+@pytest.mark.docker
+def test_backup_lock_restore_round_trip_live(tmp_path, monkeypatch):
+    """A SEALED backup (--lock) round-trips: the bundle carries env.enc (no plaintext env), a wrong
+    passphrase fails WITHOUT touching the stack, and the correct passphrase restores the volumes AND
+    installs the unsealed .env. Recoverability is the whole point -- prove it on real volumes."""
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    if dv.load_fernet() is None:
+        pytest.skip("cryptography not installed")
+    prefix = "dvbaklock"
+    cfg = dict(_reusable_env_cfg(), volume_prefix=prefix, deployment_id="live")
+    env_text = "\n".join(dv.build_env_lines(cfg)) + "\n"
+    (tmp_path / ".env").write_text(env_text, encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(tool, "_stop_stack", lambda: calls.append("stop"))
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: (calls.append("start"), True)[1])
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
+    names = dv.set_volume_names(prefix)
+    vols = [names["pg"], names["storage"], names["keys"]]
+    pf = tmp_path / "pass.txt"
+    pf.write_text("seal-passphrase-live-1\n", encoding="utf-8")
+    wrong = tmp_path / "wrong.txt"
+    wrong.write_text("not-the-passphrase\n", encoding="utf-8")
+
+    def run(*a):
+        return subprocess.run(list(a), capture_output=True, text=True, timeout=90)
+    try:
+        try:
+            for v in vols:
+                run("docker", "volume", "create", v)
+            seed = run("docker", "run", "--rm", "-v", names["keys"] + ":/d", "busybox",
+                       "sh", "-c", "echo SEALED-DATA-7 > /d/marker.txt")
+            if seed.returncode != 0:
+                pytest.skip("docker run unavailable: %s" % seed.stderr[:120])
+        except (subprocess.SubprocessError, OSError) as exc:
+            pytest.skip("docker unavailable: %s" % exc)
+        backup_dir = tmp_path / "backups"
+        tool._do_backup(dv.parse_env(env_text), argparse.Namespace(
+            non_interactive=True, backup_dir=str(backup_dir), lock=True,
+            passphrase_file=str(pf), passphrase_stdin=False, hint=None, recovery_out=None))
+        bundle = list(backup_dir.glob("dockvault-%s-*" % prefix))[0]
+        assert (bundle / "env.enc").exists(), "a sealed backup carries env.enc"
+        assert not (bundle / "env").exists(), "a sealed backup has NO plaintext env"
+
+        # Wrong passphrase must fail BEFORE the stack is touched (no 'stop' recorded).
+        with pytest.raises(SystemExit):
+            tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle),
+                             force=True, passphrase_file=str(wrong), passphrase_stdin=False,
+                             use_recovery_key=False, recovery_key_file=None))
+        assert "stop" not in calls, "a wrong passphrase must not stop/touch the deployment"
+
+        # Change the live data, then restore with the correct passphrase: REPLACE + unseal the .env.
+        run("docker", "run", "--rm", "-v", names["keys"] + ":/d", "busybox", "sh", "-c",
+            "rm -f /d/marker.txt && echo POST > /d/added_after.txt")
+        # Perturb the on-host .env so the final assertion proves the restore actually re-wrote it from
+        # the UNSEALED bundle (not that it was merely left unchanged from setup).
+        (tmp_path / ".env").write_text("STALE_BEFORE_RESTORE=1\n", encoding="utf-8")
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=True,
+                         passphrase_file=str(pf), passphrase_stdin=False, use_recovery_key=False,
+                         recovery_key_file=None))
+        got = run("docker", "run", "--rm", "-v", names["keys"] + ":/d:ro", "busybox", "cat", "/d/marker.txt")
+        assert "SEALED-DATA-7" in got.stdout, "restore of a sealed backup brings back the data"
+        leftover = run("docker", "run", "--rm", "-v", names["keys"] + ":/d:ro", "busybox",
+                       "sh", "-c", "ls /d/added_after.txt 2>&1 || echo GONE")
+        assert "GONE" in leftover.stdout, "sealed restore REPLACES, not merges"
+        assert calls and calls[0] == "stop" and "start" in calls
+        assert (tmp_path / ".env").read_text(encoding="utf-8") == env_text, "the unsealed .env is installed"
+    finally:
+        for v in vols:
+            run("docker", "volume", "rm", "-f", v)
+
+
 def test_restore_stops_before_replacing_and_starts_after(tmp_path, monkeypatch):
     # No docker: prove _do_restore STOPS the stack before it clears/extracts a volume and STARTS +
     # health-checks after, in that order -- the fix for extracting pg_data under a live Postgres

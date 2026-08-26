@@ -3258,6 +3258,14 @@ class DockVault:
         if action == "restore":
             self._do_restore(args)
         else:
+            # Offer sealing only for the EXPLICIT backup command (this path). The pre-upgrade
+            # auto-backup calls _do_backup directly, so it is never prompted and never sealed.
+            if interactive and not (args and getattr(args, "lock", False)):
+                if confirm("Seal this backup? (encrypts its .env so a stolen backup can't decrypt "
+                           "your files; needs a passphrase you must not lose)", pal, default=False):
+                    if args is None:
+                        args = argparse.Namespace()
+                    args.lock = True
             self._do_backup(self._load_env(), args)
 
     def _write_candidates(self, args):
@@ -3409,10 +3417,115 @@ class DockVault:
                 json.dump(manifest, f, indent=2)
         except OSError as exc:
             self._fail_backup(bundle, "failed to write the manifest: %s" % exc)
+
+        # Opt-in sealing: encrypt the bundle's plaintext 'env' (which holds ENCRYPTION_KEY) into an
+        # 'env.enc' and remove the plaintext, so a stolen backup cannot decrypt the stored files. The
+        # volume archives themselves are NOT re-encrypted here (storage is already ciphertext at rest;
+        # sealing the key that opens it is what makes the bundle safe) -- so the pg_data metadata tar
+        # stays as-is. Default off (owner decision A).
+        # Sealed only when explicitly requested (--lock, or the interactive prompt in backup() for the
+        # EXPLICIT backup command -- NEVER the pre-upgrade auto-backup, whose rollback must stay
+        # restorable without a passphrase the operator may not have during a failed upgrade).
+        seal = bool(getattr(args, "lock", False)) if args else False
+        if seal:
+            self._seal_bundle_env(bundle, args)
+
         print(pal.paint("\n  Backup written to: %s" % bundle, "green"))
-        print("    %d volume(s) + the paired .env + manifest.json" % len(entries))
-        print(pal.paint("  *** This bundle's 'env' holds ENCRYPTION_KEY - store the whole bundle "
-                        "somewhere safe (off-host). ***\n", "yellow"))
+        print("    %d volume(s) + the paired %s + manifest.json"
+              % (len(entries), "env.enc (SEALED)" if seal else ".env"))
+        if seal:
+            print(pal.paint("  The bundle's .env is SEALED - keep the passphrase/recovery key to "
+                            "restore it. Without either, this backup cannot be restored.\n", "yellow"))
+        else:
+            print(pal.paint("  *** This bundle's 'env' holds ENCRYPTION_KEY - store the whole bundle "
+                            "somewhere safe (off-host), or re-run with --lock to seal it. ***\n", "yellow"))
+
+    def _seal_bundle_env(self, bundle, args):
+        """Seal bundle/env -> bundle/env.enc (envelope encryption; passphrase + one-time recovery key),
+        then remove the plaintext env. Verify-before-destroy: the sealed file must decrypt back to the
+        exact bytes before the plaintext is removed. A seal FAILURE keeps the complete plaintext bundle
+        (a valid UNSEALED backup) rather than discarding it. Reuses the same crypto as `dockvault.py
+        lock`."""
+        pal = self.pal
+        env_file = os.path.join(bundle, "env")
+        enc_file = os.path.join(bundle, "env.enc")
+
+        def _abort(msg):
+            # A failed OPTIONAL seal must NOT destroy the complete plaintext bundle: drop any partial
+            # env.enc and keep {env, volumes, manifest} -- it restores normally, just unsealed.
+            try:
+                os.remove(enc_file)
+            except OSError:
+                pass
+            self._fail("could not seal the backup (%s). The backup at %s is COMPLETE but UNSEALED "
+                       "(its plaintext env is kept and it restores normally); re-run backup --lock "
+                       "to seal it." % (msg, bundle))
+
+        interactive = not (args and getattr(args, "non_interactive", False))
+        has_pass_source = bool(args and (getattr(args, "passphrase_file", None)
+                                         or getattr(args, "passphrase_stdin", False)))
+        if not interactive and not has_pass_source:
+            _abort("--lock --non-interactive needs --passphrase-file or --passphrase-stdin")
+        fernet = self._require_fernet()
+        try:
+            with open(env_file, "rb") as f:
+                env_bytes = f.read()
+        except OSError as exc:
+            _abort("could not read the bundle env: %s" % exc)
+        if interactive:
+            print(pal.paint(
+                "\n  Set a passphrase to seal this backup's .env. You will also get a one-time recovery "
+                "key.\n  Lose BOTH and this backup cannot be restored.", "yellow"))
+        passphrase = self._read_passphrase(args, confirm=True)
+        import datetime as _dt
+        now_iso = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
+        enc_text, dek = env_lock_seal(fernet, env_bytes, passphrase,
+                                      hint=getattr(args, "hint", None), now_iso=now_iso)
+        self._atomic_write_secret(enc_file, enc_text)
+        # Verify-before-destroy: the freshly written env.enc must decrypt (by passphrase) back to the
+        # exact bytes, or _abort keeps the complete plaintext bundle. (The recovery key is the same
+        # DEK this verify confirmed opens the payload, so the recovery-key path is verified too.)
+        try:
+            with open(enc_file, encoding="utf-8") as f:
+                check_bytes, _ = env_lock_open(fernet, f.read(), passphrase=passphrase)
+        except EnvLockError as exc:
+            _abort("sealed env failed verification (%s)" % exc)
+        if check_bytes != env_bytes:
+            _abort("sealed env did not round-trip")
+        os.remove(env_file)
+        # Recovery-key output: on a controlling terminal _show_recovery_key uses /dev/tty; in a
+        # non-interactive run WITHOUT --recovery-out do NOT print it to stdout (it could be captured
+        # into a log kept beside the bundle) -- the passphrase already restores, and --recovery-out is
+        # the safe channel for keeping a recovery key.
+        if interactive or getattr(args, "recovery_out", None):
+            self._show_recovery_key(dek, args)
+        else:
+            print(pal.paint("  Sealed. The recovery key was NOT printed (non-interactive without "
+                            "--recovery-out); restore with the passphrase, or re-run with "
+                            "--recovery-out to capture a recovery key off-host.", "yellow"))
+
+    def _unseal_bundle_env(self, enc_path, args):
+        """Decrypt a sealed bundle's env.enc and return the plaintext env BYTES (never written to
+        disk). Uses the recovery key when --recovery-key-file/-stdin or --use-recovery-key is given,
+        else the passphrase. A wrong credential fails here, before the restore touches the stack."""
+        fernet = self._require_fernet()
+        try:
+            with open(enc_path, encoding="utf-8") as f:
+                enc_text = f.read()
+        except OSError as exc:
+            self._fail("could not read the sealed backup env: %s" % exc)
+        use_recovery = bool(args and (getattr(args, "recovery_key_file", None)
+                                      or getattr(args, "use_recovery_key", False)))
+        try:
+            if use_recovery:
+                env_bytes, _ = env_lock_open(fernet, enc_text,
+                                             recovery_key=self._read_recovery_key(args))
+            else:
+                env_bytes, _ = env_lock_open(fernet, enc_text,
+                                             passphrase=self._read_passphrase(args, confirm=False))
+        except EnvLockError as exc:
+            self._fail("cannot open the sealed backup (%s) - the deployment was NOT touched." % exc)
+        return env_bytes
 
     def _do_restore(self, args=None):
         """Restore a bundle: verify the bundle's .env matches its volumes (coupling fingerprint),
@@ -3438,14 +3551,23 @@ class DockVault:
             bundle = cands[int(sel) - 1]
         if not bundle or not os.path.isdir(bundle):
             self._fail("backup bundle not found (pass --bundle-dir)")
-        man_path, env_path = os.path.join(bundle, "manifest.json"), os.path.join(bundle, "env")
-        if not (os.path.exists(man_path) and os.path.exists(env_path)):
-            self._fail("that bundle is missing manifest.json or env - refusing to restore")
+        man_path = os.path.join(bundle, "manifest.json")
+        env_path = os.path.join(bundle, "env")
+        enc_path = os.path.join(bundle, "env.enc")
+        # A sealed bundle carries env.enc instead of a plaintext env. Decrypt it into MEMORY here --
+        # before manifest/coupling checks and long before the stack is stopped -- so a wrong
+        # passphrase/recovery key aborts with the deployment intact and no plaintext ever hits disk.
+        sealed_env_bytes = None
+        if not os.path.exists(env_path) and os.path.exists(enc_path):
+            sealed_env_bytes = self._unseal_bundle_env(enc_path, args)
+        if not os.path.exists(man_path) or (sealed_env_bytes is None and not os.path.exists(env_path)):
+            self._fail("that bundle is missing manifest.json or its env - refusing to restore")
         try:
             manifest = json.load(open(man_path, encoding="utf-8"))
         except (OSError, ValueError) as exc:
             self._fail("could not read the manifest: %s" % exc)
-        bundle_env = parse_env(open(env_path, encoding="utf-8").read())
+        bundle_env = parse_env(sealed_env_bytes.decode("utf-8") if sealed_env_bytes is not None
+                               else open(env_path, encoding="utf-8").read())
         # COUPLING: the bundle's .env must be the one its volumes were created with - never restore
         # volumes without their matching .env (same rule the pre-start secret guard enforces).
         if not verify_backup_coupling(bundle_env, manifest):
@@ -3515,8 +3637,12 @@ class DockVault:
             if not untar_volume(vol, bundle, archive):
                 self._fail("failed to restore volume %s from %s - the deployment is stopped; fix the "
                            "bundle and retry." % (vol, archive))
-        # install the paired .env (mode-600) so the restored set is whole again.
-        _copy_secret(env_path, self._env_path())
+        # install the paired .env (mode-600) so the restored set is whole again. For a sealed bundle
+        # the plaintext was decrypted into memory above; write those exact bytes.
+        if sealed_env_bytes is not None:
+            self._atomic_write_secret(self._env_path(), sealed_env_bytes)
+        else:
+            _copy_secret(env_path, self._env_path())
         tighten_secret_file(self._env_path())
         print(pal.paint("\n  Restored set '%s' (%d volume(s)) + its .env." % (prefix, len(plan)), "green"))
         # Bring the restored set back up on ITS .env and health-check, so restore leaves a RUNNING
@@ -4280,6 +4406,20 @@ def build_parser():
                          "path separator; also settable via DOCKVAULT_BACKUP_DIR. The legacy <root>/backups is always searched too")
     bp.add_argument("--bundle-dir", dest="bundle_dir", help="restore: the bundle directory to restore")
     bp.add_argument("--force", dest="force", action="store_true", help="restore: REPLACE existing target volumes with the backup (stops the stack; current data discarded)")
+    bp.add_argument("--lock", dest="lock", action="store_true",
+                    help="backup: SEAL the bundle's .env (which holds ENCRYPTION_KEY) into env.enc so "
+                         "a stolen backup can't decrypt your files; needs a passphrase + gives a recovery key")
+    bp.add_argument("--passphrase-file", dest="passphrase_file",
+                    help="seal/restore: read the passphrase from this file (first line)")
+    bp.add_argument("--passphrase-stdin", dest="passphrase_stdin", action="store_true",
+                    help="seal/restore: read the passphrase from stdin")
+    bp.add_argument("--use-recovery-key", dest="use_recovery_key", action="store_true",
+                    help="restore: open a sealed bundle with its recovery key instead of the passphrase")
+    bp.add_argument("--recovery-key-file", dest="recovery_key_file",
+                    help="restore: read the sealed bundle's recovery key from this file")
+    bp.add_argument("--hint", dest="hint", help="seal: store a NON-secret passphrase hint in env.enc")
+    bp.add_argument("--recovery-out", dest="recovery_out",
+                    help="seal: also write the recovery key to this file (move it off-host)")
     bp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
 
     up = parsers["update"]

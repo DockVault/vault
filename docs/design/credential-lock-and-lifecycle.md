@@ -25,7 +25,11 @@ less-error-prone `lock`/`unlock`.
 **What locking protects (state it plainly to users):** the `.env` while the server is **off and
 locked** — i.e. a stolen disk, a stolen backup, or a VM snapshot that happens to capture the box while
 it was sealed. Also: `.env.enc` is safe to include in a backup bundle where plaintext `.env` would not
-be.
+be. `backup --lock` uses exactly this envelope to seal a bundle's `env` into `env.enc` (opt-in): the
+volume archives are already ciphertext at rest, so sealing the one file that holds `ENCRYPTION_KEY`
+makes a stolen backup undecryptable. Restore detects `env.enc`, decrypts it in memory with the
+passphrase or recovery key (a wrong credential aborts before the deployment is touched), and installs
+the plaintext `.env` only onto the restored host.
 
 **What it does NOT protect:**
 - A **running** server. A running vault must hold the plaintext secrets in process memory, so the
