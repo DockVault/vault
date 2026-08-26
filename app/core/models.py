@@ -565,9 +565,15 @@ class Vault(Base):
     __tablename__ = 'vaults'
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name = Column(String(255), nullable=False)
+    # Nullable: STANDARD vaults store the name encrypted at rest (enc_name) with this column NULL;
+    # the load/refresh event decrypts it back into `name` so every read site is unchanged. Legacy
+    # (not-yet-backfilled) and zero-knowledge vaults still carry the plaintext here.
+    name = Column(String(255), nullable=True)
+    # AES-GCM seal of the vault name at rest (Standard), keyed per-vault; NULL for legacy rows until
+    # the boot backfill seals them. (ZK vault names are browser-sealed in a later phase.)
+    enc_name = Column(Text, nullable=True)
     description = Column(Text, nullable=True)
-    
+
     owner_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
     
     # Password protection (hashed)
@@ -919,10 +925,32 @@ def _decrypt_folder_name(target, *_args):
         print(f"⚠ folder name decrypt failed for {getattr(target, 'id', None)}")
 
 
+def _decrypt_vault_name(target, *_args):
+    enc_name = getattr(target, 'enc_name', None)
+    if not enc_name:
+        return
+    from app.core.security import decrypt_object_field, is_zk_sealed_name
+    # A ZK vault name is browser-encrypted under the vault DEK (a later phase) — leave it opaque;
+    # the plaintext `name` column stays whatever it held.
+    if is_zk_sealed_name(enc_name):
+        return
+    try:
+        # Keyed per-vault: a vault is its own scope, so (vault_id, obj_id) is (id, id).
+        _sa_attributes.set_committed_value(
+            target, 'name',
+            decrypt_object_field(target.id, target.id, enc_name, 'name'))
+    except Exception:  # noqa: BLE001 — never let a decrypt error break a load (SFTP dir name guard)
+        # enc_name present but undecryptable usually means a wrong/rotated ENCRYPTION_KEY; log the
+        # id (never the plaintext). The name is left as-is rather than blanked.
+        print(f"⚠ vault name decrypt failed for {getattr(target, 'id', None)}")
+
+
 _sa_event.listen(File, 'load', _decrypt_file_names)
 _sa_event.listen(File, 'refresh', _decrypt_file_names)
 _sa_event.listen(Folder, 'load', _decrypt_folder_name)
 _sa_event.listen(Folder, 'refresh', _decrypt_folder_name)
+_sa_event.listen(Vault, 'load', _decrypt_vault_name)
+_sa_event.listen(Vault, 'refresh', _decrypt_vault_name)
 
 
 # --- Cross-vault-move guard (at-rest AAD integrity) -------------------------

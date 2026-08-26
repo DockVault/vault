@@ -9744,7 +9744,10 @@ async def update_vault_info(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Vault name too long (max 255 characters)"
                 )
-            vault.name = new_name.strip()
+            # Seal the name at rest (Standard vaults); the db.refresh() below restores the
+            # plaintext into vault.name so the response echoes it correctly.
+            from app.services.vault_service import _seal_vault_name
+            _seal_vault_name(vault, new_name.strip())
         
         if 'description' in vault_update:
             description = vault_update['description']
@@ -15620,6 +15623,12 @@ def _run_lightweight_migrations():
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS enc_name TEXT",
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS name_bi VARCHAR(64)",
             "CREATE INDEX IF NOT EXISTS ix_folders_name_bi ON folders (name_bi)",
+            # Vault name sealed at rest (Standard vaults): enc_name holds the AES-GCM blob and the
+            # plaintext `name` becomes NULLABLE (a sealed row NULLs it; the load event restores it on
+            # read). create_all adds these on a fresh DB; these backfill them on an existing one. A
+            # one-time eager backfill of existing rows runs in _backfill_encrypted_names.
+            "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS enc_name TEXT",
+            "ALTER TABLE vaults ALTER COLUMN name DROP NOT NULL",
             # Sharing: a tag can FORCE view-only on every share it mints (independent of allow_custom).
             # create_all adds the column on a fresh DB; this backfills it on a vault that already ran an
             # earlier sharing build. Idempotent + additive.
@@ -15952,7 +15961,7 @@ def _backfill_encrypted_names():
     try:
         from app.core.database import get_db_context
         from app.core.models import File, Folder, Vault
-        from app.services.vault_service import _seal_named_object
+        from app.services.vault_service import _seal_named_object, _seal_vault_name
         BATCH = 500
         with get_db_context() as db:
             # Only STANDARD vaults are sealed (ZK names are deferred). Load just those
@@ -15963,6 +15972,26 @@ def _backfill_encrypted_names():
             if not vaults:
                 return
             std_ids = list(vaults.keys())
+            # Seal the vault NAMES themselves in place (the load event restores them on read).
+            # Idempotent: a row already sealed has enc_name set and is skipped. NULLing a vault's
+            # name does not affect the file/folder loop below (it keys off vault.id, not the name).
+            # Isolated in its own try/except so a hiccup here can never skip the proven file/folder
+            # name backfill that follows; it just retries next boot. On failure the in-memory vault
+            # objects may be partly mutated (name NULLed without a commit), so re-fetch them for the
+            # file/folder loop rather than trusting the dict.
+            try:
+                vname = 0
+                for _v in vaults.values():
+                    if getattr(_v, 'enc_name', None) is None and _v.name is not None:
+                        _seal_vault_name(_v, _v.name)
+                        vname += 1
+                if vname:
+                    db.commit()
+                    print(f"[OK] Sealed {vname} vault name(s) at rest")
+            except Exception as _ve:  # noqa: BLE001 — never block the file/folder backfill
+                db.rollback()
+                vaults = {v.id: v for v in db.query(Vault).filter(Vault.type == 'standard').all()}
+                print(f"⚠ Vault-name backfill skipped this boot (retries next boot): {_ve}")
             total = 0
             for model, is_file in ((File, True), (Folder, False)):
                 plain_col = model.original_name if is_file else model.name

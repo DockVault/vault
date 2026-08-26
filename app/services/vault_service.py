@@ -79,6 +79,23 @@ def _seal_named_object(vault, obj, is_file: bool) -> None:
         obj.name = None
 
 
+def _seal_vault_name(vault, name):
+    """Seal a STANDARD vault's name at rest: store the AES-GCM blob in `enc_name` and NULL the
+    plaintext `name` column, mirroring _seal_named_object for files/folders. A vault is its own
+    cipher scope, so the key is per-(vault.id, vault.id). The load/refresh event restores `name`
+    in-memory, so a caller that reads it right after sealing must refresh() the object first (every
+    write site here commits + refreshes). No-op for ZK vaults (name browser-sealed later), for a
+    vault without an id yet, and for a None name.
+    """
+    vault.name = name
+    if getattr(vault, 'type', 'standard') != 'standard' or getattr(vault, 'id', None) is None \
+            or name is None:
+        return
+    from app.core.security import encrypt_object_field
+    vault.enc_name = encrypt_object_field(vault.id, vault.id, name, 'name')
+    vault.name = None
+
+
 def _name_match_filter(model, vault, name: str):
     """SQLAlchemy filter matching `model` (File|Folder) rows whose name equals `name`.
 
@@ -507,6 +524,10 @@ class VaultService:
         if size_limit is not None:
             vault.size_limit = size_limit
 
+        # Seal the name at rest (Standard vaults). The id is already assigned above, so the
+        # per-vault cipher key is available; the refresh() below restores the plaintext in-memory.
+        _seal_vault_name(vault, name)
+
         self.db.add(vault)
         self.db.commit()
         self.db.refresh(vault)
@@ -800,8 +821,8 @@ class VaultService:
             raise PermissionDeniedError("Only vault owner can update vault")
         
         if name is not None:
-            vault.name = name
-        
+            _seal_vault_name(vault, name)   # Standard: seals enc_name + NULLs name; refresh() below restores it
+
         if description is not None:
             vault.description = description
         
