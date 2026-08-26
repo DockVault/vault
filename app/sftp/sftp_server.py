@@ -71,6 +71,7 @@ from app.services.vault_service import (
 from app.services.vault_service import FileNotFoundError as VaultFileNotFoundError
 from app.services.audit_logger import AuditLogger
 from app.core.config import settings
+from app.sftp.host_key import generate_ed25519_host_key, load_host_key
 from app.core.safe_log import safe_event
 from app.core.temp_scope import is_scoped, effective_vault_caps, scope_ids
 from app.core.security import name_blind_index
@@ -1599,13 +1600,14 @@ def start_sftp_server():
     host_key_path = Path(settings.sftp_host_key_path)
 
     if not host_key_path.exists():
-        # Where it is written is a host path and stays out of the log.
+        # New install: generate a modern Ed25519 key. Where it is written is a host path and stays
+        # out of the log. An existing deployment already has its key here and skips this branch, so
+        # its fingerprint never changes on upgrade.
         safe_event('host-key.generating')
-        host_key_path.parent.mkdir(parents=True, exist_ok=True)
-        key = paramiko.RSAKey.generate(2048)
-        key.write_private_key_file(str(host_key_path))
+        generate_ed25519_host_key(host_key_path)
 
-    host_key = paramiko.RSAKey.from_private_key_file(str(host_key_path))
+    # Load whatever is present -- Ed25519 on new installs, RSA on ones that predate this.
+    host_key = load_host_key(str(host_key_path))
 
     # Remove any plaintext upload buffers orphaned by a previous crash/kill (no uploads can
     # be in flight at startup, so all are stale).
@@ -1676,7 +1678,7 @@ def start_sftp_server():
 def handle_sftp_client(
     client_socket: socket.socket,
     client_address: tuple,
-    host_key: paramiko.RSAKey
+    host_key: paramiko.PKey
 ):
     """
     Handle an SFTP client connection.

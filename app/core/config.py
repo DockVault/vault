@@ -66,6 +66,8 @@ class Settings(BaseSettings):
     # SFTP Server Configuration
     sftp_host: str = Field(default="0.0.0.0")
     sftp_port: int = Field(default=2222)
+    # Keeps its historical filename so an existing deployment's key is found unchanged on upgrade;
+    # new installs write an Ed25519 key at this path (the loader accepts either kind).
     sftp_host_key_path: str = Field(default="./keys/ssh_host_rsa_key")
     
     # API Server Configuration

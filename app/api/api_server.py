@@ -4537,14 +4537,15 @@ async def get_sftp_host_key(current_user: User = Depends(get_current_user)):
     user may read it. Returns available=false until the SFTP server has created the key."""
     import hashlib
     import base64
-    import paramiko
+    from app.sftp.host_key import load_host_key
     key_path = settings.sftp_host_key_path
     try:
         if not os.path.exists(key_path):
             return {"available": False}
-        host_key = paramiko.RSAKey.from_private_key_file(key_path)
+        # Ed25519 on new installs, RSA on ones that predate it -- report whichever this is.
+        host_key = load_host_key(key_path)
         fp = "SHA256:" + base64.b64encode(hashlib.sha256(host_key.asbytes()).digest()).decode().rstrip("=")
-        return {"available": True, "algorithm": "ssh-rsa", "fingerprint_sha256": fp}
+        return {"available": True, "algorithm": host_key.get_name(), "fingerprint_sha256": fp}
     except Exception as e:  # noqa: BLE001 — best-effort; never 500 on a missing/odd key file
         print(f"⚠️ host-key fingerprint read failed: {e}")
         return {"available": False}
