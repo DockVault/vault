@@ -3145,13 +3145,17 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
 
                 // Seal the name + description IN THE BROWSER (the server never sees them). The
                 // plaintext `name`/`description` are replaced by the non-secret label + the sealed
-                // blobs; a vault is its own object, so the seal binds to its own id (epoch 1).
+                // blobs; a vault is its own object, so the seal binds to its own id. A brand-new vault
+                // is at DEK epoch 1, and name_key_version records the epoch so a later read/retire uses
+                // the right one (the vault name has no content epoch, exactly like a folder name).
+                const nameEpoch = 1;                 // a freshly-created vault's DEK epoch
                 const zkLabel = ((document.getElementById('vault-label') || {}).value || '').trim();
-                payload.enc_name = await lib.encryptName(name, dek, payload.id, 'name', 1, payload.id);
+                payload.enc_name = await lib.encryptName(name, dek, payload.id, 'name', nameEpoch, payload.id);
                 if (description) {
                     payload.enc_description = await lib.encryptName(
-                        description, dek, payload.id, 'description', 1, payload.id);
+                        description, dek, payload.id, 'description', nameEpoch, payload.id);
                 }
+                payload.name_key_version = nameEpoch;
                 payload.name = zkLabel || null;      // non-secret label (shown while locked), or none
                 delete payload.description;           // the real description rides sealed in enc_description
 
@@ -9397,10 +9401,14 @@ async function openVault(vaultId) {
             if (vault._zkLabel === undefined) vault._zkLabel = vault.name || null;
             if (zkKeyUnlocked()) {
                 try {
-                    const dek = await zkGetVaultDek(vault.id, 1);
-                    vault.name = await eccLib().decryptName(vault.enc_name, dek, vault.id, 'name', 1, vault.id);
+                    // Read at the epoch the name was sealed under (name_key_version); NULL/absent => 1
+                    // (how the first sealed build wrote it). The vault name has no content epoch, so
+                    // this is the ONLY thing that says which DEK opens it.
+                    const _ep = vault.name_key_version || 1;
+                    const dek = await zkGetVaultDek(vault.id, _ep);
+                    vault.name = await eccLib().decryptName(vault.enc_name, dek, vault.id, 'name', _ep, vault.id);
                     if (vault.enc_description) {
-                        try { vault.description = await eccLib().decryptName(vault.enc_description, dek, vault.id, 'description', 1, vault.id); }
+                        try { vault.description = await eccLib().decryptName(vault.enc_description, dek, vault.id, 'description', _ep, vault.id); }
                         catch (_) { vault.description = null; }
                     }
                 } catch (_) { vault.name = vault._zkLabel; }   // fall back to the label
@@ -11463,10 +11471,12 @@ async function zkDecryptVaultNames(vaults) {
     }
     for (const v of zk) {
         try {
-            const dek = await zkGetVaultDek(v.id, 1);
-            v.name = await eccLib().decryptName(v.enc_name, dek, v.id, 'name', 1, v.id);
+            // Read at the epoch the name was sealed under (name_key_version); NULL/absent => 1.
+            const _ep = v.name_key_version || 1;
+            const dek = await zkGetVaultDek(v.id, _ep);
+            v.name = await eccLib().decryptName(v.enc_name, dek, v.id, 'name', _ep, v.id);
             if (v.enc_description) {
-                try { v.description = await eccLib().decryptName(v.enc_description, dek, v.id, 'description', 1, v.id); }
+                try { v.description = await eccLib().decryptName(v.enc_description, dek, v.id, 'description', _ep, v.id); }
                 catch (_) { /* keep whatever the server returned for description */ }
             }
             v.zkLocked = false;
@@ -11552,15 +11562,23 @@ async function zkSealLegacyVaultNames() {
     if (!legacy.length) return;
     for (const v of legacy) {
         try {
-            const dek = await zkGetVaultDek(v.id, 1);
-            const body = { enc_name: await eccLib().encryptName(v.name, dek, v.id, 'name', 1, v.id) };
+            // Seal at the CURRENT DEK epoch -- every active member holds it, whereas a member who
+            // joined after a rekey does NOT hold epoch 1 -- and record it as name_key_version so a
+            // later read/retire uses the right epoch. Mirrors how a ZK folder name is sealed.
+            const epoch = await zkGetCurrentDekVersion(v.id);
+            const dek = await zkGetVaultDek(v.id, epoch);
+            const body = {
+                enc_name: await eccLib().encryptName(v.name, dek, v.id, 'name', epoch, v.id),
+                name_key_version: epoch,
+            };
             if (v.description) {
-                body.enc_description = await eccLib().encryptName(v.description, dek, v.id, 'description', 1, v.id);
+                body.enc_description = await eccLib().encryptName(v.description, dek, v.id, 'description', epoch, v.id);
             }
             await apiRequest(`/vaults/${v.id}`, { method: 'PATCH', body: JSON.stringify(body), silent: true });
             // Reflect locally: the name is now the sealed real name; no label was set for a legacy
             // vault, so it shows the neutral placeholder while locked until the owner sets one.
             v.enc_name = body.enc_name;
+            v.name_key_version = epoch;
             v._zkLabel = null;
         } catch (_) { /* missing DEK / offline — retried on the next unlock */ }
     }
@@ -14601,15 +14619,21 @@ async function handleEditVaultInfo(e) {
         const cv = state.currentVault;
         const isZk = cv && cv.type === 'zero_knowledge';
         let body;
+        let zkEpoch = null;
         if (isZk) {
             // Seal the (possibly changed) name + description in the browser; the server never sees
-            // the plaintext. The non-secret label (server-side `name`) is left unchanged here.
-            const dek = await zkGetVaultDek(cv.id, 1);
+            // the plaintext. Seal at the CURRENT DEK epoch (every active member holds it; a member
+            // who joined after a rekey does NOT hold epoch 1) and send name_key_version so a later
+            // read/retire uses the right epoch. The non-secret label (server-side `name`) is left
+            // unchanged here.
+            zkEpoch = await zkGetCurrentDekVersion(cv.id);
+            const dek = await zkGetVaultDek(cv.id, zkEpoch);
             body = {
-                enc_name: await eccLib().encryptName(name, dek, cv.id, 'name', 1, cv.id),
+                enc_name: await eccLib().encryptName(name, dek, cv.id, 'name', zkEpoch, cv.id),
                 enc_description: description
-                    ? await eccLib().encryptName(description, dek, cv.id, 'description', 1, cv.id)
+                    ? await eccLib().encryptName(description, dek, cv.id, 'description', zkEpoch, cv.id)
                     : null,
+                name_key_version: zkEpoch,
             };
         } else {
             body = { name: name, description: description || null };
@@ -14624,6 +14648,7 @@ async function handleEditVaultInfo(e) {
         if (isZk) {
             cv.name = name;
             cv.description = description || null;
+            cv.name_key_version = zkEpoch;   // keep local read epoch in lockstep with the re-seal
         } else {
             cv.name = updatedVault.name;
             cv.description = updatedVault.description;
