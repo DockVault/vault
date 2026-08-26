@@ -447,14 +447,16 @@ class VaultService:
     
     def create_vault(
         self,
-        name: str,
+        name: Optional[str],
         owner: User,
         description: Optional[str] = None,
         password: Optional[str] = None,
         expire_files_after_days: Optional[int] = None,
         vault_type: str = 'standard',
         size_limit: Optional[int] = None,
-        vault_id: Optional[uuid.UUID] = None
+        vault_id: Optional[uuid.UUID] = None,
+        enc_name: Optional[str] = None,
+        enc_description: Optional[str] = None,
     ) -> Vault:
         """
         Create a new vault.
@@ -526,7 +528,15 @@ class VaultService:
 
         # Seal the name at rest (Standard vaults). The id is already assigned above, so the
         # per-vault cipher key is available; the refresh() below restores the plaintext in-memory.
+        # For a ZK vault this is a no-op seal that just sets `name` to the non-secret label.
         _seal_vault_name(vault, name)
+        # Zero-knowledge: store the browser-sealed name/description verbatim -- the server cannot read
+        # them. `name` already holds the non-secret label (set above); the load event skips these
+        # ZK-marked blobs, so `name`/`description` stay as the label/NULL for a ZK vault.
+        if enc_name is not None:
+            vault.enc_name = enc_name
+        if enc_description is not None:
+            vault.enc_description = enc_description
 
         self.db.add(vault)
         self.db.commit()

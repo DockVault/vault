@@ -222,6 +222,57 @@ def test_backfill_seals_legacy_plaintext_and_is_idempotent(_pg):
         s.close()
 
 
+@pytest.mark.docker
+def test_a_zk_vault_stores_a_browser_sealed_name_and_a_label(_pg):
+    """A zero-knowledge vault carries a browser-sealed real name (a zk2: blob the server can't read)
+    while the plaintext `name` column holds only the user's non-secret label. The load event must
+    LEAVE the label alone (recognizing the zk marker), never try to decrypt the blob server-side."""
+    from app.core.models import Vault
+    s = _session(_pg)
+    try:
+        u = _a_user(s)
+        # What POST /vaults stores for a ZK vault: name = the non-secret label, enc_name/enc_description
+        # = opaque browser seals (zk2: marker), plaintext description NULL.
+        v = Vault(id=uuid.uuid4(), owner_id=u.id, type="zero_knowledge", name="Work",
+                  enc_name="zk2:" + "A" * 40, enc_description="zk2:" + "B" * 40, description=None)
+        s.add(v)
+        s.commit()
+        vid = v.id
+        assert _raw(_pg, "name", vid) == "Work", "the non-secret label is stored plainly"
+        assert _raw(_pg, "enc_name", vid).startswith("zk2:"), "the real name is the browser seal"
+        assert _raw(_pg, "enc_description", vid).startswith("zk2:")
+        assert _raw(_pg, "description", vid) is None, "no plaintext description for a ZK vault"
+        # A fresh ORM load must NOT blank or alter the label (the server can't decrypt a zk2: blob and
+        # must recognize it, not treat it as a server-sealed name).
+        s.expire_all()
+        got = s.get(Vault, vid)
+        assert got.name == "Work" and got.enc_name.startswith("zk2:")
+        # This is exactly what a server-side surface (admin/logs) renders: the label, never a marker.
+        assert (got.name or f"vault_{got.id}") == "Work"
+    finally:
+        s.close()
+
+
+@pytest.mark.docker
+def test_a_zk_vault_with_no_label_reads_back_a_null_name(_pg):
+    """A ZK vault whose owner set no label stores name=NULL; the load event still leaves it NULL
+    (the browser shows a neutral placeholder), never a decrypt attempt on the zk2: blob."""
+    from app.core.models import Vault
+    s = _session(_pg)
+    try:
+        u = _a_user(s)
+        v = Vault(id=uuid.uuid4(), owner_id=u.id, type="zero_knowledge", name=None,
+                  enc_name="zk2:" + "C" * 40)
+        s.add(v)
+        s.commit()
+        vid = v.id
+        assert _raw(_pg, "name", vid) is None
+        s.expire_all()
+        assert s.get(Vault, vid).name is None, "the label-less ZK vault reads back NULL, not a marker"
+    finally:
+        s.close()
+
+
 def test_wrong_vault_decrypt_raises():
     if not _crypto_ok():
         pytest.skip("cryptography not available")

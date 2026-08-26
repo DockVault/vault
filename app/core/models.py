@@ -569,9 +569,15 @@ class Vault(Base):
     # the load/refresh event decrypts it back into `name` so every read site is unchanged. Legacy
     # (not-yet-backfilled) and zero-knowledge vaults still carry the plaintext here.
     name = Column(String(255), nullable=True)
-    # AES-GCM seal of the vault name at rest (Standard), keyed per-vault; NULL for legacy rows until
-    # the boot backfill seals them. (ZK vault names are browser-sealed in a later phase.)
+    # Sealed vault name at rest. Standard: an AES-GCM blob the server seals/decrypts (per-vault key),
+    # with `name` NULL. Zero-knowledge: a browser-sealed blob (zk2: marker) the server stores but
+    # cannot read -- for a ZK vault, `name` instead holds the user's chosen NON-SECRET label (shown
+    # while locked), and the browser decrypts enc_name to the real name once unlocked.
     enc_name = Column(Text, nullable=True)
+    # Zero-knowledge only: the browser-sealed vault DESCRIPTION (zk2: marker). The server stores it
+    # and never reads it; `description` stays NULL for a ZK vault. Standard vaults keep the plaintext
+    # in `description` and leave this NULL.
+    enc_description = Column(Text, nullable=True)
     description = Column(Text, nullable=True)
 
     owner_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)

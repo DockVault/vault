@@ -1080,13 +1080,20 @@ class TempCredentialResponse(BaseModel):
 
 
 class VaultCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=255)
+    # Optional so a zero-knowledge client can send only its non-secret LABEL (or nothing) here while
+    # the real name travels sealed in enc_name. A standard vault still requires a real name -- the
+    # handler enforces that. Blank/whitespace is normalized to None below.
+    name: Optional[str] = Field(None, max_length=255)
     # Optionally the id to create this vault under. A zero-knowledge client needs the id
     # before it locks the vault key -- the newer lock format stamps the key with its vault,
     # and the key travels in this same request, so waiting for the server to assign one is
     # too late. Absent, the server assigns it as before.
     id: Optional[uuid.UUID] = None
     description: Optional[str] = None
+    # Zero-knowledge: the vault name/description sealed IN THE BROWSER (zk2: markers). The server
+    # stores them and cannot read them; `name` then carries only the non-secret label.
+    enc_name: Optional[str] = None
+    enc_description: Optional[str] = None
     password: Optional[str] = None
     expire_files_after_days: Optional[int] = Field(None, gt=0)
     # Per-vault maximum size in GB (absent => 1 GB, the model column default). Bounded at create
@@ -1160,8 +1167,13 @@ class FileRename(BaseModel):
 
 class VaultResponse(BaseModel):
     id: uuid.UUID
-    name: str
+    # Optional: a zero-knowledge vault may carry only a non-secret label here (or nothing), with the
+    # real name sealed in enc_name. A standard vault's decrypted name is always present.
+    name: Optional[str] = None
     description: Optional[str]
+    # Zero-knowledge: browser-sealed name/description for the client to decrypt (None for standard).
+    enc_name: Optional[str] = None
+    enc_description: Optional[str] = None
     owner_id: uuid.UUID
     owner_username: Optional[str] = None
     has_password: bool
@@ -9195,16 +9207,42 @@ async def create_vault(
                     RetiredObjectId.id == vault_create.id).first()):
             raise HTTPException(status_code=409, detail="That vault id is already in use.")
 
+    # Name / seal validation. A standard vault needs a real plaintext name. A zero-knowledge vault
+    # seals its name (and optionally its description) in the BROWSER and sends only its non-secret
+    # label (or nothing) as `name`; a sealed blob MUST carry the ZK marker so the server never
+    # mistakes a browser seal for one it can decrypt, and the plaintext description is dropped (the
+    # real one rides in enc_description).
+    _name = (vault_create.name or '').strip() or None
+    _enc_name = vault_create.enc_name
+    _enc_description = vault_create.enc_description
+    _description = vault_create.description
+    if vault_type == 'zero_knowledge':
+        from app.core.security import is_zk_sealed_name
+        if _enc_name is not None and not is_zk_sealed_name(_enc_name):
+            raise HTTPException(status_code=400,
+                                detail="A zero-knowledge vault name must be sealed in the browser.")
+        if _enc_description is not None and not is_zk_sealed_name(_enc_description):
+            raise HTTPException(status_code=400,
+                                detail="A zero-knowledge vault description must be sealed in the browser.")
+        _description = None                       # the real description is sealed in enc_description
+    else:
+        if _name is None:
+            raise HTTPException(status_code=400, detail="Vault name is required.")
+        _enc_name = None                          # a standard vault never carries browser seals
+        _enc_description = None
+
     try:
         vault = vault_service.create_vault(
             vault_id=vault_create.id,
-            name=vault_create.name,
+            name=_name,
             owner=current_user,
-            description=vault_create.description,
+            description=_description,
             password=vault_create.password,
             expire_files_after_days=vault_create.expire_files_after_days,
             vault_type=vault_type,
             size_limit=requested_size,
+            enc_name=_enc_name,
+            enc_description=_enc_description,
         )
     except (ValueError, IntegrityError) as exc:
         # Losing the race between the check above and this insert should look to a caller
@@ -9387,6 +9425,13 @@ async def list_vaults(
             'last_accessed': vault.last_accessed,
             'is_active': vault.is_active,
             'type': vault.type,
+            # Zero-knowledge: the browser-sealed name/description, so the client can decrypt them
+            # once unlocked (the server can't). For a ZK vault `name`/`description` above carry only
+            # the non-secret label / NULL. Omitted for standard vaults (nothing to client-decrypt);
+            # enc_description masked for an id-scoped caller like the plaintext description is.
+            'enc_name': vault.enc_name if vault.type == 'zero_knowledge' else None,
+            'enc_description': (None if _id_scoped
+                                else (vault.enc_description if vault.type == 'zero_knowledge' else None)),
             'my_permission': _effective_vault_permission(vault, perms, current_user),
             'is_favorite': vault.id in fav_ids,
             'last_viewed_at': view_times.get(vault.id),
@@ -9467,6 +9512,11 @@ async def get_vault(
             # owner-authored vault description may reference items outside that scope, so mask it too
             # (same rationale as suppressing the whole-vault aggregates).
             'description': None if _id_scoped else vault.description,
+            # Zero-knowledge: browser-sealed name/description for the client to decrypt once unlocked
+            # (None for standard; enc_description masked for an id-scoped caller like description is).
+            'enc_name': vault.enc_name if vault.type == 'zero_knowledge' else None,
+            'enc_description': (None if _id_scoped
+                                else (vault.enc_description if vault.type == 'zero_knowledge' else None)),
             'owner_id': vault.owner_id,
             'owner_username': owner_username,
             'has_password': vault.password_hash is not None,
@@ -15629,6 +15679,8 @@ def _run_lightweight_migrations():
             # one-time eager backfill of existing rows runs in _backfill_encrypted_names.
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS enc_name TEXT",
             "ALTER TABLE vaults ALTER COLUMN name DROP NOT NULL",
+            # Zero-knowledge vault description sealed in the browser (server stores, never reads).
+            "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS enc_description TEXT",
             # Sharing: a tag can FORCE view-only on every share it mints (independent of allow_custom).
             # create_all adds the column on a fresh DB; this backfills it on a vault that already ran an
             # earlier sharing build. Idempotent + additive.
