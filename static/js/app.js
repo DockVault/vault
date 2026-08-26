@@ -2888,6 +2888,14 @@ function syncCreateVaultForm() {
     // would otherwise silently block "Create Vault") and is never submitted.
     if (pwInput) pwInput.disabled = isZk;
     if (hierWrap) hierWrap.style.display = isZk ? '' : 'none';
+    // Zero-knowledge: the name is sealed in the browser, so surface the non-secret "label" field
+    // (shown while locked) and explain the name is encrypted. Standard vaults hide both.
+    const labelGroup = document.getElementById('vault-label-group');
+    const zkNameHelp = document.getElementById('vault-name-zk-help');
+    const nameLabel = document.getElementById('vault-name-label');
+    if (labelGroup) labelGroup.style.display = isZk ? '' : 'none';
+    if (zkNameHelp) zkNameHelp.style.display = isZk ? '' : 'none';
+    if (nameLabel) nameLabel.textContent = isZk ? 'Vault Name (encrypted)' : 'Vault Name';
 }
 
 // The create-vault size hint, with the "you can change this later" clause only for a reader who
@@ -3115,6 +3123,18 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                 // what makes it safe is that the server types the field as a UUID, so what reaches
                 // the filesystem is always canonical and never a path.
                 payload.id = zkNewObjId();
+
+                // Seal the name + description IN THE BROWSER (the server never sees them). The
+                // plaintext `name`/`description` are replaced by the non-secret label + the sealed
+                // blobs; a vault is its own object, so the seal binds to its own id (epoch 1).
+                const zkLabel = ((document.getElementById('vault-label') || {}).value || '').trim();
+                payload.enc_name = await lib.encryptName(name, dek, payload.id, 'name', 1, payload.id);
+                if (description) {
+                    payload.enc_description = await lib.encryptName(
+                        description, dek, payload.id, 'description', 1, payload.id);
+                }
+                payload.name = zkLabel || null;      // non-secret label (shown while locked), or none
+                delete payload.description;           // the real description rides sealed in enc_description
 
                 const hcb = document.getElementById('vault-hierarchical');
                 if (hcb && hcb.checked) {

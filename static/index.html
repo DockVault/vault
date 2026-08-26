@@ -2608,8 +2608,18 @@
                         <form id="create-vault-form">
                             <div class="modal-body">
                                 <div class="form-group">
-                                    <label for="vault-name">Vault Name</label>
+                                    <label for="vault-name" id="vault-name-label">Vault Name</label>
                                     <input type="text" id="vault-name" class="form-control" required>
+                                    <!-- Shown only for zero-knowledge vaults: explains the name is sealed. -->
+                                    <small class="form-help" id="vault-name-zk-help" style="display:none;">Encrypted in your browser — the server never sees it. Shown only after you unlock with your passphrase.</small>
+                                </div>
+                                <!-- Zero-knowledge only: a non-secret label the server CAN see, shown in the
+                                     vault list while locked so the vault is identifiable before you unlock.
+                                     Optional; leave empty to show a neutral placeholder. -->
+                                <div class="form-group" id="vault-label-group" style="display:none;">
+                                    <label for="vault-label">Label <span class="text-tertiary">(optional, shown while locked)</span></label>
+                                    <input type="text" id="vault-label" class="form-control" maxlength="120" autocomplete="off">
+                                    <small class="form-help">A non-secret hint (e.g. “Work”) visible before unlock. The real name stays encrypted. Leave empty for a neutral placeholder.</small>
                                 </div>
                                 <div class="form-group">
                                     <label for="vault-desc">Description</label>
