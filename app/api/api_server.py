@@ -13418,13 +13418,18 @@ async def download_file(
         # to resume is the only option that leaves the cap meaning what it says.
         rangeable = download.read_range is not None and not share_authorized
 
-        # The stored checksum, as an entity tag. Resuming across two requests is only safe if the
-        # second one is reading the same bytes as the first, and nothing else here establishes
-        # that: a same-name replacement between the two would let a client splice two different
-        # files together and notice nothing, because each half authenticates perfectly well on its
-        # own. Per-record AEAD proves a record belongs to this file; it cannot prove both requests
-        # saw the same version of it.
-        etag = f'"{download.checksum}"' if download.checksum else None
+        # A KEYED tag over the content, as the entity tag -- NOT the plaintext checksum, which would
+        # let anyone who can request the file confirm whether it holds specific known content (hash
+        # a candidate, compare the ETag). content_mac is HMAC of the checksum under a per-file key,
+        # so it is still stable and unique per version but cannot be reproduced without the key.
+        #
+        # Resuming across two requests is only safe if the second one is reading the same bytes as
+        # the first, and nothing else here establishes that: a same-name replacement between the two
+        # would let a client splice two different files together and notice nothing, because each
+        # half authenticates perfectly well on its own. A replacement changes the file id and/or the
+        # checksum, so the tag changes and the If-Range below mismatches. Per-record AEAD proves a
+        # record belongs to this file; it cannot prove both requests saw the same version of it.
+        etag = f'"{download.content_mac}"' if download.content_mac else None
 
         if_range = request.headers.get('if-range')
         stale_resume = False
@@ -15607,6 +15612,11 @@ def _run_lightweight_migrations():
             "CREATE INDEX IF NOT EXISTS ix_files_name_bi ON files (name_bi)",
             "ALTER TABLE files ALTER COLUMN name DROP NOT NULL",
             "ALTER TABLE files ALTER COLUMN original_name DROP NOT NULL",
+            # Keyed content MAC used as the file's ETag (HMAC of checksum_sha256 under a per-file
+            # key), so the plaintext checksum is never handed to a client. create_all adds it on a
+            # fresh DB; this adds it on an existing one. No backfill: for a row whose column is still
+            # NULL the value is derived on read (deterministic from id + checksum_sha256).
+            "ALTER TABLE files ADD COLUMN IF NOT EXISTS content_mac VARCHAR(64)",
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS enc_name TEXT",
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS name_bi VARCHAR(64)",
             "CREATE INDEX IF NOT EXISTS ix_folders_name_bi ON folders (name_bi)",

@@ -97,13 +97,19 @@ class BoundedDownload:
     """
 
     def __init__(self, handle, chunks, total_length, name, mime_type, checksum,
-                 length_is_authenticated=False, read_range=None):
+                 length_is_authenticated=False, read_range=None, content_mac=None):
         self._handle = handle
         self._chunks = chunks
         self.total_length = total_length
         self.name = name
         self.mime_type = mime_type
+        # The plaintext content checksum: the INTERNAL integrity verifier (enforced in chunks()
+        # before the last piece is released). Never sent to a client.
         self.checksum = checksum
+        # The KEYED entity tag exposed as the ETag, so a client never sees the plaintext checksum.
+        # Deterministic from (file id, checksum); a caller derives it for a legacy row whose stored
+        # column is still NULL.
+        self.content_mac = content_mac
         self.length_is_authenticated = length_is_authenticated
         self.read_range = read_range
 

@@ -1352,6 +1352,7 @@ class VaultService:
             )
 
         # Create file record
+        from app.core.security import content_mac as _content_mac
         file = File(
             id=file_info['id'],
             # ZK: no plaintext name/MIME at rest — set below from the client blobs.
@@ -1362,6 +1363,8 @@ class VaultService:
             size_bytes=total_size,
             mime_type=None if is_zk else file_info['mime_type'],
             checksum_sha256=checksum,
+            # Keyed ETag tag; the plaintext checksum stays internal (integrity verification only).
+            content_mac=_content_mac(file_info['id'], checksum),
             storage_path=file_info['storage_path'],
             is_encrypted=file_info['is_encrypted'],
             password_hash=file_info['password_hash'],
@@ -1676,8 +1679,14 @@ class VaultService:
         """
         from app.core.security import (
             is_gcm_chunk_stream, decrypt_chunk_stream, GcmChunkStreamReader,
+            content_mac as _content_mac,
         )
         from app.services.download_stream import BoundedDownload
+
+        # The keyed ETag for this file. Stored on rows written since the column was added; derived
+        # (same value) for a legacy row whose column is still NULL, so no row exposes its plaintext
+        # checksum through the ETag and no backfill is needed.
+        _etag_mac = file.content_mac or _content_mac(file.id, file.checksum_sha256)
 
         if is_zk:
             # The server stored the client's ciphertext verbatim and holds no key for it. There are
@@ -1712,7 +1721,7 @@ class VaultService:
             return BoundedDownload(
                 handle, _primed(_fixed_windows(handle)), size,
                 file.original_name, mime, file.checksum_sha256,
-                read_range=_raw_range)
+                read_range=_raw_range, content_mac=_etag_mac)
 
         # The identification itself can fail, and it must be caught HERE: it used to return False
         # for an unreadable file, which silently routed a healthy object to the wrong reader and
@@ -1736,6 +1745,7 @@ class VaultService:
                 handle, reader.records(), reader.total_length,
                 file.original_name, mime, file.checksum_sha256,
                 length_is_authenticated=reader.length_is_authenticated,
+                content_mac=_etag_mac,
                 # The same open handle and the same index the walk above already built, so a
                 # ranged response costs no second authorization, no second open and no second
                 # walk. The other two branches leave this None and are therefore not rangeable.
@@ -1751,7 +1761,8 @@ class VaultService:
             raise FileServiceError(f"Failed to decrypt chunked file: {e}")
         return BoundedDownload(
             handle, pieces, file.size_bytes or 0,
-            file.original_name, mime, file.checksum_sha256)
+            file.original_name, mime, file.checksum_sha256,
+            content_mac=_etag_mac)
     
     def delete_file(self, file_id: uuid.UUID, user: User):
         """

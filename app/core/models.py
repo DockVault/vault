@@ -802,7 +802,11 @@ class File(Base):
     # File metadata
     size_bytes = Column(BigInteger, nullable=False)
     mime_type = Column(String(255), nullable=True)
-    checksum_sha256 = Column(String(64), nullable=False)  # For integrity verification
+    checksum_sha256 = Column(String(64), nullable=False)  # For integrity verification (internal, never exposed)
+    # Keyed MAC over the content (HMAC of checksum_sha256 under a per-file key) used as the ETag,
+    # so the plaintext checksum is never handed to a client. NULL on rows written before this
+    # column: the value is deterministic from (id, checksum_sha256), so it is derived on read.
+    content_mac = Column(String(64), nullable=True)
 
     # Storage information
     storage_path = Column(String(512), nullable=False)  # Encrypted file path

@@ -918,6 +918,34 @@ def name_blind_index(vault_id, name: str) -> str:
     return hmac.new(key, name.encode('utf-8'), hashlib.sha256).hexdigest()
 
 
+def _content_mac_key(file_id) -> bytes:
+    """Per-file HMAC key for the content MAC, derived from the deployment root key."""
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32,
+        salt=b'dockvault-content-mac-v1', info=_uuid_bytes(file_id),
+    ).derive(_runtime_settings().encryption_key.encode())
+
+
+def content_mac(file_id, checksum_sha256: str) -> str:
+    """A KEYED tag over a file's content, for use as its entity tag (ETag).
+
+    The plaintext SHA-256 of a file's content used to be its ETag, which let anyone who could
+    request the file confirm whether it holds specific known content: hash a candidate, compare the
+    tag. This is HMAC-SHA256 of that checksum under a per-file key, so the tag stays a stable,
+    unique-per-version identifier (same content on the same file -> same tag; a same-name
+    replacement changes the file id and/or the checksum, so the tag changes and a resume's If-Range
+    correctly mismatches) but cannot be reproduced or predicted without the deployment key. Per-file
+    keying also stops two files with identical content from sharing a tag.
+
+    Deterministic from (file_id, checksum_sha256), so a row written before the stored column existed
+    derives the SAME value on read -- no backfill, and legacy rows stop leaking their plaintext
+    checksum through the ETag too. The plaintext checksum itself is untouched: it stays the server's
+    internal integrity verifier, never exposed.
+    """
+    return hmac.new(_content_mac_key(file_id), (checksum_sha256 or '').encode('ascii'),
+                    hashlib.sha256).hexdigest()
+
+
 def vault_password_fingerprint(password_hash: str) -> str:
     """A stable, non-reversible fingerprint of a vault's stored password hash.
 
