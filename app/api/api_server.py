@@ -16111,6 +16111,21 @@ def _verify_encryption_key_canary():
         print(f"⚠ encryption-key canary check skipped: {e}")
 
 
+def _purge_audit_log_names():
+    """Strip residual plaintext names (file/folder/old/new/vault_name) from legacy audit-log rows
+    written before the AuditLogger began redacting them (idempotent; a marker makes it a no-op after
+    the first run). Best-effort: never block boot. Logic lives in app.core.audit_migrations."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.audit_migrations import purge_audit_log_names
+        with get_db_context() as db:
+            purged = purge_audit_log_names(db)
+        if purged:
+            print(f"[OK] Redacted residual names from {purged} legacy audit-log row(s)")
+    except Exception as e:  # noqa: BLE001 — best-effort hardening migration, never block boot
+        print(f"⚠ audit-log name redaction skipped: {e}")
+
+
 def _backfill_note_content():
     """Seal any legacy plaintext note/link content at rest (idempotent). Best-effort: never block
     boot. Runs after the widen DDL. The logic lives in app.core.note_migrations so it is testable."""
@@ -16310,6 +16325,7 @@ async def lifespan(app: FastAPI):
     _rehash_plaintext_session_tokens()  # hash any legacy plaintext session tokens at rest (no logout)
     _backfill_note_content()            # seal any legacy plaintext note/link content at rest
     _backfill_encrypted_names()
+    _purge_audit_log_names()            # strip residual plaintext names from legacy audit-log rows
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
     _seed_admin_user()
     _seed_default_share_tags()  # after the admin exists, so seed tags can record it as creator
