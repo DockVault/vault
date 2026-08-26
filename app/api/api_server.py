@@ -37,6 +37,7 @@ from app.core.config import bootstrap_entrypoint
 bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
+from app.core.chunk_cleanup import fail_chunk_session
 from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink
 from app.core import sharing_policy
 from app.core import note_link_policy
@@ -12783,9 +12784,9 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         # pre-check) -> a clean 409, not a 500. Any other ValueError keeps the generic handling.
         if "id already in use" in str(e):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="File id already in use")
-        session.status = 'failed'
-        session.error_message = str(e)[:500]
-        db.commit()
+        # Genuine finalize failure: fail the session and clear its plaintext name/MIME + staged
+        # chunks now, rather than leaving the plaintext name + chunks on disk until the TTL sweep.
+        fail_chunk_session(db, session, sdir, e)
         raise HTTPException(status_code=500, detail=f"Failed to finalize upload: {str(e)}")
     except PermissionDeniedError as e:
         # A permission denial is a 403, not a 500 — and it isn't a corrupt upload, so leave
@@ -12793,9 +12794,9 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         _remove_orphan_blob()
-        session.status = 'failed'
-        session.error_message = str(e)[:500]
-        db.commit()
+        # Genuine finalize failure: fail the session and clear its plaintext name/MIME + staged
+        # chunks now, rather than leaving the plaintext name + chunks on disk until the TTL sweep.
+        fail_chunk_session(db, session, sdir, e)
         print(f"Error finalizing chunked upload: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to finalize upload: {str(e)}")
 
