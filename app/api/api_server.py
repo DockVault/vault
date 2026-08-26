@@ -16040,6 +16040,27 @@ def _rehash_plaintext_session_tokens():
         print(f"⚠ session-token rehash skipped: {e}")
 
 
+def _verify_encryption_key_canary():
+    """Refuse to boot if the configured ENCRYPTION_KEY cannot open this deployment's sealed data.
+
+    Runs BEFORE any data-touching migration (session-token rehash, note/name backfills) so a boot on a
+    MISMATCHED key cannot corrupt at-rest content. A definitive wrong-key signal is FATAL (raised, boot
+    stops); any ambiguous condition is logged and boot continues (the migrations are loss-safe on their
+    own). The first boot of this version SEEDS the canary under the current key, so an upgrade never
+    refuses -- only a later key change does. Logic lives in app.core.key_canary so it is testable."""
+    from app.core.key_canary import EncryptionKeyMismatch, verify_or_seed_key_canary
+    try:
+        from app.core.database import get_db_context
+        with get_db_context() as db:
+            status = verify_or_seed_key_canary(db)
+        if status not in ("ok", "seeded"):
+            print(f"⚠ encryption-key canary check inconclusive: {status}")
+    except EncryptionKeyMismatch:
+        raise                              # fatal on purpose -- do not run migrations under a wrong key
+    except Exception as e:  # noqa: BLE001 — never brick boot on an unexpected canary-check error
+        print(f"⚠ encryption-key canary check skipped: {e}")
+
+
 def _backfill_note_content():
     """Seal any legacy plaintext note/link content at rest (idempotent). Best-effort: never block
     boot. Runs after the widen DDL. The logic lives in app.core.note_migrations so it is testable."""
@@ -16235,6 +16256,7 @@ async def lifespan(app: FastAPI):
     # After the replay, so the remembered value describes what this boot actually achieved.
     from app.core.health import refresh_schema_state
     print(f"Schema state: {refresh_schema_state(recorded=recorded)}")
+    _verify_encryption_key_canary()     # refuse to boot under a mismatched ENCRYPTION_KEY, BEFORE any seal migration
     _rehash_plaintext_session_tokens()  # hash any legacy plaintext session tokens at rest (no logout)
     _backfill_note_content()            # seal any legacy plaintext note/link content at rest
     _backfill_encrypted_names()
