@@ -226,6 +226,27 @@ and threat model: [`docs/design/credential-lock-and-lifecycle.md`](docs/design/c
 > ⚠️ Lose **both** the passphrase and the recovery key and `.env.enc` — hence `ENCRYPTION_KEY` — is
 > gone, and every stored file becomes permanently unrecoverable. Back them up.
 
+### What is encrypted at rest — and the host disk-encryption prerequisite
+
+DockVault encrypts **file contents** (AES-256-GCM, per-file keys derived from the deployment key) and
+**file/folder names + MIME types** at rest, so a raw read of the storage volume yields ciphertext, not
+your files or their names.
+
+It does **not** encrypt the rest of the database. The Postgres volume (`vault_pg_data`) holds usernames,
+emails, vault names, note text, and audit records (usernames, client IPs, user agents) in **plaintext**,
+recoverable by anyone who can mount that volume — no password required. All server-side at-rest
+protection also derives from the single `ENCRYPTION_KEY`; there is no per-tenant key separation, so that
+key plus the volumes is total compromise.
+
+**Host full-disk encryption (LUKS/dm-crypt, BitLocker, FileVault, or an encrypted cloud volume) is
+therefore a prerequisite — not an optional extra — for protecting the database and at-rest metadata.**
+It is the same control that protects a running deployment's `.env`. Run DockVault on an encrypted disk.
+
+**Zero-knowledge vaults** additionally seal names and contents in the browser (the server holds no key),
+but the on-disk layout still reveals **structure** — vault/file/folder counts, each encrypted file's
+size (to within the format's fixed overhead), and modification times. That residual metadata channel is
+an explicit non-goal; host full-disk encryption is again the control against a volume reader.
+
 ## Update notifications (opt-in)
 
 DockVault can tell an admin when a newer release is available. It is **off by default**; set

@@ -57,6 +57,13 @@ sizes, retry behaviour, expiry and everything else about transport remain out of
 because the server cannot read any of this and a migration that could damage opaque bytes is a
 stop-condition for this work.
 
+**Not hidden: storage-structure metadata.** These envelopes seal contents and names, but the on-disk
+storage layout still reveals STRUCTURE to anyone who can read the volume: vault/file/folder counts, each
+encrypted file's size (to within the format's fixed per-record overhead), and modification times.
+Closing this residual channel would need size padding and access-pattern obfuscation this work does not
+attempt, so it is an explicit non-goal; host full-disk encryption (see the README) is the control
+against a volume reader.
+
 ## 3. The constraint that shapes everything
 
 **AES-KW has no associated-data channel.** A wrap built on it can bind context only through the

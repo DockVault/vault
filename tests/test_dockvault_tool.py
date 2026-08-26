@@ -3030,3 +3030,19 @@ def test_zero_is_refused_because_it_would_mean_the_opposite(tmp_path, monkeypatc
         tool.storage(argparse.Namespace(set_gb=0, non_interactive=True, no_restart=True))
     assert (tmp_path / ".env").read_text(encoding="utf-8") == before
     assert "no ceiling" in dv.storage_limit_problem(0, 0)
+
+
+# --- at-rest host disk-encryption advisory + docs ----------------------------------------
+def test_setup_summary_advises_host_disk_encryption(capsys):
+    tool = dv.DockVault(dv.Palette(False))
+    tool._print_setup_summary({"server_name": "vault.example", "web_host_port": 443,
+                               "admin_username": "admin"}, healthy=True)
+    out = capsys.readouterr().out
+    assert "ENCRYPT THE HOST DISK" in out and "at-rest control" in out
+
+
+def test_docs_document_host_fde_prerequisite_and_zk_metadata_nongoal():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8").lower()
+    assert "full-disk encryption" in readme and "prerequisite" in readme
+    zk = (ROOT / "docs" / "design" / "vault-zk-envelope-v2.md").read_text(encoding="utf-8").lower()
+    assert "non-goal" in zk and "metadata" in zk
