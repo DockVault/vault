@@ -462,6 +462,7 @@ class VaultService:
         vault_id: Optional[uuid.UUID] = None,
         enc_name: Optional[str] = None,
         enc_description: Optional[str] = None,
+        name_key_version: Optional[int] = None,
     ) -> Vault:
         """
         Create a new vault.
@@ -542,6 +543,10 @@ class VaultService:
             vault.enc_name = enc_name
         if enc_description is not None:
             vault.enc_description = enc_description
+        # The DEK epoch the browser sealed enc_name/enc_description under (ZK). retire-version counts
+        # it so the name's epoch is never dropped. Absent => NULL (read defaults to epoch 1).
+        if name_key_version is not None:
+            vault.name_key_version = name_key_version
 
         self.db.add(vault)
         self.db.commit()

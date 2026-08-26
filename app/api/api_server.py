@@ -1094,6 +1094,9 @@ class VaultCreate(BaseModel):
     # stores them and cannot read them; `name` then carries only the non-secret label.
     enc_name: Optional[str] = None
     enc_description: Optional[str] = None
+    # Zero-knowledge: the DEK epoch the browser sealed enc_name/enc_description under (mirrors a ZK
+    # folder's name_key_version). Absent => epoch 1. Only meaningful with enc_name.
+    name_key_version: Optional[int] = None
     password: Optional[str] = None
     expire_files_after_days: Optional[int] = Field(None, gt=0)
     # Per-vault maximum size in GB (absent => 1 GB, the model column default). Bounded at create
@@ -1174,6 +1177,9 @@ class VaultResponse(BaseModel):
     # Zero-knowledge: browser-sealed name/description for the client to decrypt (None for standard).
     enc_name: Optional[str] = None
     enc_description: Optional[str] = None
+    # Zero-knowledge: the DEK epoch enc_name/enc_description were sealed under, so the client reads
+    # them at the right epoch (None/absent => epoch 1). None for standard vaults.
+    name_key_version: Optional[int] = None
     owner_id: uuid.UUID
     owner_username: Optional[str] = None
     has_password: bool
@@ -9216,6 +9222,7 @@ async def create_vault(
     _enc_name = vault_create.enc_name
     _enc_description = vault_create.enc_description
     _description = vault_create.description
+    _name_key_version = None
     if vault_type == 'zero_knowledge':
         from app.core.security import is_zk_sealed_name
         if _enc_name is not None and not is_zk_sealed_name(_enc_name):
@@ -9225,6 +9232,12 @@ async def create_vault(
             raise HTTPException(status_code=400,
                                 detail="A zero-knowledge vault description must be sealed in the browser.")
         _description = None                       # the real description is sealed in enc_description
+        # Epoch the browser sealed the name/description under (only meaningful with a sealed name).
+        # Absent => 1 (the first sealed build's constant, and what a read defaults to).
+        if _enc_name is not None:
+            _name_key_version = vault_create.name_key_version if vault_create.name_key_version else 1
+            if _name_key_version < 1:
+                raise HTTPException(status_code=400, detail="name_key_version must be a positive integer.")
     else:
         if _name is None:
             # 422 (not 400): a missing required field is a validation error, matching the status the
@@ -9245,6 +9258,7 @@ async def create_vault(
             size_limit=requested_size,
             enc_name=_enc_name,
             enc_description=_enc_description,
+            name_key_version=_name_key_version,
         )
     except (ValueError, IntegrityError) as exc:
         # Losing the race between the check above and this insert should look to a caller
@@ -9434,6 +9448,9 @@ async def list_vaults(
             'enc_name': vault.enc_name if vault.type == 'zero_knowledge' else None,
             'enc_description': (None if _id_scoped
                                 else (vault.enc_description if vault.type == 'zero_knowledge' else None)),
+            # The epoch enc_name/enc_description were sealed under, so the client reads them at the
+            # right DEK version (follows enc_name's visibility -- not masked for scoped creds).
+            'name_key_version': vault.name_key_version if vault.type == 'zero_knowledge' else None,
             'my_permission': _effective_vault_permission(vault, perms, current_user),
             'is_favorite': vault.id in fav_ids,
             'last_viewed_at': view_times.get(vault.id),
@@ -9519,6 +9536,8 @@ async def get_vault(
             'enc_name': vault.enc_name if vault.type == 'zero_knowledge' else None,
             'enc_description': (None if _id_scoped
                                 else (vault.enc_description if vault.type == 'zero_knowledge' else None)),
+            # The epoch enc_name/enc_description were sealed under (follows enc_name's visibility).
+            'name_key_version': vault.name_key_version if vault.type == 'zero_knowledge' else None,
             'owner_id': vault.owner_id,
             'owner_username': owner_username,
             'has_password': vault.password_hash is not None,
@@ -9850,6 +9869,20 @@ async def update_vault_info(
                     vault.enc_name = _en
                     if _was_legacy:
                         vault.name = None
+                    # The DEK epoch this seal used (the browser seals under the CURRENT epoch on a
+                    # re-seal), kept in lockstep with enc_name so a read decrypts at the right version
+                    # and retire-version counts the right epoch. A client that predates the field
+                    # (still sealing at the constant epoch 1) omits it -> default 1.
+                    _nkv = vault_update.get('name_key_version')
+                    try:
+                        _nkv = int(_nkv) if _nkv else 1
+                    except (TypeError, ValueError):
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                            detail="name_key_version must be an integer.")
+                    if _nkv < 1:
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                            detail="name_key_version must be a positive integer.")
+                    vault.name_key_version = _nkv
             if 'enc_description' in vault_update:
                 _ed = vault_update['enc_description']
                 if _ed is not None and not is_zk_sealed_name(_ed):
@@ -15731,6 +15764,11 @@ def _run_lightweight_migrations():
             "ALTER TABLE vaults ALTER COLUMN name DROP NOT NULL",
             # Zero-knowledge vault description sealed in the browser (server stores, never reads).
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS enc_description TEXT",
+            # Zero-knowledge vault NAME epoch: the DEK version the browser sealed enc_name/enc_description
+            # under (mirrors folders.name_key_version). retire-version counts it so the name's epoch is
+            # never dropped. NULL/absent => epoch 1 (the first sealed build's constant). create_all adds
+            # it on a fresh DB; this backfills it on an existing one.
+            "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS name_key_version INTEGER",
             # Sharing: a tag can FORCE view-only on every share it mints (independent of allow_custom).
             # create_all adds the column on a fresh DB; this backfills it on a vault that already ran an
             # earlier sharing build. Idempotent + additive.

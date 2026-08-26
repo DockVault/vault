@@ -1827,6 +1827,46 @@ async def rekey_vault(
     return {"status": "ok", "vault_id": vault_id, "dek_version": request.to_version}
 
 
+def _lowest_epoch_in_use(db, vault_id, vault):
+    """The lowest DEK epoch still referenced by any file's CONTENT (File.encryption_metadata
+    key_version), any ZK folder's NAME (Folder.name_key_version), or the vault's OWN sealed
+    name/description (Vault.name_key_version). Returns None when nothing references an epoch.
+
+    Files, folder names and the vault name have no shared "content epoch": each is sealed under
+    whatever the DEK epoch was at seal time, so retiring a member key below any of these would make
+    that item permanently undecryptable for everyone. The vault name has no content of its own, so
+    -- exactly like a folder name -- its epoch MUST be counted or a retire could strand it. Absent
+    metadata everywhere => epoch 1 (the first sealed build's constant). Read-only; the caller runs
+    it under the vault-row lock so the floor cannot move before the delete."""
+    from app.core.models import File, Folder
+
+    def _as_epoch(value):
+        # None/absent metadata => epoch 1; a present value is used as-is (int-coerced). Preserves the
+        # prior inline behaviour exactly, including a stored 0 (which never occurs; epochs are >= 1).
+        if value is None:
+            return 1
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 1
+
+    min_in_use = None
+    for f in db.query(File).filter(File.vault_id == vault_id).all():
+        meta = f.encryption_metadata or {}
+        v = _as_epoch(meta.get('key_version', 1) if isinstance(meta, dict) else 1)
+        if min_in_use is None or v < min_in_use:
+            min_in_use = v
+    for fol in db.query(Folder.name_key_version).filter(Folder.vault_id == vault_id).all():
+        v = _as_epoch(fol[0])
+        if min_in_use is None or v < min_in_use:
+            min_in_use = v
+    if getattr(vault, 'enc_name', None):
+        v = _as_epoch(getattr(vault, 'name_key_version', None))
+        if min_in_use is None or v < min_in_use:
+            min_in_use = v
+    return min_in_use
+
+
 @router.post("/vaults/{vault_id}/retire-version")
 @require_endpoint_permission("VAULT_PERMISSIONS")
 @require_vault_cap("vault.change_permissions")
@@ -1861,26 +1901,9 @@ async def retire_dek_versions(
     locked = (db.query(Vault).populate_existing()
               .filter(Vault.id == vault_id).with_for_update().first())
 
-    # Lowest DEK epoch still in use by any file's CONTENT or any ZK folder's NAME
-    # (absent metadata => epoch 1).
-    min_in_use = None
-    for f in db.query(File).filter(File.vault_id == vault_id).all():
-        meta = f.encryption_metadata or {}
-        v = meta.get('key_version', 1) if isinstance(meta, dict) else 1
-        try:
-            v = int(v)
-        except (TypeError, ValueError):
-            v = 1
-        if min_in_use is None or v < min_in_use:
-            min_in_use = v
-    for fol in db.query(Folder.name_key_version).filter(Folder.vault_id == vault_id).all():
-        v = fol[0] if fol[0] is not None else 1
-        try:
-            v = int(v)
-        except (TypeError, ValueError):
-            v = 1
-        if min_in_use is None or v < min_in_use:
-            min_in_use = v
+    # Lowest DEK epoch still referenced by any file CONTENT, any ZK folder NAME, or the vault's own
+    # sealed name (all under the row lock, so the floor can't move before the delete below).
+    min_in_use = _lowest_epoch_in_use(db, vault_id, locked)
     # No files => nothing references any epoch; keep only the current epoch's rows.
     dek_floor = min_in_use if min_in_use is not None else (getattr(locked, 'dek_version', 1) or 1)
 

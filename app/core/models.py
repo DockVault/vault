@@ -578,6 +578,11 @@ class Vault(Base):
     # and never reads it; `description` stays NULL for a ZK vault. Standard vaults keep the plaintext
     # in `description` and leave this NULL.
     enc_description = Column(Text, nullable=True)
+    # Zero-knowledge only: the DEK epoch the browser sealed enc_name/enc_description under (mirrors
+    # Folder.name_key_version -- a vault name, like a folder name, has no CONTENT epoch of its own).
+    # retire-version counts this so the name's epoch is never dropped out from under it. NULL/absent
+    # means epoch 1 (how the first sealed build wrote it, and what a fresh read defaults to).
+    name_key_version = Column(Integer, nullable=True)
     description = Column(Text, nullable=True)
 
     owner_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
