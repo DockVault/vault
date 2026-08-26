@@ -62,9 +62,10 @@ def backfill_note_content(db) -> int:
         # ENCRYPTION_KEY does not match the data that sealed these rows. Leaving them untouched is
         # lossless (the correct key still opens them); re-sealing them would not be.
         print(
-            "⚠ SECURITY: %d note/link field(s) carry the seal marker but do NOT decrypt with "
-            "the current ENCRYPTION_KEY. They were LEFT UNCHANGED (never re-sealed). This usually "
-            "means the configured ENCRYPTION_KEY does not match the stored data -- fix the key; the "
-            "content is intact under the correct one." % skipped_undecryptable
+            "⚠ SECURITY: %d note/link field(s) carry the seal marker but do NOT decrypt with the "
+            "current ENCRYPTION_KEY. They were LEFT UNCHANGED (never re-sealed). If the key is wrong, "
+            "the content is intact under the correct one -- restore it. If the key is confirmed "
+            "correct, these are legacy values that literally began with the marker (harmless; they "
+            "seal on the next edit)." % skipped_undecryptable
         )
     return rows_updated

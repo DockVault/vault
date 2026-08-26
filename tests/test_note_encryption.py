@@ -295,7 +295,7 @@ def test_backfill_seals_legacy_plaintext_and_is_idempotent(_pg):
 
 
 @pytest.mark.docker
-def test_backfill_never_reseals_a_marked_value_it_cannot_decrypt(_pg):
+def test_backfill_never_reseals_a_marked_value_it_cannot_decrypt(_pg, capsys):
     """A row that carries the seal marker but will not decrypt is what a genuine seal under a
     MISMATCHED ENCRYPTION_KEY looks like. The backfill must LEAVE IT UNTOUCHED -- re-sealing would
     double-encrypt it under a key nobody keeps (permanent, silent loss on one wrong-key boot). Here
@@ -322,6 +322,10 @@ def test_backfill_never_reseals_a_marked_value_it_cannot_decrypt(_pg):
 
         updated = backfill_note_content(s)
         s.commit()
+
+        # The skip is LOUD and COUNTED: a probable key mismatch must be visible, not silent.
+        warned = capsys.readouterr().out
+        assert "SECURITY" in warned and "do NOT decrypt" in warned, "the boot warning fired for the skip"
 
         after = _raw(_pg, "notes", "title", nid)
         # The undecryptable marked title is BYTE-IDENTICAL: never re-sealed (no double-encryption).

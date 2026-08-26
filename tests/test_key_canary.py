@@ -153,6 +153,58 @@ def test_canary_refuses_boot_on_a_wrong_key(_pg):
 
 
 @pytest.mark.docker
+def test_canary_that_decrypts_to_the_wrong_value_refuses(_pg):
+    """A canary sealed under the CURRENT key but carrying different plaintext must still refuse:
+    a clean decrypt that yields the wrong constant is a mismatch, not an 'ok'. Guards the
+    opened != constant branch against a future key that produces valid padding by chance."""
+    from app.core.security import _fernet
+    from app.core.key_canary import (verify_or_seed_key_canary, EncryptionKeyMismatch, _CANARY_KEY)
+    from app.core.models import SystemSetting
+    s = _session(_pg)
+    try:
+        _clear_canary(s)
+        wrong_ct = _fernet().encrypt(b"not-the-canary-constant").decode("ascii")
+        s.add(SystemSetting(key=_CANARY_KEY, value={"ct": wrong_ct, "v": 1}))
+        s.commit()
+        with pytest.raises(EncryptionKeyMismatch):
+            verify_or_seed_key_canary(s)
+    finally:
+        _clear_canary(s)
+        s.close()
+
+
+def test_boot_hook_reraises_mismatch_but_swallows_other_errors(monkeypatch):
+    """The lifespan wrapper must make EncryptionKeyMismatch FATAL (propagate, stopping boot) while
+    logging and swallowing any other error -- so a wrong key stops boot but an infra hiccup does not.
+    Pure unit test: the checker and db context are patched, so no Postgres is needed."""
+    if not _load_fernet_ok():
+        pytest.skip("cryptography not available")
+    import contextlib
+    from app.api import api_server
+    from app.core.key_canary import EncryptionKeyMismatch
+
+    @contextlib.contextmanager
+    def _fake_ctx():
+        yield object()                      # db is unused because the checker itself is patched
+
+    monkeypatch.setattr("app.core.database.get_db_context", _fake_ctx)
+
+    def _raise(exc):
+        def _f(_db):
+            raise exc
+        return _f
+
+    monkeypatch.setattr("app.core.key_canary.verify_or_seed_key_canary",
+                        _raise(EncryptionKeyMismatch("wrong key")))
+    with pytest.raises(EncryptionKeyMismatch):
+        api_server._verify_encryption_key_canary()      # fatal: must propagate
+
+    monkeypatch.setattr("app.core.key_canary.verify_or_seed_key_canary",
+                        _raise(RuntimeError("transient infra error")))
+    api_server._verify_encryption_key_canary()          # non-fatal: must NOT raise
+
+
+@pytest.mark.docker
 def test_canary_row_without_ciphertext_is_not_fatal(_pg):
     """A malformed canary row (no ciphertext) cannot be verified but must NOT brick a deployment --
     the guard is defense-in-depth, never a new failure mode."""

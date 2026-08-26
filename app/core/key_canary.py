@@ -58,8 +58,11 @@ def verify_or_seed_key_canary(db) -> str:
             "/ volume set). If you are certain the key is correct and the canary is corrupted, delete the "
             "'encryption_key_canary' row from system_settings to re-seed."
         )
-    except Exception:                    # noqa: BLE001 -- malformed ct / infra error, not a clean mismatch
-        return "skipped:unreadable"
+    except Exception:                    # noqa: BLE001 -- non-ASCII ct or an infra/setup error. (A
+        return "skipped:unreadable"      # base64-malformed ASCII ct raises InvalidToken above, and is
+                                         # deliberately treated as a mismatch: if the stored canary is
+                                         # unopenable, refuse rather than trust the key -- recovery is
+                                         # deleting the row, as the InvalidToken message states.)
 
     if opened != _CANARY_PLAINTEXT:
         raise EncryptionKeyMismatch(
