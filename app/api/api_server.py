@@ -9236,8 +9236,9 @@ async def create_vault(
         # Absent => 1 (the first sealed build's constant, and what a read defaults to).
         if _enc_name is not None:
             _name_key_version = vault_create.name_key_version if vault_create.name_key_version else 1
-            if _name_key_version < 1:
-                raise HTTPException(status_code=400, detail="name_key_version must be a positive integer.")
+            # Bounded to a 32-bit column (a huge value would only fail as a 500 at commit).
+            if _name_key_version < 1 or _name_key_version > 2147483647:
+                raise HTTPException(status_code=400, detail="name_key_version out of range.")
     else:
         if _name is None:
             # 422 (not 400): a missing required field is a validation error, matching the status the
@@ -9879,15 +9880,26 @@ async def update_vault_info(
                     except (TypeError, ValueError):
                         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                                             detail="name_key_version must be an integer.")
-                    if _nkv < 1:
+                    # Bounded to a 32-bit column: a huge value would pass this check and only fail as
+                    # a DataError at commit -> a 500. Reject it here as a 400 instead.
+                    if _nkv < 1 or _nkv > 2147483647:
                         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                                            detail="name_key_version must be a positive integer.")
+                                            detail="name_key_version out of range.")
                     vault.name_key_version = _nkv
             if 'enc_description' in vault_update:
                 _ed = vault_update['enc_description']
                 if _ed is not None and not is_zk_sealed_name(_ed):
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                                         detail="A zero-knowledge vault description must be sealed in the browser.")
+                # enc_description shares the name's DEK epoch (name_key_version), which only advances
+                # when enc_name is re-sealed above. Re-sealing a description to a NEW value WITHOUT also
+                # sending enc_name would desync its ciphertext epoch from the recorded one, so the
+                # description would later read at the wrong epoch. Require enc_name alongside a real
+                # value; clearing to null is always allowed.
+                if _ed and 'enc_name' not in vault_update:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                        detail="Re-sealing a zero-knowledge description requires enc_name "
+                                               "(they share a key epoch).")
                 vault.enc_description = _ed        # None clears a removed description
                 vault.description = None           # a ZK vault never stores a plaintext description
 

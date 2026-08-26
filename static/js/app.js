@@ -11564,7 +11564,10 @@ async function zkSealLegacyVaultNames() {
         try {
             // Seal at the CURRENT DEK epoch -- every active member holds it, whereas a member who
             // joined after a rekey does NOT hold epoch 1 -- and record it as name_key_version so a
-            // later read/retire uses the right epoch. Mirrors how a ZK folder name is sealed.
+            // later read/retire uses the right epoch. (A vault name always advances to the current
+            // epoch, unlike a file/folder rename which keeps the item's existing epoch: nothing reads
+            // the vault name pinned to an old epoch the way a file's content is, so advancing is safe
+            // and lets the stale epoch be retired.)
             const epoch = await zkGetCurrentDekVersion(v.id);
             const dek = await zkGetVaultDek(v.id, epoch);
             const body = {

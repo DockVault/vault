@@ -170,15 +170,31 @@ def test_lowest_epoch_defaults_a_nameless_epoch_to_one(_pg):
 
 
 @pytest.mark.docker
-def test_lowest_epoch_is_none_for_a_standard_vault_with_no_items(_pg):
+def test_lowest_epoch_is_none_when_nothing_references_an_epoch(_pg):
     """No files, no folders, no sealed name -> nothing references an epoch -> None (the endpoint then
     keeps only the current epoch)."""
     from app.api.ecc_router import _lowest_epoch_in_use
     s = _session(_pg)
     try:
         u = _a_user(s)
-        vault = _vault(s, u, vtype="standard")
+        vault = _vault(s, u, vtype="standard", enc_name=None)
         s.flush()
         assert _lowest_epoch_in_use(s, vault.id, vault) is None
+    finally:
+        s.close()
+
+
+@pytest.mark.docker
+def test_lowest_epoch_counts_a_standard_vault_at_rest_sealed_name(_pg):
+    """A Standard vault seals its name at rest (enc_name set), so its epoch (NULL => 1) also pins the
+    floor. Harmless and intentional -- retire only deletes ZK member-key rows (Standard vaults have
+    none) and a lower floor deletes FEWER -- so lock the behaviour: enc_name present => floor 1."""
+    from app.api.ecc_router import _lowest_epoch_in_use
+    s = _session(_pg)
+    try:
+        u = _a_user(s)
+        vault = _vault(s, u, vtype="standard", enc_name="atrest-sealed-name-blob", name_key_version=None)
+        s.flush()
+        assert _lowest_epoch_in_use(s, vault.id, vault) == 1
     finally:
         s.close()
