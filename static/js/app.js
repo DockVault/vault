@@ -1962,6 +1962,11 @@ async function loadVaults() {
 
     try {
         state.allVaults = await apiRequest('/vaults');
+        // Decrypt any zero-knowledge vault names/descriptions IN PLACE if the account key is already
+        // unlocked; otherwise they keep their non-secret labels (no prompt). Best-effort — a decrypt
+        // hiccup must not stop the list from rendering.
+        try { await zkDecryptVaultNames(state.allVaults); } catch (_) { /* labels remain */ }
+        updateZkLockControl();
         renderVaults();
     } catch (error) {
         container.innerHTML = `<div class="alert alert-error">Failed to load vaults: ${error.message}</div>`;
@@ -2174,30 +2179,49 @@ function renderVaults() {
         return;
     }
 
-    container.innerHTML = vaults.map(vault => `
-        <div class="card card-interactive vault-card" data-vault-id="${vault.id}">
+    container.innerHTML = vaults.map(vault => {
+        const isZk = vault.type === 'zero_knowledge';
+        const locked = isZk && vault.zkLocked;
+        // Locked ZK card: the real name shows only if the owner set a non-secret label (else a
+        // neutral placeholder), and description/counts are hidden behind the seal until unlock. The
+        // .zk-field spans are what the decode animation replaces when the vault is unlocked.
+        const nameHtml = escapeHtml(vaultDisplayName(vault));
+        const descHtml = locked ? '••••••'
+                                : escapeHtml(vault.description || 'No description');
+        const filesHtml = locked ? '••' : `${vault.file_count || 0}`;
+        const membersHtml = locked ? '••' : `${vault.member_count || 1}`;
+        return `
+        <div class="card card-interactive vault-card ${locked ? 'vault-zk-locked' : ''}" data-vault-id="${vault.id}"${isZk ? ' data-zk="1"' : ''}>
             <button class="vault-fav ${vault.is_favorite ? 'is-fav' : ''}" data-vault-id="${vault.id}"
                     title="${vault.is_favorite ? 'Remove from favorites' : 'Add to favorites'}" aria-label="Toggle favorite">
                 ${iconSvg('star')}
             </button>
             ${currentUser.role === 'admin' ? `<button class="delete-vault-btn vault-del" data-vault-id="${vault.id}" title="Delete vault" aria-label="Delete vault">${iconSvg('trash', 'icon-sm')}</button>` : ''}
             <div class="vault-card-body">
-                <div class="vault-tile">${iconSvg('vault')}</div>
+                <div class="vault-tile${locked ? ' vault-tile-locked' : ''}">${locked ? iconSvg('lock') : iconSvg('vault')}</div>
                 <div class="vault-card-main">
-                    <h3 class="vault-name">${escapeHtml(vault.name)}</h3>
-                    <p class="vault-desc">${escapeHtml(vault.description || 'No description')}</p>
+                    <h3 class="vault-name"><span class="zk-field" data-zk-field="name">${nameHtml}</span></h3>
+                    <p class="vault-desc"><span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="desc">${descHtml}</span></p>
                     <div class="vault-meta">
-                        <span>${iconSvg('folder', 'icon-sm')} ${vault.file_count || 0} files</span>
-                        <span>${iconSvg('users', 'icon-sm')} ${vault.member_count || 1} members</span>
+                        <span>${iconSvg('folder', 'icon-sm')} <span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="files">${filesHtml}</span> files</span>
+                        <span>${iconSvg('users', 'icon-sm')} <span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="members">${membersHtml}</span> members</span>
                     </div>
                 </div>
-                <button class="open-vault-btn btn btn-primary btn-sm vault-open" data-vault-id="${vault.id}">Open</button>
+                <button class="open-vault-btn btn btn-primary btn-sm vault-open" data-vault-id="${vault.id}">${locked ? 'Unlock' : 'Open'}</button>
             </div>
-        </div>
-    `).join('');
+        </div>`;
+    }).join('');
 
     container.querySelectorAll('.open-vault-btn').forEach(btn => {
-        btn.addEventListener('click', (e) => { e.stopPropagation(); openVault(e.currentTarget.getAttribute('data-vault-id')); });
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const id = e.currentTarget.getAttribute('data-vault-id');
+            const v = (state.allVaults || []).find(x => String(x.id) === String(id));
+            // A locked zero-knowledge vault: the same unlock flow as the lock control (reveal all),
+            // rather than opening straight into a passphrase prompt for this one vault.
+            if (v && v.type === 'zero_knowledge' && v.zkLocked) { zkUnlockAllVaults(); return; }
+            openVault(id);
+        });
     });
     container.querySelectorAll('.delete-vault-btn').forEach(btn => {
         btn.addEventListener('click', (e) => { e.stopPropagation(); deleteVault(e.currentTarget.getAttribute('data-vault-id')); });
@@ -10155,8 +10179,18 @@ function zkIdleLock() {
     if (_zkIdleTimer) { clearTimeout(_zkIdleTimer); _zkIdleTimer = null; }
     if (!zkState.privateKey) return;          // already locked
     zkResetKeys();                            // drop the ECC key + per-vault DEKs; next op re-prompts
+    // Re-hide any zero-knowledge vault names/metadata that were decrypted on screen, and flip the
+    // lock control back to locked, so the idle timeout is visible rather than leaving stale plaintext.
+    try {
+        zkRelockVaultNames(state.allVaults);
+        if (typeof updateZkLockControl === 'function') updateZkLockControl();
+        if (typeof renderVaults === 'function') renderVaults();
+    } catch (_) { /* re-hide is best effort */ }
     try { showInfo('Encryption locked after inactivity — you\'ll be asked for your passphrase again.'); } catch (_) {}
 }
+
+// A convenience for the lock control + unlock flow to (re)arm the idle countdown.
+function zkResetIdleLock() { try { zkArmIdleLock(); } catch (_) {} }
 
 // (Re)arm the idle timer. No-op unless the policy is on AND a key is currently unlocked.
 function zkArmIdleLock() {
@@ -11387,6 +11421,156 @@ async function zkDecryptListingNames(items, vault) {
         }
     }
     if (unavailable) showError(safeMessageForCode('CRYPTO_UNAVAILABLE', 'unlock'));
+}
+
+// Whether the account's zero-knowledge key is currently held in memory (unlocked).
+function zkKeyUnlocked() { return !!(zkState && zkState.privateKey); }
+
+// Decrypt the browser-sealed name/description of zero-knowledge vaults in the list IN PLACE, so the
+// rest of the UI keeps reading vault.name / vault.description. NON-prompting on purpose: while the
+// account key is locked the server-sent `name` (the non-secret label) is left in place and the vault
+// is marked zkLocked, so the vault list never forces a passphrase prompt just to render. The lock
+// control does the unlocking, then calls this again. The original label is preserved in `_zkLabel`
+// so re-locking can restore it. Vault names/descriptions are sealed at epoch 1 (a vault, unlike its
+// files, does not rotate its own name).
+async function zkDecryptVaultNames(vaults) {
+    const zk = (vaults || []).filter(v => v && v.type === 'zero_knowledge' && v.enc_name);
+    if (!zk.length) return;
+    for (const v of zk) {
+        // Capture the server-sent non-secret label ONCE (before we overwrite name with the real one).
+        if (v._zkLabel === undefined) v._zkLabel = v.name || null;
+    }
+    if (!zkKeyUnlocked()) {                 // locked -> show labels, do not prompt
+        for (const v of zk) { v.name = v._zkLabel; v.zkLocked = true; }
+        return;
+    }
+    for (const v of zk) {
+        try {
+            const dek = await zkGetVaultDek(v.id, 1);
+            v.name = await eccLib().decryptName(v.enc_name, dek, v.id, 'name', 1, v.id);
+            if (v.enc_description) {
+                try { v.description = await eccLib().decryptName(v.enc_description, dek, v.id, 'description', 1, v.id); }
+                catch (_) { /* keep whatever the server returned for description */ }
+            }
+            v.zkLocked = false;
+        } catch (_) {
+            v.name = v._zkLabel;            // can't decrypt -> fall back to the label
+            v.zkLocked = true;
+        }
+    }
+}
+
+// Re-lock: forget the decrypted names and restore the non-secret labels, so the list re-hides the
+// real data. Does NOT touch the account key (the caller decides whether to drop that).
+function zkRelockVaultNames(vaults) {
+    for (const v of (vaults || [])) {
+        if (v && v.type === 'zero_knowledge' && v.enc_name) {
+            v.name = (v._zkLabel !== undefined ? v._zkLabel : v.name);
+            v.description = null;
+            v.zkLocked = true;
+        }
+    }
+}
+
+// The label a locked zero-knowledge vault shows when its owner set none: a neutral, styled
+// placeholder (never the raw padlock emoji, per design).
+function vaultDisplayName(v) {
+    if (v && v.name) return v.name;
+    return (v && v.type === 'zero_knowledge') ? 'Encrypted vault' : 'Vault';
+}
+
+// --- Zero-knowledge lock control (vaults toolbar) --------------------------
+function _zkHasSealedVaults() {
+    return (state.allVaults || []).some(v => v && v.type === 'zero_knowledge' && v.enc_name);
+}
+
+// Reflect the current lock state in the toolbar control (hidden when the user has no ZK vaults).
+function updateZkLockControl() {
+    const btn = document.getElementById('zk-lock-control');
+    if (!btn) return;
+    if (!_zkHasSealedVaults()) { btn.style.display = 'none'; return; }
+    const unlocked = zkKeyUnlocked();
+    btn.style.display = '';
+    btn.classList.toggle('is-unlocked', unlocked);
+    btn.setAttribute('aria-pressed', unlocked ? 'true' : 'false');
+    const use = btn.querySelector('use');
+    if (use) use.setAttribute('href', unlocked ? '#i-unlock' : '#i-lock');
+    const label = document.getElementById('zk-lock-label');
+    if (label) label.textContent = unlocked ? 'Unlocked' : 'Locked';
+    btn.title = unlocked
+        ? 'Zero-knowledge vaults unlocked — click to lock and hide names again'
+        : 'Zero-knowledge vaults locked — click to unlock and reveal names';
+    if (!btn._zkWired) { btn._zkWired = true; btn.addEventListener('click', toggleZkLock); }
+}
+
+async function zkUnlockAllVaults() {
+    try {
+        await zkEnsureUnlocked();            // the shared account-key passphrase prompt
+    } catch (e) {
+        if (typeof isCodedCryptoError === 'function' && isCodedCryptoError(e)) {
+            showError(safeMessageForCode(e.code, 'unlock'));
+        } else if (!/cancel/i.test((e && e.message) || '')) {
+            showError((e && e.message) || 'Unlock failed.');
+        }
+        return;
+    }
+    try { await zkDecryptVaultNames(state.allVaults); } catch (_) {}
+    updateZkLockControl();
+    renderVaults();
+    zkResetIdleLock();
+    // Reveal the freshly-decrypted metadata with the decode animation (after the render commits).
+    requestAnimationFrame(() => { try { zkAnimateReveal(); } catch (_) {} });
+}
+
+function zkLockAllVaults() {
+    zkResetKeys();                           // forget the account key + cached DEKs
+    zkRelockVaultNames(state.allVaults);
+    updateZkLockControl();
+    renderVaults();
+    try { showInfo('Zero-knowledge vaults locked.'); } catch (_) {}
+}
+
+function toggleZkLock() {
+    if (zkKeyUnlocked()) zkLockAllVaults();
+    else zkUnlockAllVaults();
+}
+
+// --- Decode reveal animation -----------------------------------------------
+// On unlock, each .zk-field on a ZK vault card reveals its (now real) text left-to-right, each
+// position flickering through random glyphs before settling — a lightweight "decrypting" effect.
+// Pure client-side (requestAnimationFrame), only over the cards currently on screen, bounded work
+// per frame (one pass over the field's characters), so it stays cheap even with many vaults.
+const _ZK_GLYPHS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789#%&@$';
+function zkAnimateReveal(root) {
+    const scope = root || document.getElementById('vaults-list');
+    if (!scope) return;
+    scope.querySelectorAll('.vault-card[data-zk="1"] .zk-field').forEach(el => _zkDecodeField(el));
+}
+function _zkDecodeField(el) {
+    const finalText = el.textContent;
+    if (!finalText) return;
+    const chars = Array.from(finalText);
+    const total = chars.length;
+    const framesPerChar = 2;                 // settle a new character every ~2 frames -> < 1s
+    let frame = 0;
+    el.classList.add('zk-decoding');
+    const step = () => {
+        const settled = Math.min(total, Math.floor(frame / framesPerChar));
+        let out = '';
+        for (let i = 0; i < total; i++) {
+            if (i < settled || chars[i] === ' ') out += chars[i];
+            else out += _ZK_GLYPHS[(Math.random() * _ZK_GLYPHS.length) | 0];
+        }
+        el.textContent = out;
+        frame++;
+        if (settled >= total) {
+            el.textContent = finalText;      // guarantee the exact final text
+            el.classList.remove('zk-decoding');
+            return;
+        }
+        requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
 }
 
 // Lazily migrate EXISTING zero-knowledge rows whose name is still plaintext server-side:

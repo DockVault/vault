@@ -519,6 +519,13 @@
                                 <button id="vaults-view-grid" class="seg-btn active" type="button" data-vaults-view="grid" title="Grid view" aria-label="Grid view"><svg class="icon icon-sm"><use href="#i-grid"/></svg></button>
                                 <button id="vaults-view-list" class="seg-btn" type="button" data-vaults-view="list" title="List view" aria-label="List view"><svg class="icon icon-sm"><use href="#i-list"/></svg></button>
                             </div>
+                            <!-- Zero-knowledge lock control: shown only when the user has ZK vaults.
+                                 Locked -> click to unlock (reveal all ZK vault names/metadata);
+                                 unlocked -> click to forget the key and re-hide. Hidden otherwise. -->
+                            <button id="zk-lock-control" class="btn zk-lock-control" type="button" style="display:none;" aria-pressed="false">
+                                <svg class="icon"><use href="#i-lock" id="zk-lock-icon"/></svg>
+                                <span id="zk-lock-label">Locked</span>
+                            </button>
                             <button id="create-vault-btn" class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg> Create Vault</button>
                         </div>
                     </div>
