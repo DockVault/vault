@@ -508,6 +508,31 @@ def test_build_env_lines_writes_ports_only_when_nondefault():
     assert env4["SFTP_HOST_PORT"] == "2200"
 
 
+def test_build_env_lines_writes_sftp_staging_size_only_when_nondefault():
+    base = {
+        "server_name": "localhost", "encryption_key": dv.gen_fernet_key(),
+        "jwt_secret_key": dv.gen_hex(32), "vault_db_password": dv.gen_hex(16),
+        "redis_password": dv.gen_hex(24), "admin_username": "admin",
+        "admin_email": "a@example.com", "admin_password": "Strong-Pass-1234", "compose_profiles": "combined",
+    }
+    # SFTP on, default staging size -> not written (the compose/app default 512 applies)
+    env = dv.parse_env("\n".join(dv.build_env_lines(dict(base, run_sftp=True, sftp_staging_tmpfs_mb=512))))
+    assert "SFTP_STAGING_TMPFS_MB" not in env
+    # SFTP on, unset -> not written
+    env_unset = dv.parse_env("\n".join(dv.build_env_lines(dict(base, run_sftp=True, sftp_staging_tmpfs_mb=None))))
+    assert "SFTP_STAGING_TMPFS_MB" not in env_unset
+    # SFTP on, non-default -> written
+    env2 = dv.parse_env("\n".join(dv.build_env_lines(dict(base, run_sftp=True, sftp_staging_tmpfs_mb=1024))))
+    assert env2["SFTP_STAGING_TMPFS_MB"] == "1024"
+    # a non-default staging size is ignored when SFTP is off (combined mode)
+    env3 = dv.parse_env("\n".join(dv.build_env_lines(dict(base, run_sftp=False, sftp_staging_tmpfs_mb=1024))))
+    assert "SFTP_STAGING_TMPFS_MB" not in env3
+    # split mode always runs the SFTP container -> a non-default staging size IS written even with run_sftp off
+    env4 = dv.parse_env("\n".join(dv.build_env_lines(dict(
+        base, compose_profiles="split", run_sftp=False, sftp_staging_tmpfs_mb=768))))
+    assert env4["SFTP_STAGING_TMPFS_MB"] == "768"
+
+
 def test_gen_deployment_id_is_short_hex():
     ids = {dv.gen_deployment_id() for _ in range(25)}
     assert all(len(i) == 8 and all(c in "0123456789abcdef" for c in i) for i in ids)

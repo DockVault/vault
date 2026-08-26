@@ -69,6 +69,14 @@ class Settings(BaseSettings):
     # Keeps its historical filename so an existing deployment's key is found unchanged on upgrade;
     # new installs write an Ed25519 key at this path (the loader accepts either kind).
     sftp_host_key_path: str = Field(default="./keys/ssh_host_rsa_key")
+    # The size, in MiB, of the RAM tmpfs the compose files back SFTP upload staging with, so the
+    # buffered plaintext never touches the persistent disk. Because a buffered upload cannot exceed
+    # that tmpfs, this also caps the SFTP upload size until true streaming lands. The compose passes
+    # the tmpfs size into the SFTP container's environment so this clamp always matches the real
+    # tmpfs. The DEFAULT here is 0 (unclamped) ON PURPOSE: a deployment whose compose does NOT mount
+    # the tmpfs -- e.g. one upgraded in place from before this existed -- must not be silently
+    # size-capped while its staging is still on the volume. .env.example ships the recommended 512.
+    sftp_staging_tmpfs_mb: int = Field(default=0)
     
     # API Server Configuration
     api_host: str = Field(default="0.0.0.0")  # Bind to all interfaces for network access

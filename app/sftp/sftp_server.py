@@ -82,9 +82,26 @@ active_transports: Dict[str, paramiko.Transport] = {}
 transport_lock = threading.Lock()
 
 # Where incoming uploads are buffered (plaintext) before being pushed through the
-# encryption pipeline at handle close. Lives inside the storage volume so it is on
-# the same filesystem as the final encrypted file.
+# encryption pipeline at handle close. The path sits inside the storage volume, but the compose
+# files mount a size-capped tmpfs (RAM) over this subdirectory, so the plaintext buffer never
+# reaches persistent disk. A deployment whose compose does not mount that tmpfs keeps buffering on
+# the volume as before (and should set SFTP_STAGING_TMPFS_MB=0 so uploads are not size-clamped).
 _SFTP_TMP_DIR = Path(settings.file_storage_path) / ".sftp_tmp"
+
+
+def _staging_capped_max(eff_max_bytes: int, tmpfs_mb: int) -> int:
+    """The per-upload byte cap, clamped to the SFTP staging tmpfs budget.
+
+    A buffered SFTP upload cannot be larger than the tmpfs it is staged in, so the per-file limit
+    is capped there and an oversized upload is refused in-stream -- a clean failure -- rather than
+    filling the tmpfs mid-write. ``tmpfs_mb <= 0`` disables the clamp (staging is on the volume, not
+    a tmpfs); an ``eff_max_bytes`` of 0 means "no configured per-file limit", so the budget itself
+    becomes the limit.
+    """
+    if tmpfs_mb and tmpfs_mb > 0:
+        budget = tmpfs_mb * 1024 * 1024
+        return budget if eff_max_bytes <= 0 else min(eff_max_bytes, budget)
+    return eff_max_bytes
 
 # POSIX open-flag access mode mask (app/sftp/sftp_server.py only runs inside the Linux
 # container, but be defensive if os lacks the constant).
@@ -163,6 +180,10 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # marks the upload for discard at close (an SFTP close can't signal failure).
         self.max_bytes = 0
         self.overlimit = False
+        # A write raised (e.g. the staging tmpfs ran out of space under concurrent uploads). Like
+        # overlimit, this marks the upload for discard at close so a truncated buffer is never
+        # finalized -- an SFTP close cannot report failure, so the discard is the only signal.
+        self.write_failed = False
         # shared
         self.attrs: Optional[paramiko.SFTPAttributes] = None
 
@@ -203,6 +224,9 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
             self.writefile.write(data)
             return paramiko.SFTP_OK
         except Exception as e:  # noqa: BLE001
+            # The buffer write failed (a full staging tmpfs is the expected cause). Mark the
+            # upload for discard so close() does not finalize the partial bytes already written.
+            self.write_failed = True
             safe_event('write.failed', e)
             return paramiko.SFTP_FAILURE
 
@@ -223,8 +247,17 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
 
         # Write mode: assemble + encrypt + persist.
         if self.writefile is not None:
+            # Flush and close are SEPARATE: the buffer is a BufferedWriter, so the final
+            # sub-buffer-size tail of the upload only reaches the staging file here, at flush().
+            # If the tmpfs filled between the last write() and this flush (concurrent uploads),
+            # flush() raises and the buffer is TRUNCATED -- mark it for discard so close() below
+            # does not finalize partial bytes. close() itself is best-effort.
             try:
                 self.writefile.flush()
+            except Exception as e:  # noqa: BLE001
+                self.write_failed = True
+                safe_event('upload.flush.failed', e)
+            try:
                 self.writefile.close()
             except Exception:  # noqa: BLE001
                 pass
@@ -233,6 +266,11 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
                 # The upload exceeded the per-file max mid-stream: discard it (don't persist),
                 # leaving any existing same-name file intact. The temp buffer is removed below.
                 safe_event('upload.discarded.too-large', limit=self.max_bytes)
+            elif self.write_failed:
+                # A buffer write failed mid-stream (e.g. the staging tmpfs filled): the buffer is
+                # truncated, so discard it rather than finalize partial bytes. Any existing
+                # same-name file is left intact.
+                safe_event('upload.discarded.write-failed')
             elif self.finalizer is not None and self.writepath:
                 try:
                     self.finalizer(self.writepath)
@@ -818,6 +856,9 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             if not _up.file_type_allowed(filename, _up.parse_allowed_exts(_sblob.get("allowed_file_types"))):
                 return paramiko.SFTP_PERMISSION_DENIED
             _eff_max = _up.effective_max_file_bytes((settings.max_file_size_mb or 0) * 1024 * 1024, _sblob.get("max_file_size"))
+            # A buffered upload can't exceed the staging tmpfs; refuse an oversized one in-stream
+            # rather than filling the tmpfs mid-write.
+            _eff_max = _staging_capped_max(_eff_max, settings.sftp_staging_tmpfs_mb)
             try:
                 folder_id = self._resolve_folder(db, vault.id, segments[1:-1])
             except _PathNotFound:

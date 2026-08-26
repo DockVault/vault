@@ -414,6 +414,12 @@ def build_env_lines(cfg):
     sftp_active = cfg.get("run_sftp") or compose_profile == "split"
     if sftp_active and cfg.get("sftp_host_port") and int(cfg["sftp_host_port"]) != 2322:
         bare("SFTP_HOST_PORT", int(cfg["sftp_host_port"]))
+    # SFTP upload-staging tmpfs size (MiB) — also the max SFTP upload size until streaming lands.
+    # Written only when the operator chose a non-default value; otherwise the compose/app default
+    # (512) applies, so an install that never mentions it authors the .env it always did.
+    if sftp_active and cfg.get("sftp_staging_tmpfs_mb") not in (None, "") \
+            and int(cfg["sftp_staging_tmpfs_mb"]) != 512:
+        bare("SFTP_STAGING_TMPFS_MB", int(cfg["sftp_staging_tmpfs_mb"]))
     if cfg.get("update_check_enabled"):
         bare("UPDATE_CHECK_ENABLED", "true")
     # Deployment storage ceiling. Only written when the operator chose one: left out, the app's
@@ -1166,6 +1172,8 @@ def new_set_config(current_env, new_prefix, new_id):
         "run_sftp": truthy("RUN_SFTP"),
         "web_host_port": _port_or(current_env.get("WEB_HOST_PORT"), 443),
         "sftp_host_port": _port_or(current_env.get("SFTP_HOST_PORT"), 2322),
+        # Keep a custom SFTP staging size across a fresh volume set, like the ports above.
+        "sftp_staging_tmpfs_mb": (current_env.get("SFTP_STAGING_TMPFS_MB") or "").strip() or None,
         "update_check_enabled": truthy("UPDATE_CHECK_ENABLED"),
         "plan_log_pull": truthy("PLAN_LOG_PULL"),
         "log_token_pepper": gen_hex(32) if truthy("PLAN_LOG_PULL") else "",
@@ -2670,6 +2678,9 @@ class DockVault:
             "run_sftp": enable_sftp,
             "web_host_port": web_port,
             "sftp_host_port": sftp_port,
+            # SFTP staging tmpfs size — install-time only (a deploy-time infra knob, not a live
+            # limit, so it is not in the Limits menu). --sftp-staging-tmpfs-mb or hand-edit .env.
+            "sftp_staging_tmpfs_mb": (getattr(args, "sftp_staging_tmpfs_mb", None) if args else None),
             "update_check_enabled": update_check,
             "plan_log_pull": log_pull,
             "log_token_pepper": gen_hex(32) if log_pull else "",
@@ -4206,6 +4217,10 @@ def build_parser():
     sp.add_argument("--key-path", dest="key_path", help="bring-your-own private key (PEM)")
     sp.add_argument("--web-port", dest="web_port", type=int, help="host port for HTTPS (default 443)")
     sp.add_argument("--sftp-port", dest="sftp_port", type=int, help="host port for SFTP (default 2322)")
+    sp.add_argument("--sftp-staging-tmpfs-mb", dest="sftp_staging_tmpfs_mb", type=int,
+                    help="size (MiB) of the RAM tmpfs SFTP buffers each upload's plaintext in, so it "
+                         "never hits disk (512 by default). Also caps the SFTP upload size until "
+                         "streaming lands, and counts toward the SFTP container's memory limit")
     sp.add_argument("--enable-sftp", dest="enable_sftp", action="store_true", help="also serve SFTP")
     sp.add_argument("--split", dest="split", action="store_true", help="two containers (vault-api + vault-sftp)")
     sp.add_argument("--image-source", dest="image_source", choices=("release", "build"),
