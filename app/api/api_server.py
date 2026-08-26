@@ -15517,6 +15517,10 @@ def _run_lightweight_migrations():
             # Delegated vault administration: a member with manage_permission is a "Manager".
             "ALTER TABLE vault_members ADD COLUMN IF NOT EXISTS manage_permission BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS folder_id UUID",
+            # Notes are sealed at rest (a marker + ciphertext); a title that once fit String(255)
+            # no longer does, so widen it (and the public-link title snapshot) to TEXT. Idempotent.
+            "ALTER TABLE notes ALTER COLUMN title TYPE TEXT",
+            "ALTER TABLE note_public_links ALTER COLUMN title_snapshot TYPE TEXT",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS note VARCHAR(500)",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS can_create_temp_credentials BOOLEAN DEFAULT FALSE",
             # Least-privilege scope for temp credentials (the temp_credential_vault_access
@@ -15908,6 +15912,21 @@ def _rehash_plaintext_session_tokens():
         print(f"⚠ session-token rehash skipped: {e}")
 
 
+def _backfill_note_content():
+    """Seal any legacy plaintext note/link content at rest (idempotent). Best-effort: never block
+    boot. Runs after the widen DDL. The logic lives in app.core.note_migrations so it is testable."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.note_migrations import backfill_note_content
+        with get_db_context() as db:
+            sealed = backfill_note_content(db)
+            if sealed:
+                db.commit()
+                print(f"[OK] Sealed {sealed} note/link row(s) with plaintext content at rest")
+    except Exception as e:  # noqa: BLE001 — best-effort hardening migration, never block boot
+        print(f"⚠ note-content backfill skipped: {e}")
+
+
 def _backfill_encrypted_names():
     """One-time, idempotent eager encryption of existing plaintext file/folder names in
     STANDARD vaults (so names already on disk before this version stop being stored in
@@ -16069,6 +16088,7 @@ async def lifespan(app: FastAPI):
     from app.core.health import refresh_schema_state
     print(f"Schema state: {refresh_schema_state(recorded=recorded)}")
     _rehash_plaintext_session_tokens()  # hash any legacy plaintext session tokens at rest (no logout)
+    _backfill_note_content()            # seal any legacy plaintext note/link content at rest
     _backfill_encrypted_names()
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
     _seed_admin_user()

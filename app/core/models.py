@@ -1255,7 +1255,9 @@ class Note(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     owner_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    title = Column(String(255), nullable=False, default='')
+    # Text, not String(255): sealed at rest (marker + ciphertext), which no longer fits 255. The boot
+    # DDL widens the same column on an already-deployed DB; here it makes create_all build it as TEXT.
+    title = Column(Text, nullable=False, default='')
     body = Column(Text, nullable=False, default='')
     is_favorite = Column(Boolean, nullable=False, default=False)
     # A received copy carries who sent it; a self-authored note leaves these NULL. sent_from_user_id
@@ -1342,8 +1344,9 @@ class NoteLink(Base):
     token = Column(String(64), nullable=False, unique=True, index=True)
     token_len = Column(Integer, nullable=False)
 
-    # Frozen content snapshot.
-    title_snapshot = Column(String(255), nullable=False, default='')
+    # Frozen content snapshot. Text (not String(255)): sealed at rest like the note it copies; the
+    # boot DDL widens the same column on an already-deployed DB.
+    title_snapshot = Column(Text, nullable=False, default='')
     body_snapshot = Column(Text, nullable=False, default='')
 
     # Frozen effective policy (resolved from the tag floor + owner tightening at creation).
@@ -1362,6 +1365,70 @@ class NoteLink(Base):
     __table_args__ = (
         Index('idx_note_link_owner', 'owner_id'),
     )
+
+
+# --- Transparent note-content sealing (personal notes + public-link snapshots) ---------------
+# Notes store title/body sealed at rest (a self-describing 'nenc1:' marker + AES-GCM keyed per row);
+# the public note LINK stores a frozen title_snapshot/body_snapshot the same way. Decrypt on
+# load/refresh into the same attribute via set_committed_value (no write-back), so every reader keeps
+# using note.title / note.body / link.*_snapshot unchanged. A legacy plaintext value (unmarked) is
+# left as-is; a marked value that does not decrypt (e.g. a user who literally typed the marker text,
+# before the boot backfill sealed it) is also left as-is -- never surfacing a placeholder as content.
+def _decrypt_note_fields(target, *_args):
+    from app.core.security import decrypt_note_field, is_note_sealed
+    for _field in ('title', 'body'):
+        _v = getattr(target, _field, None)
+        if is_note_sealed(_v):
+            try:
+                _sa_attributes.set_committed_value(
+                    target, _field, decrypt_note_field(target.id, _v, _field))
+            except Exception:  # noqa: BLE001 — marker-prefixed non-seal / wrong key: read as-is
+                pass
+
+
+def _decrypt_notelink_snapshot(target, *_args):
+    from app.core.security import decrypt_note_field, is_note_sealed
+    for _field in ('title_snapshot', 'body_snapshot'):
+        _v = getattr(target, _field, None)
+        if is_note_sealed(_v):
+            try:
+                _sa_attributes.set_committed_value(
+                    target, _field, decrypt_note_field(target.id, _v, _field))
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _seal_note_content_before_flush(session, _flush_context, _instances):
+    """Seal note/link content at flush, so no write site can miss it (the in-place marker diverges the
+    ORM's committed value from the DB, so a plaintext write-back would silently unseal). Seals only
+    content that is NEW or was MODIFIED this flush -- keyed off the attribute HISTORY, not the marker,
+    so an unrelated update never re-encrypts unchanged content and a value whose plaintext starts with
+    the marker is still sealed. Assigns the row id first, since the per-row key needs it."""
+    from sqlalchemy import inspect as _sa_inspect
+    from app.core.security import encrypt_note_field
+    _specs = ((Note, ('title', 'body')), (NoteLink, ('title_snapshot', 'body_snapshot')))
+    for _obj in list(session.new) + list(session.dirty):
+        for _model, _fields in _specs:
+            if not isinstance(_obj, _model):
+                continue
+            _is_new = _obj in session.new
+            if _is_new and getattr(_obj, 'id', None) is None:
+                _obj.id = uuid.uuid4()
+            _insp = _sa_inspect(_obj)
+            for _field in _fields:
+                if _is_new or _insp.attrs[_field].history.has_changes():
+                    _val = getattr(_obj, _field, None)
+                    if _val:                       # empty '' stays '' (read-old returns '')
+                        setattr(_obj, _field, encrypt_note_field(_obj.id, _val, _field))
+            break
+
+
+from sqlalchemy.orm import Session as _SaSessionForNoteSeal
+_sa_event.listen(Note, 'load', _decrypt_note_fields)
+_sa_event.listen(Note, 'refresh', _decrypt_note_fields)
+_sa_event.listen(NoteLink, 'load', _decrypt_notelink_snapshot)
+_sa_event.listen(NoteLink, 'refresh', _decrypt_notelink_snapshot)
+_sa_event.listen(_SaSessionForNoteSeal, 'before_flush', _seal_note_content_before_flush)
 
 
 class RateLimitRecord(Base):
