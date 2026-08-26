@@ -317,7 +317,9 @@ class TemporaryCredential(Base):
     
     temp_username = Column(String(255), unique=True, nullable=False, index=True)
     credential_hash = Column(String(255), nullable=False)  # Bcrypt hash for SFTP authentication
-    encrypted_password = Column(Text, nullable=True)  # DEPRECATED - No longer used (security enhancement)
+    # NOTE: the removed `encrypted_password` column stored a retrievable copy of the temp password.
+    # It has been unused (always NULL) since the password became show-once-at-creation; the boot DDL
+    # drops it (ALTER TABLE ... DROP COLUMN IF EXISTS encrypted_password). See docs/upgrade-matrix.json.
     password_shown = Column(Boolean, default=True)  # Tracks if user viewed password at creation
     
     created_at = Column(DateTime, default=datetime.utcnow)

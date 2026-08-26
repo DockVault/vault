@@ -892,8 +892,7 @@ class AuthService:
             user_id=user_id,
             temp_username=temp_username,
             credential_hash=credential_hash,
-            encrypted_password=None,  # No longer stored (security enhancement)
-            password_shown=True,  # User receives password in this response
+            password_shown=True,  # User receives password in this response (never stored for re-reveal)
             deactivate_at=deactivate_at,
             expires_at=expires_at,
             note=(note.strip() if note else None),
@@ -970,10 +969,10 @@ class AuthService:
         }
 
     def retrieve_temp_password(self, temp_username: str) -> Optional[str]:
-        """Temporary-credential passwords are bcrypt-hashed one-way and never
-        stored in a retrievable form (encrypted_password is NULL by design), so
-        they cannot be fetched after creation. Always returns None; the API
-        surfaces this as a 404 "password not available".
+        """Temporary-credential passwords are bcrypt-hashed one-way and are
+        never stored in any retrievable form, so they cannot be fetched after
+        creation. Always returns None; the API surfaces this as a 404 "password
+        not available".
         """
         return None
 

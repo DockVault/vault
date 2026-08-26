@@ -4979,8 +4979,9 @@ async def list_temp_credentials(
             'active_session_count': len(sessions_data),
             'note': cred.note,
             'can_create_temp_credentials': bool(getattr(cred, 'can_create_temp_credentials', False)),
-            # Password available via dedicated endpoint for better security and caching
-            'has_password': cred.encrypted_password is not None
+            # A temp password is show-once at creation and never stored for re-reveal, so there is
+            # never a retrievable password to fetch (the reveal endpoint always 404s).
+            'has_password': False
         }
         
         # Note: Passwords are NOT decrypted in list endpoint for:
@@ -15540,6 +15541,11 @@ def _run_lightweight_migrations():
             "WHERE vault_access_mode IS NULL",
             "ALTER TABLE temporary_credentials ALTER COLUMN vault_access_mode SET NOT NULL",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS created_by_temp_credential_id UUID",
+            # Drop the long-deprecated encrypted_password column: it held a retrievable copy of the temp
+            # password and has been NULL for every row since the password became show-once-at-creation.
+            # Removing it takes the column (and its SQL-readable data) out of the schema. Idempotent - a
+            # fresh install (whose model never declared the column) is a clean no-op.
+            "ALTER TABLE temporary_credentials DROP COLUMN IF EXISTS encrypted_password",
             # Per-vault SFTP password proof: fingerprint of the vault password hash proven
             # when this grant was minted (re-checked on SFTP access; voided by a rotation).
             "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS vault_password_fingerprint VARCHAR(64)",
