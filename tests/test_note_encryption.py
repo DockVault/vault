@@ -294,6 +294,51 @@ def test_backfill_seals_legacy_plaintext_and_is_idempotent(_pg):
         s.close()
 
 
+@pytest.mark.docker
+def test_backfill_never_reseals_a_marked_value_it_cannot_decrypt(_pg):
+    """A row that carries the seal marker but will not decrypt is what a genuine seal under a
+    MISMATCHED ENCRYPTION_KEY looks like. The backfill must LEAVE IT UNTOUCHED -- re-sealing would
+    double-encrypt it under a key nobody keeps (permanent, silent loss on one wrong-key boot). Here
+    we stand in for the wrong-key case with an AAD mismatch: a token sealed and bound to a DIFFERENT
+    row id, which the backfill cannot distinguish from a wrong-key seal and must treat identically."""
+    import uuid
+    from sqlalchemy import text
+    from app.core.security import encrypt_note_field, decrypt_note_field
+    from app.core.note_migrations import backfill_note_content
+    s = _session(_pg)
+    try:
+        u = _a_user(s)
+        nid = uuid.uuid4()
+        other = uuid.uuid4()
+        # A genuine seal, but bound (via AAD) to `other`, not to `nid`. Stored under `nid` it carries
+        # the marker yet cannot be decrypted for `nid` -- exactly the wrong-key shape.
+        foreign_title = encrypt_note_field(other, "bank pin 4417", "title")
+        assert foreign_title.startswith(_MARK)
+        s.execute(text("INSERT INTO notes (id, owner_id, title, body, is_favorite, adopted, "
+                       "created_at, updated_at) VALUES (:i,:o,:t,:b,false,true,now(),now())"),
+                  {"i": str(nid), "o": str(u.id), "t": foreign_title, "b": "plain body"})
+        s.commit()
+        assert _raw(_pg, "notes", "title", nid) == foreign_title, "seeded the undecryptable marked value"
+
+        updated = backfill_note_content(s)
+        s.commit()
+
+        after = _raw(_pg, "notes", "title", nid)
+        # The undecryptable marked title is BYTE-IDENTICAL: never re-sealed (no double-encryption).
+        assert after == foreign_title, "backfill must never re-seal a marker-carrying value"
+        # It is still recoverable under its true binding -- nothing was lost.
+        assert decrypt_note_field(other, after, "title") == "bank pin 4417"
+        # The genuinely-plaintext body on the SAME row WAS still sealed (backfill still does its job).
+        assert _raw(_pg, "notes", "body", nid).startswith(_MARK)
+        assert updated >= 1
+        s.expire_all()
+        # Idempotent + non-lossy across boots: a second run re-seals nothing (title skipped, not
+        # re-encrypted each time).
+        assert backfill_note_content(s) == 0
+    finally:
+        s.close()
+
+
 def test_wrong_row_decrypt_raises():
     if not _load_fernet_ok():
         pytest.skip("cryptography not available")
