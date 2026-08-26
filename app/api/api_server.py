@@ -9807,7 +9807,35 @@ async def update_vault_info(
                     detail="Vault description too long (max 1000 characters)"
                 )
             vault.description = description.strip() if description else None
-        
+
+        # Zero-knowledge rename: the browser sends the sealed name/description (zk2: blobs the server
+        # cannot read). Store them and leave the non-secret label (vault.name) untouched; the
+        # plaintext description stays NULL. Only ever acts on a ZK vault, and only on the sealed
+        # fields, so a plaintext name can never overwrite a ZK vault's seal.
+        if vault.type == 'zero_knowledge' and ('enc_name' in vault_update or 'enc_description' in vault_update):
+            from app.core.security import is_zk_sealed_name
+            if 'enc_name' in vault_update:
+                _en = vault_update['enc_name']
+                if _en is not None and not is_zk_sealed_name(_en):
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                        detail="A zero-knowledge vault name must be sealed in the browser.")
+                if _en:
+                    # Legacy re-seal: a ZK vault whose name was still plaintext (enc_name NULL) is
+                    # being sealed for the first time -> drop the now-redundant plaintext name so the
+                    # server no longer holds it (it becomes a label-less encrypted vault). A rename of
+                    # an already-sealed vault keeps its label.
+                    _was_legacy = vault.enc_name is None
+                    vault.enc_name = _en
+                    if _was_legacy:
+                        vault.name = None
+            if 'enc_description' in vault_update:
+                _ed = vault_update['enc_description']
+                if _ed is not None and not is_zk_sealed_name(_ed):
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                        detail="A zero-knowledge vault description must be sealed in the browser.")
+                vault.enc_description = _ed        # None clears a removed description
+                vault.description = None           # a ZK vault never stores a plaintext description
+
         vault.updated_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(vault)

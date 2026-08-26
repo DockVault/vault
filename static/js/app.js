@@ -11514,12 +11514,39 @@ async function zkUnlockAllVaults() {
         }
         return;
     }
+    // Migrate any EXISTING zero-knowledge vaults whose name is still plaintext server-side (best
+    // effort), then decrypt everything for display.
+    try { await zkSealLegacyVaultNames(); } catch (_) {}
     try { await zkDecryptVaultNames(state.allVaults); } catch (_) {}
     updateZkLockControl();
     renderVaults();
     zkResetIdleLock();
     // Reveal the freshly-decrypted metadata with the decode animation (after the render commits).
     requestAnimationFrame(() => { try { zkAnimateReveal(); } catch (_) {} });
+}
+
+// Migrate EXISTING zero-knowledge vaults whose name is still plaintext at rest (enc_name absent):
+// seal the name/description in the browser and PATCH the blobs, so the server swaps the plaintext
+// for ciphertext (and drops the plaintext name — see update_vault_info). Fire-and-forget, best
+// effort, idempotent — the next load returns the sealed form. Runs on unlock (the DEK is available).
+async function zkSealLegacyVaultNames() {
+    const legacy = (state.allVaults || []).filter(v =>
+        v && v.type === 'zero_knowledge' && !v.enc_name && v.name);
+    if (!legacy.length) return;
+    for (const v of legacy) {
+        try {
+            const dek = await zkGetVaultDek(v.id, 1);
+            const body = { enc_name: await eccLib().encryptName(v.name, dek, v.id, 'name', 1, v.id) };
+            if (v.description) {
+                body.enc_description = await eccLib().encryptName(v.description, dek, v.id, 'description', 1, v.id);
+            }
+            await apiRequest(`/vaults/${v.id}`, { method: 'PATCH', body: JSON.stringify(body), silent: true });
+            // Reflect locally: the name is now the sealed real name; no label was set for a legacy
+            // vault, so it shows the neutral placeholder while locked until the owner sets one.
+            v.enc_name = body.enc_name;
+            v._zkLabel = null;
+        } catch (_) { /* missing DEK / offline — retried on the next unlock */ }
+    }
 }
 
 function zkLockAllVaults() {
@@ -14534,24 +14561,43 @@ async function handleEditVaultInfo(e) {
     }
     
     try {
-        const updatedVault = await apiRequest(`/vaults/${state.currentVault.id}`, {
+        const cv = state.currentVault;
+        const isZk = cv && cv.type === 'zero_knowledge';
+        let body;
+        if (isZk) {
+            // Seal the (possibly changed) name + description in the browser; the server never sees
+            // the plaintext. The non-secret label (server-side `name`) is left unchanged here.
+            const dek = await zkGetVaultDek(cv.id, 1);
+            body = {
+                enc_name: await eccLib().encryptName(name, dek, cv.id, 'name', 1, cv.id),
+                enc_description: description
+                    ? await eccLib().encryptName(description, dek, cv.id, 'description', 1, cv.id)
+                    : null,
+            };
+        } else {
+            body = { name: name, description: description || null };
+        }
+        const updatedVault = await apiRequest(`/vaults/${cv.id}`, {
             method: 'PATCH',
-            body: JSON.stringify({
-                name: name,
-                description: description || null
-            })
+            body: JSON.stringify(body)
         });
-        
-        // Update local state
-        state.currentVault.name = updatedVault.name;
-        state.currentVault.description = updatedVault.description;
-        
-        // Update UI
+
+        // Update local state. For a ZK vault the server echoes the label as `name`, so keep the
+        // edited real name/description locally rather than overwriting them with the label.
+        if (isZk) {
+            cv.name = name;
+            cv.description = description || null;
+        } else {
+            cv.name = updatedVault.name;
+            cv.description = updatedVault.description;
+        }
+
+        // Update UI (show the real, edited values)
         const vaultTitle = document.getElementById('vault-view-title');
-        if (vaultTitle) vaultTitle.textContent = updatedVault.name;
-        
+        if (vaultTitle) vaultTitle.textContent = cv.name;
+
         const vaultDesc = document.getElementById('vault-view-description');
-        if (vaultDesc) vaultDesc.textContent = updatedVault.description || 'No description';
+        if (vaultDesc) vaultDesc.textContent = cv.description || 'No description';
         
         showSuccess('Vault information updated successfully');
         closeModal('edit-vault-info-modal');
