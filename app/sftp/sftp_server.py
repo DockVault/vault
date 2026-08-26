@@ -72,6 +72,7 @@ from app.services.vault_service import FileNotFoundError as VaultFileNotFoundErr
 from app.services.audit_logger import AuditLogger
 from app.core.config import settings
 from app.sftp.host_key import generate_ed25519_host_key, load_host_key
+from app.core.session_hash_utils import hash_session_token
 from app.core.safe_log import safe_event
 from app.core.temp_scope import is_scoped, effective_vault_caps, scope_ids
 from app.core.security import name_blind_index
@@ -396,7 +397,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         try:
             with get_db_context() as db:
                 session = db.query(ActiveSession).filter(
-                    ActiveSession.session_token == token,
+                    ActiveSession.session_token == hash_session_token(token),
                     ActiveSession.is_active == True  # noqa: E712
                 ).first()
                 if not session:
@@ -1417,7 +1418,7 @@ class SFTPServer(paramiko.ServerInterface):
                             deny = "SFTP requires a temporary credential for this account"
                         if deny is not None:
                             db.query(ActiveSession).filter(
-                                ActiveSession.session_token == session_token
+                                ActiveSession.session_token == hash_session_token(session_token)
                             ).update({"is_active": False})
                             db.commit()
                             audit_logger.log_login_failure(username, self.client_address, deny)
@@ -1763,10 +1764,12 @@ def handle_sftp_client(
             return
 
         # Register transport in global registry if authenticated (key-auth sessions
-        # are created in check_channel_request, so session_token is set by now).
+        # are created in check_channel_request, so session_token is set by now). Keyed by the
+        # token's hash — the same value the DB stores and the termination signal carries — so a
+        # revocation published by the API (which sends the stored hash) finds this transport.
         if server.session_token:
             with transport_lock:
-                active_transports[server.session_token] = transport
+                active_transports[hash_session_token(server.session_token)] = transport
             safe_event('transport.registered', session=server.session_token[:8])
 
         # Keep connection alive
@@ -1777,10 +1780,10 @@ def handle_sftp_client(
         safe_event('client.handling.failed', e, peer=client_address)
 
     finally:
-        # Unregister transport
+        # Unregister transport (same hashed key it was registered under).
         if transport and server and server.session_token:
             with transport_lock:
-                active_transports.pop(server.session_token, None)
+                active_transports.pop(hash_session_token(server.session_token), None)
             safe_event('transport.unregistered', session=server.session_token[:8])
 
         if transport:

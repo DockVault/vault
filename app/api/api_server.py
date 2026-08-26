@@ -38,6 +38,7 @@ bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
 from app.core.chunk_cleanup import fail_chunk_session
+from app.core.session_hash_utils import hash_session_token
 from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink
 from app.core import sharing_policy
 from app.core import note_link_policy
@@ -1320,7 +1321,7 @@ async def get_current_user(
     if session_token and not is_temporary:
         from app.core.models import ActiveSession
         revoked_session = db.query(ActiveSession.revoked).filter(
-            ActiveSession.session_token == session_token
+            ActiveSession.session_token == hash_session_token(session_token)
         ).first()
         if revoked_session is not None and revoked_session[0]:
             raise HTTPException(
@@ -1335,7 +1336,7 @@ async def get_current_user(
         from datetime import timedelta
 
         session = db.query(ActiveSession).filter(
-            ActiveSession.session_token == session_token,
+            ActiveSession.session_token == hash_session_token(session_token),
             ActiveSession.is_active == True
         ).first()
 
@@ -5360,7 +5361,7 @@ def _ws_session_invalid(session_token: str, user_id: str, is_temporary: bool) ->
         db = SessionLocal()
         try:
             row = db.query(_AS.revoked, _AS.is_active).filter(
-                _AS.session_token == session_token).first()
+                _AS.session_token == hash_session_token(session_token)).first()
             if row is None:
                 return True  # session row gone -> treat as terminated
             revoked, is_active = row
@@ -5458,7 +5459,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                     raise ValueError("Session terminated")
                 if not is_temporary:
                     _rev = _wsdb.query(_WsAS.revoked).filter(
-                        _WsAS.session_token == session_token
+                        _WsAS.session_token == hash_session_token(session_token)
                     ).first()
                     if _rev is not None and _rev[0]:
                         raise ValueError("Session terminated")
@@ -5474,7 +5475,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                     from app.core.models import TemporaryCredential as _WsTC
                     from datetime import timedelta as _wstd
                     _sess = _wsdb.query(_WsAS.last_activity, _WsAS.temp_credential_id).filter(
-                        _WsAS.session_token == session_token,
+                        _WsAS.session_token == hash_session_token(session_token),
                         _WsAS.is_active == True,  # noqa: E712
                     ).first()
                     if _sess is None:
@@ -14540,7 +14541,7 @@ async def logout(
         if session_token:
             # Invalidate session in database
             session = db.query(ActiveSession).filter(
-                ActiveSession.session_token == session_token
+                ActiveSession.session_token == hash_session_token(session_token)
             ).first()
             if session:
                 session.is_active = False
@@ -15892,6 +15893,21 @@ def _verify_retired_object_id_triggers(db) -> None:
         )
 
 
+def _rehash_plaintext_session_tokens():
+    """Hash any legacy plaintext session token at rest (idempotent, no forced logout). Best-effort:
+    never block boot. The logic lives in app.core.session_migrations so it is unit-testable."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.session_migrations import rehash_plaintext_session_tokens
+        with get_db_context() as db:
+            rehashed = rehash_plaintext_session_tokens(db)
+            if rehashed:
+                db.commit()
+                print(f"[OK] Rehashed {rehashed} plaintext session token(s) at rest")
+    except Exception as e:  # noqa: BLE001 — best-effort hardening migration, never block boot
+        print(f"⚠ session-token rehash skipped: {e}")
+
+
 def _backfill_encrypted_names():
     """One-time, idempotent eager encryption of existing plaintext file/folder names in
     STANDARD vaults (so names already on disk before this version stop being stored in
@@ -16052,6 +16068,7 @@ async def lifespan(app: FastAPI):
     # After the replay, so the remembered value describes what this boot actually achieved.
     from app.core.health import refresh_schema_state
     print(f"Schema state: {refresh_schema_state(recorded=recorded)}")
+    _rehash_plaintext_session_tokens()  # hash any legacy plaintext session tokens at rest (no logout)
     _backfill_encrypted_names()
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
     _seed_admin_user()

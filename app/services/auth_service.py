@@ -1000,8 +1000,12 @@ class AuthService:
             session = self.db.query(ActiveSession).filter(
                 ActiveSession.id == uuid.UUID(session_id)
             ).first()
-            
-            if session and session.is_active:
+
+            # Fail closed on revocation: the cached entry proves the token was valid once, but a
+            # session revoked (logout / lock / deactivate) AFTER it was cached is still in Redis
+            # until its TTL. Re-check the durable DB flags here so a revoked session is not honoured
+            # off a stale cache.
+            if session and session.is_active and not session.revoked:
                 # Check expiration
                 if session.expires_at and datetime.now(timezone.utc) > session.expires_at:
                     self._terminate_session(session)
@@ -1013,14 +1017,16 @@ class AuthService:
                 
                 return session.user, session
         
-        # Fallback to database
+        # Fallback to database. The token is stored as its SHA-256 hash, so match on the hash of
+        # the presented token; also require the session to be neither inactive nor revoked.
         session = self.db.query(ActiveSession).filter(
             and_(
-                ActiveSession.session_token == session_token,
-                ActiveSession.is_active == True
+                ActiveSession.session_token == hash_session_token(session_token),
+                ActiveSession.is_active == True,
+                ActiveSession.revoked == False  # noqa: E712
             )
         ).first()
-        
+
         if not session:
             return None
         
@@ -1052,12 +1058,12 @@ class AuthService:
         Terminate a session.
         
         Args:
-            session_token: Session token to terminate
+            session_token: the plaintext session token to terminate
         """
         session = self.db.query(ActiveSession).filter(
-            ActiveSession.session_token == session_token
+            ActiveSession.session_token == hash_session_token(session_token)
         ).first()
-        
+
         if session:
             self._terminate_session(session)
     
@@ -1123,9 +1129,12 @@ class AuthService:
     ) -> str:
         """Create a new active session."""
         session_token = generate_session_token()
-        
+
+        # Store the token's SHA-256 hash at rest, not the token itself: a database read then yields
+        # no usable session credential. The plaintext is returned to the caller (and embedded in the
+        # JWT) and never persisted; verification hashes the presented token to match this row.
         session = ActiveSession(
-            session_token=session_token,
+            session_token=hash_session_token(session_token),
             user_id=user.id,
             temp_credential_id=temp_credential_id,
             ip_address=ip_address,
@@ -1153,12 +1162,13 @@ class AuthService:
     def _terminate_session(self, session: ActiveSession):
         """Terminate a session."""
         session.is_active = False
-        
-        # Remove from Redis (using hashed token)
-        token_hash = hash_session_token(session.session_token)
-        redis_key = f"session:{token_hash}"
+
+        # The Redis key is session:<hash>, and session.session_token IS that hash at rest -- use it
+        # directly. Re-hashing it here would compute session:<hash-of-hash> and never delete the
+        # real key, stranding the cached session until its own TTL.
+        redis_key = f"session:{session.session_token}"
         redis_client.delete(redis_key)
-        
+
         self.db.commit()
     
     def _terminate_existing_sessions(self, user_id: uuid.UUID):
