@@ -82,7 +82,10 @@ class AuditLogger:
         if isinstance(details, dict):
             # old_name/new_name are the rename before/after names — just as sensitive as file_name,
             # so redact them too (they otherwise persist in cleartext for Standard-vault renames).
-            _name_keys = ("file_name", "folder_name", "old_name", "new_name")
+            # vault_name is redacted for the same reason: resource_id already identifies the vault by
+            # UUID, and for a zero-knowledge vault the name is the residual plaintext label. The
+            # transient SSE/monitor broadcast keeps the name because this redacts a COPY (below).
+            _name_keys = ("file_name", "folder_name", "old_name", "new_name", "vault_name")
             if any(k in details for k in _name_keys):
                 details = {k: v for k, v in details.items() if k not in _name_keys}
 
