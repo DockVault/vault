@@ -61,6 +61,9 @@ from app.core.id_scope import id_in_scope
 from sqlalchemy.exc import IntegrityError
 from app.services.audit_logger import AuditLogger
 from app.services.streaming_upload import receive_bounded, ChunkTooLarge, EmptyBody
+from app.core.upload_chunk_crypto import (
+    seal_stream_to_file, sealed_plaintext_size, open_staged_chunk, StagedChunkError,
+)
 from app.services.download_stream import (
     ChecksumMismatch, UNSATISFIABLE, parse_byte_range,
 )
@@ -12358,12 +12361,12 @@ async def upload_chunk(
     sdir.mkdir(parents=True, exist_ok=True)
     chunk_path = sdir / f"chunk_{chunk_index:06d}"
     already = chunk_path.exists()
-    # Size of this index if it is being re-sent, so the running total stays accurate
-    # and an overwrite is not double-counted.
-    try:
-        existing_size = chunk_path.stat().st_size if already else 0
-    except OSError:
-        existing_size = 0
+    # PLAINTEXT size of this index if it is being re-sent, so the running total stays accurate and
+    # an overwrite is not double-counted. A sealed chunk carries its plaintext length in its header
+    # (a legacy plaintext chunk is its own on-disk size); using that -- not the on-disk ciphertext
+    # size -- keeps the byte accounting in the same plaintext units as `total_size`, so the
+    # encryption framing overhead is never charged against the declared file size.
+    existing_size = sealed_plaintext_size(chunk_path) if already else 0
     # Bytes already buffered for this session EXCLUDING the index being written. Clamp at
     # 0: a crash between writing a chunk and committing the counter can leave bytes_received
     # undercounted, and base_bytes must never go negative (that would loosen the bound).
@@ -12411,8 +12414,13 @@ async def upload_chunk(
     # disk rather than memory.
     try:
         # The byte count is not needed here: the counters below are recomputed from what is
-        # actually on disk, which is what stays right under a concurrent re-send.
-        _written, chunk_digest = await receive_bounded(request.stream(), tmp_path, remaining)
+        # actually on disk, which is what stays right under a concurrent re-send. The chunk is
+        # sealed as it streams (each 1 MiB record AES-GCM-encrypted under a per-session key, bound
+        # to this session+index) so no raw chunk is ever readable on the staging volume; `remaining`
+        # still bounds PLAINTEXT bytes and `chunk_digest` is still over the plaintext, so the
+        # ChunkTooLarge/EmptyBody contract and the resume digest are unchanged.
+        _written, chunk_digest = await seal_stream_to_file(
+            request.stream(), tmp_path, remaining, session.id, chunk_index)
     except ChunkTooLarge:
         # The body reached disk before it could be measured, which is the trade for not holding it
         # in memory. It is bounded by `remaining` -- disk this session was already approved to
@@ -12466,10 +12474,9 @@ async def upload_chunk(
     _present = sorted(sdir.glob("chunk_*"))
     _bytes = 0
     for _p in _present:
-        try:
-            _bytes += _p.stat().st_size
-        except OSError:
-            pass
+        # PLAINTEXT bytes (sealed chunks report it from their header; legacy plaintext chunks report
+        # their on-disk size), so `bytes_received` stays comparable to the plaintext `total_size`.
+        _bytes += sealed_plaintext_size(_p)
     received = len(_present)
     if locked is not None:
         locked.bytes_received = _bytes
@@ -12664,11 +12671,11 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         )
         with stream_ctx as ctx:
             for i in range(session.total_chunks):
-                with open(sdir / f"chunk_{i:06d}", 'rb') as cf:
-                    while True:
-                        buf = cf.read(1024 * 1024)
-                        if not buf:
-                            break
+                # Each staged chunk was sealed on arrival; unseal it in order (memory-bounded,
+                # one record at a time) and hand the plaintext to the at-rest codec. A chunk
+                # staged as plaintext by a pre-upgrade release streams through verbatim.
+                for buf in open_staged_chunk(sdir / f"chunk_{i:06d}", session.id, i):
+                    if buf:
                         ctx.write_chunk(buf)
             final_checksum = ctx.get_checksum()
             final_size = ctx.get_total_size()
