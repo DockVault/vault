@@ -1839,6 +1839,27 @@ def test_down_non_interactive_without_yes_refuses(tmp_path, monkeypatch):
     assert calls == [], "non-interactive without --yes must not remove containers"
 
 
+def test_down_removal_confirm_defaults_to_no(tmp_path, monkeypatch):
+    # The reachable automation path is a bare `down` with a piped/closed stdin, where confirm() returns
+    # its DEFAULT. That default must be NO, so a script that forgot --yes does not silently remove the
+    # containers. (This is the path the real argparse can emit -- `down` has no --non-interactive flag.)
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    calls = []
+    monkeypatch.setattr(tool, "_run_dc", _dc_recorder(calls))
+    seen = {}
+
+    def _confirm_returns_default(prompt, pal, default=True):
+        seen["default"] = default
+        return default                      # emulate a piped/EOF stdin (confirm returns its default)
+
+    monkeypatch.setattr(dv, "confirm", _confirm_returns_default)
+    tool.down(argparse.Namespace(lock=False, yes=False))
+    assert seen.get("default") is False, "the removal confirm must default to NO"
+    assert calls == [], "a piped/EOF stdin (default no) must not remove containers"
+
+
 def test_only_down_lock_seals_env(tmp_path, monkeypatch):
     # --lock lives on `down` only (down --lock removes containers AND seals .env). `stop` never seals.
     (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")

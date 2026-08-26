@@ -2333,16 +2333,18 @@ class DockVault:
         return True
 
     def _confirm_remove(self, args):
-        """Confirm removing the containers. --yes bypasses; a --non-interactive run WITHOUT --yes is
-        refused (removing containers must be explicit in automation, mirroring the update command)."""
+        """Confirm removing the containers. `--yes` bypasses. Otherwise prompt, defaulting to NO -- so a
+        piped/EOF stdin (automation) declines rather than silently removing containers; a script must be
+        explicit via `--yes`. (A programmatic `non_interactive` arg also refuses outright, with a clear
+        message.)"""
         if getattr(args, "yes", False):
             return True
         if args is not None and getattr(args, "non_interactive", False):
-            print(self.pal.paint("  Refusing to remove containers in --non-interactive without --yes.",
+            print(self.pal.paint("  Refusing to remove containers non-interactively without --yes.",
                                   "red"))
             return False
         return confirm("Remove the deployment's containers now? (data volumes are kept)",
-                       self.pal, default=True)
+                       self.pal, default=False)
 
     def stop(self, args=None):
         """Stop the deployment but KEEP its (stopped) containers, for a faster restart and to retain
@@ -2371,13 +2373,16 @@ class DockVault:
     def down(self, args=None):
         """Stop the deployment and REMOVE its containers (`docker compose down`, never `-v` - data
         volumes are kept), which also clears Docker's on-disk copy of their secrets. Confirms first (it
-        removes the running containers; --yes / --non-interactive bypass the prompt). --lock also seals
-        `.env` into `.env.enc` afterwards, so no plaintext secret is left at rest anywhere."""
+        removes the running containers); `--yes` skips the prompt, and a piped/non-interactive stdin
+        declines unless `--yes` is given. `--lock` also seals `.env` into `.env.enc` afterwards, so no
+        plaintext secret is left at rest anywhere."""
         pal = self.pal
-        if not os.path.exists(self._env_path()):
-            # Nothing this tool can address; still allow a --lock to seal a stray plaintext .env below.
-            print(pal.paint("  .env is not present (locked?); nothing to remove by this tool.", "yellow"))
-        else:
+        if os.path.exists(self._env_path()):
+            # Check Docker BEFORE prompting, so we don't ask + announce a removal we then can't do.
+            ok, _ = docker_available()
+            if not ok:
+                print(pal.paint("  Docker is not available.", "red"))
+                raise SystemExit(2)
             if not self._confirm_remove(args):
                 print(pal.paint("  Cancelled - nothing was removed.", "yellow"))
                 return
@@ -2386,6 +2391,9 @@ class DockVault:
             self._tear_down_containers()
             print(pal.paint("  Stopped and removed - the deployment's secrets are no longer held in "
                             "Docker's container config.", "green"))
+        else:
+            # Nothing this tool can address; still allow a --lock to seal a stray plaintext .env below.
+            print(pal.paint("  .env is not present (locked?); nothing to remove by this tool.", "yellow"))
         if getattr(args, "lock", False) and os.path.exists(self._env_path()):
             self.lock(args)
 
@@ -4493,7 +4501,7 @@ def build_parser():
     parsers["down"].add_argument("--lock", dest="lock", action="store_true",
                                  help="also seal .env into .env.enc after removing the containers")
     parsers["down"].add_argument("--yes", dest="yes", action="store_true",
-                                 help="skip the confirmation prompt (required in --non-interactive)")
+                                 help="skip the confirmation prompt (required to remove containers non-interactively)")
     return p
 
 
