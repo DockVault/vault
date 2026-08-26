@@ -2213,15 +2213,10 @@ function renderVaults() {
     }).join('');
 
     container.querySelectorAll('.open-vault-btn').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const id = e.currentTarget.getAttribute('data-vault-id');
-            const v = (state.allVaults || []).find(x => String(x.id) === String(id));
-            // A locked zero-knowledge vault: the same unlock flow as the lock control (reveal all),
-            // rather than opening straight into a passphrase prompt for this one vault.
-            if (v && v.type === 'zero_knowledge' && v.zkLocked) { zkUnlockAllVaults(); return; }
-            openVault(id);
-        });
+        // openVault handles a locked zero-knowledge vault itself: it shows the vault, then loading
+        // its files prompts for the account passphrase (the SAME unlock modal the lock control uses)
+        // and decrypts. So entering a locked ZK vault just opens it — no separate reveal-all step.
+        btn.addEventListener('click', (e) => { e.stopPropagation(); openVault(e.currentTarget.getAttribute('data-vault-id')); });
     });
     container.querySelectorAll('.delete-vault-btn').forEach(btn => {
         btn.addEventListener('click', (e) => { e.stopPropagation(); deleteVault(e.currentTarget.getAttribute('data-vault-id')); });
