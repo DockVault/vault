@@ -38,8 +38,8 @@ APP_ROOT = os.environ.get("DOCKVAULT_ROOT") or os.path.dirname(os.path.abspath(_
 MENU = [
     ("setup",   "Setup - configure + start the vault"),
     ("start",   "Start - bring the deployment up (health-checked)"),
-    ("stop",    "Stop - stop + REMOVE containers (clears secrets from Docker; data volumes kept)"),
-    ("down",    "Down - stop but KEEP containers (faster restart; secrets remain until 'stop')"),
+    ("stop",    "Stop - stop the deployment, KEEP containers (faster restart; secrets remain until 'down')"),
+    ("down",    "Down - stop + REMOVE containers (clears secrets from Docker; confirms first; data kept)"),
     ("restart", "Restart - stop then start (health-checked)"),
     ("status",  "Status - containers, health, ports, lock state"),
     ("lock",    "Lock - seal .env into an encrypted .env.enc"),
@@ -2206,6 +2206,12 @@ class DockVault:
             raise SystemExit(1)
         os.remove(env_path)
         print(pal.paint("  Locked: .env -> .env.enc (plaintext .env removed).", "green"))
+        # Sealing .env does NOT clear the copy Docker already baked into a running/stopped container's
+        # on-disk config -- point the operator at the command that does.
+        if container_exists(DB_CONTAINER):
+            print(pal.paint("  NOTE: the deployment's containers still exist, so their secrets are STILL "
+                            "in Docker's on-disk config even though .env is sealed - run 'down' to remove "
+                            "the containers (or 'down --lock' to do both at once).", "yellow"))
         if not reuse:
             self._show_recovery_key(dek, args)
 
@@ -2305,13 +2311,11 @@ class DockVault:
         print(pal.paint("  Up and healthy.", "green"))
         self._print_status(profiles)
 
-    def stop(self, args=None):
-        """Stop the deployment and REMOVE its containers (`compose down`, never `-v` - data volumes are
-        kept). Removing the containers also removes Docker's on-disk copy of their environment, so the
-        deployment's secrets stop sitting in /var/lib/docker/containers/<id>/config.v2.json while it is
-        down. To keep the (stopped) containers for a faster restart instead, use `down`. --lock also
-        seals .env into .env.enc afterwards (which by itself does NOT clear the container copy - that is
-        why stop removes the containers)."""
+    def _tear_down_containers(self):
+        """`compose down --remove-orphans` (removes containers, keeps data volumes). Removing the
+        containers also removes Docker's on-disk copy of their environment, so the deployment's secrets
+        stop sitting in config.v2.json / `docker inspect`. Returns True if it ran, False when there was
+        nothing to address (no .env). Raises SystemExit on docker-unavailable or a compose failure."""
         pal = self.pal
         ok, _ = docker_available()
         if not ok:
@@ -2319,26 +2323,32 @@ class DockVault:
             raise SystemExit(2)
         if not os.path.exists(self._env_path()):
             # compose needs .env for the ${VAR:?} interpolation even to address the stack.
-            print(pal.paint("  .env is not present (locked?); nothing to stop by this tool.", "yellow"))
-        else:
-            print(pal.paint("  Stopping the deployment and removing its containers (data volumes are "
-                            "kept) ...", "cyan"))
-            try:
-                self._run_dc("down", "--remove-orphans", capture=False, timeout=120)
-            except (OSError, subprocess.SubprocessError) as exc:
-                print(pal.paint("  Stop failed: %s" % exc, "red"))
-                raise SystemExit(1)
-            print(pal.paint("  Stopped and removed - the deployment's secrets are no longer held in "
-                            "Docker's container config.", "green"))
-        if getattr(args, "lock", False) and os.path.exists(self._env_path()):
-            self.lock(args)
+            print(pal.paint("  .env is not present (locked?); nothing to remove by this tool.", "yellow"))
+            return False
+        try:
+            self._run_dc("down", "--remove-orphans", capture=False, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(pal.paint("  Down failed: %s" % exc, "red"))
+            raise SystemExit(1)
+        return True
 
-    def down(self, args=None):
+    def _confirm_remove(self, args):
+        """Confirm removing the containers. --yes bypasses; a --non-interactive run WITHOUT --yes is
+        refused (removing containers must be explicit in automation, mirroring the update command)."""
+        if getattr(args, "yes", False):
+            return True
+        if args is not None and getattr(args, "non_interactive", False):
+            print(self.pal.paint("  Refusing to remove containers in --non-interactive without --yes.",
+                                  "red"))
+            return False
+        return confirm("Remove the deployment's containers now? (data volumes are kept)",
+                       self.pal, default=True)
+
+    def stop(self, args=None):
         """Stop the deployment but KEEP its (stopped) containers, for a faster restart and to retain
-        `docker logs`. WARNING: a stopped container STILL holds the deployment's secrets in Docker's
-        on-disk config (/var/lib/docker/containers/<id>/config.v2.json) and via `docker inspect`, so
-        this does NOT remove them from disk - run `stop` for that. --lock also seals .env into
-        .env.enc (which alone does not clear the container copy)."""
+        `docker logs` (`docker compose stop`). WARNING: a stopped container STILL holds the deployment's
+        secrets in Docker's on-disk config (config.v2.json) and via `docker inspect`, so this does NOT
+        remove them from disk -- run `down` for that (or `down --lock` to also seal `.env`)."""
         pal = self.pal
         ok, _ = docker_available()
         if not ok:
@@ -2346,23 +2356,44 @@ class DockVault:
             raise SystemExit(2)
         if not os.path.exists(self._env_path()):
             print(pal.paint("  .env is not present (locked?); nothing to stop by this tool.", "yellow"))
+            return
+        print(pal.paint("  Stopping the deployment, keeping its containers (data volumes kept) ...",
+                        "cyan"))
+        try:
+            self._run_dc("stop", capture=False, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(pal.paint("  Stop failed: %s" % exc, "red"))
+            raise SystemExit(1)
+        print(pal.paint("  Stopped (containers kept). WARNING: the stopped containers STILL hold the "
+                        "deployment secrets in Docker's on-disk config - run 'down' to remove them "
+                        "(or 'down --lock' to also seal .env).", "yellow"))
+
+    def down(self, args=None):
+        """Stop the deployment and REMOVE its containers (`docker compose down`, never `-v` - data
+        volumes are kept), which also clears Docker's on-disk copy of their secrets. Confirms first (it
+        removes the running containers; --yes / --non-interactive bypass the prompt). --lock also seals
+        `.env` into `.env.enc` afterwards, so no plaintext secret is left at rest anywhere."""
+        pal = self.pal
+        if not os.path.exists(self._env_path()):
+            # Nothing this tool can address; still allow a --lock to seal a stray plaintext .env below.
+            print(pal.paint("  .env is not present (locked?); nothing to remove by this tool.", "yellow"))
         else:
-            print(pal.paint("  Stopping the deployment, keeping its containers (data volumes kept) ...",
-                            "cyan"))
-            try:
-                self._run_dc("stop", capture=False, timeout=120)
-            except (OSError, subprocess.SubprocessError) as exc:
-                print(pal.paint("  Stop failed: %s" % exc, "red"))
-                raise SystemExit(1)
-            print(pal.paint("  Stopped (containers kept). NOTE: the stopped containers STILL hold the "
-                            "deployment secrets in Docker's config - run 'stop' to remove them.",
-                            "yellow"))
+            if not self._confirm_remove(args):
+                print(pal.paint("  Cancelled - nothing was removed.", "yellow"))
+                return
+            print(pal.paint("  Stopping the deployment and removing its containers (data volumes are "
+                            "kept) ...", "cyan"))
+            self._tear_down_containers()
+            print(pal.paint("  Stopped and removed - the deployment's secrets are no longer held in "
+                            "Docker's container config.", "green"))
         if getattr(args, "lock", False) and os.path.exists(self._env_path()):
             self.lock(args)
 
     def restart(self, args=None):
-        """Stop, then start (health-checked). Data volumes are untouched."""
-        self.stop(args)
+        """Recreate the deployment (compose down + start, health-checked) so a changed .env takes
+        effect. Data volumes are untouched. No prompt: this is an explicit in-place action, not the
+        standalone `down`."""
+        self._tear_down_containers()
         self.start(args)
 
     def status(self, args=None):
@@ -4459,10 +4490,10 @@ def build_parser():
     cp.add_argument("--new-passphrase-file", dest="new_passphrase_file", help="new passphrase file (first line)")
     cp.add_argument("--new-passphrase-stdin", dest="new_passphrase_stdin", action="store_true", help="read the new passphrase from stdin")
 
-    parsers["stop"].add_argument("--lock", dest="lock", action="store_true",
-                                 help="also seal .env into .env.enc after stopping")
     parsers["down"].add_argument("--lock", dest="lock", action="store_true",
-                                 help="also seal .env into .env.enc after stopping (containers kept)")
+                                 help="also seal .env into .env.enc after removing the containers")
+    parsers["down"].add_argument("--yes", dest="yes", action="store_true",
+                                 help="skip the confirmation prompt (required in --non-interactive)")
     return p
 
 

@@ -1786,40 +1786,69 @@ def _dc_recorder(calls):
     return lambda *a, **k: (calls.append(a), type("R", (), {"returncode": 0})())[1]
 
 
-def test_stop_removes_containers_and_never_passes_v(tmp_path, monkeypatch):
-    # `stop` must run `compose down` (removing the containers clears their secrets from Docker's
-    # on-disk config) and MUST NEVER pass -v (data volumes must survive).
+def test_stop_keeps_containers_via_compose_stop(tmp_path, monkeypatch, capsys):
+    # Docker-aligned: `stop` keeps the (stopped) containers -> `compose stop`, and warns loudly that
+    # their secrets remain in Docker's on-disk config until `down` removes them.
     (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
     calls = []
     monkeypatch.setattr(tool, "_run_dc", _dc_recorder(calls))
-    tool.stop(argparse.Namespace(lock=False))
-    assert calls and calls[0][0] == "down", "stop must run `compose down`"
-    assert "-v" not in calls[0], "stop must NEVER pass -v"
+    tool.stop(argparse.Namespace())
+    assert calls and calls[0][0] == "stop" and "down" not in calls[0], "stop must keep containers (compose stop)"
+    assert "run 'down'" in capsys.readouterr().out, "stop must point at 'down' to clear the config secrets"
 
 
-def test_down_keeps_containers_via_compose_stop(tmp_path, monkeypatch):
-    # `down` keeps the (stopped) containers -> `compose stop`, not `down`.
+def test_down_removes_containers_and_never_passes_v(tmp_path, monkeypatch):
+    # Docker-aligned: `down` runs `compose down` (removing the containers clears their secrets from
+    # Docker's on-disk config) and MUST NEVER pass -v (data volumes must survive). --yes bypasses confirm.
     (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
     calls = []
     monkeypatch.setattr(tool, "_run_dc", _dc_recorder(calls))
-    tool.down(argparse.Namespace(lock=False))
-    assert calls and calls[0][0] == "stop" and "down" not in calls[0], "down must keep containers (compose stop)"
+    tool.down(argparse.Namespace(lock=False, yes=True))
+    assert calls and calls[0][0] == "down", "down must run `compose down`"
+    assert "-v" not in calls[0], "down must NEVER pass -v"
 
 
-def test_stop_and_down_lock_seal_env(tmp_path, monkeypatch):
+def test_down_confirms_and_a_declined_prompt_removes_nothing(tmp_path, monkeypatch, capsys):
+    # Without --yes, `down` asks first; a declined answer removes nothing and seals nothing.
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    calls = []
+    monkeypatch.setattr(tool, "_run_dc", _dc_recorder(calls))
+    monkeypatch.setattr(dv, "confirm", lambda *a, **k: False)        # operator declines
+    locked = []
+    monkeypatch.setattr(tool, "lock", lambda args=None: locked.append(True))
+    tool.down(argparse.Namespace(lock=True, yes=False))
+    assert calls == [], "a declined confirm must remove nothing"
+    assert locked == [], "a declined down must not seal .env either"
+    assert "Cancelled" in capsys.readouterr().out
+
+
+def test_down_non_interactive_without_yes_refuses(tmp_path, monkeypatch):
+    # Automation must be explicit: a --non-interactive run without --yes removes nothing.
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    calls = []
+    monkeypatch.setattr(tool, "_run_dc", _dc_recorder(calls))
+    tool.down(argparse.Namespace(lock=False, yes=False, non_interactive=True))
+    assert calls == [], "non-interactive without --yes must not remove containers"
+
+
+def test_only_down_lock_seals_env(tmp_path, monkeypatch):
+    # --lock lives on `down` only (down --lock removes containers AND seals .env). `stop` never seals.
     (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
     monkeypatch.setattr(tool, "_run_dc", _dc_recorder([]))
     locked = []
     monkeypatch.setattr(tool, "lock", lambda args=None: locked.append(True))
-    tool.stop(argparse.Namespace(lock=True))
-    tool.down(argparse.Namespace(lock=True))
-    assert locked == [True, True], "both stop --lock and down --lock must seal .env"
+    tool.down(argparse.Namespace(lock=True, yes=True))
+    assert locked == [True], "down --lock must seal .env after removing the containers"
 
 
 def test_status_warns_when_locked_but_container_exists(tmp_path, monkeypatch, capsys):

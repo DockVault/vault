@@ -197,9 +197,15 @@ Once set up, drive the deployment through `dockvault.py` instead of raw `docker 
 ```bash
 python dockvault.py start      # bring it up (waits for health; shows the failing logs if not)
 python dockvault.py status     # containers, health, ports, and whether .env is sealed
-python dockvault.py stop       # stop the containers — data volumes are never touched
-python dockvault.py restart    # stop then start, health-checked
+python dockvault.py stop       # stop the containers, KEEP them (fast restart); data volumes untouched
+python dockvault.py down       # stop + REMOVE the containers (clears their secrets from Docker); asks first
+python dockvault.py restart    # recreate (down + start), health-checked; picks up .env changes
 ```
+
+`stop` mirrors `docker compose stop` (the containers stay, so their secrets stay in Docker's on-disk
+config); `down` mirrors `docker compose down` (the containers are removed, clearing those secrets — it
+never passes `-v`, so your data volumes always survive). To clear *every* at-rest copy of the secrets in
+one step, use `python dockvault.py down --lock` (removes the containers **and** seals `.env`).
 
 ### Sealing credentials at rest (optional)
 
