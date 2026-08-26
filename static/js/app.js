@@ -9544,7 +9544,9 @@ async function openVault(vaultId) {
         console.log('✓ Opened vault:', vault.name);
 
     } catch (error) {
-        console.error('Failed to open vault:', error);
+        // Do NOT log the raw error object: this path now performs zero-knowledge decryption, and a
+        // crypto error object can carry sensitive detail. The user-facing message is shown below.
+        console.error('Failed to open vault');
         showError(error.message || 'Failed to open vault');
 
         // Clear vault state
@@ -14644,7 +14646,9 @@ async function handleEditVaultInfo(e) {
         await loadVaultSettings();
         
     } catch (error) {
-        console.error('Failed to update vault info:', error);
+        // Do NOT log the raw error object: this path now performs zero-knowledge sealing, and a
+        // crypto error object can carry sensitive detail. The user-facing message is shown below.
+        console.error('Failed to update vault info');
         showError(error.message || 'Failed to update vault information');
     }
 }
