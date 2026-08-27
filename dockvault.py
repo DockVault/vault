@@ -1675,7 +1675,8 @@ def plan_upgrade_path(matrix, current, target):
         return unknown
     if _semver_key(target) < _semver_key(current):
         # A downgrade. The matrix describes forward edges only, and reversing one is not the same
-        # claim, so this is deliberately not classified from it.
+        # claim, so this is deliberately not classified from it here -- the host tool asks
+        # `downgrade_refusal` separately when it needs the reverse verdict.
         return unknown
 
     steps = _walk_edges(matrix, current, target)
@@ -1693,6 +1694,74 @@ def plan_upgrade_path(matrix, current, target):
         "conditions": [c for e in steps for c in (e.get("conditions") or [])],
         "known": True,
     }
+
+
+def downgrade_refusal(matrix, current, target):
+    """Whether a DOWNGRADE from `current` to `target` must be refused, and why.
+
+    The matrix declares forward edges; reversing one is only a safe claim where that edge is
+    reversible, and impossible across a blocked one. So the reverse verdict is read off the FORWARD
+    path from `target` up to `current`: a downgrade across any irreversible or blocked edge is
+    refused. Returns (refused: bool, reason: str|None). A downgrade the matrix cannot describe at all
+    is NOT force-refused here -- it flows through the existing 'undescribed, needs a backup' path so
+    behaviour outside the declared range is unchanged.
+    """
+    if not isinstance(matrix, dict):
+        return False, None
+    versions = matrix.get("versions") or {}
+    cur = (current or "").lstrip("vV")
+    tgt = (target or "").lstrip("vV")
+    if cur not in versions or tgt not in versions or _semver_key(tgt) >= _semver_key(cur):
+        return False, None
+    forward = _walk_edges(matrix, tgt, cur)
+    if not forward:
+        return False, None
+    blocked = next((e for e in forward if e.get("kind") == "blocked"), None)
+    if blocked is not None:
+        return True, blocked.get("reason") or "the forward upgrade is blocked, so it has no reverse"
+    if any(not e.get("reversible", True) for e in forward):
+        return True, ("the upgrade into the running version is marked irreversible, so an older "
+                      "image cannot read the data written since")
+    return False, None
+
+
+def version_support(matrix, version):
+    """The `support` lifecycle block for `version`, or {} when it is not stated.
+
+    Returns {} for a matrix that predates the lifecycle schema (an older published upgrade.json) or
+    that does not declare the version, so an old file keeps working: an absent block means 'lifecycle
+    not stated' -- neither end-of-life nor known-insecure -- rather than an error."""
+    if not isinstance(matrix, dict):
+        return {}
+    version = (version or "").lstrip("vV")
+    meta = (matrix.get("versions") or {}).get(version) or {}
+    support = meta.get("support")
+    return support if isinstance(support, dict) else {}
+
+
+def is_eol(matrix, version):
+    """True only when the matrix explicitly marks `version` end-of-life."""
+    return version_support(matrix, version).get("eol") is True
+
+
+def support_line(matrix, version):
+    """A one-line human summary of a version's lifecycle, or '' when nothing is stated. Names the
+    end-of-life state, any extended-support tail dates, and whether the version is insecure."""
+    s = version_support(matrix, version)
+    if not s:
+        return ""
+    if s.get("eol") is True:
+        parts = ["end-of-life"]
+        if s.get("code_support"):
+            parts.append("code support until %s" % s["code_support"])
+        if s.get("security_support"):
+            parts.append("security support until %s" % s["security_support"])
+        head = "; ".join(parts)
+    else:
+        head = "supported"
+    if s.get("secure") is False:
+        head += " -- has known unpatched vulnerabilities"
+    return head
 
 
 def fetch_upgrade_matrix(tag, root=None, opener=None):
@@ -3997,12 +4066,27 @@ class DockVault:
 
         tag = getattr(args, "tag", None) if args else None
         from_source = bool(getattr(args, "source", False)) if args else False
+        # This checkout's matrix describes every version's lifecycle up to what it ships; use it to
+        # decide which releases to OFFER (end-of-life ones are hidden) and to annotate the rest.
+        local_matrix, _ = fetch_upgrade_matrix(None, root=self.root)
         if not tag:
             tags = fetch_release_tags()
             if tags:
+                offered = [t for t in tags if not is_eol(local_matrix, t)]
+                hidden = len(tags) - len(offered)
                 print(pal.paint("\n  Available releases (newest first):", "cyan"))
-                for t in tags[:15]:
-                    print("    %s%s" % (t, "   <- current" if parse_semver(t) == parse_semver(current) else ""))
+                for t in offered[:15]:
+                    label = "   <- current" if parse_semver(t) == parse_semver(current) else ""
+                    note = support_line(local_matrix, t)
+                    if note and note != "supported":
+                        label += "   (%s)" % note
+                    print("    %s%s" % (t, label))
+                if not offered:
+                    print(pal.paint("    (every reachable release is end-of-life)", "yellow"))
+                if hidden:
+                    print(pal.paint(
+                        "    %d end-of-life release(s) hidden -- they cannot be upgraded or "
+                        "downgraded to." % hidden, "yellow"))
             else:
                 print(pal.paint("\n  (couldn't reach GitHub - enter a tag manually)", "yellow"))
             if interactive:
@@ -4036,6 +4120,30 @@ class DockVault:
             plan = plan_upgrade_path(None, current, tag)
 
         self._describe_hop(plan, matrix_source, current, tag)
+
+        # Refuse an end-of-life target outright -- it is neither offered in the list nor a place to
+        # move to. Prefer the matrix that actually describes the target (the fetched one; else this
+        # checkout's), so an older published file that predates the lifecycle schema does not hide it.
+        eol_matrix = matrix if version_support(matrix, tag) else local_matrix
+        if is_eol(eol_matrix, tag):
+            self._fail("%s is end-of-life and cannot be upgraded or downgraded to (%s)."
+                       % (tag, support_line(eol_matrix, tag)))
+        if version_support(eol_matrix, tag).get("secure") is False:
+            print(pal.paint(
+                "  WARNING: %s has known unpatched vulnerabilities (%s)."
+                % (tag, support_line(eol_matrix, tag)), "red"))
+
+        # A downgrade the matrix refuses: an older image cannot read data written by the newer one,
+        # so the move is not offered even with an 'i accept'. Read off this checkout's matrix, which
+        # knows the running version and the forward edge (the target's own published matrix, being
+        # older, may not). This is the case a bare downgrade used to slip through as 'undescribed'.
+        down_refused, down_reason = downgrade_refusal(local_matrix, current, tag)
+        if down_refused:
+            self._fail(
+                "%s -> %s is a downgrade this deployment cannot take: an older image cannot read the "
+                "data written by the newer one (%s). Deploy the older version as a fresh set and "
+                "restore from a backup instead of downgrading over these volumes."
+                % (current, tag, down_reason))
 
         if plan["blocked"] is not None:
             self._fail("the upgrade matrix says this change must not be taken directly: %s"

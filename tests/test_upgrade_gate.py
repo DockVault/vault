@@ -579,3 +579,61 @@ def test_the_backup_is_taken_once_for_the_whole_change(tmp_path, monkeypatch):
     monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.1.0", "the running container"))
     tool.update(argparse.Namespace(non_interactive=True, tag="v0.3.0", source=False, yes=True))
     assert len(backups) == 1, f"expected one backup for the whole change, got {len(backups)}"
+
+
+# --- downgrade refusal + lifecycle: the host tool's floor enforcement -------------------------
+
+def test_a_downgrade_across_a_blocked_edge_is_refused():
+    refused, reason = dv.downgrade_refusal(_matrix(kind="blocked"), "0.2.0", "0.1.0")
+    assert refused is True and "0.2.0 rewrites" in (reason or "")
+
+
+def test_a_downgrade_across_an_irreversible_edge_is_refused():
+    refused, reason = dv.downgrade_refusal(_matrix(reversible=False), "0.2.0", "0.1.0")
+    assert refused is True and "irreversible" in (reason or "")
+
+
+def test_a_downgrade_across_a_reversible_edge_is_allowed():
+    assert dv.downgrade_refusal(_matrix(reversible=True), "0.2.0", "0.1.0") == (False, None)
+
+
+def test_a_downgrade_the_matrix_cannot_describe_is_not_force_refused():
+    # Out of range / unknown -> not refused here; it flows through the 'undescribed, needs a backup'
+    # path unchanged, so behaviour outside the declared range does not change.
+    assert dv.downgrade_refusal(_matrix(), "0.2.0", "9.9.9") == (False, None)
+    assert dv.downgrade_refusal(None, "0.2.0", "0.1.0") == (False, None)
+    # An UPGRADE is never a downgrade refusal, even across an irreversible edge.
+    assert dv.downgrade_refusal(_matrix(reversible=False), "0.1.0", "0.2.0") == (False, None)
+
+
+def _lifecycle_matrix():
+    m = _matrix()
+    m["schema_version"] = 2
+    m["versions"]["0.1.0"]["support"] = {"eol": True, "secure": False,
+                                         "security_support": "2027-01-01"}
+    m["versions"]["0.2.0"]["support"] = {"eol": False, "secure": True}
+    return m
+
+
+def test_is_eol_and_version_support_read_the_lifecycle():
+    m = _lifecycle_matrix()
+    assert dv.is_eol(m, "0.1.0") is True
+    assert dv.is_eol(m, "v0.2.0") is False            # tolerates a v-prefix
+    assert dv.is_eol(m, "9.9.9") is False             # unknown -> not eol
+    assert dv.version_support(m, "0.2.0") == {"eol": False, "secure": True}
+
+
+def test_support_is_empty_for_a_pre_lifecycle_matrix():
+    # A schema_version-1 matrix has no support blocks -> {} everywhere, so an older published file
+    # keeps working instead of erroring.
+    assert dv.version_support(_matrix(), "0.1.0") == {}
+    assert dv.is_eol(_matrix(), "0.1.0") is False
+
+
+def test_support_line_names_eol_tail_and_insecurity():
+    m = _lifecycle_matrix()
+    line = dv.support_line(m, "0.1.0")
+    assert "end-of-life" in line and "security support until 2027-01-01" in line
+    assert "unpatched" in line                        # insecure is named
+    assert dv.support_line(m, "0.2.0") == "supported"
+    assert dv.support_line(_matrix(), "0.1.0") == ""  # nothing stated -> empty
