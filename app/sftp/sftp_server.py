@@ -185,6 +185,11 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # overlimit, this marks the upload for discard at close so a truncated buffer is never
         # finalized -- an SFTP close cannot report failure, so the discard is the only signal.
         self.write_failed = False
+        # Back-reference to the paramiko SFTP protocol handler, set on an upload handle in open().
+        # A raw int status return (e.g. SFTP_FAILURE) carries only paramiko's default word "Failure";
+        # setting a pending description here lets _send_status attach a message that names the actual
+        # cause (over the size limit / staging buffer full) so the SFTP client is not left guessing.
+        self._sftp_server = None
         # shared
         self.attrs: Optional[paramiko.SFTPAttributes] = None
 
@@ -219,6 +224,10 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # before the close-time size check runs. Mark the handle so close() discards the upload.
         if self.max_bytes and (offset + len(data)) > self.max_bytes:
             self.overlimit = True
+            self._set_status_desc(
+                "upload rejected: file exceeds the %d MB SFTP limit (raise SFTP_STAGING_TMPFS_MB, "
+                "which uses that much RAM, or lower MAX_FILE_SIZE_MB to match)"
+                % (self.max_bytes // (1024 * 1024)))
             return paramiko.SFTP_FAILURE
         try:
             self.writefile.seek(offset)
@@ -228,8 +237,18 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
             # The buffer write failed (a full staging tmpfs is the expected cause). Mark the
             # upload for discard so close() does not finalize the partial bytes already written.
             self.write_failed = True
+            self._set_status_desc(
+                "upload failed: the SFTP staging buffer is full (raise SFTP_STAGING_TMPFS_MB)")
             safe_event('write.failed', e)
             return paramiko.SFTP_FAILURE
+
+    def _set_status_desc(self, desc: str):
+        """Attach a human description to the status paramiko is about to send for THIS request.
+        Consumed and cleared by _MessageSFTPServer._send_status, which runs synchronously right after
+        this write() returns (paramiko processes one request at a time per connection)."""
+        srv = self._sftp_server
+        if srv is not None:
+            srv._pending_status_desc = desc
 
     def stat(self):
         if self.attrs is not None:
@@ -908,6 +927,9 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         # Bound the buffered plaintext in-stream at the configured per-file max, so the write
         # can't fill the shared .sftp_tmp volume before the close-time size check runs.
         handle.max_bytes = _eff_max
+        # Let an in-stream refusal (over-limit / staging-full) carry a descriptive status instead of
+        # paramiko's bare "Failure". _sftp_server is the protocol handler, wired by _MessageSFTPServer.
+        handle._sftp_server = getattr(self, "_sftp_server", None)
         handle.finalizer = self._make_upload_finalizer(
             vault_id, folder_id, filename, can_overwrite
         )
@@ -1334,6 +1356,38 @@ def _sftp_key_throttled(ip: str, username: str) -> bool:
         return True
 
 
+class _MessageSFTPServer(paramiko.SFTPServer):
+    """paramiko SFTP protocol handler that can attach a human-readable description to a status.
+
+    A handle method (e.g. VaultSFTPHandle.write) returns a bare int status code, which paramiko
+    turns into its default word for that code ("Failure"). When an upload is refused in-stream for a
+    reason the operator can act on (over the SFTP size limit, or a full staging buffer), the handle
+    records a description via _set_status_desc; this override sends it in place of the default. Only
+    the tiny _send_status method is overridden, so it is robust across paramiko point releases.
+
+    Paramiko processes one request at a time per connection, so a description set inside a handle
+    method is consumed by exactly the status that method's return produces; it is cleared on every
+    send so it can never attach to an unrelated status.
+    """
+
+    def __init__(self, channel, name, server, sftp_si=SFTPServerInterface, *largs, **kwargs):
+        super().__init__(channel, name, server, sftp_si, *largs, **kwargs)
+        self._pending_status_desc = None
+        # Give the request handler (self.server is the SFTPServerInterface) a back-reference so
+        # open() can wire each upload handle to this protocol handler.
+        try:
+            self.server._sftp_server = self
+        except Exception:  # noqa: BLE001 - never let wiring break a connection
+            pass
+
+    def _send_status(self, request_number, code, desc=None):
+        pending = self._pending_status_desc
+        self._pending_status_desc = None
+        if desc is None and pending:
+            desc = pending
+        return super()._send_status(request_number, code, desc)
+
+
 def _sftp_key_clear(ip: str, username: str) -> None:
     """Reset this principal's key-offer counter after a successful key auth -- BOTH the Redis counter
     and the durable DB-fallback row -- so a healthy (frequently reconnecting, multi-key) client never
@@ -1746,7 +1800,7 @@ def handle_sftp_client(
         transport.add_server_key(host_key)
         transport.set_subsystem_handler(
             'sftp',
-            paramiko.SFTPServer,
+            _MessageSFTPServer,
             SFTPServerInterface
         )
 

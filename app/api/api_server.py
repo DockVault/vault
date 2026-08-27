@@ -2885,6 +2885,20 @@ async def get_settings(
                                          if (settings.max_storage_gb or 0) > 0 else None)
     data["deployment_storage_limit_bytes"] = deployment_storage_limit_bytes(db)
     data["deployment_storage_used_bytes"] = deployment_storage_used(db)
+    # The EFFECTIVE per-file SFTP upload limit (MB). A buffered SFTP upload cannot exceed the RAM
+    # staging tmpfs, so over SFTP the limit is min(the file-size limit, SFTP_STAGING_TMPFS_MB) — which
+    # can be BELOW the web limit. Surface it so the admin sees why SFTP may refuse a file the web UI
+    # accepts. None => no SFTP-specific cap (the tmpfs is unbounded / not mounted; sftp_staging_tmpfs_mb
+    # is 0), matching _staging_capped_max's "0 disables the clamp".
+    from app.core import upload_policy as _uploadp
+    _eff_file_bytes = _uploadp.effective_max_file_bytes(
+        (settings.max_file_size_mb or 0) * 1024 * 1024, data.get("max_file_size"))
+    _tmpfs_mb = settings.sftp_staging_tmpfs_mb or 0
+    if _tmpfs_mb > 0:
+        _eff_file_mb = _eff_file_bytes // (1024 * 1024) if _eff_file_bytes > 0 else _tmpfs_mb
+        data["sftp_effective_max_file_mb"] = min(_eff_file_mb, _tmpfs_mb)
+    else:
+        data["sftp_effective_max_file_mb"] = None
     # Overlay the EFFECTIVE Temporary Vault Passcode policy (incl. the ZK-in-scope toggle) so the
     # Settings card renders correct defaults even when never saved (feature default OFF, allow-ZK ON).
     data.update(_temp_passcode_policy(db))
@@ -8035,11 +8049,14 @@ async def create_share(
             ]
         recipient_ids = [u for u in recipient_ids if str(u) != str(current_user.id)]  # not myself
         if recipient_ids:
-            item = out.get("target_name") or out.get("vault_name") or "an item"
+            # Do NOT copy the item/vault NAME into the notification body: those names are sealed at
+            # rest everywhere else (File.enc_name, the vault-name seal), and notifications.body is a
+            # plaintext column, so embedding them would re-expose sealed names to a DB/backup reader.
+            # The recipient opens the item via the deep link (its name decrypts in-memory on read).
             _notify_users(
                 recipient_ids, "share_received",
                 title=f"{current_user.username} shared a {tt} with you",
-                body=f'"{item}" in {out.get("vault_name") or "a vault"}',
+                body="Open 'Shared with me' to view it.",
                 target="#shared",
                 dedup_prefix=f"share:{share.id}",
             )
@@ -8829,9 +8846,11 @@ async def send_note(
                 sent_from_user_id=current_user.id, sent_from_name=sender_name, adopted=False)
     db.add(copy)
     db.commit()
-    # Best-effort in-app notification (separate session; never fails the send).
+    # Best-effort in-app notification (separate session; never fails the send). The note TITLE is
+    # sealed at rest (nenc1: in Note.title), so it must NOT be copied into the plaintext
+    # notifications.body — the recipient opens the note via the deep link instead.
     _notify_users([str(recipient.id)], "note_received", f"{sender_name} sent you a note",
-                  body=(src.title or "Untitled note"), target="#notes")
+                  body="Open your notes to read it.", target="#notes")
     try:
         AuditLogger(db).log_action(
             action='note_send', status='success', user=current_user, resource_type='note',
@@ -12291,7 +12310,10 @@ async def init_chunked_upload(
     if is_zk:
         resume_q = resume_q.filter(ChunkedUploadSession.name_bi == body.name_bi)
     else:
-        resume_q = resume_q.filter(ChunkedUploadSession.filename == body.file_name)
+        # Standard sessions no longer store the plaintext filename (it is sealed at rest); match on the
+        # server blind index of the sanitized name instead, which init records the same way.
+        from app.core.security import name_blind_index as _nbi
+        resume_q = resume_q.filter(ChunkedUploadSession.name_bi == _nbi(vault.id, body.file_name))
     # Resuming is something a client ASKS for. It used to be inferred: a new upload matching an
     # existing session on vault, folder, name, size and chunk count was handed that session and
     # its already-received chunks. Nothing in that set distinguishes a genuine resume from a
@@ -12440,16 +12462,34 @@ async def init_chunked_upload(
                 or db.query(RetiredObjectId.id).filter(
                     RetiredObjectId.id == body.file_id).first()):
             raise HTTPException(status_code=409, detail="File id already in use")
+        # Pre-assign the session id: it keys the per-object name seal below, and
+        # ChunkedUploadSession.id defaults at flush (None at construction), so the seal cannot be
+        # computed after the fact.
+        _sid = uuid.uuid4()
+        if is_zk:
+            # Zero-knowledge: the client sent the browser-encrypted name in enc_name/enc_mime + its
+            # own blind index; the server never sees the plaintext, so plaintext columns stay NULL.
+            _f_filename, _f_mime = body.file_name, body.mime_type
+            _f_enc_name, _f_enc_mime, _f_name_bi = body.enc_name, body.enc_mime, body.name_bi
+        else:
+            # Standard: seal the working name/MIME at rest (AES-GCM keyed per (vault, session-id), like
+            # a File name) for the life of the active upload instead of holding them plaintext. The
+            # transparent load/refresh event restores filename/mime_type in-memory on every read.
+            from app.core.security import encrypt_object_field, name_blind_index
+            _f_filename, _f_mime = None, None
+            _f_enc_name = encrypt_object_field(vault_id, _sid, body.file_name, 'name') if body.file_name else None
+            _f_enc_mime = encrypt_object_field(vault_id, _sid, body.mime_type, 'mime') if body.mime_type else None
+            # Server blind index over the sanitized name, so a resume can match without a plaintext column.
+            _f_name_bi = name_blind_index(vault_id, body.file_name) if body.file_name else None
         session = ChunkedUploadSession(
+            id=_sid,
             vault_id=vault_id,
             user_id=current_user.id,
-            # Standard: plaintext name/MIME. ZK: NULL plaintext, client-encrypted name in
-            # enc_name/enc_mime + the blind index (server never sees the plaintext name).
-            filename=body.file_name,
-            mime_type=body.mime_type,
-            enc_name=body.enc_name,
-            enc_mime=body.enc_mime,
-            name_bi=body.name_bi,
+            filename=_f_filename,
+            mime_type=_f_mime,
+            enc_name=_f_enc_name,
+            enc_mime=_f_enc_mime,
+            name_bi=_f_name_bi,
             name_bi_candidates=body.name_bi_candidates or None,
             total_size=body.total_size,
             total_chunks=body.total_chunks,

@@ -49,6 +49,23 @@ def test_share_creates_notification_for_recipient_not_creator(admin, temp_user, 
         admin.delete_vault(v["id"])
 
 
+def test_share_notification_body_does_not_leak_the_sealed_item_name(admin, temp_user, temp_user_client):
+    # Item/vault names are sealed at rest everywhere else; the notification body must not re-expose
+    # them in the plaintext notifications.body column. Share a vault with a UNIQUE name and assert the
+    # recipient's notification (title + body) never contains it — only a generic call to action.
+    _enable_sharing(admin, True)
+    vname = unique("secretvault")
+    v = admin.create_vault(name=vname)
+    try:
+        _share_to_user(admin, v, temp_user["id"])
+        n = next(x for x in _notifs(temp_user_client)["notifications"] if x["type"] == "share_received")
+        assert vname not in (n.get("body") or ""), "the sealed vault name leaked into the notification body"
+        assert vname not in (n.get("title") or ""), "the sealed vault name leaked into the notification title"
+        assert n.get("target") == "#shared"      # the recipient still reaches the live item via the link
+    finally:
+        admin.delete_vault(v["id"])
+
+
 def test_notifications_are_per_user_scoped(admin, temp_user, temp_user_client):
     _enable_sharing(admin, True)
     v = admin.create_vault(name=unique("nsc"))
