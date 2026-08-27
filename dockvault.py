@@ -3349,10 +3349,12 @@ class DockVault:
             print(pal.paint(" Admin passwd : %s   (auto-generated - store it NOW)" % summary["admin_password"], "yellow"))
         print(pal.paint("\n *** ENCRYPT THE HOST DISK (LUKS / BitLocker / FileVault / encrypted cloud"
                         " volume). ***", "yellow"))
-        print(pal.paint("     The database volume holds usernames, notes and audit records in the clear,"
-                        " and a", "yellow"))
-        print(pal.paint("     running stack needs the plaintext .env - host disk encryption is the"
-                        " at-rest control.", "yellow"))
+        print(pal.paint("     Names, descriptions, notes and file contents are sealed at rest, but the"
+                        " database", "yellow"))
+        print(pal.paint("     still holds usernames, emails and audit metadata in the clear, and a"
+                        " running", "yellow"))
+        print(pal.paint("     stack needs the plaintext .env - host disk encryption is the at-rest"
+                        " control for what is not sealed.", "yellow"))
         print(pal.paint(" *** BACK UP .env OFF THIS HOST - it holds ENCRYPTION_KEY. ***", "yellow"))
         print(pal.paint("===================================================================\n", "blue"))
 
