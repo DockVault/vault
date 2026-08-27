@@ -173,9 +173,11 @@ def test_the_audit_still_scrubs_names_and_no_longer_stores_exception_text() -> N
     """
     audit = (ROOT / "app" / "services" / "audit_logger.py").read_text(encoding="utf-8")
     # vault_name joins the redacted names: a vault's name is a plaintext label (and the residual
-    # name for a zero-knowledge vault); resource_id still identifies the vault by UUID.
-    assert '_name_keys = ("file_name", "folder_name", "old_name", "new_name", "vault_name")' in audit
-    assert "k not in _name_keys" in audit
+    # name for a zero-knowledge vault); resource_id still identifies the vault by UUID. The key set
+    # is a module-level constant so the boot purge migration (app/core/audit_migrations.py) reads the
+    # SAME list and cannot drift from what is redacted on write.
+    assert 'REDACTED_NAME_KEYS = ("file_name", "folder_name", "old_name", "new_name", "vault_name")' in audit
+    assert "k not in REDACTED_NAME_KEYS" in audit
 
     sftp = SFTP_SRC.read_text(encoding="utf-8")
     assert "self.client_address, type(e).__name__" in sftp, (
