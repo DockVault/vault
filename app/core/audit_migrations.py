@@ -11,7 +11,6 @@ the table is scanned at most once ever. Safe on a fresh DB (nothing to purge; th
 """
 
 _MARKER_KEY = "audit_name_redaction_purged"
-_NAME_KEYS = ("file_name", "folder_name", "old_name", "new_name", "vault_name")
 
 
 def purge_audit_log_names(db) -> int:
@@ -19,6 +18,9 @@ def purge_audit_log_names(db) -> int:
     Returns the number of ROWS updated. Commits its own transaction (updates + marker together), so a
     crash mid-run leaves the marker unset and the purge is retried, never half-done."""
     from app.core.models import AuditLog, SystemSetting
+    # The SAME list the AuditLogger strips on write, so this purge and the live redaction can never
+    # drift: adding a key there covers legacy rows here too.
+    from app.services.audit_logger import REDACTED_NAME_KEYS
 
     if db.query(SystemSetting).filter(SystemSetting.key == _MARKER_KEY).first():
         return 0  # already purged on an earlier boot -- no table scan
@@ -29,8 +31,8 @@ def purge_audit_log_names(db) -> int:
     pending = []
     for row in db.query(AuditLog.id, AuditLog.details).yield_per(1000):
         details = row[1]
-        if isinstance(details, dict) and any(k in details for k in _NAME_KEYS):
-            pending.append((row[0], {k: v for k, v in details.items() if k not in _NAME_KEYS}))
+        if isinstance(details, dict) and any(k in details for k in REDACTED_NAME_KEYS):
+            pending.append((row[0], {k: v for k, v in details.items() if k not in REDACTED_NAME_KEYS}))
     for row_id, cleaned in pending:
         db.query(AuditLog).filter(AuditLog.id == row_id).update(
             {AuditLog.details: cleaned}, synchronize_session=False)

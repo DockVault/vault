@@ -142,3 +142,30 @@ def test_purge_on_a_clean_db_sets_the_marker(_pg):
         assert s.query(SystemSetting).filter(SystemSetting.key == _MARKER_KEY).first() is not None
     finally:
         s.close()
+
+
+@pytest.mark.docker
+def test_purge_ignores_null_and_non_dict_details(_pg):
+    """A NULL / scalar / list / empty-dict `details` must be left untouched by the isinstance-dict
+    guard and never crash the scan."""
+    from app.core.models import AuditLog, SystemSetting
+    from app.core.audit_migrations import purge_audit_log_names, _MARKER_KEY
+    s = _session(_pg)
+    try:
+        s.query(SystemSetting).filter(SystemSetting.key == _MARKER_KEY).delete()  # force a scan
+        s.commit()
+        rows = [
+            AuditLog(action="a", status="success", details=None),
+            AuditLog(action="b", status="success", details=[1, 2, 3]),
+            AuditLog(action="c", status="success", details="a string"),
+            AuditLog(action="d", status="success", details={}),
+        ]
+        s.add_all(rows)
+        s.commit()
+        ids = [r.id for r in rows]
+        assert purge_audit_log_names(s) == 0, "no dict-with-name-keys rows -> nothing updated, no crash"
+        s.expire_all()
+        assert [s.get(AuditLog, i).details for i in ids] == [None, [1, 2, 3], "a string", {}], \
+            "null / non-dict / empty details are left exactly as-is"
+    finally:
+        s.close()
