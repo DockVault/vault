@@ -1160,13 +1160,19 @@ def new_set_config(current_env, new_prefix, new_id):
     deployment id. The paired secrets and volumes are created together, upholding the bundle invariant."""
     def truthy(k):
         return (current_env.get(k) or "").strip().lower() in ("1", "true", "yes", "on")
+    # A new set is a new admin. Carry the source .env's admin password if it still has one, but a
+    # deployment whose spent ADMIN_PASSWORD was dropped after bootstrap has none to carry - generate
+    # a fresh one and flag it so the caller shows it once (the operator needs it to log into the new
+    # set, and it is the only place it is ever printed).
+    src_admin_pw = (current_env.get("ADMIN_PASSWORD") or "").strip()
     cfg = {
         "server_name": current_env.get("SERVER_NAME") or current_env.get("ALLOWED_HOSTS") or "localhost",
         "encryption_key": gen_fernet_key(), "jwt_secret_key": gen_hex(32),
         "vault_db_password": gen_hex(16), "redis_password": gen_hex(24),
         "admin_username": current_env.get("ADMIN_USERNAME") or "admin",
         "admin_email": current_env.get("ADMIN_EMAIL") or "admin@example.com",
-        "admin_password": current_env.get("ADMIN_PASSWORD") or gen_hex(12),
+        "admin_password": src_admin_pw or gen_hex(12),
+        "_generated_admin_pw": not src_admin_pw,
         "compose_profiles": current_env.get("COMPOSE_PROFILES") or "combined",
         "deployment_id": new_id, "volume_prefix": new_prefix,
         "run_sftp": truthy("RUN_SFTP"),
@@ -1938,6 +1944,36 @@ def probe_pg_password(container, user, db, password, run=subprocess.run):
     return classify_pg_probe(getattr(r, "returncode", 1), getattr(r, "stderr", ""))
 
 
+def admin_bootstrap_done(container, user, db, password, run=subprocess.run):
+    """Whether the running DB carries the admin_bootstrap marker - i.e. an admin exists and the
+    initial ADMIN_PASSWORD is spent. Returns True (marker present), False (confirmed absent) or None
+    (any docker/exec/auth error -> the caller must fail closed and KEEP the password). Connects the
+    same way probe_pg_password does (the container's own IP + PGPASSWORD, never the trusted socket),
+    so it exercises real auth and never puts a secret on the host argv."""
+    try:
+        ipr = run(["docker", "exec", container, "hostname", "-i"],
+                  capture_output=True, text=True, timeout=20)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if getattr(ipr, "returncode", 1) != 0:
+        return None
+    parts = (getattr(ipr, "stdout", "") or "").split()
+    if not parts:
+        return None
+    ip = parts[0]
+    try:
+        r = run(["docker", "exec", "-e", "PGPASSWORD", container,
+                 "psql", "-h", ip, "-U", user, "-d", db, "-tAc",
+                 "SELECT 1 FROM system_settings WHERE key='admin_bootstrap' LIMIT 1"],
+                capture_output=True, text=True, timeout=30,
+                env=dict(os.environ, PGPASSWORD=password))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    return (getattr(r, "stdout", "") or "").strip() == "1"
+
+
 def db_guard_decision(volume_exists_flag, probe_result):
     """The pure guardrail decision: 'proceed' | 'refuse'. A fresh (non-existent) volume always
     proceeds (the .env password is baked in on first init). An existing volume proceeds ONLY on a
@@ -2287,6 +2323,15 @@ class DockVault:
             raise SystemExit(1)
         os.remove(env_path)
         print(pal.paint("  Locked: .env -> .env.enc (plaintext .env removed).", "green"))
+        # Sealing .env seals ONLY .env. Any .env.<prefix> archives set aside by 'new set' / repoint /
+        # remove are still plaintext on disk and each holds an ENCRYPTION_KEY -- surface them so they
+        # are not overlooked (lock does not manage them).
+        archives = self._env_archives()
+        if archives:
+            print(pal.paint(
+                "  WARNING: %d plaintext .env archive(s) are NOT sealed by lock and still hold an\n"
+                "  ENCRYPTION_KEY (%s). Back them up off this host, then delete them."
+                % (len(archives), ", ".join(os.path.basename(a) for a in archives)), "red"))
         # Sealing .env does NOT clear the copy Docker already baked into a running/stopped container's
         # on-disk config -- point the operator at the command that does.
         if container_exists(DB_CONTAINER):
@@ -2498,6 +2543,11 @@ class DockVault:
                             "green"))
         else:
             print(pal.paint("  Credentials: plaintext .env (not locked)", "grey"))
+        archives = self._env_archives()
+        if archives:
+            print(pal.paint("  Note: %d plaintext .env archive(s) on disk (%s) - each holds an "
+                            "ENCRYPTION_KEY and is NOT sealed by 'lock'."
+                            % (len(archives), ", ".join(os.path.basename(a) for a in archives)), "yellow"))
         ok, _ = docker_available()
         if not ok:
             print(pal.paint("  Docker is not available.", "yellow"))
@@ -2552,6 +2602,12 @@ class DockVault:
             # second run keeps whatever id is already there.
             if not (existing.get("DEPLOYMENT_ID") or "").strip():
                 self._set_env_key(env_path, "DEPLOYMENT_ID", "default")
+            # Honour an explicit --admin-password/--admin-username on a reuse: it seeds the FIRST admin
+            # of a set that is not bootstrapped yet (e.g. a fresh set just authored by the Volumes
+            # menu, whose .env carries an auto-generated placeholder password). On an already-
+            # bootstrapped deployment the seed is marker-guarded, so this is inert and the value is
+            # dropped again after a healthy boot. Not passed -> the existing .env is left untouched.
+            existing = self._apply_cli_admin_overrides(env_path, existing, args)
             summary = {"server_name": existing.get("SERVER_NAME") or existing.get("ALLOWED_HOSTS") or "",
                        "admin_username": existing.get("ADMIN_USERNAME") or "admin",
                        "compose_profiles": migrated,
@@ -2624,7 +2680,10 @@ class DockVault:
         # with a clear diagnosis (the reported "wrong password after re-setup" footgun).
         env_now = parse_env(open(env_path, encoding="utf-8").read()) if os.path.exists(env_path) else {}
         interactive = not (args and getattr(args, "non_interactive", False))
-        if not self._guard_db_secret(env_now, interactive=interactive):
+        # A .env authored by THIS run (a fresh install, not a reuse) that has never touched data is a
+        # throwaway - tell the guard so its 'deploy a new set' option discards it instead of archiving
+        # a pointless plaintext-secret file.
+        if not self._guard_db_secret(env_now, interactive=interactive, env_is_fresh=not reusing):
             raise SystemExit(1)   # the guard already printed the diagnosis + recovery paths
         # The interactive guard can install a different .env or author a fresh set. Re-read it,
         # persist any supported legacy profile, and refresh every profile/port value used below.
@@ -2671,6 +2730,12 @@ class DockVault:
         healthy = self._wait_secure_healthy(profiles)
         logs_shown = False if healthy else self._tail_logs(self._web_service(profiles))
         self._print_setup_summary(summary, healthy, logs_shown)
+        # Once the deployment is up and the admin is bootstrapped, ADMIN_PASSWORD is spent: drop it
+        # from the host .env so the initial admin password is not retained in plaintext at rest. The
+        # app scrubs its own in-container copy; this closes the on-disk copy. Fail-safe (keeps the
+        # value on any doubt) and never breaks a healthy setup.
+        if healthy:
+            self._strip_spent_admin_password(env_path, env_now)
         # NOTE: the coupling stamp is written ONLY where a pairing has been PROVEN - after a
         # successful psql auth probe in _verify_env_against_volume. Stamping here would be
         # fail-OPEN: the interactive guard can rewrite .env mid-run (choosing "deploy a NEW set"
@@ -2855,6 +2920,90 @@ class DockVault:
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(lines) + "\n")
         tighten_secret_file(path)
+
+    def _remove_env_keys(self, path, keys):
+        """Remove any KEY= lines for the given keys from .env (preserving perms). Returns True if any
+        line was removed. Comments and every other line are kept verbatim."""
+        if not os.path.exists(path):
+            return False
+        keyset = set(keys)
+        out, removed = [], False
+        for raw in open(path, encoding="utf-8").read().splitlines():
+            m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", raw)
+            if m and m.group(1) in keyset:
+                removed = True
+                continue
+            out.append(raw)
+        if removed:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("\n".join(out) + "\n")
+            tighten_secret_file(path)
+        return removed
+
+    def _apply_cli_admin_overrides(self, path, env, args):
+        """On a setup reuse, write an EXPLICIT --admin-password/--admin-username/--admin-email into the
+        reused .env so it can seed a not-yet-bootstrapped set (harmless on a bootstrapped one). Returns
+        the updated env dict. A no-op when none were passed."""
+        changed = {}
+        for cli, key in (("admin_password", "ADMIN_PASSWORD"), ("admin_username", "ADMIN_USERNAME"),
+                         ("admin_email", "ADMIN_EMAIL")):
+            val = (getattr(args, cli, None) if args else None)
+            if not val:
+                continue
+            # Validate the password with the SAME guard the fresh path uses (_collect_setup_config),
+            # BEFORE it reaches .env. An unvalidated value that contains a single quote would corrupt
+            # the single-quoted .env line, so the app is seeded with a different password than the
+            # operator supplied - then dropped after a healthy boot, a silent admin lockout.
+            if key == "ADMIN_PASSWORD":
+                prob = admin_password_problem(val, "production")
+                if prob:
+                    self._fail("admin password %s" % prob)
+            self._set_env_key(path, key, "'%s'" % val)
+            changed[key] = val
+        if changed:
+            env = dict(env, **changed)
+        return env
+
+    def _env_archives(self):
+        """Every plaintext .env archive on disk (.env.<something>), excluding the template and the
+        sealed lock file. These are set aside by 'new set' / repoint / remove and still hold an
+        ENCRYPTION_KEY; 'lock' does not manage them, so the tool surfaces them instead."""
+        out = []
+        for p in glob.glob(os.path.join(self.root, ".env.*")):
+            base = os.path.basename(p)
+            if base in (".env.example", ".env.enc") or not os.path.isfile(p):
+                continue
+            out.append(p)
+        return sorted(out)
+
+    def _warn_env_archived(self, archived):
+        """Warn (in red) that a real .env was set aside as a plaintext archive the tool won't manage."""
+        print(self.pal.paint(
+            "  ! Your previous .env was archived to %s. It is PLAINTEXT and still holds that\n"
+            "    deployment's ENCRYPTION_KEY and DB password. 'lock' does NOT seal .env.* archives -\n"
+            "    back it up off this host, then delete or hand-seal it." % os.path.basename(archived),
+            "bold", "red"))
+
+    def _strip_spent_admin_password(self, env_path, env):
+        """After a healthy boot, drop the spent ADMIN_PASSWORD from the host .env once the admin is
+        bootstrapped (an admin exists). Fail-safe: only strips when the DB confirms the bootstrap
+        marker; on any doubt it keeps the value (a later boot may still need it to seed the first
+        admin). ADMIN_USERNAME/ADMIN_EMAIL are not secrets and are kept (they give a re-run its admin
+        name). Never raises - credential hygiene must not break a working setup."""
+        pal = self.pal
+        try:
+            if not (env.get("ADMIN_PASSWORD") or "").strip():
+                return   # already stripped / never set
+            done = admin_bootstrap_done(DB_CONTAINER, PG_USER, PG_DB, env.get("VAULT_DB_PASSWORD", ""))
+            if done is not True:
+                return   # could not confirm an admin exists -> keep the bootstrap password
+            if self._remove_env_keys(env_path, ["ADMIN_PASSWORD"]):
+                print(pal.paint(
+                    "  Removed the spent ADMIN_PASSWORD from .env (the admin is bootstrapped; it is no\n"
+                    "  longer needed). Re-supply it only to seed a NEW admin on a fresh database.",
+                    "green"))
+        except Exception as exc:  # noqa: BLE001 - hygiene is best-effort, never fatal
+            print(pal.paint("  (could not drop the spent ADMIN_PASSWORD from .env: %s)" % exc, "yellow"))
 
     def _normalize_compose_profile(self):
         """Persist the one supported app profile before any Compose command reads ``.env``.
@@ -3124,12 +3273,13 @@ class DockVault:
         return False
 
     def _guard_db_secret(self, env, interactive=False, exists_fn=None, start_fn=None, wait_fn=None,
-                         probe_fn=None, stop_fn=None, marker_fn=None, stamp_fn=None):
+                         probe_fn=None, stop_fn=None, marker_fn=None, stamp_fn=None, env_is_fresh=False):
         """Guardrail against the 'existing volume + wrong .env' footgun. No-op (True) for a fresh
         volume. NON-interactive (a script): auto-verify the current .env's DB password and FAIL CLOSED
         on a mismatch/ambiguous result. INTERACTIVE: do NOT auto-wait - present choices (verify / point
         at a .env / new set / destroy / cancel) and run the ~30s DB probe only if the operator asks.
-        Never prints a secret. The *_fn hooks are injectable for tests."""
+        Never prints a secret. The *_fn hooks are injectable for tests. env_is_fresh flags a .env this
+        setup run just authored and never used, so the interactive 'new set' option can discard it."""
         exists_fn = exists_fn or volume_exists
         vol = "%s_vault_pg_data" % volume_prefix(env)
         if not exists_fn(vol):
@@ -3138,7 +3288,7 @@ class DockVault:
                  probe_fn or probe_pg_password, stop_fn or self._stop_db_only,
                  marker_fn or read_volume_coupling, stamp_fn or write_volume_coupling)
         if interactive:
-            return self._resolve_existing_volume(env, vol, hooks)
+            return self._resolve_existing_volume(env, vol, hooks, env_is_fresh=env_is_fresh)
         # non-interactive: verify + fail closed (a script must not auto-destroy or auto-fork).
         result = self._verify_env_against_volume(env, vol, hooks)
         if result == "ok":
@@ -3185,10 +3335,15 @@ class DockVault:
             stamp_fn(vol, env)   # best-effort: make the next check instant
         return result if result in ("ok", "mismatch") else "ambiguous"
 
-    def _resolve_existing_volume(self, env, vol, hooks):
+    def _resolve_existing_volume(self, env, vol, hooks, env_is_fresh=False):
         """Interactive menu shown when an existing data volume is found. NOTHING starts until the
         operator chooses; only 1/2 run the slow DB probe. Returns True to PROCEED (after acting) or
-        False to stop. Never prints a secret."""
+        False to stop. Never prints a secret.
+
+        env_is_fresh marks the current .env as one THIS setup run just authored and never used (a
+        fresh install that found a pre-existing volume). It is threaded to option 3 so a throwaway
+        .env is discarded rather than archived. Pointing at another .env (option 2) installs a real
+        secret file, so the flag is cleared once that happens."""
         pal = self.pal
         print(pal.paint("\n  Found an existing data volume from a previous deployment:", "yellow"))
         print("    %s" % vol)
@@ -3221,11 +3376,12 @@ class DockVault:
                     print(pal.paint("  That .env is not deployable: %s." % exc, "red"))
                     continue
                 env = self._load_env()   # the installed .env may name a different volume set
+                env_is_fresh = False     # a real, operator-supplied .env now - never discard it
                 print(pal.paint("  Installed that .env; verifying it...", "cyan"))
                 if self._try_verify(env, "%s_vault_pg_data" % volume_prefix(env), hooks):
                     return True
             elif choice == "3":
-                self._new_set_from(env)
+                self._new_set_from(env, current_env_is_fresh=env_is_fresh)
                 return True
             elif choice == "4":
                 if self._destroy_data(vol):
@@ -3254,19 +3410,33 @@ class DockVault:
                             "mismatch. Try again, or pick another option.", "yellow"))
         return False
 
-    def _new_set_from(self, env):
-        """Author a fresh set (new prefix + secrets) with its own .env, archiving the current one. The
-        old data is left untouched (re-pointable later from the Volumes menu)."""
+    def _new_set_from(self, env, current_env_is_fresh=False):
+        """Author a fresh set (new prefix + secrets) with its own .env. The old data is left untouched
+        (re-pointable later from the Volumes menu).
+
+        current_env_is_fresh marks a .env this same setup run just authored and never used to touch
+        data (a fresh install that hit an existing volume). That .env's secrets open nothing, so it is
+        DISCARDED (overwritten by the new set's .env) rather than archived as a pointless plaintext
+        secret file. A real, pre-existing .env is archived and the operator is warned in red that the
+        archive is plaintext and holds that deployment's ENCRYPTION_KEY."""
         pal = self.pal
         new_id = gen_deployment_id()
         new_prefix = "%s-%s" % (DEFAULT_PROJECT, new_id)
-        self._archive_env(volume_prefix(env))
-        if write_env(self._env_path(), build_env_lines(new_set_config(env, new_prefix, new_id))):
-            print(pal.paint("  Authored a fresh set '%s' (new volumes + secrets); starting it. The previous "
-                            "set's .env was saved aside." % new_prefix, "green"))
+        archived = None if current_env_is_fresh else self._archive_env(volume_prefix(env))
+        cfg = new_set_config(env, new_prefix, new_id)
+        if write_env(self._env_path(), build_env_lines(cfg)):
+            note = "  Authored a fresh set '%s' (new volumes + secrets); starting it." % new_prefix
+            if archived:
+                note += " The previous set's .env was saved aside."
+            print(pal.paint(note, "green"))
         else:
             print(pal.paint("  Authored a fresh set '%s' - WARNING: could not restrict the new .env's "
                             "permissions; secure it yourself." % new_prefix, "yellow"))
+        if archived:
+            self._warn_env_archived(archived)
+        if cfg.get("_generated_admin_pw"):
+            print(pal.paint("  New set's admin password: %s   (auto-generated - store it NOW)"
+                            % cfg["admin_password"], "bold", "yellow"))
 
     def _destroy_data(self, vol):
         """Strong-confirm + docker compose down -v. True to proceed (destroyed), False if declined."""
@@ -3882,7 +4052,10 @@ class DockVault:
             print(pal.paint("  Wrote a fresh .env - WARNING: could not restrict its permissions "
                             "(it holds ENCRYPTION_KEY); secure it yourself.", "yellow"))
         if archived:
-            print("  Your previous set's .env was saved at: %s" % archived)
+            self._warn_env_archived(archived)
+        if cfg.get("_generated_admin_pw"):
+            print(pal.paint("  New set's admin password: %s   (auto-generated - store it NOW)"
+                            % cfg["admin_password"], "bold", "yellow"))
         print(pal.paint("  Run Setup to build + start the new (empty) set.\n", "cyan"))
 
     def _volume_repoint(self, env, args=None):

@@ -1077,7 +1077,8 @@ def test_guard_interactive_routes_to_menu_not_autoprobe(tmp_path, monkeypatch):
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     env = {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"}
     called = []
-    monkeypatch.setattr(tool, "_resolve_existing_volume", lambda e, vol, hooks: called.append(1) or True)
+    monkeypatch.setattr(tool, "_resolve_existing_volume",
+                        lambda e, vol, hooks, env_is_fresh=False: called.append(1) or True)
     # interactive + existing volume -> the menu (nothing probes automatically)
     assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True, **_NO_STAMP) is True and called == [1]
     # non-interactive -> auto-verify directly, NO menu
@@ -1190,6 +1191,124 @@ def test_volume_new_authors_fresh_set_and_archives_current(tmp_path):
     archive = tmp_path / ".env.dockvault-vault"                              # current set's .env saved
     assert archive.exists()
     assert dv.parse_env(archive.read_text(encoding="utf-8"))["ENCRYPTION_KEY"] == old["ENCRYPTION_KEY"]
+
+
+def test_new_set_config_flags_generated_admin_pw():
+    # A source .env that still carries ADMIN_PASSWORD -> the new set keeps it, no auto-generate flag.
+    kept = dv.new_set_config({"SERVER_NAME": "v", "ADMIN_PASSWORD": "Kept-Pass-9999"},
+                             "dockvault-vault-a1", "a1")
+    assert kept["admin_password"] == "Kept-Pass-9999" and kept["_generated_admin_pw"] is False
+    # A source .env whose spent ADMIN_PASSWORD was dropped -> the new set generates one AND flags it,
+    # so the caller shows it once (the operator needs it to log into the fresh set).
+    gen = dv.new_set_config({"SERVER_NAME": "v"}, "dockvault-vault-a2", "a2")
+    assert gen["_generated_admin_pw"] is True and len(gen["admin_password"]) >= 8
+
+
+def test_new_set_from_discards_fresh_env_but_archives_real(tmp_path):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    # A freshly-authored throwaway .env (this run, never used) is DISCARDED - no pointless archive.
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    tool._new_set_from(env, current_env_is_fresh=True)
+    assert not (tmp_path / ".env.dockvault-vault").exists()                   # not archived
+    assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["VAULT_VOLUME_PREFIX"].startswith(
+        "dockvault-vault-")                                                   # the new set replaced it
+    # A real, pre-existing .env is archived (and the operator warned).
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    env2 = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    tool._new_set_from(env2, current_env_is_fresh=False)
+    assert (tmp_path / ".env.dockvault-vault").exists()                       # archived, not discarded
+
+
+def test_remove_env_keys_drops_only_named_lines(tmp_path):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    p = str(tmp_path / ".env")
+    (tmp_path / ".env").write_text("# a comment\nADMIN_PASSWORD='secret'\nSERVER_NAME='x'\n", encoding="utf-8")
+    assert tool._remove_env_keys(p, ["ADMIN_PASSWORD"]) is True
+    left = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "ADMIN_PASSWORD" not in left and "# a comment" in left and "SERVER_NAME='x'" in left
+    assert tool._remove_env_keys(p, ["ADMIN_PASSWORD"]) is False              # already gone -> no-op
+
+
+def test_env_archives_excludes_template_and_lock(tmp_path):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    for name in (".env.example", ".env.enc", ".env.dockvault-vault", ".env.dockvault-vault-x9"):
+        (tmp_path / name).write_text("x\n", encoding="utf-8")
+    got = sorted(os.path.basename(a) for a in tool._env_archives())
+    assert got == [".env.dockvault-vault", ".env.dockvault-vault-x9"]         # template + lock excluded
+
+
+def test_admin_bootstrap_done_classifies():
+    def _run(marker_stdout=None, host_rc=0, psql_rc=0, raise_on=None):
+        def run(args, **k):
+            if raise_on and raise_on in args:
+                raise OSError("boom")
+            r = type("R", (), {})()
+            if "hostname" in args:
+                r.returncode, r.stdout = host_rc, "172.18.0.9\n"
+            else:  # psql
+                r.returncode, r.stdout, r.stderr = psql_rc, (marker_stdout or ""), ""
+            return r
+        return run
+    done = dv.admin_bootstrap_done
+    assert done("c", "u", "d", "pw", run=_run(marker_stdout="1\n")) is True   # marker present
+    assert done("c", "u", "d", "pw", run=_run(marker_stdout="\n")) is False   # confirmed absent
+    assert done("c", "u", "d", "pw", run=_run(psql_rc=1)) is None             # query failed -> unknown
+    assert done("c", "u", "d", "pw", run=_run(host_rc=1)) is None             # no container IP -> unknown
+    assert done("c", "u", "d", "pw", run=_run(raise_on="hostname")) is None   # exec error -> unknown
+
+
+def test_strip_spent_admin_password_gated_on_marker(tmp_path, monkeypatch):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    p = str(tmp_path / ".env")
+
+    def seed():
+        (tmp_path / ".env").write_text(
+            "ADMIN_PASSWORD='Strong-Pass-1234'\nVAULT_DB_PASSWORD='dbpw'\n", encoding="utf-8")
+    env = {"ADMIN_PASSWORD": "Strong-Pass-1234", "VAULT_DB_PASSWORD": "dbpw"}
+    # marker confirmed -> strip
+    seed(); monkeypatch.setattr(dv, "admin_bootstrap_done", lambda *a, **k: True)
+    tool._strip_spent_admin_password(p, env)
+    assert "ADMIN_PASSWORD" not in (tmp_path / ".env").read_text(encoding="utf-8")
+    # marker unknown (None) or absent (False) -> KEEP (a later boot may still need it)
+    for verdict in (None, False):
+        seed(); monkeypatch.setattr(dv, "admin_bootstrap_done", lambda *a, v=verdict, **k: v)
+        tool._strip_spent_admin_password(p, env)
+        assert "ADMIN_PASSWORD" in (tmp_path / ".env").read_text(encoding="utf-8")
+    # nothing to strip -> never even probes the DB
+    seed()
+    monkeypatch.setattr(dv, "admin_bootstrap_done",
+                        lambda *a, **k: pytest.fail("must not probe when no ADMIN_PASSWORD is set"))
+    tool._strip_spent_admin_password(p, {"VAULT_DB_PASSWORD": "dbpw"})
+
+
+def test_apply_cli_admin_overrides_only_when_passed(tmp_path):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    p = str(tmp_path / ".env")
+    (tmp_path / ".env").write_text("ADMIN_PASSWORD='old'\nSERVER_NAME='x'\n", encoding="utf-8")
+    # nothing passed -> untouched
+    out = tool._apply_cli_admin_overrides(p, {"ADMIN_PASSWORD": "old"}, argparse.Namespace())
+    assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["ADMIN_PASSWORD"] == "old"
+    assert out["ADMIN_PASSWORD"] == "old"
+    # explicit --admin-password -> written into .env AND reflected in the returned env
+    out = tool._apply_cli_admin_overrides(p, {"ADMIN_PASSWORD": "old"},
+                                          argparse.Namespace(admin_password="New-Pass-1234"))
+    assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["ADMIN_PASSWORD"] == "New-Pass-1234"
+    assert out["ADMIN_PASSWORD"] == "New-Pass-1234"
+
+
+def test_apply_cli_admin_overrides_validates_password_like_fresh_path(tmp_path):
+    # The reuse override must run the SAME guard as the fresh path, or a value that corrupts .env
+    # quoting (a single quote) or is too weak reaches the seed and then a silent post-boot lockout.
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    p = str(tmp_path / ".env")
+    (tmp_path / ".env").write_text("ADMIN_PASSWORD='keep'\n", encoding="utf-8")
+    for bad in ("a'b-Str0ng-Pass", "short"):   # single quote (breaks quoting); too short
+        with pytest.raises(SystemExit):
+            tool._apply_cli_admin_overrides(p, {"ADMIN_PASSWORD": "keep"},
+                                            argparse.Namespace(admin_password=bad))
+        # rejected BEFORE any write -> the previous value is intact
+        assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["ADMIN_PASSWORD"] == "keep"
 
 
 def _write_target_set(tmp_path, prefix, did):
