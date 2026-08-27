@@ -1744,6 +1744,18 @@ def is_eol(matrix, version):
     return version_support(matrix, version).get("eol") is True
 
 
+def preferred_lifecycle_matrix(local_matrix, fetched_matrix, version):
+    """Which matrix to read a version's LIFECYCLE (eol / secure) from.
+
+    Lifecycle is a GLOBAL, time-varying property -- a version is marked end-of-life LATER than it
+    shipped -- so the authoritative source is this checkout's newest matrix, not the target's own
+    published one (which is frozen at its cut time and forever self-declares eol:false). Fall back to
+    the target's matrix only when the local one does not describe the version at all, e.g. the target
+    is newer than this checkout. This is the INVERSE of hop DESCRIPTION, where the target's own file
+    is preferred because only it can describe a hop reaching a newer release."""
+    return local_matrix if version_support(local_matrix, version) else fetched_matrix
+
+
 def support_line(matrix, version):
     """A one-line human summary of a version's lifecycle, or '' when nothing is stated. Names the
     end-of-life state, any extended-support tail dates, and whether the version is insecure."""
@@ -4122,9 +4134,9 @@ class DockVault:
         self._describe_hop(plan, matrix_source, current, tag)
 
         # Refuse an end-of-life target outright -- it is neither offered in the list nor a place to
-        # move to. Prefer the matrix that actually describes the target (the fetched one; else this
-        # checkout's), so an older published file that predates the lifecycle schema does not hide it.
-        eol_matrix = matrix if version_support(matrix, tag) else local_matrix
+        # move to. Read the lifecycle from THIS checkout's matrix (the newest view), since a version
+        # becomes end-of-life after it ships and its own published matrix is frozen at cut time.
+        eol_matrix = preferred_lifecycle_matrix(local_matrix, matrix, tag)
         if is_eol(eol_matrix, tag):
             self._fail("%s is end-of-life and cannot be upgraded or downgraded to (%s)."
                        % (tag, support_line(eol_matrix, tag)))

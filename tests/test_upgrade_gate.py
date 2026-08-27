@@ -637,3 +637,19 @@ def test_support_line_names_eol_tail_and_insecurity():
     assert "unpatched" in line                        # insecure is named
     assert dv.support_line(m, "0.2.0") == "supported"
     assert dv.support_line(_matrix(), "0.1.0") == ""  # nothing stated -> empty
+
+
+def test_lifecycle_is_read_from_the_newest_local_view_not_the_frozen_target():
+    # A version becomes end-of-life AFTER it ships; the target's own published matrix is frozen at
+    # cut time and forever self-declares eol:false, so this checkout's newer view must win.
+    local = _lifecycle_matrix()
+    local["versions"]["0.2.0"]["support"] = {"eol": True, "secure": False}
+    frozen = _lifecycle_matrix()                          # the target's own: 0.2.0 eol:false
+    chosen = dv.preferred_lifecycle_matrix(local, frozen, "0.2.0")
+    assert dv.is_eol(chosen, "0.2.0") is True
+    # But when the local view does not describe the target at all (a release newer than this
+    # checkout), fall back to the fetched matrix, which does.
+    newer = {"schema_version": 2, "about": "t", "kinds": {"direct": "a", "blocked": "b"},
+             "versions": {"0.9.0": {"released": "2026-01-01", "notes": "n",
+                                    "support": {"eol": False, "secure": True}}}, "edges": []}
+    assert dv.preferred_lifecycle_matrix(local, newer, "0.9.0") is newer
