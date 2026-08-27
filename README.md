@@ -327,6 +327,21 @@ backup when one is required, and asks you to type an acknowledgement for a chang
 rolled back. `--dry-run` reports the plan and changes nothing. An upgrade it cannot find a
 description for is treated as the riskiest case rather than assumed safe.
 
+### Support lifecycle and the minimum supported version
+
+Each version in the matrix also declares a support lifecycle: whether it is **end-of-life**, whether
+it is **secure** (free of known unpatched vulnerabilities), and — for an end-of-life version kept on
+extended support — the dates its code fixes and its (usually longer) security-only support run until.
+`dockvault.py update` hides end-of-life releases from the list, refuses to upgrade or downgrade to
+one, and warns before moving to a version with known unpatched vulnerabilities.
+
+**0.17.0 is the minimum supported version.** It seals vault names, descriptions and file checksums at
+rest in columns an older image cannot read, so there is no in-place upgrade into it from 0.16.1 and no
+in-place downgrade off it — an older image fails closed rather than serving something wrong. Reach
+0.17.0 by deploying it as a fresh set and restoring your data from a backup, not by upgrading over the
+existing volumes; `dockvault.py update` refuses the in-place move and says so. Every release below
+0.17.0 is end-of-life.
+
 ## Data volumes
 
 A deployment keeps its data in five named volumes — `vault_pg_data` (database), `vault_storage`
