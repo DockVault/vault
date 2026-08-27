@@ -320,7 +320,10 @@ def test_retire_version_drops_unused_epochs(admin):
     the old-epoch member rows; the old epoch then reports no access."""
     ensure_ecc_keypair(admin)
     with _zk_enabled(admin):
-        vid = create_zk_vault(admin)["id"]
+        # Nameless: a sealed vault name would legitimately pin its DEK epoch, so epoch 1 would not
+        # be 'unused' after the rotation and could not be retired. This test isolates epoch use to
+        # the member/content rows it rotates.
+        vid = create_zk_vault(admin, seal_name=False)["id"]
     try:
         admin.post(f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
@@ -343,7 +346,10 @@ def test_retire_version_keeps_epochs_still_in_use(admin):
     epoch 1, then a rotation to 2, leaves epoch 1 un-retirable (the owner keeps reading it)."""
     ensure_ecc_keypair(admin)
     with _zk_enabled(admin):
-        vid = create_zk_vault(admin)["id"]
+        # Nameless: a sealed vault name would ALSO pin epoch 1, so this test would pass even if
+        # the FILE content-epoch pin regressed. Nameless isolates the property under test to the
+        # file below.
+        vid = create_zk_vault(admin, seal_name=False)["id"]
     try:
         _zk_chunked_upload(admin, vid, b"old-epoch-file", zk_key_version=1)  # file pins epoch 1
         admin.post(f"/ecc/vaults/{vid}/rekey", json={
@@ -367,7 +373,9 @@ def test_retire_version_keeps_epoch_used_by_a_folder_name(admin):
     import uuid as _uuid
     ensure_ecc_keypair(admin)
     with _zk_enabled(admin):
-        vid = create_zk_vault(admin)["id"]
+        # Nameless: a sealed vault name would ALSO pin epoch 1, masking a regression of the FOLDER
+        # name-epoch pin this test guards (the folder below must be the only thing keeping epoch 1).
+        vid = create_zk_vault(admin, seal_name=False)["id"]
     try:
         dek = os.urandom(32)
         nm = unique("dir")

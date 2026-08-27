@@ -20,6 +20,7 @@ import pytest
 
 from app.core.zk_temp_access import TEMP_ZK_KEY_ACCESS_DENIED
 from conftest import (
+    ZK_ENC_NAME_STUB,
     ZK_EPHEMERAL_STUB,
     ZK_WRAPPED_DEK_STUB,
     compute_registration_pop,
@@ -2804,7 +2805,7 @@ def test_a_credential_cannot_manufacture_its_own_envelope_eligibility(
                 # would hold with the bound under test reverted and this test would prove nothing.
                 created = temp.post("/vaults", json={
                     "name": unique("zk_self_escalation"),
-                    "type": "zero_knowledge",
+                    "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
                     "description": "created by the temporary credential",
                     "wrapped_dek": ZK_WRAPPED_DEK_STUB,
                     "ephemeral_public_key": ZK_EPHEMERAL_STUB,

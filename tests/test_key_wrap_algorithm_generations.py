@@ -271,7 +271,8 @@ def _stub(prefix="w"):
 def _create_hier_vault(admin):
     ensure_ecc_keypair(admin)
     r = admin.post("/vaults", json={
-        "name": unique("algogen"),
+        # Nameless (no sealed name): these tests exercise team/DEK-epoch retirement in isolation,
+        # and a sealed name would pin epoch 1 so its stale wraps could never be retired.
         "type": "zero_knowledge",
         "key_wrapping_mode": "hierarchical",
         "team_public_key": "TEAMPUB-" + uuid.uuid4().hex,

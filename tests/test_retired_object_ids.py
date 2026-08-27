@@ -24,7 +24,7 @@ import uuid
 
 import pytest
 
-from conftest import unique
+from conftest import unique, ZK_ENC_NAME_STUB
 
 
 pytestmark = pytest.mark.integration
@@ -160,7 +160,7 @@ def test_a_retired_vault_id_is_refused_by_the_create_endpoint(admin, zk_enabled)
     _seed_retired(retired, kind=3)
 
     r = admin.post("/vaults", json={"name": unique("reborn"), "id": str(retired),
-                                    "type": "zero_knowledge"})
+                                    "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1})
     assert r.status_code == 409, (
         f"a retired vault id was not refused ({r.status_code}: {r.text[:200]})")
     assert "already in use" in r.text
@@ -175,7 +175,7 @@ def test_a_fresh_vault_id_still_reaches_the_zero_knowledge_checks(admin, zk_enab
     says, which for a request carrying no wrapped key is a different rejection entirely.
     """
     r = admin.post("/vaults", json={"name": unique("fresh-zk"), "id": str(uuid.uuid4()),
-                                    "type": "zero_knowledge"})
+                                    "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1})
     assert "not enabled" not in r.text, (
         "zero-knowledge vaults are off, so this never reached the id check and proves nothing")
     assert r.status_code != 409 or "already in use" not in r.text, (
@@ -188,7 +188,7 @@ def _zk_vault(admin, vault_id=None):
     """A zero-knowledge vault, optionally under a client-chosen id."""
     from conftest import ensure_ecc_keypair, ZK_WRAPPED_DEK_STUB, ZK_EPHEMERAL_STUB
     ensure_ecc_keypair(admin)
-    body = {"name": unique("zk"), "type": "zero_knowledge",
+    body = {"name": unique("zk"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "wrapped_dek": ZK_WRAPPED_DEK_STUB, "ephemeral_public_key": ZK_EPHEMERAL_STUB}
     if vault_id:
         body["id"] = str(vault_id)

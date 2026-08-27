@@ -163,6 +163,11 @@ def ensure_ecc_keypair(client) -> None:
 import base64 as _base64  # noqa: E402
 ZK_WRAPPED_DEK_STUB = _base64.b64encode(b"wrapped-dek-stub" * 4).decode()
 ZK_EPHEMERAL_STUB = _base64.b64encode(b"ephemeral-pubkey-stub" * 5).decode()
+# A browser-sealed vault name is a zk2: blob the server stores verbatim and never decrypts. The
+# server now REFUSES a ZK vault whose name is sent in the clear (a plaintext `name` with no
+# enc_name), so a ZK create must carry a sealed name. API tests never decrypt the vault name, so a
+# fixed well-formed zk2: stand-in suffices; the real seal/round-trip is covered by the Playwright E2E.
+ZK_ENC_NAME_STUB = "zk2:" + _base64.urlsafe_b64encode(b"zk-vault-name-seal-stub" * 3).decode()
 
 
 # ---------------------------------------------------------------------------
@@ -262,18 +267,30 @@ def zk_chunked_upload(client, vault_id, name, content, dek, epoch=1, mime="text/
     return done.json()["id"]
 
 
-def create_zk_vault(client, name=None, wrapped_dek=None, ephemeral_public_key=None):
+def create_zk_vault(client, name=None, wrapped_dek=None, ephemeral_public_key=None, seal_name=True):
     """Create a zero-knowledge vault the way the browser does — supplying a vault DEK
     that was generated and wrapped CLIENT-SIDE (the server never sees it). Ensures the
     creator has a keypair and returns the vault JSON. The caller must have enabled
-    'zero_knowledge_enabled' (these helpers don't toggle deployment policy)."""
+    'zero_knowledge_enabled' (these helpers don't toggle deployment policy).
+
+    seal_name=True (default) sends a sealed name (enc_name) at epoch 1 alongside a non-secret
+    label, mirroring the browser. Pass seal_name=False for a NAMELESS vault (no label, no
+    enc_name) when a test exercises DEK-epoch retirement in isolation: a sealed name pins its
+    epoch (the name is a legitimate user of that DEK epoch), so a named vault's first epoch is
+    not 'unused' after a rotation and cannot be retired."""
     ensure_ecc_keypair(client)
-    r = client.post("/vaults", json={
-        "name": name or unique("zk"),
+    body = {
         "type": "zero_knowledge",
         "wrapped_dek": wrapped_dek or ZK_WRAPPED_DEK_STUB,
         "ephemeral_public_key": ephemeral_public_key or ZK_EPHEMERAL_STUB,
-    })
+    }
+    if seal_name:
+        # `name` is only the non-secret label the browser sends alongside the sealed name; the real
+        # name rides sealed in enc_name (which the server now requires for a ZK vault).
+        body["name"] = name or unique("zk")
+        body["enc_name"] = ZK_ENC_NAME_STUB
+        body["name_key_version"] = 1
+    r = client.post("/vaults", json=body)
     r.raise_for_status()
     return r.json()
 

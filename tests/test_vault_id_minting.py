@@ -24,7 +24,7 @@ import uuid
 
 import pytest
 
-from conftest import unique, ensure_ecc_keypair
+from conftest import unique, ensure_ecc_keypair, ZK_ENC_NAME_STUB
 
 
 def _stub(prefix="w"):
@@ -35,7 +35,7 @@ def _stub(prefix="w"):
 def _zk_payload(vault_id=None):
     body = {
         "name": unique("mintid"),
-        "type": "zero_knowledge",
+        "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
         "wrapped_dek": _stub("dek"),
         "ephemeral_public_key": _stub("eph"),
     }
@@ -163,7 +163,7 @@ def test_a_team_vault_may_also_choose_its_id(admin):
         ensure_ecc_keypair(admin)
         r = admin.post("/vaults", json={
             "name": unique("teamid"),
-            "type": "zero_knowledge",
+            "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "id": str(chosen),
             "key_wrapping_mode": "hierarchical",
             "team_public_key": "TEAMPUB-" + uuid.uuid4().hex,

@@ -27,7 +27,7 @@ import uuid
 
 import pytest
 
-from conftest import unique, ensure_ecc_keypair, create_zk_vault
+from conftest import unique, ensure_ecc_keypair, create_zk_vault, ZK_ENC_NAME_STUB
 
 DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 
@@ -258,7 +258,7 @@ def test_a_hierarchical_grant_refuses_an_epoch_it_cannot_honour(admin, temp_user
     try:
         r = admin.post("/vaults", json={
             "name": unique("hierepoch"),
-            "type": "zero_knowledge",
+            "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "key_wrapping_mode": "hierarchical",
             "team_public_key": "TEAMPUB-" + uuid.uuid4().hex,
             "team_wrapped_dek": _stub("tdek"),

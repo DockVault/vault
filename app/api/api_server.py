@@ -9229,6 +9229,20 @@ async def create_vault(
     _name_key_version = None
     if vault_type == 'zero_knowledge':
         from app.core.security import is_zk_sealed_name
+        # The server is the enforcement boundary for the ZK guarantee: a real name must be sealed in
+        # the browser (enc_name), never stored in the clear. A plaintext `name` is only ever a
+        # non-secret label, which the browser sends (or null) ALONGSIDE the sealed enc_name. A
+        # plaintext name with NO enc_name is a naive or buggy client putting the real name in the
+        # clear -- refuse it so that leak cannot happen, mirroring the rename path, which refuses a
+        # plaintext name on a ZK vault. (This closes the forgot-to-seal case. It cannot stop a client
+        # that deliberately pairs a real plaintext name with a throwaway sealed blob: the label is
+        # documented non-secret and the server cannot tell a label from a secret, so a client that
+        # mislabels its own secret is leaking its own data, outside the ZK boundary.)
+        # (name/description here have already been stripped-to-None.)
+        if _name is not None and _enc_name is None:
+            raise HTTPException(
+                status_code=400,
+                detail="A zero-knowledge vault name must be sealed in the browser (send enc_name).")
         if _enc_name is not None and not is_zk_sealed_name(_enc_name):
             raise HTTPException(status_code=400,
                                 detail="A zero-knowledge vault name must be sealed in the browser.")
