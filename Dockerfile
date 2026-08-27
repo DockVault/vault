@@ -1,5 +1,12 @@
 FROM python:3.14-alpine@sha256:a1321512d6a287428c50dcdf2ab3857761127e03a23b1f648e9c1c0de59288f8
 
+# Patch base-OS packages against the alpine security repository. The pinned base image is rebuilt
+# less often than the repo publishes fixes, so it can still carry an openssl (libcrypto3/libssl3)
+# with fixed HIGH CVEs installed -- which the release image scan (grype --fail-on high) rejects.
+# Upgrading here pulls the patched packages at build time; --no-cache keeps the apk index out of the
+# layer. The base digest stays pinned, so the starting point is still reproducible.
+RUN apk --no-cache upgrade
+
 WORKDIR /app
 
 # Bound DNS resolution so a Redis (or DB) outage fails FAST. socket_connect_timeout does NOT
