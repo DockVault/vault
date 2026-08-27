@@ -819,7 +819,15 @@ class File(Base):
     # File metadata
     size_bytes = Column(BigInteger, nullable=False)
     mime_type = Column(String(255), nullable=True)
-    checksum_sha256 = Column(String(64), nullable=False)  # For integrity verification (internal, never exposed)
+    # For integrity verification (internal, never exposed). Nullable because it is sealed at rest into
+    # enc_checksum (the plaintext column is NULLed; the load event restores it in-memory), so a fresh
+    # sealed row stores NULL here.
+    checksum_sha256 = Column(String(64), nullable=True)
+    # AES-GCM seal of the content checksum (per-file key). The plaintext checksum is a SHA-256 of the
+    # content -- a weak confirmation oracle for a DB/backup reader -- so it is sealed at rest like the
+    # file name. Server-computed for EVERY file (ZK + Standard), so unlike enc_name it is never a
+    # browser blob and the load event always decrypts it.
+    enc_checksum = Column(Text, nullable=True)
     # Keyed MAC over the content (HMAC of checksum_sha256 under a per-file key) used as the ETag,
     # so the plaintext checksum is never handed to a client. NULL on rows written before this
     # column: the value is deterministic from (id, checksum_sha256), so it is derived on read.
@@ -887,11 +895,22 @@ from sqlalchemy.orm import attributes as _sa_attributes
 
 
 def _decrypt_file_names(target, *_args):
+    from app.core.security import decrypt_object_field, is_zk_sealed_name
+    # The content checksum is sealed at rest for EVERY file (server-computed, never a ZK browser blob),
+    # so decrypt it FIRST -- before the name/MIME logic and its ZK early-return, and independently of
+    # whether this file has a sealed name. The ETag/MAC derivation and the integrity read the plaintext.
+    enc_checksum = getattr(target, 'enc_checksum', None)
+    if enc_checksum:
+        try:
+            _sa_attributes.set_committed_value(
+                target, 'checksum_sha256',
+                decrypt_object_field(target.vault_id, target.id, enc_checksum, 'checksum'))
+        except Exception:  # noqa: BLE001 — never let a decrypt error break a load
+            print(f"⚠ file checksum decrypt failed for {getattr(target, 'id', None)}")
     enc_name = getattr(target, 'enc_name', None)
     enc_mime = getattr(target, 'enc_mime', None)
     if not enc_name and not enc_mime:
         return
-    from app.core.security import decrypt_object_field, is_zk_sealed_name
     # Zero-knowledge names are encrypted client-side under the vault DEK; the server has
     # no key and MUST leave them opaque (plaintext columns stay NULL — the browser
     # decrypts). Detect by the ZK marker so we never spam decrypt failures or, worse,

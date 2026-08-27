@@ -15772,6 +15772,12 @@ def _run_lightweight_migrations():
             # fresh DB; this adds it on an existing one. No backfill: for a row whose column is still
             # NULL the value is derived on read (deterministic from id + checksum_sha256).
             "ALTER TABLE files ADD COLUMN IF NOT EXISTS content_mac VARCHAR(64)",
+            # Seal the content checksum at rest: enc_checksum holds the AES-GCM blob and the plaintext
+            # checksum_sha256 becomes NULLABLE (a sealed row NULLs it; the load event restores it on
+            # read). create_all adds these on a fresh DB; these backfill them on an existing one. A
+            # one-time eager backfill of existing rows runs in _backfill_encrypted_names.
+            "ALTER TABLE files ADD COLUMN IF NOT EXISTS enc_checksum TEXT",
+            "ALTER TABLE files ALTER COLUMN checksum_sha256 DROP NOT NULL",
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS enc_name TEXT",
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS name_bi VARCHAR(64)",
             "CREATE INDEX IF NOT EXISTS ix_folders_name_bi ON folders (name_bi)",
@@ -16133,6 +16139,20 @@ def _purge_audit_log_names():
         print(f"⚠ audit-log name redaction skipped: {e}")
 
 
+def _backfill_file_checksums():
+    """Seal any legacy plaintext file content checksums at rest (idempotent, batched). Covers every
+    file (ZK + Standard). Best-effort: never block boot. Logic lives in app.core.file_migrations."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.file_migrations import backfill_file_checksums
+        with get_db_context() as db:
+            sealed = backfill_file_checksums(db)
+        if sealed:
+            print(f"[OK] Sealed {sealed} file checksum(s) at rest")
+    except Exception as e:  # noqa: BLE001 — best-effort hardening migration, never block boot
+        print(f"⚠ file-checksum backfill skipped: {e}")
+
+
 def _backfill_note_content():
     """Seal any legacy plaintext note/link content at rest (idempotent). Best-effort: never block
     boot. Runs after the widen DDL. The logic lives in app.core.note_migrations so it is testable."""
@@ -16340,6 +16360,7 @@ async def lifespan(app: FastAPI):
     _rehash_plaintext_session_tokens()  # hash any legacy plaintext session tokens at rest (no logout)
     _backfill_note_content()            # seal any legacy plaintext note/link content at rest
     _backfill_encrypted_names()
+    _backfill_file_checksums()          # seal any legacy plaintext file content checksums at rest
     _purge_audit_log_names()            # strip residual plaintext names from legacy audit-log rows
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
     _seed_admin_user()

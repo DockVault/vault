@@ -79,6 +79,20 @@ def _seal_named_object(vault, obj, is_file: bool) -> None:
         obj.name = None
 
 
+def _seal_file_checksum(file) -> None:
+    """Seal a file's content checksum at rest: store the AES-GCM blob in enc_checksum and NULL the
+    plaintext checksum_sha256. UNLIKE the name, the checksum is server-computed for EVERY file (ZK and
+    Standard) -- it is never a browser blob -- so this runs for all files, and the load event always
+    decrypts it back for the ETag/MAC derivation and integrity read. The file MUST already have its id
+    assigned (the cipher key is per-(vault_id, id)). No-op if there is no id/vault_id/checksum yet."""
+    if getattr(file, 'id', None) is None or getattr(file, 'vault_id', None) is None \
+            or not getattr(file, 'checksum_sha256', None):
+        return
+    from app.core.security import encrypt_object_field
+    file.enc_checksum = encrypt_object_field(file.vault_id, file.id, file.checksum_sha256, 'checksum')
+    file.checksum_sha256 = None
+
+
 def _seal_vault_name(vault, name):
     """Seal a STANDARD vault's name at rest: store the AES-GCM blob in `enc_name` and NULL the
     plaintext `name` column, mirroring _seal_named_object for files/folders. A vault is its own
@@ -1462,6 +1476,11 @@ class VaultService:
 
         # Encrypt the filename/MIME at rest (Standard vaults) before persisting. No-op for ZK.
         _seal_named_object(file_info['vault'], file, is_file=True)
+        # Seal the content checksum at rest for EVERY file (ZK + Standard): it is server-computed, so
+        # unlike the name it is never a browser blob. content_mac (the ETag) was already stored above,
+        # so nothing on the hot read path needs the plaintext checksum except the load event, which
+        # restores it. Runs after _seal_named_object so a Standard file already has enc_name set.
+        _seal_file_checksum(file)
 
         # Update vault statistics.
         #
