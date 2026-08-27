@@ -136,12 +136,15 @@ def test_the_committed_matrix_declares_every_released_edge_direct():
     that is fine and expected -- but it should be a deliberate edit, not a silent one.
     """
     data = um.load_matrix(MATRIX_PATH)
-    # A blocked edge INTO the release being prepared is the deliberate floor -- it says the new
-    # minimum version is reached by a fresh deploy + restore, not an in-place upgrade. Every edge
-    # between already-RELEASED versions must still be direct.
+    # A blocked edge INTO a FLOOR release is the deliberate exception -- it says that version is the
+    # minimum reached by a fresh deploy + restore, not an in-place upgrade. That is true of the
+    # release being prepared AND of an already-released floor (marked by a waiver), whose blocked
+    # inbound edge stays deliberately non-direct after it ships (e.g. 0.16.1 -> 0.17.0). Every OTHER
+    # edge between already-RELEASED versions must still be direct.
     preparing = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    floors = {w["version"] for w in data.get("waivers", [])} | {preparing}
     non_direct = [(edge["from"], edge["to"], edge["kind"]) for edge in data["edges"]
-                  if edge["kind"] != "direct" and edge["to"] != preparing]
+                  if edge["kind"] != "direct" and edge["to"] not in floors]
     assert not non_direct, (
         f"the matrix now declares non-direct edge(s) between released versions: {non_direct}; if a "
         "released upgrade has stopped being direct, update this test deliberately")
