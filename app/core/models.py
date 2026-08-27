@@ -906,6 +906,9 @@ def _decrypt_file_names(target, *_args):
                 target, 'checksum_sha256',
                 decrypt_object_field(target.vault_id, target.id, enc_checksum, 'checksum'))
         except Exception:  # noqa: BLE001 — never let a decrypt error break a load
+            # checksum_sha256 is left None, so the download integrity verifier fails CLOSED (it cannot
+            # confirm the streamed bytes). Intentional: the startup key canary already refuses to boot
+            # on a wrong ENCRYPTION_KEY, so this only bites isolated enc_checksum corruption.
             print(f"⚠ file checksum decrypt failed for {getattr(target, 'id', None)}")
     enc_name = getattr(target, 'enc_name', None)
     enc_mime = getattr(target, 'enc_mime', None)

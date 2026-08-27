@@ -219,3 +219,18 @@ def test_a_corrupt_enc_checksum_is_left_as_is_not_blanked(_pg):
         assert s.get(File, fid).checksum_sha256 == "still-here", "undecryptable enc_checksum -> left as-is"
     finally:
         s.close()
+
+
+def test_the_upload_path_seals_the_checksum_after_content_mac():
+    """Static guard: the upload/finalize path MUST call _seal_file_checksum, and AFTER content_mac is
+    computed. The helper + backfill tests above would still pass if the upload call were deleted (they
+    call the helper directly), leaving every new upload's checksum plaintext at rest -- and sealing
+    BEFORE content_mac would MAC a NULLed checksum. Pin both so neither can be silently broken."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "app" / "services" / "vault_service.py").read_text(
+        encoding="utf-8")
+    def_pos = src.index("def _seal_file_checksum(file)")
+    # The CALL is a later occurrence than the `def`; .index raises (test fails) if the call was deleted.
+    call_pos = src.index("_seal_file_checksum(file)", def_pos + len("def _seal_file_checksum(file)"))
+    assert src.index("content_mac=_content_mac(") < call_pos, \
+        "the checksum must be sealed AFTER content_mac is computed (else the ETag would MAC a NULL)"
