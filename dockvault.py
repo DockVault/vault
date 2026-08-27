@@ -3435,8 +3435,10 @@ class DockVault:
         if archived:
             self._warn_env_archived(archived)
         if cfg.get("_generated_admin_pw"):
-            print(pal.paint("  New set's admin password: %s   (auto-generated - store it NOW)"
-                            % cfg["admin_password"], "bold", "yellow"))
+            # Show the freshly-generated admin password on the controlling terminal only (like the
+            # recovery key), so a redirected/tee'd stdout or CI log can't capture it.
+            self._emit_secret(pal.paint("  New set's admin password: %s   (auto-generated - store it NOW)"
+                                        % cfg["admin_password"], "bold", "yellow"))
 
     def _destroy_data(self, vol):
         """Strong-confirm + docker compose down -v. True to proceed (destroyed), False if declined."""
@@ -4054,8 +4056,10 @@ class DockVault:
         if archived:
             self._warn_env_archived(archived)
         if cfg.get("_generated_admin_pw"):
-            print(pal.paint("  New set's admin password: %s   (auto-generated - store it NOW)"
-                            % cfg["admin_password"], "bold", "yellow"))
+            # Show the freshly-generated admin password on the controlling terminal only (like the
+            # recovery key), so a redirected/tee'd stdout or CI log can't capture it.
+            self._emit_secret(pal.paint("  New set's admin password: %s   (auto-generated - store it NOW)"
+                                        % cfg["admin_password"], "bold", "yellow"))
         print(pal.paint("  Run Setup to build + start the new (empty) set.\n", "cyan"))
 
     def _volume_repoint(self, env, args=None):
