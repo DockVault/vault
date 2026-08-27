@@ -30,7 +30,10 @@ from pathlib import Path
 # Generous next to a file that holds a few dozen short records, and small enough that a runaway or
 # hostile file cannot make the parser the problem.
 MAX_BYTES = 256 * 1024
-SUPPORTED_SCHEMA_VERSION = 1
+# 2 adds a required per-version `support` block (lifecycle: end-of-life, security posture, and
+# optional extended-support end dates). A schema_version-1 file has no such block and would leave
+# every version's lifecycle undeclared, so the bump is not backward-compatible on purpose.
+SUPPORTED_SCHEMA_VERSION = 2
 
 _UTF8_BOM = b"\xef\xbb\xbf"
 # No leading zeros: "0.10.00" and "0.10.0" would be two keys for one release, and the second would
@@ -41,7 +44,13 @@ _DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
 
 KINDS = ("direct", "blocked")
 
-_VERSION_KEYS = {"released", "notes", "must_land_here"}
+_VERSION_KEYS = {"released", "notes", "must_land_here", "support"}
+# A version's lifecycle. `eol`/`secure` are always required so no release ships with its status
+# unstated. `code_support`/`security_support` are the extended-support end dates -- features/bug
+# fixes and security fixes can end on different days (the common security-only tail), and either may
+# be absent. They describe support GIVEN PAST end-of-life, so they are only meaningful on an EOL
+# version.
+_SUPPORT_KEYS = {"eol", "secure", "code_support", "security_support"}
 _EDGE_KEYS = {"from", "to", "kind", "reversible", "requires_backup", "reason", "conditions"}
 _CONDITION_KEYS = {"id", "summary", "detect"}
 _WAIVER_KEYS = {"version", "reason"}
@@ -54,6 +63,26 @@ class UpgradeMatrixError(ValueError):
 
 def _sort_key(version: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in version.split("."))
+
+
+def _inbound_edge(data: dict, version: str) -> dict | None:
+    """The edge into `version` from its version-order predecessor, or None.
+
+    None means either the version is the earliest declared one (nothing leads in) or no edge was
+    declared for that adjacent pair. Used both to require a takeable route into a release and to
+    tell a deliberately-unreachable floor release (a blocked route in) from a version a waiver has
+    no business covering.
+    """
+    versions = data.get("versions", {})
+    if version not in versions:
+        return None
+    ordered = sorted(versions, key=_sort_key)
+    index = ordered.index(version)
+    if index == 0:
+        return None
+    previous = ordered[index - 1]
+    return {(edge["from"], edge["to"]): edge
+            for edge in data.get("edges", [])}.get((previous, version))
 
 
 def _require(condition: bool, message: str) -> None:
@@ -88,6 +117,35 @@ def _no_duplicate_keys(pairs):
             raise UpgradeMatrixError(f"upgrade matrix repeats the key {key!r}")
         seen.add(key)
     return dict(pairs)
+
+
+def _validate_support(support: object, where: str) -> None:
+    """A version's lifecycle block, required on every version.
+
+    `eol` and `secure` are booleans that must be present, so no release ships with its end-of-life
+    or security status left unstated. `code_support` and `security_support` are optional
+    extended-support END DATES: after end-of-life a version may still receive feature/bug fixes for
+    a while (code) and security fixes for longer (the common security-only tail). They describe
+    support given PAST end-of-life, so they are meaningful only when `eol` is true, and security
+    support may not end before code support.
+    """
+    _require(isinstance(support, dict), f"{where}.support must be present and an object")
+    _no_unknown_keys(support, _SUPPORT_KEYS, f"{where}.support")
+    for flag in ("eol", "secure"):
+        _require(isinstance(support.get(flag), bool),
+                 f"{where}.support.{flag} must be present and a boolean")
+    dates: dict[str, str] = {}
+    for field in ("code_support", "security_support"):
+        if field in support:
+            _require(support["eol"] is True,
+                     f"{where}.support.{field} is extended support and is only meaningful once "
+                     "eol is true")
+            # Lexical order of an ISO date is chronological order, so a plain string compare below
+            # is a date compare.
+            dates[field] = _string(support[field], f"{where}.support.{field}", pattern=_DATE_RE)
+    if "code_support" in dates and "security_support" in dates:
+        _require(dates["security_support"] >= dates["code_support"],
+                 f"{where}.support.security_support must not end before code_support")
 
 
 def load_matrix(path: Path) -> dict:
@@ -154,6 +212,7 @@ def validate_matrix(data: dict) -> dict:
             # the person does.
             _require(isinstance(meta["must_land_here"], bool),
                      f"versions[{version}].must_land_here must be a boolean")
+        _validate_support(meta.get("support"), f"versions[{version}]")
 
     edges = data.get("edges")
     _require(isinstance(edges, list), "upgrade matrix needs an 'edges' list")
@@ -244,12 +303,21 @@ def validate_matrix(data: dict) -> dict:
         _string(waiver.get("reason"), f"{where}.reason")
         _require(version not in waived, f"{where} waives {version} twice")
         waived.add(version)
-        # A waiver for a version that IS declared is stale, and a stale waiver is how an escape
-        # hatch quietly becomes the normal route. Erroring forces it to be removed.
-        _require(
-            version not in versions,
-            f"{where} waives {version}, which is declared anyway -- remove the waiver",
-        )
+        # A waiver names a version with no takeable route in. That is normally an UNDECLARED version.
+        # It is also a declared FLOOR release: one that carries its own entry (notes, lifecycle) but
+        # whose only route in is a `blocked` edge -- reached by fresh deploy + restore, never by an
+        # in-place upgrade. The waiver is what lets such a release be cut while the blocked edge says
+        # why the in-place upgrade is refused. A declared version that is genuinely REACHABLE (a
+        # non-blocked inbound edge) needs no waiver, and a stale waiver there is how the hatch quietly
+        # becomes the normal route -- so that stays an error.
+        if version in versions:
+            inbound = _inbound_edge(data, version)
+            _require(
+                inbound is not None and inbound.get("kind") == "blocked",
+                f"{where} waives {version}, which is declared and reachable -- a waiver is only for "
+                "a version with no takeable route in (undeclared, or a floor release whose only "
+                "inbound edge is blocked). Remove the waiver",
+            )
 
     return data
 

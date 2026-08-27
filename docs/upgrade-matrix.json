@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "about": "Declares what it takes to move between released versions of DockVault. Every release must appear here before it can be cut; the release workflow refuses otherwise. Edges are declared between ADJACENT releases only -- a longer upgrade is composed by walking them in order, rather than being asserted as a single hop nobody tested.",
+  "schema_version": 2,
+  "about": "Declares what it takes to move between released versions of DockVault, and each version's support lifecycle. Every release must appear here before it can be cut; the release workflow refuses otherwise. Edges are declared between ADJACENT releases only -- a longer upgrade is composed by walking them in order, rather than being asserted as a single hop nobody tested. Each version also carries a `support` block: `eol` (end-of-life) and `secure` (free of known unpatched vulnerabilities) are always stated, and an EOL version may carry `code_support` / `security_support` end dates for extended support. The host tool hides EOL releases and refuses to upgrade into or downgrade out of them; a downgrade is refused across any edge marked irreversible.",
   "kinds": {
     "direct": "The upgrade can be taken in one step. Any caveats are listed in the edge's conditions.",
     "blocked": "The upgrade must not be taken. The edge says why, and what to do instead."
@@ -8,85 +8,267 @@
   "versions": {
     "0.6.0": {
       "released": "2026-07-21",
-      "notes": "First published release."
+      "notes": "First published release.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.7.0": {
       "released": "2026-07-22",
-      "notes": "No schema change."
+      "notes": "No schema change.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.7.1": {
       "released": "2026-07-22",
-      "notes": "No schema change."
+      "notes": "No schema change.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.7.2": {
       "released": "2026-07-22",
-      "notes": "No schema change."
+      "notes": "No schema change.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.8.0": {
       "released": "2026-07-23",
-      "notes": "No schema change."
+      "notes": "No schema change.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.9.0": {
       "released": "2026-07-24",
-      "notes": "No schema change."
+      "notes": "No schema change.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.10.0": {
       "released": "2026-08-02",
-      "notes": "No schema change. Every release up to here shares one physical schema: the set of boot DDL statements is byte-identical across all of them, and the model differs only in comment text."
+      "notes": "No schema change. Every release up to here shares one physical schema: the set of boot DDL statements is byte-identical across all of them, and the model differs only in comment text.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.11.0": {
       "released": "2026-08-20",
-      "notes": "First release to change the physical schema: adds the vault_storage_grants table and a nullable users.storage_quota_bytes column, applied automatically and idempotently at boot. The additions are unused by 0.10.0, so a rollback is clean; take a backup before upgrading."
+      "notes": "First release to change the physical schema: adds the vault_storage_grants table and a nullable users.storage_quota_bytes column, applied automatically and idempotently at boot. The additions are unused by 0.10.0, so a rollback is clean; take a backup before upgrading.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.11.1": {
       "released": "2026-08-21",
-      "notes": "No schema change; same physical schema as 0.11.0. Security patch: user-controlled values (the failed-login redis key and the alert resolver) are sanitized before they reach the security-monitor logs (log-injection hardening). A rollback is clean and needs no backup."
+      "notes": "No schema change; same physical schema as 0.11.0. Security patch: user-controlled values (the failed-login redis key and the alert resolver) are sanitized before they reach the security-monitor logs (log-injection hardening). A rollback is clean and needs no backup.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.11.2": {
       "released": "2026-08-21",
-      "notes": "No schema change; same physical schema as 0.11.0/0.11.1. Security hardening: closes a temporary-credential mint vault-password oracle (vault membership is now verified before the password proof), audits admin-plane and cross-tenant access denials, bounds client-supplied encrypted-name metadata, orders the user-update authorization check before the existence lookup, and re-checks temporary-credential deactivation on the web path every request. A rollback is clean and needs no backup."
+      "notes": "No schema change; same physical schema as 0.11.0/0.11.1. Security hardening: closes a temporary-credential mint vault-password oracle (vault membership is now verified before the password proof), audits admin-plane and cross-tenant access denials, bounds client-supplied encrypted-name metadata, orders the user-update authorization check before the existence lookup, and re-checks temporary-credential deactivation on the web path every request. A rollback is clean and needs no backup.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.12.0": {
       "released": "2026-08-22",
-      "notes": "No schema change; same physical schema as 0.11.0/0.11.1/0.11.2. Adds credential lock/unlock/change-passphrase plus start/stop/restart/status lifecycle commands to the dockvault.py host management tool, so an operator can seal the .env secrets file into an encrypted .env.enc while a deployment is off (envelope encryption: a Fernet data key wrapped under a scrypt-derived passphrase key, with a stable recovery key). This is a host-tool change only; the container image is functionally unchanged from 0.11.2. Also hardens the test suite. A rollback is clean and needs no backup."
+      "notes": "No schema change; same physical schema as 0.11.0/0.11.1/0.11.2. Adds credential lock/unlock/change-passphrase plus start/stop/restart/status lifecycle commands to the dockvault.py host management tool, so an operator can seal the .env secrets file into an encrypted .env.enc while a deployment is off (envelope encryption: a Fernet data key wrapped under a scrypt-derived passphrase key, with a stable recovery key). This is a host-tool change only; the container image is functionally unchanged from 0.11.2. Also hardens the test suite. A rollback is clean and needs no backup.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.13.0": {
       "released": "2026-08-23",
-      "notes": "Account onboarding. Adds two tables (account_invitations, email_change_codes), created automatically and idempotently at boot by create_all; both are additive and unused by 0.12.0, so a rollback is clean -- take a backup before upgrading. Verified live: a 0.12.0 stack upgraded to 0.13.0 over the same volume creates both tables (schema complete) and self-signup works. Features: admin account invitations (mint / list / revoke, plus a public single-use accept link); public self-signup gated by an org policy (email requirement, signup domain allow/deny, login identifier username/email/either); self-service email change with an emailed one-time verification code; a last-admin-email lockout guard; and log-access fixes (web log-pull in the split-container shape plus a settings-tab overflow fix)."
+      "notes": "Account onboarding. Adds two tables (account_invitations, email_change_codes), created automatically and idempotently at boot by create_all; both are additive and unused by 0.12.0, so a rollback is clean -- take a backup before upgrading. Verified live: a 0.12.0 stack upgraded to 0.13.0 over the same volume creates both tables (schema complete) and self-signup works. Features: admin account invitations (mint / list / revoke, plus a public single-use accept link); public self-signup gated by an org policy (email requirement, signup domain allow/deny, login identifier username/email/either); self-service email change with an emailed one-time verification code; a last-admin-email lockout guard; and log-access fixes (web log-pull in the split-container shape plus a settings-tab overflow fix).",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.14.0": {
       "released": "2026-08-24",
-      "notes": "Adds six additive tables (email_profiles, email_templates, email_resources for the Email Studio; notifications; notes; email_actions), all created automatically and idempotently at boot by create_all and unused by 0.13.0, so a rollback is clean -- take a backup before upgrading. Features: Email Studio (branded HTML email templates with grouped substitution tokens and automated-email actions that route the verification-code / password-reset / invitation emails through the template mechanism, with a fail-safe that never sends a system security email missing its code or link token); an in-app notification bell plus a reworked three-lane non-admin dashboard (What's waiting for you / Favourites / Most recent); move and copy for files and folders, within a vault and across Standard vaults (re-encrypting content under the destination binding; zero-knowledge cross-vault deferred); personal server-side notes with a snapshot 'send note' to other users; and a rate-limiter split giving per-chunk uploads and polled reads their own generous budgets so large uploads and normal polling are no longer throttled."
+      "notes": "Adds six additive tables (email_profiles, email_templates, email_resources for the Email Studio; notifications; notes; email_actions), all created automatically and idempotently at boot by create_all and unused by 0.13.0, so a rollback is clean -- take a backup before upgrading. Features: Email Studio (branded HTML email templates with grouped substitution tokens and automated-email actions that route the verification-code / password-reset / invitation emails through the template mechanism, with a fail-safe that never sends a system security email missing its code or link token); an in-app notification bell plus a reworked three-lane non-admin dashboard (What's waiting for you / Favourites / Most recent); move and copy for files and folders, within a vault and across Standard vaults (re-encrypting content under the destination binding; zero-knowledge cross-vault deferred); personal server-side notes with a snapshot 'send note' to other users; and a rate-limiter split giving per-chunk uploads and polled reads their own generous budgets so large uploads and normal polling are no longer throttled.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.15.0": {
       "released": "2026-08-25",
-      "notes": "Public note links + notes UX. Adds two additive tables (note_link_tags, note_public_links), created automatically and idempotently at boot by create_all and unused by 0.14.0, so a rollback is clean -- take a backup before upgrading. Features: public note links -- a note owner can turn a note into an anonymous, tokenized SNAPSHOT link that anyone holding the link can read without signing in, governed by admin-defined 'note-link tags' that act as a security FLOOR the creator may only tighten (a longer token, an added or stronger PIN/password, a shorter expiry, fewer views), with anonymous redemption rate-limited per link, a per-link lockout after repeated wrong secrets, and fail-closed behaviour. Plus a Notes read modal with a left rail; clickable note tiles with wrapping text and bottom-aligned actions; a Send->Share chooser (send a copy to a member, or create a public link); a 'Shared (by me)' tab; live in-app notification delivery over the activity socket so a sent note appears without a page refresh (the socket now persists app-wide and re-checks session revocation); and admin oversight of every public link (list, revoke, and bulk-revoke). Host tool only: dockvault.py setup on a re-run now honours --image-source build so an operator can run freshly-pulled source instead of re-pulling the pinned release."
+      "notes": "Public note links + notes UX. Adds two additive tables (note_link_tags, note_public_links), created automatically and idempotently at boot by create_all and unused by 0.14.0, so a rollback is clean -- take a backup before upgrading. Features: public note links -- a note owner can turn a note into an anonymous, tokenized SNAPSHOT link that anyone holding the link can read without signing in, governed by admin-defined 'note-link tags' that act as a security FLOOR the creator may only tighten (a longer token, an added or stronger PIN/password, a shorter expiry, fewer views), with anonymous redemption rate-limited per link, a per-link lockout after repeated wrong secrets, and fail-closed behaviour. Plus a Notes read modal with a left rail; clickable note tiles with wrapping text and bottom-aligned actions; a Send->Share chooser (send a copy to a member, or create a public link); a 'Shared (by me)' tab; live in-app notification delivery over the activity socket so a sent note appears without a page refresh (the socket now persists app-wide and re-checks session revocation); and admin oversight of every public link (list, revoke, and bulk-revoke). Host tool only: dockvault.py setup on a re-run now honours --image-source build so an operator can run freshly-pulled source instead of re-pulling the pinned release.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.16.0": {
       "released": "2026-08-25",
-      "notes": "Email templates & automation, plus notes-UX fixes. Schema: one additive nullable column, email_templates.default_key (created by create_all on a fresh DB, and by the boot DDL ADD COLUMN IF NOT EXISTS on an existing one), plus a partial-unique index over it -- marks a template as the built-in default for an automated-email action; boot seeds a default template per action and pre-binds each action to its default (idempotent, never overwriting an admin's own template or 'none' choice). Two additive tables: otp_codes (the durable fallback for a generalized one-time-code service -- codes live in Redis first, this table when Redis is down; it supersedes email_change_codes, which is retained but no longer written) and password_reset_tokens (single-use, hashed-at-rest tokens for self-service and admin-triggered password-reset links). All additive and unused by 0.15.0, so a rollback is clean -- take a backup before upgrading. Features: a generalized OTP service backing email verification and password reset; self-service + admin-triggered password reset via emailed links; default email templates seeded with 'Load from default' in the Email Studio; and log redaction of sensitive values. Also folds in notes follow-up fixes: the sidebar no longer collapses when a very long note is present; the public-link creator gains a working Done button and disables 'never expires' under a lifetime-capped tag; the Shared tab refreshes live and can view a link's frozen snapshot; the active Notes tab persists across reload; a My-notes count badge; and a new admin 'maximum note size' setting."
+      "notes": "Email templates & automation, plus notes-UX fixes. Schema: one additive nullable column, email_templates.default_key (created by create_all on a fresh DB, and by the boot DDL ADD COLUMN IF NOT EXISTS on an existing one), plus a partial-unique index over it -- marks a template as the built-in default for an automated-email action; boot seeds a default template per action and pre-binds each action to its default (idempotent, never overwriting an admin's own template or 'none' choice). Two additive tables: otp_codes (the durable fallback for a generalized one-time-code service -- codes live in Redis first, this table when Redis is down; it supersedes email_change_codes, which is retained but no longer written) and password_reset_tokens (single-use, hashed-at-rest tokens for self-service and admin-triggered password-reset links). All additive and unused by 0.15.0, so a rollback is clean -- take a backup before upgrading. Features: a generalized OTP service backing email verification and password reset; self-service + admin-triggered password reset via emailed links; default email templates seeded with 'Load from default' in the Email Studio; and log redaction of sensitive values. Also folds in notes follow-up fixes: the sidebar no longer collapses when a very long note is present; the public-link creator gains a working Done button and disables 'never expires' under a lifetime-capped tag; the Shared tab refreshes live and can view a link's frozen snapshot; the active Notes tab persists across reload; a My-notes count badge; and a new admin 'maximum note size' setting.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
     },
     "0.16.1": {
       "released": "2026-08-25",
-      "notes": "No schema change; same physical schema as 0.16.0. Fix: an automated-email SYSTEM action (password reset / account invite / email change) whose built-in default template existed but was left unbound is now bound to it at boot, so editing that template in the Email Studio applies to the sent email instead of being a silent no-op (the send path reads the bound template; an unbound system action previously fell back to the built-in body). Only SYSTEM actions are self-healed -- their 'none' equals the built-in body the default template already carries, so binding never changes what is sent; OPTIONAL actions keep an admin's explicit 'none', and an admin's own custom binding is never overwritten. A rollback is clean and needs no backup."
+      "notes": "No schema change; same physical schema as 0.16.0. Fix: an automated-email SYSTEM action (password reset / account invite / email change) whose built-in default template existed but was left unbound is now bound to it at boot, so editing that template in the Email Studio applies to the sent email instead of being a silent no-op (the send path reads the bound template; an unbound system action previously fell back to the built-in body). Only SYSTEM actions are self-healed -- their 'none' equals the built-in body the default template already carries, so binding never changes what is sent; OPTIONAL actions keep an admin's explicit 'none', and an admin's own custom binding is never overwritten. A rollback is clean and needs no backup.",
+      "support": {
+        "eol": true,
+        "secure": false
+      }
+    },
+    "0.17.0": {
+      "released": "2026-08-27",
+      "notes": "Minimum supported release. First version to seal names, descriptions and content checksums at rest. Schema: adds vaults.name_key_version and files.enc_checksum, and makes files.checksum_sha256 nullable (the content checksum is sealed into enc_checksum and decrypted on load), all applied by the boot DDL. An image older than 0.17.0 cannot read a deployment written by it: a vault name/description reads back NULL, a note title reads as an opaque sealed token, and a file download fails closed mid-stream because the integrity verifier finds checksum_sha256 NULL. There is therefore no in-place downgrade off it, and no in-place upgrade into it from 0.16.1 -- reach it by deploying fresh and restoring from a backup (see the blocked edge and the waiver). Every release below it is end-of-life.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
-    { "from": "0.6.0", "to": "0.7.0", "kind": "direct", "reversible": true, "requires_backup": false },
-    { "from": "0.7.0", "to": "0.7.1", "kind": "direct", "reversible": true, "requires_backup": false },
-    { "from": "0.7.1", "to": "0.7.2", "kind": "direct", "reversible": true, "requires_backup": false },
-    { "from": "0.7.2", "to": "0.8.0", "kind": "direct", "reversible": true, "requires_backup": false },
-    { "from": "0.8.0", "to": "0.9.0", "kind": "direct", "reversible": true, "requires_backup": false },
-    { "from": "0.9.0", "to": "0.10.0", "kind": "direct", "reversible": true, "requires_backup": false },
-    { "from": "0.10.0", "to": "0.11.0", "kind": "direct", "reversible": true, "requires_backup": true },
-    { "from": "0.11.0", "to": "0.11.1", "kind": "direct", "reversible": true, "requires_backup": false },
-    { "from": "0.11.1", "to": "0.11.2", "kind": "direct", "reversible": true, "requires_backup": false },
-    { "from": "0.11.2", "to": "0.12.0", "kind": "direct", "reversible": true, "requires_backup": false },
-    { "from": "0.12.0", "to": "0.13.0", "kind": "direct", "reversible": true, "requires_backup": true },
-    { "from": "0.13.0", "to": "0.14.0", "kind": "direct", "reversible": true, "requires_backup": true },
-    { "from": "0.14.0", "to": "0.15.0", "kind": "direct", "reversible": true, "requires_backup": true },
-    { "from": "0.15.0", "to": "0.16.0", "kind": "direct", "reversible": true, "requires_backup": true },
-    { "from": "0.16.0", "to": "0.16.1", "kind": "direct", "reversible": true, "requires_backup": false }
+    {
+      "from": "0.6.0",
+      "to": "0.7.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.7.0",
+      "to": "0.7.1",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.7.1",
+      "to": "0.7.2",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.7.2",
+      "to": "0.8.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.8.0",
+      "to": "0.9.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.9.0",
+      "to": "0.10.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.10.0",
+      "to": "0.11.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": true
+    },
+    {
+      "from": "0.11.0",
+      "to": "0.11.1",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.11.1",
+      "to": "0.11.2",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.11.2",
+      "to": "0.12.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.12.0",
+      "to": "0.13.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": true
+    },
+    {
+      "from": "0.13.0",
+      "to": "0.14.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": true
+    },
+    {
+      "from": "0.14.0",
+      "to": "0.15.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": true
+    },
+    {
+      "from": "0.15.0",
+      "to": "0.16.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": true
+    },
+    {
+      "from": "0.16.0",
+      "to": "0.16.1",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.16.1",
+      "to": "0.17.0",
+      "kind": "blocked",
+      "reversible": false,
+      "requires_backup": true,
+      "reason": "No in-place upgrade. 0.17.0 seals vault names, descriptions and file checksums at rest in columns 0.16.1 cannot read, and the change is one-way. Deploy 0.17.0 as a fresh set and restore your data from a backup rather than upgrading over the existing volumes.",
+      "conditions": [
+        {
+          "id": "sealed-at-rest",
+          "summary": "A deployment written by 0.17.0 seals names, descriptions and checksums at rest; an image older than 0.17.0 reads them as NULL or an opaque token and fails a file download closed mid-stream. The presence of files.enc_checksum is the durable signal that this data cannot be served by an older image.",
+          "detect": "SELECT 1 FROM information_schema.columns WHERE table_name='files' AND column_name='enc_checksum'"
+        }
+      ]
+    }
   ],
-  "waivers": []
+  "waivers": [
+    {
+      "version": "0.17.0",
+      "reason": "Floor release. Reachable only by a fresh deploy and restore-from-backup, not by an in-place upgrade from 0.16.1 (see the blocked 0.16.1 -> 0.17.0 edge). This is the minimum supported version; every release below it is end-of-life and insecure."
+    }
+  ]
 }
