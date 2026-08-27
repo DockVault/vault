@@ -171,8 +171,13 @@ def _count(share_id, user_id):
 def _corrupt_checksum(file_id):
     """Point the file's recorded checksum at a value its bytes cannot hash to. The download's
     hold-back compares the streamed plaintext against this column and raises ChecksumMismatch with
-    the final piece still owed -- a server-side integrity failure discovered mid-stream."""
-    _psql_exec(f"UPDATE files SET checksum_sha256='{'0' * 64}' WHERE id='{file_id}'")
+    the final piece still owed -- a server-side integrity failure discovered mid-stream.
+
+    The checksum is sealed at rest (enc_checksum) and the load event restores the ORIGINAL value from
+    it -- which would undo a plaintext-column corruption -- so clear enc_checksum too. With it NULL the
+    load event skips decryption and the corrupt plaintext checksum_sha256 is used as-is, reproducing
+    the pre-seal wrong-checksum behaviour exactly."""
+    _psql_exec(f"UPDATE files SET checksum_sha256='{'0' * 64}', enc_checksum=NULL WHERE id='{file_id}'")
 
 
 def _truncate_blob(file_id):
