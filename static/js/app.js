@@ -7217,6 +7217,21 @@ async function loadSettings() {
         // (see upload_policy.effective_max_file_bytes). Rendering 100 for a stored 0 made "Save All
         // Changes" persist 100 and silently clamp a 1024MB deployment to 100MB.
         document.getElementById('setting-max-file-size').value = (settings.max_file_size > 0) ? settings.max_file_size : '';
+        // A buffered SFTP upload cannot exceed the RAM staging tmpfs (SFTP_STAGING_TMPFS_MB), so the
+        // effective SFTP per-file limit is min(this, that) and can be BELOW the web limit. Surface it
+        // so the admin knows why SFTP may refuse a file the web UI accepts. Hidden when unbounded.
+        const sftpEff = document.getElementById('setting-sftp-eff-limit');
+        if (sftpEff) {
+            const effMb = settings.sftp_effective_max_file_mb;
+            if (effMb != null) {
+                sftpEff.textContent = 'Over SFTP, uploads are also capped at ' + effMb +
+                    ' MB by the RAM staging buffer (SFTP_STAGING_TMPFS_MB); raise both together for larger files.';
+                sftpEff.style.display = '';
+            } else {
+                sftpEff.textContent = '';
+                sftpEff.style.display = 'none';
+            }
+        }
         document.getElementById('setting-allowed-types').value = (settings.allowed_file_types || []).join(', ');
 
         // App version (read-only; from the public /version endpoint)

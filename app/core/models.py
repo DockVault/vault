@@ -834,7 +834,9 @@ class File(Base):
     content_mac = Column(String(64), nullable=True)
 
     # Storage information
-    storage_path = Column(String(512), nullable=False)  # Encrypted file path
+    # Cleartext at rest: the on-disk blob is named purely by the file UUID (no name, no
+    # extension). The human name/extension live only in the sealed enc_name/enc_mime below.
+    storage_path = Column(String(512), nullable=False)
     is_encrypted = Column(Boolean, default=True)
     encryption_metadata = Column(JSON, nullable=True)  # Store encryption details
 
@@ -1882,6 +1884,43 @@ class ChunkedUploadSession(Base):
         Index('idx_chunked_upload_status', 'status', 'expires_at'),
     )
 
+
+def _decrypt_chunked_session_name(target, *_args):
+    """Transparently restore a Standard-vault upload session's sealed filename/mime at read time.
+
+    enc_name/enc_mime on this table are dual-use: a ZERO-KNOWLEDGE upload carries the browser blob
+    (leave opaque — the server has no key), a Standard upload carries a SERVER seal (AES-GCM keyed
+    per (vault_id, session-id), like a File name). For the server seal, decrypt into the plaintext
+    filename/mime_type columns (stored NULL at rest) so every in-memory read — listing, resume,
+    completion — sees the real name unchanged. A decrypt error leaves the column NULL, never breaks
+    the load. Registered on BOTH load and refresh: expire_on_commit re-reads the attribute after the
+    session's TTL-push commit, so refresh must restore it too or completion would store a wrong name.
+    """
+    from app.core.security import decrypt_object_field, is_zk_sealed_name
+    enc_name = getattr(target, 'enc_name', None)
+    enc_mime = getattr(target, 'enc_mime', None)
+    if not enc_name and not enc_mime:
+        return
+    if is_zk_sealed_name(enc_name) or is_zk_sealed_name(enc_mime):
+        return   # zero-knowledge: opaque browser blob, decrypted client-side
+    if enc_name:
+        try:
+            _sa_attributes.set_committed_value(
+                target, 'filename',
+                decrypt_object_field(target.vault_id, target.id, enc_name, 'name'))
+        except Exception:  # noqa: BLE001 — never let a decrypt error break a load
+            print(f"⚠ upload-session name decrypt failed for {getattr(target, 'id', None)}")
+    if enc_mime:
+        try:
+            _sa_attributes.set_committed_value(
+                target, 'mime_type',
+                decrypt_object_field(target.vault_id, target.id, enc_mime, 'mime'))
+        except Exception:  # noqa: BLE001
+            print(f"⚠ upload-session mime decrypt failed for {getattr(target, 'id', None)}")
+
+
+_sa_event.listen(ChunkedUploadSession, 'load', _decrypt_chunked_session_name)
+_sa_event.listen(ChunkedUploadSession, 'refresh', _decrypt_chunked_session_name)
 
 
 class VaultMemberIndexKey(Base):

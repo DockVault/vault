@@ -174,6 +174,66 @@ def test_an_over_limit_upload_is_still_discarded(tmp_path):
     assert finalized == [], "an over-limit upload is discarded, not finalized"
 
 
+# --- named error instead of a bare "Failure" ---------------------------------------------------
+
+class _FakeProtocolServer:
+    """Stand-in for the paramiko protocol handler the handle records a status description on."""
+    def __init__(self):
+        self._pending_status_desc = None
+
+
+def test_over_limit_write_names_the_limit_instead_of_bare_failure(tmp_path):
+    handle, _ = _handle_with(tmp_path, _OkWriteFile())
+    handle.max_bytes = 4 * 1024 * 1024                       # 4 MiB
+    handle._sftp_server = _FakeProtocolServer()
+    assert handle.write(0, b"x" * (5 * 1024 * 1024)) == paramiko.SFTP_FAILURE
+    desc = handle._sftp_server._pending_status_desc
+    assert desc and "4 MB SFTP limit" in desc and "SFTP_STAGING_TMPFS_MB" in desc
+
+
+def test_staging_full_write_names_the_buffer_instead_of_bare_failure(tmp_path):
+    handle, _ = _handle_with(tmp_path, _FailingWriteFile())   # write raises ENOSPC
+    handle._sftp_server = _FakeProtocolServer()
+    assert handle.write(0, b"some bytes") == paramiko.SFTP_FAILURE
+    desc = handle._sftp_server._pending_status_desc
+    assert desc and "staging buffer is full" in desc
+
+
+def test_no_status_desc_is_set_without_a_wired_server(tmp_path):
+    # A read handle (no _sftp_server) must never crash setting a description.
+    handle, _ = _handle_with(tmp_path, _OkWriteFile())
+    handle.max_bytes = 2
+    assert handle.write(0, b"toolong") == paramiko.SFTP_FAILURE   # no wired server -> just refuses
+
+
+def test_message_server_substitutes_and_clears_pending_desc(monkeypatch):
+    from app.sftp.sftp_server import _MessageSFTPServer
+    srv = _MessageSFTPServer.__new__(_MessageSFTPServer)      # bypass paramiko's __init__
+    srv._pending_status_desc = "upload rejected: file exceeds the 4 MB SFTP limit"
+    sent = []
+    monkeypatch.setattr(paramiko.SFTPServer, "_send_status",
+                        lambda self, rn, code, desc=None: sent.append((rn, code, desc)))
+    srv._send_status(7, paramiko.SFTP_FAILURE)
+    assert sent[-1] == (7, paramiko.SFTP_FAILURE, "upload rejected: file exceeds the 4 MB SFTP limit")
+    assert srv._pending_status_desc is None                  # consumed + cleared
+    srv._send_status(8, paramiko.SFTP_OK)                     # nothing pending -> paramiko default
+    assert sent[-1] == (8, paramiko.SFTP_OK, None)
+    srv._pending_status_desc = "leftover"                    # an explicit desc still wins over pending
+    srv._send_status(9, paramiko.SFTP_FAILURE, "explicit")
+    assert sent[-1] == (9, paramiko.SFTP_FAILURE, "explicit") and srv._pending_status_desc is None
+
+
+def test_env_example_file_size_agrees_with_sftp_staging():
+    """The shipped defaults must agree so SFTP never silently refuses a file the web UI accepts:
+    the effective SFTP per-file limit is min(MAX_FILE_SIZE_MB, SFTP_STAGING_TMPFS_MB)."""
+    env = _read(".env.example")
+    file_mb = int(re.search(r"^MAX_FILE_SIZE_MB=(\d+)", env, re.M).group(1))
+    tmpfs_mb = int(re.search(r"^SFTP_STAGING_TMPFS_MB=(\d+)", env, re.M).group(1))
+    assert file_mb <= tmpfs_mb, (
+        "MAX_FILE_SIZE_MB (%d) must not exceed SFTP_STAGING_TMPFS_MB (%d), or SFTP refuses files the "
+        "web UI accepts" % (file_mb, tmpfs_mb))
+
+
 # --- the compose backing --------------------------------------------------------------------
 
 def test_the_tmpfs_is_on_the_sftp_running_services_and_not_the_api_service():
