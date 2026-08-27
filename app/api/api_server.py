@@ -16381,7 +16381,12 @@ async def lifespan(app: FastAPI):
     _backfill_file_checksums()          # seal any legacy plaintext file content checksums at rest
     _purge_audit_log_names()            # strip residual plaintext names from legacy audit-log rows
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
-    _seed_admin_user()
+    _admin_bootstrap_status = _seed_admin_user()
+    # Once the admin is bootstrapped, ADMIN_PASSWORD is spent: drop it (remove a writable mounted
+    # ADMIN_PASSWORD_FILE, clear it from this process's env, or warn) so a plaintext admin password
+    # is not retained. Fail-safe -- never breaks boot.
+    from app.core.admin_password_hygiene import scrub_bootstrap_password_source
+    scrub_bootstrap_password_source(_admin_bootstrap_status)
     _seed_default_share_tags()  # after the admin exists, so seed tags can record it as creator
     _seed_default_note_link_tags()  # public-note-link starter tags (inert until enabled)
     _backfill_default_permissions()
