@@ -936,32 +936,32 @@ def _decrypt_folder_name(target, *_args):
         print(f"⚠ folder name decrypt failed for {getattr(target, 'id', None)}")
 
 
-def _decrypt_vault_name(target, *_args):
-    enc_name = getattr(target, 'enc_name', None)
-    if not enc_name:
-        return
+def _decrypt_vault_fields(target, *_args):
     from app.core.security import decrypt_object_field, is_zk_sealed_name
-    # A ZK vault name is browser-encrypted under the vault DEK (a later phase) — leave it opaque;
-    # the plaintext `name` column stays whatever it held.
-    if is_zk_sealed_name(enc_name):
-        return
-    try:
-        # Keyed per-vault: a vault is its own scope, so (vault_id, obj_id) is (id, id).
-        _sa_attributes.set_committed_value(
-            target, 'name',
-            decrypt_object_field(target.id, target.id, enc_name, 'name'))
-    except Exception:  # noqa: BLE001 — never let a decrypt error break a load (SFTP dir name guard)
-        # enc_name present but undecryptable usually means a wrong/rotated ENCRYPTION_KEY; log the
-        # id (never the plaintext). The name is left as-is rather than blanked.
-        print(f"⚠ vault name decrypt failed for {getattr(target, 'id', None)}")
+    # Standard vaults seal both name and description at rest server-side; a ZK vault's enc_name /
+    # enc_description are browser-encrypted under the vault DEK (zk2:) and MUST be left opaque — the
+    # plaintext `name`/`description` columns stay whatever they held (a label / NULL), and the browser
+    # decrypts. A decrypt error (wrong/rotated ENCRYPTION_KEY) leaves the column as-is, never blanked.
+    for _field, _col in (('name', 'enc_name'), ('description', 'enc_description')):
+        _blob = getattr(target, _col, None)
+        if not _blob or is_zk_sealed_name(_blob):
+            continue
+        try:
+            # Keyed per-vault: a vault is its own scope, so (vault_id, obj_id) is (id, id).
+            _sa_attributes.set_committed_value(
+                target, _field,
+                decrypt_object_field(target.id, target.id, _blob, _field))
+        except Exception:  # noqa: BLE001 — never let a decrypt error break a load (SFTP dir name guard)
+            # Log the id (never the plaintext); the value is left as-is rather than blanked.
+            print(f"⚠ vault {_field} decrypt failed for {getattr(target, 'id', None)}")
 
 
 _sa_event.listen(File, 'load', _decrypt_file_names)
 _sa_event.listen(File, 'refresh', _decrypt_file_names)
 _sa_event.listen(Folder, 'load', _decrypt_folder_name)
 _sa_event.listen(Folder, 'refresh', _decrypt_folder_name)
-_sa_event.listen(Vault, 'load', _decrypt_vault_name)
-_sa_event.listen(Vault, 'refresh', _decrypt_vault_name)
+_sa_event.listen(Vault, 'load', _decrypt_vault_fields)
+_sa_event.listen(Vault, 'refresh', _decrypt_vault_fields)
 
 
 # --- Cross-vault-move guard (at-rest AAD integrity) -------------------------

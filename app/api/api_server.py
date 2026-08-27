@@ -9848,7 +9848,14 @@ async def update_vault_info(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="Vault description too long (max 1000 characters)"
                     )
-                vault.description = description.strip() if description else None
+                _desc = description.strip() if description else None
+                if _desc:
+                    # Seal at rest (Standard vaults); the db.refresh() below restores the plaintext
+                    # into vault.description so the response echoes it correctly.
+                    from app.services.vault_service import _seal_vault_description
+                    _seal_vault_description(vault, _desc)
+                else:
+                    vault.description = vault.enc_description = None   # cleared
 
         # Zero-knowledge rename: the browser sends the sealed name/description (zk2: blobs the server
         # cannot read). Store them and leave the non-secret label (vault.name) untouched; the
@@ -16149,7 +16156,8 @@ def _backfill_encrypted_names():
     try:
         from app.core.database import get_db_context
         from app.core.models import File, Folder, Vault
-        from app.services.vault_service import _seal_named_object, _seal_vault_name
+        from app.services.vault_service import (_seal_named_object, _seal_vault_name,
+                                                _seal_vault_description)
         BATCH = 500
         with get_db_context() as db:
             # Only STANDARD vaults are sealed (ZK names are deferred). Load just those
@@ -16168,14 +16176,21 @@ def _backfill_encrypted_names():
             # objects may be partly mutated (name NULLed without a commit), so re-fetch them for the
             # file/folder loop rather than trusting the dict.
             try:
-                vname = 0
+                vname = vdesc = 0
                 for _v in vaults.values():
                     if getattr(_v, 'enc_name', None) is None and _v.name is not None:
                         _seal_vault_name(_v, _v.name)
                         vname += 1
-                if vname:
+                    # Same for a legacy plaintext DESCRIPTION (enc_description NULL, description set).
+                    if getattr(_v, 'enc_description', None) is None and _v.description:
+                        _seal_vault_description(_v, _v.description)
+                        vdesc += 1
+                if vname or vdesc:
                     db.commit()
-                    print(f"[OK] Sealed {vname} vault name(s) at rest")
+                    if vname:
+                        print(f"[OK] Sealed {vname} vault name(s) at rest")
+                    if vdesc:
+                        print(f"[OK] Sealed {vdesc} vault description(s) at rest")
             except Exception as _ve:  # noqa: BLE001 — never block the file/folder backfill
                 db.rollback()
                 vaults = {v.id: v for v in db.query(Vault).filter(Vault.type == 'standard').all()}

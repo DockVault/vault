@@ -101,6 +101,25 @@ def _seal_vault_name(vault, name):
     vault.name = None
 
 
+def _seal_vault_description(vault, description):
+    """Seal a STANDARD vault's DESCRIPTION at rest: store the AES-GCM blob in `enc_description` and
+    NULL the plaintext `description` column, mirroring _seal_vault_name (same per-(vault.id, vault.id)
+    scope, field 'description'). The load/refresh event restores `description` in-memory. No-op for a
+    ZK vault (its description is browser-sealed into a zk2: enc_description), a vault without an id
+    yet, and a None/empty description.
+
+    Standard-only guard FIRST, before any assignment, for the same reason as _seal_vault_name: a
+    zero-knowledge vault's description is sealed in the browser, so this helper must NEVER write a
+    plaintext description onto a non-standard vault.
+    """
+    if getattr(vault, 'type', 'standard') != 'standard' or getattr(vault, 'id', None) is None \
+            or not description:
+        return
+    from app.core.security import encrypt_object_field
+    vault.enc_description = encrypt_object_field(vault.id, vault.id, description, 'description')
+    vault.description = None
+
+
 def _name_match_filter(model, vault, name: str):
     """SQLAlchemy filter matching `model` (File|Folder) rows whose name equals `name`.
 
@@ -534,8 +553,11 @@ class VaultService:
 
         # Seal the name at rest (Standard vaults). The id is already assigned above, so the
         # per-vault cipher key is available; the refresh() below restores the plaintext in-memory.
-        # For a ZK vault this is a no-op seal that just sets `name` to the non-secret label.
+        # For a ZK vault these are no-op seals (name keeps its non-secret label, the description is
+        # sealed in the browser below); for a Standard vault they move the plaintext into enc_name /
+        # enc_description and NULL the plaintext columns. The refresh() below restores both in-memory.
         _seal_vault_name(vault, name)
+        _seal_vault_description(vault, description)
         # Zero-knowledge: store the browser-sealed name/description verbatim -- the server cannot read
         # them. `name` already holds the non-secret label (set above); the load event skips these
         # ZK-marked blobs, so `name`/`description` stay as the label/NULL for a ZK vault.
@@ -844,7 +866,10 @@ class VaultService:
             _seal_vault_name(vault, name)   # Standard: seals enc_name + NULLs name; refresh() below restores it
 
         if description is not None:
-            vault.description = description
+            if description:
+                _seal_vault_description(vault, description)  # Standard: seals enc_description + NULLs it
+            else:
+                vault.description = vault.enc_description = None  # cleared
         
         # ✅ NEW: Handle password changes that require re-encrypting vault key
         if password is not None:

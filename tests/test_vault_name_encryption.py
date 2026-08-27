@@ -309,3 +309,115 @@ def test_wrong_vault_decrypt_raises():
     assert decrypt_object_field(a, a, token, "name") == "Secret"
     with pytest.raises(Exception):
         decrypt_object_field(b, b, token, "name")          # wrong vault -> key/AAD mismatch
+
+
+# --- Standard-vault DESCRIPTION sealing at rest (mirrors the name-seal above) ------------------
+
+def _mk_std_vault_with_desc(session, owner, name, description):
+    """A Standard vault with name + description BOTH sealed at rest (mirrors create_vault's two seals)."""
+    from app.core.models import Vault
+    from app.services.vault_service import _seal_vault_name, _seal_vault_description
+    v = Vault(id=uuid.uuid4(), owner_id=owner.id, type="standard", name=name, description=description)
+    _seal_vault_name(v, name)
+    _seal_vault_description(v, description)
+    session.add(v)
+    session.commit()
+    return v
+
+
+@pytest.mark.docker
+def test_a_standard_vault_description_is_sealed_and_reads_back(_pg):
+    from app.core.models import Vault
+    from app.core.security import is_zk_sealed_name
+    s = _session(_pg)
+    try:
+        u = _a_user(s)
+        v = _mk_std_vault_with_desc(s, u, "Finance", "Q3 forecast and salaries")
+        vid = v.id
+        assert _raw(_pg, "enc_description", vid), "enc_description is populated at rest"
+        assert _raw(_pg, "description", vid) is None, "the plaintext description column is NULL at rest"
+        # The blob is a SERVER seal, not a browser zk2: marker.
+        assert not is_zk_sealed_name(_raw(_pg, "enc_description", vid))
+        s.expire_all()
+        assert s.get(Vault, vid).description == "Q3 forecast and salaries", "the load event decrypts it"
+    finally:
+        s.close()
+
+
+@pytest.mark.docker
+def test_a_zk_vault_browser_sealed_description_is_left_opaque(_pg):
+    """A ZK vault's enc_description is a browser zk2: blob the server cannot read; the load listener
+    must SKIP it (never server-decrypt it) and leave `description` as-is."""
+    from app.core.models import Vault
+    from app.services.vault_service import _seal_vault_description
+    s = _session(_pg)
+    try:
+        u = _a_user(s)
+        v = Vault(id=uuid.uuid4(), owner_id=u.id, type="zero_knowledge", name="Label",
+                  enc_description="zk2:browser-sealed-blob")
+        s.add(v)
+        s.commit()
+        vid = v.id
+        _seal_vault_description(v, "Real secret description")   # no-op on a ZK vault
+        s.commit()
+        assert _raw(_pg, "enc_description", vid) == "zk2:browser-sealed-blob", "the ZK blob is untouched"
+        assert _raw(_pg, "description", vid) is None, "no plaintext description on a ZK vault"
+        s.expire_all()
+        assert s.get(Vault, vid).description is None, "the listener leaves a zk2: description opaque"
+    finally:
+        s.close()
+
+
+@pytest.mark.docker
+def test_seal_vault_description_never_writes_plaintext_to_a_zk_vault(_pg):
+    """Defense-in-depth: even a mis-call with the real description must not land it in the clear on a
+    non-standard vault (the standard-only guard is first)."""
+    from app.services.vault_service import _seal_vault_description
+    s = _session(_pg)
+    try:
+        u = _a_user(s)
+        from app.core.models import Vault
+        v = Vault(id=uuid.uuid4(), owner_id=u.id, type="zero_knowledge", name="Label")
+        s.add(v)
+        s.commit()
+        vid = v.id
+        _seal_vault_description(v, "Top Secret Real Description")
+        s.commit()
+        assert _raw(_pg, "description", vid) is None, "the real description never reaches the plaintext column"
+        assert _raw(_pg, "enc_description", vid) is None, "and no server-seal is written on a ZK vault"
+    finally:
+        s.close()
+
+
+@pytest.mark.docker
+def test_backfill_seals_a_legacy_plaintext_description_and_is_idempotent(_pg):
+    """A Standard vault written before this phase (plaintext description, enc_description NULL) is
+    sealed by the same helper the boot backfill loops over; a sealed row is then skipped."""
+    from app.core.models import Vault
+    from app.services.vault_service import _seal_vault_description
+    s = _session(_pg)
+    try:
+        u = _a_user(s)
+        v = Vault(id=uuid.uuid4(), owner_id=u.id, type="standard", name="Legacy", description="plain desc")
+        s.add(v)
+        s.commit()
+        vid = v.id
+        assert _raw(_pg, "description", vid) == "plain desc" and _raw(_pg, "enc_description", vid) is None
+
+        # The backfill's per-vault action, applied to a fresh load.
+        s.expire_all()
+        v2 = s.get(Vault, vid)
+        if getattr(v2, 'enc_description', None) is None and v2.description:
+            _seal_vault_description(v2, v2.description)
+        s.commit()
+        assert _raw(_pg, "enc_description", vid), "backfill sealed the legacy description"
+        assert _raw(_pg, "description", vid) is None
+        s.expire_all()
+        assert s.get(Vault, vid).description == "plain desc", "reads back as the original plaintext"
+
+        # Idempotent: a second pass sees enc_description set and skips.
+        s.expire_all()
+        v3 = s.get(Vault, vid)
+        assert not (getattr(v3, 'enc_description', None) is None and v3.description), "already sealed -> skipped"
+    finally:
+        s.close()
