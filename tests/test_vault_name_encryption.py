@@ -345,7 +345,7 @@ def test_a_standard_vault_description_is_sealed_and_reads_back(_pg):
 
 
 @pytest.mark.docker
-def test_a_zk_vault_browser_sealed_description_is_left_opaque(_pg):
+def test_a_zk_vault_browser_sealed_description_is_left_opaque(_pg, capsys):
     """A ZK vault's enc_description is a browser zk2: blob the server cannot read; the load listener
     must SKIP it (never server-decrypt it) and leave `description` as-is."""
     from app.core.models import Vault
@@ -362,8 +362,12 @@ def test_a_zk_vault_browser_sealed_description_is_left_opaque(_pg):
         s.commit()
         assert _raw(_pg, "enc_description", vid) == "zk2:browser-sealed-blob", "the ZK blob is untouched"
         assert _raw(_pg, "description", vid) is None, "no plaintext description on a ZK vault"
+        capsys.readouterr()                    # discard anything from setup/seed
         s.expire_all()
         assert s.get(Vault, vid).description is None, "the listener leaves a zk2: description opaque"
+        # Prove the listener SKIPPED the zk2: blob rather than ATTEMPTING and failing to decrypt it:
+        # a failed server-decrypt attempt logs a 'decrypt failed' warning; the skip logs nothing.
+        assert "decrypt failed" not in capsys.readouterr().out, "the zk2: blob must be skipped, not decrypt-attempted"
     finally:
         s.close()
 
@@ -419,5 +423,46 @@ def test_backfill_seals_a_legacy_plaintext_description_and_is_idempotent(_pg):
         s.expire_all()
         v3 = s.get(Vault, vid)
         assert not (getattr(v3, 'enc_description', None) is None and v3.description), "already sealed -> skipped"
+    finally:
+        s.close()
+
+
+@pytest.mark.docker
+def test_clearing_a_standard_description_removes_the_seal(_pg):
+    """Clearing a Standard description sets BOTH description and enc_description to None (what the
+    update / clear callers do), so the old sealed value cannot resurrect via the load listener."""
+    from app.core.models import Vault
+    s = _session(_pg)
+    try:
+        u = _a_user(s)
+        v = _mk_std_vault_with_desc(s, u, "V", "will be cleared")
+        vid = v.id
+        assert _raw(_pg, "enc_description", vid), "sealed to start"
+        v2 = s.get(Vault, vid)
+        v2.description = v2.enc_description = None     # the caller's clear branch
+        s.commit()
+        assert _raw(_pg, "enc_description", vid) is None and _raw(_pg, "description", vid) is None
+        s.expire_all()
+        assert s.get(Vault, vid).description is None, "a cleared description does not come back on load"
+    finally:
+        s.close()
+
+
+@pytest.mark.docker
+def test_a_corrupt_standard_enc_description_is_left_as_is_not_blanked(_pg):
+    """Fail-safe: an enc_description that is neither a ZK blob nor a valid server seal (wrong/rotated
+    key or corruption) must leave `description` as-is, never blank it, and never crash the load."""
+    from app.core.models import Vault
+    s = _session(_pg)
+    try:
+        u = _a_user(s)
+        v = Vault(id=uuid.uuid4(), owner_id=u.id, type="standard", name="V",
+                  description="still here", enc_description="not-a-valid-seal-blob")
+        s.add(v)
+        s.commit()
+        vid = v.id
+        s.expire_all()
+        got = s.get(Vault, vid)                        # must not raise
+        assert got.description == "still here", "an undecryptable enc_description leaves description as-is"
     finally:
         s.close()

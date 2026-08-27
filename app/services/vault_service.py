@@ -560,10 +560,12 @@ class VaultService:
         _seal_vault_description(vault, description)
         # Zero-knowledge: store the browser-sealed name/description verbatim -- the server cannot read
         # them. `name` already holds the non-secret label (set above); the load event skips these
-        # ZK-marked blobs, so `name`/`description` stay as the label/NULL for a ZK vault.
-        if enc_name is not None:
+        # ZK-marked blobs, so `name`/`description` stay as the label/NULL for a ZK vault. Gated on the
+        # ZK type so a caller can NEVER overwrite the SERVER seal a Standard vault just wrote above
+        # (its enc_name/enc_description come from _seal_vault_name/_seal_vault_description, not a param).
+        if enc_name is not None and getattr(vault, 'type', 'standard') != 'standard':
             vault.enc_name = enc_name
-        if enc_description is not None:
+        if enc_description is not None and getattr(vault, 'type', 'standard') != 'standard':
             vault.enc_description = enc_description
         # The DEK epoch the browser sealed enc_name/enc_description under (ZK). retire-version counts
         # it so the name's epoch is never dropped. Absent => NULL (read defaults to epoch 1).
