@@ -1336,15 +1336,19 @@ async def get_current_user(
 
     # Durable revocation for REGULAR-user tokens: a logged-out / locked / deactivated session
     # is marked `revoked` in the DB (see logout + _revoke_sessions). Unlike the best-effort
-    # Redis denylist above, this survives a Redis outage. We reject only an explicitly-revoked
-    # session — a new login does NOT set `revoked`, so concurrent sessions keep working (no
-    # single-session side effect). Temp sessions get a stricter is_active check below.
+    # Redis denylist above, this survives a Redis outage. Fail CLOSED: reject a session whose
+    # row is MISSING as well as one marked `revoked`. Every regular login inserts its session
+    # row (auth_service._create_session commits it before the token is minted), so a legitimate
+    # token always finds its row; a MISSING row means a forged/replayed session_token or a token
+    # for a since-deleted user (the row was cascade-removed) — both must be denied, not admitted.
+    # A new login does NOT set `revoked`, so concurrent sessions keep working (no single-session
+    # side effect). Temp sessions get a stricter is_active check below.
     if session_token and not is_temporary:
         from app.core.models import ActiveSession
         revoked_session = db.query(ActiveSession.revoked).filter(
             ActiveSession.session_token == hash_session_token(session_token)
         ).first()
-        if revoked_session is not None and revoked_session[0]:
+        if revoked_session is None or revoked_session[0]:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Session has been terminated. Please login again.",
