@@ -110,15 +110,25 @@ def _install_oldest():
         "\n".join(f"{k}={v}" for k, v in env.items()) + "\n")
 
     def override(image):
+        # A throwaway drill stack, not a real deployment: pin restart "no" so a container that dies
+        # (e.g. an OOM under CI contention) STAYS down and the drill fails fast with diagnose() output
+        # instead of crash-looping and eating the job's time budget. Give the DB a longer first-boot
+        # grace (start_period/retries) so a slow initdb under load is not marked unhealthy prematurely
+        # — start_period failures are not counted, so this is safe for the walk too.
         io.open(os.path.join(workdir, "drill.override.yml"), "w", newline="\n").write(
             "services:\n"
             f"  vault-db:\n    container_name: {project}-db\n"
+            f"    restart: \"no\"\n"
+            f"    healthcheck:\n      start_period: 45s\n      retries: 12\n"
             f"  vault-redis:\n    container_name: {project}-redis\n"
+            f"    restart: \"no\"\n"
             f"  vault-api:\n    container_name: {project}-api\n"
             f"    image: {image}\n    build: !reset null\n"
+            f"    restart: \"no\"\n"
             f"    ports: !override\n      - \"127.0.0.1:{port}:8000\"\n"
             f"  vault-sftp:\n    container_name: {project}-sftp\n"
             f"    image: {image}\n    build: !reset null\n"
+            f"    restart: \"no\"\n"
             f"    ports: !override\n      - \"127.0.0.1:{port + 1}:2222\"\n")
 
     def compose(*args, timeout=900):
