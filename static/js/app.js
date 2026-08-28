@@ -12712,6 +12712,83 @@ function setupImageZoom(img, wrap, controls) {
     apply();
 }
 
+// Above this size, a media/image/PDF file is NOT pulled into memory just to preview it inline --
+// loading a multi-GB blob can crash the tab. It is refused with a "download it" message instead.
+const MEDIA_PREVIEW_MAX_BYTES = 150 * 1024 * 1024;   // 150 MB
+// Above this size, a Standard-vault text file is previewed from just its FIRST WINDOW (a Range
+// request) rather than loaded whole; the window itself is capped at MEDIA-independent bytes below.
+const TEXT_PREVIEW_WINDOW_BYTES = 2 * 1024 * 1024;   // 2 MB (matches the whole-blob text cap)
+const TEXT_WINDOW_FETCH_BYTES = 512 * 1024;          // read only the first 512 KB of a big text file
+
+// Media/image/PDF extensions that, when large, we refuse to load whole (paired with the MIME check).
+const LARGE_MEDIA_EXTS = new Set([
+    'mp4', 'webm', 'mov', 'mkv', 'avi', 'm4v', 'mpg', 'mpeg',
+    'mp3', 'wav', 'flac', 'ogg', 'oga', 'm4a', 'aac', 'opus',
+    'pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tiff', 'tif',
+]);
+// Text extensions eligible for the windowed big-text preview.
+const WINDOWABLE_TEXT_EXTS = new Set([
+    'txt', 'md', 'markdown', 'mkd', 'mdown', 'json', 'jsonc', 'csv', 'tsv', 'log', 'xml',
+    'yml', 'yaml', 'toml', 'ini', 'cfg', 'conf', 'html', 'htm', 'js', 'mjs', 'cjs', 'ts', 'tsx',
+    'jsx', 'css', 'scss', 'less', 'py', 'pyw', 'sh', 'bash', 'go', 'rs', 'rb', 'php', 'java',
+    'kt', 'c', 'h', 'cpp', 'cc', 'hpp', 'cs', 'sql', 'diff', 'patch', 'srt', 'vtt',
+]);
+
+// Bounded "too large to preview inline" placeholder (no body is fetched at all).
+function _renderPreviewTooLarge(bodyEl, fsize) {
+    const wrap = document.createElement('div');
+    wrap.className = 'preview-none text-center text-secondary p-xl';
+    const p1 = document.createElement('p');
+    p1.textContent = `This file is ${formatBytes ? formatBytes(fsize) : fsize + ' bytes'} — too large to preview inline.`;
+    const p2 = document.createElement('p');
+    p2.className = 'text-sm';
+    p2.textContent = 'Use Download to save it, then open it locally.';
+    wrap.append(p1, p2);
+    bodyEl.replaceChildren(wrap);
+}
+
+// Preview a big Standard-vault text file from just its first window: fetch the leading bytes with a
+// Range request, read at most TEXT_WINDOW_FETCH_BYTES, then cancel the rest so nothing more is
+// buffered. Shows the window in a <pre> with a note that it is truncated. A trailing multi-byte UTF-8
+// character that the byte window split is dropped by the lenient decoder rather than shown as junk.
+async function _renderTextWindow(bodyEl, fileId, fileName, fsize, headers) {
+    const win = TEXT_WINDOW_FETCH_BYTES;
+    const h = { ...headers, 'Range': `bytes=0-${win - 1}` };
+    const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, { headers: h });
+    if (!resp.ok && resp.status !== 206) throw new Error('Could not load file (status ' + resp.status + ')');
+    let got = 0;
+    const chunks = [];
+    const reader = resp.body && resp.body.getReader ? resp.body.getReader() : null;
+    if (reader) {
+        while (got < win) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const take = value.subarray(0, Math.min(value.length, win - got));
+            chunks.push(take); got += take.length;
+        }
+        try { await reader.cancel(); } catch (_) { /* stop the rest; bounded memory */ }
+    } else {
+        // No stream reader (very old browser): the Range response body is already <= the window.
+        const buf = new Uint8Array(await resp.arrayBuffer());
+        chunks.push(buf.subarray(0, win)); got = Math.min(buf.length, win);
+    }
+    const merged = new Uint8Array(got);
+    let off = 0;
+    for (const c of chunks) { merged.set(c, off); off += c.length; }
+    const text = new TextDecoder('utf-8', { fatal: false }).decode(merged);
+    const container = document.createElement('div');
+    container.className = 'preview-render-container';
+    const note = document.createElement('div');
+    note.className = 'preview-window-note';
+    note.textContent = `Showing the first ${formatBytes ? formatBytes(got) : got + ' B'} of `
+        + `${formatBytes ? formatBytes(fsize) : fsize + ' B'} — download the file to view all of it.`;
+    const pre = document.createElement('pre');
+    pre.className = 'preview-text';
+    pre.textContent = text;
+    container.append(note, pre);
+    bodyEl.replaceChildren(container);
+}
+
 // Extensions offered a "Render" toggle in the preview (Markdown / HTML / source). Kept in step with
 // the server's renderer (app/core/preview_render.py); the server has the final say on the kind.
 const RENDERABLE_PREVIEW_EXTS = new Set([
@@ -12801,6 +12878,29 @@ async function openFilePreview(fileId, fileName, mime) {
     try {
         const headers = { 'Authorization': `Bearer ${authToken}` };
         if (state.currentVault.has_password && state.vaultPassword) headers['X-Vault-Password'] = state.vaultPassword;
+
+        // Bound memory BEFORE fetching the body. Type + size come from the listing meta + name/MIME,
+        // so we can decide without loading anything: a large media/image/PDF is refused for inline
+        // preview (download it), and a big text file on a Standard vault is previewed from just its
+        // first window via a Range request. ZK content is decrypted end-to-end in the browser, so a
+        // windowed range can't apply there -- ZK keeps the whole-blob path (its own size guard is the
+        // <2MB text check below).
+        const _meta = (state.currentFiles || []).find(i => i.id === fileId);
+        const _fsize = _meta ? (_meta.size || 0) : 0;
+        const _ext0 = (fileName.split('.').pop() || '').toLowerCase();
+        const _mt0 = (mime || '').toLowerCase();
+        const _isMedia = _mt0.startsWith('video/') || _mt0.startsWith('audio/') || _mt0.startsWith('image/')
+            || _mt0.includes('pdf') || LARGE_MEDIA_EXTS.has(_ext0);
+        if (_isMedia && _fsize > MEDIA_PREVIEW_MAX_BYTES) {
+            _renderPreviewTooLarge(bodyEl, _fsize);
+            return;
+        }
+        const _isTextish = _mt0.startsWith('text/') || WINDOWABLE_TEXT_EXTS.has(_ext0);
+        if (_isTextish && _fsize > TEXT_PREVIEW_WINDOW_BYTES && !isZkVault(state.currentVault)) {
+            await _renderTextWindow(bodyEl, fileId, fileName, _fsize, headers);
+            return;
+        }
+
         const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, { headers });
         if (!resp.ok) throw new Error('Could not load file (status ' + resp.status + ')');
         // Zero-knowledge vault: decrypt the ciphertext in-browser before rendering, reading from

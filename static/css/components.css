@@ -1897,6 +1897,7 @@ details summary:hover {
 .preview-render-toolbar { display: flex; justify-content: flex-end; }
 .preview-render-frame { width: 100%; height: 66vh; border: 1px solid var(--border); border-radius: var(--radius-md); background: #fff; }
 .preview-render-container [hidden] { display: none; }
+.preview-window-note { font-size: var(--text-xs); color: var(--text-secondary); font-style: italic; padding: 4px 2px; }
 
 /* Live download progress tray: a small fixed panel (bottom-left, opposite the upload tray) with one
    row per active download showing the file name + a byte progress bar. */
