@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 def test_copied_items_panel_is_wired():
     app = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
     idx = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+    css = (ROOT / "static" / "css" / "components.css").read_text(encoding="utf-8")
     assert 'id="copied-items-btn"' in idx and 'id="copied-items-panel"' in idx
     assert 'id="ci-list"' in idx and 'id="ci-mixed-modal"' in idx
     assert "function renderCopiedItems(" in app
@@ -30,6 +31,10 @@ def test_copied_items_panel_is_wired():
     assert "keepAfter" in app                       # keep-after-paste flag
     # the old always-visible bar is gone.
     assert 'id="move-copy-bar"' not in idx
+    # The panel is position:fixed z-index:1500 with display:flex; its `hidden` attribute must be
+    # honoured, or a hidden panel intercepts clicks on the toolbar beneath it (a real regression:
+    # it blocked #create-folder-btn for 30s). This rule restores display:none when hidden.
+    assert ".ci-panel[hidden]" in css
 
 
 # --------------------------------------------------------------------------- ui lane

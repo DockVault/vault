@@ -2071,6 +2071,10 @@ details summary:hover {
     z-index: 1500;
     overflow: hidden;
 }
+/* `display:flex` above ties with the UA `[hidden]{display:none}` on specificity and wins by source
+   order, so a hidden panel would stay rendered -- a fixed, top-right, z-index:1500 box that intercepts
+   clicks on the toolbar beneath it. This higher-specificity rule restores the hidden attribute. */
+.ci-panel[hidden] { display: none; }
 .ci-head { display: flex; align-items: center; justify-content: space-between; padding: var(--space-sm) var(--space-md); border-bottom: 1px solid var(--surface-3); }
 .ci-title { margin: 0; font-size: var(--text-base); }
 .ci-close { background: transparent; border: none; color: var(--text-secondary); font-size: 22px; line-height: 1; cursor: pointer; }
