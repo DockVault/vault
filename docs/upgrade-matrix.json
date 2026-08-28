@@ -142,6 +142,14 @@
         "secure": true
       }
     },
+    "0.18.1": {
+      "released": "2026-08-28",
+      "notes": "No schema change; same physical schema as 0.17.0/0.18.0. Follow-up fixes from an external audit of 0.18.0, none a confidentiality break: two vault handlers (update-info, change-password) that answered an authorization failure with 500 now return 403; the ECC key-topology endpoint (/ecc/vaults/{id}/keys) returns 403 for a vault the caller cannot reach instead of leaking mode/dek_version to a non-member or 404-vs-403 confirming existence; the public note-link redeem endpoint adds the missing per-IP rate-limit bucket (token enumeration was unthrottled); chunked-upload completion returns a named 409 (not a 500) for a session it cannot read, and the 0.17.0->0.18.0 downgrade edge now documents that in-flight uploads do not survive a downgrade; the download Content-Disposition header strips forward slashes as well as backslashes; a NUL byte in an uploaded filename is rejected with 400 instead of surfacing as a 500; and the base-image apk-upgrade reproducibility exception is documented and contract-tested. A rollback to 0.18.0 is clean and needs no backup.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
+    },
     "0.18.0": {
       "released": "2026-08-28",
       "notes": "No schema change; same physical schema as 0.17.0. Follow-up hardening and fixes on the 0.17.0 at-rest sealing round. At rest: seals a Standard vault's ACTIVE resumable-upload filename and MIME (they were plaintext in chunked_upload_sessions for the life of the upload; the enc_name/enc_mime/name_bi columns already existed and are simply now used for Standard uploads too, decrypted transparently on read), and stops copying already-sealed item/vault names and note titles into the plaintext notification body (the recipient reaches the live item via the deep link). Host tool (dockvault.py): drops the spent ADMIN_PASSWORD from .env after the admin is bootstrapped (only when the DB bootstrap marker confirms an admin exists; fail-closed otherwise); no longer archives a never-used fresh .env when 'deploy a new set' is chosen on a fresh install, and warns in red when a real .env is archived; and lock/status now surface unsealed plaintext .env.* archives. SFTP: the effective per-file upload limit is min(MAX_FILE_SIZE_MB, the RAM staging tmpfs) -- the shipped .env.example defaults are reconciled to agree, the effective SFTP limit is surfaced in the admin settings, and an over-limit or staging-full upload returns a named error instead of a bare 'Failure'. A rollback to 0.17.0 is clean and needs no backup: no persistent schema or data changed, and only an upload in flight at the moment of a downgrade would be affected.",
@@ -275,6 +283,20 @@
     {
       "from": "0.17.0",
       "to": "0.18.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false,
+      "conditions": [
+        {
+          "id": "in-flight-uploads",
+          "summary": "Stored data is unaffected by a downgrade to 0.17.0 (vault names, descriptions, notes and files all still read correctly). The one exception is a resumable upload that is IN FLIGHT across the downgrade: 0.18.0 seals the active session's filename and 0.17.0 has no decrypt event for it, so that unfinished transfer cannot be completed on 0.17.0 (the file is not lost - only that in-progress upload). Complete or cancel in-progress uploads before downgrading.",
+          "detect": "SELECT 1 FROM chunked_upload_sessions WHERE status='active' AND filename IS NULL AND enc_name IS NOT NULL"
+        }
+      ]
+    },
+    {
+      "from": "0.18.0",
+      "to": "0.18.1",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
