@@ -255,3 +255,134 @@ def test_this_deployment_holds_the_converged_shape():
     assert all(value == "NO" for value in nullability.values()), (
         f"this deployment permits NULL in columns the model forbids ({nullability}). If it was "
         "upgraded rather than installed fresh, the tightening did not reach it")
+
+
+CREATED_BY_FK = "temporary_credentials_created_by_temp_credential_id_fkey"
+
+
+@pytest.mark.unit
+def test_the_boot_ddl_adds_the_created_by_temp_credential_fk():
+    """temporary_credentials.created_by_temp_credential_id is declared with a self-referential
+    ForeignKey(ondelete='SET NULL'), so create_all makes that constraint on a fresh install. The
+    boot DDL that carries the column to an existing deployment must add the constraint too -- else a
+    fresh install has the FK and an upgraded one does not, and deleting a temp credential that minted
+    others leaves their provenance pointer dangling instead of nulling it (the same divergence class
+    that files.modified_by had). This was red while the boot DDL added the column without the FK.
+    """
+    from pathlib import Path
+    boot = (Path(__file__).resolve().parents[1] / "app" / "api" / "api_server.py").read_text(
+        encoding="utf-8")
+    assert re.search(
+        rf"ADD CONSTRAINT\s+{CREATED_BY_FK}\s+FOREIGN KEY\s*\(\s*created_by_temp_credential_id\s*\)"
+        r"\s+REFERENCES\s+temporary_credentials\s*\(\s*id\s*\)\s+ON DELETE SET NULL",
+        boot, re.IGNORECASE), (
+        "the boot DDL adds temporary_credentials.created_by_temp_credential_id (declared with a "
+        "ForeignKey) but never adds its FOREIGN KEY; a fresh create_all install gets the constraint "
+        "and an upgraded one does not.")
+    # Guarded so a re-run, and a fresh install that already carries create_all's identically-named
+    # constraint, are both no-ops rather than a duplicate-constraint error. The guard is qualified by
+    # conrelid: constraint names are unique per TABLE in Postgres, so a name-only check could be
+    # satisfied by a same-named constraint on a different table and skip adding the one it means to.
+    assert re.search(
+        rf"FROM pg_constraint\s+WHERE conname\s*=\s*'{CREATED_BY_FK}'\s+"
+        r"AND conrelid\s*=\s*'temporary_credentials'::regclass",
+        boot, re.IGNORECASE), (
+        "the created_by_temp_credential_id FK add is not guarded by a table-qualified pg_constraint "
+        "existence check (conname AND conrelid), so it could fail on a fresh install that already has "
+        "create_all's constraint, or be fooled by a same-named constraint on another table.")
+    # And the FK add is preceded by a backfill that nulls any pre-existing dangling ids -- without it
+    # ADD CONSTRAINT fails on a diverged install that accumulated some, rolls back, and crash-loops
+    # that boot step every restart. It is the load-bearing line, so it is pinned too. Written as a
+    # correlated NOT EXISTS (not NOT IN, which is silently never-true if the subquery yields a NULL).
+    assert re.search(
+        r"UPDATE temporary_credentials\b.*?SET created_by_temp_credential_id\s*=\s*NULL"
+        r".*?NOT EXISTS\s*\(\s*SELECT 1 FROM temporary_credentials\b.*?"
+        r"=\s*t\.created_by_temp_credential_id",
+        boot, re.IGNORECASE | re.DOTALL), (
+        "the FK add is not preceded by a null-the-dangling-ids backfill; ADD CONSTRAINT would fail "
+        "and crash-loop the boot on a diverged install that accumulated dangling children.")
+
+
+def _created_by_fk_do_block():
+    """The exact guarded DO block from the boot DDL that adds the self-referential FK, as a string.
+
+    Pulled from the source so the convergence test below replays the REAL statement -- a SQL error,
+    an inverted guard, or a dropped backfill in it is then caught by an executing test, not only by
+    the source-regex one.
+    """
+    from pathlib import Path
+    boot = (Path(__file__).resolve().parents[1] / "app" / "api" / "api_server.py").read_text(
+        encoding="utf-8")
+    blocks = [s for s in _string_literals(boot)
+              if s.lstrip().startswith("DO $$") and CREATED_BY_FK in s]
+    assert len(blocks) == 1, (
+        f"expected exactly one boot DO block adding {CREATED_BY_FK}, found {len(blocks)}")
+    return blocks[0]
+
+
+@pytest.mark.integration
+def test_the_boot_ddl_block_converges_an_upgraded_table_and_nulls_dangling_ids():
+    """Replay the REAL guarded FK block onto a table in the UPGRADED shape (column present, no FK,
+    holding a dangling id) and prove it converges. A fresh create_all database carries the FK from
+    birth, so only this upgraded-shape replay actually exercises the fix -- on a fresh install the
+    block's guard finds the constraint and does nothing. The column is self-referential, so the
+    block is retargeted onto one scratch table.
+    """
+    run = uuid.uuid4().hex[:8]
+    scratch = f"tc_fkconv_{run}"
+    block = _created_by_fk_do_block().replace(TABLE, scratch)
+    parent = "11111111-1111-1111-1111-111111111111"
+    child = "22222222-2222-2222-2222-222222222222"
+    orphan = "33333333-3333-3333-3333-333333333333"
+    missing = "99999999-9999-9999-9999-999999999999"
+    fk_count = (f"SELECT count(*) FROM pg_constraint "
+                f"WHERE conrelid = '{scratch}'::regclass AND contype = 'f'")
+    _psql(f"CREATE TABLE {scratch} (id uuid PRIMARY KEY, created_by_temp_credential_id uuid)")
+    try:
+        _psql(f"INSERT INTO {scratch} (id) VALUES ('{parent}')")
+        _psql(f"INSERT INTO {scratch} (id, created_by_temp_credential_id) "
+              f"VALUES ('{child}', '{parent}')")
+        _psql(f"INSERT INTO {scratch} (id, created_by_temp_credential_id) "
+              f"VALUES ('{orphan}', '{missing}')")
+        assert _psql(fk_count) == "0", "the scratch table is not in the upgraded (no-FK) shape"
+
+        _psql(block)
+
+        deltype = _psql(f"SELECT confdeltype FROM pg_constraint "
+                        f"WHERE conrelid = '{scratch}'::regclass AND contype = 'f'")
+        assert deltype == "n", (
+            f"the block did not add the self-referential FK with ON DELETE SET NULL "
+            f"(confdeltype={deltype!r})")
+        assert _psql(f"SELECT created_by_temp_credential_id IS NULL FROM {scratch} "
+                     f"WHERE id = '{orphan}'") == "t", (
+            "the dangling id was not nulled before the FK was added -- ADD CONSTRAINT would have "
+            "failed on it")
+        assert _psql(f"SELECT created_by_temp_credential_id FROM {scratch} "
+                     f"WHERE id = '{child}'") == parent, "a valid provenance pointer was nulled"
+
+        _psql(block)  # idempotent: the guard finds the FK and does nothing
+        assert _psql(fk_count) == "1", "re-running the block duplicated or dropped the FK"
+
+        _psql(f"DELETE FROM {scratch} WHERE id = '{parent}'")
+        assert _psql(f"SELECT created_by_temp_credential_id IS NULL FROM {scratch} "
+                     f"WHERE id = '{child}'") == "t", (
+            "deleting a parent did not null its child's pointer (ON DELETE SET NULL is not in effect)")
+    finally:
+        _drop(scratch)
+
+
+@pytest.mark.integration
+def test_this_deployment_holds_the_created_by_temp_credential_fk():
+    """The live database carries the self-referential FK, whichever way it got here. Kept alongside
+    the replay above because it asks the "did they, here" question, not "do the statements converge";
+    on a fresh install the FK comes from create_all, on an upgraded one from the boot block.
+    """
+    if not _table_exists(TABLE):
+        pytest.skip(f"{TABLE} does not exist in this database")
+    # confdeltype 'n' == ON DELETE SET NULL; an empty answer means the FK is absent (divergence).
+    deltype = _psql(
+        f"SELECT confdeltype FROM pg_constraint WHERE conname = '{CREATED_BY_FK}'", on_error="skip")
+    assert deltype == "n", (
+        "the live temporary_credentials table is missing its created_by_temp_credential_id foreign "
+        f"key or its delete rule is not SET NULL (confdeltype={deltype!r}). A deployment upgraded "
+        "before this fix diverges from a fresh install and dangles a child on parent deletion.")

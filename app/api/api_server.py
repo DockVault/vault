@@ -15826,6 +15826,25 @@ def _run_lightweight_migrations():
             "WHERE vault_access_mode IS NULL",
             "ALTER TABLE temporary_credentials ALTER COLUMN vault_access_mode SET NOT NULL",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS created_by_temp_credential_id UUID",
+            # Add the self-referential FK only if it isn't already there (so a re-run is a no-op, and
+            # create_all's own constraint isn't duplicated). Null any pre-existing dangling ids first --
+            # an install that ran an earlier build of this DDL (column, no FK) could have accumulated
+            # some -- so the ADD CONSTRAINT cannot fail on them. Without this, a fresh create_all install
+            # gets the FK and an upgraded one does not: the two schemas diverge and deleting a parent
+            # temp credential leaves its children's created_by_temp_credential_id dangling instead of
+            # nulling it (the model declares ON DELETE SET NULL).
+            """DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                 WHERE conname = 'temporary_credentials_created_by_temp_credential_id_fkey'
+                   AND conrelid = 'temporary_credentials'::regclass) THEN
+    UPDATE temporary_credentials t SET created_by_temp_credential_id = NULL
+      WHERE t.created_by_temp_credential_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM temporary_credentials p
+                        WHERE p.id = t.created_by_temp_credential_id);
+    ALTER TABLE temporary_credentials ADD CONSTRAINT temporary_credentials_created_by_temp_credential_id_fkey
+      FOREIGN KEY (created_by_temp_credential_id) REFERENCES temporary_credentials(id) ON DELETE SET NULL;
+  END IF;
+END $$;""",
             # Drop the long-deprecated encrypted_password column: it held a retrievable copy of the temp
             # password and has been NULL for every row since the password became show-once-at-creation.
             # Removing it takes the column (and its SQL-readable data) out of the schema. Idempotent - a
