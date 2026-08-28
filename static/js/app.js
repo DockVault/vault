@@ -12638,6 +12638,77 @@ function setupImageZoom(img, wrap, controls) {
     apply();
 }
 
+// Extensions offered a "Render" toggle in the preview (Markdown / HTML / source). Kept in step with
+// the server's renderer (app/core/preview_render.py); the server has the final say on the kind.
+const RENDERABLE_PREVIEW_EXTS = new Set([
+    'md', 'markdown', 'mkd', 'mdown', 'html', 'htm', 'xhtml',
+    'py', 'pyw', 'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'css', 'scss', 'less', 'json', 'jsonc',
+    'xml', 'yml', 'yaml', 'toml', 'ini', 'cfg', 'conf', 'sh', 'bash', 'zsh', 'ps1', 'bat',
+    'c', 'h', 'cpp', 'cc', 'hpp', 'cs', 'java', 'kt', 'go', 'rs', 'rb', 'php', 'pl', 'lua',
+    'sql', 'r', 'swift', 'scala', 'clj', 'ex', 'exs', 'erl', 'hs', 'diff', 'patch', 'csv', 'tsv',
+    'vue', 'svelte', 'proto', 'graphql',
+]);
+
+// Build a raw-text preview with a "Render" toggle. Raw shows a <pre>; "Render" fetches the SERVER's
+// sanitized, CSP-locked document and shows it in a fully sandboxed iframe. The iframe is created
+// lazily on first Render and reused; toggling only flips which of {<pre>, <iframe>} is visible.
+function _buildRenderablePreview(fileId, fileName, pre, headers) {
+    const container = document.createElement('div');
+    container.className = 'preview-render-container';
+    const toolbar = document.createElement('div');
+    toolbar.className = 'preview-render-toolbar';
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'btn btn-sm btn-secondary';
+    toggle.textContent = 'Render';
+    toolbar.appendChild(toggle);
+    container.append(toolbar, pre);
+    const vaultId = state.currentVault && state.currentVault.id;
+    let frame = null;
+    let showing = 'raw';
+    toggle.addEventListener('click', async () => {
+        if (showing === 'rendered') {
+            if (frame) frame.hidden = true;
+            pre.hidden = false;
+            toggle.textContent = 'Render';
+            showing = 'raw';
+            return;
+        }
+        toggle.disabled = true;
+        const prev = toggle.textContent;
+        toggle.textContent = 'Rendering…';
+        try {
+            if (!frame) {
+                const r = await fetch(`${API_BASE}/vaults/${vaultId}/files/${fileId}/preview-render`, { headers });
+                if (!r.ok) {
+                    let msg = 'This file could not be rendered.';
+                    try { const e = await r.json(); if (typeof e.detail === 'string') msg = e.detail; } catch (_) {}
+                    throw new Error(msg);
+                }
+                const data = await r.json();
+                frame = document.createElement('iframe');
+                frame.className = 'preview-frame preview-render-frame';
+                // Empty sandbox: scripts never run and the frame has an opaque origin, even if the
+                // server's sanitizer somehow let something through. srcdoc (not src) so no request.
+                frame.setAttribute('sandbox', '');
+                frame.title = fileName;
+                frame.srcdoc = data.html;
+                container.appendChild(frame);
+            }
+            frame.hidden = false;
+            pre.hidden = true;
+            toggle.textContent = 'View raw';
+            showing = 'rendered';
+        } catch (err) {
+            showError((err && err.message) || 'This file could not be rendered.');
+            toggle.textContent = prev;
+        } finally {
+            toggle.disabled = false;
+        }
+    });
+    return container;
+}
+
 async function openFilePreview(fileId, fileName, mime) {
     const modal = document.getElementById('file-preview-modal');
     if (!modal) return;
@@ -12682,7 +12753,17 @@ async function openFilePreview(fileId, fileName, mime) {
             const pre = document.createElement('pre');
             pre.className = 'preview-text';
             pre.textContent = await blob.text();
-            bodyEl.replaceChildren(pre);
+            // A "Render" toggle for Markdown / HTML / source files on a Standard vault. Rendering is
+            // done SERVER-side (sanitized by an nh3 allowlist and wrapped in a CSP-locked document)
+            // and shown in a FULLY SANDBOXED iframe (sandbox="" => no scripts, opaque origin) -- so
+            // no script runs, no external request is made, and the file's markup cannot script the
+            // page. A zero-knowledge vault's content lives only in the browser (the server holds
+            // ciphertext), so it stays raw text there.
+            if (RENDERABLE_PREVIEW_EXTS.has(ext) && !isZkVault(state.currentVault)) {
+                bodyEl.replaceChildren(_buildRenderablePreview(fileId, fileName, pre, headers));
+            } else {
+                bodyEl.replaceChildren(pre);
+            }
         } else if (isImg) {
             // Image: fit-to-view (CSS object-fit) inside a clipping container, plus a
             // zoom control that only ever transforms the <img> -- never the page.

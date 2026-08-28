@@ -14158,6 +14158,120 @@ async def get_file_info(
                             detail="Failed to read file info")
 
 
+#: A rendered preview is for readable text, not multi-megabyte blobs; a larger file is refused here
+#: (the client keeps showing the raw text). Independent of the renderer's own char ceiling.
+_MAX_PREVIEW_RENDER_BYTES = 2 * 1024 * 1024
+
+
+@app.get("/vaults/{vault_id}/files/{file_id}/preview-render")
+@require_endpoint_permission("FILE_DOWNLOAD")
+@require_vault_cap("file.download")
+async def preview_render_file(
+    vault_id: uuid.UUID,
+    file_id: uuid.UUID,
+    request: Request,
+    kind: Optional[str] = None,
+    file_password: Optional[str] = Header(None, alias="X-File-Password"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    x_vault_password: Optional[str] = Header(None),
+):
+    """Render a Standard-vault text file (Markdown / HTML / source) to a SANITIZED, CSP-locked HTML
+    document for display inside a fully sandboxed preview iframe.
+
+    Rendering reveals the file's content, so it requires the same download capability, endpoint group,
+    item scope and download scope as /download. Deliberate differences from /download:
+
+      * allow_share=False -- a rendered preview does NOT meter a share's per-recipient download cap,
+        so it must not be a way around it. A share recipient uses /download (which burns the cap);
+        preview-render is member-only, and a pure-share principal is denied by get_vault here.
+      * it takes a transfer-admission slot so it sheds EXCESS load under pressure, and the CPU-bound
+        Markdown/Pygments render runs in a worker thread (asyncio.to_thread) so it never blocks the
+        event loop.
+      * it writes a content-access audit record, so a render is not a silent, unlogged disclosure.
+
+    Refused (400) for zero-knowledge vaults: the server holds only ciphertext (the client renders raw
+    text there instead). The returned {html} is a complete document whose own <meta> CSP + the
+    iframe's empty sandbox are the runtime boundary; nh3 is the authoritative content control
+    (app/core/preview_render.py)."""
+    import asyncio
+
+    from app.core.preview_render import render_preview_document
+
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    audit_logger = AuditLogger(db)
+    transfer_slot = None
+    try:
+        vault = vault_service.get_vault(vault_id, current_user, x_vault_password,
+                                        require_password=True, allow_share=False)
+        # Rendering exposes the content: gate it with the download scopes, not merely see_files.
+        require_file_scope(db, current_user, vault_id, file_id)
+        require_download_scope(db, current_user, vault_id, file_id)
+
+        if _is_zk_vault(vault):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Rendered preview is not available for zero-knowledge vaults.")
+
+        file_record = db.query(File).filter(File.id == file_id, File.vault_id == vault_id).first()
+        if file_record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+        if (file_record.size_bytes or 0) > _MAX_PREVIEW_RENDER_BYTES:
+            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                                detail="File is too large to render inline; download it to view it.")
+
+        # Load-shed like /download: refuse under pressure rather than queue a CPU-bound render onto
+        # the event loop. Taken AFTER the cheap 404/413 answers so a rejected caller never queues.
+        try:
+            transfer_slot = await transfer_admission.acquire()
+        except TransferBusy as busy:
+            raise _busy_response(busy)
+
+        # Bounded by the size gate above. download_file re-checks the same access/scope internally.
+        content, name, _mime = vault_service.download_file(
+            file_id, current_user, file_password=file_password, allow_share=False)
+        text = content.decode("utf-8", errors="replace")
+
+        if kind not in ("markdown", "html", "code", "text", None):
+            kind = None
+        # The render is pure CPU (no DB/session touch) -- run it in a worker thread so a crafted
+        # large input to the Markdown/Pygments parser cannot stall the event loop for other requests.
+        document, resolved_kind = await asyncio.to_thread(
+            render_preview_document, text, name or file_record.original_name or "file.txt", kind)
+
+        # A render discloses the file's content, exactly like a download -- record it so content
+        # access via this surface is not silently unlogged. Standard vault only (ZK refused above),
+        # so the name is loggable (mirrors /download's audit_name for a Standard file).
+        audit_logger.log_action(
+            action='file_preview_rendered', status='authorized', user=current_user,
+            resource_type='file', resource_id=str(file_id),
+            details={'vault_id': str(vault_id), 'file_name': name, 'kind': resolved_kind},
+            ip_address=get_client_ip(request),
+        )
+
+        resp = JSONResponse({"html": document, "kind": resolved_kind})
+        # Defence-in-depth: the response is JSON, never itself a rendered document, but stamp a strict
+        # CSP + nosniff so it can't be coerced into being interpreted as HTML if fetched directly.
+        resp.headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        return resp
+    except (PasswordRequiredError, InvalidPasswordError) as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+    except (FileNotFoundError, FileServiceError):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+    except PermissionDeniedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logging.getLogger(__name__).exception("preview_render_file failed")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="Failed to render preview")
+    finally:
+        if transfer_slot is not None:
+            transfer_admission.release(transfer_slot)
+
+
 @app.put("/vaults/{vault_id}/files/{file_id}/rename")
 @require_endpoint_permission("FILE_DELETE")
 @require_vault_cap("file.rename")

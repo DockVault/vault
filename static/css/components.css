@@ -1892,6 +1892,12 @@ details summary:hover {
 .preview-text  { width: 100%; max-height: 66vh; overflow: auto; white-space: pre-wrap; word-break: break-word; font-family: var(--font-mono); font-size: var(--text-sm); background: var(--surface-1); padding: var(--space-md); border-radius: var(--radius-md); color: var(--text-primary); margin: 0; }
 .preview-none  { width: 100%; }
 
+/* Render toggle: a small toolbar above the raw <pre>; the sandboxed render iframe replaces it. */
+.preview-render-container { width: 100%; display: flex; flex-direction: column; gap: var(--space-sm); }
+.preview-render-toolbar { display: flex; justify-content: flex-end; }
+.preview-render-frame { width: 100%; height: 66vh; border: 1px solid var(--border); border-radius: var(--radius-md); background: #fff; }
+.preview-render-container [hidden] { display: none; }
+
 /* Image zoom: the transform lives on the <img> inside an overflow:hidden
    container, so zooming/panning only ever affects the preview, never the page. */
 .preview-zoom {
