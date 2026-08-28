@@ -35,6 +35,9 @@ def test_copied_items_panel_is_wired():
     # honoured, or a hidden panel intercepts clicks on the toolbar beneath it (a real regression:
     # it blocked #create-folder-btn for 30s). This rule restores display:none when hidden.
     assert ".ci-panel[hidden]" in css
+    # Same for the toolbar button: `.btn { display:inline-flex }` beats [hidden], so without this
+    # rule the "Copied Items" button never hid when the clip emptied (a move left it visible).
+    assert "#copied-items-btn[hidden]" in css
 
 
 # --------------------------------------------------------------------------- ui lane

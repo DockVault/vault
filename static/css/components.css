@@ -2081,6 +2081,10 @@ details summary:hover {
    order, so a hidden panel would stay rendered -- a fixed, top-right, z-index:1500 box that intercepts
    clicks on the toolbar beneath it. This higher-specificity rule restores the hidden attribute. */
 .ci-panel[hidden] { display: none; }
+/* Same trap for the toolbar button: `.btn { display:inline-flex }` beats the UA `[hidden]` rule, so
+   `btn.hidden = true` (set when the clip empties) would not hide it -- the button stayed visible with
+   nothing staged. Restore the hidden attribute for this button. */
+#copied-items-btn[hidden] { display: none; }
 .ci-head { display: flex; align-items: center; justify-content: space-between; padding: var(--space-sm) var(--space-md); border-bottom: 1px solid var(--surface-3); }
 .ci-title { margin: 0; font-size: var(--text-base); }
 .ci-close { background: transparent; border: none; color: var(--text-secondary); font-size: 22px; line-height: 1; cursor: pointer; }
@@ -2114,6 +2118,11 @@ details summary:hover {
 .ci-item-name { font-size: var(--text-sm); color: var(--text-primary); word-break: break-word; }
 .ci-item-loc, .ci-item-meta { font-size: var(--text-xs); color: var(--text-secondary); word-break: break-word; }
 .ci-actions { border-top: 1px solid var(--surface-3); padding: var(--space-sm) var(--space-md); display: flex; flex-direction: column; gap: 8px; }
+/* Every Copied-Items control below sets `display:flex`/`inline-flex` on its class, which beats the
+   UA `[hidden]{display:none}` on specificity+source-order. Each is toggled via the `hidden` attribute
+   (actions when nothing is selected, the settings row / keep button per selection), so without these
+   the control would stay visible when told to hide. Restore the hidden attribute for each. */
+.ci-actions[hidden], .ci-settings-row[hidden], #ci-keep[hidden] { display: none; }
 .ci-action-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .ci-settings-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
 .ci-settings-label { font-size: var(--text-xs); color: var(--text-secondary); }
