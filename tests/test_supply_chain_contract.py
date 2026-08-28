@@ -118,6 +118,20 @@ def test_apk_upgrade_is_the_only_unpinned_install():
     assert "apk --no-cache upgrade" in doc and "reproducib" in doc.lower(), (
         "the apk reproducibility exception must be documented in docs/supply-chain-controls.md"
     )
+    # ...and enforce the docstring's wider promise: no OTHER unpinned fetch-and-execute install can be
+    # added quietly under another tool. pip is covered by the --require-hashes assertions above; apk is
+    # the one documented exception. Word boundaries so a shell pipe ('| sh') is caught but 'sha256sum'
+    # (a '| sha256sum' hash check) is not.
+    forbidden = [
+        r"\bcurl\b", r"\bwget\b", r"\bnpm\b", r"\byarn\b", r"\bpnpm\b",
+        r"\bgo\s+(?:install|get)\b", r"\bgem\s+install\b", r"\bcargo\s+install\b",
+        r"\|\s*(?:sh|bash)\b",
+    ]
+    for pat in forbidden:
+        m = re.search(pat, _DOCKERFILE)
+        assert m is None, (
+            "Dockerfile has an unpinned fetch-and-execute install matching %r: ...%r..."
+            % (pat, _DOCKERFILE[max(0, m.start() - 15):m.start() + 25]))
 
 
 def test_cpython_security_backports_are_exact_and_verified_during_build():
