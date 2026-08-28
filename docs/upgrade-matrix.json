@@ -150,6 +150,14 @@
         "secure": true
       }
     },
+    "0.18.2": {
+      "released": "2026-08-28",
+      "notes": "Additive schema fix, no data migration. Adds the foreign key for temporary_credentials.created_by_temp_credential_id (self-referential, ON DELETE SET NULL) that create_all already declares but the boot DDL omitted, so a fresh install and an upgraded one converge to the same physical schema. Deleting a temp credential that had minted others now nulls their created_by_temp_credential_id provenance pointer instead of leaving a dangling id (any pre-existing dangling ids are nulled first, so the constraint add cannot fail on an install that ran the earlier column-only DDL). A rollback to 0.18.1 is clean and needs no backup: the older image simply does not re-add the foreign key and the column is unchanged.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
+    },
     "0.18.0": {
       "released": "2026-08-28",
       "notes": "No schema change; same physical schema as 0.17.0. Follow-up hardening and fixes on the 0.17.0 at-rest sealing round. At rest: seals a Standard vault's ACTIVE resumable-upload filename and MIME (they were plaintext in chunked_upload_sessions for the life of the upload; the enc_name/enc_mime/name_bi columns already existed and are simply now used for Standard uploads too, decrypted transparently on read), and stops copying already-sealed item/vault names and note titles into the plaintext notification body (the recipient reaches the live item via the deep link). Host tool (dockvault.py): drops the spent ADMIN_PASSWORD from .env after the admin is bootstrapped (only when the DB bootstrap marker confirms an admin exists; fail-closed otherwise); no longer archives a never-used fresh .env when 'deploy a new set' is chosen on a fresh install, and warns in red when a real .env is archived; and lock/status now surface unsealed plaintext .env.* archives. SFTP: the effective per-file upload limit is min(MAX_FILE_SIZE_MB, the RAM staging tmpfs) -- the shipped .env.example defaults are reconciled to agree, the effective SFTP limit is surfaced in the admin settings, and an over-limit or staging-full upload returns a named error instead of a bare 'Failure'. A rollback to 0.17.0 is clean and needs no backup: no persistent schema or data changed, and only an upload in flight at the moment of a downgrade would be affected.",
@@ -297,6 +305,13 @@
     {
       "from": "0.18.0",
       "to": "0.18.1",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.18.1",
+      "to": "0.18.2",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
