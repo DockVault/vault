@@ -63,6 +63,29 @@ OpenSSL's QUIC Listener is never instantiated and the vulnerable code is not rea
 statement binds the `pkg:apk/alpine/libssl3` and `pkg:apk/alpine/libcrypto3` subcomponents; if a
 future base image changes those package versions, the pin stops matching and the exception is
 re-reviewed rather than silently carried forward.
+
+### Base-package patching: a deliberate reproducibility exception
+
+The Dockerfile's first build step is `RUN apk --no-cache upgrade`, which patches the base Alpine OS
+packages to the versions the Alpine security repository serves at build time. It is the **one
+unpinned network install** in the image, and it is deliberate. Docker Hub rebuilds the pinned base
+digest more slowly than Alpine publishes security fixes, so the digest can still carry a base package
+(e.g. `libcrypto3`/`libssl3`) with a fixed HIGH CVE installed — which the release scan
+(`grype --fail-on high`, run before publication) rejects. Upgrading here pulls the patched packages
+at build time; `--no-cache` keeps the apk index out of the layer, and the base digest stays pinned so
+the starting point is still reproducible.
+
+The trade-off is that the image is no longer byte-for-byte reproducible from source alone: the same
+commit can pull a newer base package next week. This is accepted in favour of always shipping the
+patched base. Pinning specific apk versions instead is **not** the safer choice here — Alpine repos
+keep only the latest version of each package, so a version pin breaks the build the moment it is
+superseded, and it would narrow patching to the named packages only (a future CVE in another base
+package would fail the release scan with nothing patching it). What the image actually installed is
+recorded in the per-release SPDX SBOM and bound to the pushed digest by attestation, so the shipped
+content is auditable after the fact. `tests/test_supply_chain_contract.py` asserts this `apk` line is
+the **only** unpinned install in the Dockerfile, so the exception stays one line and a second one
+cannot be added quietly; any change to it is a reviewed source change.
+
 ## Hosted settings evidence
 
 | Control | Evidence on 2026-07-24 | Status |
