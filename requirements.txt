@@ -53,7 +53,7 @@ nh3==0.3.6
 # highlighting. Their output is ALWAYS run back through an nh3 allowlist (app/core/preview_render.py)
 # and shown in a fully-sandboxed, CSP-locked iframe, so neither library's output is trusted markup.
 # Both are pure-Python (no compiler needed for the alpine image).
-Markdown==3.7
+Markdown==3.10.3
 Pygments==2.20.0
 
 # NOTE: `requests` was removed — the only outbound HTTP is a stdlib-urllib localhost /health probe.
