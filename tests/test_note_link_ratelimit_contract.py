@@ -35,3 +35,18 @@ def test_redeem_adds_the_per_ip_bucket_for_enumeration():
         "the per-IP bucket is missing -> guessing many different tokens from one IP is unthrottled")
     assert 'prefix="notelink_redeem_ip"' in body, (
         "the per-IP bucket must use its own distinct rate-limit prefix")
+
+
+def test_redeem_per_ip_bucket_uses_its_own_generous_budget():
+    # A note link is a broadcast artifact opened by many people at once (often one egress IP), so the
+    # per-IP budget must be its OWN generous value, NOT the tight one-per-user auth budget
+    # (rate_limit_api_auth defaults to 10/min, which refuses the 11th legitimate opener from an office).
+    body = _redeem_body()
+    assert "limit=_NOTELINK_REDEEM_IP_LIMIT" in body, (
+        "the per-IP bucket must use the dedicated _NOTELINK_REDEEM_IP_LIMIT budget")
+    assert "rate_limit_api_auth" not in body, (
+        "the per-IP bucket must NOT borrow the auth budget -- that default refuses legitimate opens")
+    # and that dedicated budget must be generous enough not to refuse a real team
+    assert _SRC.count("_NOTELINK_REDEEM_IP_LIMIT = ") == 1
+    m = re.search(r"_NOTELINK_REDEEM_IP_LIMIT\s*=\s*(\d+)", _SRC)
+    assert m and int(m.group(1)) >= 300, "the per-IP note-link redeem budget should be >= 300/min"

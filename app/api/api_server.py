@@ -7239,8 +7239,16 @@ async def deactivate_note_link_tag(
 # redemption is PUBLIC, rate-limited, optionally secret-gated with a per-link lockout, and audited.
 
 _NOTELINK_TOKEN_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"  # base62
-_NOTELINK_REDEEM_LIMIT = 10          # redemption requests / minute / IP (and / token)
+_NOTELINK_REDEEM_LIMIT = 10          # redemption requests / minute per (IP, link) — the guess-the-secret bound
 _NOTELINK_REDEEM_WINDOW = 60
+# Per-IP redemption budget (across ALL links), for the token-ENUMERATION case. A note link is a
+# broadcast artifact — one team behind one NAT opens many DIFFERENT valid links at once — so this must
+# be generous, UNLIKE the one-per-user /invites and /reset flows (which can borrow the tight auth
+# budget). It is deliberately NOT rate_limit_api_auth: that default (10/min) refuses the 11th
+# legitimate opener from one office. At 600/min the weakest allowed token (6 base62 chars, ~35.7 bits)
+# still takes ~2000 years to enumerate, while no real office ever trips it.
+_NOTELINK_REDEEM_IP_LIMIT = 600
+_NOTELINK_REDEEM_IP_WINDOW = 60
 _NOTELINK_FAIL_MAX = 5               # wrong-secret attempts before a lockout
 _NOTELINK_FAIL_WINDOW = 900          # 15-minute lockout window
 _NOTELINK_TOKEN_MAX_INPUT = 128      # reject absurd tokens before they touch redis/db
@@ -7677,8 +7685,8 @@ async def redeem_note_link(
             identifier=f"{client_ip}:{token}", limit=_NOTELINK_REDEEM_LIMIT,
             window=_NOTELINK_REDEEM_WINDOW, prefix="notelink_redeem", fail_open=False)
         allowed_ip, _, reset_ip = _rl.check_rate_limit(
-            identifier=client_ip, limit=settings.rate_limit_api_auth,
-            window=settings.rate_limit_api_auth_window, prefix="notelink_redeem_ip", fail_open=False)
+            identifier=client_ip, limit=_NOTELINK_REDEEM_IP_LIMIT,
+            window=_NOTELINK_REDEEM_IP_WINDOW, prefix="notelink_redeem_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
     if not allowed or not allowed_ip:
@@ -9830,18 +9838,23 @@ async def update_vault_info(
 ):
     """
     Update vault basic information (name, description).
-    Only owner or admin can update vault info.
+
+    Only the vault OWNER may edit its metadata. A global admin is NOT a superuser over vault contents:
+    vault_service.get_vault() enforces membership first (with no admin bypass), so an admin who is not
+    the owner is already denied. Do not add an admin bypass here without making it a deliberate change
+    at the get_vault chokepoint, with a test -- otherwise every administrator silently gains write
+    access to every vault in the deployment.
     """
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
-    
+
     try:
         # Get vault (no password required for metadata update)
         vault = vault_service.get_vault(vault_id, current_user, require_password=False)
-        
-        # SECURITY: Only vault owner or admin can edit info
-        if vault.owner_id != current_user.id and current_user.role != RoleEnum.ADMIN:
+
+        # SECURITY: only the vault owner may edit its metadata (admins are not exempt -- see docstring).
+        if vault.owner_id != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only vault owner can edit vault information"
