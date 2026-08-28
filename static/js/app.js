@@ -10106,10 +10106,17 @@ function openContextMenu(item, x, y) {
         menu.appendChild(b);
     });
     menu.hidden = false;
-    // Position, clamped to the viewport.
+    // Position on the side of the anchor that has room. Extend RIGHT from x when it fits -- this is
+    // what makes a left-column item's menu open rightward and keep every item (rename included) on
+    // screen -- and flip LEFT only when a right-column anchor would push the menu off the edge.
     const r = menu.getBoundingClientRect();
-    const left = Math.max(4, Math.min(x, window.innerWidth - r.width - 8));
-    const top = Math.max(4, Math.min(y, window.innerHeight - r.height - 8));
+    const vw = window.innerWidth, vh = window.innerHeight, pad = 8;
+    let left = x;
+    if (x + r.width + pad > vw) left = x - r.width;          // flip to the left of the anchor
+    left = Math.max(pad, Math.min(left, vw - r.width - pad));
+    let top = y;
+    if (y + r.height + pad > vh) top = y - r.height - 6;     // flip above the anchor
+    top = Math.max(pad, Math.min(top, vh - r.height - pad));
     menu.style.left = left + 'px';
     menu.style.top = top + 'px';
     document.addEventListener('click', _ctxOutside, true);
@@ -10163,6 +10170,19 @@ function wireFileItemHandlers(container) {
                 return;
             }
             runFileAction(action, btn.getAttribute('data-id'), btn.getAttribute('data-name'));
+        });
+    });
+    // The hover cluster opens to the LEFT of the "more" button. Near the left edge of the file area
+    // (a left-column grid tile) that would clip it -- so flip it to open RIGHT there, keeping every
+    // option (rename included) on screen. Decided on hover, since positions shift with scroll/resize.
+    container.querySelectorAll('.action-more-wrap').forEach(wrap => {
+        wrap.addEventListener('mouseenter', () => {
+            const r = wrap.getBoundingClientRect();
+            const host = wrap.closest('#vault-files-grid, #vault-files-table-body, .files-scroll') || document.body;
+            const hostLeft = host.getBoundingClientRect().left;
+            const CLUSTER_EST = 200;   // generous width of the 4-icon cluster + padding
+            // Flip right when opening left would cross the file-area's left edge.
+            wrap.classList.toggle('cluster-right', (r.left - CLUSTER_EST) < hostLeft + 4);
         });
     });
     // Right-click a row/tile -> the context menu with every permitted action. Delegated + wired ONCE
@@ -12435,16 +12455,26 @@ const downloadProgress = {
         if (!t) { t = document.createElement('div'); t.id = 'download-tray'; document.body.appendChild(t); }
         return t;
     },
-    start(fileName) {
+    start(fileName, onCancel) {
         const id = `dl_${++_dlSeq}`;
         const tray = this._tray();
         const row = document.createElement('div'); row.className = 'dl-row'; row.setAttribute('data-dl-row', id);
+        const head = document.createElement('div'); head.className = 'dl-head';
         const name = document.createElement('div'); name.className = 'dl-name'; name.textContent = fileName; name.title = fileName;
+        head.appendChild(name);
+        if (typeof onCancel === 'function') {
+            const cancel = document.createElement('button');
+            cancel.type = 'button'; cancel.className = 'dl-cancel';
+            cancel.title = 'Cancel download'; cancel.setAttribute('aria-label', 'Cancel download');
+            cancel.textContent = '✕';   // ✕
+            cancel.addEventListener('click', () => { try { onCancel(); } catch (_) {} });
+            head.appendChild(cancel);
+        }
         const sub = document.createElement('div'); sub.className = 'dl-sub'; sub.textContent = 'Downloading…';
         const bar = document.createElement('div'); bar.className = 'dl-bar';
         const fill = document.createElement('div'); fill.className = 'dl-bar-fill';
         bar.appendChild(fill);
-        row.append(name, sub, bar);
+        row.append(head, sub, bar);
         tray.appendChild(row); tray.classList.add('show');
         this.rows.set(id, { row, fill, sub });
         return id;
@@ -12492,6 +12522,11 @@ async function downloadFile(fileId, fileName) {
 }
 
 async function _downloadFile(fileId, fileName) {
+    // A cancel handle for the download. Aborting it stops the in-flight fetch/read; the Standard
+    // path below wires it to the progress tray's Cancel button. (This does not change the transfer
+    // -- it just lets the user stop one.) Declared before the try so the catch can tell a
+    // user-initiated cancel from a genuine failure.
+    const _dlAbort = new AbortController();
     try {
         // Zero-knowledge: if we couldn't decrypt this item's NAME we also lack the DEK for
         // its content epoch, so a download can't be decrypted here — say so plainly.
@@ -12514,7 +12549,7 @@ async function _downloadFile(fileId, fileName) {
         // Fetch file. Not const: a streaming attempt that cannot proceed has already consumed
         // this body, so the buffered fallback replaces it.
         let response = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, {
-            headers
+            headers, signal: _dlAbort.signal
         });
         
         if (!response.ok) {
@@ -12563,7 +12598,7 @@ async function _downloadFile(fileId, fileName) {
             // Standard vault: the server has already decrypted, so we just read the body -- but read
             // it through a byte-counting reader so the download tray can show live progress. Same
             // bytes, same resulting blob; the fetch/transfer is untouched.
-            const dlId = downloadProgress.start(fileName);
+            const dlId = downloadProgress.start(fileName, () => _dlAbort.abort());
             try {
                 blob = await readResponseWithProgress(
                     response, (rec, tot) => downloadProgress.update(dlId, rec, tot));
@@ -12582,6 +12617,11 @@ async function _downloadFile(fileId, fileName) {
         
         showSuccess('File downloaded successfully');
     } catch (error) {
+        // A user-initiated cancel aborts the fetch/read -- report it as cancelled, not failed.
+        if (_dlAbort.signal.aborted || (error && error.name === 'AbortError')) {
+            showInfo(`Download of "${fileName}" cancelled.`);
+            return;
+        }
         console.error('Download failed:', error);
         showError('Failed to download file');
     }
