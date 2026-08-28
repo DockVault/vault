@@ -103,6 +103,19 @@ async def list_dynamic_actions(
     }
 
 
+@router.get("/default-templates")
+async def list_default_templates(
+    _admin: User = Depends(require_interactive_admin),
+):
+    """The built-in default templates the editor's "Load From → Default templates" section offers.
+
+    Server-owned and always available (kept in code), so an admin can reset a template to its original
+    content — or copy a default as a starting point — even after the seeded row was edited. Bodies are
+    already sanitized (byte-identical to the seeded row's stored body)."""
+    from app.core.email_actions import default_template_payloads
+    return {"templates": default_template_payloads()}
+
+
 # --------------------------------------------------------------------------------------------------
 # Sending profiles
 # --------------------------------------------------------------------------------------------------
@@ -480,6 +493,10 @@ def _template_out(t: EmailTemplate, *, include_body: bool = False, action_map: O
         "description": t.description,
         "profile_id": str(t.profile_id) if t.profile_id else None,
         "subject": t.subject,
+        # Built-in default templates are seeded + pre-bound and can't be deleted (they're recoverable
+        # via "Load From"); the grid badges them and the editor treats them accordingly.
+        "default_key": t.default_key,
+        "is_default": bool(t.default_key),
         "created_at": t.created_at.isoformat() if t.created_at else None,
         "updated_at": t.updated_at.isoformat() if t.updated_at else None,
     }
@@ -584,6 +601,13 @@ async def delete_template(template_id: uuid.UUID, request: Request,
     t = db.get(EmailTemplate, template_id)
     if t is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found.")
+    # A built-in default template is permanent: deleting it would let a re-seed silently rebind an
+    # action an admin had set to a different template (or "none"). Customize it in place instead, or
+    # use "Load From" to reset it to the original.
+    if t.default_key:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="This is a built-in default template and can't be deleted. Edit it, "
+                                   "or use “Load From” to reset it to the original.")
     # A template bound to an automated email is protected: a SYSTEM action's template is non-removable
     # (the vault must be able to send it); an OPTIONAL action's must be re-pointed first. This is what
     # makes the seeded system templates "non-removable" without adding a column to email_templates.
@@ -714,8 +738,17 @@ async def update_action(key: str, payload: ActionUpdateIn, request: Request,
 
     if action.category == "system":
         action.enabled = True                            # system actions are always on
-    elif payload.enabled is not None:
-        action.enabled = bool(payload.enabled)
+    else:
+        # An optional email can be enabled only with a bound template — one with no template has nothing
+        # to send. Refuse an explicit enable-without-template, and force it off if it ends up unbound
+        # (e.g. the template was set to "none" in this same request).
+        if payload.enabled is not None:
+            if payload.enabled and action.template_id is None:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail="Choose a template for this email before turning it on.")
+            action.enabled = bool(payload.enabled)
+        if action.template_id is None:
+            action.enabled = False
 
     db.commit()
     _audit(db, request, admin, "email_action_updated", action_key=key,
@@ -725,29 +758,55 @@ async def update_action(key: str, payload: ActionUpdateIn, request: Request,
 
 class ActionTestIn(BaseModel):
     to_addr: Optional[str] = None
+    to_user_id: Optional[uuid.UUID] = None    # send to this user's email (resolved server-side)
+
+
+# A test send is clearly marked so it can't be mistaken for a real notification: a subject prefix + a
+# footer banner. The footer uses only allowlisted tags (it is re-sanitized on the way out anyway).
+_TEST_SUBJECT_PREFIX = "[Test] "
+_TEST_FOOTER_HTML = (
+    "<hr><p><small><strong>This is a test email.</strong> It was sent from Settings &rarr; Email to "
+    "preview this template and is not a real notification. Any codes, links, and dates above are sample "
+    "values.</small></p>")
 
 
 @router.post("/actions/{key}/test")
 async def test_action(key: str, payload: ActionTestIn, request: Request,
                       admin: User = Depends(require_interactive_admin),
                       db: Session = Depends(get_db)):
-    """Send the action's email with SAMPLE token values to a chosen address, so an admin can preview an
-    automated email through real delivery. Force-sends even a disabled optional action (it's a test)."""
+    """Send the action's email with SAMPLE token values to a chosen recipient, so an admin can preview an
+    automated email through real delivery. Force-sends even a disabled optional action (it's a test), and
+    marks the message as a test (subject prefix + footer). The recipient is a picked user (its email is
+    resolved server-side — never trusting a client-supplied address for that user), else a typed address,
+    else the admin's own email."""
     from app.core.email_actions import send_action_email
     action = db.get(EmailAction, key)
     if action is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown email action.")
     _rate_limit(admin.id, limit=30, window=60, prefix="email_action_test",
                 detail="Too many test emails; please wait a moment.")
-    to_addr = (payload.to_addr or "").strip() or (admin.email or "").strip()
+    # Recipient: a picked user (resolve its own email), else a typed address, else the admin's own.
+    if payload.to_user_id is not None:
+        target = db.get(User, payload.to_user_id)
+        if target is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That user was not found.")
+        to_addr = (target.email or "").strip()
+        to_username = target.username or "user"
+        if not to_addr:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="That user has no email address on file. Pick someone else or type an address.")
+    else:
+        to_addr = (payload.to_addr or "").strip() or (admin.email or "").strip()
+        to_username = admin.username or "admin"
     if not _valid_address(to_addr):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail="Enter a valid recipient address (or set one on your admin account).")
     sample = {"link": (_vault_url() or "https://vault.example.com") + "/sample-token",
               "code": "482913", "expires": "in 24 hours"}
     try:
-        send_action_email(db, key, recipient={"email": to_addr, "username": admin.username or "admin"},
-                          action_context=sample, force=True, raise_errors=True)
+        send_action_email(db, key, recipient={"email": to_addr, "username": to_username},
+                          action_context=sample, force=True, raise_errors=True,
+                          subject_prefix=_TEST_SUBJECT_PREFIX, footer_html=_TEST_FOOTER_HTML)
     except email_send.EmailSendError as e:
         code = status.HTTP_400_BAD_REQUEST if e.category == "config" else status.HTTP_502_BAD_GATEWAY
         raise HTTPException(status_code=code, detail=e.message)

@@ -37,6 +37,8 @@ from app.core.config import bootstrap_entrypoint
 bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
+from app.core.chunk_cleanup import fail_chunk_session
+from app.core.session_hash_utils import hash_session_token
 from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink
 from app.core import sharing_policy
 from app.core import note_link_policy
@@ -59,6 +61,9 @@ from app.core.id_scope import id_in_scope
 from sqlalchemy.exc import IntegrityError
 from app.services.audit_logger import AuditLogger
 from app.services.streaming_upload import receive_bounded, ChunkTooLarge, EmptyBody
+from app.core.upload_chunk_crypto import (
+    seal_stream_to_file, sealed_plaintext_size, open_staged_chunk, StagedChunkError,
+)
 from app.services.download_stream import (
     ChecksumMismatch, UNSATISFIABLE, parse_byte_range,
 )
@@ -260,55 +265,22 @@ _MAX_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024  # 64 MiB
 _MAX_REQUEST_BODY_BYTES = 4 * _MAX_UPLOAD_CHUNK_BYTES  # 256 MiB
 
 
-# Path segments that are replayable SECRETS, not identifiers: the invitation token and the share-claim
-# secret both travel in the URL PATH. The web log-pull serves request paths to a `web`-scoped token
-# holder (a less-privileged consumer), and redact_log_text does not catch these (no key= separator,
-# not JWT-shaped), so mask them at the source before they reach the sink. Add any new secret-in-path
-# route here.
-_LOG_PATH_SECRET_SUBS = [
-    (re.compile(r"^(/invites/)[^/]+"), r"\1<redacted>"),           # GET/POST /invites/{token}[/accept]
-    (re.compile(r"^(/shares/)[^/]+(/claim)"), r"\1<redacted>\2"),  # /shares/{claim-secret}/claim
-]
+# The URL-secret redaction (invite/reset/share tokens in the path or landing-page query) lives in a
+# small stdlib-only module so it is unit-testable offline and shared by the in-app sink AND the uvicorn
+# access-log filter below. Add new secret-bearing routes in app/core/log_redaction.py.
+from app.core.log_redaction import (  # noqa: E402
+    redact_log_path as _redact_log_path,
+    redact_access_path as _redact_access_path,
+    AccessLogRedactFilter as _AccessLogRedactFilter,
+)
 
 
-def _redact_log_path(path: str) -> str:
-    """Mask replayable secrets carried in a URL path before it is written to the log-pull sink."""
-    for rx, repl in _LOG_PATH_SECRET_SUBS:
-        path = rx.sub(repl, path)
-    return path
-
-
-_INVITE_QUERY_RE = re.compile(r"(?i)([?&]invite=)[^&#]+")
-
-
-def _redact_access_path(full_path: str) -> str:
-    """Redact secrets from a full request target (path + optional query) for the uvicorn access log:
-    mask the invite/share token in the PATH and the ?invite=<token> QUERY the landing page carries."""
-    path, sep, query = full_path.partition("?")
-    path = _redact_log_path(path)
-    if not sep:
-        return path
-    query = _INVITE_QUERY_RE.sub(r"\1<redacted>", "?" + query)[1:]
-    return path + "?" + query
-
-
-class _AccessLogRedactFilter(logging.Filter):
-    """Scrub the invite/share tokens out of uvicorn's access log. Those single-use tokens travel in the
-    URL (a path segment on the invite endpoints, the ?invite= query on the landing page), so uvicorn's
-    default access log would otherwise write the raw token on every request — the leak the app's other
-    bearer tokens avoid by being header-only. Rewrites the request-target arg in place; never raises,
-    never drops a line."""
-    def filter(self, record):  # noqa: A003
-        try:
-            args = record.args
-            if (isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str)
-                    and ("/invites/" in args[2] or "/shares/" in args[2] or "invite=" in args[2])):
-                lst = list(args)
-                lst[2] = _redact_access_path(args[2])
-                record.args = tuple(lst)
-        except Exception:  # noqa: BLE001 — logging must never raise
-            pass
-        return True
+def _public_base_url(request) -> str:
+    """Absolute base URL for the tokened links we email (reset/invite). Delegates to
+    ``email_actions.public_base_url`` (offline-testable): prefer the configured public host so a spoofed
+    ``Host`` header can't poison an emailed token, else fall back to the request host."""
+    from app.core.email_actions import public_base_url
+    return public_base_url(request)
 
 
 def _install_access_log_redaction() -> None:
@@ -1108,13 +1080,23 @@ class TempCredentialResponse(BaseModel):
 
 
 class VaultCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=255)
+    # Optional so a zero-knowledge client can send only its non-secret LABEL (or nothing) here while
+    # the real name travels sealed in enc_name. A standard vault still requires a real name -- the
+    # handler enforces that. Blank/whitespace is normalized to None below.
+    name: Optional[str] = Field(None, max_length=255)
     # Optionally the id to create this vault under. A zero-knowledge client needs the id
     # before it locks the vault key -- the newer lock format stamps the key with its vault,
     # and the key travels in this same request, so waiting for the server to assign one is
     # too late. Absent, the server assigns it as before.
     id: Optional[uuid.UUID] = None
     description: Optional[str] = None
+    # Zero-knowledge: the vault name/description sealed IN THE BROWSER (zk2: markers). The server
+    # stores them and cannot read them; `name` then carries only the non-secret label.
+    enc_name: Optional[str] = None
+    enc_description: Optional[str] = None
+    # Zero-knowledge: the DEK epoch the browser sealed enc_name/enc_description under (mirrors a ZK
+    # folder's name_key_version). Absent => epoch 1. Only meaningful with enc_name.
+    name_key_version: Optional[int] = None
     password: Optional[str] = None
     expire_files_after_days: Optional[int] = Field(None, gt=0)
     # Per-vault maximum size in GB (absent => 1 GB, the model column default). Bounded at create
@@ -1188,8 +1170,16 @@ class FileRename(BaseModel):
 
 class VaultResponse(BaseModel):
     id: uuid.UUID
-    name: str
+    # Optional: a zero-knowledge vault may carry only a non-secret label here (or nothing), with the
+    # real name sealed in enc_name. A standard vault's decrypted name is always present.
+    name: Optional[str] = None
     description: Optional[str]
+    # Zero-knowledge: browser-sealed name/description for the client to decrypt (None for standard).
+    enc_name: Optional[str] = None
+    enc_description: Optional[str] = None
+    # Zero-knowledge: the DEK epoch enc_name/enc_description were sealed under, so the client reads
+    # them at the right epoch (None/absent => epoch 1). None for standard vaults.
+    name_key_version: Optional[int] = None
     owner_id: uuid.UUID
     owner_username: Optional[str] = None
     has_password: bool
@@ -1346,15 +1336,19 @@ async def get_current_user(
 
     # Durable revocation for REGULAR-user tokens: a logged-out / locked / deactivated session
     # is marked `revoked` in the DB (see logout + _revoke_sessions). Unlike the best-effort
-    # Redis denylist above, this survives a Redis outage. We reject only an explicitly-revoked
-    # session — a new login does NOT set `revoked`, so concurrent sessions keep working (no
-    # single-session side effect). Temp sessions get a stricter is_active check below.
+    # Redis denylist above, this survives a Redis outage. Fail CLOSED: reject a session whose
+    # row is MISSING as well as one marked `revoked`. Every regular login inserts its session
+    # row (auth_service._create_session commits it before the token is minted), so a legitimate
+    # token always finds its row; a MISSING row means a forged/replayed session_token or a token
+    # for a since-deleted user (the row was cascade-removed) — both must be denied, not admitted.
+    # A new login does NOT set `revoked`, so concurrent sessions keep working (no single-session
+    # side effect). Temp sessions get a stricter is_active check below.
     if session_token and not is_temporary:
         from app.core.models import ActiveSession
         revoked_session = db.query(ActiveSession.revoked).filter(
-            ActiveSession.session_token == session_token
+            ActiveSession.session_token == hash_session_token(session_token)
         ).first()
-        if revoked_session is not None and revoked_session[0]:
+        if revoked_session is None or revoked_session[0]:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Session has been terminated. Please login again.",
@@ -1367,7 +1361,7 @@ async def get_current_user(
         from datetime import timedelta
 
         session = db.query(ActiveSession).filter(
-            ActiveSession.session_token == session_token,
+            ActiveSession.session_token == hash_session_token(session_token),
             ActiveSession.is_active == True
         ).first()
 
@@ -2571,12 +2565,59 @@ def _smtp_configured(db: Session) -> bool:
     return email_send.smtp_configured(db)
 
 
+def _fire_action_email_bulk(db: Session, key: str, recipients, action_context=None) -> None:
+    """Best-effort trigger for an OPTIONAL automated email to one or more recipients.
+
+    Uses the request ``db`` ONLY for a fast enabled-check, so a disabled action (the default) costs a
+    single indexed lookup on the hot path and spawns nothing. When the action is on and bound, the
+    render + SMTP fan-out runs on a daemon thread in its OWN session, so mail latency never delays the
+    triggering request (a sign-in, a share, a member add …) and a mail failure can't touch its
+    transaction. ``recipients`` is an iterable of ``(email, username)``. Never raises."""
+    try:
+        from app.core.models import EmailAction
+        a = db.get(EmailAction, key)
+        # An optional action only sends when explicitly enabled AND bound to a template.
+        if not (a is not None and a.enabled and a.template_id is not None):
+            return
+        pairs = [((e or "").strip(), u) for (e, u) in recipients if (e or "").strip()]
+        if not pairs:
+            return
+        ctx = dict(action_context or {})
+
+        def _run(k, pp, c):
+            try:
+                from app.core.database import get_db_context
+                from app.core.email_actions import send_action_email
+                with get_db_context() as s:
+                    for em, un in pp:
+                        send_action_email(s, k, recipient={"email": em, "username": un}, action_context=c)
+            except Exception:  # noqa: BLE001 — a courtesy notification must never surface anywhere
+                pass
+
+        threading.Thread(target=_run, args=(key, pairs, ctx), daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _fire_action_email(db: Session, key: str, *, email, username=None, action_context=None) -> None:
+    """Single-recipient convenience wrapper over :func:`_fire_action_email_bulk`."""
+    _fire_action_email_bulk(db, key, [(email, username)], action_context)
+
+
 def _email_change_requires_verification(db: Session) -> bool:
     """Effective org policy: does a self-service email change require an emailed one-time code?"""
     from app.core.models import SystemSetting
     from app.core.account_policy import effective_account_policy
     row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
     return bool(effective_account_policy(row.value if row else None)["email_change_requires_verification"])
+
+
+def _email_change_otp_ttl_minutes(db: Session) -> int:
+    """Configured lifetime (minutes) of the email-change verification code; effective policy default 5."""
+    from app.core.models import SystemSetting
+    from app.core.account_policy import effective_account_policy
+    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    return int(effective_account_policy(row.value if row else None)["email_change_otp_ttl_minutes"])
 
 
 def _login_identifier(db: Session) -> str:
@@ -2682,6 +2723,13 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
         note_link_policy.validate_settings(payload)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    # Max note size (chars).
+    if "note_max_chars" in payload:
+        v = payload["note_max_chars"]
+        if isinstance(v, bool) or not isinstance(v, int) or not (_NOTE_BODY_MAX_FLOOR <= v <= _NOTE_BODY_MAX_CEILING):
+            raise HTTPException(status_code=400,
+                                detail=f"note_max_chars must be an integer {_NOTE_BODY_MAX_FLOOR}..{_NOTE_BODY_MAX_CEILING}")
 
     # Where a decrypted download is written. Refused here rather than tolerated, because the read
     # path deliberately falls back on anything it cannot parse -- so a typo would silently mean
@@ -2837,6 +2885,20 @@ async def get_settings(
                                          if (settings.max_storage_gb or 0) > 0 else None)
     data["deployment_storage_limit_bytes"] = deployment_storage_limit_bytes(db)
     data["deployment_storage_used_bytes"] = deployment_storage_used(db)
+    # The EFFECTIVE per-file SFTP upload limit (MB). A buffered SFTP upload cannot exceed the RAM
+    # staging tmpfs, so over SFTP the limit is min(the file-size limit, SFTP_STAGING_TMPFS_MB) — which
+    # can be BELOW the web limit. Surface it so the admin sees why SFTP may refuse a file the web UI
+    # accepts. None => no SFTP-specific cap (the tmpfs is unbounded / not mounted; sftp_staging_tmpfs_mb
+    # is 0), matching _staging_capped_max's "0 disables the clamp".
+    from app.core import upload_policy as _uploadp
+    _eff_file_bytes = _uploadp.effective_max_file_bytes(
+        (settings.max_file_size_mb or 0) * 1024 * 1024, data.get("max_file_size"))
+    _tmpfs_mb = settings.sftp_staging_tmpfs_mb or 0
+    if _tmpfs_mb > 0:
+        _eff_file_mb = _eff_file_bytes // (1024 * 1024) if _eff_file_bytes > 0 else _tmpfs_mb
+        data["sftp_effective_max_file_mb"] = min(_eff_file_mb, _tmpfs_mb)
+    else:
+        data["sftp_effective_max_file_mb"] = None
     # Overlay the EFFECTIVE Temporary Vault Passcode policy (incl. the ZK-in-scope toggle) so the
     # Settings card renders correct defaults even when never saved (feature default OFF, allow-ZK ON).
     data.update(_temp_passcode_policy(db))
@@ -2850,6 +2912,7 @@ async def get_settings(
     _blob = _global_settings_blob(db)
     data["public_note_links_enabled"] = note_link_policy.public_note_links_enabled(_blob)
     data["public_note_link_user_cap"] = note_link_policy.public_note_link_user_cap(_blob)
+    data["note_max_chars"] = _note_max_chars(db)
     # Effective account-onboarding policy (email requirement, invitation + signup switches, domain
     # gate, login identifier) with defaults filled in, so the Accounts & Access tab renders the real
     # posture and a whole-object save can't persist an unchecked default.
@@ -3454,12 +3517,30 @@ async def create_invite(
     except Exception:
         pass
 
-    base = str(request.base_url).rstrip("/") if request is not None else ""
+    base = _public_base_url(request) if request is not None else ""
+    invite_url = f"{base}/?invite={plaintext}"
+
+    # Send the invitation email carrying the freshly-minted link (the {{action.link}} token). This is
+    # the SYSTEM "account_invite" action (always on), so it sends whenever the invite carries an email
+    # and SMTP is configured. The link is ALSO returned below for the admin to copy, so a mail failure
+    # (or an invite with no email) never blocks the invite — email_sent just tells the UI which to show.
+    email_sent = False
+    if email:
+        try:
+            from app.core.email_actions import send_action_email
+            _ttl_h = int(pol.get("invite_ttl_hours") or 24)
+            email_sent = bool(send_action_email(
+                db, "account_invite", recipient={"email": email, "username": username},
+                action_context={"link": invite_url, "expires": f"in {_ttl_h} hours"}))
+        except Exception:  # noqa: BLE001 — the link is still returned; never fail the mint on mail trouble
+            email_sent = False
+
     return {
         "id": str(inv.id), "username": username, "email": email, "role": role,
         "status": "pending", "expires_at": inv.expires_at.isoformat(), "token_prefix": prefix,
         "token": plaintext,                       # shown ONCE — never stored, never re-returned
-        "invite_url": f"{base}/?invite={plaintext}",
+        "invite_url": invite_url,
+        "email_sent": email_sent,
     }
 
 
@@ -3748,6 +3829,9 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
     except Exception:
         pass
 
+    # Optionally welcome the freshly-created account by email (opt-in). Best-effort.
+    _fire_action_email(db, "account_welcome", email=user.email, username=user.username)
+
     # Deliberately NOT auto-logged-in and NO token returned: an invitation link sitting in a mail
     # client's history must not become a live session.
     return {"ok": True, "username": inv.username}
@@ -3764,6 +3848,7 @@ async def auth_policy(db: Session = Depends(get_db)):
     pol = _account_policy(db)
     return {
         "signup_enabled": bool(pol.get("signup_enabled")),
+        "password_reset_enabled": bool(pol.get("password_reset_enabled")),
         "login_identifier": pol.get("login_identifier"),
         "email_requirement": pol.get("email_requirement"),
         "password_policy": _password_policy_view(db),
@@ -3799,6 +3884,260 @@ def _audit_signup_failure(db: Session, username: str, ip: str, reason: str) -> N
             details={"username": (username or "")[:64], "reason": reason})
     except Exception:
         pass
+
+
+# ============ Password reset (self-service, gated OFF by default, + admin-triggered) ============
+class ForgotPasswordRequest(BaseModel):
+    identifier: str          # a username or an email address
+
+
+class ResetPasswordRequest(BaseModel):
+    # min_length mirrors the sibling password models (the server also enforces HARD_FLOOR=8); max_length
+    # bounds the input so a pathologically large body can't be hashed.
+    new_password: str = Field(..., min_length=8, max_length=1024)
+
+
+def _password_reset_policy(db: Session):
+    """(enabled, ttl_minutes) — self-service switch + link lifetime, from effective account policy."""
+    pol = _account_policy(db)
+    return bool(pol.get("password_reset_enabled")), int(pol.get("password_reset_ttl_minutes") or 5)
+
+
+def _reset_pepper() -> str:
+    from app.core.password_reset import reset_pepper
+    return reset_pepper(settings.jwt_secret_key)
+
+
+def _resolve_reset_user(db: Session, identifier: str):
+    """Resolve a username OR email to an ACTIVE user, or None. Case-insensitive."""
+    ident = (identifier or "").strip()
+    if not ident:
+        return None
+    from sqlalchemy import func as _f
+    from app.core.email_identity import find_user_by_email
+    u = db.query(User).filter(User.is_active.is_(True),
+                              _f.lower(User.username) == ident.lower()).first()
+    if u is None and "@" in ident:
+        # Reuse the canonical email resolver (SQL-folds both sides, exactly like the unique index), then
+        # honour the active-only rule.
+        cand = find_user_by_email(db, ident)
+        if cand is not None and getattr(cand, "is_active", True):
+            u = cand
+    return u
+
+
+def _mint_and_send_reset(db: Session, user, base_url: str, *, created_by_id) -> bool:
+    """Mint a single-use reset token (invalidating any prior unconsumed one), email it through the
+    password_reset action with the freshly-minted {{action.link}}, and return whether it was sent.
+    Never raises — the caller (public or admin) must not fail on mail trouble."""
+    from app.core.password_reset import mint_reset_token, hash_reset_token, pepper_ok
+    from app.core.models import PasswordResetToken
+    from app.core.email_actions import send_action_email
+    pepper = _reset_pepper()
+    email = (getattr(user, "email", "") or "").strip()
+    if not pepper_ok(pepper) or not email:
+        return False
+    _, ttl = _password_reset_policy(db)
+    try:
+        db.query(PasswordResetToken).filter(
+            PasswordResetToken.user_id == user.id,
+            PasswordResetToken.consumed_at.is_(None)).delete(synchronize_session=False)
+        plaintext, prefix = mint_reset_token()
+        db.add(PasswordResetToken(
+            user_id=user.id, token_prefix=prefix, token_hash=hash_reset_token(plaintext, pepper),
+            expires_at=datetime.utcnow() + timedelta(minutes=ttl), created_by=created_by_id))
+        db.commit()
+    except Exception:
+        db.rollback()
+        return False
+    link = f"{(base_url or '').rstrip('/')}/?reset={plaintext}"
+    try:
+        return bool(send_action_email(db, "password_reset",
+                                      recipient={"email": email, "username": user.username},
+                                      action_context={"link": link, "expires": f"in {ttl} minutes"}))
+    except Exception:
+        return False
+
+
+def _mint_and_send_reset_async(user_id, base_url: str) -> None:
+    """Fire-and-forget the self-service reset mint+send on a daemon thread in its OWN session, so a
+    resolved identifier doesn't respond measurably slower than an unknown one (a timing enumeration
+    oracle). The 202 has already been returned by the time this runs."""
+    def _run():
+        try:
+            from app.core.database import get_db_context
+            with get_db_context() as s:
+                u = s.query(User).filter(User.id == user_id).first()
+                if u is not None:
+                    _mint_and_send_reset(s, u, base_url, created_by_id=None)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        threading.Thread(target=_run, daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _resolve_valid_reset_token(db: Session, token: str):
+    """The valid, unconsumed, unexpired PasswordResetToken for a presented token, or None. Fails closed
+    and never enumerates: lifecycle is checked in Python AFTER a constant-time hash match, so an
+    expired/consumed token is indistinguishable from one that never existed."""
+    from app.core.password_reset import token_prefix, reset_tokens_match, pepper_ok
+    from app.core.models import PasswordResetToken
+    try:
+        pepper = _reset_pepper()
+        if not pepper_ok(pepper):
+            return None
+        now = datetime.utcnow()
+        for r in db.query(PasswordResetToken).filter(
+                PasswordResetToken.token_prefix == token_prefix(token)).all():
+            if reset_tokens_match(token, pepper, r.token_hash):
+                return r if (r.consumed_at is None and r.expires_at > now) else None
+    except Exception:
+        return None
+    return None
+
+
+@app.post("/auth/forgot-password")
+async def forgot_password(body: ForgotPasswordRequest, request: Request, db: Session = Depends(get_db)):
+    """Public self-service password-reset request. ALWAYS returns 202 (enumeration-safe). A link is
+    minted+sent only when self-service is enabled AND the identifier resolves to an active account with
+    an email AND SMTP is configured. Rate-limited fail-closed per client IP."""
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    ip = get_client_ip(request)
+    try:
+        allowed, _, reset = _rl.check_rate_limit(
+            identifier=ip, limit=settings.rate_limit_api_auth, window=settings.rate_limit_api_auth_window,
+            prefix="forgot_password_ip", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable. Please try again shortly.")
+    if not allowed:
+        import time as _t
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many requests; please wait a few minutes.",
+                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    enabled, _ttl = _password_reset_policy(db)
+    if enabled and _smtp_configured(db):
+        user = _resolve_reset_user(db, body.identifier)
+        if user is not None:
+            # Background the mint+send so a resolved identifier can't be told apart from an unknown one
+            # by response timing (both do only the resolution query on the request path). The link base
+            # prefers the configured public host so a spoofed Host header can't poison the emailed token.
+            _mint_and_send_reset_async(user.id, _public_base_url(request))
+    try:
+        AuditLogger(db).log_action(action="password_reset_requested", status="success", user=None,
+                                   ip_address=ip, details={})
+    except Exception:  # noqa: BLE001
+        pass
+    return JSONResponse(status_code=202, content={
+        "message": "If an account matches and self-service reset is enabled, a reset link has been sent."})
+
+
+@app.post("/users/{user_id}/send-reset-link")
+@require_endpoint_permission("USER_MANAGE")
+async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
+                                current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Admin action: email a password-reset link to a user. Always available (independent of the public
+    self-service switch), interactive-admin only."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage users.")
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not (user.email or "").strip():
+        raise HTTPException(status_code=400, detail="That user has no email address to send a reset link to.")
+    if not _smtp_configured(db):
+        raise HTTPException(status_code=400,
+                            detail="Email is not configured. Add a sending profile in Settings -> Email first.")
+    sent = _mint_and_send_reset(db, user, _public_base_url(request), created_by_id=current_user.id)
+    try:
+        AuditLogger(db).log_action(action="password_reset_link_sent", status="success", user=current_user,
+                                   ip_address=get_client_ip(request),
+                                   details={"target_user_id": str(user_id), "email_sent": bool(sent)})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"email_sent": bool(sent)}
+
+
+@app.get("/reset/{token}")
+async def get_reset(token: str, request: Request, db: Session = Depends(get_db)):
+    """Public: validate a reset token and return the minimal info the reset form needs. Generic 404 for
+    any unusable token (no enumeration). Rate-limited fail-closed per IP."""
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    ip = get_client_ip(request)
+    try:
+        allowed, _, _ = _rl.check_rate_limit(
+            identifier=ip, limit=settings.rate_limit_api_auth, window=settings.rate_limit_api_auth_window,
+            prefix="reset_lookup_ip", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+    if not allowed:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many requests; please wait.")
+    r = _resolve_valid_reset_token(db, token)
+    if r is None:
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    user = db.query(User).filter(User.id == r.user_id).first()
+    return {"username": (user.username if user else None)}
+
+
+@app.post("/reset/{token}")
+async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db: Session = Depends(get_db)):
+    """Public: set a new password using a valid reset token. Single-use (atomic claim); revokes the
+    user's sessions so a stolen session can't outlive the reset. Rate-limited fail-closed per IP AND
+    per token-prefix."""
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    from app.core.password_reset import token_prefix
+    from app.core.security import hash_password
+    from app.core.models import PasswordResetToken
+    ip = get_client_ip(request)
+    prefix = token_prefix(token)
+    # Two fail-closed limits: a generous per-IP cap (many users can share one address) and a tight
+    # per-token-prefix cap that bounds repeated attempts against ONE known prefix (e.g. a leaked one).
+    # Whole-space brute force is already infeasible against the 256-bit token and bounded by the per-IP cap.
+    try:
+        for ident, pfx, lim, win in (
+                (ip, "reset_do_ip", settings.rate_limit_api_auth, settings.rate_limit_api_auth_window),
+                (prefix or "none", "reset_do_prefix", 5, 60)):
+            allowed, _, reset = _rl.check_rate_limit(identifier=ident, limit=lim, window=win, prefix=pfx, fail_open=False)
+            if not allowed:
+                import time as _t
+                raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                                    detail="Too many attempts; please wait.",
+                                    headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+    r = _resolve_valid_reset_token(db, token)
+    if r is None:
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    _validate_password_policy(db, body.new_password)     # 400 on a weak password BEFORE the token is burned
+    user = db.query(User).filter(User.id == r.user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    # Atomic single-use claim: only the request that flips consumed_at proceeds.
+    claimed = db.query(PasswordResetToken).filter(
+        PasswordResetToken.id == r.id, PasswordResetToken.consumed_at.is_(None)).update(
+        {"consumed_at": datetime.utcnow()}, synchronize_session=False)
+    if not claimed:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    user.password_hash = hash_password(body.new_password)
+    db.commit()
+    try:
+        # _revoke_sessions mutates session rows but does NOT commit — commit it ourselves so the durable
+        # DB-level revocation persists (a hijacked session must not outlive the reset).
+        _revoke_sessions(db, user_id=user.id, actor_username="password-reset")   # force re-login everywhere
+        db.commit()
+    except Exception:  # noqa: BLE001
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    try:
+        AuditLogger(db).log_action(action="password_reset_completed", status="success", user=user,
+                                   ip_address=ip, details={})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True}
 
 
 @app.post("/auth/signup")
@@ -3927,6 +4266,9 @@ async def self_signup(payload: SignupRequest, request: Request, db: Session = De
             resource_type="user", resource_id=str(user.id), details={"username": uname})
     except Exception:
         pass
+
+    # Optionally welcome the freshly-created account by email (opt-in). Best-effort.
+    _fire_action_email(db, "account_welcome", email=user.email, username=user.username)
 
     # Not auto-logged-in and no token returned — success returns the visitor to the sign-in form.
     return {"ok": True, "username": uname}
@@ -4236,14 +4578,15 @@ async def get_sftp_host_key(current_user: User = Depends(get_current_user)):
     user may read it. Returns available=false until the SFTP server has created the key."""
     import hashlib
     import base64
-    import paramiko
+    from app.sftp.host_key import load_host_key
     key_path = settings.sftp_host_key_path
     try:
         if not os.path.exists(key_path):
             return {"available": False}
-        host_key = paramiko.RSAKey.from_private_key_file(key_path)
+        # Ed25519 on new installs, RSA on ones that predate it -- report whichever this is.
+        host_key = load_host_key(key_path)
         fp = "SHA256:" + base64.b64encode(hashlib.sha256(host_key.asbytes()).digest()).decode().rstrip("=")
-        return {"available": True, "algorithm": "ssh-rsa", "fingerprint_sha256": fp}
+        return {"available": True, "algorithm": host_key.get_name(), "fingerprint_sha256": fp}
     except Exception as e:  # noqa: BLE001 — best-effort; never 500 on a missing/odd key file
         print(f"⚠️ host-key fingerprint read failed: {e}")
         return {"available": False}
@@ -4332,6 +4675,10 @@ async def login(
                 body=f"{login_request.username} signed in" + (f" from {client_ip}" if client_ip else ""),
                 target="#temp-creds",
             )
+        else:
+            # A real account sign-in optionally emails the owner a "New sign-in alert" (opt-in; the
+            # default template uses {{current_datetime}}, so no action_context is required). Best-effort.
+            _fire_action_email(db, "login_alert", email=user.email, username=user.username)
 
         from app.core.temp_scope import is_scoped as _is_scoped
         return LoginResponse(
@@ -4586,6 +4933,12 @@ async def create_temp_credentials(
             same_for_all=bool(payload.passcode_same_for_all) if payload else False,
         )
 
+    # Optionally email the account owner that a temporary credential was issued for their access
+    # (opt-in). NEVER include the credential plaintext — only that one exists + when it expires.
+    _lifetime = temp_creds.get('total_lifetime_minutes')
+    _fire_action_email(db, "temp_credential_issued", email=current_user.email, username=current_user.username,
+                       action_context={"expires": f"in {_lifetime} minutes"} if _lifetime else {})
+
     return TempCredentialResponse(**temp_creds)
 
 
@@ -4668,8 +5021,9 @@ async def list_temp_credentials(
             'active_session_count': len(sessions_data),
             'note': cred.note,
             'can_create_temp_credentials': bool(getattr(cred, 'can_create_temp_credentials', False)),
-            # Password available via dedicated endpoint for better security and caching
-            'has_password': cred.encrypted_password is not None
+            # A temp password is show-once at creation and never stored for re-reveal, so there is
+            # never a retrievable password to fetch (the reveal endpoint always 404s).
+            'has_password': False
         }
         
         # Note: Passwords are NOT decrypted in list endpoint for:
@@ -5046,7 +5400,7 @@ def _ws_session_invalid(session_token: str, user_id: str, is_temporary: bool) ->
         db = SessionLocal()
         try:
             row = db.query(_AS.revoked, _AS.is_active).filter(
-                _AS.session_token == session_token).first()
+                _AS.session_token == hash_session_token(session_token)).first()
             if row is None:
                 return True  # session row gone -> treat as terminated
             revoked, is_active = row
@@ -5144,7 +5498,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                     raise ValueError("Session terminated")
                 if not is_temporary:
                     _rev = _wsdb.query(_WsAS.revoked).filter(
-                        _WsAS.session_token == session_token
+                        _WsAS.session_token == hash_session_token(session_token)
                     ).first()
                     if _rev is not None and _rev[0]:
                         raise ValueError("Session terminated")
@@ -5160,7 +5514,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                     from app.core.models import TemporaryCredential as _WsTC
                     from datetime import timedelta as _wstd
                     _sess = _wsdb.query(_WsAS.last_activity, _WsAS.temp_credential_id).filter(
-                        _WsAS.session_token == session_token,
+                        _WsAS.session_token == hash_session_token(session_token),
                         _WsAS.is_active == True,  # noqa: E712
                     ).first()
                     if _sess is None:
@@ -5396,7 +5750,10 @@ async def create_user(
         grant_default_permissions_for_role(str(new_user.id), new_user.role, db)
         
         audit_logger.log_user_created(new_user, current_user, client_ip)
-        
+
+        # Optionally send the new account a welcome email (opt-in). Best-effort.
+        _fire_action_email(db, "account_welcome", email=new_user.email, username=new_user.username)
+
         return UserResponse.model_validate(new_user)
     
     except ValueError as e:
@@ -5539,9 +5896,8 @@ async def request_email_change(
     one-time code to the NEW address. The account email is not touched until the code is confirmed.
     Enumeration-safe: an address already in use (or unchanged) gets the same 202 and no usable code."""
     from app.core.security import verify_password
-    from app.core.email_change import generate_code, hash_code, CODE_TTL_MINUTES
+    from app.core import otp_service
     from app.core.rate_limiter import rate_limiter as _rl
-    from app.core.models import EmailChangeCode
 
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot change account settings.")
@@ -5568,17 +5924,12 @@ async def request_email_change(
     # Mint + send only for a genuinely new, unused address; otherwise return the same 202 with no
     # usable code, so this endpoint can't be used to probe which addresses are registered.
     if new_email and new_email != user.email and not email_in_use(db, new_email, exclude_user_id=user.id):
-        # One pending change at a time: drop any prior unconsumed codes for this user.
-        db.query(EmailChangeCode).filter(
-            EmailChangeCode.user_id == user.id,
-            EmailChangeCode.consumed_at.is_(None),
-        ).delete()
-        code = generate_code()
-        db.add(EmailChangeCode(
-            user_id=user.id, new_email=new_email,
-            code_hash=hash_code(code, settings.jwt_secret_key),
-            expires_at=datetime.utcnow() + timedelta(minutes=CODE_TTL_MINUTES)))
-        db.commit()
+        # Mint a one-time code bound to (email_change, this user, the new address). Redis-primary with a
+        # durable DB fallback; issuing invalidates any prior code (one pending change at a time). TTL is
+        # org-configurable (default 5 minutes).
+        ttl = _email_change_otp_ttl_minutes(db)
+        code = otp_service.issue(db, purpose="email_change", user_id=user.id, destination=new_email,
+                                 ttl_minutes=ttl, pepper=settings.jwt_secret_key)
         # Route through the central action helper so this uses the admin-customizable "email_change"
         # template (its {{action.code}} / {{action.expires}} tokens). raise_errors preserves the prior
         # behavior: a clean 400/502 on a config/transport failure rather than a silent miss.
@@ -5588,7 +5939,7 @@ async def request_email_change(
             send_action_email(
                 db, "email_change",
                 recipient={"email": new_email, "username": user.username},
-                action_context={"code": code, "expires": f"in {CODE_TTL_MINUTES} minutes"},
+                action_context={"code": code, "expires": f"in {ttl} minutes"},
                 raise_errors=True)
         except _es.EmailSendError as e:
             code_status = (status.HTTP_400_BAD_REQUEST if e.category == "config"
@@ -5612,16 +5963,16 @@ async def confirm_email_change(
 ):
     """Complete a verified email change by presenting the code sent to the new address. On success
     the account's email becomes the new address and the code is consumed (single-use)."""
-    from app.core.email_change import code_matches
+    from app.core import otp_service
     from app.core.rate_limiter import rate_limiter as _rl
-    from app.core.models import EmailChangeCode
 
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot change account settings.")
     user = db.query(User).filter(User.id == current_user.id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
-    # Cap confirm attempts — a brute-force guard on the code space.
+    # Cap confirm attempts — an OUTER brute-force guard on the code space (the OTP service also
+    # invalidates the code after 3 wrong tries).
     allowed, _, reset = _rl.check_rate_limit(identifier=str(user.id), limit=10, window=300,
                                              prefix="email_change_confirm")
     if not allowed:
@@ -5629,26 +5980,22 @@ async def confirm_email_change(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="Too many attempts; please wait a few minutes.",
                             headers={"Retry-After": str(max(1, reset - int(_t.time())))})
-    now = datetime.utcnow()
-    rec = db.query(EmailChangeCode).filter(
-        EmailChangeCode.user_id == user.id,
-        EmailChangeCode.consumed_at.is_(None),
-        EmailChangeCode.expires_at > now,
-    ).order_by(EmailChangeCode.created_at.desc()).first()
-    if rec is None or not code_matches(body.code, settings.jwt_secret_key, rec.code_hash):
+    result = otp_service.verify(db, purpose="email_change", user_id=user.id, code=body.code,
+                                pepper=settings.jwt_secret_key)
+    if not result.ok or not result.destination:
         raise HTTPException(status_code=400, detail="That code is invalid or has expired.")
+    new_email = result.destination
     # Re-check uniqueness at apply time — the address may have been taken since the request.
-    if email_in_use(db, rec.new_email, exclude_user_id=user.id):
+    if email_in_use(db, new_email, exclude_user_id=user.id):
         raise HTTPException(status_code=400, detail="That email address is now in use.")
     old_email = user.email
-    user.email = rec.new_email
-    rec.consumed_at = now
+    user.email = new_email
     db.commit()
     db.refresh(user)
     try:
         AuditLogger(db).log_action(action="email_change_confirmed", status="success", user=user,
                                    ip_address=get_client_ip(request),
-                                   details={"old": old_email, "new": rec.new_email})
+                                   details={"old": old_email, "new": new_email})
     except Exception:  # noqa: BLE001
         pass
     return UserResponse.model_validate(user)
@@ -6892,8 +7239,16 @@ async def deactivate_note_link_tag(
 # redemption is PUBLIC, rate-limited, optionally secret-gated with a per-link lockout, and audited.
 
 _NOTELINK_TOKEN_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"  # base62
-_NOTELINK_REDEEM_LIMIT = 10          # redemption requests / minute / IP (and / token)
+_NOTELINK_REDEEM_LIMIT = 10          # redemption requests / minute per (IP, link) — the guess-the-secret bound
 _NOTELINK_REDEEM_WINDOW = 60
+# Per-IP redemption budget (across ALL links), for the token-ENUMERATION case. A note link is a
+# broadcast artifact — one team behind one NAT opens many DIFFERENT valid links at once — so this must
+# be generous, UNLIKE the one-per-user /invites and /reset flows (which can borrow the tight auth
+# budget). It is deliberately NOT rate_limit_api_auth: that default (10/min) refuses the 11th
+# legitimate opener from one office. At 600/min the weakest allowed token (6 base62 chars, ~35.7 bits)
+# still takes ~2000 years to enumerate, while no real office ever trips it.
+_NOTELINK_REDEEM_IP_LIMIT = 600
+_NOTELINK_REDEEM_IP_WINDOW = 60
 _NOTELINK_FAIL_MAX = 5               # wrong-secret attempts before a lockout
 _NOTELINK_FAIL_WINDOW = 900          # 15-minute lockout window
 _NOTELINK_TOKEN_MAX_INPUT = 128      # reject absurd tokens before they touch redis/db
@@ -6917,12 +7272,15 @@ def _notelink_status(link, now=None) -> str:
 
 
 def _notelink_public_dict(link, tag=None) -> dict:
-    """Owner-facing view of a link — NEVER the body snapshot (only the title, for the list tile)."""
+    """Owner-facing view of a link. Includes the frozen title + body SNAPSHOT so the owner can recall
+    what a link contains from the Shared tab (it is their OWN note's content). The admin-oversight
+    variant (_notelink_admin_dict) strips body + token — an admin must not read others' content."""
     return {
         "id": str(link.id),
         "token": link.token,
         "url_path": f"/l/{link.token}",
         "title": link.title_snapshot or "",
+        "body": link.body_snapshot or "",
         "tag_id": str(link.tag_id) if link.tag_id else None,
         "tag_name": getattr(tag, "name", None),
         "tag_border_color": getattr(tag, "border_color", None),
@@ -7105,6 +7463,47 @@ async def list_note_links(
     return {"links": [_notelink_public_dict(l, tags.get(l.tag_id)) for l in links]}
 
 
+@app.get("/note-link-policy")
+async def get_note_link_policy(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Effective PUBLIC-note-link policy for the CURRENT user — non-admin readable (like /share-policy),
+    so the Share modal's Public tile can shape its controls without the admin-only /note-link-tags.
+    Returns whether public links are enabled, the per-user active-link cap, and ONLY the tags this user
+    may create links with — each carrying its FLOOR fields + tile colour/icon so the UI can render the
+    floor and permit tightening. The create-allowlist internals are NEVER exposed.
+
+    FAIL-CLOSED: feature off -> no tags; a temp-credential session can't create links -> no tags; a
+    user not permitted by a tag's create-allowlist never sees that tag."""
+    blob = _global_settings_blob(db)
+    enabled = note_link_policy.public_note_links_enabled(blob)
+    cap = note_link_policy.public_note_link_user_cap(blob)
+    if not enabled or _notes_denied_for_temp(current_user):
+        return {"enabled": enabled, "user_cap": cap, "tags": []}
+    user_gids = [str(r[0]) for r in db.query(user_groups.c.group_id)
+                 .filter(user_groups.c.user_id == current_user.id).all()]
+    tags = []
+    for t in db.query(NoteLinkTag).filter(NoteLinkTag.is_active.is_(True)).order_by(NoteLinkTag.name).all():
+        allowlist = {"is_active": t.is_active, "blocked_user_ids": t.blocked_user_ids,
+                     "allowed_user_ids": t.allowed_user_ids,
+                     "allowed_department_ids": t.allowed_department_ids,
+                     "auto_enroll_new_users": t.auto_enroll_new_users}
+        if not sharing_policy.user_can_create_with_tag(allowlist, current_user.id, user_gids):
+            continue
+        tags.append({
+            "id": str(t.id), "name": t.name, "description": t.description,
+            "border_color": t.border_color, "icon": t.icon,
+            "min_token_len": t.min_token_len,
+            "default_ttl_hours": t.default_ttl_hours, "max_ttl_hours": t.max_ttl_hours,
+            "require_secret": t.require_secret, "min_pin_len": t.min_pin_len,
+            "password_min_len": t.password_min_len,
+            "password_require_alnum": bool(t.password_require_alnum),
+            "max_uses_cap": t.max_uses_cap,
+        })
+    return {"enabled": True, "user_cap": cap, "tags": tags}
+
+
 @app.post("/note-links/{link_id}/revoke")
 async def revoke_note_link(
     link_id: uuid.UUID,
@@ -7156,6 +7555,90 @@ async def delete_note_link(
     return {"ok": True}
 
 
+# --- Admin oversight of public note links (the review-flagged gap: admins had no way to see or stop
+# OTHER users' public links besides the feature kill-switch). ---------------------------------------
+def _notelink_admin_dict(link, tag, owner) -> dict:
+    d = _notelink_public_dict(link, tag)
+    # Admin oversight must not expose others' note CONTENT or a redeemable token: drop the body
+    # snapshot, the token, and the URL. Admins see owner/title/status metadata only; revoke uses the id.
+    d.pop("body", None)
+    d.pop("token", None)
+    d.pop("url_path", None)
+    d["owner_id"] = str(link.owner_id)
+    d["owner"] = (getattr(owner, "username", None) or getattr(owner, "email", None)) if owner else None
+    return d
+
+
+@app.get("/admin/note-links")
+async def admin_list_note_links(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """List ALL public note links across every user (interactive-admin), so an admin can audit and
+    revoke exposures. Newest first, capped; each row carries the owner + tag + status (NEVER the body
+    snapshot)."""
+    _CAP = 1000
+    links = db.query(NoteLink).order_by(NoteLink.created_at.desc()).limit(_CAP).all()
+    tag_ids = {l.tag_id for l in links if l.tag_id}
+    owner_ids = {l.owner_id for l in links}
+    tags = {t.id: t for t in db.query(NoteLinkTag).filter(NoteLinkTag.id.in_(tag_ids)).all()} if tag_ids else {}
+    owners = {u.id: u for u in db.query(User).filter(User.id.in_(owner_ids)).all()} if owner_ids else {}
+    active = sum(1 for l in links if _notelink_status(l) == "active")
+    return {"links": [_notelink_admin_dict(l, tags.get(l.tag_id), owners.get(l.owner_id)) for l in links],
+            "active_count": active, "total": len(links), "capped": len(links) >= _CAP}
+
+
+@app.post("/admin/note-links/{link_id}/revoke")
+async def admin_revoke_note_link(
+    link_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin-revoke ANY user's public link (immediate)."""
+    link = db.query(NoteLink).filter(NoteLink.id == link_id).first()
+    if not link:
+        raise HTTPException(status_code=404, detail="Link not found")
+    if not link.revoked:
+        link.revoked = True
+        db.commit()
+        try:
+            AuditLogger(db).log_action(
+                action="note_link_admin_revoke", status="success", user=current_user,
+                resource_type="note_link", resource_id=str(link.id),
+                details={"owner_id": str(link.owner_id)}, ip_address=get_client_ip(request))
+        except Exception:
+            pass
+    return {"ok": True, "id": str(link.id), "revoked": True}
+
+
+@app.post("/admin/note-links/revoke-all")
+async def admin_revoke_all_note_links(
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin bulk-revoke: revoke EVERY currently-active public link (a surgical stop that leaves the
+    feature enabled, unlike the settings kill-switch). Returns how many were revoked."""
+    from sqlalchemy import update as _sa_update, or_ as _or
+    now = datetime.utcnow()
+    stmt = (_sa_update(NoteLink)
+            .where(NoteLink.revoked.is_(False),
+                   _or(NoteLink.expires_at.is_(None), NoteLink.expires_at > now),
+                   _or(NoteLink.max_uses.is_(None), NoteLink.use_count < NoteLink.max_uses))
+            .values(revoked=True))
+    res = db.execute(stmt)
+    db.commit()
+    n = res.rowcount or 0
+    try:
+        AuditLogger(db).log_action(
+            action="note_link_admin_revoke_all", status="success", user=current_user,
+            resource_type="note_link", details={"revoked_count": n}, ip_address=get_client_ip(request))
+    except Exception:
+        pass
+    return {"ok": True, "revoked_count": n}
+
+
 @app.get("/l/{token}")
 async def note_link_page(token: str):
     """PUBLIC: serve the anonymous redemption page. It reads the token from the URL and POSTs to
@@ -7190,19 +7673,26 @@ async def redeem_note_link(
     if not token or len(token) > _NOTELINK_TOKEN_MAX_INPUT:
         raise HTTPException(status_code=404, detail="This link is not available.")
 
-    # (1) Redemption rate limit — 10 requests / minute per (IP, link), fail-closed (anonymous
-    # surface). Keying on IP+token means one IP may open many different links, but is throttled on
-    # any single one; the global middleware caps a single IP's overall rate, and the per-token
-    # lockout below stops distributed secret-guessing on one link.
+    # (1) Redemption rate limit, fail-closed (anonymous surface). TWO buckets, because one alone
+    # cannot see both attack shapes:
+    #   - per (IP, link): throttles hammering ONE link (the per-link secret lockout below is the
+    #     stronger guard there, but this bounds request volume on a single token).
+    #   - per IP alone: throttles guessing many DIFFERENT tokens from one IP (enumeration). The
+    #     per-pair bucket gives each new token a fresh allowance, so it is blind to enumeration; this
+    #     is the per-IP throttle GET /invites/{token} and /reset/{token} already apply.
     try:
         allowed, _, reset = _rl.check_rate_limit(
             identifier=f"{client_ip}:{token}", limit=_NOTELINK_REDEEM_LIMIT,
             window=_NOTELINK_REDEEM_WINDOW, prefix="notelink_redeem", fail_open=False)
+        allowed_ip, _, reset_ip = _rl.check_rate_limit(
+            identifier=client_ip, limit=_NOTELINK_REDEEM_IP_LIMIT,
+            window=_NOTELINK_REDEEM_IP_WINDOW, prefix="notelink_redeem_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
-    if not allowed:
+    if not allowed or not allowed_ip:
+        _reset = reset if not allowed else reset_ip
         raise HTTPException(status_code=429, detail="Too many requests.",
-                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+                            headers={"Retry-After": str(max(1, _reset - int(_t.time())))})
 
     def _audit(status, reason=None, link_id=None):
         try:
@@ -7574,14 +8064,27 @@ async def create_share(
             ]
         recipient_ids = [u for u in recipient_ids if str(u) != str(current_user.id)]  # not myself
         if recipient_ids:
-            item = out.get("target_name") or out.get("vault_name") or "an item"
+            # Do NOT copy the item/vault NAME into the notification body: those names are sealed at
+            # rest everywhere else (File.enc_name, the vault-name seal), and notifications.body is a
+            # plaintext column, so embedding them would re-expose sealed names to a DB/backup reader.
+            # The recipient opens the item via the deep link (its name decrypts in-memory on read).
             _notify_users(
                 recipient_ids, "share_received",
                 title=f"{current_user.username} shared a {tt} with you",
-                body=f'"{item}" in {out.get("vault_name") or "a vault"}',
+                body="Open 'Shared with me' to view it.",
                 target="#shared",
                 dedup_prefix=f"share:{share.id}",
             )
+            # Optionally ALSO email each recipient the "File / folder shared" notice (opt-in). Resolve
+            # addresses now (one query), then fan the SMTP out on a background thread. NEVER email the
+            # link_token (the bearer secret for anyone_internal shares) — link into "Shared with me".
+            from app.core.email_actions import vault_url as _email_vault_url
+            _base = (_email_vault_url() or str(request.base_url).rstrip("/"))
+            _share_ctx = {"link": (_base.rstrip("/") + "/#shared") if _base else "",
+                          "expires": (f"until {share.expires_at.strftime('%Y-%m-%d')} UTC" if share.expires_at else "")}
+            _share_pairs = [(u.email, u.username) for u in
+                            db.query(User).filter(User.id.in_([str(x) for x in recipient_ids])).all()]
+            _fire_action_email_bulk(db, "share_created", _share_pairs, _share_ctx)
     except Exception as e:
         print(f"⚠ share notification skipped: {e}")
     out["link_token"] = link_token  # SHOW ONCE — only the hash is stored; this is never returned again
@@ -8169,16 +8672,31 @@ def _notes_denied_for_temp(current_user) -> bool:
     return bool(getattr(current_user, "_is_temp_session", False))
 
 
-def _clean_note_fields(title, body):
+_NOTE_BODY_MAX_FLOOR = 100         # smallest an admin may set the note-size cap to
+_NOTE_BODY_MAX_CEILING = 1_000_000  # largest (guards memory / payload size)
+
+
+def _note_max_chars(db) -> int:
+    """The admin-configured maximum note-body length (chars). Defaults to _NOTE_BODY_MAX; clamped to
+    a sane range so a bad stored value can't disable or explode the limit."""
+    try:
+        raw = _global_settings_blob(db).get("note_max_chars", _NOTE_BODY_MAX)
+        v = int(raw)
+    except (TypeError, ValueError):
+        return _NOTE_BODY_MAX
+    return v if _NOTE_BODY_MAX_FLOOR <= v <= _NOTE_BODY_MAX_CEILING else _NOTE_BODY_MAX
+
+
+def _clean_note_fields(title, body, max_body=_NOTE_BODY_MAX):
     title = (title or "").strip()
     # Drop control chars (CR/LF etc.): the title also lands in a notification title on send.
     title = ''.join(c for c in title if ord(c) >= 32 and ord(c) != 127)
     if len(title) > _NOTE_TITLE_MAX:
         raise HTTPException(status_code=400, detail=f"Title is too long (max {_NOTE_TITLE_MAX} characters)")
     body = body or ""
-    if len(body) > _NOTE_BODY_MAX:
+    if len(body) > max_body:
         raise HTTPException(status_code=400,
-                            detail=f"Note is too long (max {_NOTE_BODY_MAX} characters)")
+                            detail=f"Note is too long (max {max_body} characters)")
     return title, body
 
 
@@ -8244,7 +8762,7 @@ async def create_note(
     from app.core.models import Note
     if _notes_denied_for_temp(current_user):
         raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
-    title, text = _clean_note_fields(body.title, body.body)
+    title, text = _clean_note_fields(body.title, body.body, _note_max_chars(db))
     if not title and not text:
         raise HTTPException(status_code=400, detail="A note needs a title or some text")
     n = Note(owner_id=current_user.id, title=title, body=text, adopted=True)
@@ -8278,7 +8796,8 @@ async def update_note(
     if body.title is not None or body.body is not None:
         title, text = _clean_note_fields(
             n.title if body.title is None else body.title,
-            n.body if body.body is None else body.body)
+            n.body if body.body is None else body.body,
+            _note_max_chars(db))
         n.title = title
         n.body = text
     if body.is_favorite is not None:
@@ -8342,9 +8861,11 @@ async def send_note(
                 sent_from_user_id=current_user.id, sent_from_name=sender_name, adopted=False)
     db.add(copy)
     db.commit()
-    # Best-effort in-app notification (separate session; never fails the send).
+    # Best-effort in-app notification (separate session; never fails the send). The note TITLE is
+    # sealed at rest (nenc1: in Note.title), so it must NOT be copied into the plaintext
+    # notifications.body — the recipient opens the note via the deep link instead.
     _notify_users([str(recipient.id)], "note_received", f"{sender_name} sent you a note",
-                  body=(src.title or "Untitled note"), target="#notes")
+                  body="Open your notes to read it.", target="#notes")
     try:
         AuditLogger(db).log_action(
             action='note_send', status='success', user=current_user, resource_type='note',
@@ -8730,16 +9251,67 @@ async def create_vault(
                     RetiredObjectId.id == vault_create.id).first()):
             raise HTTPException(status_code=409, detail="That vault id is already in use.")
 
+    # Name / seal validation. A standard vault needs a real plaintext name. A zero-knowledge vault
+    # seals its name (and optionally its description) in the BROWSER and sends only its non-secret
+    # label (or nothing) as `name`; a sealed blob MUST carry the ZK marker so the server never
+    # mistakes a browser seal for one it can decrypt, and the plaintext description is dropped (the
+    # real one rides in enc_description).
+    _name = (vault_create.name or '').strip() or None
+    _enc_name = vault_create.enc_name
+    _enc_description = vault_create.enc_description
+    _description = vault_create.description
+    _name_key_version = None
+    if vault_type == 'zero_knowledge':
+        from app.core.security import is_zk_sealed_name
+        # The server is the enforcement boundary for the ZK guarantee: a real name must be sealed in
+        # the browser (enc_name), never stored in the clear. A plaintext `name` is only ever a
+        # non-secret label, which the browser sends (or null) ALONGSIDE the sealed enc_name. A
+        # plaintext name with NO enc_name is a naive or buggy client putting the real name in the
+        # clear -- refuse it so that leak cannot happen, mirroring the rename path, which refuses a
+        # plaintext name on a ZK vault. (This closes the forgot-to-seal case. It cannot stop a client
+        # that deliberately pairs a real plaintext name with a throwaway sealed blob: the label is
+        # documented non-secret and the server cannot tell a label from a secret, so a client that
+        # mislabels its own secret is leaking its own data, outside the ZK boundary.)
+        # (name/description here have already been stripped-to-None.)
+        if _name is not None and _enc_name is None:
+            raise HTTPException(
+                status_code=400,
+                detail="A zero-knowledge vault name must be sealed in the browser (send enc_name).")
+        if _enc_name is not None and not is_zk_sealed_name(_enc_name):
+            raise HTTPException(status_code=400,
+                                detail="A zero-knowledge vault name must be sealed in the browser.")
+        if _enc_description is not None and not is_zk_sealed_name(_enc_description):
+            raise HTTPException(status_code=400,
+                                detail="A zero-knowledge vault description must be sealed in the browser.")
+        _description = None                       # the real description is sealed in enc_description
+        # Epoch the browser sealed the name/description under (only meaningful with a sealed name).
+        # Absent => 1 (the first sealed build's constant, and what a read defaults to).
+        if _enc_name is not None:
+            _name_key_version = vault_create.name_key_version if vault_create.name_key_version else 1
+            # Bounded to a 32-bit column (a huge value would only fail as a 500 at commit).
+            if _name_key_version < 1 or _name_key_version > 2147483647:
+                raise HTTPException(status_code=400, detail="name_key_version out of range.")
+    else:
+        if _name is None:
+            # 422 (not 400): a missing required field is a validation error, matching the status the
+            # schema returned before `name` became optional (so a ZK vault can send only enc_name).
+            raise HTTPException(status_code=422, detail="Vault name is required.")
+        _enc_name = None                          # a standard vault never carries browser seals
+        _enc_description = None
+
     try:
         vault = vault_service.create_vault(
             vault_id=vault_create.id,
-            name=vault_create.name,
+            name=_name,
             owner=current_user,
-            description=vault_create.description,
+            description=_description,
             password=vault_create.password,
             expire_files_after_days=vault_create.expire_files_after_days,
             vault_type=vault_type,
             size_limit=requested_size,
+            enc_name=_enc_name,
+            enc_description=_enc_description,
+            name_key_version=_name_key_version,
         )
     except (ValueError, IntegrityError) as exc:
         # Losing the race between the check above and this insert should look to a caller
@@ -8922,6 +9494,16 @@ async def list_vaults(
             'last_accessed': vault.last_accessed,
             'is_active': vault.is_active,
             'type': vault.type,
+            # Zero-knowledge: the browser-sealed name/description, so the client can decrypt them
+            # once unlocked (the server can't). For a ZK vault `name`/`description` above carry only
+            # the non-secret label / NULL. Omitted for standard vaults (nothing to client-decrypt);
+            # enc_description masked for an id-scoped caller like the plaintext description is.
+            'enc_name': vault.enc_name if vault.type == 'zero_knowledge' else None,
+            'enc_description': (None if _id_scoped
+                                else (vault.enc_description if vault.type == 'zero_knowledge' else None)),
+            # The epoch enc_name/enc_description were sealed under, so the client reads them at the
+            # right DEK version (follows enc_name's visibility -- not masked for scoped creds).
+            'name_key_version': vault.name_key_version if vault.type == 'zero_knowledge' else None,
             'my_permission': _effective_vault_permission(vault, perms, current_user),
             'is_favorite': vault.id in fav_ids,
             'last_viewed_at': view_times.get(vault.id),
@@ -9002,6 +9584,13 @@ async def get_vault(
             # owner-authored vault description may reference items outside that scope, so mask it too
             # (same rationale as suppressing the whole-vault aggregates).
             'description': None if _id_scoped else vault.description,
+            # Zero-knowledge: browser-sealed name/description for the client to decrypt once unlocked
+            # (None for standard; enc_description masked for an id-scoped caller like description is).
+            'enc_name': vault.enc_name if vault.type == 'zero_knowledge' else None,
+            'enc_description': (None if _id_scoped
+                                else (vault.enc_description if vault.type == 'zero_knowledge' else None)),
+            # The epoch enc_name/enc_description were sealed under (follows enc_name's visibility).
+            'name_key_version': vault.name_key_version if vault.type == 'zero_knowledge' else None,
             'owner_id': vault.owner_id,
             'owner_username': owner_username,
             'has_password': vault.password_hash is not None,
@@ -9249,25 +9838,39 @@ async def update_vault_info(
 ):
     """
     Update vault basic information (name, description).
-    Only owner or admin can update vault info.
+
+    Only the vault OWNER may edit its metadata. A global admin is NOT a superuser over vault contents:
+    vault_service.get_vault() enforces membership first (with no admin bypass), so an admin who is not
+    the owner is already denied. Do not add an admin bypass here without making it a deliberate change
+    at the get_vault chokepoint, with a test -- otherwise every administrator silently gains write
+    access to every vault in the deployment.
     """
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
-    
+
     try:
         # Get vault (no password required for metadata update)
         vault = vault_service.get_vault(vault_id, current_user, require_password=False)
-        
-        # SECURITY: Only vault owner or admin can edit info
-        if vault.owner_id != current_user.id and current_user.role != RoleEnum.ADMIN:
+
+        # SECURITY: only the vault owner may edit its metadata (admins are not exempt -- see docstring).
+        if vault.owner_id != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only vault owner can edit vault information"
             )
         
-        # Update fields if provided
-        if 'name' in vault_update:
+        # Update fields if provided. A plaintext name/description is a STANDARD-vault concern only:
+        # a zero-knowledge vault's real name/description are sealed in the browser (enc_name/
+        # enc_description below), and the server -- the enforcement boundary for the ZK guarantee --
+        # must REFUSE a plaintext one so a naive/buggy/hostile caller can never store the real value
+        # in the clear (its label is set at creation).
+        if 'name' in vault_update and vault_update['name'] is not None:
+            if vault.type == 'zero_knowledge':
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="A zero-knowledge vault name must be sealed in the browser (send enc_name)."
+                )
             new_name = vault_update['name']
             if not new_name or len(new_name.strip()) == 0:
                 raise HTTPException(
@@ -9279,17 +9882,91 @@ async def update_vault_info(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Vault name too long (max 255 characters)"
                 )
-            vault.name = new_name.strip()
-        
+            # Seal the name at rest (Standard vaults); the db.refresh() below restores the
+            # plaintext into vault.name so the response echoes it correctly.
+            from app.services.vault_service import _seal_vault_name
+            _seal_vault_name(vault, new_name.strip())
+
         if 'description' in vault_update:
-            description = vault_update['description']
-            if description and len(description) > 1000:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Vault description too long (max 1000 characters)"
-                )
-            vault.description = description.strip() if description else None
-        
+            if vault.type == 'zero_knowledge':
+                # A ZK vault never stores a plaintext description. A truthy one is refused; an empty
+                # /null value is accepted only to CLEAR it (the sealed enc_description carries the
+                # real one).
+                if vault_update['description']:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="A zero-knowledge vault description must be sealed in the browser (send enc_description)."
+                    )
+                vault.description = None
+            else:
+                description = vault_update['description']
+                if description and len(description) > 1000:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Vault description too long (max 1000 characters)"
+                    )
+                _desc = description.strip() if description else None
+                if _desc:
+                    # Seal at rest (Standard vaults); the db.refresh() below restores the plaintext
+                    # into vault.description so the response echoes it correctly.
+                    from app.services.vault_service import _seal_vault_description
+                    _seal_vault_description(vault, _desc)
+                else:
+                    vault.description = vault.enc_description = None   # cleared
+
+        # Zero-knowledge rename: the browser sends the sealed name/description (zk2: blobs the server
+        # cannot read). Store them and leave the non-secret label (vault.name) untouched; the
+        # plaintext description stays NULL. Only ever acts on a ZK vault, and only on the sealed
+        # fields, so a plaintext name can never overwrite a ZK vault's seal.
+        if vault.type == 'zero_knowledge' and ('enc_name' in vault_update or 'enc_description' in vault_update):
+            from app.core.security import is_zk_sealed_name
+            if 'enc_name' in vault_update:
+                _en = vault_update['enc_name']
+                if _en is not None and not is_zk_sealed_name(_en):
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                        detail="A zero-knowledge vault name must be sealed in the browser.")
+                if _en:
+                    # Legacy re-seal: a ZK vault whose name was still plaintext (enc_name NULL) is
+                    # being sealed for the first time -> drop the now-redundant plaintext name so the
+                    # server no longer holds it (it becomes a label-less encrypted vault). A rename of
+                    # an already-sealed vault keeps its label.
+                    _was_legacy = vault.enc_name is None
+                    vault.enc_name = _en
+                    if _was_legacy:
+                        vault.name = None
+                    # The DEK epoch this seal used (the browser seals under the CURRENT epoch on a
+                    # re-seal), kept in lockstep with enc_name so a read decrypts at the right version
+                    # and retire-version counts the right epoch. A client that predates the field
+                    # (still sealing at the constant epoch 1) omits it -> default 1.
+                    _nkv = vault_update.get('name_key_version')
+                    try:
+                        _nkv = int(_nkv) if _nkv else 1
+                    except (TypeError, ValueError):
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                            detail="name_key_version must be an integer.")
+                    # Bounded to a 32-bit column: a huge value would pass this check and only fail as
+                    # a DataError at commit -> a 500. Reject it here as a 400 instead.
+                    if _nkv < 1 or _nkv > 2147483647:
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                            detail="name_key_version out of range.")
+                    vault.name_key_version = _nkv
+            if 'enc_description' in vault_update:
+                _ed = vault_update['enc_description']
+                if _ed is not None and not is_zk_sealed_name(_ed):
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                        detail="A zero-knowledge vault description must be sealed in the browser.")
+                # enc_description shares the name's DEK epoch (name_key_version), which only advances
+                # when enc_name is re-sealed above. Re-sealing a description to a NEW value WITHOUT also
+                # sending enc_name would desync its ciphertext epoch from the recorded one, so the
+                # description would later read at the wrong epoch. Require enc_name alongside a real
+                # value; clearing to null is always allowed.
+                if _ed and 'enc_name' not in vault_update:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                        detail="Re-sealing a zero-knowledge description requires enc_name "
+                                               "(they share a key epoch).")
+                vault.enc_description = _ed        # None clears a removed description
+                vault.description = None           # a ZK vault never stores a plaintext description
+
         vault.updated_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(vault)
@@ -9325,6 +10002,10 @@ async def update_vault_info(
         )
     except HTTPException:
         raise
+    except PermissionDeniedError as e:
+        # A non-member reaches here via get_vault(); answer 403 like the sixteen handlers that
+        # already do, not a 500 (which mints a spurious error_id and teaches operators to ignore 500s).
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         db.rollback()
         raise HTTPException(
@@ -9401,6 +10082,13 @@ async def change_vault_password(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e)
         )
+    except HTTPException:
+        # The body raises its own HTTPExceptions (e.g. a 400 for a bad/duplicate password); let them
+        # through rather than have the generic handler below re-wrap them as a 500.
+        raise
+    except PermissionDeniedError as e:
+        # A non-member reaches here via get_vault(); answer 403, not a 500.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         db.rollback()
         raise HTTPException(
@@ -9878,6 +10566,12 @@ async def grant_vault_permission(
         from app.core.models import vault_members
         from sqlalchemy.dialects.postgresql import insert as _pg_insert
 
+        # Was this user already a member? The upsert below is idempotent (on_conflict_do_update), so a
+        # re-grant that only changes a permission level must NOT fire the "added to a vault" email.
+        _already_member = db.query(vault_members).filter(
+            vault_members.c.vault_id == vault_id,
+            vault_members.c.user_id == permission.user_id).first() is not None
+
         # Set permissions based on level. 'manage' implies full read/write/delete.
         manage_perm = permission.level == 'manage'
         read_perm = permission.level in ['read', 'write', 'delete', 'manage']
@@ -9907,7 +10601,12 @@ async def grant_vault_permission(
             },
         ))
         db.commit()
-        
+
+        # Optionally email a genuinely-new member that they were added to a vault (opt-in). Best-effort;
+        # the default template uses {{vault.name}}/{{vault.url}}, so no action_context is required.
+        if not _already_member:
+            _fire_action_email(db, "vault_member_added", email=user.email, username=user.username)
+
         return {
             "message": f"Permission '{permission.level}' granted to user {user.username}",
             "user_id": str(permission.user_id),
@@ -10626,15 +11325,21 @@ def _content_disposition(file_name: str) -> str:
     on a non-Latin-1 character)."""
     from urllib.parse import quote
     name = file_name or 'download'
-    # Strip control chars (incl. CR/LF, which ARE ASCII and survive the ascii encode) plus
-    # quotes/backslashes, so a crafted filename can't inject header content, split the response,
-    # or (on uvicorn) make the whole download 500 on a malformed header. The UTF-8 filename*
-    # below is already safe (quote() percent-encodes control chars).
+    # Path separators must reach NEITHER header parameter, and not survive decoding of filename*
+    # either: a non-browser client that honours the suggested filename literally could otherwise be
+    # steered to write outside its target directory. RFC 6266 clients PREFER filename*, so stripping
+    # only the ASCII filename= fallback (the raw name still fed filename*, and %2F decodes back to '/')
+    # was not enough -- strip both separators from the shared name up front.
+    name = name.replace('/', '').replace('\\', '')
+    # ASCII filename= fallback: additionally drop non-ASCII and control chars (incl. CR/LF, which are
+    # ASCII and survive the ascii encode -> header injection) and quotes.
     ascii_fallback = ''.join(
         c for c in name.encode('ascii', 'ignore').decode('ascii')
-        if 32 <= ord(c) < 127 and c not in '"\\'
+        if 32 <= ord(c) < 127 and c not in '"'
     ).strip() or 'download'
-    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(name)}"
+    # RFC 5987 ext-value: percent-encode everything outside attr-char (safe='' -- the default safe='/'
+    # would leave a separator raw). The name is already separator-free; quote handles control chars.
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(name, safe='')}"
 
 
 
@@ -10840,6 +11545,13 @@ async def upload_file(
             # Validate filename
             if not upload_file.filename:
                 continue  # Skip files without names
+
+            # A NUL byte cannot be stored (the database driver rejects "\x00" in a string literal),
+            # so a name carrying one would surface as an opaque 500 deep in the pipeline. Refuse it up
+            # front with a 400 - no legitimate filename contains a NUL. (The chunked and SFTP paths
+            # already strip control bytes, incl. NUL, so this closes the one path that did not.)
+            if '\x00' in upload_file.filename:
+                raise HTTPException(status_code=400, detail="Filename contains an invalid NUL byte.")
 
             # Reject a disallowed file type up front (before any reservation/streaming work).
             _enforce_file_type(upload_file.filename, _allowed_exts)
@@ -11671,7 +12383,10 @@ async def init_chunked_upload(
     if is_zk:
         resume_q = resume_q.filter(ChunkedUploadSession.name_bi == body.name_bi)
     else:
-        resume_q = resume_q.filter(ChunkedUploadSession.filename == body.file_name)
+        # Standard sessions no longer store the plaintext filename (it is sealed at rest); match on the
+        # server blind index of the sanitized name instead, which init records the same way.
+        from app.core.security import name_blind_index as _nbi
+        resume_q = resume_q.filter(ChunkedUploadSession.name_bi == _nbi(vault.id, body.file_name))
     # Resuming is something a client ASKS for. It used to be inferred: a new upload matching an
     # existing session on vault, folder, name, size and chunk count was handed that session and
     # its already-received chunks. Nothing in that set distinguishes a genuine resume from a
@@ -11820,16 +12535,34 @@ async def init_chunked_upload(
                 or db.query(RetiredObjectId.id).filter(
                     RetiredObjectId.id == body.file_id).first()):
             raise HTTPException(status_code=409, detail="File id already in use")
+        # Pre-assign the session id: it keys the per-object name seal below, and
+        # ChunkedUploadSession.id defaults at flush (None at construction), so the seal cannot be
+        # computed after the fact.
+        _sid = uuid.uuid4()
+        if is_zk:
+            # Zero-knowledge: the client sent the browser-encrypted name in enc_name/enc_mime + its
+            # own blind index; the server never sees the plaintext, so plaintext columns stay NULL.
+            _f_filename, _f_mime = body.file_name, body.mime_type
+            _f_enc_name, _f_enc_mime, _f_name_bi = body.enc_name, body.enc_mime, body.name_bi
+        else:
+            # Standard: seal the working name/MIME at rest (AES-GCM keyed per (vault, session-id), like
+            # a File name) for the life of the active upload instead of holding them plaintext. The
+            # transparent load/refresh event restores filename/mime_type in-memory on every read.
+            from app.core.security import encrypt_object_field, name_blind_index
+            _f_filename, _f_mime = None, None
+            _f_enc_name = encrypt_object_field(vault_id, _sid, body.file_name, 'name') if body.file_name else None
+            _f_enc_mime = encrypt_object_field(vault_id, _sid, body.mime_type, 'mime') if body.mime_type else None
+            # Server blind index over the sanitized name, so a resume can match without a plaintext column.
+            _f_name_bi = name_blind_index(vault_id, body.file_name) if body.file_name else None
         session = ChunkedUploadSession(
+            id=_sid,
             vault_id=vault_id,
             user_id=current_user.id,
-            # Standard: plaintext name/MIME. ZK: NULL plaintext, client-encrypted name in
-            # enc_name/enc_mime + the blind index (server never sees the plaintext name).
-            filename=body.file_name,
-            mime_type=body.mime_type,
-            enc_name=body.enc_name,
-            enc_mime=body.enc_mime,
-            name_bi=body.name_bi,
+            filename=_f_filename,
+            mime_type=_f_mime,
+            enc_name=_f_enc_name,
+            enc_mime=_f_enc_mime,
+            name_bi=_f_name_bi,
             name_bi_candidates=body.name_bi_candidates or None,
             total_size=body.total_size,
             total_chunks=body.total_chunks,
@@ -11914,12 +12647,12 @@ async def upload_chunk(
     sdir.mkdir(parents=True, exist_ok=True)
     chunk_path = sdir / f"chunk_{chunk_index:06d}"
     already = chunk_path.exists()
-    # Size of this index if it is being re-sent, so the running total stays accurate
-    # and an overwrite is not double-counted.
-    try:
-        existing_size = chunk_path.stat().st_size if already else 0
-    except OSError:
-        existing_size = 0
+    # PLAINTEXT size of this index if it is being re-sent, so the running total stays accurate and
+    # an overwrite is not double-counted. A sealed chunk carries its plaintext length in its header
+    # (a legacy plaintext chunk is its own on-disk size); using that -- not the on-disk ciphertext
+    # size -- keeps the byte accounting in the same plaintext units as `total_size`, so the
+    # encryption framing overhead is never charged against the declared file size.
+    existing_size = sealed_plaintext_size(chunk_path) if already else 0
     # Bytes already buffered for this session EXCLUDING the index being written. Clamp at
     # 0: a crash between writing a chunk and committing the counter can leave bytes_received
     # undercounted, and base_bytes must never go negative (that would loosen the bound).
@@ -11967,8 +12700,13 @@ async def upload_chunk(
     # disk rather than memory.
     try:
         # The byte count is not needed here: the counters below are recomputed from what is
-        # actually on disk, which is what stays right under a concurrent re-send.
-        _written, chunk_digest = await receive_bounded(request.stream(), tmp_path, remaining)
+        # actually on disk, which is what stays right under a concurrent re-send. The chunk is
+        # sealed as it streams (each 1 MiB record AES-GCM-encrypted under a per-session key, bound
+        # to this session+index) so no raw chunk is ever readable on the staging volume; `remaining`
+        # still bounds PLAINTEXT bytes and `chunk_digest` is still over the plaintext, so the
+        # ChunkTooLarge/EmptyBody contract and the resume digest are unchanged.
+        _written, chunk_digest = await seal_stream_to_file(
+            request.stream(), tmp_path, remaining, session.id, chunk_index)
     except ChunkTooLarge:
         # The body reached disk before it could be measured, which is the trade for not holding it
         # in memory. It is bounded by `remaining` -- disk this session was already approved to
@@ -12022,10 +12760,9 @@ async def upload_chunk(
     _present = sorted(sdir.glob("chunk_*"))
     _bytes = 0
     for _p in _present:
-        try:
-            _bytes += _p.stat().st_size
-        except OSError:
-            pass
+        # PLAINTEXT bytes (sealed chunks report it from their header; legacy plaintext chunks report
+        # their on-disk size), so `bytes_received` stays comparable to the plaintext `total_size`.
+        _bytes += sealed_plaintext_size(_p)
     received = len(_present)
     if locked is not None:
         locked.bytes_received = _bytes
@@ -12148,6 +12885,15 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
     # name (the on-disk blob is keyed by the file UUID, and finalize NULLs the plaintext
     # name anyway).
     is_zk = _is_zk_vault(vault)
+    # A Standard session whose sealed name could not be decrypted leaves filename NULL (its enc_name is
+    # set). That happens when the session was started by a NEWER image whose name seal this one cannot
+    # read and the deployment was then rolled back. Completing it would surface deep in the pipeline as
+    # an opaque 500; refuse cleanly with a named 409 so the operator knows to cancel and re-upload, and
+    # the un-nameable file is never half-created.
+    if not is_zk and session.filename is None and session.enc_name:
+        raise HTTPException(status_code=409, detail=(
+            "This upload was started by a different version and cannot be completed here. "
+            "Cancel it and upload the file again."))
     zk_name_bi = session.name_bi if is_zk else None
     # The full set a ZK name may match under (all epochs' candidates + the index-key value),
     # stored at init. Used for BOTH the reject pre-check and the replace at finalize, so an
@@ -12220,11 +12966,11 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         )
         with stream_ctx as ctx:
             for i in range(session.total_chunks):
-                with open(sdir / f"chunk_{i:06d}", 'rb') as cf:
-                    while True:
-                        buf = cf.read(1024 * 1024)
-                        if not buf:
-                            break
+                # Each staged chunk was sealed on arrival; unseal it in order (memory-bounded,
+                # one record at a time) and hand the plaintext to the at-rest codec. A chunk
+                # staged as plaintext by a pre-upgrade release streams through verbatim.
+                for buf in open_staged_chunk(sdir / f"chunk_{i:06d}", session.id, i):
+                    if buf:
                         ctx.write_chunk(buf)
             final_checksum = ctx.get_checksum()
             final_size = ctx.get_total_size()
@@ -12341,9 +13087,9 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         # pre-check) -> a clean 409, not a 500. Any other ValueError keeps the generic handling.
         if "id already in use" in str(e):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="File id already in use")
-        session.status = 'failed'
-        session.error_message = str(e)[:500]
-        db.commit()
+        # Genuine finalize failure: fail the session and clear its plaintext name/MIME + staged
+        # chunks now, rather than leaving the plaintext name + chunks on disk until the TTL sweep.
+        fail_chunk_session(db, session, sdir, e)
         raise HTTPException(status_code=500, detail=f"Failed to finalize upload: {str(e)}")
     except PermissionDeniedError as e:
         # A permission denial is a 403, not a 500 — and it isn't a corrupt upload, so leave
@@ -12351,9 +13097,9 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         _remove_orphan_blob()
-        session.status = 'failed'
-        session.error_message = str(e)[:500]
-        db.commit()
+        # Genuine finalize failure: fail the session and clear its plaintext name/MIME + staged
+        # chunks now, rather than leaving the plaintext name + chunks on disk until the TTL sweep.
+        fail_chunk_session(db, session, sdir, e)
         print(f"Error finalizing chunked upload: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to finalize upload: {str(e)}")
 
@@ -12967,13 +13713,18 @@ async def download_file(
         # to resume is the only option that leaves the cap meaning what it says.
         rangeable = download.read_range is not None and not share_authorized
 
-        # The stored checksum, as an entity tag. Resuming across two requests is only safe if the
-        # second one is reading the same bytes as the first, and nothing else here establishes
-        # that: a same-name replacement between the two would let a client splice two different
-        # files together and notice nothing, because each half authenticates perfectly well on its
-        # own. Per-record AEAD proves a record belongs to this file; it cannot prove both requests
-        # saw the same version of it.
-        etag = f'"{download.checksum}"' if download.checksum else None
+        # A KEYED tag over the content, as the entity tag -- NOT the plaintext checksum, which would
+        # let anyone who can request the file confirm whether it holds specific known content (hash
+        # a candidate, compare the ETag). content_mac is HMAC of the checksum under a per-file key,
+        # so it is still stable and unique per version but cannot be reproduced without the key.
+        #
+        # Resuming across two requests is only safe if the second one is reading the same bytes as
+        # the first, and nothing else here establishes that: a same-name replacement between the two
+        # would let a client splice two different files together and notice nothing, because each
+        # half authenticates perfectly well on its own. A replacement changes the file id and/or the
+        # checksum, so the tag changes and the If-Range below mismatches. Per-record AEAD proves a
+        # record belongs to this file; it cannot prove both requests saw the same version of it.
+        etag = f'"{download.content_mac}"' if download.content_mac else None
 
         if_range = request.headers.get('if-range')
         stale_resume = False
@@ -14183,7 +14934,7 @@ async def logout(
         if session_token:
             # Invalidate session in database
             session = db.query(ActiveSession).filter(
-                ActiveSession.session_token == session_token
+                ActiveSession.session_token == hash_session_token(session_token)
             ).first()
             if session:
                 session.is_active = False
@@ -14842,34 +15593,27 @@ async def cleanup_expired_sessions():
         except Exception as e:
             print(f"❌ Error in session cleanup task: {e}")
 
-def _seed_admin_user():
-    """
-    Bootstrap an admin user from ADMIN_USERNAME/ADMIN_PASSWORD when no users
-    exist yet. This lets env-configured deployments log in without manual database
-    bootstrap. No-op if an admin already exists or
-    no admin password is configured.
+def _seed_admin_user(db=None):
+    """Bootstrap the FIRST admin from ADMIN_USERNAME/ADMIN_PASSWORD, exactly ONCE per deployment.
+
+    The logic lives in app.core.admin_bootstrap (side-effect-free, so it is unit-testable against a
+    throwaway database). Seed-once is enforced by an ``admin_bootstrap`` marker in ``system_settings``:
+    once bootstrapped, or once any admin exists, this refuses to seed again - so a later ADMIN_USERNAME
+    change in ``.env`` can no longer mint a new admin. No-op if already bootstrapped / an admin exists
+    / no password is configured. ``db`` is an injection seam for tests; production passes None and a
+    session is opened here.
     """
     try:
-        from app.core.database import get_db_context
-        from app.services.auth_service import AuthService
-        from app.core.models import RoleEnum, User
+        from app.core.admin_bootstrap import bootstrap_admin
 
-        # Match the app/core/config.py guard's emptiness definition: a whitespace-only value is "blank"
-        # (the post-bootstrap no-op state), not a credential to seed.
-        if not (settings.admin_password or "").strip():
-            return
-        with get_db_context() as db:
-            if db.query(User).filter(User.username == settings.admin_username).first():
-                return
-            AuthService(db).create_user(
-                username=settings.admin_username,
-                email=settings.admin_email or "admin@local",
-                password=settings.admin_password,
-                role=RoleEnum.ADMIN,
-            )
-            print(f"[OK] Bootstrapped admin user '{settings.admin_username}' from environment")
+        if db is not None:
+            return bootstrap_admin(db)
+        from app.core.database import get_db_context
+        with get_db_context() as session:
+            return bootstrap_admin(session)
     except Exception as e:
         print(f"⚠ Admin bootstrap skipped: {e}")
+        return "error"
 
 
 # Starter share-tag set seeded onto a FRESH deployment so sharing is usable out of the box. The
@@ -14980,13 +15724,19 @@ def _seed_default_email_profile():
     try:
         from app.core.database import get_db_context
         from app.core import email_send
-        from app.core.email_actions import seed_email_actions
+        from app.core.email_actions import seed_email_actions, seed_default_templates
         with get_db_context() as db:
             if email_send.seed_default_profile(db):
                 print("[OK] Seeded default email sending profile from legacy SMTP config")
             n = seed_email_actions(db)
             if n:
                 print(f"[OK] Seeded {n} automated-email action(s)")
+            # Materialize each action's built-in default template and pre-bind it (idempotent; never
+            # overwrites an admin's own template choice). Runs after the actions exist so it can bind,
+            # and self-heals an unbound SYSTEM action against an existing default (see seed_default_templates).
+            t = seed_default_templates(db)
+            if t:
+                print(f"[OK] Seeded {t} default email template(s)")
     except Exception as e:
         print(f"⚠ Default email profile seed skipped: {e}")
 
@@ -15160,6 +15910,10 @@ def _run_lightweight_migrations():
             # Delegated vault administration: a member with manage_permission is a "Manager".
             "ALTER TABLE vault_members ADD COLUMN IF NOT EXISTS manage_permission BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS folder_id UUID",
+            # Notes are sealed at rest (a marker + ciphertext); a title that once fit String(255)
+            # no longer does, so widen it (and the public-link title snapshot) to TEXT. Idempotent.
+            "ALTER TABLE notes ALTER COLUMN title TYPE TEXT",
+            "ALTER TABLE note_public_links ALTER COLUMN title_snapshot TYPE TEXT",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS note VARCHAR(500)",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS can_create_temp_credentials BOOLEAN DEFAULT FALSE",
             # Least-privilege scope for temp credentials (the temp_credential_vault_access
@@ -15187,6 +15941,11 @@ def _run_lightweight_migrations():
             "WHERE vault_access_mode IS NULL",
             "ALTER TABLE temporary_credentials ALTER COLUMN vault_access_mode SET NOT NULL",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS created_by_temp_credential_id UUID",
+            # Drop the long-deprecated encrypted_password column: it held a retrievable copy of the temp
+            # password and has been NULL for every row since the password became show-once-at-creation.
+            # Removing it takes the column (and its SQL-readable data) out of the schema. Idempotent - a
+            # fresh install (whose model never declared the column) is a clean no-op.
+            "ALTER TABLE temporary_credentials DROP COLUMN IF EXISTS encrypted_password",
             # Per-vault SFTP password proof: fingerprint of the vault password hash proven
             # when this grant was minted (re-checked on SFTP access; voided by a rotation).
             "ALTER TABLE temp_credential_vault_access ADD COLUMN IF NOT EXISTS vault_password_fingerprint VARCHAR(64)",
@@ -15237,9 +15996,33 @@ def _run_lightweight_migrations():
             "ALTER TABLE files ADD COLUMN IF NOT EXISTS modified_by UUID",
             "ALTER TABLE files ALTER COLUMN name DROP NOT NULL",
             "ALTER TABLE files ALTER COLUMN original_name DROP NOT NULL",
+            # Keyed content MAC used as the file's ETag (HMAC of checksum_sha256 under a per-file
+            # key), so the plaintext checksum is never handed to a client. create_all adds it on a
+            # fresh DB; this adds it on an existing one. No backfill: for a row whose column is still
+            # NULL the value is derived on read (deterministic from id + checksum_sha256).
+            "ALTER TABLE files ADD COLUMN IF NOT EXISTS content_mac VARCHAR(64)",
+            # Seal the content checksum at rest: enc_checksum holds the AES-GCM blob and the plaintext
+            # checksum_sha256 becomes NULLABLE (a sealed row NULLs it; the load event restores it on
+            # read). create_all adds these on a fresh DB; these backfill them on an existing one. A
+            # one-time eager backfill of existing rows runs in _backfill_encrypted_names.
+            "ALTER TABLE files ADD COLUMN IF NOT EXISTS enc_checksum TEXT",
+            "ALTER TABLE files ALTER COLUMN checksum_sha256 DROP NOT NULL",
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS enc_name TEXT",
             "ALTER TABLE folders ADD COLUMN IF NOT EXISTS name_bi VARCHAR(64)",
             "CREATE INDEX IF NOT EXISTS ix_folders_name_bi ON folders (name_bi)",
+            # Vault name sealed at rest (Standard vaults): enc_name holds the AES-GCM blob and the
+            # plaintext `name` becomes NULLABLE (a sealed row NULLs it; the load event restores it on
+            # read). create_all adds these on a fresh DB; these backfill them on an existing one. A
+            # one-time eager backfill of existing rows runs in _backfill_encrypted_names.
+            "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS enc_name TEXT",
+            "ALTER TABLE vaults ALTER COLUMN name DROP NOT NULL",
+            # Zero-knowledge vault description sealed in the browser (server stores, never reads).
+            "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS enc_description TEXT",
+            # Zero-knowledge vault NAME epoch: the DEK version the browser sealed enc_name/enc_description
+            # under (mirrors folders.name_key_version). retire-version counts it so the name's epoch is
+            # never dropped. NULL/absent => epoch 1 (the first sealed build's constant). create_all adds
+            # it on a fresh DB; this backfills it on an existing one.
+            "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS name_key_version INTEGER",
             # Sharing: a tag can FORCE view-only on every share it mints (independent of allow_custom).
             # create_all adds the column on a fresh DB; this backfills it on a vault that already ran an
             # earlier sharing build. Idempotent + additive.
@@ -15385,6 +16168,15 @@ def _run_lightweight_migrations():
             # idempotent; the table always exists by now because init_db()/create_all ran first.
             "ALTER TABLE email_profiles ADD COLUMN IF NOT EXISTS "
             "smtp_allow_insecure_tls BOOLEAN NOT NULL DEFAULT FALSE",
+            # Email Studio: mark a template as the built-in default for an action key (NULL = user
+            # template). Additive + idempotent; create_all builds it on a fresh DB, this ADDs it on an
+            # INTERMEDIATE deployment that created email_templates before the column existed.
+            "ALTER TABLE email_templates ADD COLUMN IF NOT EXISTS default_key VARCHAR(64)",
+            # Partial unique: at most one default template per action key (NULLs — user templates —
+            # unconstrained). Safe to create on upgrade: the column is brand-new (all NULL) until the
+            # boot seed, which runs after migrations, so no duplicate can exist at index-creation time.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_email_template_default_key "
+            "ON email_templates (default_key) WHERE default_key IS NOT NULL",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)
@@ -15525,6 +16317,86 @@ def _verify_retired_object_id_triggers(db) -> None:
         )
 
 
+def _rehash_plaintext_session_tokens():
+    """Hash any legacy plaintext session token at rest (idempotent, no forced logout). Best-effort:
+    never block boot. The logic lives in app.core.session_migrations so it is unit-testable."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.session_migrations import rehash_plaintext_session_tokens
+        with get_db_context() as db:
+            rehashed = rehash_plaintext_session_tokens(db)
+            if rehashed:
+                db.commit()
+                print(f"[OK] Rehashed {rehashed} plaintext session token(s) at rest")
+    except Exception as e:  # noqa: BLE001 — best-effort hardening migration, never block boot
+        print(f"⚠ session-token rehash skipped: {e}")
+
+
+def _verify_encryption_key_canary():
+    """Refuse to boot if the configured ENCRYPTION_KEY cannot open this deployment's sealed data.
+
+    Runs BEFORE any data-touching migration (session-token rehash, note/name backfills) so a boot on a
+    MISMATCHED key cannot corrupt at-rest content. A definitive wrong-key signal is FATAL (raised, boot
+    stops); any ambiguous condition is logged and boot continues (the migrations are loss-safe on their
+    own). The first boot of this version SEEDS the canary under the current key, so an upgrade never
+    refuses -- only a later key change does. Logic lives in app.core.key_canary so it is testable."""
+    from app.core.key_canary import EncryptionKeyMismatch, verify_or_seed_key_canary
+    try:
+        from app.core.database import get_db_context
+        with get_db_context() as db:
+            status = verify_or_seed_key_canary(db)
+        if status not in ("ok", "seeded"):
+            print(f"⚠ encryption-key canary check inconclusive: {status}")
+    except EncryptionKeyMismatch:
+        raise                              # fatal on purpose -- do not run migrations under a wrong key
+    except Exception as e:  # noqa: BLE001 — never brick boot on an unexpected canary-check error
+        print(f"⚠ encryption-key canary check skipped: {e}")
+
+
+def _purge_audit_log_names():
+    """Strip residual plaintext names (file/folder/old/new/vault_name) from legacy audit-log rows
+    written before the AuditLogger began redacting them (idempotent; a marker makes it a no-op after
+    the first run). Best-effort: never block boot. Logic lives in app.core.audit_migrations."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.audit_migrations import purge_audit_log_names
+        with get_db_context() as db:
+            purged = purge_audit_log_names(db)
+        if purged:
+            print(f"[OK] Redacted residual names from {purged} legacy audit-log row(s)")
+    except Exception as e:  # noqa: BLE001 — best-effort hardening migration, never block boot
+        print(f"⚠ audit-log name redaction skipped: {e}")
+
+
+def _backfill_file_checksums():
+    """Seal any legacy plaintext file content checksums at rest (idempotent, batched). Covers every
+    file (ZK + Standard). Best-effort: never block boot. Logic lives in app.core.file_migrations."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.file_migrations import backfill_file_checksums
+        with get_db_context() as db:
+            sealed = backfill_file_checksums(db)
+        if sealed:
+            print(f"[OK] Sealed {sealed} file checksum(s) at rest")
+    except Exception as e:  # noqa: BLE001 — best-effort hardening migration, never block boot
+        print(f"⚠ file-checksum backfill skipped: {e}")
+
+
+def _backfill_note_content():
+    """Seal any legacy plaintext note/link content at rest (idempotent). Best-effort: never block
+    boot. Runs after the widen DDL. The logic lives in app.core.note_migrations so it is testable."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.note_migrations import backfill_note_content
+        with get_db_context() as db:
+            sealed = backfill_note_content(db)
+            if sealed:
+                db.commit()
+                print(f"[OK] Sealed {sealed} note/link row(s) with plaintext content at rest")
+    except Exception as e:  # noqa: BLE001 — best-effort hardening migration, never block boot
+        print(f"⚠ note-content backfill skipped: {e}")
+
+
 def _backfill_encrypted_names():
     """One-time, idempotent eager encryption of existing plaintext file/folder names in
     STANDARD vaults (so names already on disk before this version stop being stored in
@@ -15533,7 +16405,8 @@ def _backfill_encrypted_names():
     try:
         from app.core.database import get_db_context
         from app.core.models import File, Folder, Vault
-        from app.services.vault_service import _seal_named_object
+        from app.services.vault_service import (_seal_named_object, _seal_vault_name,
+                                                _seal_vault_description)
         BATCH = 500
         with get_db_context() as db:
             # Only STANDARD vaults are sealed (ZK names are deferred). Load just those
@@ -15544,6 +16417,33 @@ def _backfill_encrypted_names():
             if not vaults:
                 return
             std_ids = list(vaults.keys())
+            # Seal the vault NAMES themselves in place (the load event restores them on read).
+            # Idempotent: a row already sealed has enc_name set and is skipped. NULLing a vault's
+            # name does not affect the file/folder loop below (it keys off vault.id, not the name).
+            # Isolated in its own try/except so a hiccup here can never skip the proven file/folder
+            # name backfill that follows; it just retries next boot. On failure the in-memory vault
+            # objects may be partly mutated (name NULLed without a commit), so re-fetch them for the
+            # file/folder loop rather than trusting the dict.
+            try:
+                vname = vdesc = 0
+                for _v in vaults.values():
+                    if getattr(_v, 'enc_name', None) is None and _v.name is not None:
+                        _seal_vault_name(_v, _v.name)
+                        vname += 1
+                    # Same for a legacy plaintext DESCRIPTION (enc_description NULL, description set).
+                    if getattr(_v, 'enc_description', None) is None and _v.description:
+                        _seal_vault_description(_v, _v.description)
+                        vdesc += 1
+                if vname or vdesc:
+                    db.commit()
+                    if vname:
+                        print(f"[OK] Sealed {vname} vault name(s) at rest")
+                    if vdesc:
+                        print(f"[OK] Sealed {vdesc} vault description(s) at rest")
+            except Exception as _ve:  # noqa: BLE001 — never block the file/folder backfill
+                db.rollback()
+                vaults = {v.id: v for v in db.query(Vault).filter(Vault.type == 'standard').all()}
+                print(f"⚠ Vault-name backfill skipped this boot (retries next boot): {_ve}")
             total = 0
             for model, is_file in ((File, True), (Folder, False)):
                 plain_col = model.original_name if is_file else model.name
@@ -15685,9 +16585,19 @@ async def lifespan(app: FastAPI):
     # After the replay, so the remembered value describes what this boot actually achieved.
     from app.core.health import refresh_schema_state
     print(f"Schema state: {refresh_schema_state(recorded=recorded)}")
+    _verify_encryption_key_canary()     # refuse to boot under a mismatched ENCRYPTION_KEY, BEFORE any seal migration
+    _rehash_plaintext_session_tokens()  # hash any legacy plaintext session tokens at rest (no logout)
+    _backfill_note_content()            # seal any legacy plaintext note/link content at rest
     _backfill_encrypted_names()
+    _backfill_file_checksums()          # seal any legacy plaintext file content checksums at rest
+    _purge_audit_log_names()            # strip residual plaintext names from legacy audit-log rows
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
-    _seed_admin_user()
+    _admin_bootstrap_status = _seed_admin_user()
+    # Once the admin is bootstrapped, ADMIN_PASSWORD is spent: drop it (remove a writable mounted
+    # ADMIN_PASSWORD_FILE, clear it from this process's env, or warn) so a plaintext admin password
+    # is not retained. Fail-safe -- never breaks boot.
+    from app.core.admin_password_hygiene import scrub_bootstrap_password_source
+    scrub_bootstrap_password_source(_admin_bootstrap_status)
     _seed_default_share_tags()  # after the admin exists, so seed tags can record it as creator
     _seed_default_note_link_tags()  # public-note-link starter tags (inert until enabled)
     _backfill_default_permissions()

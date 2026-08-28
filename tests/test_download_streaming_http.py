@@ -206,7 +206,7 @@ def _break_checksum(file_id):
     db = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
     out = subprocess.run(
         ["docker", "exec", db, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc",
-         f"UPDATE files SET checksum_sha256 = repeat('d', 64) WHERE id = '{file_id}';"],
+         f"UPDATE files SET checksum_sha256 = repeat('d', 64), enc_checksum = NULL WHERE id = '{file_id}';"],
         capture_output=True, text=True, timeout=60)
     skip_if_container_absent(out, db)
     assert out.returncode == 0 and "UPDATE 1" in out.stdout, (

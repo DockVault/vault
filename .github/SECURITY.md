@@ -36,6 +36,31 @@ Use the hardened production path, not the local-trial default:
 - Always run behind TLS. Do not expose the plaintext HTTP listener to an untrusted
   network.
 
+## Encryption at rest, and upgrading an existing deployment
+
+The vault encrypts file **contents** at rest, and recent releases also seal sensitive
+**metadata** in the database — note titles/bodies, file/folder names, and vault
+names/descriptions — so they are not stored in the clear.
+
+When you **upgrade an existing deployment**, the boot migrations seal the rows that were
+written in the clear by an older version, in place. This is an important caveat for a
+raw-volume threat model:
+
+- **Postgres does not erase the old plaintext when a row is sealed in place.** An in-place
+  update writes a new row version and keeps the old one as a *dead tuple* until `VACUUM`
+  reclaims it, and records the change (including the old value) in the write-ahead log
+  (`pg_wal`) regardless. So for a while after an upgrade, the raw data volume can still
+  contain the pre-seal plaintext — recoverable only by someone who can read the raw
+  Postgres files or a filesystem-level backup/snapshot, **not** through the application.
+- **A fresh install never accumulates this residue** — it writes sealed from the first row.
+- To actually retire the residue on an upgraded deployment, use **host full-disk
+  encryption** (which protects the whole volume regardless), or **dump and restore onto a
+  fresh volume** after upgrading (a new data directory + WAL that never held the plaintext).
+
+If your threat model does not include an attacker obtaining the raw data volume (disk
+image, filesystem backup, or storage snapshot), this residue is not reachable and no
+action is needed.
+
 ## Update check (opt-in phone-home)
 
 The optional update check (`UPDATE_CHECK_ENABLED=true`, **default off**) makes an outbound request

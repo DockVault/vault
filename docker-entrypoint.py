@@ -17,12 +17,49 @@ the recursive fix is skipped via a cheap top-level owner check. If the container
 started as non-root (no override needs it), it just execs the command unchanged.
 """
 import os
-import pwd
 import sys
 
 _APP_USER = "appuser"
 # Persistent / writable mount points an older root-era image may have created root-owned.
 _VOLUME_DIRS = ("/app/keys", "/app/storage", "/app/logs", "/app/brand", "/app/certs")
+
+# Secrets an operator may supply via a mounted file (the Docker / Kubernetes "<NAME>_FILE"
+# convention) instead of a plaintext value in .env. Read-old: the plain <NAME> still works and takes
+# precedence, so an existing deployment is unaffected. DATABASE_URL is here for completeness, but the
+# compose files assemble it from VAULT_DB_PASSWORD and set it directly, so DATABASE_URL_FILE only
+# takes effect on a compose that does not.
+_FILE_SECRETS = (
+    "ENCRYPTION_KEY",
+    "JWT_SECRET_KEY",
+    "REDIS_PASSWORD",
+    "ADMIN_PASSWORD",
+    "LOG_TOKEN_PEPPER",
+    "INVITE_TOKEN_PEPPER",
+    "DATABASE_URL",
+)
+
+
+def _expand_file_secrets():
+    """Populate a secret env var from <NAME>_FILE when the plain <NAME> is not already set, so an
+    operator can keep secrets out of a plaintext .env. The plain value wins if both are present
+    (read-old). Trailing CR/LF is stripped (the usual shape of ``printf secret > file``). Runs before
+    the privilege drop so a root-owned secret file is still readable. Never raises: a bad file leaves
+    <NAME> unset so the app fails closed on it, rather than crash-looping the container."""
+    for name in _FILE_SECRETS:
+        path = os.environ.get(name + "_FILE")
+        if not path or os.environ.get(name):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                os.environ[name] = fh.read().rstrip("\r\n")
+        except OSError as exc:
+            sys.stderr.write("[entrypoint] could not read %s_FILE (%s); %s left unset\n"
+                             % (name, exc, name))
+        except Exception:  # noqa: BLE001 — e.g. the file is not valid UTF-8 text (raw random bytes).
+            # NEVER echo the exception here: a UnicodeDecodeError message quotes the offending secret
+            # byte. Leave the var unset and let the app's own validation fail closed on it.
+            sys.stderr.write("[entrypoint] %s_FILE is not valid UTF-8 text; %s left unset\n"
+                             % (name, name))
 
 
 def _fix_ownership(path, uid, gid):
@@ -48,7 +85,11 @@ def _fix_ownership(path, uid, gid):
 
 def main():
     args = sys.argv[1:] or ["python", "run_combined.py"]
+    # Read any file-mounted secrets into the environment BEFORE the privilege drop (so a root-owned
+    # secret file is still readable) and before exec, so the workload inherits them.
+    _expand_file_secrets()
     if os.geteuid() == 0:
+        import pwd
         try:
             pw = pwd.getpwnam(_APP_USER)
         except KeyError:

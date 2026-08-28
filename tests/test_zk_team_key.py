@@ -24,7 +24,7 @@ import uuid
 
 import pytest
 
-from conftest import unique, ensure_ecc_keypair, ApiClient
+from conftest import unique, ensure_ecc_keypair, ApiClient, ZK_ENC_NAME_STUB
 
 
 @contextlib.contextmanager
@@ -46,7 +46,7 @@ def _create_hier_vault(admin):
     ensure_ecc_keypair(admin)
     r = admin.post("/vaults", json={
         "name": unique("hteam"),
-        "type": "zero_knowledge",
+        "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
         "key_wrapping_mode": "hierarchical",
         "team_public_key": "TEAMPUB-" + uuid.uuid4().hex,
         "team_wrapped_dek": _stub("tdek"),
@@ -300,7 +300,7 @@ def test_direct_vault_unaffected(admin):
     ensure_ecc_keypair(admin)
     with _zk_enabled(admin):
         r = admin.post("/vaults", json={
-            "name": unique("hdirect"), "type": "zero_knowledge",
+            "name": unique("hdirect"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "wrapped_dek": _stub("dek"), "ephemeral_public_key": _stub("eph"),
         })
         r.raise_for_status()

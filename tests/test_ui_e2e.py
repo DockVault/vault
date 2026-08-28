@@ -746,6 +746,11 @@ def test_zero_knowledge_vault_end_to_end(page: Page, admin):
         page.fill("#vault-name", vname)
         expect(page.locator("#vault-type-group")).to_be_visible(timeout=5000)
         page.select_option("#vault-type", "zero_knowledge")
+        # A zero-knowledge vault's real name (#vault-name) is now SEALED in the browser; the
+        # server-visible name is the non-secret LABEL. Set it (to the same value here for simplicity)
+        # so the round-trip can still find the vault by name, and so this exercises the label field.
+        expect(page.locator("#vault-label-group")).to_be_visible(timeout=5000)
+        page.fill("#vault-label", vname)
         page.click("#create-vault-form button[type=submit]")
         expect(page.locator("#create-vault-modal")).to_be_hidden(timeout=15000)
 
@@ -1825,6 +1830,10 @@ def _create_zk_vault_via_ui(page: Page, owner_client, passphrase: str) -> str:
     page.fill("#vault-name", vname)
     expect(page.locator("#vault-type-group")).to_be_visible(timeout=5000)
     page.select_option("#vault-type", "zero_knowledge")
+    # The ZK real name (#vault-name) is sealed in the browser; the server sees only the non-secret
+    # LABEL, so set it (same value here) to keep the by-name lookup below working.
+    expect(page.locator("#vault-label-group")).to_be_visible(timeout=5000)
+    page.fill("#vault-label", vname)
     page.click("#create-vault-form button[type=submit]")
     expect(page.locator("#create-vault-modal")).to_be_hidden(timeout=15000)
     m = [v for v in owner_client.get("/vaults").json() if v["name"] == vname]

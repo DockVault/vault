@@ -19,7 +19,7 @@ import uuid
 
 import pytest
 
-from conftest import unique, ensure_ecc_keypair
+from conftest import unique, ensure_ecc_keypair, ZK_ENC_NAME_STUB
 
 
 def _init(admin, vault_id, **extra):
@@ -45,7 +45,7 @@ def zk_vault(admin):
     try:
         ensure_ecc_keypair(admin)
         r = admin.post("/vaults", json={
-            "name": unique("objidzk"), "type": "zero_knowledge",
+            "name": unique("objidzk"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "wrapped_dek": base64.b64encode(b"dek-" + uuid.uuid4().bytes).decode(),
             "ephemeral_public_key": base64.b64encode(b"eph-" + uuid.uuid4().bytes).decode(),
         })
@@ -262,7 +262,7 @@ def test_an_encrypted_upload_is_protected_too(admin):
     try:
         ensure_ecc_keypair(admin)
         v = admin.post("/vaults", json={
-            "name": unique("objidzk"), "type": "zero_knowledge",
+            "name": unique("objidzk"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "wrapped_dek": base64.b64encode(b"dek-" + uuid.uuid4().bytes).decode(),
             "ephemeral_public_key": base64.b64encode(b"eph-" + uuid.uuid4().bytes).decode(),
         })

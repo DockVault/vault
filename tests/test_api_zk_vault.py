@@ -19,6 +19,7 @@ import json
 import pytest
 
 from conftest import (
+    ZK_ENC_NAME_STUB,
     unique, ensure_ecc_keypair, create_zk_vault, ZK_WRAPPED_DEK_STUB,
     zk_encrypt_name, zk_decrypt_name, zk_name_blind_index, zk_chunked_upload, ZK_NAME_PREFIX,
     ZK_NAME_PREFIX_V2,
@@ -71,7 +72,7 @@ def test_zk_vault_stores_owner_client_wrapped_dek_verbatim(admin):
     ensure_ecc_keypair(admin)
     with _zk_enabled(admin):
         r = admin.post("/vaults", json={
-            "name": unique("zk"), "type": "zero_knowledge",
+            "name": unique("zk"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "wrapped_dek": ZK_WRAPPED_DEK_STUB, "ephemeral_public_key": "EPH-SENTINEL",
         })
         assert r.status_code == 200, r.text
@@ -92,7 +93,7 @@ def test_zk_vault_creation_requires_client_wrapped_dek(admin):
     browser-wrapped DEK is refused (and leaves no orphan vault)."""
     ensure_ecc_keypair(admin)
     with _zk_enabled(admin):
-        r = admin.post("/vaults", json={"name": unique("zk"), "type": "zero_knowledge"})
+        r = admin.post("/vaults", json={"name": unique("zk"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1})
         assert r.status_code == 400, r.text
         assert "key" in r.json().get("detail", "").lower()
 
@@ -110,7 +111,7 @@ def test_zk_vault_creation_requires_a_keypair(admin):
         with _zk_enabled(admin):
             # ensure this fresh user truly has no keypair
             assert client.get("/ecc/keys/public").json().get("has_keypair") is False
-            r = client.post("/vaults", json={"name": unique("zk"), "type": "zero_knowledge"})
+            r = client.post("/vaults", json={"name": unique("zk"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1})
             assert r.status_code in (400, 403), r.text
             if r.status_code == 400:
                 assert "key" in r.json().get("detail", "").lower()
@@ -896,7 +897,7 @@ def test_zk_seal_names_works_on_password_protected_vault(admin):
     pw = "Zk-Vault-Pass-123"
     with _zk_enabled(admin):
         r = admin.post("/vaults", json={
-            "name": unique("zkpw"), "type": "zero_knowledge",
+            "name": unique("zkpw"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "wrapped_dek": ZK_WRAPPED_DEK_STUB, "ephemeral_public_key": "EPH-SENTINEL",
             "password": pw,
         })

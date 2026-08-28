@@ -197,9 +197,15 @@ Once set up, drive the deployment through `dockvault.py` instead of raw `docker 
 ```bash
 python dockvault.py start      # bring it up (waits for health; shows the failing logs if not)
 python dockvault.py status     # containers, health, ports, and whether .env is sealed
-python dockvault.py stop       # stop the containers — data volumes are never touched
-python dockvault.py restart    # stop then start, health-checked
+python dockvault.py stop       # stop the containers, KEEP them (fast restart); data volumes untouched
+python dockvault.py down       # stop + REMOVE the containers (clears their secrets from Docker); asks first
+python dockvault.py restart    # recreate (down + start), health-checked; picks up .env changes
 ```
+
+`stop` mirrors `docker compose stop` (the containers stay, so their secrets stay in Docker's on-disk
+config); `down` mirrors `docker compose down` (the containers are removed, clearing those secrets — it
+never passes `-v`, so your data volumes always survive). To clear *every* at-rest copy of the secrets in
+one step, use `python dockvault.py down --lock` (removes the containers **and** seals `.env`).
 
 ### Sealing credentials at rest (optional)
 
@@ -225,6 +231,27 @@ and threat model: [`docs/design/credential-lock-and-lifecycle.md`](docs/design/c
 
 > ⚠️ Lose **both** the passphrase and the recovery key and `.env.enc` — hence `ENCRYPTION_KEY` — is
 > gone, and every stored file becomes permanently unrecoverable. Back them up.
+
+### What is encrypted at rest — and the host disk-encryption prerequisite
+
+DockVault encrypts **file contents** (AES-256-GCM, per-file keys derived from the deployment key) and
+**file/folder names + MIME types** at rest, so a raw read of the storage volume yields ciphertext, not
+your files or their names.
+
+It does **not** encrypt the rest of the database. The Postgres volume (`vault_pg_data`) holds usernames,
+emails, vault names, note text, and audit records (usernames, client IPs, user agents) in **plaintext**,
+recoverable by anyone who can mount that volume — no password required. All server-side at-rest
+protection also derives from the single `ENCRYPTION_KEY`; there is no per-tenant key separation, so that
+key plus the volumes is total compromise.
+
+**Host full-disk encryption (LUKS/dm-crypt, BitLocker, FileVault, or an encrypted cloud volume) is
+therefore a prerequisite — not an optional extra — for protecting the database and at-rest metadata.**
+It is the same control that protects a running deployment's `.env`. Run DockVault on an encrypted disk.
+
+**Zero-knowledge vaults** additionally seal names and contents in the browser (the server holds no key),
+but the on-disk layout still reveals **structure** — vault/file/folder counts, each encrypted file's
+size (to within the format's fixed overhead), and modification times. That residual metadata channel is
+an explicit non-goal; host full-disk encryption is again the control against a volume reader.
 
 ## Update notifications (opt-in)
 
@@ -299,6 +326,21 @@ might forget to write.
 backup when one is required, and asks you to type an acknowledgement for a change that cannot be
 rolled back. `--dry-run` reports the plan and changes nothing. An upgrade it cannot find a
 description for is treated as the riskiest case rather than assumed safe.
+
+### Support lifecycle and the minimum supported version
+
+Each version in the matrix also declares a support lifecycle: whether it is **end-of-life**, whether
+it is **secure** (free of known unpatched vulnerabilities), and — for an end-of-life version kept on
+extended support — the dates its code fixes and its (usually longer) security-only support run until.
+`dockvault.py update` hides end-of-life releases from the list, refuses to upgrade or downgrade to
+one, and warns before moving to a version with known unpatched vulnerabilities.
+
+**0.17.0 is the minimum supported version.** It seals vault names, descriptions and file checksums at
+rest in columns an older image cannot read, so there is no in-place upgrade into it from 0.16.1 and no
+in-place downgrade off it — an older image fails closed rather than serving something wrong. Reach
+0.17.0 by deploying it as a fresh set and restoring your data from a backup, not by upgrading over the
+existing volumes; `dockvault.py update` refuses the in-place move and says so. Every release below
+0.17.0 is end-of-life.
 
 ## Data volumes
 

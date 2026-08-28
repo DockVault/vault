@@ -116,10 +116,13 @@ def test_redis_denylisted_session_is_denied_identically(temp_user_client):
 
 
 def test_durably_revoked_session_is_denied_identically(temp_user, temp_user_client):
-    session_token = _token_payload(temp_user_client.token)["session_token"].replace("'", "''")
+    # Session tokens are stored hashed at rest, so mark the row revoked by the token's hash (a
+    # 64-char hex value, so no SQL-quote escaping is needed).
+    session_token = _token_payload(temp_user_client.token)["session_token"]
+    token_hash = hashlib.sha256(session_token.encode()).hexdigest()
     _db(
         "UPDATE active_sessions SET revoked=true "
-        f"WHERE user_id='{temp_user['id']}' AND session_token='{session_token}'"
+        f"WHERE user_id='{temp_user['id']}' AND session_token='{token_hash}'"
     )
     _assert_all(temp_user_client, 401)
 

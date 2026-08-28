@@ -38,7 +38,8 @@ APP_ROOT = os.environ.get("DOCKVAULT_ROOT") or os.path.dirname(os.path.abspath(_
 MENU = [
     ("setup",   "Setup - configure + start the vault"),
     ("start",   "Start - bring the deployment up (health-checked)"),
-    ("stop",    "Stop - stop the deployment (data volumes kept)"),
+    ("stop",    "Stop - stop the deployment, KEEP containers (faster restart; secrets remain until 'down')"),
+    ("down",    "Down - stop + REMOVE containers (clears secrets from Docker; confirms first; data kept)"),
     ("restart", "Restart - stop then start (health-checked)"),
     ("status",  "Status - containers, health, ports, lock state"),
     ("lock",    "Lock - seal .env into an encrypted .env.enc"),
@@ -413,6 +414,12 @@ def build_env_lines(cfg):
     sftp_active = cfg.get("run_sftp") or compose_profile == "split"
     if sftp_active and cfg.get("sftp_host_port") and int(cfg["sftp_host_port"]) != 2322:
         bare("SFTP_HOST_PORT", int(cfg["sftp_host_port"]))
+    # SFTP upload-staging tmpfs size (MiB) — also the max SFTP upload size until streaming lands.
+    # Written only when the operator chose a non-default value; otherwise the compose/app default
+    # (512) applies, so an install that never mentions it authors the .env it always did.
+    if sftp_active and cfg.get("sftp_staging_tmpfs_mb") not in (None, "") \
+            and int(cfg["sftp_staging_tmpfs_mb"]) != 512:
+        bare("SFTP_STAGING_TMPFS_MB", int(cfg["sftp_staging_tmpfs_mb"]))
     if cfg.get("update_check_enabled"):
         bare("UPDATE_CHECK_ENABLED", "true")
     # Deployment storage ceiling. Only written when the operator chose one: left out, the app's
@@ -1153,18 +1160,26 @@ def new_set_config(current_env, new_prefix, new_id):
     deployment id. The paired secrets and volumes are created together, upholding the bundle invariant."""
     def truthy(k):
         return (current_env.get(k) or "").strip().lower() in ("1", "true", "yes", "on")
+    # A new set is a new admin. Carry the source .env's admin password if it still has one, but a
+    # deployment whose spent ADMIN_PASSWORD was dropped after bootstrap has none to carry - generate
+    # a fresh one and flag it so the caller shows it once (the operator needs it to log into the new
+    # set, and it is the only place it is ever printed).
+    src_admin_pw = (current_env.get("ADMIN_PASSWORD") or "").strip()
     cfg = {
         "server_name": current_env.get("SERVER_NAME") or current_env.get("ALLOWED_HOSTS") or "localhost",
         "encryption_key": gen_fernet_key(), "jwt_secret_key": gen_hex(32),
         "vault_db_password": gen_hex(16), "redis_password": gen_hex(24),
         "admin_username": current_env.get("ADMIN_USERNAME") or "admin",
         "admin_email": current_env.get("ADMIN_EMAIL") or "admin@example.com",
-        "admin_password": current_env.get("ADMIN_PASSWORD") or gen_hex(12),
+        "admin_password": src_admin_pw or gen_hex(12),
+        "_generated_admin_pw": not src_admin_pw,
         "compose_profiles": current_env.get("COMPOSE_PROFILES") or "combined",
         "deployment_id": new_id, "volume_prefix": new_prefix,
         "run_sftp": truthy("RUN_SFTP"),
         "web_host_port": _port_or(current_env.get("WEB_HOST_PORT"), 443),
         "sftp_host_port": _port_or(current_env.get("SFTP_HOST_PORT"), 2322),
+        # Keep a custom SFTP staging size across a fresh volume set, like the ports above.
+        "sftp_staging_tmpfs_mb": (current_env.get("SFTP_STAGING_TMPFS_MB") or "").strip() or None,
         "update_check_enabled": truthy("UPDATE_CHECK_ENABLED"),
         "plan_log_pull": truthy("PLAN_LOG_PULL"),
         "log_token_pepper": gen_hex(32) if truthy("PLAN_LOG_PULL") else "",
@@ -1340,6 +1355,106 @@ def untar_volume(volume, src_dir, archive_name, run=subprocess.run):
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
     return getattr(r, "returncode", 1) == 0
+
+
+def clear_volume(volume, run=subprocess.run):
+    """Empty a docker volume's contents IN PLACE via a throwaway busybox (read-write mount), so a
+    restore REPLACES rather than merges. Clears dotfiles + regular entries but keeps the volume
+    OBJECT (and its DockVault labels) - unlike `docker volume rm`, which would drop the labels the
+    volume manager groups sets by. The volume must not be in use (the caller stops the stack first);
+    the -v mount creates it if absent (then the clear is a no-op on the empty dir). Returns True on
+    success, False on a real failure - which the caller MUST honour rather than extracting on top (a
+    partial clear + extract is the merge this exists to prevent). No trailing `; true`: the rm globs
+    already exit 0 on an empty volume (rm -f ignores a non-matching literal), so keeping the real exit
+    code lets a genuine failure (permission / read-only / I/O) surface as False."""
+    try:
+        r = run(["docker", "run", "--rm", "-v", "%s:/v" % volume, "busybox", "sh", "-c",
+                 "rm -rf /v/..?* /v/.[!.]* /v/* 2>/dev/null"],
+                capture_output=True, text=True, timeout=300)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return getattr(r, "returncode", 1) == 0
+
+
+# --- backup directory resolution -------------------------------------------------------------
+# Backups used to land in <repo>/backups (the script's own directory), so a clone under Downloads put
+# every secret-bearing bundle under Downloads. They now default to a per-OS application-data directory
+# and the location is overridable + can name SEVERAL directories.
+def _writable_dir(path):
+    """True if `path` exists-or-can-be-created AND a probe file can be written there (creating it 0700
+    on POSIX as a side effect, then removing the probe). Picking the first WRITABLE candidate stops a
+    full / read-only / disconnected-network location from silently swallowing a backup."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        if os.name != "nt":
+            try:
+                os.chmod(path, 0o700)
+            except OSError:
+                pass
+        probe = os.path.join(path, ".dockvault_write_probe")
+        try:
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("")
+        finally:
+            try:
+                os.remove(probe)        # always clean up, even if the write raised mid-way
+            except OSError:
+                pass
+        return True
+    except OSError:
+        return False
+
+
+def _app_data_backup_root():
+    """The per-OS application-data backup directory (a PATH only - not created, not probed). Windows:
+    %LOCALAPPDATA% (non-roaming, because bundles are large and hold ENCRYPTION_KEY so they must not
+    sync) then %APPDATA%. macOS: ~/Library/Application Support. Linux/other: $XDG_DATA_HOME then
+    ~/.local/share. All under DockVault/backups."""
+    home = os.path.expanduser("~")
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or home
+    elif sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share")
+    return os.path.join(base, "DockVault", "backups")
+
+
+def parse_backup_dirs(raw):
+    """Split a backup-location value into an ordered list of paths. Accepts a single path OR several
+    separated by os.pathsep (';' Windows, ':' POSIX) or newlines, so DOCKVAULT_BACKUP_DIR / --backup-dir
+    can name MULTIPLE locations. Expands ~; drops blanks. Returns [] for empty/None."""
+    if not raw:
+        return []
+    out = []
+    for chunk in str(raw).replace("\n", os.pathsep).split(os.pathsep):
+        chunk = chunk.strip()
+        if chunk:
+            out.append(os.path.expanduser(chunk))
+    return out
+
+
+def _default_backup_candidates():
+    """The ordered default write-target candidates when no --backup-dir is given: DOCKVAULT_BACKUP_DIR
+    (which may list several), then the per-OS app-data dir, then ~/DockVault/backups, then
+    ~/Downloads/DockVault/backups. PURE - computes paths only, never probes or creates (so a
+    read-only listing can display them without side effects)."""
+    home = os.path.expanduser("~")
+    return parse_backup_dirs(os.environ.get("DOCKVAULT_BACKUP_DIR")) + [
+        _app_data_backup_root(),
+        os.path.join(home, "DockVault", "backups"),
+        os.path.join(home, "Downloads", "DockVault", "backups"),
+    ]
+
+
+def default_backup_dir():
+    """The directory NEW bundles are written to when no --backup-dir is given: the first WRITABLE
+    default candidate (created as a side effect), else the app-data path (a later mkdir then surfaces
+    the error) so a backup never silently vanishes into an unwritable location."""
+    for cand in _default_backup_candidates():
+        if _writable_dir(cand):
+            return cand
+    return _app_data_backup_root()
 
 
 # --- update (release list + upgrade/downgrade) -----------------------------------------------
@@ -1566,7 +1681,8 @@ def plan_upgrade_path(matrix, current, target):
         return unknown
     if _semver_key(target) < _semver_key(current):
         # A downgrade. The matrix describes forward edges only, and reversing one is not the same
-        # claim, so this is deliberately not classified from it.
+        # claim, so this is deliberately not classified from it here -- the host tool asks
+        # `downgrade_refusal` separately when it needs the reverse verdict.
         return unknown
 
     steps = _walk_edges(matrix, current, target)
@@ -1584,6 +1700,86 @@ def plan_upgrade_path(matrix, current, target):
         "conditions": [c for e in steps for c in (e.get("conditions") or [])],
         "known": True,
     }
+
+
+def downgrade_refusal(matrix, current, target):
+    """Whether a DOWNGRADE from `current` to `target` must be refused, and why.
+
+    The matrix declares forward edges; reversing one is only a safe claim where that edge is
+    reversible, and impossible across a blocked one. So the reverse verdict is read off the FORWARD
+    path from `target` up to `current`: a downgrade across any irreversible or blocked edge is
+    refused. Returns (refused: bool, reason: str|None). A downgrade the matrix cannot describe at all
+    is NOT force-refused here -- it flows through the existing 'undescribed, needs a backup' path so
+    behaviour outside the declared range is unchanged.
+    """
+    if not isinstance(matrix, dict):
+        return False, None
+    versions = matrix.get("versions") or {}
+    cur = (current or "").lstrip("vV")
+    tgt = (target or "").lstrip("vV")
+    if cur not in versions or tgt not in versions or _semver_key(tgt) >= _semver_key(cur):
+        return False, None
+    forward = _walk_edges(matrix, tgt, cur)
+    if not forward:
+        return False, None
+    blocked = next((e for e in forward if e.get("kind") == "blocked"), None)
+    if blocked is not None:
+        return True, blocked.get("reason") or "the forward upgrade is blocked, so it has no reverse"
+    if any(not e.get("reversible", True) for e in forward):
+        return True, ("the upgrade into the running version is marked irreversible, so an older "
+                      "image cannot read the data written since")
+    return False, None
+
+
+def version_support(matrix, version):
+    """The `support` lifecycle block for `version`, or {} when it is not stated.
+
+    Returns {} for a matrix that predates the lifecycle schema (an older published upgrade.json) or
+    that does not declare the version, so an old file keeps working: an absent block means 'lifecycle
+    not stated' -- neither end-of-life nor known-insecure -- rather than an error."""
+    if not isinstance(matrix, dict):
+        return {}
+    version = (version or "").lstrip("vV")
+    meta = (matrix.get("versions") or {}).get(version) or {}
+    support = meta.get("support")
+    return support if isinstance(support, dict) else {}
+
+
+def is_eol(matrix, version):
+    """True only when the matrix explicitly marks `version` end-of-life."""
+    return version_support(matrix, version).get("eol") is True
+
+
+def preferred_lifecycle_matrix(local_matrix, fetched_matrix, version):
+    """Which matrix to read a version's LIFECYCLE (eol / secure) from.
+
+    Lifecycle is a GLOBAL, time-varying property -- a version is marked end-of-life LATER than it
+    shipped -- so the authoritative source is this checkout's newest matrix, not the target's own
+    published one (which is frozen at its cut time and forever self-declares eol:false). Fall back to
+    the target's matrix only when the local one does not describe the version at all, e.g. the target
+    is newer than this checkout. This is the INVERSE of hop DESCRIPTION, where the target's own file
+    is preferred because only it can describe a hop reaching a newer release."""
+    return local_matrix if version_support(local_matrix, version) else fetched_matrix
+
+
+def support_line(matrix, version):
+    """A one-line human summary of a version's lifecycle, or '' when nothing is stated. Names the
+    end-of-life state, any extended-support tail dates, and whether the version is insecure."""
+    s = version_support(matrix, version)
+    if not s:
+        return ""
+    if s.get("eol") is True:
+        parts = ["end-of-life"]
+        if s.get("code_support"):
+            parts.append("code support until %s" % s["code_support"])
+        if s.get("security_support"):
+            parts.append("security support until %s" % s["security_support"])
+        head = "; ".join(parts)
+    else:
+        head = "supported"
+    if s.get("secure") is False:
+        head += " -- has known unpatched vulnerabilities"
+    return head
 
 
 def fetch_upgrade_matrix(tag, root=None, opener=None):
@@ -1655,6 +1851,18 @@ def container_running(name, run=subprocess.run):
     if getattr(r, "returncode", 1) != 0:
         return False
     return (getattr(r, "stdout", "") or "").strip() == "true"
+
+
+def container_exists(name, run=subprocess.run):
+    """True if a container named `name` exists at all - RUNNING OR STOPPED. A stopped container still
+    holds its environment in Docker's on-disk config, so this (not container_running) is what tells an
+    operator whether the deployment's secrets still sit in Docker while .env is sealed. Best-effort:
+    any docker error answers False."""
+    try:
+        r = run(["docker", "container", "inspect", name], capture_output=True, text=True, timeout=20)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return getattr(r, "returncode", 1) == 0
 
 
 def container_mounts(name, run=subprocess.run):
@@ -1734,6 +1942,36 @@ def probe_pg_password(container, user, db, password, run=subprocess.run):
     except (OSError, ValueError, subprocess.SubprocessError):
         return "ambiguous"
     return classify_pg_probe(getattr(r, "returncode", 1), getattr(r, "stderr", ""))
+
+
+def admin_bootstrap_done(container, user, db, password, run=subprocess.run):
+    """Whether the running DB carries the admin_bootstrap marker - i.e. an admin exists and the
+    initial ADMIN_PASSWORD is spent. Returns True (marker present), False (confirmed absent) or None
+    (any docker/exec/auth error -> the caller must fail closed and KEEP the password). Connects the
+    same way probe_pg_password does (the container's own IP + PGPASSWORD, never the trusted socket),
+    so it exercises real auth and never puts a secret on the host argv."""
+    try:
+        ipr = run(["docker", "exec", container, "hostname", "-i"],
+                  capture_output=True, text=True, timeout=20)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if getattr(ipr, "returncode", 1) != 0:
+        return None
+    parts = (getattr(ipr, "stdout", "") or "").split()
+    if not parts:
+        return None
+    ip = parts[0]
+    try:
+        r = run(["docker", "exec", "-e", "PGPASSWORD", container,
+                 "psql", "-h", ip, "-U", user, "-d", db, "-tAc",
+                 "SELECT 1 FROM system_settings WHERE key='admin_bootstrap' LIMIT 1"],
+                capture_output=True, text=True, timeout=30,
+                env=dict(os.environ, PGPASSWORD=password))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    return (getattr(r, "stdout", "") or "").strip() == "1"
 
 
 def db_guard_decision(volume_exists_flag, probe_result):
@@ -2085,6 +2323,21 @@ class DockVault:
             raise SystemExit(1)
         os.remove(env_path)
         print(pal.paint("  Locked: .env -> .env.enc (plaintext .env removed).", "green"))
+        # Sealing .env seals ONLY .env. Any .env.<prefix> archives set aside by 'new set' / repoint /
+        # remove are still plaintext on disk and each holds an ENCRYPTION_KEY -- surface them so they
+        # are not overlooked (lock does not manage them).
+        archives = self._env_archives()
+        if archives:
+            print(pal.paint(
+                "  WARNING: %d plaintext .env archive(s) are NOT sealed by lock and still hold an\n"
+                "  ENCRYPTION_KEY (%s). Back them up off this host, then delete them."
+                % (len(archives), ", ".join(os.path.basename(a) for a in archives)), "red"))
+        # Sealing .env does NOT clear the copy Docker already baked into a running/stopped container's
+        # on-disk config -- point the operator at the command that does.
+        if container_exists(DB_CONTAINER):
+            print(pal.paint("  NOTE: the deployment's containers still exist, so their secrets are STILL "
+                            "in Docker's on-disk config even though .env is sealed - run 'down' to remove "
+                            "the containers (or 'down --lock' to do both at once).", "yellow"))
         if not reuse:
             self._show_recovery_key(dek, args)
 
@@ -2184,8 +2437,11 @@ class DockVault:
         print(pal.paint("  Up and healthy.", "green"))
         self._print_status(profiles)
 
-    def stop(self, args=None):
-        """Stop the deployment's containers. Data volumes are untouched (never `down -v`)."""
+    def _tear_down_containers(self):
+        """`compose down --remove-orphans` (removes containers, keeps data volumes). Removing the
+        containers also removes Docker's on-disk copy of their environment, so the deployment's secrets
+        stop sitting in config.v2.json / `docker inspect`. Returns True if it ran, False when there was
+        nothing to address (no .env). Raises SystemExit on docker-unavailable or a compose failure."""
         pal = self.pal
         ok, _ = docker_available()
         if not ok:
@@ -2193,21 +2449,85 @@ class DockVault:
             raise SystemExit(2)
         if not os.path.exists(self._env_path()):
             # compose needs .env for the ${VAR:?} interpolation even to address the stack.
+            print(pal.paint("  .env is not present (locked?); nothing to remove by this tool.", "yellow"))
+            return False
+        try:
+            self._run_dc("down", "--remove-orphans", capture=False, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(pal.paint("  Down failed: %s" % exc, "red"))
+            raise SystemExit(1)
+        return True
+
+    def _confirm_remove(self, args):
+        """Confirm removing the containers. `--yes` bypasses. Otherwise prompt, defaulting to NO -- so a
+        piped/EOF stdin (automation) declines rather than silently removing containers; a script must be
+        explicit via `--yes`. (A programmatic `non_interactive` arg also refuses outright, with a clear
+        message.)"""
+        if getattr(args, "yes", False):
+            return True
+        if args is not None and getattr(args, "non_interactive", False):
+            print(self.pal.paint("  Refusing to remove containers non-interactively without --yes.",
+                                  "red"))
+            return False
+        return confirm("Remove the deployment's containers now? (data volumes are kept)",
+                       self.pal, default=False)
+
+    def stop(self, args=None):
+        """Stop the deployment but KEEP its (stopped) containers, for a faster restart and to retain
+        `docker logs` (`docker compose stop`). WARNING: a stopped container STILL holds the deployment's
+        secrets in Docker's on-disk config (config.v2.json) and via `docker inspect`, so this does NOT
+        remove them from disk -- run `down` for that (or `down --lock` to also seal `.env`)."""
+        pal = self.pal
+        ok, _ = docker_available()
+        if not ok:
+            print(pal.paint("  Docker is not available.", "red"))
+            raise SystemExit(2)
+        if not os.path.exists(self._env_path()):
             print(pal.paint("  .env is not present (locked?); nothing to stop by this tool.", "yellow"))
+            return
+        print(pal.paint("  Stopping the deployment, keeping its containers (data volumes kept) ...",
+                        "cyan"))
+        try:
+            self._run_dc("stop", capture=False, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(pal.paint("  Stop failed: %s" % exc, "red"))
+            raise SystemExit(1)
+        print(pal.paint("  Stopped (containers kept). WARNING: the stopped containers STILL hold the "
+                        "deployment secrets in Docker's on-disk config - run 'down' to remove them "
+                        "(or 'down --lock' to also seal .env).", "yellow"))
+
+    def down(self, args=None):
+        """Stop the deployment and REMOVE its containers (`docker compose down`, never `-v` - data
+        volumes are kept), which also clears Docker's on-disk copy of their secrets. Confirms first (it
+        removes the running containers); `--yes` skips the prompt, and a piped/non-interactive stdin
+        declines unless `--yes` is given. `--lock` also seals `.env` into `.env.enc` afterwards, so no
+        plaintext secret is left at rest anywhere."""
+        pal = self.pal
+        if os.path.exists(self._env_path()):
+            # Check Docker BEFORE prompting, so we don't ask + announce a removal we then can't do.
+            ok, _ = docker_available()
+            if not ok:
+                print(pal.paint("  Docker is not available.", "red"))
+                raise SystemExit(2)
+            if not self._confirm_remove(args):
+                print(pal.paint("  Cancelled - nothing was removed.", "yellow"))
+                return
+            print(pal.paint("  Stopping the deployment and removing its containers (data volumes are "
+                            "kept) ...", "cyan"))
+            self._tear_down_containers()
+            print(pal.paint("  Stopped and removed - the deployment's secrets are no longer held in "
+                            "Docker's container config.", "green"))
         else:
-            print(pal.paint("  Stopping the deployment (data volumes are kept) ...", "cyan"))
-            try:
-                self._run_dc("stop", capture=False, timeout=120)
-            except (OSError, subprocess.SubprocessError) as exc:
-                print(pal.paint("  Stop failed: %s" % exc, "red"))
-                raise SystemExit(1)
-            print(pal.paint("  Stopped.", "green"))
+            # Nothing this tool can address; still allow a --lock to seal a stray plaintext .env below.
+            print(pal.paint("  .env is not present (locked?); nothing to remove by this tool.", "yellow"))
         if getattr(args, "lock", False) and os.path.exists(self._env_path()):
             self.lock(args)
 
     def restart(self, args=None):
-        """Stop, then start (health-checked). Data volumes are untouched."""
-        self.stop(args)
+        """Recreate the deployment (compose down + start, health-checked) so a changed .env takes
+        effect. Data volumes are untouched. No prompt: this is an explicit in-place action, not the
+        standalone `down`."""
+        self._tear_down_containers()
         self.start(args)
 
     def status(self, args=None):
@@ -2223,11 +2543,22 @@ class DockVault:
                             "green"))
         else:
             print(pal.paint("  Credentials: plaintext .env (not locked)", "grey"))
+        archives = self._env_archives()
+        if archives:
+            print(pal.paint("  Note: %d plaintext .env archive(s) on disk (%s) - each holds an "
+                            "ENCRYPTION_KEY and is NOT sealed by 'lock'."
+                            % (len(archives), ", ".join(os.path.basename(a) for a in archives)), "yellow"))
         ok, _ = docker_available()
         if not ok:
             print(pal.paint("  Docker is not available.", "yellow"))
             return
         if not os.path.exists(self._env_path()):
+            if container_exists(DB_CONTAINER):
+                # 'stop' needs .env to address the stack, so while sealed it is a no-op: guide the
+                # operator to unlock first, then stop (which removes the containers + their secrets).
+                print(pal.paint("  WARNING: the deployment's containers still exist, so its secrets are "
+                                "STILL in Docker's on-disk config even though .env is sealed - run "
+                                "'unlock' then 'stop' to remove them.", "red"))
             print(pal.paint("  (containers not listed while .env is locked - unlock first)", "yellow"))
             return
         try:
@@ -2271,6 +2602,12 @@ class DockVault:
             # second run keeps whatever id is already there.
             if not (existing.get("DEPLOYMENT_ID") or "").strip():
                 self._set_env_key(env_path, "DEPLOYMENT_ID", "default")
+            # Honour an explicit --admin-password/--admin-username on a reuse: it seeds the FIRST admin
+            # of a set that is not bootstrapped yet (e.g. a fresh set just authored by the Volumes
+            # menu, whose .env carries an auto-generated placeholder password). On an already-
+            # bootstrapped deployment the seed is marker-guarded, so this is inert and the value is
+            # dropped again after a healthy boot. Not passed -> the existing .env is left untouched.
+            existing = self._apply_cli_admin_overrides(env_path, existing, args)
             summary = {"server_name": existing.get("SERVER_NAME") or existing.get("ALLOWED_HOSTS") or "",
                        "admin_username": existing.get("ADMIN_USERNAME") or "admin",
                        "compose_profiles": migrated,
@@ -2343,7 +2680,10 @@ class DockVault:
         # with a clear diagnosis (the reported "wrong password after re-setup" footgun).
         env_now = parse_env(open(env_path, encoding="utf-8").read()) if os.path.exists(env_path) else {}
         interactive = not (args and getattr(args, "non_interactive", False))
-        if not self._guard_db_secret(env_now, interactive=interactive):
+        # A .env authored by THIS run (a fresh install, not a reuse) that has never touched data is a
+        # throwaway - tell the guard so its 'deploy a new set' option discards it instead of archiving
+        # a pointless plaintext-secret file.
+        if not self._guard_db_secret(env_now, interactive=interactive, env_is_fresh=not reusing):
             raise SystemExit(1)   # the guard already printed the diagnosis + recovery paths
         # The interactive guard can install a different .env or author a fresh set. Re-read it,
         # persist any supported legacy profile, and refresh every profile/port value used below.
@@ -2390,6 +2730,12 @@ class DockVault:
         healthy = self._wait_secure_healthy(profiles)
         logs_shown = False if healthy else self._tail_logs(self._web_service(profiles))
         self._print_setup_summary(summary, healthy, logs_shown)
+        # Once the deployment is up and the admin is bootstrapped, ADMIN_PASSWORD is spent: drop it
+        # from the host .env so the initial admin password is not retained in plaintext at rest. The
+        # app scrubs its own in-container copy; this closes the on-disk copy. Fail-safe (keeps the
+        # value on any doubt) and never breaks a healthy setup.
+        if healthy:
+            self._strip_spent_admin_password(env_path, env_now)
         # NOTE: the coupling stamp is written ONLY where a pairing has been PROVEN - after a
         # successful psql auth probe in _verify_env_against_volume. Stamping here would be
         # fail-OPEN: the interactive guard can rewrite .env mid-run (choosing "deploy a NEW set"
@@ -2517,6 +2863,9 @@ class DockVault:
             "run_sftp": enable_sftp,
             "web_host_port": web_port,
             "sftp_host_port": sftp_port,
+            # SFTP staging tmpfs size — install-time only (a deploy-time infra knob, not a live
+            # limit, so it is not in the Limits menu). --sftp-staging-tmpfs-mb or hand-edit .env.
+            "sftp_staging_tmpfs_mb": (getattr(args, "sftp_staging_tmpfs_mb", None) if args else None),
             "update_check_enabled": update_check,
             "plan_log_pull": log_pull,
             "log_token_pepper": gen_hex(32) if log_pull else "",
@@ -2571,6 +2920,90 @@ class DockVault:
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(lines) + "\n")
         tighten_secret_file(path)
+
+    def _remove_env_keys(self, path, keys):
+        """Remove any KEY= lines for the given keys from .env (preserving perms). Returns True if any
+        line was removed. Comments and every other line are kept verbatim."""
+        if not os.path.exists(path):
+            return False
+        keyset = set(keys)
+        out, removed = [], False
+        for raw in open(path, encoding="utf-8").read().splitlines():
+            m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", raw)
+            if m and m.group(1) in keyset:
+                removed = True
+                continue
+            out.append(raw)
+        if removed:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("\n".join(out) + "\n")
+            tighten_secret_file(path)
+        return removed
+
+    def _apply_cli_admin_overrides(self, path, env, args):
+        """On a setup reuse, write an EXPLICIT --admin-password/--admin-username/--admin-email into the
+        reused .env so it can seed a not-yet-bootstrapped set (harmless on a bootstrapped one). Returns
+        the updated env dict. A no-op when none were passed."""
+        changed = {}
+        for cli, key in (("admin_password", "ADMIN_PASSWORD"), ("admin_username", "ADMIN_USERNAME"),
+                         ("admin_email", "ADMIN_EMAIL")):
+            val = (getattr(args, cli, None) if args else None)
+            if not val:
+                continue
+            # Validate the password with the SAME guard the fresh path uses (_collect_setup_config),
+            # BEFORE it reaches .env. An unvalidated value that contains a single quote would corrupt
+            # the single-quoted .env line, so the app is seeded with a different password than the
+            # operator supplied - then dropped after a healthy boot, a silent admin lockout.
+            if key == "ADMIN_PASSWORD":
+                prob = admin_password_problem(val, "production")
+                if prob:
+                    self._fail("admin password %s" % prob)
+            self._set_env_key(path, key, "'%s'" % val)
+            changed[key] = val
+        if changed:
+            env = dict(env, **changed)
+        return env
+
+    def _env_archives(self):
+        """Every plaintext .env archive on disk (.env.<something>), excluding the template and the
+        sealed lock file. These are set aside by 'new set' / repoint / remove and still hold an
+        ENCRYPTION_KEY; 'lock' does not manage them, so the tool surfaces them instead."""
+        out = []
+        for p in glob.glob(os.path.join(self.root, ".env.*")):
+            base = os.path.basename(p)
+            if base in (".env.example", ".env.enc") or not os.path.isfile(p):
+                continue
+            out.append(p)
+        return sorted(out)
+
+    def _warn_env_archived(self, archived):
+        """Warn (in red) that a real .env was set aside as a plaintext archive the tool won't manage."""
+        print(self.pal.paint(
+            "  ! Your previous .env was archived to %s. It is PLAINTEXT and still holds that\n"
+            "    deployment's ENCRYPTION_KEY and DB password. 'lock' does NOT seal .env.* archives -\n"
+            "    back it up off this host, then delete or hand-seal it." % os.path.basename(archived),
+            "bold", "red"))
+
+    def _strip_spent_admin_password(self, env_path, env):
+        """After a healthy boot, drop the spent ADMIN_PASSWORD from the host .env once the admin is
+        bootstrapped (an admin exists). Fail-safe: only strips when the DB confirms the bootstrap
+        marker; on any doubt it keeps the value (a later boot may still need it to seed the first
+        admin). ADMIN_USERNAME/ADMIN_EMAIL are not secrets and are kept (they give a re-run its admin
+        name). Never raises - credential hygiene must not break a working setup."""
+        pal = self.pal
+        try:
+            if not (env.get("ADMIN_PASSWORD") or "").strip():
+                return   # already stripped / never set
+            done = admin_bootstrap_done(DB_CONTAINER, PG_USER, PG_DB, env.get("VAULT_DB_PASSWORD", ""))
+            if done is not True:
+                return   # could not confirm an admin exists -> keep the bootstrap password
+            if self._remove_env_keys(env_path, ["ADMIN_PASSWORD"]):
+                print(pal.paint(
+                    "  Removed the spent ADMIN_PASSWORD from .env (the admin is bootstrapped; it is no\n"
+                    "  longer needed). Re-supply it only to seed a NEW admin on a fresh database.",
+                    "green"))
+        except Exception as exc:  # noqa: BLE001 - hygiene is best-effort, never fatal
+            print(pal.paint("  (could not drop the spent ADMIN_PASSWORD from .env: %s)" % exc, "yellow"))
 
     def _normalize_compose_profile(self):
         """Persist the one supported app profile before any Compose command reads ``.env``.
@@ -2840,12 +3273,13 @@ class DockVault:
         return False
 
     def _guard_db_secret(self, env, interactive=False, exists_fn=None, start_fn=None, wait_fn=None,
-                         probe_fn=None, stop_fn=None, marker_fn=None, stamp_fn=None):
+                         probe_fn=None, stop_fn=None, marker_fn=None, stamp_fn=None, env_is_fresh=False):
         """Guardrail against the 'existing volume + wrong .env' footgun. No-op (True) for a fresh
         volume. NON-interactive (a script): auto-verify the current .env's DB password and FAIL CLOSED
         on a mismatch/ambiguous result. INTERACTIVE: do NOT auto-wait - present choices (verify / point
         at a .env / new set / destroy / cancel) and run the ~30s DB probe only if the operator asks.
-        Never prints a secret. The *_fn hooks are injectable for tests."""
+        Never prints a secret. The *_fn hooks are injectable for tests. env_is_fresh flags a .env this
+        setup run just authored and never used, so the interactive 'new set' option can discard it."""
         exists_fn = exists_fn or volume_exists
         vol = "%s_vault_pg_data" % volume_prefix(env)
         if not exists_fn(vol):
@@ -2854,7 +3288,7 @@ class DockVault:
                  probe_fn or probe_pg_password, stop_fn or self._stop_db_only,
                  marker_fn or read_volume_coupling, stamp_fn or write_volume_coupling)
         if interactive:
-            return self._resolve_existing_volume(env, vol, hooks)
+            return self._resolve_existing_volume(env, vol, hooks, env_is_fresh=env_is_fresh)
         # non-interactive: verify + fail closed (a script must not auto-destroy or auto-fork).
         result = self._verify_env_against_volume(env, vol, hooks)
         if result == "ok":
@@ -2901,10 +3335,15 @@ class DockVault:
             stamp_fn(vol, env)   # best-effort: make the next check instant
         return result if result in ("ok", "mismatch") else "ambiguous"
 
-    def _resolve_existing_volume(self, env, vol, hooks):
+    def _resolve_existing_volume(self, env, vol, hooks, env_is_fresh=False):
         """Interactive menu shown when an existing data volume is found. NOTHING starts until the
         operator chooses; only 1/2 run the slow DB probe. Returns True to PROCEED (after acting) or
-        False to stop. Never prints a secret."""
+        False to stop. Never prints a secret.
+
+        env_is_fresh marks the current .env as one THIS setup run just authored and never used (a
+        fresh install that found a pre-existing volume). It is threaded to option 3 so a throwaway
+        .env is discarded rather than archived. Pointing at another .env (option 2) installs a real
+        secret file, so the flag is cleared once that happens."""
         pal = self.pal
         print(pal.paint("\n  Found an existing data volume from a previous deployment:", "yellow"))
         print("    %s" % vol)
@@ -2937,11 +3376,12 @@ class DockVault:
                     print(pal.paint("  That .env is not deployable: %s." % exc, "red"))
                     continue
                 env = self._load_env()   # the installed .env may name a different volume set
+                env_is_fresh = False     # a real, operator-supplied .env now - never discard it
                 print(pal.paint("  Installed that .env; verifying it...", "cyan"))
                 if self._try_verify(env, "%s_vault_pg_data" % volume_prefix(env), hooks):
                     return True
             elif choice == "3":
-                self._new_set_from(env)
+                self._new_set_from(env, current_env_is_fresh=env_is_fresh)
                 return True
             elif choice == "4":
                 if self._destroy_data(vol):
@@ -2970,19 +3410,35 @@ class DockVault:
                             "mismatch. Try again, or pick another option.", "yellow"))
         return False
 
-    def _new_set_from(self, env):
-        """Author a fresh set (new prefix + secrets) with its own .env, archiving the current one. The
-        old data is left untouched (re-pointable later from the Volumes menu)."""
+    def _new_set_from(self, env, current_env_is_fresh=False):
+        """Author a fresh set (new prefix + secrets) with its own .env. The old data is left untouched
+        (re-pointable later from the Volumes menu).
+
+        current_env_is_fresh marks a .env this same setup run just authored and never used to touch
+        data (a fresh install that hit an existing volume). That .env's secrets open nothing, so it is
+        DISCARDED (overwritten by the new set's .env) rather than archived as a pointless plaintext
+        secret file. A real, pre-existing .env is archived and the operator is warned in red that the
+        archive is plaintext and holds that deployment's ENCRYPTION_KEY."""
         pal = self.pal
         new_id = gen_deployment_id()
         new_prefix = "%s-%s" % (DEFAULT_PROJECT, new_id)
-        self._archive_env(volume_prefix(env))
-        if write_env(self._env_path(), build_env_lines(new_set_config(env, new_prefix, new_id))):
-            print(pal.paint("  Authored a fresh set '%s' (new volumes + secrets); starting it. The previous "
-                            "set's .env was saved aside." % new_prefix, "green"))
+        archived = None if current_env_is_fresh else self._archive_env(volume_prefix(env))
+        cfg = new_set_config(env, new_prefix, new_id)
+        if write_env(self._env_path(), build_env_lines(cfg)):
+            note = "  Authored a fresh set '%s' (new volumes + secrets); starting it." % new_prefix
+            if archived:
+                note += " The previous set's .env was saved aside."
+            print(pal.paint(note, "green"))
         else:
             print(pal.paint("  Authored a fresh set '%s' - WARNING: could not restrict the new .env's "
                             "permissions; secure it yourself." % new_prefix, "yellow"))
+        if archived:
+            self._warn_env_archived(archived)
+        if cfg.get("_generated_admin_pw"):
+            # Show the freshly-generated admin password on the controlling terminal only (like the
+            # recovery key), so a redirected/tee'd stdout or CI log can't capture it.
+            self._emit_secret(pal.paint("  New set's admin password: %s   (auto-generated - store it NOW)"
+                                        % cfg["admin_password"], "bold", "yellow"))
 
     def _destroy_data(self, vol):
         """Strong-confirm + docker compose down -v. True to proceed (destroyed), False if declined."""
@@ -3063,29 +3519,121 @@ class DockVault:
             print(" Admin login  : %s" % summary["admin_username"])
         if summary.get("admin_password"):
             print(pal.paint(" Admin passwd : %s   (auto-generated - store it NOW)" % summary["admin_password"], "yellow"))
-        print(pal.paint("\n *** BACK UP .env OFF THIS HOST - it holds ENCRYPTION_KEY. ***", "yellow"))
+        print(pal.paint("\n *** ENCRYPT THE HOST DISK (LUKS / BitLocker / FileVault / encrypted cloud"
+                        " volume). ***", "yellow"))
+        print(pal.paint("     Names, descriptions, notes and file contents are sealed at rest, but the"
+                        " database", "yellow"))
+        print(pal.paint("     still holds usernames, emails and audit metadata in the clear, and a"
+                        " running", "yellow"))
+        print(pal.paint("     stack needs the plaintext .env - host disk encryption is the at-rest"
+                        " control for what is not sealed.", "yellow"))
+        print(pal.paint(" *** BACK UP .env OFF THIS HOST - it holds ENCRYPTION_KEY. ***", "yellow"))
         print(pal.paint("===================================================================\n", "blue"))
 
     def backup(self, args=None):
-        """Backup & Restore menu: dump the current set ({.env + volumes}) into one bundle, or restore a
-        bundle back. Interactive by default; arg-mode via args.backup_action (backup|restore)."""
+        """Backup & Restore menu: dump the current set ({.env + volumes}) into one bundle, restore a
+        bundle back, or LIST the bundles found across every backup location. Interactive by default;
+        arg-mode via args.backup_action (backup|restore|list) or --list."""
         pal = self.pal
-        ok, msg = docker_available()
-        if not ok:
-            self._fail(msg)
         interactive = not (args and getattr(args, "non_interactive", False))
         action = getattr(args, "backup_action", None) if args else None
+        if args and getattr(args, "list", False):
+            action = "list"
         if not action and interactive:
-            print(pal.paint("\n  1) Backup the current set   2) Restore a bundle", "cyan"))
-            action = {"2": "restore"}.get(ask("Choose 1/2", pal, "1").strip(), "backup")
-        if (action or "backup") == "restore":
+            print(pal.paint("\n  1) Backup the current set   2) Restore a bundle (STOPS + REPLACES "
+                            "current data)   3) List backups", "cyan"))
+            action = {"2": "restore", "3": "list"}.get(ask("Choose 1/2/3", pal, "1").strip(), "backup")
+        if action == "list":
+            self._list_backups(args)             # host-side; no docker needed
+            return
+        ok, msg = docker_available()             # backup + restore drive docker volumes
+        if not ok:
+            self._fail(msg)
+        if action == "restore":
             self._do_restore(args)
         else:
+            # Offer sealing only for the EXPLICIT backup command (this path). The pre-upgrade
+            # auto-backup calls _do_backup directly, so it is never prompted and never sealed.
+            if interactive and not (args and getattr(args, "lock", False)):
+                if confirm("Seal this backup? (encrypts its .env so a stolen backup can't decrypt "
+                           "your files; needs a passphrase you must not lose)", pal, default=False):
+                    if args is None:
+                        args = argparse.Namespace()
+                    args.lock = True
             self._do_backup(self._load_env(), args)
 
+    def _write_candidates(self, args):
+        """Ordered candidate directories a NEW backup would be written to (first writable wins): an
+        explicit --backup-dir list, else the default candidates. PURE - no probing/creation, so it is
+        safe to use for display + search."""
+        explicit = parse_backup_dirs(getattr(args, "backup_dir", None) if args else None)
+        return explicit if explicit else _default_backup_candidates()
+
     def _backup_root(self, args):
-        d = (getattr(args, "backup_dir", None) if args else None)
-        return d or os.path.join(self.root, "backups")
+        """The directory NEW bundles are WRITTEN to: the first WRITABLE candidate (created here), else
+        the first candidate (a later mkdir surfaces the error) so a backup never silently vanishes."""
+        cands = self._write_candidates(args)
+        for c in cands:
+            if _writable_dir(c):
+                return c
+        return cands[0] if cands else _app_data_backup_root()
+
+    def _backup_search_roots(self, args):
+        """Every EXISTING directory to search when listing / restoring: the write candidates, ALWAYS
+        plus the legacy <root>/backups so bundles written by an older version (or under the repo) are
+        never orphaned when the default moves. Deduped by absolute path, existing dirs only (a search
+        never creates one), order preserved."""
+        roots = list(self._write_candidates(args))
+        roots.append(os.path.join(self.root, "backups"))        # legacy in-repo location
+        seen, out = set(), []
+        for r in roots:
+            rr = os.path.abspath(os.path.expanduser(r))
+            if rr in seen:
+                continue
+            seen.add(rr)
+            if os.path.isdir(rr):
+                out.append(rr)
+        return out
+
+    def _list_bundles(self, args):
+        """Bundle directories found across every search root, NEWEST FIRST, deduped by absolute path.
+        Returns FULL paths - a same-name bundle can exist in more than one root, so the basename alone
+        is ambiguous. mtime is captured right where existence was just checked, so a bundle that
+        disappears mid-scan is skipped rather than crashing the sort."""
+        found, seen = [], set()
+        for root in self._backup_search_roots(args):
+            for c in glob.glob(os.path.join(root, "dockvault-*")):
+                if not os.path.isdir(c):
+                    continue
+                ap = os.path.abspath(c)
+                if ap in seen:
+                    continue
+                try:
+                    mtime = os.path.getmtime(c)
+                except OSError:
+                    continue                    # vanished between glob and stat - skip it
+                seen.add(ap)
+                found.append((mtime, ap))
+        found.sort(key=lambda t: t[0], reverse=True)
+        return [ap for _, ap in found]
+
+    def _list_backups(self, args):
+        """Print WHERE new bundles will be written + every existing bundle across all search roots
+        (newest first, full paths). Host-side and READ-ONLY: unlike a real backup it never creates a
+        directory, so it only NAMES the write candidates rather than resolving (and creating) one."""
+        pal = self.pal
+        cands = self._write_candidates(args)
+        print(pal.paint("\n  New backups go to the first writable of (created when you back up):", "cyan"))
+        for c in cands:
+            print("    %s" % c)
+        bundles = self._list_bundles(args)
+        if not bundles:
+            print(pal.paint("\n  No backups found yet.\n", "yellow"))
+            return
+        print(pal.paint("\n  Backups (newest first):", "green"))
+        for c in bundles:
+            print("    %s" % c)
+        print()
 
     def _fail_backup(self, bundle, msg):
         """Abort a backup: DELETE the partial bundle first (it already holds a mode-600 copy of .env
@@ -3115,6 +3663,7 @@ class DockVault:
         while os.path.exists(bundle):
             bundle = os.path.join(root, "dockvault-%s-%s-%d" % (prefix, ts, suffix))
             suffix += 1
+        print(pal.paint("  Backup will be written under: %s" % root, "cyan"))
         try:
             os.makedirs(bundle)
             # Restrict the whole bundle dir to the owner (makedirs' mode is umask-masked): the volume
@@ -3162,40 +3711,157 @@ class DockVault:
                 json.dump(manifest, f, indent=2)
         except OSError as exc:
             self._fail_backup(bundle, "failed to write the manifest: %s" % exc)
+
+        # Opt-in sealing: encrypt the bundle's plaintext 'env' (which holds ENCRYPTION_KEY) into an
+        # 'env.enc' and remove the plaintext, so a stolen backup cannot decrypt the stored files. The
+        # volume archives themselves are NOT re-encrypted here (storage is already ciphertext at rest;
+        # sealing the key that opens it is what makes the bundle safe) -- so the pg_data metadata tar
+        # stays as-is. Default off (owner decision A).
+        # Sealed only when explicitly requested (--lock, or the interactive prompt in backup() for the
+        # EXPLICIT backup command -- NEVER the pre-upgrade auto-backup, whose rollback must stay
+        # restorable without a passphrase the operator may not have during a failed upgrade).
+        seal = bool(getattr(args, "lock", False)) if args else False
+        if seal:
+            self._seal_bundle_env(bundle, args)
+
         print(pal.paint("\n  Backup written to: %s" % bundle, "green"))
-        print("    %d volume(s) + the paired .env + manifest.json" % len(entries))
-        print(pal.paint("  *** This bundle's 'env' holds ENCRYPTION_KEY - store the whole bundle "
-                        "somewhere safe (off-host). ***\n", "yellow"))
+        print("    %d volume(s) + the paired %s + manifest.json"
+              % (len(entries), "env.enc (SEALED)" if seal else ".env"))
+        if seal:
+            print(pal.paint("  The bundle's .env is SEALED - keep the passphrase/recovery key to "
+                            "restore it. Without either, this backup cannot be restored.\n", "yellow"))
+        else:
+            print(pal.paint("  *** This bundle's 'env' holds ENCRYPTION_KEY - store the whole bundle "
+                            "somewhere safe (off-host), or re-run with --lock to seal it. ***\n", "yellow"))
+
+    def _seal_bundle_env(self, bundle, args):
+        """Seal bundle/env -> bundle/env.enc (envelope encryption; passphrase + one-time recovery key),
+        then remove the plaintext env. Verify-before-destroy: the sealed file must decrypt back to the
+        exact bytes before the plaintext is removed. A seal FAILURE keeps the complete plaintext bundle
+        (a valid UNSEALED backup) rather than discarding it. Reuses the same crypto as `dockvault.py
+        lock`."""
+        pal = self.pal
+        env_file = os.path.join(bundle, "env")
+        enc_file = os.path.join(bundle, "env.enc")
+
+        def _abort(msg):
+            # A failed OPTIONAL seal must NOT destroy the complete plaintext bundle: drop any partial
+            # env.enc and keep {env, volumes, manifest} -- it restores normally, just unsealed.
+            try:
+                os.remove(enc_file)
+            except OSError:
+                pass
+            self._fail("could not seal the backup (%s). The backup at %s is COMPLETE but UNSEALED "
+                       "(its plaintext env is kept and it restores normally); re-run backup --lock "
+                       "to seal it." % (msg, bundle))
+
+        interactive = not (args and getattr(args, "non_interactive", False))
+        has_pass_source = bool(args and (getattr(args, "passphrase_file", None)
+                                         or getattr(args, "passphrase_stdin", False)))
+        if not interactive and not has_pass_source:
+            _abort("--lock --non-interactive needs --passphrase-file or --passphrase-stdin")
+        fernet = self._require_fernet()
+        try:
+            with open(env_file, "rb") as f:
+                env_bytes = f.read()
+        except OSError as exc:
+            _abort("could not read the bundle env: %s" % exc)
+        if interactive:
+            print(pal.paint(
+                "\n  Set a passphrase to seal this backup's .env. You will also get a one-time recovery "
+                "key.\n  Lose BOTH and this backup cannot be restored.", "yellow"))
+        passphrase = self._read_passphrase(args, confirm=True)
+        import datetime as _dt
+        now_iso = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
+        enc_text, dek = env_lock_seal(fernet, env_bytes, passphrase,
+                                      hint=getattr(args, "hint", None), now_iso=now_iso)
+        self._atomic_write_secret(enc_file, enc_text)
+        # Verify-before-destroy: the freshly written env.enc must decrypt (by passphrase) back to the
+        # exact bytes, or _abort keeps the complete plaintext bundle. (The recovery key is the same
+        # DEK this verify confirmed opens the payload, so the recovery-key path is verified too.)
+        try:
+            with open(enc_file, encoding="utf-8") as f:
+                check_bytes, _ = env_lock_open(fernet, f.read(), passphrase=passphrase)
+        except EnvLockError as exc:
+            _abort("sealed env failed verification (%s)" % exc)
+        if check_bytes != env_bytes:
+            _abort("sealed env did not round-trip")
+        os.remove(env_file)
+        # Recovery-key output: on a controlling terminal _show_recovery_key uses /dev/tty; in a
+        # non-interactive run WITHOUT --recovery-out do NOT print it to stdout (it could be captured
+        # into a log kept beside the bundle) -- the passphrase already restores, and --recovery-out is
+        # the safe channel for keeping a recovery key.
+        if interactive or getattr(args, "recovery_out", None):
+            self._show_recovery_key(dek, args)
+        else:
+            print(pal.paint("  Sealed. The recovery key was NOT printed (non-interactive without "
+                            "--recovery-out); restore with the passphrase, or re-run with "
+                            "--recovery-out to capture a recovery key off-host.", "yellow"))
+
+    def _unseal_bundle_env(self, enc_path, args):
+        """Decrypt a sealed bundle's env.enc and return the plaintext env BYTES (never written to
+        disk). Uses the recovery key when --recovery-key-file/-stdin or --use-recovery-key is given,
+        else the passphrase. A wrong credential fails here, before the restore touches the stack."""
+        fernet = self._require_fernet()
+        try:
+            with open(enc_path, encoding="utf-8") as f:
+                enc_text = f.read()
+        except OSError as exc:
+            self._fail("could not read the sealed backup env: %s" % exc)
+        use_recovery = bool(args and (getattr(args, "recovery_key_file", None)
+                                      or getattr(args, "use_recovery_key", False)))
+        try:
+            if use_recovery:
+                env_bytes, _ = env_lock_open(fernet, enc_text,
+                                             recovery_key=self._read_recovery_key(args))
+            else:
+                env_bytes, _ = env_lock_open(fernet, enc_text,
+                                             passphrase=self._read_passphrase(args, confirm=False))
+        except EnvLockError as exc:
+            self._fail("cannot open the sealed backup (%s) - the deployment was NOT touched." % exc)
+        return env_bytes
 
     def _do_restore(self, args=None):
         """Restore a bundle: verify the bundle's .env matches its volumes (coupling fingerprint),
-        recreate the volumes, and install the paired .env. Refuses a mismatched bundle, a bundle
-        missing its .env/manifest, or clobbering existing volumes (unless --force)."""
+        then STOP the stack, REPLACE each target volume's contents from the backup, install the
+        paired .env, and restart + health-check. Refuses a mismatched bundle, a bundle missing its
+        .env/manifest, or clobbering existing volumes without --force; confirms an over-existing
+        interactive restore with a typed set-name gate."""
         pal = self.pal
         interactive = not (args and getattr(args, "non_interactive", False))
         bundle = getattr(args, "bundle_dir", None) if args else None
         if not bundle and interactive:
-            root = self._backup_root(args)
-            cands = sorted(glob.glob(os.path.join(root, "dockvault-*")))
+            cands = self._list_bundles(args)     # every search root, newest first, full paths
             if not cands:
-                self._fail("no backups found under %s (pass --bundle-dir)" % root)
-            print(pal.paint("\n  Backups:", "cyan"))
+                roots = self._backup_search_roots(args)
+                self._fail("no backups found under: %s (pass --bundle-dir)"
+                           % (", ".join(roots) if roots else "(no backup directory yet)"))
+            print(pal.paint("\n  Backups (newest first):", "cyan"))
             for i, c in enumerate(cands, 1):
-                print("    %d) %s" % (i, os.path.basename(c)))
+                print("    %d) %s" % (i, c))      # full path disambiguates same-name bundles across roots
             sel = ask("Which backup number", pal).strip()
             if not (sel.isdigit() and 1 <= int(sel) <= len(cands)):
                 self._fail("not a listed backup")
             bundle = cands[int(sel) - 1]
         if not bundle or not os.path.isdir(bundle):
             self._fail("backup bundle not found (pass --bundle-dir)")
-        man_path, env_path = os.path.join(bundle, "manifest.json"), os.path.join(bundle, "env")
-        if not (os.path.exists(man_path) and os.path.exists(env_path)):
-            self._fail("that bundle is missing manifest.json or env - refusing to restore")
+        man_path = os.path.join(bundle, "manifest.json")
+        env_path = os.path.join(bundle, "env")
+        enc_path = os.path.join(bundle, "env.enc")
+        # A sealed bundle carries env.enc instead of a plaintext env. Decrypt it into MEMORY here --
+        # before manifest/coupling checks and long before the stack is stopped -- so a wrong
+        # passphrase/recovery key aborts with the deployment intact and no plaintext ever hits disk.
+        sealed_env_bytes = None
+        if not os.path.exists(env_path) and os.path.exists(enc_path):
+            sealed_env_bytes = self._unseal_bundle_env(enc_path, args)
+        if not os.path.exists(man_path) or (sealed_env_bytes is None and not os.path.exists(env_path)):
+            self._fail("that bundle is missing manifest.json or its env - refusing to restore")
         try:
             manifest = json.load(open(man_path, encoding="utf-8"))
         except (OSError, ValueError) as exc:
             self._fail("could not read the manifest: %s" % exc)
-        bundle_env = parse_env(open(env_path, encoding="utf-8").read())
+        bundle_env = parse_env(sealed_env_bytes.decode("utf-8") if sealed_env_bytes is not None
+                               else open(env_path, encoding="utf-8").read())
         # COUPLING: the bundle's .env must be the one its volumes were created with - never restore
         # volumes without their matching .env (same rule the pre-start secret guard enforces).
         if not verify_backup_coupling(bundle_env, manifest):
@@ -3218,18 +3884,80 @@ class DockVault:
         existing = [v for v, _ in plan if volume_exists(v)]
         if existing and not force:
             self._fail("these target volumes already exist: %s - Reset them first, or pass --force to "
-                       "overwrite (this replaces their contents)." % ", ".join(existing))
+                       "REPLACE their contents from this backup." % ", ".join(existing))
+        # Verify every archive is present BEFORE we stop the stack or clear a single volume, so a
+        # missing-file bundle can never leave a half-restored (stopped, partly-wiped) deployment.
         for vol, archive in plan:
             if not os.path.exists(os.path.join(bundle, archive)):
                 self._fail("the bundle is missing %s (for volume %s) - refusing to restore" % (archive, vol))
-            print(pal.paint("  restoring %s ..." % vol, "cyan"))
+        # Restore REPLACES the current data with the backup. Confirm loudly for an interactive
+        # over-existing restore (mirrors the Reset typed-name gate); --non-interactive --force skips it.
+        if existing and interactive:
+            print(pal.paint(
+                "\n  RESTORE will STOP the deployment and REPLACE the current data of set '%s' with "
+                "this backup.\n  The current stored files, database and keys are DISCARDED and cannot "
+                "be recovered without another backup." % prefix, "red"))
+            typed = ask("Type the set name '%s' to confirm (anything else cancels)" % prefix, pal).strip()
+            if typed != prefix:
+                print(pal.paint("  Cancelled - nothing was changed.\n", "yellow"))
+                return
+        # Stop the stack FIRST: extracting pg_data under a live Postgres both fails to take effect (the
+        # running server keeps serving its cached state - the "restored, saw the same files" trap) and
+        # risks corrupting the cluster. down (no -v) removes the containers but KEEPS every volume,
+        # which we then overwrite in place.
+        current_prefix = volume_prefix(self._load_env())
+        if current_prefix and current_prefix != prefix and container_running(DB_CONTAINER):
+            print(pal.paint("  Note: a different deployment (set '%s') is running and will be stopped "
+                            "to restore set '%s' (its data is kept)." % (current_prefix, prefix), "yellow"))
+        print(pal.paint("  Stopping the deployment before restore (data volumes are kept) ...", "cyan"))
+        self._stop_stack()
+        # `down` can fail or time out (e.g. a slow Postgres checkpoint) and _stop_stack swallows that.
+        # NEVER clear a volume out from under a live container: if the database is still up after the
+        # stop attempt, abort with the data intact (a fresh-host restore has no container, so this is
+        # skipped there).
+        if container_running(DB_CONTAINER):
+            self._fail("could not stop the running deployment before restore (the database is still "
+                       "up) - aborting; your data is intact. Stop the stack and retry.")
+        # REPLACE each volume: clear it IN PLACE (keeps the volume + its DockVault labels) then extract
+        # the archive. Strictly the RECONSTRUCTED names[role] - never a manifest-supplied name.
+        for vol, archive in plan:
+            print(pal.paint("  restoring %s (replacing current contents) ..." % vol, "cyan"))
+            # If the clear fails (e.g. the volume is still held), do NOT extract on top - that would
+            # silently degrade to the old MERGE (the exact "restored, saw the same files" trap). The
+            # stack is already stopped, so aborting loudly is the safe state.
+            if not clear_volume(vol):
+                self._fail("could not clear volume %s before restore - the deployment is stopped; free "
+                           "the volume and retry (refusing to merge the backup over stale data)." % vol)
             if not untar_volume(vol, bundle, archive):
-                self._fail("failed to restore volume %s from %s" % (vol, archive))
-        # install the paired .env (mode-600) so the set is whole again.
-        _copy_secret(env_path, self._env_path())
+                self._fail("failed to restore volume %s from %s - the deployment is stopped; fix the "
+                           "bundle and retry." % (vol, archive))
+        # install the paired .env (mode-600) so the restored set is whole again. For a sealed bundle
+        # the plaintext was decrypted into memory above; write those exact bytes.
+        if sealed_env_bytes is not None:
+            self._atomic_write_secret(self._env_path(), sealed_env_bytes)
+        else:
+            _copy_secret(env_path, self._env_path())
         tighten_secret_file(self._env_path())
         print(pal.paint("\n  Restored set '%s' (%d volume(s)) + its .env." % (prefix, len(plan)), "green"))
-        print(pal.paint("  Run Setup to start it (the secret check will confirm the pairing).\n", "cyan"))
+        # Bring the restored set back up on ITS .env and health-check, so restore leaves a RUNNING
+        # deployment serving the restored state (not a stopped stack the operator must remember to
+        # start, which is what let the old no-op behaviour hide).
+        ok, _ = docker_available()
+        if not ok:
+            print(pal.paint("  Docker is not available - start the restored set later with Start.\n",
+                            "yellow"))
+            return
+        print(pal.paint("  Starting the restored deployment ...", "cyan"))
+        profiles = self._load_env().get("COMPOSE_PROFILES", "combined")
+        if not self._start_secure_stack():
+            self._tail_logs(self._web_service(profiles))
+            self._fail("restored, but the stack did not start - the last log lines are above.")
+        if not self._wait_secure_healthy(profiles):
+            self._tail_logs(self._web_service(profiles))
+            print(pal.paint("  Restored and started, but the vault did NOT report healthy yet - "
+                            "logs above.\n", "red"))
+        else:
+            print(pal.paint("  Restored and healthy.\n", "green"))
 
     def _load_env(self):
         """Parse the current .env (best-effort: {} if absent or unreadable)."""
@@ -3326,7 +4054,12 @@ class DockVault:
             print(pal.paint("  Wrote a fresh .env - WARNING: could not restrict its permissions "
                             "(it holds ENCRYPTION_KEY); secure it yourself.", "yellow"))
         if archived:
-            print("  Your previous set's .env was saved at: %s" % archived)
+            self._warn_env_archived(archived)
+        if cfg.get("_generated_admin_pw"):
+            # Show the freshly-generated admin password on the controlling terminal only (like the
+            # recovery key), so a redirected/tee'd stdout or CI log can't capture it.
+            self._emit_secret(pal.paint("  New set's admin password: %s   (auto-generated - store it NOW)"
+                                        % cfg["admin_password"], "bold", "yellow"))
         print(pal.paint("  Run Setup to build + start the new (empty) set.\n", "cyan"))
 
     def _volume_repoint(self, env, args=None):
@@ -3524,12 +4257,27 @@ class DockVault:
 
         tag = getattr(args, "tag", None) if args else None
         from_source = bool(getattr(args, "source", False)) if args else False
+        # This checkout's matrix describes every version's lifecycle up to what it ships; use it to
+        # decide which releases to OFFER (end-of-life ones are hidden) and to annotate the rest.
+        local_matrix, _ = fetch_upgrade_matrix(None, root=self.root)
         if not tag:
             tags = fetch_release_tags()
             if tags:
+                offered = [t for t in tags if not is_eol(local_matrix, t)]
+                hidden = len(tags) - len(offered)
                 print(pal.paint("\n  Available releases (newest first):", "cyan"))
-                for t in tags[:15]:
-                    print("    %s%s" % (t, "   <- current" if parse_semver(t) == parse_semver(current) else ""))
+                for t in offered[:15]:
+                    label = "   <- current" if parse_semver(t) == parse_semver(current) else ""
+                    note = support_line(local_matrix, t)
+                    if note and note != "supported":
+                        label += "   (%s)" % note
+                    print("    %s%s" % (t, label))
+                if not offered:
+                    print(pal.paint("    (every reachable release is end-of-life)", "yellow"))
+                if hidden:
+                    print(pal.paint(
+                        "    %d end-of-life release(s) hidden -- they cannot be upgraded or "
+                        "downgraded to." % hidden, "yellow"))
             else:
                 print(pal.paint("\n  (couldn't reach GitHub - enter a tag manually)", "yellow"))
             if interactive:
@@ -3563,6 +4311,30 @@ class DockVault:
             plan = plan_upgrade_path(None, current, tag)
 
         self._describe_hop(plan, matrix_source, current, tag)
+
+        # Refuse an end-of-life target outright -- it is neither offered in the list nor a place to
+        # move to. Read the lifecycle from THIS checkout's matrix (the newest view), since a version
+        # becomes end-of-life after it ships and its own published matrix is frozen at cut time.
+        eol_matrix = preferred_lifecycle_matrix(local_matrix, matrix, tag)
+        if is_eol(eol_matrix, tag):
+            self._fail("%s is end-of-life and cannot be upgraded or downgraded to (%s)."
+                       % (tag, support_line(eol_matrix, tag)))
+        if version_support(eol_matrix, tag).get("secure") is False:
+            print(pal.paint(
+                "  WARNING: %s has known unpatched vulnerabilities (%s)."
+                % (tag, support_line(eol_matrix, tag)), "red"))
+
+        # A downgrade the matrix refuses: an older image cannot read data written by the newer one,
+        # so the move is not offered even with an 'i accept'. Read off this checkout's matrix, which
+        # knows the running version and the forward edge (the target's own published matrix, being
+        # older, may not). This is the case a bare downgrade used to slip through as 'undescribed'.
+        down_refused, down_reason = downgrade_refusal(local_matrix, current, tag)
+        if down_refused:
+            self._fail(
+                "%s -> %s is a downgrade this deployment cannot take: an older image cannot read the "
+                "data written by the newer one (%s). Deploy the older version as a fresh set and "
+                "restore from a backup instead of downgrading over these volumes."
+                % (current, tag, down_reason))
 
         if plan["blocked"] is not None:
             self._fail("the upgrade matrix says this change must not be taken directly: %s"
@@ -3909,6 +4681,10 @@ def build_parser():
     sp.add_argument("--key-path", dest="key_path", help="bring-your-own private key (PEM)")
     sp.add_argument("--web-port", dest="web_port", type=int, help="host port for HTTPS (default 443)")
     sp.add_argument("--sftp-port", dest="sftp_port", type=int, help="host port for SFTP (default 2322)")
+    sp.add_argument("--sftp-staging-tmpfs-mb", dest="sftp_staging_tmpfs_mb", type=int,
+                    help="size (MiB) of the RAM tmpfs SFTP buffers each upload's plaintext in, so it "
+                         "never hits disk (512 by default). Also caps the SFTP upload size until "
+                         "streaming lands, and counts toward the SFTP container's memory limit")
     sp.add_argument("--enable-sftp", dest="enable_sftp", action="store_true", help="also serve SFTP")
     sp.add_argument("--split", dest="split", action="store_true", help="two containers (vault-api + vault-sftp)")
     sp.add_argument("--image-source", dest="image_source", choices=("release", "build"),
@@ -3958,11 +4734,30 @@ def build_parser():
     rp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
 
     bp = parsers["backup"]
-    bp.add_argument("--action", dest="backup_action", choices=("backup", "restore"),
-                    help="backup the current set | restore a bundle")
-    bp.add_argument("--backup-dir", dest="backup_dir", help="directory to write/list bundles (default <root>/backups)")
+    bp.add_argument("--action", dest="backup_action", choices=("backup", "restore", "list"),
+                    help="backup the current set | restore a bundle | list found bundles")
+    bp.add_argument("--list", dest="list", action="store_true",
+                    help="list backups found across all locations + where new ones are written (no docker needed)")
+    bp.add_argument("--backup-dir", dest="backup_dir",
+                    help="directory to write/search bundles (default: per-OS app data, e.g. "
+                         "%%LOCALAPPDATA%%\\DockVault\\backups). May name SEVERAL, separated by the OS "
+                         "path separator; also settable via DOCKVAULT_BACKUP_DIR. The legacy <root>/backups is always searched too")
     bp.add_argument("--bundle-dir", dest="bundle_dir", help="restore: the bundle directory to restore")
-    bp.add_argument("--force", dest="force", action="store_true", help="restore: overwrite existing target volumes")
+    bp.add_argument("--force", dest="force", action="store_true", help="restore: REPLACE existing target volumes with the backup (stops the stack; current data discarded)")
+    bp.add_argument("--lock", dest="lock", action="store_true",
+                    help="backup: SEAL the bundle's .env (which holds ENCRYPTION_KEY) into env.enc so "
+                         "a stolen backup can't decrypt your files; needs a passphrase + gives a recovery key")
+    bp.add_argument("--passphrase-file", dest="passphrase_file",
+                    help="seal/restore: read the passphrase from this file (first line)")
+    bp.add_argument("--passphrase-stdin", dest="passphrase_stdin", action="store_true",
+                    help="seal/restore: read the passphrase from stdin")
+    bp.add_argument("--use-recovery-key", dest="use_recovery_key", action="store_true",
+                    help="restore: open a sealed bundle with its recovery key instead of the passphrase")
+    bp.add_argument("--recovery-key-file", dest="recovery_key_file",
+                    help="restore: read the sealed bundle's recovery key from this file")
+    bp.add_argument("--hint", dest="hint", help="seal: store a NON-secret passphrase hint in env.enc")
+    bp.add_argument("--recovery-out", dest="recovery_out",
+                    help="seal: also write the recovery key to this file (move it off-host)")
     bp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
 
     up = parsers["update"]
@@ -4002,8 +4797,10 @@ def build_parser():
     cp.add_argument("--new-passphrase-file", dest="new_passphrase_file", help="new passphrase file (first line)")
     cp.add_argument("--new-passphrase-stdin", dest="new_passphrase_stdin", action="store_true", help="read the new passphrase from stdin")
 
-    parsers["stop"].add_argument("--lock", dest="lock", action="store_true",
-                                 help="also seal .env into .env.enc after stopping")
+    parsers["down"].add_argument("--lock", dest="lock", action="store_true",
+                                 help="also seal .env into .env.enc after removing the containers")
+    parsers["down"].add_argument("--yes", dest="yes", action="store_true",
+                                 help="skip the confirmation prompt (required to remove containers non-interactively)")
     return p
 
 

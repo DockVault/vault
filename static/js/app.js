@@ -969,9 +969,51 @@ async function applyLoginPolicyLabel() {
             }
         }
         _initSignupAffordance(policy);
+        _initForgotAffordance(policy);
     } catch (_) { /* keep the static fallback */ }
 }
 applyLoginPolicyLabel();
+
+// ---- Forgot password (public self-service; the link shows only when the org enabled it) ----------
+let _forgotWired = false;
+
+function _initForgotAffordance(policy) {
+    const toggle = document.getElementById('forgot-toggle');
+    const form = document.getElementById('forgot-form');
+    if (!toggle || !form) return;
+    if (!policy || !policy.password_reset_enabled) { toggle.style.display = 'none'; form.style.display = 'none'; return; }
+    toggle.style.display = '';
+    if (_forgotWired) return;
+    _forgotWired = true;
+    const showLink = document.getElementById('show-forgot-link');
+    const backLink = document.getElementById('forgot-back-link');
+    const loginForm = document.getElementById('login-form');
+    const msg = document.getElementById('forgot-message');
+    const showForgot = (on) => {
+        form.style.display = on ? '' : 'none';
+        if (loginForm) loginForm.style.display = on ? 'none' : '';
+        toggle.style.display = on ? 'none' : '';
+        if (msg) { msg.style.display = 'none'; msg.textContent = ''; }
+    };
+    if (showLink) showLink.addEventListener('click', (e) => {
+        e.preventDefault(); showForgot(true);
+        const i = document.getElementById('forgot-identifier'); if (i) i.focus();
+    });
+    if (backLink) backLink.addEventListener('click', (e) => { e.preventDefault(); showForgot(false); });
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const ident = ((document.getElementById('forgot-identifier') || {}).value || '').trim();
+        const btn = form.querySelector('button[type=submit]');
+        if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+        try {
+            await fetch(`${API_BASE}/auth/forgot-password`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ identifier: ident }) });
+        } catch (_) { /* enumeration-safe: show the same message regardless */ }
+        if (msg) { msg.textContent = 'If an account matches, a reset link has been sent to its email.'; msg.style.display = 'block'; }
+        if (btn) { btn.disabled = false; btn.textContent = 'Send reset link'; }
+    });
+}
 
 // ---- Self-signup (public, unauthenticated) --------------------------------
 // The toggle + form are hidden until /auth/policy confirms signup_enabled. Email presence/required
@@ -1221,6 +1263,85 @@ function _inviteAccepted(username) {
         body.appendChild(_el('h2', 'text-xl font-bold mb-sm', 'Account created'));
         body.appendChild(_el('p', 'text-secondary mb-lg',
             'Your account is ready. Sign in with your new password to continue.'));
+        const go = _el('button', 'btn btn-primary btn-block', 'Go to sign in');
+        go.addEventListener('click', () => showScreen('login-screen'));
+        body.appendChild(go);
+    }
+    setTimeout(() => { showScreen('login-screen'); }, 2500);
+}
+
+// Reached via /?reset=<token>. Bare fetch only; DOM built with _el/textContent; every failure shows
+// ONE generic message so the page can't probe which tokens are valid; success does NOT sign the
+// visitor in — it routes to login.
+const _RESET_GENERIC_ERROR = 'This reset link is invalid or has expired.';
+
+function _resetCard() { return document.getElementById('reset-card-body'); }
+
+function _resetMessage(text, kind) {
+    const body = _resetCard(); if (!body) return;
+    body.replaceChildren(); body.appendChild(_el('div', 'alert alert-' + (kind || 'error'), text));
+}
+
+async function initResetFlow(token) {
+    showScreen('reset-screen');
+    let info;
+    try {
+        const res = await fetch(`${API_BASE}/reset/${encodeURIComponent(token)}`, { headers: { Accept: 'application/json' } });
+        if (!res.ok) { _resetMessage(_RESET_GENERIC_ERROR); return; }
+        info = await res.json();
+    } catch (_) { _resetMessage(_RESET_GENERIC_ERROR); return; }
+    _renderResetForm(token, info);
+}
+
+function _renderResetForm(token, info) {
+    const body = _resetCard(); if (!body) return;
+    body.replaceChildren();
+    body.appendChild(_el('h2', 'text-xl font-bold mb-sm', 'Set a new password'));
+    const sub = _el('p', 'text-secondary mb-lg');
+    if (info && info.username) {
+        sub.appendChild(document.createTextNode('For the account '));
+        sub.appendChild(_el('strong', null, info.username));
+        sub.appendChild(document.createTextNode('.'));
+    } else { sub.textContent = 'Choose a new password to finish.'; }
+    body.appendChild(sub);
+
+    const form = _el('form');
+    const pg = _el('div', 'form-group');
+    pg.appendChild(_el('label', null, 'New password'));
+    const pw = _el('input', 'form-control'); pw.type = 'password'; pw.required = true;
+    pw.setAttribute('autocomplete', 'new-password');
+    pg.appendChild(pw); form.appendChild(pg);
+    const err = _el('div', 'alert alert-error mt-md'); err.style.display = 'none'; form.appendChild(err);
+    const btn = _el('button', 'btn btn-primary btn-block', 'Set password'); btn.type = 'submit'; form.appendChild(btn);
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault(); err.style.display = 'none'; btn.disabled = true; btn.textContent = 'Saving…';
+        try {
+            const res = await fetch(`${API_BASE}/reset/${encodeURIComponent(token)}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ new_password: pw.value }) });
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                err.textContent = data.detail || _RESET_GENERIC_ERROR; err.style.display = 'block';
+                btn.disabled = false; btn.textContent = 'Set password'; return;
+            }
+            _resetDone();
+        } catch (_) {
+            err.textContent = _RESET_GENERIC_ERROR; err.style.display = 'block';
+            btn.disabled = false; btn.textContent = 'Set password';
+        }
+    });
+    body.appendChild(form); pw.focus();
+}
+
+function _resetDone() {
+    try { history.replaceState(null, '', location.pathname); } catch (_) {}
+    document.documentElement.removeAttribute('data-reset');
+    const body = _resetCard();
+    if (body) {
+        body.replaceChildren();
+        body.appendChild(_el('h2', 'text-xl font-bold mb-sm', 'Password updated'));
+        body.appendChild(_el('p', 'text-secondary mb-lg',
+            'Your password has been changed. Sign in with your new password to continue.'));
         const go = _el('button', 'btn btn-primary btn-block', 'Go to sign in');
         go.addEventListener('click', () => showScreen('login-screen'));
         body.appendChild(go);
@@ -1841,6 +1962,11 @@ async function loadVaults() {
 
     try {
         state.allVaults = await apiRequest('/vaults');
+        // Decrypt any zero-knowledge vault names/descriptions IN PLACE if the account key is already
+        // unlocked; otherwise they keep their non-secret labels (no prompt). Best-effort — a decrypt
+        // hiccup must not stop the list from rendering.
+        try { await zkDecryptVaultNames(state.allVaults); } catch (_) { /* labels remain */ }
+        updateZkLockControl();
         renderVaults();
     } catch (error) {
         container.innerHTML = `<div class="alert alert-error">Failed to load vaults: ${error.message}</div>`;
@@ -2053,29 +2179,43 @@ function renderVaults() {
         return;
     }
 
-    container.innerHTML = vaults.map(vault => `
-        <div class="card card-interactive vault-card" data-vault-id="${vault.id}">
+    container.innerHTML = vaults.map(vault => {
+        const isZk = vault.type === 'zero_knowledge';
+        const locked = isZk && vault.zkLocked;
+        // Locked ZK card: the real name shows only if the owner set a non-secret label (else a
+        // neutral placeholder), and description/counts are hidden behind the seal until unlock. The
+        // .zk-field spans are what the decode animation replaces when the vault is unlocked.
+        const nameHtml = escapeHtml(vaultDisplayName(vault));
+        const descHtml = locked ? '••••••'
+                                : escapeHtml(vault.description || 'No description');
+        const filesHtml = locked ? '••' : `${vault.file_count || 0}`;
+        const membersHtml = locked ? '••' : `${vault.member_count || 1}`;
+        return `
+        <div class="card card-interactive vault-card ${locked ? 'vault-zk-locked' : ''}" data-vault-id="${vault.id}"${isZk ? ' data-zk="1"' : ''}>
             <button class="vault-fav ${vault.is_favorite ? 'is-fav' : ''}" data-vault-id="${vault.id}"
                     title="${vault.is_favorite ? 'Remove from favorites' : 'Add to favorites'}" aria-label="Toggle favorite">
                 ${iconSvg('star')}
             </button>
             ${currentUser.role === 'admin' ? `<button class="delete-vault-btn vault-del" data-vault-id="${vault.id}" title="Delete vault" aria-label="Delete vault">${iconSvg('trash', 'icon-sm')}</button>` : ''}
             <div class="vault-card-body">
-                <div class="vault-tile">${iconSvg('vault')}</div>
+                <div class="vault-tile${locked ? ' vault-tile-locked' : ''}">${locked ? iconSvg('lock') : iconSvg('vault')}</div>
                 <div class="vault-card-main">
-                    <h3 class="vault-name">${escapeHtml(vault.name)}</h3>
-                    <p class="vault-desc">${escapeHtml(vault.description || 'No description')}</p>
+                    <h3 class="vault-name"><span class="zk-field" data-zk-field="name">${nameHtml}</span></h3>
+                    <p class="vault-desc"><span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="desc">${descHtml}</span></p>
                     <div class="vault-meta">
-                        <span>${iconSvg('folder', 'icon-sm')} ${vault.file_count || 0} files</span>
-                        <span>${iconSvg('users', 'icon-sm')} ${vault.member_count || 1} members</span>
+                        <span>${iconSvg('folder', 'icon-sm')} <span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="files">${filesHtml}</span> files</span>
+                        <span>${iconSvg('users', 'icon-sm')} <span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="members">${membersHtml}</span> members</span>
                     </div>
                 </div>
-                <button class="open-vault-btn btn btn-primary btn-sm vault-open" data-vault-id="${vault.id}">Open</button>
+                <button class="open-vault-btn btn btn-primary btn-sm vault-open" data-vault-id="${vault.id}">${locked ? 'Unlock' : 'Open'}</button>
             </div>
-        </div>
-    `).join('');
+        </div>`;
+    }).join('');
 
     container.querySelectorAll('.open-vault-btn').forEach(btn => {
+        // openVault handles a locked zero-knowledge vault itself: it shows the vault, then loading
+        // its files prompts for the account passphrase (the SAME unlock modal the lock control uses)
+        // and decrypts. So entering a locked ZK vault just opens it — no separate reveal-all step.
         btn.addEventListener('click', (e) => { e.stopPropagation(); openVault(e.currentTarget.getAttribute('data-vault-id')); });
     });
     container.querySelectorAll('.delete-vault-btn').forEach(btn => {
@@ -2767,6 +2907,14 @@ function syncCreateVaultForm() {
     // would otherwise silently block "Create Vault") and is never submitted.
     if (pwInput) pwInput.disabled = isZk;
     if (hierWrap) hierWrap.style.display = isZk ? '' : 'none';
+    // Zero-knowledge: the name is sealed in the browser, so surface the non-secret "label" field
+    // (shown while locked) and explain the name is encrypted. Standard vaults hide both.
+    const labelGroup = document.getElementById('vault-label-group');
+    const zkNameHelp = document.getElementById('vault-name-zk-help');
+    const nameLabel = document.getElementById('vault-name-label');
+    if (labelGroup) labelGroup.style.display = isZk ? '' : 'none';
+    if (zkNameHelp) zkNameHelp.style.display = isZk ? '' : 'none';
+    if (nameLabel) nameLabel.textContent = isZk ? 'Vault Name (encrypted)' : 'Vault Name';
 }
 
 // The create-vault size hint, with the "you can change this later" clause only for a reader who
@@ -2994,6 +3142,22 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                 // what makes it safe is that the server types the field as a UUID, so what reaches
                 // the filesystem is always canonical and never a path.
                 payload.id = zkNewObjId();
+
+                // Seal the name + description IN THE BROWSER (the server never sees them). The
+                // plaintext `name`/`description` are replaced by the non-secret label + the sealed
+                // blobs; a vault is its own object, so the seal binds to its own id. A brand-new vault
+                // is at DEK epoch 1, and name_key_version records the epoch so a later read/retire uses
+                // the right one (the vault name has no content epoch, exactly like a folder name).
+                const nameEpoch = 1;                 // a freshly-created vault's DEK epoch
+                const zkLabel = ((document.getElementById('vault-label') || {}).value || '').trim();
+                payload.enc_name = await lib.encryptName(name, dek, payload.id, 'name', nameEpoch, payload.id);
+                if (description) {
+                    payload.enc_description = await lib.encryptName(
+                        description, dek, payload.id, 'description', nameEpoch, payload.id);
+                }
+                payload.name_key_version = nameEpoch;
+                payload.name = zkLabel || null;      // non-secret label (shown while locked), or none
+                delete payload.description;           // the real description rides sealed in enc_description
 
                 const hcb = document.getElementById('vault-hierarchical');
                 if (hcb && hcb.checked) {
@@ -4245,8 +4409,13 @@ async function submitInvite(e) {
         const res = await apiRequest('/invites', { method: 'POST', body: JSON.stringify(payload) });
         _lastInviteLink = res.invite_url || res.token;
         document.getElementById('invite-link-value').textContent = _lastInviteLink;
-        document.getElementById('invite-link-expiry').textContent =
-            'This link expires ' + formatServerTime(res.expires_at) + '.';
+        let _inviteNote = 'This link expires ' + formatServerTime(res.expires_at) + '.';
+        if (email) {
+            _inviteNote += res.email_sent
+                ? ' We emailed the invitation to ' + email + '.'
+                : ' We couldn’t email it — copy the link above and send it yourself.';
+        }
+        document.getElementById('invite-link-expiry').textContent = _inviteNote;
         document.getElementById('invite-user-fields').style.display = 'none';
         document.getElementById('invite-user-footer').style.display = 'none';
         document.getElementById('invite-link-result').style.display = '';
@@ -4478,6 +4647,7 @@ function renderUserDetail(u) {
                     ? `<button class="btn btn-sm btn-success unlock-user-btn" data-user-id="${u.id}">${iconSvg('unlock', 'icon-sm')} Unlock</button>`
                     : `<button class="btn btn-sm btn-warning lock-user-btn" data-user-id="${u.id}">${iconSvg('lock', 'icon-sm')} Lock</button>`}
                 <button class="btn btn-sm btn-secondary change-password-btn" data-user-id="${u.id}">${iconSvg('key', 'icon-sm')} Change Password</button>
+                ${u.email ? `<button class="btn btn-sm btn-secondary send-reset-link-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('key', 'icon-sm')} Send reset link</button>` : ''}
                 ${currentUser.role === 'admin' && u.role !== 'admin' ? `<button class="btn btn-sm btn-secondary manage-perms-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('shield', 'icon-sm')} Permissions</button>` : ''}
                 ${currentUser.role === 'admin' && u.username !== currentUser.username ? `<button class="btn btn-sm btn-warning terminate-user-sessions-btn" data-user-id="${u.id}">${iconSvg('alert-triangle', 'icon-sm')} Terminate Sessions</button>` : ''}
                 ${u.username !== currentUser.username ? `<button class="btn btn-sm btn-danger delete-user-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('trash', 'icon-sm')} Delete</button>` : ''}
@@ -4813,6 +4983,23 @@ function attachUserListeners() {
         btn.addEventListener('click', () => {
             const userId = btn.getAttribute('data-user-id');
             showEditUserModal(userId);
+        });
+    });
+
+    // Send password-reset link buttons
+    document.querySelectorAll('.send-reset-link-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const userId = btn.getAttribute('data-user-id');
+            const username = btn.getAttribute('data-username') || 'this user';
+            if (!confirm('Email a password-reset link to ' + username + '?')) return;
+            btn.disabled = true;
+            try {
+                const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/send-reset-link', { method: 'POST' });
+                if (r && r.email_sent) showSuccess('Reset link sent to ' + username + '.');
+                else showError('Could not send the reset link (check email configuration).');
+            } catch (e) {
+                showError('Could not send the reset link: ' + (e.message || ''));
+            } finally { btn.disabled = false; }
         });
     });
     
@@ -6353,7 +6540,7 @@ function setupSettingsTabs() {
             }
             if (tabId === 'logs') { loadLogSettings(); }  // refresh on tab open
             if (tabId === 'sharing') { setupShareTagsUI(); loadShareTags(); }  // wire (idempotent) + refresh
-            if (tabId === 'notelinks') { setupNoteLinkTagsUI(); loadNoteLinkTags(); }  // wire + refresh
+            if (tabId === 'notelinks') { setupNoteLinkTagsUI(); loadNoteLinkTags(); loadAdminNoteLinks(); }  // wire + refresh
             if (tabId === 'accounts') { setupAccountsPolicyUI(); refreshAccountsPolicyUI(); }  // wire + reflect deps
             if (tabId === 'email') { loadEmailProfiles(); loadEmailTemplates(); loadEmailActions(); }  // refresh profiles + templates + actions on tab open
         });
@@ -6982,6 +7169,9 @@ function populateAccountsPolicy(settings) {
     setVal('setting-email-requirement', settings.email_requirement || 'required');
     setVal('setting-login-identifier', settings.login_identifier || 'username');
     setChk('setting-email-change-verification', settings.email_change_requires_verification);
+    setVal('setting-email-change-otp-ttl-minutes', settings.email_change_otp_ttl_minutes != null ? settings.email_change_otp_ttl_minutes : 5);
+    setChk('setting-password-reset-enabled', settings.password_reset_enabled);
+    setVal('setting-password-reset-ttl-minutes', settings.password_reset_ttl_minutes != null ? settings.password_reset_ttl_minutes : 5);
     accountsDomains = Array.isArray(settings.signup_email_domains) ? settings.signup_email_domains.slice() : [];
     // Profile-aware: the backend reports whether a usable sending profile (or legacy config) exists.
     accountsSmtpConfigured = settings.smtp_configured === true;
@@ -7007,6 +7197,11 @@ function collectAccountsPolicy(settings) {
     if (accountsSmtpConfigured) {
         settings.email_change_requires_verification = on('setting-email-change-verification');
     }
+    const otpTtl = parseInt(val('setting-email-change-otp-ttl-minutes'), 10);
+    if (!Number.isNaN(otpTtl)) settings.email_change_otp_ttl_minutes = otpTtl;
+    settings.password_reset_enabled = on('setting-password-reset-enabled');
+    const prTtl = parseInt(val('setting-password-reset-ttl-minutes'), 10);
+    if (!Number.isNaN(prTtl)) settings.password_reset_ttl_minutes = prTtl;
 }
 
 async function loadSettings() {
@@ -7022,6 +7217,21 @@ async function loadSettings() {
         // (see upload_policy.effective_max_file_bytes). Rendering 100 for a stored 0 made "Save All
         // Changes" persist 100 and silently clamp a 1024MB deployment to 100MB.
         document.getElementById('setting-max-file-size').value = (settings.max_file_size > 0) ? settings.max_file_size : '';
+        // A buffered SFTP upload cannot exceed the RAM staging tmpfs (SFTP_STAGING_TMPFS_MB), so the
+        // effective SFTP per-file limit is min(this, that) and can be BELOW the web limit. Surface it
+        // so the admin knows why SFTP may refuse a file the web UI accepts. Hidden when unbounded.
+        const sftpEff = document.getElementById('setting-sftp-eff-limit');
+        if (sftpEff) {
+            const effMb = settings.sftp_effective_max_file_mb;
+            if (effMb != null) {
+                sftpEff.textContent = 'Over SFTP, uploads are also capped at ' + effMb +
+                    ' MB by the RAM staging buffer (SFTP_STAGING_TMPFS_MB); raise both together for larger files.';
+                sftpEff.style.display = '';
+            } else {
+                sftpEff.textContent = '';
+                sftpEff.style.display = 'none';
+            }
+        }
         document.getElementById('setting-allowed-types').value = (settings.allowed_file_types || []).join(', ');
 
         // App version (read-only; from the public /version endpoint)
@@ -7161,6 +7371,8 @@ async function loadSettings() {
         if (nlEn) nlEn.checked = settings.public_note_links_enabled === true;
         const nlCap = document.getElementById('setting-public-note-link-user-cap');
         if (nlCap) nlCap.value = settings.public_note_link_user_cap != null ? settings.public_note_link_user_cap : 50;
+        const nMax = document.getElementById('setting-note-max-chars');
+        if (nMax) nMax.value = settings.note_max_chars != null ? settings.note_max_chars : 100000;
         setupNoteLinkTagsUI();
         loadNoteLinkTags();
 
@@ -7278,6 +7490,8 @@ async function saveAllSettings() {
         if (nlEnEl) settings.public_note_links_enabled = nlEnEl.checked;
         const nlCapEl = document.getElementById('setting-public-note-link-user-cap');
         if (nlCapEl && nlCapEl.value !== '') settings.public_note_link_user_cap = parseInt(nlCapEl.value, 10);
+        const nMaxEl = document.getElementById('setting-note-max-chars');
+        if (nMaxEl && nMaxEl.value !== '') settings.note_max_chars = parseInt(nMaxEl.value, 10);
 
         // Accounts & Access: the org-onboarding policy block.
         collectAccountsPolicy(settings);
@@ -8190,6 +8404,7 @@ async function deleteEmailProfile(p) {
 let _editingTemplateId = null;
 let _sendTemplateId = null;
 let _etPreviewTimer = null;
+let _loadFromDefaults = null;   // cached GET /email/default-templates payload
 
 async function loadEmailTemplates() {
     const grid = document.getElementById('email-templates-grid');
@@ -8219,6 +8434,12 @@ function buildEmailTemplateCard(t) {
     card.className = 'email-profile-card'; card.setAttribute('role', 'listitem'); card.dataset.templateId = t.id;
     const title = document.createElement('div'); title.className = 'epc-title';
     const name = document.createElement('span'); name.textContent = t.name || '(untitled)'; title.appendChild(name);
+    if (t.is_default) {
+        const db = document.createElement('span');
+        db.className = 'epc-badge epc-badge-default'; db.textContent = 'Default';
+        db.title = 'A built-in default template. Edit it to customize; use “Load From” to reset it.';
+        title.appendChild(db);
+    }
     if (t.bound_action) {
         const isSys = t.bound_action.category === 'system';
         const badge = document.createElement('span');
@@ -8241,7 +8462,8 @@ function buildEmailTemplateCard(t) {
     const actions = document.createElement('div'); actions.className = 'epc-actions';
     const rowDefs = [['Edit', 'etc-edit', () => openTemplateEditor(t)],
                      ['Send', 'etc-send', () => openSendModal(t)]];
-    if (!t.bound_action) rowDefs.push(['Delete', 'etc-delete', () => deleteTemplate(t)]);   // bound = non-removable
+    // Non-removable when bound to an action OR a built-in default (both refuse deletion server-side).
+    if (!t.bound_action && !t.is_default) rowDefs.push(['Delete', 'etc-delete', () => deleteTemplate(t)]);
     for (const [label, cls, fn] of rowDefs) {
         const b = document.createElement('button'); b.type = 'button';
         b.className = 'btn btn-secondary btn-sm ' + cls; b.textContent = label;
@@ -8268,6 +8490,11 @@ function renderEmailActions(actions, templates) {
     const list = document.getElementById('email-actions-list');
     list.replaceChildren();
     actions.forEach(a => list.appendChild(buildActionRow(a, templates)));
+}
+
+function _earNotifyLabel(cb) {
+    if (cb.checked) return 'Notify by email · On';
+    return cb.disabled ? 'Notify by email · pick a template' : 'Notify by email · Off';
 }
 
 function buildActionRow(a, templates) {
@@ -8298,21 +8525,50 @@ function buildActionRow(a, templates) {
         if (a.template_id === t.id) o.selected = true;
         sel.appendChild(o);
     });
-    sel.addEventListener('change', () => saveAction(a.key, { template_id: sel.value || null }));
+    sel.addEventListener('change', () => {
+        const picked = sel.value || null;
+        // Only reflect the SAFE direction immediately: no template => the switch turns off + disables.
+        // Re-ENABLING waits for the reload after the bind is saved, so a click can't race the template
+        // PUT and fire a premature enable (which the server would 400). The reload is server-authoritative.
+        if (!picked) {
+            const swCb = controls.querySelector('.ear-notify input');
+            if (swCb) {
+                swCb.checked = false; swCb.disabled = true;
+                const st = controls.querySelector('.ear-notify-state');
+                if (st) st.textContent = _earNotifyLabel(swCb);
+            }
+        }
+        saveAction(a.key, { template_id: picked });
+    });
     tplWrap.appendChild(sel); controls.appendChild(tplWrap);
 
-    // notify toggle (optional actions only)
+    // Notify switch (optional actions only): a clear on/off, DISABLED until a template is chosen —
+    // an email with no template has nothing to send, so it can't be turned on.
     if (a.category !== 'system') {
-        const tog = document.createElement('label'); tog.className = 'checkbox-label ear-notify';
-        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!a.enabled;
-        cb.addEventListener('change', () => saveAction(a.key, { enabled: cb.checked }));
-        tog.appendChild(cb); tog.appendChild(document.createTextNode(' Notify by email'));
-        controls.appendChild(tog);
+        const hasTpl = !!a.template_id;
+        const field = document.createElement('div'); field.className = 'ear-notify';
+        const sw = document.createElement('label'); sw.className = 'dv-switch';
+        const cb = document.createElement('input'); cb.type = 'checkbox';
+        cb.checked = !!a.enabled && hasTpl; cb.disabled = !hasTpl;
+        cb.setAttribute('aria-label', 'Notify by email for ' + a.name);
+        const track = document.createElement('span'); track.className = 'dv-switch-track'; track.setAttribute('aria-hidden', 'true');
+        sw.appendChild(cb); sw.appendChild(track);
+        const state = document.createElement('span'); state.className = 'ear-notify-state';
+        state.id = 'ear-state-' + a.key; cb.setAttribute('aria-describedby', state.id);   // expose the reason to AT
+        state.textContent = _earNotifyLabel(cb);
+        sw.title = cb.disabled ? 'Choose a template to enable this email' : (cb.checked ? 'On — this email will send' : 'Off');
+        cb.addEventListener('change', () => {
+            state.textContent = _earNotifyLabel(cb);
+            sw.title = cb.checked ? 'On — this email will send' : 'Off';
+            saveAction(a.key, { enabled: cb.checked });
+        });
+        field.appendChild(sw); field.appendChild(state);
+        controls.appendChild(field);
     }
 
     const test = document.createElement('button'); test.type = 'button';
     test.className = 'btn btn-secondary btn-sm ear-test'; test.textContent = '📧 Send test';
-    test.addEventListener('click', () => testAction(a.key, row));
+    test.addEventListener('click', () => openTestModal(a.key, a.name));
     controls.appendChild(test);
 
     const msg = document.createElement('span'); msg.className = 'ear-msg text-sm'; msg.setAttribute('role', 'status'); controls.appendChild(msg);
@@ -8331,18 +8587,79 @@ async function saveAction(key, patch) {
     }
 }
 
-async function testAction(key, row) {
-    const msg = row.querySelector('.ear-msg');
-    const to = prompt('Send a test of this email to which address?');
-    if (to === null) return;
-    if (msg) { msg.textContent = 'Sending…'; msg.style.color = 'var(--text-secondary)'; }
+// ---- Send-test modal (styled recipient picker: search a user, or type an address) ----------------
+let _testActionKey = null;
+let _testUserId = null;
+let _testSearchTimer = null;
+let _testSearchSeq = 0;
+
+function openTestModal(key, name) {
+    _testActionKey = key; _testUserId = null;
+    clearTimeout(_testSearchTimer); _testSearchSeq++;   // cancel any pending/in-flight search from a prior open
+    document.getElementById('email-test-modal-title').textContent = 'Send a test: ' + name;
+    document.getElementById('et-test-search').value = '';
+    document.getElementById('et-test-addr').value = '';
+    document.getElementById('et-test-results').replaceChildren();
+    const sel = document.getElementById('et-test-selected'); sel.hidden = true; sel.replaceChildren();
+    document.getElementById('et-test-msg').textContent = '';
+    document.getElementById('email-test-modal').classList.add('active');
+    document.getElementById('et-test-search').focus();
+}
+
+async function _testUserSearch(q) {
+    const results = document.getElementById('et-test-results');
+    const search = document.getElementById('et-test-search');
+    q = (q || '').trim();
+    if (q.length < 2) { results.replaceChildren(); search.setAttribute('aria-expanded', 'false'); return; }
+    const seq = ++_testSearchSeq;
     try {
-        const r = await apiRequest('/email/actions/' + encodeURIComponent(key) + '/test',
-            { method: 'POST', body: JSON.stringify({ to_addr: (to || '').trim() }) });
-        if (msg) { msg.textContent = '✓ ' + ((r && r.message) || 'Test sent'); msg.style.color = 'var(--success)'; }
+        const data = await apiRequest('/users/search?q=' + encodeURIComponent(q), { silent: true });
+        if (seq !== _testSearchSeq) return;   // drop a stale/out-of-order response
+        results.replaceChildren();
+        (data || []).slice(0, 8).forEach(u => {
+            const b = document.createElement('button'); b.type = 'button'; b.className = 'pick-row';
+            b.setAttribute('role', 'option'); b.textContent = u.username;
+            b.addEventListener('click', () => _testSelectUser(u.id, u.username));
+            results.appendChild(b);
+        });
+        search.setAttribute('aria-expanded', results.childElementCount ? 'true' : 'false');
+    } catch (e) {}
+}
+
+function _testSelectUser(id, username) {
+    _testUserId = id;
+    clearTimeout(_testSearchTimer); _testSearchSeq++;   // a pending search must not re-open the dropdown
+    document.getElementById('et-test-results').replaceChildren();
+    document.getElementById('et-test-search').value = username;
+    document.getElementById('et-test-search').setAttribute('aria-expanded', 'false');
+    document.getElementById('et-test-addr').value = '';           // user + address are mutually exclusive
+    const sel = document.getElementById('et-test-selected'); sel.hidden = false; sel.replaceChildren();
+    const txt = document.createElement('span');
+    txt.textContent = 'Will send to ' + username + '’s email address. ';
+    const change = document.createElement('button'); change.type = 'button';
+    change.className = 'btn btn-secondary btn-sm'; change.textContent = 'Change';
+    change.addEventListener('click', () => {
+        _testUserId = null; clearTimeout(_testSearchTimer); sel.hidden = true; sel.replaceChildren();
+        const s = document.getElementById('et-test-search'); s.value = ''; s.focus();
+    });
+    sel.appendChild(txt); sel.appendChild(change);
+}
+
+async function sendActionTest() {
+    if (!_testActionKey) return;
+    const msg = document.getElementById('et-test-msg');
+    const addr = document.getElementById('et-test-addr').value.trim();
+    // Picked user wins; else a typed address; else the server falls back to the admin's own email.
+    const body = _testUserId ? { to_user_id: _testUserId } : (addr ? { to_addr: addr } : {});
+    const btn = document.getElementById('et-test-send');
+    try {
+        btn.disabled = true; msg.textContent = 'Sending…'; msg.style.color = 'var(--text-secondary)';
+        const r = await apiRequest('/email/actions/' + encodeURIComponent(_testActionKey) + '/test',
+            { method: 'POST', body: JSON.stringify(body) });
+        msg.textContent = '✓ ' + ((r && r.message) || 'Test sent'); msg.style.color = 'var(--success)';
     } catch (e) {
-        if (msg) { msg.textContent = '✗ ' + ((e && e.message) || 'Test failed'); msg.style.color = 'var(--error)'; }
-    }
+        msg.textContent = '✗ ' + ((e && e.message) || 'Test failed'); msg.style.color = 'var(--error)';
+    } finally { btn.disabled = false; }
 }
 
 async function openTemplateEditor(t) {
@@ -8393,6 +8710,7 @@ function closeTemplateEditor() {
     document.getElementById('email-template-editor').hidden = true;
     _editingTemplateId = null;
     closeDynMenu();   // dismiss the body-level flyout submenu so it can't orphan
+    closeLoadFromMenu();
 }
 
 function setEditorView(view) {
@@ -8535,6 +8853,7 @@ async function toggleDynamicMenu() {
     const menu = document.getElementById('et-dyn-menu');
     const btn = document.getElementById('et-add-dynamic');
     if (!menu.hidden) { closeDynMenu(); return; }
+    closeLoadFromMenu();   // don't leave the other toolbar dropdown open behind this one
     menu.replaceChildren();
     _closeDynSubmenu();
     try {
@@ -8590,6 +8909,81 @@ function _positionDynSubmenu(sub, row) {
     if (top + sh > vh - m) top = Math.max(m, rr.bottom - sh);       // no room below -> flip up
     sub.style.left = Math.round(left) + 'px';
     sub.style.top = Math.round(top) + 'px';
+}
+
+// ---- Load From (reset to a default template, or copy an existing one) ----------------------------
+function closeLoadFromMenu() {
+    const menu = document.getElementById('et-loadfrom-menu');
+    if (menu) menu.hidden = true;
+    const btn = document.getElementById('et-load-from');
+    if (btn) btn.setAttribute('aria-expanded', 'false');
+}
+
+function _loadFromRow(label, onPick) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'et-loadfrom-item'; b.setAttribute('role', 'menuitem');
+    b.textContent = label;
+    b.addEventListener('click', (e) => { e.stopPropagation(); onPick(); });
+    return b;
+}
+
+function _loadFromApply(name, subject, body) {
+    // Replacing the current editor content is destructive, so confirm first.
+    if (!confirm('Replace the current subject and body with “' + name + '”?')) return;
+    document.getElementById('et-subject').value = subject || '';
+    document.getElementById('et-body').value = body || '';
+    closeLoadFromMenu();
+    refreshTemplatePreview();
+    const msg = document.getElementById('et-editor-msg');
+    if (msg) { msg.textContent = 'Loaded “' + name + '”. Review, then Save to keep it.'; msg.style.color = 'var(--text-secondary)'; }
+}
+
+function _loadFromSection(menu, label) {
+    const h = document.createElement('div'); h.className = 'et-loadfrom-section'; h.textContent = label;
+    menu.appendChild(h);
+}
+
+async function toggleLoadFromMenu() {
+    const menu = document.getElementById('et-loadfrom-menu');
+    const btn = document.getElementById('et-load-from');
+    if (!menu.hidden) { closeLoadFromMenu(); return; }
+    closeDynMenu();   // don't leave the other toolbar dropdown open behind this one
+    menu.replaceChildren();
+    // 1) Default templates (from code — always available, even after a seeded row was edited).
+    try {
+        if (!_loadFromDefaults) {
+            const d = await apiRequest('/email/default-templates', { silent: true });
+            _loadFromDefaults = (d && d.templates) || [];
+        }
+    } catch (e) { _loadFromDefaults = _loadFromDefaults || []; }
+    _loadFromSection(menu, 'Default templates');
+    if (_loadFromDefaults.length) {
+        _loadFromDefaults.forEach(t => menu.appendChild(
+            _loadFromRow(t.name || t.key, () => _loadFromApply(t.name || t.key, t.subject, t.body_html))));
+    } else {
+        const e = document.createElement('div'); e.className = 'et-loadfrom-empty'; e.textContent = 'None available'; menu.appendChild(e);
+    }
+    // 2) Your templates (existing rows; exclude built-in defaults — already listed above — and the one
+    // being edited, since loading itself is a no-op).
+    let mine = [];
+    try {
+        const r = await apiRequest('/email/templates', { silent: true });
+        mine = ((r && r.templates) || []).filter(t => !t.is_default && t.id !== _editingTemplateId);
+    } catch (e) {}
+    const sep = document.createElement('div'); sep.className = 'et-loadfrom-sep'; menu.appendChild(sep);
+    _loadFromSection(menu, 'Your templates');
+    if (mine.length) {
+        mine.forEach(t => menu.appendChild(_loadFromRow(t.name || '(untitled)', async () => {
+            // The list omits the body; fetch the full row before applying.
+            let full = null;
+            try { full = await apiRequest('/email/templates/' + t.id, { silent: true }); } catch (e) {}
+            if (!full) { showError('Could not load that template.'); return; }
+            _loadFromApply(t.name || '(untitled)', full.subject, full.body_html);
+        })));
+    } else {
+        const e = document.createElement('div'); e.className = 'et-loadfrom-empty'; e.textContent = 'No other templates yet'; menu.appendChild(e);
+    }
+    menu.hidden = false; btn.setAttribute('aria-expanded', 'true');
 }
 
 async function openImagePicker() {
@@ -8925,6 +9319,8 @@ function attachSettingsListeners() {
         if (etAddImg) etAddImg.addEventListener('click', openImagePicker);
         const etAddDyn = document.getElementById('et-add-dynamic');
         if (etAddDyn) etAddDyn.addEventListener('click', (e) => { e.stopPropagation(); toggleDynamicMenu(); });
+        const etLoadFrom = document.getElementById('et-load-from');
+        if (etLoadFrom) etLoadFrom.addEventListener('click', (e) => { e.stopPropagation(); toggleLoadFromMenu(); });
         const etImgUpload = document.getElementById('et-image-upload');
         if (etImgUpload) etImgUpload.addEventListener('change', (e) => { if (e.target.files[0]) uploadImageResource(e.target.files[0]); });
         const etImgSize = document.getElementById('et-image-size');
@@ -8934,11 +9330,34 @@ function attachSettingsListeners() {
         });
         const etSendGo = document.getElementById('et-send-go');
         if (etSendGo) etSendGo.addEventListener('click', sendTemplateNow);
+        // Send-test modal: debounced user search + send.
+        const etTestSearch = document.getElementById('et-test-search');
+        if (etTestSearch) etTestSearch.addEventListener('input', () => {
+            _testUserId = null;                  // typing = re-searching, so drop any prior selection
+            const sel = document.getElementById('et-test-selected'); if (sel) { sel.hidden = true; sel.replaceChildren(); }
+            clearTimeout(_testSearchTimer);
+            _testSearchTimer = setTimeout(() => _testUserSearch(etTestSearch.value), 250);
+        });
+        const etTestAddr = document.getElementById('et-test-addr');
+        if (etTestAddr) etTestAddr.addEventListener('input', () => {
+            // Typing a specific address supersedes a picked user (they're mutually exclusive), so clear
+            // the selection + banner rather than silently ignoring the typed address.
+            if (etTestAddr.value.trim()) {
+                _testUserId = null;
+                const sel = document.getElementById('et-test-selected'); if (sel) { sel.hidden = true; sel.replaceChildren(); }
+            }
+        });
+        const etTestSend = document.getElementById('et-test-send');
+        if (etTestSend) etTestSend.addEventListener('click', sendActionTest);
         // Close the dynamic-action menu (and its body-level flyout submenu) on an outside click.
         document.addEventListener('click', (e) => {
             const menu = document.getElementById('et-dyn-menu');
             if (menu && !menu.hidden && !e.target.closest('.et-dyn-wrap') && !e.target.closest('#et-dyn-submenu')) {
                 closeDynMenu();
+            }
+            const lf = document.getElementById('et-loadfrom-menu');
+            if (lf && !lf.hidden && !e.target.closest('.et-loadfrom-wrap')) {
+                closeLoadFromMenu();
             }
         });
         // The flyout submenu is position:fixed, so a scroll/resize would detach it from its row —
@@ -8989,9 +9408,32 @@ async function openVault(vaultId) {
         state.currentVaultId = vaultId;
         state.currentFolderId = null;  // Start at root
         state.currentPath = [];  // Empty path array (root)
-        
+
+        // Zero-knowledge: the server returns the non-secret label as `name`. Capture it (so a later
+        // lock can restore it to the header) and, if the account key is unlocked, decrypt the real
+        // name/description for the header. While locked the header shows the label / placeholder.
+        if (vault.type === 'zero_knowledge' && vault.enc_name) {
+            if (vault._zkLabel === undefined) vault._zkLabel = vault.name || null;
+            if (zkKeyUnlocked()) {
+                try {
+                    // Read at the epoch the name was sealed under (name_key_version); NULL/absent => 1
+                    // (how the first sealed build wrote it). The vault name has no content epoch, so
+                    // this is the ONLY thing that says which DEK opens it.
+                    const _ep = vault.name_key_version || 1;
+                    const dek = await zkGetVaultDek(vault.id, _ep);
+                    vault.name = await eccLib().decryptName(vault.enc_name, dek, vault.id, 'name', _ep, vault.id);
+                    if (vault.enc_description) {
+                        try { vault.description = await eccLib().decryptName(vault.enc_description, dek, vault.id, 'description', _ep, vault.id); }
+                        catch (_) { vault.description = null; }
+                    }
+                } catch (_) { vault.name = vault._zkLabel; }   // fall back to the label
+            } else {
+                vault.name = vault._zkLabel;
+            }
+        }
+
         // Update vault view header
-        document.getElementById('vault-view-title').textContent = vault.name;
+        document.getElementById('vault-view-title').textContent = vaultDisplayName(vault);
         const descEl = document.getElementById('vault-view-description');
         if (descEl) {
             descEl.textContent = vault.description || '';
@@ -9120,7 +9562,9 @@ async function openVault(vaultId) {
         console.log('✓ Opened vault:', vault.name);
 
     } catch (error) {
-        console.error('Failed to open vault:', error);
+        // Do NOT log the raw error object: this path now performs zero-knowledge decryption, and a
+        // crypto error object can carry sensitive detail. The user-facing message is shown below.
+        console.error('Failed to open vault');
         showError(error.message || 'Failed to open vault');
 
         // Clear vault state
@@ -10247,8 +10691,19 @@ function zkIdleLock() {
     if (_zkIdleTimer) { clearTimeout(_zkIdleTimer); _zkIdleTimer = null; }
     if (!zkState.privateKey) return;          // already locked
     zkResetKeys();                            // drop the ECC key + per-vault DEKs; next op re-prompts
+    // Re-hide any zero-knowledge vault names/metadata that were decrypted on screen, and flip the
+    // lock control back to locked, so the idle timeout is visible rather than leaving stale plaintext.
+    try {
+        zkRelockVaultNames(state.allVaults);
+        if (typeof zkRelockOpenDetail === 'function') zkRelockOpenDetail();
+        if (typeof updateZkLockControl === 'function') updateZkLockControl();
+        if (typeof renderVaults === 'function') renderVaults();
+    } catch (_) { /* re-hide is best effort */ }
     try { showInfo('Encryption locked after inactivity — you\'ll be asked for your passphrase again.'); } catch (_) {}
 }
+
+// A convenience for the lock control + unlock flow to (re)arm the idle countdown.
+function zkResetIdleLock() { try { zkArmIdleLock(); } catch (_) {} }
 
 // (Re)arm the idle timer. No-op unless the policy is on AND a key is currently unlocked.
 function zkArmIdleLock() {
@@ -11479,6 +11934,216 @@ async function zkDecryptListingNames(items, vault) {
         }
     }
     if (unavailable) showError(safeMessageForCode('CRYPTO_UNAVAILABLE', 'unlock'));
+}
+
+// Whether the account's zero-knowledge key is currently held in memory (unlocked).
+function zkKeyUnlocked() { return !!(zkState && zkState.privateKey); }
+
+// Decrypt the browser-sealed name/description of zero-knowledge vaults in the list IN PLACE, so the
+// rest of the UI keeps reading vault.name / vault.description. NON-prompting on purpose: while the
+// account key is locked the server-sent `name` (the non-secret label) is left in place and the vault
+// is marked zkLocked, so the vault list never forces a passphrase prompt just to render. The lock
+// control does the unlocking, then calls this again. The original label is preserved in `_zkLabel`
+// so re-locking can restore it. Vault names/descriptions are sealed at epoch 1 (a vault, unlike its
+// files, does not rotate its own name).
+async function zkDecryptVaultNames(vaults) {
+    const zk = (vaults || []).filter(v => v && v.type === 'zero_knowledge' && v.enc_name);
+    if (!zk.length) return;
+    for (const v of zk) {
+        // Capture the server-sent non-secret label ONCE (before we overwrite name with the real one).
+        if (v._zkLabel === undefined) v._zkLabel = v.name || null;
+    }
+    if (!zkKeyUnlocked()) {                 // locked -> show labels, do not prompt
+        for (const v of zk) { v.name = v._zkLabel; v.zkLocked = true; }
+        return;
+    }
+    for (const v of zk) {
+        try {
+            // Read at the epoch the name was sealed under (name_key_version); NULL/absent => 1.
+            const _ep = v.name_key_version || 1;
+            const dek = await zkGetVaultDek(v.id, _ep);
+            v.name = await eccLib().decryptName(v.enc_name, dek, v.id, 'name', _ep, v.id);
+            if (v.enc_description) {
+                try { v.description = await eccLib().decryptName(v.enc_description, dek, v.id, 'description', _ep, v.id); }
+                catch (_) { /* keep whatever the server returned for description */ }
+            }
+            v.zkLocked = false;
+        } catch (_) {
+            v.name = v._zkLabel;            // can't decrypt -> fall back to the label
+            v.zkLocked = true;
+        }
+    }
+}
+
+// Re-lock: forget the decrypted names and restore the non-secret labels, so the list re-hides the
+// real data. Does NOT touch the account key (the caller decides whether to drop that).
+function zkRelockVaultNames(vaults) {
+    for (const v of (vaults || [])) {
+        if (v && v.type === 'zero_knowledge' && v.enc_name) {
+            v.name = (v._zkLabel !== undefined ? v._zkLabel : v.name);
+            v.description = null;
+            v.zkLocked = true;
+        }
+    }
+}
+
+// The label a locked zero-knowledge vault shows when its owner set none: a neutral, styled
+// placeholder (never the raw padlock emoji, per design).
+function vaultDisplayName(v) {
+    if (v && v.name) return v.name;
+    return (v && v.type === 'zero_knowledge') ? 'Encrypted vault' : 'Vault';
+}
+
+// --- Zero-knowledge lock control (vaults toolbar) --------------------------
+function _zkHasSealedVaults() {
+    return (state.allVaults || []).some(v => v && v.type === 'zero_knowledge' && v.enc_name);
+}
+
+// Reflect the current lock state in the toolbar control (hidden when the user has no ZK vaults).
+function updateZkLockControl() {
+    const btn = document.getElementById('zk-lock-control');
+    if (!btn) return;
+    if (!_zkHasSealedVaults()) { btn.style.display = 'none'; return; }
+    const unlocked = zkKeyUnlocked();
+    btn.style.display = '';
+    btn.classList.toggle('is-unlocked', unlocked);
+    btn.setAttribute('aria-pressed', unlocked ? 'true' : 'false');
+    const use = btn.querySelector('use');
+    if (use) use.setAttribute('href', unlocked ? '#i-unlock' : '#i-lock');
+    const label = document.getElementById('zk-lock-label');
+    if (label) label.textContent = unlocked ? 'Unlocked' : 'Locked';
+    btn.title = unlocked
+        ? 'Zero-knowledge vaults unlocked — click to lock and hide names again'
+        : 'Zero-knowledge vaults locked — click to unlock and reveal names';
+    if (!btn._zkWired) { btn._zkWired = true; btn.addEventListener('click', toggleZkLock); }
+}
+
+async function zkUnlockAllVaults() {
+    try {
+        await zkEnsureUnlocked();            // the shared account-key passphrase prompt
+    } catch (e) {
+        if (typeof isCodedCryptoError === 'function' && isCodedCryptoError(e)) {
+            showError(safeMessageForCode(e.code, 'unlock'));
+        } else if (!/cancel/i.test((e && e.message) || '')) {
+            showError((e && e.message) || 'Unlock failed.');
+        }
+        return;
+    }
+    // Migrate any EXISTING zero-knowledge vaults whose name is still plaintext server-side (best
+    // effort), then decrypt everything for display.
+    try { await zkSealLegacyVaultNames(); } catch (_) {}
+    try { await zkDecryptVaultNames(state.allVaults); } catch (_) {}
+    updateZkLockControl();
+    renderVaults();
+    zkResetIdleLock();
+    // Reveal the freshly-decrypted metadata with the decode animation (after the render commits).
+    requestAnimationFrame(() => { try { zkAnimateReveal(); } catch (_) {} });
+}
+
+// Migrate EXISTING zero-knowledge vaults whose name is still plaintext at rest (enc_name absent):
+// seal the name/description in the browser and PATCH the blobs, so the server swaps the plaintext
+// for ciphertext (and drops the plaintext name — see update_vault_info). Fire-and-forget, best
+// effort, idempotent — the next load returns the sealed form. Runs on unlock (the DEK is available).
+async function zkSealLegacyVaultNames() {
+    const legacy = (state.allVaults || []).filter(v =>
+        v && v.type === 'zero_knowledge' && !v.enc_name && v.name);
+    if (!legacy.length) return;
+    for (const v of legacy) {
+        try {
+            // Seal at the CURRENT DEK epoch -- every active member holds it, whereas a member who
+            // joined after a rekey does NOT hold epoch 1 -- and record it as name_key_version so a
+            // later read/retire uses the right epoch. (A vault name always advances to the current
+            // epoch, unlike a file/folder rename which keeps the item's existing epoch: nothing reads
+            // the vault name pinned to an old epoch the way a file's content is, so advancing is safe
+            // and lets the stale epoch be retired.)
+            const epoch = await zkGetCurrentDekVersion(v.id);
+            const dek = await zkGetVaultDek(v.id, epoch);
+            const body = {
+                enc_name: await eccLib().encryptName(v.name, dek, v.id, 'name', epoch, v.id),
+                name_key_version: epoch,
+            };
+            if (v.description) {
+                body.enc_description = await eccLib().encryptName(v.description, dek, v.id, 'description', epoch, v.id);
+            }
+            await apiRequest(`/vaults/${v.id}`, { method: 'PATCH', body: JSON.stringify(body), silent: true });
+            // Reflect locally: the name is now the sealed real name; no label was set for a legacy
+            // vault, so it shows the neutral placeholder while locked until the owner sets one.
+            v.enc_name = body.enc_name;
+            v.name_key_version = epoch;
+            v._zkLabel = null;
+        } catch (_) { /* missing DEK / offline — retried on the next unlock */ }
+    }
+}
+
+function zkLockAllVaults() {
+    zkResetKeys();                           // forget the account key + cached DEKs
+    zkRelockVaultNames(state.allVaults);
+    zkRelockOpenDetail();                    // also re-hide the OPEN vault's detail header/description
+    updateZkLockControl();
+    renderVaults();
+    try { showInfo('Zero-knowledge vaults locked.'); } catch (_) {}
+}
+
+// After a lock, the OPEN vault's detail header may still show a decrypted ZK name/description (e.g.
+// typed into the edit form during an in-session rename). Reset it to the non-secret label /
+// placeholder so a lock removes decrypted ZK metadata from the screen, not just from the list.
+function zkRelockOpenDetail() {
+    const cv = state.currentVault;
+    if (!cv || cv.type !== 'zero_knowledge' || !cv.enc_name) return;
+    let label = cv._zkLabel;
+    if (label === undefined) {               // not captured on this object -> borrow the list's
+        const lv = (state.allVaults || []).find(v => v && String(v.id) === String(cv.id));
+        label = lv ? (lv._zkLabel !== undefined ? lv._zkLabel : lv.name) : null;
+    }
+    cv.name = (label != null ? label : null);
+    cv.description = null;
+    const title = document.getElementById('vault-view-title');
+    if (title) title.textContent = vaultDisplayName(cv);
+    const descEl = document.getElementById('vault-view-description');
+    if (descEl) { descEl.textContent = ''; descEl.style.display = 'none'; }
+}
+
+function toggleZkLock() {
+    if (zkKeyUnlocked()) zkLockAllVaults();
+    else zkUnlockAllVaults();
+}
+
+// --- Decode reveal animation -----------------------------------------------
+// On unlock, each .zk-field on a ZK vault card reveals its (now real) text left-to-right, each
+// position flickering through random glyphs before settling — a lightweight "decrypting" effect.
+// Pure client-side (requestAnimationFrame), only over the cards currently on screen, bounded work
+// per frame (one pass over the field's characters), so it stays cheap even with many vaults.
+const _ZK_GLYPHS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789#%&@$';
+function zkAnimateReveal(root) {
+    const scope = root || document.getElementById('vaults-list');
+    if (!scope) return;
+    scope.querySelectorAll('.vault-card[data-zk="1"] .zk-field').forEach(el => _zkDecodeField(el));
+}
+function _zkDecodeField(el) {
+    const finalText = el.textContent;
+    if (!finalText) return;
+    const chars = Array.from(finalText);
+    const total = chars.length;
+    const framesPerChar = 2;                 // settle a new character every ~2 frames -> < 1s
+    let frame = 0;
+    el.classList.add('zk-decoding');
+    const step = () => {
+        const settled = Math.min(total, Math.floor(frame / framesPerChar));
+        let out = '';
+        for (let i = 0; i < total; i++) {
+            if (i < settled || chars[i] === ' ') out += chars[i];
+            else out += _ZK_GLYPHS[(Math.random() * _ZK_GLYPHS.length) | 0];
+        }
+        el.textContent = out;
+        frame++;
+        if (settled >= total) {
+            el.textContent = finalText;      // guarantee the exact final text
+            el.classList.remove('zk-decoding');
+            return;
+        }
+        requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
 }
 
 // Lazily migrate EXISTING zero-knowledge rows whose name is still plaintext server-side:
@@ -14791,31 +15456,59 @@ async function handleEditVaultInfo(e) {
     }
     
     try {
-        const updatedVault = await apiRequest(`/vaults/${state.currentVault.id}`, {
+        const cv = state.currentVault;
+        const isZk = cv && cv.type === 'zero_knowledge';
+        let body;
+        let zkEpoch = null;
+        if (isZk) {
+            // Seal the (possibly changed) name + description in the browser; the server never sees
+            // the plaintext. Seal at the CURRENT DEK epoch (every active member holds it; a member
+            // who joined after a rekey does NOT hold epoch 1) and send name_key_version so a later
+            // read/retire uses the right epoch. The non-secret label (server-side `name`) is left
+            // unchanged here.
+            zkEpoch = await zkGetCurrentDekVersion(cv.id);
+            const dek = await zkGetVaultDek(cv.id, zkEpoch);
+            body = {
+                enc_name: await eccLib().encryptName(name, dek, cv.id, 'name', zkEpoch, cv.id),
+                enc_description: description
+                    ? await eccLib().encryptName(description, dek, cv.id, 'description', zkEpoch, cv.id)
+                    : null,
+                name_key_version: zkEpoch,
+            };
+        } else {
+            body = { name: name, description: description || null };
+        }
+        const updatedVault = await apiRequest(`/vaults/${cv.id}`, {
             method: 'PATCH',
-            body: JSON.stringify({
-                name: name,
-                description: description || null
-            })
+            body: JSON.stringify(body)
         });
-        
-        // Update local state
-        state.currentVault.name = updatedVault.name;
-        state.currentVault.description = updatedVault.description;
-        
-        // Update UI
+
+        // Update local state. For a ZK vault the server echoes the label as `name`, so keep the
+        // edited real name/description locally rather than overwriting them with the label.
+        if (isZk) {
+            cv.name = name;
+            cv.description = description || null;
+            cv.name_key_version = zkEpoch;   // keep local read epoch in lockstep with the re-seal
+        } else {
+            cv.name = updatedVault.name;
+            cv.description = updatedVault.description;
+        }
+
+        // Update UI (show the real, edited values)
         const vaultTitle = document.getElementById('vault-view-title');
-        if (vaultTitle) vaultTitle.textContent = updatedVault.name;
-        
+        if (vaultTitle) vaultTitle.textContent = cv.name;
+
         const vaultDesc = document.getElementById('vault-view-description');
-        if (vaultDesc) vaultDesc.textContent = updatedVault.description || 'No description';
+        if (vaultDesc) vaultDesc.textContent = cv.description || 'No description';
         
         showSuccess('Vault information updated successfully');
         closeModal('edit-vault-info-modal');
         await loadVaultSettings();
         
     } catch (error) {
-        console.error('Failed to update vault info:', error);
+        // Do NOT log the raw error object: this path now performs zero-knowledge sealing, and a
+        // crypto error object can carry sensitive detail. The user-facing message is shown below.
+        console.error('Failed to update vault info');
         showError(error.message || 'Failed to update vault information');
     }
 }
@@ -15029,7 +15722,88 @@ function setupNoteLinkTagsUI() {
         const b = e.target.closest('.icon-choice');
         if (b) { e.preventDefault(); setNoteLinkTagIcon(b.getAttribute('data-icon') || ''); }
     });
+    const refresh = _nlEl('nl-admin-refresh');
+    if (refresh) refresh.addEventListener('click', loadAdminNoteLinks);
+    const revokeAll = _nlEl('nl-admin-revoke-all');
+    if (revokeAll) revokeAll.addEventListener('click', adminRevokeAllNoteLinks);
     noteLinkTagsUIWired = true;
+}
+
+// ---- Admin oversight: all public links across users (Settings -> Note Links) -----------------
+async function loadAdminNoteLinks() {
+    const host = _nlEl('nl-admin-links');
+    const summary = _nlEl('nl-admin-summary');
+    if (!host) return;
+    host.replaceChildren(_el('div', 'spinner'));
+    try {
+        const data = await apiRequest('/admin/note-links', { silent: true });
+        renderAdminNoteLinks(data || { links: [] });
+        if (summary) {
+            const total = (data && data.total) || 0, active = (data && data.active_count) || 0;
+            summary.textContent = total + ' link(s), ' + active + ' active'
+                + (data && data.capped ? ' (showing the newest 1000)' : '');
+        }
+    } catch (e) {
+        host.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load links: ' + ((e && e.message) || '')));
+    }
+}
+
+function renderAdminNoteLinks(data) {
+    const host = _nlEl('nl-admin-links');
+    if (!host) return;
+    const links = (data && data.links) || [];
+    if (!links.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', 'No public links exist.')); return; }
+    const table = _el('table', 'data-table');
+    const thead = _el('thead');
+    const hr = _el('tr');
+    ['Owner', 'Type', 'Note', 'Status', 'Protection', 'Expires', 'Views', ''].forEach(h => hr.appendChild(_el('th', '', h)));
+    thead.appendChild(hr); table.appendChild(thead);
+    const tb = _el('tbody');
+    links.forEach(l => {
+        const tr = _el('tr');
+        tr.appendChild(_el('td', '', l.owner || '—'));
+        const typeTd = _el('td', 'nl-tag-idlead');
+        const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
+        if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
+        typeTd.appendChild(_el('span', '', l.tag_name || '—'));
+        tr.appendChild(typeTd);
+        tr.appendChild(_el('td', '', l.title || 'Untitled note'));
+        tr.appendChild(_el('td', '', _NOTE_LINK_STATUS_LABEL[l.status] || l.status));
+        tr.appendChild(_el('td', '', l.secret_kind === 'password' ? 'Password' : (l.secret_kind === 'pin' ? 'PIN' : 'None')));
+        tr.appendChild(_el('td', '', l.expires_at ? _fmtLinkExpiry(l.expires_at).replace(/^Expires /, '') : 'Never'));
+        tr.appendChild(_el('td', '', (l.max_uses != null) ? (l.view_count + '/' + l.max_uses) : String(l.view_count)));
+        const actTd = _el('td');
+        if (l.status === 'active') {
+            const rv = _el('button', 'btn btn-ghost btn-sm', 'Revoke');
+            rv.type = 'button';
+            rv.addEventListener('click', () => adminRevokeNoteLink(l.id));
+            actTd.appendChild(rv);
+        }
+        tr.appendChild(actTd);
+        tb.appendChild(tr);
+    });
+    table.appendChild(tb);
+    host.replaceChildren(table);
+}
+
+async function adminRevokeNoteLink(id) {
+    const ok = await showConfirm('Revoke this public link? Anyone holding it will no longer be able to open it.');
+    if (!ok) return;
+    try {
+        await apiRequest('/admin/note-links/' + id + '/revoke', { method: 'POST' });
+        showSuccess('Link revoked');
+        await loadAdminNoteLinks();
+    } catch (e) { showError((e && e.message) || 'Could not revoke the link'); }
+}
+
+async function adminRevokeAllNoteLinks() {
+    const ok = await showConfirm('Revoke ALL currently-active public links across every user? This cannot be undone.');
+    if (!ok) return;
+    try {
+        const r = await apiRequest('/admin/note-links/revoke-all', { method: 'POST' });
+        showSuccess('Revoked ' + ((r && r.revoked_count) || 0) + ' link(s)');
+        await loadAdminNoteLinks();
+    } catch (e) { showError((e && e.message) || 'Could not revoke links'); }
 }
 
 // Named tile colours for note-link tags -> hex (also accepts a raw #hex). Superset of the seeded
@@ -15218,7 +15992,12 @@ function _notesState() {
         try { state.notesHideText = localStorage.getItem('notesHideText') === '1'; }
         catch (_) { state.notesHideText = false; }
     }
-    if (!state.notesTab) state.notesTab = 'mine';
+    if (!state.notesTab) {
+        // Restore the last-viewed tab across a page reload (mine / received / shared).
+        let saved = 'mine';
+        try { saved = localStorage.getItem('notesTab') || 'mine'; } catch (_) {}
+        state.notesTab = ['mine', 'received', 'shared'].includes(saved) ? saved : 'mine';
+    }
 }
 
 async function loadNotes() {
@@ -15227,9 +16006,15 @@ async function loadNotes() {
     const mine = document.getElementById('notes-list');
     if (mine) mine.replaceChildren(_el('div', 'spinner'));
     try {
-        const [a, b] = await Promise.all([apiRequest('/notes'), apiRequest('/notes/received')]);
+        // Public links are best-effort: if the endpoint is unavailable the notes still render.
+        const [a, b, c] = await Promise.all([
+            apiRequest('/notes'),
+            apiRequest('/notes/received'),
+            apiRequest('/note-links', { silent: true }).catch(() => ({ links: [] })),
+        ]);
         state.notes = (a && a.notes) || [];
         state.notesReceived = (b && b.notes) || [];
+        state.noteLinks = (c && c.links) || [];
         renderNotes();
     } catch (e) {
         if (mine) mine.replaceChildren(_el('div', 'alert alert-error', 'Failed to load notes: ' + ((e && e.message) || '')));
@@ -15245,13 +16030,38 @@ function renderNotes() {
         b => b.classList.toggle('active', b.getAttribute('data-notes-tab') === state.notesTab));
     const mineTab = document.getElementById('notes-tab-mine');
     const recvTab = document.getElementById('notes-tab-received');
+    const sharedTab = document.getElementById('notes-tab-shared');
     if (mineTab) mineTab.style.display = state.notesTab === 'mine' ? '' : 'none';
     if (recvTab) recvTab.style.display = state.notesTab === 'received' ? '' : 'none';
+    if (sharedTab) sharedTab.style.display = state.notesTab === 'shared' ? '' : 'none';
+    // My-notes count badge
+    const mineBadge = document.getElementById('notes-mine-count');
+    if (mineBadge) {
+        mineBadge.textContent = String(state.notes.length);
+        mineBadge.hidden = state.notes.length === 0;
+    }
     // Received count badge
     const badge = document.getElementById('notes-received-count');
     if (badge) {
         badge.textContent = String(state.notesReceived.length);
         badge.hidden = state.notesReceived.length === 0;
+    }
+    // Shared (active links) count badge
+    const links = state.noteLinks || [];
+    const sharedBadge = document.getElementById('notes-shared-count');
+    if (sharedBadge) {
+        const activeLinks = links.filter(l => l.status === 'active').length;
+        sharedBadge.textContent = String(activeLinks);
+        sharedBadge.hidden = activeLinks === 0;
+    }
+    // Shared (by me)
+    const shared = document.getElementById('notes-shared-list');
+    if (shared) {
+        if (!links.length) {
+            shared.replaceChildren(_el('p', 'text-secondary p-md', 'No public links yet. Use Share → Public link on a note to create one.'));
+        } else {
+            shared.replaceChildren(...links.map(_noteLinkCard));
+        }
     }
     // My notes
     const mine = document.getElementById('notes-list');
@@ -15345,10 +16155,10 @@ function _noteCard(n, received) {
         edit.type = 'button';
         edit.addEventListener('click', () => openNoteEditor(n));
         actions.appendChild(edit);
-        const send = _el('button', 'btn btn-ghost btn-sm', 'Send');
-        send.type = 'button';
-        send.addEventListener('click', () => openSendNote(n.id));
-        actions.appendChild(send);
+        const share = _el('button', 'btn btn-ghost btn-sm', 'Share');
+        share.type = 'button';
+        share.addEventListener('click', () => openNoteShare(n.id));
+        actions.appendChild(share);
         const del = _el('button', 'btn btn-ghost btn-sm', 'Delete');
         del.type = 'button';
         del.addEventListener('click', () => deleteNoteItem(n.id, n.title));
@@ -15357,6 +16167,99 @@ function _noteCard(n, received) {
     bodyWrap.appendChild(actions);
     card.appendChild(bodyWrap);
     return card;
+}
+
+// ---- "Shared (by me)" tab: a card per public note link ---------------------------------------
+const _NOTE_LINK_STATUS_LABEL = { active: 'Active', revoked: 'Revoked', expired: 'Expired', exhausted: 'Used up' };
+
+function _fmtLinkExpiry(iso) {
+    // parseServerTime reads the API's UTC timestamp correctly (the bare Date constructor would
+    // misread it as local time — and the offline UI-time guard test forbids that).
+    const d = parseServerTime(iso);
+    if (!d || isNaN(d)) return 'No expiry';
+    return 'Expires ' + d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+function _noteLinkCard(l) {
+    const card = _el('div', 'card note-link-card');
+    const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
+    if (hex) card.style.borderLeft = '4px solid ' + hex;
+    const body = _el('div', 'card-body');
+    const head = _el('div', 'flex justify-between items-center gap-sm');
+    const lead = _el('div', 'nl-tag-idlead');
+    if (l.tag_icon) lead.appendChild(_svgIcon(l.tag_icon, 'icon-sm'));
+    lead.appendChild(_el('span', 'text-secondary text-sm', l.tag_name || 'Link'));
+    head.appendChild(lead);
+    head.appendChild(_el('span', 'badge ' + (l.status === 'active' ? 'badge-success' : 'badge-secondary'),
+        _NOTE_LINK_STATUS_LABEL[l.status] || l.status));
+    body.appendChild(head);
+    body.appendChild(_el('h3', 'text-base font-bold mt-sm note-link-title', l.title || 'Untitled note'));
+    const secret = l.secret_kind === 'password' ? 'Password' : (l.secret_kind === 'pin' ? 'PIN' : 'No code');
+    const exp = l.expires_at ? _fmtLinkExpiry(l.expires_at) : 'No expiry';
+    const views = (l.max_uses != null) ? (l.view_count + ' / ' + l.max_uses + ' views') : (l.view_count + ' views');
+    body.appendChild(_el('div', 'text-secondary text-sm mt-sm', secret + ' · ' + exp + ' · ' + views));
+    const actions = _el('div', 'flex gap-sm mt-md flex-wrap note-actions');
+    // View the frozen snapshot this link serves (always available, even once revoked/expired).
+    const view = _el('button', 'btn btn-secondary btn-sm', 'View');
+    view.type = 'button';
+    view.addEventListener('click', () => openNoteLinkSnapshot(l));
+    actions.appendChild(view);
+    if (l.status === 'active') {
+        const copy = _el('button', 'btn btn-ghost btn-sm', 'Copy link');
+        copy.type = 'button';
+        copy.addEventListener('click', () => copyNoteLinkUrl(l));
+        actions.appendChild(copy);
+        const revoke = _el('button', 'btn btn-ghost btn-sm', 'Revoke');
+        revoke.type = 'button';
+        revoke.addEventListener('click', () => revokeNoteLink(l.id));
+        actions.appendChild(revoke);
+    }
+    const del = _el('button', 'btn btn-ghost btn-sm', 'Delete');
+    del.type = 'button';
+    del.addEventListener('click', () => deleteNoteLink(l.id));
+    actions.appendChild(del);
+    body.appendChild(actions);
+    card.appendChild(body);
+    return card;
+}
+
+function openNoteLinkSnapshot(l) {
+    // Show the frozen snapshot this link serves (title + body), so the owner can recall what's in it.
+    const titleEl = document.getElementById('note-link-snapshot-title');
+    const bodyEl = document.getElementById('note-link-snapshot-body');
+    if (titleEl) titleEl.textContent = l.title || 'Untitled note';
+    if (bodyEl) bodyEl.textContent = (l.body != null) ? l.body : '(snapshot text unavailable)';
+    openModal('note-link-snapshot-modal');
+}
+
+function copyNoteLinkUrl(l) {
+    const url = window.location.origin + (l.url_path || ('/l/' + l.token));
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(() => showSuccess('Link copied'))
+            .catch(() => showError('Copy failed — ' + url));
+    } else {
+        showError('Copy not supported — ' + url);
+    }
+}
+
+async function revokeNoteLink(id) {
+    const ok = await showConfirm('Revoke this link? Anyone holding it will no longer be able to open it.');
+    if (!ok) return;
+    try {
+        await apiRequest('/note-links/' + id + '/revoke', { method: 'POST' });
+        showSuccess('Link revoked');
+        await loadNotes();
+    } catch (e) { showError((e && e.message) || 'Could not revoke the link'); }
+}
+
+async function deleteNoteLink(id) {
+    const ok = await showConfirm('Delete this link permanently? This removes the shared snapshot.');
+    if (!ok) return;
+    try {
+        await apiRequest('/note-links/' + id, { method: 'DELETE' });
+        showSuccess('Link deleted');
+        await loadNotes();
+    } catch (e) { showError((e && e.message) || 'Could not delete the link'); }
 }
 
 // ---- Note read modal (rendered note + a left rail to switch between notes) --------------------
@@ -15418,10 +16321,10 @@ function renderNoteView() {
             edit.type = 'button';
             edit.addEventListener('click', () => { closeModal(); openNoteEditor(cur); });
             actions.appendChild(edit);
-            const send = _el('button', 'btn btn-ghost', 'Send');
-            send.type = 'button';
-            send.addEventListener('click', () => { closeModal(); openSendNote(cur.id); });
-            actions.appendChild(send);
+            const share = _el('button', 'btn btn-ghost', 'Share');
+            share.type = 'button';
+            share.addEventListener('click', () => { closeModal(); openNoteShare(cur.id); });
+            actions.appendChild(share);
         }
         const close = _el('button', 'btn btn-ghost', 'Close');
         close.type = 'button';
@@ -15540,13 +16443,195 @@ async function confirmSendNote() {
     } catch (e) { showError((e && e.message) || 'Could not send the note'); if (btn) btn.disabled = false; }
 }
 
+// ---- Share note: a two-tile chooser (Send to a member / Public link) -------------------------
+function openNoteShare(id) {
+    state.shareNoteId = id;
+    const pubTile = document.getElementById('note-share-public');
+    const disabledNote = document.getElementById('note-share-public-disabled');
+    if (pubTile) pubTile.disabled = false;          // refined once the policy loads
+    if (disabledNote) disabledNote.hidden = true;
+    openModal('note-share-modal');
+    // Learn whether public links are enabled + which tags this user may create with.
+    apiRequest('/note-link-policy', { silent: true }).then(p => {
+        state._noteLinkPolicy = p || { enabled: false, tags: [] };
+        const enabled = !!(p && p.enabled);
+        if (pubTile) pubTile.disabled = !enabled;
+        if (disabledNote) disabledNote.hidden = enabled;
+    }).catch(() => {
+        state._noteLinkPolicy = { enabled: false, tags: [] };
+        if (pubTile) pubTile.disabled = true;
+        if (disabledNote) disabledNote.hidden = false;
+    });
+}
+
+function _npEl(id) { return document.getElementById(id); }
+
+async function openNotePublicLink(id) {
+    state.shareNoteId = id;
+    if (!state._noteLinkPolicy) {
+        try { state._noteLinkPolicy = await apiRequest('/note-link-policy', { silent: true }); }
+        catch (_) { state._noteLinkPolicy = { enabled: false, tags: [] }; }
+    }
+    const policy = state._noteLinkPolicy || { enabled: false, tags: [] };
+    _npEl('note-public-form').hidden = false;
+    _npEl('note-public-result').hidden = true;
+    _npEl('note-public-create').hidden = false;
+    if (_npEl('note-public-cancel')) _npEl('note-public-cancel').hidden = false;
+    if (_npEl('note-public-done')) _npEl('note-public-done').hidden = true;
+    const err = _npEl('note-public-error'); if (err) err.hidden = true;
+    const sel = _npEl('note-public-tag');
+    sel.replaceChildren();
+    const tags = policy.tags || [];
+    if (!tags.length) {
+        const o = _el('option', '', policy.enabled ? 'No link types available to you' : 'Public links are turned off');
+        o.value = '';
+        sel.appendChild(o);
+        _npEl('note-public-create').disabled = true;
+    } else {
+        _npEl('note-public-create').disabled = false;
+        tags.forEach(t => { const o = _el('option', '', t.name); o.value = t.id; sel.appendChild(o); });
+    }
+    openModal('note-public-link-modal');
+    onNotePublicTagChange();
+}
+
+function _notePublicSelectedTag() {
+    const sel = _npEl('note-public-tag');
+    const id = sel ? sel.value : '';
+    return (((state._noteLinkPolicy || {}).tags) || []).find(t => t.id === id) || null;
+}
+
+function _npSecretPhrase(kind) {
+    return kind === 'password' ? 'a password' : (kind === 'pin' ? 'a PIN' : 'no code');
+}
+
+const _NP_SECRET_STRENGTH = { none: 0, pin: 1, password: 2 };
+
+function onNotePublicTagChange() {
+    const t = _notePublicSelectedTag();
+    const floor = _npEl('note-public-tag-floor');
+    if (!t) { if (floor) floor.textContent = ''; return; }
+    const ttlTxt = t.max_ttl_hours ? ('expires within ' + t.max_ttl_hours + 'h') : 'no expiry required';
+    const useTxt = t.max_uses_cap ? ('up to ' + t.max_uses_cap + ' view(s)') : 'unlimited views';
+    if (floor) floor.textContent = 'This type requires at least: a ' + t.min_token_len + '-char link, '
+        + _npSecretPhrase(t.require_secret) + ', ' + ttlTxt + ', ' + useTxt + '. You can only make it stricter.';
+    // Token length floor.
+    const tok = _npEl('note-public-token-len');
+    tok.min = t.min_token_len; tok.value = t.min_token_len;
+    // Secret: disable anything weaker than the floor; default to the floor.
+    const secret = _npEl('note-public-secret');
+    Array.from(secret.options).forEach(o => {
+        o.disabled = (_NP_SECRET_STRENGTH[o.value] || 0) < (_NP_SECRET_STRENGTH[t.require_secret] || 0);
+    });
+    secret.value = t.require_secret;
+    onNotePublicSecretChange();
+    // PIN length options >= the floor.
+    const pinLen = _npEl('note-public-pin-len');
+    pinLen.replaceChildren();
+    [4, 6, 8].filter(n => n >= (t.min_pin_len || 4)).forEach(n => {
+        const o = _el('option', '', n + ' digits'); o.value = String(n); pinLen.appendChild(o);
+    });
+    const pwHelp = _npEl('note-public-password-help');
+    if (pwHelp) pwHelp.textContent = 'At least ' + (t.password_min_len || 8) + ' characters'
+        + (t.password_require_alnum ? ', including letters and numbers.' : '.');
+    // Expiry: the tag's max is the ceiling. "Never expires" is only allowed when the tag sets no
+    // ceiling — so it's always VISIBLE but DISABLED (greyed) under a capped tag, rather than hidden,
+    // so the operator can see it's an option that this tag forbids.
+    const ttl = _npEl('note-public-ttl');
+    const never = _npEl('note-public-never');
+    if (t.max_ttl_hours) {
+        ttl.max = t.max_ttl_hours;
+        ttl.value = t.default_ttl_hours || t.max_ttl_hours;
+        ttl.disabled = false;
+        if (never) { never.checked = false; never.disabled = true; never.title = 'This link type caps the lifetime, so it cannot be set to never expire.'; }
+    } else {
+        ttl.removeAttribute('max');
+        if (never) { never.disabled = false; never.title = ''; }
+        if (t.default_ttl_hours) { ttl.value = t.default_ttl_hours; if (never) never.checked = false; ttl.disabled = false; }
+        else { if (never) never.checked = true; ttl.value = ''; ttl.disabled = true; }
+    }
+    // Max uses: the tag's cap is the ceiling; unlimited only when the tag sets no cap.
+    const uses = _npEl('note-public-max-uses');
+    if (t.max_uses_cap) { uses.max = t.max_uses_cap; uses.value = t.max_uses_cap; uses.placeholder = 'up to ' + t.max_uses_cap; }
+    else { uses.removeAttribute('max'); uses.value = ''; uses.placeholder = 'unlimited'; }
+}
+
+function onNotePublicSecretChange() {
+    const kind = _npEl('note-public-secret').value;
+    _npEl('note-public-pin-group').hidden = (kind !== 'pin');
+    _npEl('note-public-password-group').hidden = (kind !== 'password');
+}
+
+function _npNeverChecked() {
+    const n = _npEl('note-public-never');
+    return !!(n && !n.disabled && n.checked);   // "never" counts only when the tag allows it
+}
+
+function _notePublicPayload() {
+    const t = _notePublicSelectedTag();
+    const p = { note_id: state.shareNoteId, tag_id: t.id };
+    const tok = parseInt(_npEl('note-public-token-len').value, 10);
+    if (Number.isFinite(tok)) p.token_len = tok;
+    const kind = _npEl('note-public-secret').value;
+    p.secret_kind = kind;
+    if (kind === 'pin') p.pin = (_npEl('note-public-pin').value || '').trim();
+    if (kind === 'password') p.password = _npEl('note-public-password').value || '';
+    if (_npNeverChecked()) { p.ttl_hours = null; }
+    else { const h = parseInt(_npEl('note-public-ttl').value, 10); if (Number.isFinite(h)) p.ttl_hours = h; }
+    const mu = parseInt(_npEl('note-public-max-uses').value, 10);
+    p.max_uses = Number.isFinite(mu) ? mu : null;
+    return p;
+}
+
+async function submitNotePublicLink() {
+    const t = _notePublicSelectedTag();
+    const err = _npEl('note-public-error');
+    if (err) err.hidden = true;
+    if (!t) { if (err) { err.textContent = 'Choose a link type first.'; err.hidden = false; } return; }
+    const btn = _npEl('note-public-create');
+    btn.disabled = true;
+    try {
+        const link = await apiRequest('/note-links', { method: 'POST', body: JSON.stringify(_notePublicPayload()) });
+        const url = window.location.origin + (link.url_path || ('/l/' + link.token));
+        state._lastPublicLinkUrl = url;
+        _npEl('note-public-form').hidden = true;
+        _npEl('note-public-result').hidden = false;
+        _npEl('note-public-link-value').value = url;
+        btn.hidden = true;
+        if (_npEl('note-public-cancel')) _npEl('note-public-cancel').hidden = true;
+        if (_npEl('note-public-done')) _npEl('note-public-done').hidden = false;
+        // Refresh so the new link shows on the "Shared" tab without a page reload.
+        loadNotes();
+    } catch (e) {
+        if (err) { err.textContent = (e && e.message) || 'Could not create the link.'; err.hidden = false; }
+        btn.disabled = false;
+    }
+}
+
+function copyNotePublicLink() {
+    const inp = _npEl('note-public-link-value');
+    const val = (inp && inp.value) || state._lastPublicLinkUrl || '';
+    if (!val) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(val).then(() => showSuccess('Link copied'))
+            .catch(() => { if (inp) { inp.select(); } showError('Copy failed — select the link and copy it.'); });
+    } else if (inp) {
+        inp.select();
+        try { document.execCommand('copy'); showSuccess('Link copied'); } catch (_) { showError('Copy failed.'); }
+    }
+}
+
 function wireNotesOnce() {
     if (state._notesWired) return;
     state._notesWired = true;
     const nw = document.getElementById('note-new-btn');
     if (nw) nw.addEventListener('click', () => openNoteEditor(null));
     document.querySelectorAll('#notes-section .tab-btn[data-notes-tab]').forEach(b =>
-        b.addEventListener('click', () => { state.notesTab = b.getAttribute('data-notes-tab'); renderNotes(); }));
+        b.addEventListener('click', () => {
+            state.notesTab = b.getAttribute('data-notes-tab');
+            try { localStorage.setItem('notesTab', state.notesTab); } catch (_) {}   // survive a page reload
+            renderNotes();
+        }));
     const hide = document.getElementById('notes-hide-toggle');
     if (hide) hide.addEventListener('change', () => {
         state.notesHideText = hide.checked;
@@ -15560,7 +16645,26 @@ function wireNotesOnce() {
     if (sendConfirm) sendConfirm.addEventListener('click', confirmSendNote);
     const sendSearch = document.getElementById('note-send-search');
     if (sendSearch) sendSearch.addEventListener('input', onNoteRecipientSearch);
-    document.querySelectorAll('[data-note-close], [data-note-send-close], [data-note-view-close]').forEach(el =>
+    // Share chooser tiles.
+    const shareInternal = document.getElementById('note-share-internal');
+    if (shareInternal) shareInternal.addEventListener('click', () => { closeModal(); openSendNote(state.shareNoteId); });
+    const sharePublic = document.getElementById('note-share-public');
+    if (sharePublic) sharePublic.addEventListener('click', () => { closeModal(); openNotePublicLink(state.shareNoteId); });
+    // Public-link form.
+    const pubTag = document.getElementById('note-public-tag');
+    if (pubTag) pubTag.addEventListener('change', onNotePublicTagChange);
+    const pubSecret = document.getElementById('note-public-secret');
+    if (pubSecret) pubSecret.addEventListener('change', onNotePublicSecretChange);
+    const pubNever = document.getElementById('note-public-never');
+    if (pubNever) pubNever.addEventListener('change', () => {
+        const ttl = document.getElementById('note-public-ttl'); if (ttl) ttl.disabled = pubNever.checked;
+    });
+    const pubCreate = document.getElementById('note-public-create');
+    if (pubCreate) pubCreate.addEventListener('click', submitNotePublicLink);
+    const pubCopy = document.getElementById('note-public-copy');
+    if (pubCopy) pubCopy.addEventListener('click', copyNotePublicLink);
+    document.querySelectorAll('[data-note-close], [data-note-send-close], [data-note-view-close], '
+        + '[data-note-share-close], [data-note-public-close], [data-note-snapshot-close]').forEach(el =>
         el.addEventListener('click', closeModal));
 }
 
@@ -15815,6 +16919,16 @@ document.addEventListener('DOMContentLoaded', () => {
         try { history.replaceState(null, '', location.pathname); } catch (_) {}
         document.documentElement.removeAttribute('data-auth');
         initInviteFlow(inviteToken);
+        return;
+    }
+
+    // A /?reset=<token> link is the password-reset flow: set a new password, then route to login. Like
+    // invite, it takes precedence over any cached session and strips the token from the URL first.
+    const resetToken = new URLSearchParams(location.search).get('reset');
+    if (resetToken) {
+        try { history.replaceState(null, '', location.pathname); } catch (_) {}
+        document.documentElement.removeAttribute('data-auth');
+        initResetFlow(resetToken);
         return;
     }
 

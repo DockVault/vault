@@ -101,6 +101,39 @@ def test_image_installs_only_the_hash_locked_production_environment():
     assert "curl" not in _DOCKERFILE
 
 
+def test_apk_upgrade_is_the_only_unpinned_install():
+    """`RUN apk --no-cache upgrade` is the ONE deliberate unpinned network install: it ships the
+    base-OS security patches the release scan requires, at the cost of byte-for-byte reproducibility
+    (documented in docs/supply-chain-controls.md). Keep it the only one, so the exception stays a
+    single reviewed line and a second unpinned install cannot be added quietly under this file's
+    "reproducible images" contract."""
+    apk_lines = [
+        ln.strip() for ln in _DOCKERFILE.splitlines()
+        if re.search(r"\bapk\b", ln) and not ln.lstrip().startswith("#")
+    ]
+    assert apk_lines == ["RUN apk --no-cache upgrade"], (
+        "the only apk line must be the documented `RUN apk --no-cache upgrade`; found: %r" % apk_lines
+    )
+    doc = (_ROOT / "docs" / "supply-chain-controls.md").read_text(encoding="utf-8")
+    assert "apk --no-cache upgrade" in doc and "reproducib" in doc.lower(), (
+        "the apk reproducibility exception must be documented in docs/supply-chain-controls.md"
+    )
+    # ...and enforce the docstring's wider promise: no OTHER unpinned fetch-and-execute install can be
+    # added quietly under another tool. pip is covered by the --require-hashes assertions above; apk is
+    # the one documented exception. Word boundaries so a shell pipe ('| sh') is caught but 'sha256sum'
+    # (a '| sha256sum' hash check) is not.
+    forbidden = [
+        r"\bcurl\b", r"\bwget\b", r"\bnpm\b", r"\byarn\b", r"\bpnpm\b",
+        r"\bgo\s+(?:install|get)\b", r"\bgem\s+install\b", r"\bcargo\s+install\b",
+        r"\|\s*(?:sh|bash)\b",
+    ]
+    for pat in forbidden:
+        m = re.search(pat, _DOCKERFILE)
+        assert m is None, (
+            "Dockerfile has an unpinned fetch-and-execute install matching %r: ...%r..."
+            % (pat, _DOCKERFILE[max(0, m.start() - 15):m.start() + 25]))
+
+
 def test_cpython_security_backports_are_exact_and_verified_during_build():
     readme = (_ROOT / "security" / "cpython-backports" / "README.md").read_text(
         encoding="utf-8"

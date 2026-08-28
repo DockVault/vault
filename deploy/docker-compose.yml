@@ -182,6 +182,10 @@ services:
       SFTP_HOST: 0.0.0.0
       SFTP_PORT: "2222"
       ENVIRONMENT: development
+      # Tie the app's per-upload clamp to the tmpfs size below, so it applies exactly when this
+      # service backs staging with a tmpfs (the app default is 0 = unclamped, for a compose that
+      # does not mount one).
+      SFTP_STAGING_TMPFS_MB: ${SFTP_STAGING_TMPFS_MB:-512}
     command: ["python", "-m", "app.sftp.sftp_server"]
     # This service runs SFTP, not the HTTP API. Check the port is bound via
     # /proc (port 2222 = hex 08AE) instead of opening a socket — a raw TCP
@@ -230,7 +234,12 @@ services:
       - /tmp:mode=1777
       - /app/logs:mode=1777
       - /app/certs:mode=1777
-    # SFTP also streams large files; keep headroom above max_file_size_mb (see vault-api note).
+      # SFTP buffers each upload's plaintext here while encrypting it; a tmpfs keeps that plaintext
+      # off the persistent storage volume. It is RAM, size-capped, and counts against mem_limit; a
+      # buffered upload cannot exceed it (SFTP_STAGING_TMPFS_MB, default 512 MiB).
+      - /app/storage/.sftp_tmp:mode=1777,size=${SFTP_STAGING_TMPFS_MB:-512}m
+    # SFTP downloads stream (fixed cost); SFTP uploads buffer their plaintext in the staging tmpfs
+    # above (a shared cap across concurrent uploads), so keep mem_limit above ~530 MB + SFTP_STAGING_TMPFS_MB.
     mem_limit: 2g
     pids_limit: 512
     cpus: 1.0

@@ -181,7 +181,9 @@ code { background: color-mix(in srgb, var(--brand-secondary) 12%, var(--surface-
     overflow: visible;
 }
 .sidebar {
+    flex: 0 0 var(--sidebar-width);   /* pin the rail so wide main content can't squeeze it */
     width: var(--sidebar-width);
+    min-width: var(--sidebar-width);
     padding: var(--space-lg) var(--space-md);
     border-right: 1px solid color-mix(in srgb, var(--surface-3) 70%, transparent);
     background: color-mix(in srgb, var(--surface-0) 35%, transparent);
@@ -919,6 +921,28 @@ button.chip:hover { filter: brightness(1.05); }
 .vaults-as-list .vault-card-body { flex-direction: row; align-items: center; gap: var(--space-md); padding: .55rem .85rem; padding-right: 5rem; }
 .vaults-as-list .vault-tile { width: 36px; height: 36px; }
 .vaults-as-list .vault-tile svg { width: 20px; height: 20px; }
+
+/* Zero-knowledge lock control + locked vault cards --------------------------- */
+.zk-lock-control { display: inline-flex; align-items: center; gap: .4rem;
+    background: color-mix(in srgb, var(--brand-secondary) 12%, var(--surface-0));
+    color: var(--brand-secondary);
+    border: 1px solid color-mix(in srgb, var(--brand-secondary) 30%, transparent); }
+.zk-lock-control:hover { background: color-mix(in srgb, var(--brand-secondary) 20%, var(--surface-0)); }
+.zk-lock-control.is-unlocked {
+    background: color-mix(in srgb, var(--accent-ok-fg, #2fa45f) 14%, var(--surface-0));
+    color: var(--accent-ok-fg, #2fa45f);
+    border-color: color-mix(in srgb, var(--accent-ok-fg, #2fa45f) 34%, transparent); }
+.zk-lock-control svg { width: 18px; height: 18px; }
+/* Locked ZK card: muted tile + name, and the hidden metadata rendered as a calm placeholder. */
+.vault-zk-locked .vault-tile-locked {
+    background: color-mix(in srgb, var(--brand-secondary) 14%, var(--surface-0));
+    color: var(--brand-secondary); }
+.vault-zk-locked .vault-name { color: var(--text-secondary); }
+.zk-hidden { color: var(--text-tertiary, var(--text-secondary)); opacity: .65;
+    letter-spacing: .18em; font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); }
+/* During the decode reveal: monospace keeps the width stable so characters settle in place. */
+.zk-field.zk-decoding { font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    color: var(--brand-secondary); letter-spacing: .02em; }
 .vaults-as-list .vault-card-main { flex: 1; display: flex; align-items: center; gap: var(--space-md); min-width: 0; }
 .vaults-as-list .vault-name { margin: 0; flex: 0 1 auto; }
 .vaults-as-list .vault-desc { display: none; }

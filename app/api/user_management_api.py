@@ -689,11 +689,9 @@ async def list_user_temp_credentials(
     
     result = []
     for cred in temp_creds:
-        # Password can be revealed if it exists and credential is within validity window
-        has_password = (
-            cred.encrypted_password is not None and
-            datetime.now(timezone.utc) <= cred.deactivate_at
-        )
+        # The temp password is show-once at creation and never stored for re-reveal, so there is
+        # never a retrievable password (the reveal endpoint always 404s).
+        has_password = False
         
         result.append(TempCredentialListItem(
             id=cred.id,
@@ -1079,7 +1077,10 @@ async def change_user_role(
     target_user.role = request.new_role
     target_user.updated_at = datetime.now(timezone.utc)
     
-    # Log the action
+    # Log the action. NOTE: this constructs an AuditLog DIRECTLY, bypassing AuditLogger.log_action's
+    # at-rest name redaction -- safe here because `details` carries only role keys. Do NOT add any of
+    # audit_logger.REDACTED_NAME_KEYS (file_name/folder_name/old_name/new_name/vault_name) to a
+    # directly-constructed row, or route it through log_action instead.
     audit_log = AuditLog(
         user_id=target_user.id,
         username=target_user.username,

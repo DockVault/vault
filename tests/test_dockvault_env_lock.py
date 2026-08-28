@@ -66,6 +66,25 @@ def test_lock_then_unlock_roundtrip(tmp_path):
     assert (tmp_path / ".env").read_text(encoding="utf-8") == ENV_TEXT, "unlock must restore byte-for-byte"
 
 
+def test_lock_warns_when_a_container_still_holds_the_secret(tmp_path, monkeypatch, capsys):
+    # Sealing .env does NOT clear the copy Docker baked into a running/stopped container's config;
+    # lock must say so and point at `down`.
+    _write_env(tmp_path)
+    app = _app(tmp_path)
+    monkeypatch.setattr(dv, "container_exists", lambda name, **k: True)
+    app.lock(_args(passphrase_file=_passfile(tmp_path)))
+    out = capsys.readouterr().out
+    assert "STILL in Docker" in out and "down" in out, "lock must warn the container config still holds the secret"
+
+
+def test_lock_gives_no_container_warning_when_none_exists(tmp_path, monkeypatch, capsys):
+    _write_env(tmp_path)
+    app = _app(tmp_path)
+    monkeypatch.setattr(dv, "container_exists", lambda name, **k: False)
+    app.lock(_args(passphrase_file=_passfile(tmp_path)))
+    assert "STILL in Docker" not in capsys.readouterr().out
+
+
 def test_unlock_with_recovery_key(tmp_path):
     _write_env(tmp_path)
     app = _app(tmp_path)

@@ -20,7 +20,8 @@ TAB = "#settings-tab-accounts"
 def restore_settings(admin):
     keys = ("email_requirement", "invite_enabled", "invite_ttl_hours", "signup_enabled",
             "signup_email_domain_mode", "signup_email_domains", "login_identifier",
-            "email_change_requires_verification", "smtp_server", "from_email")
+            "email_change_requires_verification", "email_change_otp_ttl_minutes",
+            "password_reset_enabled", "password_reset_ttl_minutes", "smtp_server", "from_email")
     before = admin.get("/settings").json()
     snap = {k: before.get(k) for k in keys}
     yield
@@ -123,6 +124,25 @@ def test_save_round_trips_through_reload(page: Page, admin_creds, restore_settin
     expect(page.locator("#setting-invite-enabled")).to_be_checked()
     expect(page.locator("#setting-invite-ttl-hours")).to_have_value("96")
     expect(page.locator("#setting-login-identifier")).to_have_value("either")
+
+
+def test_password_reset_and_otp_ttl_controls_round_trip(page: Page, admin_creds, restore_settings):
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open_accounts_tab(page)
+    for sel in ("#setting-password-reset-enabled", "#setting-password-reset-ttl-minutes",
+                "#setting-email-change-otp-ttl-minutes"):
+        expect(page.locator(sel)).to_be_visible()
+    page.check("#setting-password-reset-enabled")
+    page.fill("#setting-password-reset-ttl-minutes", "12")
+    page.fill("#setting-email-change-otp-ttl-minutes", "9")
+    page.click("#save-all-settings-btn")
+    page.wait_for_timeout(1200)
+    _logout(page)
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open_accounts_tab(page)
+    expect(page.locator("#setting-password-reset-enabled")).to_be_checked()
+    expect(page.locator("#setting-password-reset-ttl-minutes")).to_have_value("12")
+    expect(page.locator("#setting-email-change-otp-ttl-minutes")).to_have_value("9")
 
 
 def test_no_console_errors_on_the_tab(page: Page, admin_creds):

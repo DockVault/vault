@@ -856,6 +856,58 @@ def decrypt_object_field(vault_id, obj_id, token: str, field: str) -> str:
     return aesgcm.decrypt(nonce, ct, _name_field_aad(field, vault_id, obj_id)).decode('utf-8')
 
 
+# --- Note content sealing (personal notes + their public-link snapshots) ---------------------
+# Notes (and the frozen snapshot of a public note link) hold title/body in PLAINTEXT at rest. Seal
+# them under a per-ROW AES-GCM key (like filenames, but keyed only by the row id -- notes are
+# per-account, not per-vault). The value is SELF-DESCRIBING (a marker prefix), so a load-time reader
+# and the backfill can tell a sealed value from a legacy plaintext one. A value that merely starts
+# with the marker but does not decrypt is treated as plaintext (a user could type the marker text).
+_NOTE_SEAL_PREFIX = 'nenc1:'
+
+
+def _note_encryption_root():
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32,
+        salt=b'dockvault-note-enc-key-v1', info=b'note-title-body',
+    ).derive(_runtime_settings().encryption_key.encode())
+
+
+def _note_object_key(row_id) -> bytes:
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32,
+        salt=b'dockvault-note-obj-v1', info=_uuid_bytes(row_id),
+    ).derive(_note_encryption_root())
+
+
+def _note_field_aad(field: str, row_id) -> bytes:
+    return b'dockvault-note-field:' + field.encode() + b':' + _uuid_bytes(row_id)
+
+
+def is_note_sealed(value) -> bool:
+    """True if `value` carries the sealed-note marker (so read-old can tell it from plaintext). Marker
+    presence alone is not proof of a valid seal -- callers that must be certain also try to decrypt."""
+    return isinstance(value, str) and value.startswith(_NOTE_SEAL_PREFIX)
+
+
+def encrypt_note_field(row_id, plaintext: str, field: str) -> str:
+    """Seal a note title/body (or a link snapshot field) at rest: marker + base64(nonce||ct+tag).
+    `field` ('title'/'body'/'title_snapshot'/'body_snapshot') is bound via AAD to the row id, so a
+    field cannot be swapped and a value cannot be transposed onto a different row."""
+    aesgcm = AESGCM(_note_object_key(row_id))
+    nonce = secrets.token_bytes(_GCM_NONCE_SIZE)
+    ct = aesgcm.encrypt(nonce, plaintext.encode('utf-8'), _note_field_aad(field, row_id))
+    return _NOTE_SEAL_PREFIX + base64.b64encode(nonce + ct).decode('ascii')
+
+
+def decrypt_note_field(row_id, token: str, field: str) -> str:
+    """Inverse of encrypt_note_field (`token` includes the marker). Raises on tamper / wrong row /
+    a marker-prefixed value that is not actually a seal."""
+    raw = base64.b64decode(token[len(_NOTE_SEAL_PREFIX):])
+    nonce, ct = raw[:_GCM_NONCE_SIZE], raw[_GCM_NONCE_SIZE:]
+    aesgcm = AESGCM(_note_object_key(row_id))
+    return aesgcm.decrypt(nonce, ct, _note_field_aad(field, row_id)).decode('utf-8')
+
+
 def name_blind_index(vault_id, name: str) -> str:
     """Deterministic per-vault HMAC-SHA256 of an EXACT name, for server-side equality
     lookup without storing plaintext. Same (vault_id, name) -> same hex digest."""
@@ -864,6 +916,34 @@ def name_blind_index(vault_id, name: str) -> str:
         salt=b'dockvault-name-bi-vault-v1', info=_uuid_bytes(vault_id),
     ).derive(_name_blind_index_root())
     return hmac.new(key, name.encode('utf-8'), hashlib.sha256).hexdigest()
+
+
+def _content_mac_key(file_id) -> bytes:
+    """Per-file HMAC key for the content MAC, derived from the deployment root key."""
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32,
+        salt=b'dockvault-content-mac-v1', info=_uuid_bytes(file_id),
+    ).derive(_runtime_settings().encryption_key.encode())
+
+
+def content_mac(file_id, checksum_sha256: str) -> str:
+    """A KEYED tag over a file's content, for use as its entity tag (ETag).
+
+    The plaintext SHA-256 of a file's content used to be its ETag, which let anyone who could
+    request the file confirm whether it holds specific known content: hash a candidate, compare the
+    tag. This is HMAC-SHA256 of that checksum under a per-file key, so the tag stays a stable,
+    unique-per-version identifier (same content on the same file -> same tag; a same-name
+    replacement changes the file id and/or the checksum, so the tag changes and a resume's If-Range
+    correctly mismatches) but cannot be reproduced or predicted without the deployment key. Per-file
+    keying also stops two files with identical content from sharing a tag.
+
+    Deterministic from (file_id, checksum_sha256), so a row written before the stored column existed
+    derives the SAME value on read -- no backfill, and legacy rows stop leaking their plaintext
+    checksum through the ETag too. The plaintext checksum itself is untouched: it stays the server's
+    internal integrity verifier, never exposed.
+    """
+    return hmac.new(_content_mac_key(file_id), (checksum_sha256 or '').encode('ascii'),
+                    hashlib.sha256).hexdigest()
 
 
 def vault_password_fingerprint(password_hash: str) -> str:

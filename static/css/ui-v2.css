@@ -225,7 +225,13 @@ code { background: var(--surface-2); color: var(--text-primary); border-radius: 
     overflow: visible;
 }
 .sidebar {
+    /* Pin the rail width so it can never be squeezed. As a flex item it was a shrink victim of
+       main-content's content-based basis: a single very long note makes the notes grid's max-content
+       huge (max-content ignores the body's line-clamp), which overflowed the row and collapsed the
+       rail to its ~26px min-content. flex:0 0 + min-width makes the rail immune to ANY wide content. */
+    flex: 0 0 var(--sidebar-width);
     width: var(--sidebar-width);
+    min-width: var(--sidebar-width);
     padding: var(--space-sm) var(--space-sm) var(--space-lg);
     border-right: 1px solid var(--line);
     background: var(--rail-bg);

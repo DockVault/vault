@@ -40,15 +40,19 @@ um = _load("upgrade_matrix_under_test", "upgrade_matrix.py")
 gate = _load("release_gate_under_test", "release_gate.py")
 
 
+def _support(eol=False, secure=True, **extra):
+    return {"eol": eol, "secure": secure, **extra}
+
+
 def _valid():
     """A minimal matrix that passes, as the starting point for each rejection case."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "about": "test fixture",
         "kinds": {"direct": "one step", "blocked": "do not"},
         "versions": {
-            "0.1.0": {"released": "2026-01-01", "notes": "first"},
-            "0.2.0": {"released": "2026-01-02", "notes": "second"},
+            "0.1.0": {"released": "2026-01-01", "notes": "first", "support": _support()},
+            "0.2.0": {"released": "2026-01-02", "notes": "second", "support": _support()},
         },
         "edges": [{"from": "0.1.0", "to": "0.2.0", "kind": "direct",
                    "reversible": True, "requires_backup": False}],
@@ -132,17 +136,25 @@ def test_the_committed_matrix_declares_every_released_edge_direct():
     that is fine and expected -- but it should be a deliberate edit, not a silent one.
     """
     data = um.load_matrix(MATRIX_PATH)
-    kinds = {edge["kind"] for edge in data["edges"]}
-    assert kinds == {"direct"}, (
-        f"the matrix now declares {kinds}; if a released upgrade has stopped being direct, update "
-        "this test deliberately")
+    # A blocked edge INTO a FLOOR release is the deliberate exception -- it says that version is the
+    # minimum reached by a fresh deploy + restore, not an in-place upgrade. That is true of the
+    # release being prepared AND of an already-released floor (marked by a waiver), whose blocked
+    # inbound edge stays deliberately non-direct after it ships (e.g. 0.16.1 -> 0.17.0). Every OTHER
+    # edge between already-RELEASED versions must still be direct.
+    preparing = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    floors = {w["version"] for w in data.get("waivers", [])} | {preparing}
+    non_direct = [(edge["from"], edge["to"], edge["kind"]) for edge in data["edges"]
+                  if edge["kind"] != "direct" and edge["to"] not in floors]
+    assert not non_direct, (
+        f"the matrix now declares non-direct edge(s) between released versions: {non_direct}; if a "
+        "released upgrade has stopped being direct, update this test deliberately")
 
 
 # --- rejection cases ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("mutate, expected", [
-    (lambda m: m.update({"schema_version": 2}), "schema_version"),
-    (lambda m: m.update({"schema_version": "1"}), "schema_version"),
+    (lambda m: m.update({"schema_version": 3}), "schema_version"),
+    (lambda m: m.update({"schema_version": "2"}), "schema_version"),
     (lambda m: m.pop("versions"), "versions"),
     (lambda m: m.update({"versions": {}}), "versions"),
     (lambda m: m.update({"surprise": 1}), "unknown key"),
@@ -153,11 +165,25 @@ def test_the_committed_matrix_declares_every_released_edge_direct():
      "must describe exactly"),
     (lambda m: m.update({"kinds": 5}), "must be an object"),
     (lambda m: m["kinds"].update({"direct": ""}), "must not be empty"),
-    (lambda m: m["versions"].update({"nope": {"released": "2026-01-03", "notes": "x"}}),
+    (lambda m: m["versions"].update({"nope": {"released": "2026-01-03", "notes": "x", "support": _support()}}),
      "malformed"),
     (lambda m: m["versions"]["0.1.0"].update({"released": "yesterday"}), "malformed"),
     (lambda m: m["versions"]["0.1.0"].update({"extra": 1}), "unknown key"),
     (lambda m: m["versions"]["0.1.0"].update({"notes": ""}), "must not be empty"),
+    # --- the per-version support block ---
+    (lambda m: m["versions"]["0.1.0"].pop("support"), "support must be present"),
+    (lambda m: m["versions"]["0.1.0"].update({"support": []}), "support must be present"),
+    (lambda m: m["versions"]["0.1.0"]["support"].pop("eol"), "eol must be present and a boolean"),
+    (lambda m: m["versions"]["0.1.0"]["support"].pop("secure"), "secure must be present and a boolean"),
+    (lambda m: m["versions"]["0.1.0"]["support"].update({"eol": "yes"}), "eol must be present and a boolean"),
+    (lambda m: m["versions"]["0.1.0"]["support"].update({"extra": 1}), "unknown key"),
+    # extended-support dates are only meaningful once eol is true
+    (lambda m: m["versions"]["0.1.0"]["support"].update({"code_support": "2026-01-01"}),
+     "only meaningful once eol is true"),
+    (lambda m: m["versions"]["0.1.0"]["support"].update({"eol": True, "code_support": "nope"}), "malformed"),
+    (lambda m: m["versions"]["0.1.0"]["support"].update(
+        {"eol": True, "code_support": "2026-06-01", "security_support": "2026-01-01"}),
+     "must not end before code_support"),
     (lambda m: m["edges"][0].update({"to": "9.9.9"}), "not a declared version"),
     (lambda m: m["edges"][0].update({"from": "9.9.9"}), "not a declared version"),
     (lambda m: m["edges"][0].update({"to": "0.1.0"}), "to itself"),
@@ -196,8 +222,13 @@ def test_the_shapes_a_real_non_trivial_upgrade_will_need_are_accepted():
     skipped and the deployment boots without it -- an upgrade that is direct, but not unconditional.
     """
     data = _valid()
-    data["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "third"}
-    data["versions"]["0.4.0"] = {"released": "2026-01-04", "notes": "fourth"}
+    data["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "third", "support": _support()}
+    # An end-of-life release carrying an extended-support tail: code fixes ended, security fixes run
+    # on for a while -- the shape a real product uses, exercised here so the schema is proven to accept it.
+    data["versions"]["0.4.0"] = {"released": "2026-01-04", "notes": "fourth",
+                                 "support": _support(eol=True, secure=True,
+                                                     code_support="2026-06-01",
+                                                     security_support="2026-12-01")}
     data["edges"].append({
         "from": "0.2.0", "to": "0.3.0", "kind": "direct",
         "reversible": False, "requires_backup": True,
@@ -252,7 +283,7 @@ def test_an_undeclared_release_is_refused():
 def test_a_declared_release_with_no_way_in_is_refused():
     """A version entry alone is a name, not a declaration."""
     data = _valid()
-    data["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "third"}
+    data["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "third", "support": _support()}
     with pytest.raises(um.UpgradeMatrixError, match="no edge from 0.2.0"):
         um.assert_release_declared(data, "0.3.0")
 
@@ -313,7 +344,7 @@ def test_the_gate_refuses_a_release_the_matrix_does_not_declare(tmp_path):
 
 def test_the_gate_passes_a_declared_release(tmp_path):
     matrix = _valid()
-    matrix["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "third"}
+    matrix["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "third", "support": _support()}
     matrix["edges"].append({"from": "0.2.0", "to": "0.3.0", "kind": "direct",
                             "reversible": True, "requires_backup": False})
     repo = _repo(tmp_path, "0.3.0", matrix)
@@ -332,8 +363,8 @@ def test_an_inbound_edge_marked_blocked_is_not_a_way_in(tmp_path):
     cut anyway.
     """
     matrix = _valid()
-    matrix["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "third"}
-    matrix["versions"]["0.4.0"] = {"released": "2026-01-04", "notes": "fourth"}
+    matrix["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "third", "support": _support()}
+    matrix["versions"]["0.4.0"] = {"released": "2026-01-04", "notes": "fourth", "support": _support()}
     matrix["edges"].append({"from": "0.2.0", "to": "0.3.0", "kind": "direct",
                             "reversible": True, "requires_backup": False})
     matrix["edges"].append({
@@ -384,8 +415,22 @@ def test_a_waiver_goes_stale_once_the_version_is_declared():
     """
     data = _valid()
     data["waivers"] = [{"version": "0.2.0", "reason": "no longer true"}]
-    with pytest.raises(um.UpgradeMatrixError, match="declared anyway"):
+    with pytest.raises(um.UpgradeMatrixError, match="declared and reachable"):
         um.validate_matrix(data)
+
+
+def test_a_waiver_may_cover_a_declared_floor_release_reached_only_by_a_blocked_edge():
+    """The floor case: a version that carries its own entry (notes, lifecycle) but whose only route
+    in is a blocked edge -- reached by fresh deploy + restore, not an in-place upgrade. The waiver is
+    what lets it be cut; the blocked edge is why the upgrade is refused. This must NOT be a stale
+    waiver, unlike a declared+reachable version."""
+    data = _valid()
+    data["edges"][0]["kind"] = "blocked"
+    data["edges"][0]["reason"] = "no in-place upgrade; deploy fresh and restore"
+    data["waivers"] = [{"version": "0.2.0", "reason": "floor release, reached by restore only"}]
+    um.validate_matrix(data)                                  # accepted, not stale
+    # And the gate lets it be cut, returning the waiver reason rather than refusing on the blocked edge.
+    assert "floor release" in (um.assert_release_declared(data, "0.2.0") or "")
 
 
 def test_the_waiver_is_reported_as_a_job_output(tmp_path):
@@ -535,7 +580,7 @@ def test_a_backport_released_after_a_later_version_does_not_have_to_lie(tmp_path
     skipped where the later version was released earlier.
     """
     data = _valid()
-    data["versions"]["0.2.1"] = {"released": "2026-02-01", "notes": "backport, shipped later"}
+    data["versions"]["0.2.1"] = {"released": "2026-02-01", "notes": "backport, shipped later", "support": _support()}
     data["edges"].append({"from": "0.2.0", "to": "0.2.1", "kind": "direct",
                           "reversible": True, "requires_backup": False})
     um.validate_matrix(data)   # no edge 0.2.1 -> ... is demanded
@@ -553,7 +598,7 @@ def test_the_backport_exemption_does_not_let_a_release_be_orphaned():
     data = _valid()
     # 0.1.5 sorts between the two but shipped after both: the backport shape. Its own inbound edge
     # is declared; 0.2.0's is not, so 0.2.0 is left with no way in at all.
-    data["versions"]["0.1.5"] = {"released": "2026-02-01", "notes": "backport"}
+    data["versions"]["0.1.5"] = {"released": "2026-02-01", "notes": "backport", "support": _support()}
     data["edges"] = [{"from": "0.1.0", "to": "0.1.5", "kind": "direct",
                       "reversible": True, "requires_backup": False}]
     with pytest.raises(um.UpgradeMatrixError, match="older than 0.2.0"):
@@ -563,7 +608,7 @@ def test_the_backport_exemption_does_not_let_a_release_be_orphaned():
 def test_an_ordinary_forward_gap_is_still_rejected():
     """Non-vacuity for the two above: the relaxed rule still catches the case it is meant to."""
     data = _valid()
-    data["versions"]["0.3.0"] = {"released": "2026-03-01", "notes": "later in both senses"}
+    data["versions"]["0.3.0"] = {"released": "2026-03-01", "notes": "later in both senses", "support": _support()}
     with pytest.raises(um.UpgradeMatrixError, match=r"0\.2\.0 -> 0\.3\.0"):
         um.validate_matrix(data)
 
@@ -575,7 +620,7 @@ def test_the_gate_rejects_a_version_that_was_never_released(tmp_path):
     so without this the matrix could describe a release nobody can install and still cut a tag.
     """
     data = _valid()
-    data["versions"]["0.1.5"] = {"released": "2026-01-15", "notes": "never existed"}
+    data["versions"]["0.1.5"] = {"released": "2026-01-15", "notes": "never existed", "support": _support()}
     data["edges"] = [
         {"from": "0.1.0", "to": "0.1.5", "kind": "direct",
          "reversible": True, "requires_backup": False},
@@ -600,7 +645,7 @@ def test_a_repeated_json_key_is_rejected(tmp_path):
 def test_a_version_with_a_leading_zero_is_rejected():
     """"0.10.00" and "0.10.0" would be two keys for one release, and one could never match a tag."""
     data = _valid()
-    data["versions"]["0.02.0"] = {"released": "2026-01-05", "notes": "x"}
+    data["versions"]["0.02.0"] = {"released": "2026-01-05", "notes": "x", "support": _support()}
     with pytest.raises(um.UpgradeMatrixError, match="malformed"):
         um.validate_matrix(data)
 

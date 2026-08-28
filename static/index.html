@@ -10,7 +10,7 @@
     <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
     <link rel="apple-touch-icon" href="/static/assets/logo.png?v=1">
     <link rel="stylesheet" href="/static/css/theme.css?v=20260822a">
-    <link rel="stylesheet" href="/static/css/components.css?v=20260824c">
+    <link rel="stylesheet" href="/static/css/components.css?v=20260824e">
     <link rel="stylesheet" href="/static/css/utilities.css?v=20251015c">
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-sans-500.woff2" crossorigin>
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-mono-500.woff2" crossorigin>
@@ -22,8 +22,8 @@
          still blocks render, so there is no unstyled flash either way).
          To adopt v2 permanently: keep only ui-v2.css, delete redesign.css +
          ui-boot.js + the Interface switcher in the profile dropdown. -->
-    <link rel="stylesheet" href="/static/css/redesign.css?v=20260703a" id="skin-v1" disabled>
-    <link rel="stylesheet" href="/static/css/ui-v2.css?v=20260703a" id="skin-v2">
+    <link rel="stylesheet" href="/static/css/redesign.css?v=20260825a" id="skin-v1" disabled>
+    <link rel="stylesheet" href="/static/css/ui-v2.css?v=20260825a" id="skin-v2">
     <script src="/static/js/ui-boot.js?v=20260703a"></script>
     <!-- Auth boot: picks the first-paint screen from whether a session token is
          cached, so an expired/logged-out load never flashes the app shell. See
@@ -117,6 +117,20 @@
                     
                     <div id="login-error" class="alert alert-error mt-md" style="display: none;"></div>
 
+                    <!-- Forgot password: link hidden until /auth/policy confirms self-service reset is on. -->
+                    <div id="forgot-toggle" class="mt-sm" style="display: none;">
+                        <a href="#" id="show-forgot-link" role="button" style="font-size: 0.9em;">Forgot your password?</a>
+                    </div>
+                    <form id="forgot-form" style="display: none;">
+                        <div class="form-group">
+                            <label for="forgot-identifier">Username or email</label>
+                            <input type="text" id="forgot-identifier" class="form-control" autocomplete="username">
+                        </div>
+                        <button type="submit" class="btn btn-primary btn-block">Send reset link</button>
+                        <div id="forgot-message" class="alert alert-info mt-md" style="display: none;" role="status"></div>
+                        <div class="mt-md"><a href="#" id="forgot-back-link" role="button">&larr; Back to sign in</a></div>
+                    </form>
+
                     <!-- Self-signup: the toggle link and the form are BOTH hidden until the pre-auth
                          policy fetch (app.js applyLoginPolicyLabel -> /auth/policy) confirms signup is
                          enabled. The email group's presence/required state is driven by the same policy
@@ -176,6 +190,17 @@
         <div class="flex items-center justify-center" style="min-height: 100vh; width: 100%; padding: var(--space-lg);">
             <div class="card" style="max-width: 420px; width: 100%;">
                 <div class="card-body" id="invite-card-body">
+                    <div class="loading-spinner" style="margin: var(--space-lg) auto;" aria-hidden="true"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Password reset (reached via /?reset=<token>) -->
+    <div id="reset-screen" class="screen">
+        <div class="flex items-center justify-center" style="min-height: 100vh; width: 100%; padding: var(--space-lg);">
+            <div class="card" style="max-width: 420px; width: 100%;">
+                <div class="card-body" id="reset-card-body">
                     <div class="loading-spinner" style="margin: var(--space-lg) auto;" aria-hidden="true"></div>
                 </div>
             </div>
@@ -496,6 +521,13 @@
                                 <button id="vaults-view-grid" class="seg-btn active" type="button" data-vaults-view="grid" title="Grid view" aria-label="Grid view"><svg class="icon icon-sm"><use href="#i-grid"/></svg></button>
                                 <button id="vaults-view-list" class="seg-btn" type="button" data-vaults-view="list" title="List view" aria-label="List view"><svg class="icon icon-sm"><use href="#i-list"/></svg></button>
                             </div>
+                            <!-- Zero-knowledge lock control: shown only when the user has ZK vaults.
+                                 Locked -> click to unlock (reveal all ZK vault names/metadata);
+                                 unlocked -> click to forget the key and re-hide. Hidden otherwise. -->
+                            <button id="zk-lock-control" class="btn zk-lock-control" type="button" style="display:none;" aria-pressed="false">
+                                <svg class="icon"><use href="#i-lock" id="zk-lock-icon"/></svg>
+                                <span id="zk-lock-label">Locked</span>
+                            </button>
                             <button id="create-vault-btn" class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg> Create Vault</button>
                         </div>
                     </div>
@@ -896,14 +928,19 @@
                         </div>
                     </div>
                     <div class="tabs mb-md" role="tablist">
-                        <button class="tab-btn active" data-notes-tab="mine" type="button">My notes</button>
+                        <button class="tab-btn active" data-notes-tab="mine" type="button">My notes <span id="notes-mine-count" class="badge badge-secondary" hidden>0</span></button>
                         <button class="tab-btn" data-notes-tab="received" type="button">Sent to me <span id="notes-received-count" class="badge badge-secondary" hidden>0</span></button>
+                        <button class="tab-btn" data-notes-tab="shared" type="button">Shared <span id="notes-shared-count" class="badge badge-secondary" hidden>0</span></button>
                     </div>
                     <div id="notes-tab-mine">
                         <div id="notes-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--space-md); align-items: start;"></div>
                     </div>
                     <div id="notes-tab-received" style="display:none;">
                         <div id="notes-received-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--space-md); align-items: start;"></div>
+                    </div>
+                    <div id="notes-tab-shared" style="display:none;">
+                        <p class="text-secondary text-sm mb-sm">Public links you've created. Anyone with a link can read a snapshot until it expires, is used up, or you revoke it.</p>
+                        <div id="notes-shared-list" class="grid" style="grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: var(--space-md); align-items: start;"></div>
                     </div>
                 </div>
 
@@ -952,6 +989,119 @@
                         <div class="modal-footer">
                             <button class="btn btn-ghost" type="button" data-note-send-close>Cancel</button>
                             <button id="note-send-confirm" class="btn btn-primary" type="button" disabled>Send</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Share note: a two-tile chooser (Send to a member / Public link). -->
+                <div id="note-share-modal" class="modal" role="dialog" aria-modal="true">
+                    <div class="modal-overlay" data-note-share-close></div>
+                    <div class="modal-content" style="max-width: 560px;">
+                        <div class="modal-header">
+                            <h3 class="text-xl font-bold">Share this note</h3>
+                            <button class="modal-close" type="button" data-note-share-close aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <div class="share-tiles">
+                                <button type="button" class="share-tile" id="note-share-internal">
+                                    <svg class="icon icon-lg" aria-hidden="true"><use href="#i-users"/></svg>
+                                    <span class="share-tile-title">Send to a member</span>
+                                    <span class="share-tile-sub">Give another user their own copy of this note.</span>
+                                </button>
+                                <button type="button" class="share-tile" id="note-share-public">
+                                    <svg class="icon icon-lg" aria-hidden="true"><use href="#i-globe"/></svg>
+                                    <span class="share-tile-title">Public link</span>
+                                    <span class="share-tile-sub">A link anyone can open — optionally behind a code, with an expiry.</span>
+                                </button>
+                            </div>
+                            <p id="note-share-public-disabled" class="text-tertiary text-sm mt-md" hidden>
+                                Public links are turned off on this deployment.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Create a public note link (the Public tile of Share). The tag is a security FLOOR;
+                     the controls only let the user TIGHTEN it. -->
+                <div id="note-public-link-modal" class="modal" role="dialog" aria-modal="true">
+                    <div class="modal-overlay" data-note-public-close></div>
+                    <div class="modal-content" style="max-width: 560px;">
+                        <div class="modal-header">
+                            <h3 class="text-xl font-bold">Create a public link</h3>
+                            <button class="modal-close" type="button" data-note-public-close aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <div id="note-public-form">
+                                <p class="text-secondary mb-sm">Anyone with the link reads a snapshot of this note. You can make a link stricter than its type allows, never looser.</p>
+                                <div class="form-group">
+                                    <label for="note-public-tag">Link type</label>
+                                    <select id="note-public-tag" class="form-control"></select>
+                                    <small id="note-public-tag-floor" class="form-help"></small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="note-public-token-len">Link length (characters)</label>
+                                    <input type="number" id="note-public-token-len" class="form-control" min="6" max="64" style="max-width:160px;">
+                                </div>
+                                <div class="form-group">
+                                    <label for="note-public-secret">Protect with</label>
+                                    <select id="note-public-secret" class="form-control" style="max-width:200px;">
+                                        <option value="none">No code</option>
+                                        <option value="pin">PIN</option>
+                                        <option value="password">Password</option>
+                                    </select>
+                                </div>
+                                <div class="form-group" id="note-public-pin-group" hidden>
+                                    <label for="note-public-pin">PIN</label>
+                                    <select id="note-public-pin-len" class="form-control" style="max-width:140px;"></select>
+                                    <input type="text" id="note-public-pin" class="form-control" inputmode="numeric" autocomplete="off" placeholder="digits only" style="margin-top:.4rem; max-width:200px;">
+                                </div>
+                                <div class="form-group" id="note-public-password-group" hidden>
+                                    <label for="note-public-password">Password</label>
+                                    <input type="password" id="note-public-password" class="form-control" autocomplete="new-password" style="max-width:280px;">
+                                    <small id="note-public-password-help" class="form-help"></small>
+                                </div>
+                                <div class="form-group" id="note-public-expiry-group">
+                                    <label for="note-public-ttl">Expires in (hours)</label>
+                                    <input type="number" id="note-public-ttl" class="form-control" min="1" style="max-width:160px;">
+                                    <label class="checkbox-label" id="note-public-never-group" style="margin-top:.35rem;">
+                                        <input type="checkbox" id="note-public-never"><span>Never expires</span>
+                                    </label>
+                                </div>
+                                <div class="form-group">
+                                    <label for="note-public-max-uses">Maximum views</label>
+                                    <input type="number" id="note-public-max-uses" class="form-control" min="1" placeholder="unlimited" style="max-width:160px;">
+                                </div>
+                                <p id="note-public-error" class="text-sm" style="color:var(--danger,#dc2626);" hidden></p>
+                            </div>
+                            <div id="note-public-result" hidden>
+                                <p class="text-secondary mb-sm">Your public link is ready — copy it now.</p>
+                                <div class="form-group">
+                                    <input type="text" id="note-public-link-value" class="form-control" readonly>
+                                </div>
+                                <button type="button" class="btn btn-secondary btn-sm" id="note-public-copy">Copy link</button>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button id="note-public-cancel" class="btn btn-ghost" type="button" data-note-public-close>Cancel</button>
+                            <button id="note-public-create" class="btn btn-primary" type="button">Create link</button>
+                            <button id="note-public-done" class="btn btn-primary" type="button" data-note-public-close hidden>Done</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- View a public link's frozen snapshot (from the Shared tab) — read-only title + body. -->
+                <div id="note-link-snapshot-modal" class="modal" role="dialog" aria-modal="true">
+                    <div class="modal-overlay" data-note-snapshot-close></div>
+                    <div class="modal-content" style="max-width: 720px; width: 90vw;">
+                        <div class="modal-header">
+                            <h3 id="note-link-snapshot-title" class="text-xl font-bold">Shared snapshot</h3>
+                            <button class="modal-close" type="button" data-note-snapshot-close aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <p class="text-secondary text-sm mb-sm">This is the frozen snapshot this link shows — it does not change when you edit the original note.</p>
+                            <pre id="note-link-snapshot-body" class="note-view-text"></pre>
+                        </div>
+                        <div class="modal-footer">
+                            <button class="btn btn-ghost" type="button" data-note-snapshot-close>Close</button>
                         </div>
                     </div>
                 </div>
@@ -1239,6 +1389,7 @@
                                     <label for="setting-max-file-size">Max File Upload Size (MB)</label>
                                     <input type="number" id="setting-max-file-size" class="form-control" placeholder="Deployment default" min="1">
                                     <small class="text-secondary">May only LOWER the deployment's <code>MAX_FILE_SIZE_MB</code> ceiling. <strong>Blank = use that ceiling.</strong></small>
+                                    <small id="setting-sftp-eff-limit" class="text-warning" style="display:none"></small>
                                 </div>
                                 <div class="form-group">
                                     <label for="setting-allowed-types">Allowed File Types (comma-separated)</label>
@@ -1680,6 +1831,10 @@
                                         <button type="button" class="btn btn-secondary btn-sm" id="et-add-dynamic" aria-haspopup="true" aria-expanded="false">＋ Dynamic action ▾</button>
                                         <div id="et-dyn-menu" class="et-dyn-menu" hidden role="menu"></div>
                                     </span>
+                                    <span class="et-dyn-wrap et-loadfrom-wrap">
+                                        <button type="button" class="btn btn-secondary btn-sm" id="et-load-from" aria-haspopup="true" aria-expanded="false" title="Replace the subject and body with a default or an existing template">⤓ Load from ▾</button>
+                                        <div id="et-loadfrom-menu" class="et-dyn-menu et-loadfrom-menu" hidden role="menu"></div>
+                                    </span>
                                     <span class="et-view-toggle" role="tablist" aria-label="Editor view">
                                         <button type="button" class="btn btn-secondary btn-sm et-view active" data-view="code">Code</button>
                                         <button type="button" class="btn btn-secondary btn-sm et-view" data-view="render">Render</button>
@@ -1742,6 +1897,31 @@
                                 <div class="modal-footer">
                                     <button type="button" class="btn btn-secondary close-modal-btn">Cancel</button>
                                     <button type="button" class="btn btn-primary" id="et-send-go">Send</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Send a test of an automated email -->
+                        <div id="email-test-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="email-test-modal-title">
+                            <div class="modal-content">
+                                <div class="modal-header"><h3 id="email-test-modal-title">Send a test email</h3></div>
+                                <div class="modal-body">
+                                    <p class="text-sm text-secondary">This sends the email with sample data, clearly marked as a test.</p>
+                                    <div class="form-group">
+                                        <label for="et-test-search">Send to a user</label>
+                                        <input type="text" id="et-test-search" class="form-control" placeholder="Search by username or email…" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="et-test-results" autocomplete="off">
+                                        <div id="et-test-results" class="et-test-results" role="listbox" aria-label="Matching users"></div>
+                                        <div id="et-test-selected" class="et-test-selected" role="status" aria-live="polite" hidden></div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="et-test-addr">Or send to a specific address</label>
+                                        <input type="email" id="et-test-addr" class="form-control" placeholder="you@example.com">
+                                    </div>
+                                    <div id="et-test-msg" class="text-sm" role="status" aria-live="polite"></div>
+                                </div>
+                                <div class="modal-footer">
+                                    <button type="button" class="btn btn-secondary close-modal-btn">Cancel</button>
+                                    <button type="button" class="btn btn-primary" id="et-test-send">Send test</button>
                                 </div>
                             </div>
                         </div>
@@ -2028,13 +2208,24 @@
                     <!-- Note Links Tab: public-link sharing of notes (anonymous, snapshot). -->
                     <div id="settings-tab-notelinks" class="settings-tab-content">
                         <div class="card">
+                            <div class="card-header"><h3>Notes</h3></div>
+                            <div class="p-lg">
+                                <div class="form-group" style="max-width:280px;">
+                                    <label for="setting-note-max-chars">Maximum note size (characters)</label>
+                                    <input type="number" id="setting-note-max-chars" class="form-control" min="100" max="1000000" step="100">
+                                    <p class="text-secondary text-sm mt-sm">The largest a single note's text may be (100–1,000,000). Applies to all notes.</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
                             <div class="card-header"><h3>Public note links</h3></div>
                             <div class="p-lg">
                                 <label class="flex items-center gap-sm">
                                     <input type="checkbox" id="setting-public-note-links-enabled">
                                     <span>Allow users to create public note links</span>
                                 </label>
-                                <p class="text-secondary text-sm mt-sm">When enabled, users may turn a note into a shareable link that anyone with the link can open (no sign-in). Each link is a <strong>snapshot</strong> — later edits don't change what a link shows — governed by the tags below. Leave off to disable public note links entirely (internal member-to-member sharing is unaffected).</p>
+                                <p class="text-secondary text-sm mt-sm">When enabled, users may turn a note into a shareable link that anyone with the link can open (no sign-in). Each link is a <strong>snapshot</strong> — later edits don't change what a link shows — governed by the tags below. Turning this off immediately <strong>pauses</strong> every public link (they stop opening) but does not delete them — turn it back on and they work again. To permanently stop links, revoke them under "All public links" below (per link, or "Revoke all active"). Internal member-to-member sharing is unaffected.</p>
                                 <div class="form-group mt-md" style="max-width:280px;">
                                     <label for="setting-public-note-link-user-cap">Maximum active links per user</label>
                                     <input type="number" id="setting-public-note-link-user-cap" class="form-control" min="1" max="10000" step="1">
@@ -2134,6 +2325,21 @@
                                 </div>
                             </div>
                         </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header flex justify-between items-center">
+                                <h3>All public links</h3>
+                                <div class="flex gap-sm">
+                                    <button type="button" id="nl-admin-refresh" class="btn btn-secondary btn-sm">Refresh</button>
+                                    <button type="button" id="nl-admin-revoke-all" class="btn btn-ghost btn-sm">Revoke all active</button>
+                                </div>
+                            </div>
+                            <div class="p-lg">
+                                <p class="text-secondary text-sm mb-md">Every public note link across all users. Revoke any link (or all active links at once) without turning the whole feature off. Snapshots are not shown here.</p>
+                                <div id="nl-admin-summary" class="text-secondary text-sm mb-sm"></div>
+                                <div id="nl-admin-links" style="overflow-x:auto;"></div>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Accounts & Access Tab -->
@@ -2215,6 +2421,27 @@
                                     <span>Require a verification code to change one’s own email</span>
                                 </label>
                                 <p class="text-secondary text-sm mt-sm" id="accounts-email-verify-help">A user changing their own email must confirm a one-time code sent to the new address; administrators setting an email are exempt. Requires email (SMTP) to be configured — set it up on the Email tab first.</p>
+                                <div class="form-group mt-md">
+                                    <label for="setting-email-change-otp-ttl-minutes">Verification code lifetime (minutes)</label>
+                                    <input type="number" id="setting-email-change-otp-ttl-minutes" class="form-control" min="1" max="60" step="1">
+                                    <p class="text-secondary text-sm mt-sm">How long the email-change verification code stays valid — from 1 to 60 minutes.</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header"><h3>Password reset</h3></div>
+                            <div class="p-lg">
+                                <label class="flex items-center gap-sm">
+                                    <input type="checkbox" id="setting-password-reset-enabled">
+                                    <span>Let people reset their own password</span>
+                                </label>
+                                <p class="text-secondary text-sm mt-sm">When on, a “Forgot password?” link appears on the sign-in screen and emails a one-time reset link. An administrator can always send a reset link from the Users page, regardless of this switch. Off by default. Requires email (SMTP) configured.</p>
+                                <div class="form-group mt-md">
+                                    <label for="setting-password-reset-ttl-minutes">Reset link lifetime (minutes)</label>
+                                    <input type="number" id="setting-password-reset-ttl-minutes" class="form-control" min="1" max="60" step="1">
+                                    <p class="text-secondary text-sm mt-sm">How long a password-reset link stays valid — from 1 to 60 minutes.</p>
+                                </div>
                             </div>
                         </div>
 
@@ -2424,8 +2651,18 @@
                         <form id="create-vault-form">
                             <div class="modal-body">
                                 <div class="form-group">
-                                    <label for="vault-name">Vault Name</label>
+                                    <label for="vault-name" id="vault-name-label">Vault Name</label>
                                     <input type="text" id="vault-name" class="form-control" required>
+                                    <!-- Shown only for zero-knowledge vaults: explains the name is sealed. -->
+                                    <small class="form-help" id="vault-name-zk-help" style="display:none;">Encrypted in your browser — the server never sees it. Shown only after you unlock with your passphrase.</small>
+                                </div>
+                                <!-- Zero-knowledge only: a non-secret label the server CAN see, shown in the
+                                     vault list while locked so the vault is identifiable before you unlock.
+                                     Optional; leave empty to show a neutral placeholder. -->
+                                <div class="form-group" id="vault-label-group" style="display:none;">
+                                    <label for="vault-label">Label <span class="text-tertiary">(optional, shown while locked)</span></label>
+                                    <input type="text" id="vault-label" class="form-control" maxlength="120" autocomplete="off">
+                                    <small class="form-help">A non-secret hint (e.g. “Work”) visible before unlock. The real name stays encrypted. Leave empty for a neutral placeholder.</small>
                                 </div>
                                 <div class="form-group">
                                     <label for="vault-desc">Description</label>
@@ -3286,7 +3523,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260824i"></script>
+    <script src="/static/js/app.js?v=20260824l"></script>
 </body>
 </html>
 

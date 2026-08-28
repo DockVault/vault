@@ -131,6 +131,9 @@ services:
       # run_combined.py supervises both processes and exits if either dies (the restart policy
       # then recreates the whole container).
       RUN_SFTP: ${RUN_SFTP:-}
+      # Tie the app's per-upload clamp to the staging tmpfs size below, so it applies exactly when
+      # this container backs SFTP staging with a tmpfs (the app default is 0 = unclamped).
+      SFTP_STAGING_TMPFS_MB: ${SFTP_STAGING_TMPFS_MB:-512}
       ENVIRONMENT: production
       CHUNK_SESSION_TTL_HOURS: "24"
     command: ["python", "run_combined.py"]
@@ -178,12 +181,16 @@ services:
     read_only: true
     tmpfs:
       - /tmp:mode=1777
-    # Runs both halves. Neither one materialises a file in memory any more: uploads and downloads
-    # are streamed, so a transfer costs a fixed amount whatever the file weighs and the setting to
-    # size against is MAX_CONCURRENT_TRANSFERS (16 by default), not MAX_FILE_SIZE_MB. Budget about
-    # 130 MB at rest plus 25 MB per concurrent transfer for this container -- roughly 530 MB at the
-    # default ceiling -- and lower the ceiling rather than the file size on a small machine. Open
-    # SFTP handles are separate and cost a couple of records each. See docs/resource-budgets.md.
+      # SFTP buffers each upload's plaintext here while encrypting it at close; a tmpfs keeps that
+      # plaintext off the persistent storage volume. It is RAM, size-capped, and counted against
+      # mem_limit; a buffered upload cannot exceed it (SFTP_STAGING_TMPFS_MB, default 512 MiB).
+      - /app/storage/.sftp_tmp:mode=1777,size=${SFTP_STAGING_TMPFS_MB:-512}m
+    # Runs both halves. Downloads stream, so a download costs a fixed amount whatever the file
+    # weighs -- size those against MAX_CONCURRENT_TRANSFERS (16 by default): about 130 MB at rest
+    # plus 25 MB per concurrent transfer, roughly 530 MB at the default ceiling. SFTP uploads buffer
+    # their plaintext in the staging tmpfs above, a shared cap across concurrent uploads, so add
+    # SFTP_STAGING_TMPFS_MB on top -- about 1 GB at the 512 MiB default. Lower either on a small
+    # machine. Open SFTP handles cost a couple of records each. See docs/resource-budgets.md.
     mem_limit: 4g
     pids_limit: 512
     cpus: 2.0
@@ -305,6 +312,9 @@ services:
       REDIS_PORT: "6379"
       SFTP_HOST: 0.0.0.0
       SFTP_PORT: "2222"
+      # Tie the app's per-upload clamp to the staging tmpfs size below, so it applies exactly when
+      # this container backs SFTP staging with a tmpfs (the app default is 0 = unclamped).
+      SFTP_STAGING_TMPFS_MB: ${SFTP_STAGING_TMPFS_MB:-512}
       ENVIRONMENT: production
     command: ["python", "-m", "app.sftp.sftp_server"]
     # This service runs SFTP, not the HTTP API. Check the port is bound via
@@ -358,7 +368,12 @@ services:
       - /tmp:mode=1777
       - /app/logs:mode=1777
       - /app/certs:mode=1777
-    # SFTP also streams large files; keep headroom above max_file_size_mb (see vault-api note).
+      # SFTP buffers each upload's plaintext here while encrypting it; a tmpfs keeps that plaintext
+      # off the persistent storage volume. It is RAM, size-capped, and counts against mem_limit; a
+      # buffered upload cannot exceed it (SFTP_STAGING_TMPFS_MB, default 512 MiB).
+      - /app/storage/.sftp_tmp:mode=1777,size=${SFTP_STAGING_TMPFS_MB:-512}m
+    # Downloads stream (fixed cost); SFTP uploads buffer their plaintext in the staging tmpfs above
+    # (a shared cap across concurrent uploads), so keep mem_limit above ~530 MB + SFTP_STAGING_TMPFS_MB.
     mem_limit: 2g
     pids_limit: 512
     cpus: 1.0

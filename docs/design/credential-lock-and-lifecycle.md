@@ -25,7 +25,11 @@ less-error-prone `lock`/`unlock`.
 **What locking protects (state it plainly to users):** the `.env` while the server is **off and
 locked** — i.e. a stolen disk, a stolen backup, or a VM snapshot that happens to capture the box while
 it was sealed. Also: `.env.enc` is safe to include in a backup bundle where plaintext `.env` would not
-be.
+be. `backup --lock` uses exactly this envelope to seal a bundle's `env` into `env.enc` (opt-in): the
+volume archives are already ciphertext at rest, so sealing the one file that holds `ENCRYPTION_KEY`
+makes a stolen backup undecryptable. Restore detects `env.enc`, decrypts it in memory with the
+passphrase or recovery key (a wrong credential aborts before the deployment is touched), and installs
+the plaintext `.env` only onto the restored host.
 
 **What it does NOT protect:**
 - A **running** server. A running vault must hold the plaintext secrets in process memory, so the
@@ -155,8 +159,9 @@ operator to move off-box, with a warning not to leave it on the host.
 | Command | Behaviour |
 |---------|-----------|
 | `start` | Preflight (`.env` present & parseable, volume set present, secret-bundle guard satisfied, ports free) → `up -d` → **wait for health** → per-container status. On failure, tail the failing service's logs and exit non-zero. If only `.env.enc` is present, **prompt to unlock inline** and continue (the server needs plaintext `.env` to run anyway). Never touches volumes. |
-| `stop` | `compose stop` (preserves containers + volumes; not `down -v`). `--lock` (or an interactive prompt) offers to re-seal `.env` after stopping. |
-| `restart` | `stop` → `start` with the same health gate. If the new start fails health, say so loudly; data is untouched. |
+| `stop` | `compose stop` — matches `docker compose stop`: preserves the (stopped) containers + volumes (not `down -v`). Warns loudly that a stopped container STILL holds the deployment's secrets in Docker's on-disk config, and points at `down`. |
+| `down` | `compose down` — matches `docker compose down`: removes the containers (which clears their secrets from Docker's on-disk config), never `-v`, so data volumes survive. **Confirms first**; `--yes` skips the prompt, and a piped / non-interactive stdin **declines** the removal unless `--yes` is given (so automation is explicit, never a silent teardown). `--lock` also seals `.env` into `.env.enc` afterwards, so no plaintext secret is left at rest anywhere. |
+| `restart` | Full recreate (`compose down` → `start`) with the same health gate, so a changed `.env` takes effect. No prompt (an explicit in-place action, not the standalone `down`). If the new start fails health, say so loudly; data is untouched. |
 | `status` | Per-container running/health, published ports, image + digest, and whether `.env` is locked/unlocked. Read-only. |
 
 **Friendly vs loud:** `start` / `restart` (and a `setup` re-run) prompt-unlock inline when locked;

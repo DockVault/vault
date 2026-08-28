@@ -71,6 +71,8 @@ from app.services.vault_service import (
 from app.services.vault_service import FileNotFoundError as VaultFileNotFoundError
 from app.services.audit_logger import AuditLogger
 from app.core.config import settings
+from app.sftp.host_key import generate_ed25519_host_key, load_host_key
+from app.core.session_hash_utils import hash_session_token
 from app.core.safe_log import safe_event
 from app.core.temp_scope import is_scoped, effective_vault_caps, scope_ids
 from app.core.security import name_blind_index
@@ -81,9 +83,26 @@ active_transports: Dict[str, paramiko.Transport] = {}
 transport_lock = threading.Lock()
 
 # Where incoming uploads are buffered (plaintext) before being pushed through the
-# encryption pipeline at handle close. Lives inside the storage volume so it is on
-# the same filesystem as the final encrypted file.
+# encryption pipeline at handle close. The path sits inside the storage volume, but the compose
+# files mount a size-capped tmpfs (RAM) over this subdirectory, so the plaintext buffer never
+# reaches persistent disk. A deployment whose compose does not mount that tmpfs keeps buffering on
+# the volume as before (and should set SFTP_STAGING_TMPFS_MB=0 so uploads are not size-clamped).
 _SFTP_TMP_DIR = Path(settings.file_storage_path) / ".sftp_tmp"
+
+
+def _staging_capped_max(eff_max_bytes: int, tmpfs_mb: int) -> int:
+    """The per-upload byte cap, clamped to the SFTP staging tmpfs budget.
+
+    A buffered SFTP upload cannot be larger than the tmpfs it is staged in, so the per-file limit
+    is capped there and an oversized upload is refused in-stream -- a clean failure -- rather than
+    filling the tmpfs mid-write. ``tmpfs_mb <= 0`` disables the clamp (staging is on the volume, not
+    a tmpfs); an ``eff_max_bytes`` of 0 means "no configured per-file limit", so the budget itself
+    becomes the limit.
+    """
+    if tmpfs_mb and tmpfs_mb > 0:
+        budget = tmpfs_mb * 1024 * 1024
+        return budget if eff_max_bytes <= 0 else min(eff_max_bytes, budget)
+    return eff_max_bytes
 
 # POSIX open-flag access mode mask (app/sftp/sftp_server.py only runs inside the Linux
 # container, but be defensive if os lacks the constant).
@@ -162,6 +181,15 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # marks the upload for discard at close (an SFTP close can't signal failure).
         self.max_bytes = 0
         self.overlimit = False
+        # A write raised (e.g. the staging tmpfs ran out of space under concurrent uploads). Like
+        # overlimit, this marks the upload for discard at close so a truncated buffer is never
+        # finalized -- an SFTP close cannot report failure, so the discard is the only signal.
+        self.write_failed = False
+        # Back-reference to the paramiko SFTP protocol handler, set on an upload handle in open().
+        # A raw int status return (e.g. SFTP_FAILURE) carries only paramiko's default word "Failure";
+        # setting a pending description here lets _send_status attach a message that names the actual
+        # cause (over the size limit / staging buffer full) so the SFTP client is not left guessing.
+        self._sftp_server = None
         # shared
         self.attrs: Optional[paramiko.SFTPAttributes] = None
 
@@ -196,14 +224,31 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # before the close-time size check runs. Mark the handle so close() discards the upload.
         if self.max_bytes and (offset + len(data)) > self.max_bytes:
             self.overlimit = True
+            self._set_status_desc(
+                "upload rejected: file exceeds the %d MB SFTP limit (raise SFTP_STAGING_TMPFS_MB, "
+                "which uses that much RAM, or lower MAX_FILE_SIZE_MB to match)"
+                % (self.max_bytes // (1024 * 1024)))
             return paramiko.SFTP_FAILURE
         try:
             self.writefile.seek(offset)
             self.writefile.write(data)
             return paramiko.SFTP_OK
         except Exception as e:  # noqa: BLE001
+            # The buffer write failed (a full staging tmpfs is the expected cause). Mark the
+            # upload for discard so close() does not finalize the partial bytes already written.
+            self.write_failed = True
+            self._set_status_desc(
+                "upload failed: the SFTP staging buffer is full (raise SFTP_STAGING_TMPFS_MB)")
             safe_event('write.failed', e)
             return paramiko.SFTP_FAILURE
+
+    def _set_status_desc(self, desc: str):
+        """Attach a human description to the status paramiko is about to send for THIS request.
+        Consumed and cleared by _MessageSFTPServer._send_status, which runs synchronously right after
+        this write() returns (paramiko processes one request at a time per connection)."""
+        srv = self._sftp_server
+        if srv is not None:
+            srv._pending_status_desc = desc
 
     def stat(self):
         if self.attrs is not None:
@@ -222,8 +267,17 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
 
         # Write mode: assemble + encrypt + persist.
         if self.writefile is not None:
+            # Flush and close are SEPARATE: the buffer is a BufferedWriter, so the final
+            # sub-buffer-size tail of the upload only reaches the staging file here, at flush().
+            # If the tmpfs filled between the last write() and this flush (concurrent uploads),
+            # flush() raises and the buffer is TRUNCATED -- mark it for discard so close() below
+            # does not finalize partial bytes. close() itself is best-effort.
             try:
                 self.writefile.flush()
+            except Exception as e:  # noqa: BLE001
+                self.write_failed = True
+                safe_event('upload.flush.failed', e)
+            try:
                 self.writefile.close()
             except Exception:  # noqa: BLE001
                 pass
@@ -232,6 +286,11 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
                 # The upload exceeded the per-file max mid-stream: discard it (don't persist),
                 # leaving any existing same-name file intact. The temp buffer is removed below.
                 safe_event('upload.discarded.too-large', limit=self.max_bytes)
+            elif self.write_failed:
+                # A buffer write failed mid-stream (e.g. the staging tmpfs filled): the buffer is
+                # truncated, so discard it rather than finalize partial bytes. Any existing
+                # same-name file is left intact.
+                safe_event('upload.discarded.write-failed')
             elif self.finalizer is not None and self.writepath:
                 try:
                     self.finalizer(self.writepath)
@@ -357,7 +416,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         try:
             with get_db_context() as db:
                 session = db.query(ActiveSession).filter(
-                    ActiveSession.session_token == token,
+                    ActiveSession.session_token == hash_session_token(token),
                     ActiveSession.is_active == True  # noqa: E712
                 ).first()
                 if not session:
@@ -817,6 +876,9 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             if not _up.file_type_allowed(filename, _up.parse_allowed_exts(_sblob.get("allowed_file_types"))):
                 return paramiko.SFTP_PERMISSION_DENIED
             _eff_max = _up.effective_max_file_bytes((settings.max_file_size_mb or 0) * 1024 * 1024, _sblob.get("max_file_size"))
+            # A buffered upload can't exceed the staging tmpfs; refuse an oversized one in-stream
+            # rather than filling the tmpfs mid-write.
+            _eff_max = _staging_capped_max(_eff_max, settings.sftp_staging_tmpfs_mb)
             try:
                 folder_id = self._resolve_folder(db, vault.id, segments[1:-1])
             except _PathNotFound:
@@ -865,6 +927,9 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         # Bound the buffered plaintext in-stream at the configured per-file max, so the write
         # can't fill the shared .sftp_tmp volume before the close-time size check runs.
         handle.max_bytes = _eff_max
+        # Let an in-stream refusal (over-limit / staging-full) carry a descriptive status instead of
+        # paramiko's bare "Failure". _sftp_server is the protocol handler, wired by _MessageSFTPServer.
+        handle._sftp_server = getattr(self, "_sftp_server", None)
         handle.finalizer = self._make_upload_finalizer(
             vault_id, folder_id, filename, can_overwrite
         )
@@ -1291,6 +1356,38 @@ def _sftp_key_throttled(ip: str, username: str) -> bool:
         return True
 
 
+class _MessageSFTPServer(paramiko.SFTPServer):
+    """paramiko SFTP protocol handler that can attach a human-readable description to a status.
+
+    A handle method (e.g. VaultSFTPHandle.write) returns a bare int status code, which paramiko
+    turns into its default word for that code ("Failure"). When an upload is refused in-stream for a
+    reason the operator can act on (over the SFTP size limit, or a full staging buffer), the handle
+    records a description via _set_status_desc; this override sends it in place of the default. Only
+    the tiny _send_status method is overridden, so it is robust across paramiko point releases.
+
+    Paramiko processes one request at a time per connection, so a description set inside a handle
+    method is consumed by exactly the status that method's return produces; it is cleared on every
+    send so it can never attach to an unrelated status.
+    """
+
+    def __init__(self, channel, name, server, sftp_si=SFTPServerInterface, *largs, **kwargs):
+        super().__init__(channel, name, server, sftp_si, *largs, **kwargs)
+        self._pending_status_desc = None
+        # Give the request handler (self.server is the SFTPServerInterface) a back-reference so
+        # open() can wire each upload handle to this protocol handler.
+        try:
+            self.server._sftp_server = self
+        except Exception:  # noqa: BLE001 - never let wiring break a connection
+            pass
+
+    def _send_status(self, request_number, code, desc=None):
+        pending = self._pending_status_desc
+        self._pending_status_desc = None
+        if desc is None and pending:
+            desc = pending
+        return super()._send_status(request_number, code, desc)
+
+
 def _sftp_key_clear(ip: str, username: str) -> None:
     """Reset this principal's key-offer counter after a successful key auth -- BOTH the Redis counter
     and the durable DB-fallback row -- so a healthy (frequently reconnecting, multi-key) client never
@@ -1375,7 +1472,7 @@ class SFTPServer(paramiko.ServerInterface):
                             deny = "SFTP requires a temporary credential for this account"
                         if deny is not None:
                             db.query(ActiveSession).filter(
-                                ActiveSession.session_token == session_token
+                                ActiveSession.session_token == hash_session_token(session_token)
                             ).update({"is_active": False})
                             db.commit()
                             audit_logger.log_login_failure(username, self.client_address, deny)
@@ -1599,13 +1696,14 @@ def start_sftp_server():
     host_key_path = Path(settings.sftp_host_key_path)
 
     if not host_key_path.exists():
-        # Where it is written is a host path and stays out of the log.
+        # New install: generate a modern Ed25519 key. Where it is written is a host path and stays
+        # out of the log. An existing deployment already has its key here and skips this branch, so
+        # its fingerprint never changes on upgrade.
         safe_event('host-key.generating')
-        host_key_path.parent.mkdir(parents=True, exist_ok=True)
-        key = paramiko.RSAKey.generate(2048)
-        key.write_private_key_file(str(host_key_path))
+        generate_ed25519_host_key(host_key_path)
 
-    host_key = paramiko.RSAKey.from_private_key_file(str(host_key_path))
+    # Load whatever is present -- Ed25519 on new installs, RSA on ones that predate this.
+    host_key = load_host_key(str(host_key_path))
 
     # Remove any plaintext upload buffers orphaned by a previous crash/kill (no uploads can
     # be in flight at startup, so all are stale).
@@ -1676,7 +1774,7 @@ def start_sftp_server():
 def handle_sftp_client(
     client_socket: socket.socket,
     client_address: tuple,
-    host_key: paramiko.RSAKey
+    host_key: paramiko.PKey
 ):
     """
     Handle an SFTP client connection.
@@ -1702,7 +1800,7 @@ def handle_sftp_client(
         transport.add_server_key(host_key)
         transport.set_subsystem_handler(
             'sftp',
-            paramiko.SFTPServer,
+            _MessageSFTPServer,
             SFTPServerInterface
         )
 
@@ -1720,10 +1818,12 @@ def handle_sftp_client(
             return
 
         # Register transport in global registry if authenticated (key-auth sessions
-        # are created in check_channel_request, so session_token is set by now).
+        # are created in check_channel_request, so session_token is set by now). Keyed by the
+        # token's hash — the same value the DB stores and the termination signal carries — so a
+        # revocation published by the API (which sends the stored hash) finds this transport.
         if server.session_token:
             with transport_lock:
-                active_transports[server.session_token] = transport
+                active_transports[hash_session_token(server.session_token)] = transport
             safe_event('transport.registered', session=server.session_token[:8])
 
         # Keep connection alive
@@ -1734,10 +1834,10 @@ def handle_sftp_client(
         safe_event('client.handling.failed', e, peer=client_address)
 
     finally:
-        # Unregister transport
+        # Unregister transport (same hashed key it was registered under).
         if transport and server and server.session_token:
             with transport_lock:
-                active_transports.pop(server.session_token, None)
+                active_transports.pop(hash_session_token(server.session_token), None)
             safe_event('transport.unregistered', session=server.session_token[:8])
 
         if transport:

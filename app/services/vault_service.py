@@ -79,6 +79,61 @@ def _seal_named_object(vault, obj, is_file: bool) -> None:
         obj.name = None
 
 
+def _seal_file_checksum(file) -> None:
+    """Seal a file's content checksum at rest: store the AES-GCM blob in enc_checksum and NULL the
+    plaintext checksum_sha256. UNLIKE the name, the checksum is server-computed for EVERY file (ZK and
+    Standard) -- it is never a browser blob -- so this runs for all files, and the load event always
+    decrypts it back for the ETag/MAC derivation and integrity read. The file MUST already have its id
+    assigned (the cipher key is per-(vault_id, id)). No-op if there is no id/vault_id/checksum yet."""
+    if getattr(file, 'id', None) is None or getattr(file, 'vault_id', None) is None \
+            or not getattr(file, 'checksum_sha256', None):
+        return
+    from app.core.security import encrypt_object_field
+    file.enc_checksum = encrypt_object_field(file.vault_id, file.id, file.checksum_sha256, 'checksum')
+    file.checksum_sha256 = None
+
+
+def _seal_vault_name(vault, name):
+    """Seal a STANDARD vault's name at rest: store the AES-GCM blob in `enc_name` and NULL the
+    plaintext `name` column, mirroring _seal_named_object for files/folders. A vault is its own
+    cipher scope, so the key is per-(vault.id, vault.id). The load/refresh event restores `name`
+    in-memory, so a caller that reads it right after sealing must refresh() the object first (every
+    write site here commits + refreshes). No-op for ZK vaults (name browser-sealed later), for a
+    vault without an id yet, and for a None name.
+
+    The standard-only guard comes FIRST, before any assignment: a zero-knowledge vault seals its name
+    in the browser and sets its non-secret label directly at creation, so this helper must NEVER
+    write a plaintext name onto a non-standard vault -- a mis-call with a real name could otherwise
+    land it in the clear (the server is the enforcement boundary for the ZK guarantee).
+    """
+    if getattr(vault, 'type', 'standard') != 'standard' or getattr(vault, 'id', None) is None \
+            or name is None:
+        return
+    vault.name = name
+    from app.core.security import encrypt_object_field
+    vault.enc_name = encrypt_object_field(vault.id, vault.id, name, 'name')
+    vault.name = None
+
+
+def _seal_vault_description(vault, description):
+    """Seal a STANDARD vault's DESCRIPTION at rest: store the AES-GCM blob in `enc_description` and
+    NULL the plaintext `description` column, mirroring _seal_vault_name (same per-(vault.id, vault.id)
+    scope, field 'description'). The load/refresh event restores `description` in-memory. No-op for a
+    ZK vault (its description is browser-sealed into a zk2: enc_description), a vault without an id
+    yet, and a None/empty description.
+
+    Standard-only guard FIRST, before any assignment, for the same reason as _seal_vault_name: a
+    zero-knowledge vault's description is sealed in the browser, so this helper must NEVER write a
+    plaintext description onto a non-standard vault.
+    """
+    if getattr(vault, 'type', 'standard') != 'standard' or getattr(vault, 'id', None) is None \
+            or not description:
+        return
+    from app.core.security import encrypt_object_field
+    vault.enc_description = encrypt_object_field(vault.id, vault.id, description, 'description')
+    vault.description = None
+
+
 def _name_match_filter(model, vault, name: str):
     """SQLAlchemy filter matching `model` (File|Folder) rows whose name equals `name`.
 
@@ -430,14 +485,17 @@ class VaultService:
     
     def create_vault(
         self,
-        name: str,
+        name: Optional[str],
         owner: User,
         description: Optional[str] = None,
         password: Optional[str] = None,
         expire_files_after_days: Optional[int] = None,
         vault_type: str = 'standard',
         size_limit: Optional[int] = None,
-        vault_id: Optional[uuid.UUID] = None
+        vault_id: Optional[uuid.UUID] = None,
+        enc_name: Optional[str] = None,
+        enc_description: Optional[str] = None,
+        name_key_version: Optional[int] = None,
     ) -> Vault:
         """
         Create a new vault.
@@ -506,6 +564,27 @@ class VaultService:
         # Per-vault size cap. When unset, the model column default (1 GB) applies.
         if size_limit is not None:
             vault.size_limit = size_limit
+
+        # Seal the name at rest (Standard vaults). The id is already assigned above, so the
+        # per-vault cipher key is available; the refresh() below restores the plaintext in-memory.
+        # For a ZK vault these are no-op seals (name keeps its non-secret label, the description is
+        # sealed in the browser below); for a Standard vault they move the plaintext into enc_name /
+        # enc_description and NULL the plaintext columns. The refresh() below restores both in-memory.
+        _seal_vault_name(vault, name)
+        _seal_vault_description(vault, description)
+        # Zero-knowledge: store the browser-sealed name/description verbatim -- the server cannot read
+        # them. `name` already holds the non-secret label (set above); the load event skips these
+        # ZK-marked blobs, so `name`/`description` stay as the label/NULL for a ZK vault. Gated on the
+        # ZK type so a caller can NEVER overwrite the SERVER seal a Standard vault just wrote above
+        # (its enc_name/enc_description come from _seal_vault_name/_seal_vault_description, not a param).
+        if enc_name is not None and getattr(vault, 'type', 'standard') != 'standard':
+            vault.enc_name = enc_name
+        if enc_description is not None and getattr(vault, 'type', 'standard') != 'standard':
+            vault.enc_description = enc_description
+        # The DEK epoch the browser sealed enc_name/enc_description under (ZK). retire-version counts
+        # it so the name's epoch is never dropped. Absent => NULL (read defaults to epoch 1).
+        if name_key_version is not None:
+            vault.name_key_version = name_key_version
 
         self.db.add(vault)
         self.db.commit()
@@ -800,10 +879,13 @@ class VaultService:
             raise PermissionDeniedError("Only vault owner can update vault")
         
         if name is not None:
-            vault.name = name
-        
+            _seal_vault_name(vault, name)   # Standard: seals enc_name + NULLs name; refresh() below restores it
+
         if description is not None:
-            vault.description = description
+            if description:
+                _seal_vault_description(vault, description)  # Standard: seals enc_description + NULLs it
+            else:
+                vault.description = vault.enc_description = None  # cleared
         
         # ✅ NEW: Handle password changes that require re-encrypting vault key
         if password is not None:
@@ -1352,6 +1434,7 @@ class VaultService:
             )
 
         # Create file record
+        from app.core.security import content_mac as _content_mac
         file = File(
             id=file_info['id'],
             # ZK: no plaintext name/MIME at rest — set below from the client blobs.
@@ -1362,6 +1445,8 @@ class VaultService:
             size_bytes=total_size,
             mime_type=None if is_zk else file_info['mime_type'],
             checksum_sha256=checksum,
+            # Keyed ETag tag; the plaintext checksum stays internal (integrity verification only).
+            content_mac=_content_mac(file_info['id'], checksum),
             storage_path=file_info['storage_path'],
             is_encrypted=file_info['is_encrypted'],
             password_hash=file_info['password_hash'],
@@ -1391,6 +1476,11 @@ class VaultService:
 
         # Encrypt the filename/MIME at rest (Standard vaults) before persisting. No-op for ZK.
         _seal_named_object(file_info['vault'], file, is_file=True)
+        # Seal the content checksum at rest for EVERY file (ZK + Standard): it is server-computed, so
+        # unlike the name it is never a browser blob. content_mac (the ETag) was already stored above,
+        # so nothing on the hot read path needs the plaintext checksum except the load event, which
+        # restores it. Runs after _seal_named_object so a Standard file already has enc_name set.
+        _seal_file_checksum(file)
 
         # Update vault statistics.
         #
@@ -1676,8 +1766,14 @@ class VaultService:
         """
         from app.core.security import (
             is_gcm_chunk_stream, decrypt_chunk_stream, GcmChunkStreamReader,
+            content_mac as _content_mac,
         )
         from app.services.download_stream import BoundedDownload
+
+        # The keyed ETag for this file. Stored on rows written since the column was added; derived
+        # (same value) for a legacy row whose column is still NULL, so no row exposes its plaintext
+        # checksum through the ETag and no backfill is needed.
+        _etag_mac = file.content_mac or _content_mac(file.id, file.checksum_sha256)
 
         if is_zk:
             # The server stored the client's ciphertext verbatim and holds no key for it. There are
@@ -1712,7 +1808,7 @@ class VaultService:
             return BoundedDownload(
                 handle, _primed(_fixed_windows(handle)), size,
                 file.original_name, mime, file.checksum_sha256,
-                read_range=_raw_range)
+                read_range=_raw_range, content_mac=_etag_mac)
 
         # The identification itself can fail, and it must be caught HERE: it used to return False
         # for an unreadable file, which silently routed a healthy object to the wrong reader and
@@ -1736,6 +1832,7 @@ class VaultService:
                 handle, reader.records(), reader.total_length,
                 file.original_name, mime, file.checksum_sha256,
                 length_is_authenticated=reader.length_is_authenticated,
+                content_mac=_etag_mac,
                 # The same open handle and the same index the walk above already built, so a
                 # ranged response costs no second authorization, no second open and no second
                 # walk. The other two branches leave this None and are therefore not rangeable.
@@ -1751,7 +1848,8 @@ class VaultService:
             raise FileServiceError(f"Failed to decrypt chunked file: {e}")
         return BoundedDownload(
             handle, pieces, file.size_bytes or 0,
-            file.original_name, mime, file.checksum_sha256)
+            file.original_name, mime, file.checksum_sha256,
+            content_mac=_etag_mac)
     
     def delete_file(self, file_id: uuid.UUID, user: User):
         """

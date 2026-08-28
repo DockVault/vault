@@ -149,7 +149,7 @@ def test_a_corrupted_zero_knowledge_blob_is_not_served_as_a_success(admin):
             db = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
             broke = subprocess.run(
                 ["docker", "exec", db, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc",
-                 f"UPDATE files SET checksum_sha256 = repeat('d', 64) WHERE id = '{file_id}';"],
+                 f"UPDATE files SET checksum_sha256 = repeat('d', 64), enc_checksum = NULL WHERE id = '{file_id}';"],
                 capture_output=True, text=True, timeout=60)
             skip_if_container_absent(broke, db)
             assert broke.returncode == 0 and "UPDATE 1" in broke.stdout, (

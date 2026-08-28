@@ -508,6 +508,31 @@ def test_build_env_lines_writes_ports_only_when_nondefault():
     assert env4["SFTP_HOST_PORT"] == "2200"
 
 
+def test_build_env_lines_writes_sftp_staging_size_only_when_nondefault():
+    base = {
+        "server_name": "localhost", "encryption_key": dv.gen_fernet_key(),
+        "jwt_secret_key": dv.gen_hex(32), "vault_db_password": dv.gen_hex(16),
+        "redis_password": dv.gen_hex(24), "admin_username": "admin",
+        "admin_email": "a@example.com", "admin_password": "Strong-Pass-1234", "compose_profiles": "combined",
+    }
+    # SFTP on, default staging size -> not written (the compose/app default 512 applies)
+    env = dv.parse_env("\n".join(dv.build_env_lines(dict(base, run_sftp=True, sftp_staging_tmpfs_mb=512))))
+    assert "SFTP_STAGING_TMPFS_MB" not in env
+    # SFTP on, unset -> not written
+    env_unset = dv.parse_env("\n".join(dv.build_env_lines(dict(base, run_sftp=True, sftp_staging_tmpfs_mb=None))))
+    assert "SFTP_STAGING_TMPFS_MB" not in env_unset
+    # SFTP on, non-default -> written
+    env2 = dv.parse_env("\n".join(dv.build_env_lines(dict(base, run_sftp=True, sftp_staging_tmpfs_mb=1024))))
+    assert env2["SFTP_STAGING_TMPFS_MB"] == "1024"
+    # a non-default staging size is ignored when SFTP is off (combined mode)
+    env3 = dv.parse_env("\n".join(dv.build_env_lines(dict(base, run_sftp=False, sftp_staging_tmpfs_mb=1024))))
+    assert "SFTP_STAGING_TMPFS_MB" not in env3
+    # split mode always runs the SFTP container -> a non-default staging size IS written even with run_sftp off
+    env4 = dv.parse_env("\n".join(dv.build_env_lines(dict(
+        base, compose_profiles="split", run_sftp=False, sftp_staging_tmpfs_mb=768))))
+    assert env4["SFTP_STAGING_TMPFS_MB"] == "768"
+
+
 def test_gen_deployment_id_is_short_hex():
     ids = {dv.gen_deployment_id() for _ in range(25)}
     assert all(len(i) == 8 and all(c in "0123456789abcdef" for c in i) for i in ids)
@@ -1052,7 +1077,8 @@ def test_guard_interactive_routes_to_menu_not_autoprobe(tmp_path, monkeypatch):
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     env = {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"}
     called = []
-    monkeypatch.setattr(tool, "_resolve_existing_volume", lambda e, vol, hooks: called.append(1) or True)
+    monkeypatch.setattr(tool, "_resolve_existing_volume",
+                        lambda e, vol, hooks, env_is_fresh=False: called.append(1) or True)
     # interactive + existing volume -> the menu (nothing probes automatically)
     assert tool._guard_db_secret(env, interactive=True, exists_fn=lambda v: True, **_NO_STAMP) is True and called == [1]
     # non-interactive -> auto-verify directly, NO menu
@@ -1165,6 +1191,124 @@ def test_volume_new_authors_fresh_set_and_archives_current(tmp_path):
     archive = tmp_path / ".env.dockvault-vault"                              # current set's .env saved
     assert archive.exists()
     assert dv.parse_env(archive.read_text(encoding="utf-8"))["ENCRYPTION_KEY"] == old["ENCRYPTION_KEY"]
+
+
+def test_new_set_config_flags_generated_admin_pw():
+    # A source .env that still carries ADMIN_PASSWORD -> the new set keeps it, no auto-generate flag.
+    kept = dv.new_set_config({"SERVER_NAME": "v", "ADMIN_PASSWORD": "Kept-Pass-9999"},
+                             "dockvault-vault-a1", "a1")
+    assert kept["admin_password"] == "Kept-Pass-9999" and kept["_generated_admin_pw"] is False
+    # A source .env whose spent ADMIN_PASSWORD was dropped -> the new set generates one AND flags it,
+    # so the caller shows it once (the operator needs it to log into the fresh set).
+    gen = dv.new_set_config({"SERVER_NAME": "v"}, "dockvault-vault-a2", "a2")
+    assert gen["_generated_admin_pw"] is True and len(gen["admin_password"]) >= 8
+
+
+def test_new_set_from_discards_fresh_env_but_archives_real(tmp_path):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    # A freshly-authored throwaway .env (this run, never used) is DISCARDED - no pointless archive.
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    tool._new_set_from(env, current_env_is_fresh=True)
+    assert not (tmp_path / ".env.dockvault-vault").exists()                   # not archived
+    assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["VAULT_VOLUME_PREFIX"].startswith(
+        "dockvault-vault-")                                                   # the new set replaced it
+    # A real, pre-existing .env is archived (and the operator warned).
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
+    env2 = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    tool._new_set_from(env2, current_env_is_fresh=False)
+    assert (tmp_path / ".env.dockvault-vault").exists()                       # archived, not discarded
+
+
+def test_remove_env_keys_drops_only_named_lines(tmp_path):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    p = str(tmp_path / ".env")
+    (tmp_path / ".env").write_text("# a comment\nADMIN_PASSWORD='secret'\nSERVER_NAME='x'\n", encoding="utf-8")
+    assert tool._remove_env_keys(p, ["ADMIN_PASSWORD"]) is True
+    left = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "ADMIN_PASSWORD" not in left and "# a comment" in left and "SERVER_NAME='x'" in left
+    assert tool._remove_env_keys(p, ["ADMIN_PASSWORD"]) is False              # already gone -> no-op
+
+
+def test_env_archives_excludes_template_and_lock(tmp_path):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    for name in (".env.example", ".env.enc", ".env.dockvault-vault", ".env.dockvault-vault-x9"):
+        (tmp_path / name).write_text("x\n", encoding="utf-8")
+    got = sorted(os.path.basename(a) for a in tool._env_archives())
+    assert got == [".env.dockvault-vault", ".env.dockvault-vault-x9"]         # template + lock excluded
+
+
+def test_admin_bootstrap_done_classifies():
+    def _run(marker_stdout=None, host_rc=0, psql_rc=0, raise_on=None):
+        def run(args, **k):
+            if raise_on and raise_on in args:
+                raise OSError("boom")
+            r = type("R", (), {})()
+            if "hostname" in args:
+                r.returncode, r.stdout = host_rc, "172.18.0.9\n"
+            else:  # psql
+                r.returncode, r.stdout, r.stderr = psql_rc, (marker_stdout or ""), ""
+            return r
+        return run
+    done = dv.admin_bootstrap_done
+    assert done("c", "u", "d", "pw", run=_run(marker_stdout="1\n")) is True   # marker present
+    assert done("c", "u", "d", "pw", run=_run(marker_stdout="\n")) is False   # confirmed absent
+    assert done("c", "u", "d", "pw", run=_run(psql_rc=1)) is None             # query failed -> unknown
+    assert done("c", "u", "d", "pw", run=_run(host_rc=1)) is None             # no container IP -> unknown
+    assert done("c", "u", "d", "pw", run=_run(raise_on="hostname")) is None   # exec error -> unknown
+
+
+def test_strip_spent_admin_password_gated_on_marker(tmp_path, monkeypatch):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    p = str(tmp_path / ".env")
+
+    def seed():
+        (tmp_path / ".env").write_text(
+            "ADMIN_PASSWORD='Strong-Pass-1234'\nVAULT_DB_PASSWORD='dbpw'\n", encoding="utf-8")
+    env = {"ADMIN_PASSWORD": "Strong-Pass-1234", "VAULT_DB_PASSWORD": "dbpw"}
+    # marker confirmed -> strip
+    seed(); monkeypatch.setattr(dv, "admin_bootstrap_done", lambda *a, **k: True)
+    tool._strip_spent_admin_password(p, env)
+    assert "ADMIN_PASSWORD" not in (tmp_path / ".env").read_text(encoding="utf-8")
+    # marker unknown (None) or absent (False) -> KEEP (a later boot may still need it)
+    for verdict in (None, False):
+        seed(); monkeypatch.setattr(dv, "admin_bootstrap_done", lambda *a, v=verdict, **k: v)
+        tool._strip_spent_admin_password(p, env)
+        assert "ADMIN_PASSWORD" in (tmp_path / ".env").read_text(encoding="utf-8")
+    # nothing to strip -> never even probes the DB
+    seed()
+    monkeypatch.setattr(dv, "admin_bootstrap_done",
+                        lambda *a, **k: pytest.fail("must not probe when no ADMIN_PASSWORD is set"))
+    tool._strip_spent_admin_password(p, {"VAULT_DB_PASSWORD": "dbpw"})
+
+
+def test_apply_cli_admin_overrides_only_when_passed(tmp_path):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    p = str(tmp_path / ".env")
+    (tmp_path / ".env").write_text("ADMIN_PASSWORD='old'\nSERVER_NAME='x'\n", encoding="utf-8")
+    # nothing passed -> untouched
+    out = tool._apply_cli_admin_overrides(p, {"ADMIN_PASSWORD": "old"}, argparse.Namespace())
+    assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["ADMIN_PASSWORD"] == "old"
+    assert out["ADMIN_PASSWORD"] == "old"
+    # explicit --admin-password -> written into .env AND reflected in the returned env
+    out = tool._apply_cli_admin_overrides(p, {"ADMIN_PASSWORD": "old"},
+                                          argparse.Namespace(admin_password="New-Pass-1234"))
+    assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["ADMIN_PASSWORD"] == "New-Pass-1234"
+    assert out["ADMIN_PASSWORD"] == "New-Pass-1234"
+
+
+def test_apply_cli_admin_overrides_validates_password_like_fresh_path(tmp_path):
+    # The reuse override must run the SAME guard as the fresh path, or a value that corrupts .env
+    # quoting (a single quote) or is too weak reaches the seed and then a silent post-boot lockout.
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    p = str(tmp_path / ".env")
+    (tmp_path / ".env").write_text("ADMIN_PASSWORD='keep'\n", encoding="utf-8")
+    for bad in ("a'b-Str0ng-Pass", "short"):   # single quote (breaks quoting); too short
+        with pytest.raises(SystemExit):
+            tool._apply_cli_admin_overrides(p, {"ADMIN_PASSWORD": "keep"},
+                                            argparse.Namespace(admin_password=bad))
+        # rejected BEFORE any write -> the previous value is intact
+        assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["ADMIN_PASSWORD"] == "keep"
 
 
 def _write_target_set(tmp_path, prefix, did):
@@ -1477,13 +1621,24 @@ def test_backup_writes_env_600_and_manifest_without_secret(tmp_path, monkeypatch
 
 
 @pytest.mark.docker
-def test_backup_restore_round_trip_live(tmp_path):
+def test_backup_restore_round_trip_live(tmp_path, monkeypatch):
     if shutil.which("docker") is None:
         pytest.skip("docker not available")
-    prefix = "dvbaklive"
+    prefix = "dvbakreplace"
     cfg = dict(_reusable_env_cfg(), volume_prefix=prefix, deployment_id="live")
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    # Isolate the volume-REPLACE round trip from the stack lifecycle: restore now stops the stack
+    # before and starts it after, but this bare test dir has no compose file/Dockerfile, so stub the
+    # three lifecycle calls (each covered by its own test) and record that they ran in the right order.
+    calls = []
+    monkeypatch.setattr(tool, "_stop_stack", lambda: calls.append("stop"))
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: (calls.append("start"), True)[1])
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    # Isolate from the fixed-name liveness guard: this test drives only its own volumes with a stubbed
+    # lifecycle, so pretend no `vault-db` is up (a real one on the dev host is unrelated to this set).
+    # The guard itself is covered by test_restore_aborts_if_database_still_running_after_stop.
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
     names = dv.set_volume_names(prefix)
     vols = [names["pg"], names["storage"], names["keys"]]
 
@@ -1506,17 +1661,354 @@ def test_backup_restore_round_trip_live(tmp_path):
         assert len(bundles) == 1
         bundle = bundles[0]
         assert cfg["encryption_key"] not in (bundle / "manifest.json").read_text(encoding="utf-8")
-        # simulate a down -v: destroy the volumes, then restore
-        for v in vols:
-            run("docker", "volume", "rm", "-f", v)
-        assert not any(dv.volume_exists(v) for v in vols)
-        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=False))
+        # Change the live data AFTER the backup: delete the backed-up file, add a NEW one. A correct
+        # restore must REPLACE (bring the marker back, DROP the new file), not MERGE (which used to
+        # leave the post-backup file in place -- the "restored, saw the same files" bug).
+        run("docker", "run", "--rm", "-v", names["keys"] + ":/d", "busybox", "sh", "-c",
+            "rm -f /d/marker.txt && echo POST-BACKUP > /d/added_after.txt")
+        # The volumes exist now -> restore needs --force; non-interactive --force skips the typed confirm.
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=True))
         got = run("docker", "run", "--rm", "-v", names["keys"] + ":/d:ro", "busybox", "cat", "/d/marker.txt")
-        assert "SECRET-DATA-42" in got.stdout, "the restored volume must contain the original file"
+        assert "SECRET-DATA-42" in got.stdout, "restore must bring back the backed-up file"
+        leftover = run("docker", "run", "--rm", "-v", names["keys"] + ":/d:ro", "busybox",
+                       "sh", "-c", "ls /d/added_after.txt 2>&1 || echo GONE")
+        assert "GONE" in leftover.stdout, "restore must REPLACE not merge: the post-backup file must be gone"
+        assert calls and calls[0] == "stop" and "start" in calls, "restore must stop before and start after"
         assert (tmp_path / ".env").exists()          # the paired .env was installed
     finally:
         for v in vols:
             run("docker", "volume", "rm", "-f", v)
+
+
+@pytest.mark.docker
+def test_backup_lock_restore_round_trip_live(tmp_path, monkeypatch):
+    """A SEALED backup (--lock) round-trips: the bundle carries env.enc (no plaintext env), a wrong
+    passphrase fails WITHOUT touching the stack, and the correct passphrase restores the volumes AND
+    installs the unsealed .env. Recoverability is the whole point -- prove it on real volumes."""
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    if dv.load_fernet() is None:
+        pytest.skip("cryptography not installed")
+    prefix = "dvbaklock"
+    cfg = dict(_reusable_env_cfg(), volume_prefix=prefix, deployment_id="live")
+    env_text = "\n".join(dv.build_env_lines(cfg)) + "\n"
+    (tmp_path / ".env").write_text(env_text, encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(tool, "_stop_stack", lambda: calls.append("stop"))
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: (calls.append("start"), True)[1])
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
+    names = dv.set_volume_names(prefix)
+    vols = [names["pg"], names["storage"], names["keys"]]
+    pf = tmp_path / "pass.txt"
+    pf.write_text("seal-passphrase-live-1\n", encoding="utf-8")
+    wrong = tmp_path / "wrong.txt"
+    wrong.write_text("not-the-passphrase\n", encoding="utf-8")
+
+    def run(*a):
+        return subprocess.run(list(a), capture_output=True, text=True, timeout=90)
+    try:
+        try:
+            for v in vols:
+                run("docker", "volume", "create", v)
+            seed = run("docker", "run", "--rm", "-v", names["keys"] + ":/d", "busybox",
+                       "sh", "-c", "echo SEALED-DATA-7 > /d/marker.txt")
+            if seed.returncode != 0:
+                pytest.skip("docker run unavailable: %s" % seed.stderr[:120])
+        except (subprocess.SubprocessError, OSError) as exc:
+            pytest.skip("docker unavailable: %s" % exc)
+        backup_dir = tmp_path / "backups"
+        tool._do_backup(dv.parse_env(env_text), argparse.Namespace(
+            non_interactive=True, backup_dir=str(backup_dir), lock=True,
+            passphrase_file=str(pf), passphrase_stdin=False, hint=None, recovery_out=None))
+        bundle = list(backup_dir.glob("dockvault-%s-*" % prefix))[0]
+        assert (bundle / "env.enc").exists(), "a sealed backup carries env.enc"
+        assert not (bundle / "env").exists(), "a sealed backup has NO plaintext env"
+
+        # Wrong passphrase must fail BEFORE the stack is touched (no 'stop' recorded).
+        with pytest.raises(SystemExit):
+            tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle),
+                             force=True, passphrase_file=str(wrong), passphrase_stdin=False,
+                             use_recovery_key=False, recovery_key_file=None))
+        assert "stop" not in calls, "a wrong passphrase must not stop/touch the deployment"
+
+        # Change the live data, then restore with the correct passphrase: REPLACE + unseal the .env.
+        run("docker", "run", "--rm", "-v", names["keys"] + ":/d", "busybox", "sh", "-c",
+            "rm -f /d/marker.txt && echo POST > /d/added_after.txt")
+        # Perturb the on-host .env so the final assertion proves the restore actually re-wrote it from
+        # the UNSEALED bundle (not that it was merely left unchanged from setup).
+        (tmp_path / ".env").write_text("STALE_BEFORE_RESTORE=1\n", encoding="utf-8")
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=True,
+                         passphrase_file=str(pf), passphrase_stdin=False, use_recovery_key=False,
+                         recovery_key_file=None))
+        got = run("docker", "run", "--rm", "-v", names["keys"] + ":/d:ro", "busybox", "cat", "/d/marker.txt")
+        assert "SEALED-DATA-7" in got.stdout, "restore of a sealed backup brings back the data"
+        leftover = run("docker", "run", "--rm", "-v", names["keys"] + ":/d:ro", "busybox",
+                       "sh", "-c", "ls /d/added_after.txt 2>&1 || echo GONE")
+        assert "GONE" in leftover.stdout, "sealed restore REPLACES, not merges"
+        assert calls and calls[0] == "stop" and "start" in calls
+        assert (tmp_path / ".env").read_text(encoding="utf-8") == env_text, "the unsealed .env is installed"
+    finally:
+        for v in vols:
+            run("docker", "volume", "rm", "-f", v)
+
+
+def test_restore_stops_before_replacing_and_starts_after(tmp_path, monkeypatch):
+    # No docker: prove _do_restore STOPS the stack before it clears/extracts a volume and STARTS +
+    # health-checks after, in that order -- the fix for extracting pg_data under a live Postgres
+    # (which never took effect and risked corruption).
+    cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-ord", deployment_id="ord")
+    entries = [{"role": "pg", "name": "dockvault-vault-ord_vault_pg_data", "archive": "vault_pg_data.tar.gz"}]
+    bundle = _write_bundle(tmp_path, cfg, entries, name="bord")
+    (bundle / "vault_pg_data.tar.gz").write_bytes(b"dummy")     # pre-flight archive-existence check
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    order = []
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: False)          # no clobber gate
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)      # nothing live to stop
+    monkeypatch.setattr(dv, "clear_volume", lambda vol, **k: order.append("clear") or True)
+    monkeypatch.setattr(dv, "untar_volume", lambda vol, *a, **k: order.append("untar") or True)
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    monkeypatch.setattr(dv, "_copy_secret", lambda *a, **k: None)
+    monkeypatch.setattr(dv, "tighten_secret_file", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_stop_stack", lambda: order.append("stop"))
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: (order.append("start"), True)[1])
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=False))
+    assert order.index("stop") < order.index("clear") < order.index("untar") < order.index("start"), order
+
+
+def test_restore_interactive_over_existing_requires_typed_confirm(tmp_path, monkeypatch):
+    # An interactive restore OVER existing volumes must be gated by a typed set-name confirm; a wrong
+    # answer cancels before anything is stopped, cleared or extracted.
+    cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-cfm", deployment_id="cfm")
+    entries = [{"role": "pg", "name": "dockvault-vault-cfm_vault_pg_data", "archive": "vault_pg_data.tar.gz"}]
+    bundle = _write_bundle(tmp_path, cfg, entries, name="bcfm")
+    (bundle / "vault_pg_data.tar.gz").write_bytes(b"dummy")
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    touched = []
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)           # over-existing
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: "not-the-set")              # wrong confirmation
+    monkeypatch.setattr(dv, "clear_volume", lambda *a, **k: touched.append("clear") or True)
+    monkeypatch.setattr(dv, "untar_volume", lambda *a, **k: touched.append("untar") or True)
+    monkeypatch.setattr(tool, "_stop_stack", lambda: touched.append("stop"))
+    # interactive (no non_interactive) + force so it clears the clobber gate and reaches the confirm.
+    tool._do_restore(argparse.Namespace(bundle_dir=str(bundle), force=True))
+    assert touched == [], "a wrong typed confirm must cancel before stopping/clearing/extracting"
+
+
+def test_restore_aborts_if_database_still_running_after_stop(tmp_path, monkeypatch):
+    # If the stop failed/timed out and the database is still up, restore must ABORT before clearing
+    # any volume - never wipe pg_data out from under a live Postgres.
+    cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-live", deployment_id="live")
+    entries = [{"role": "pg", "name": "dockvault-vault-live_vault_pg_data", "archive": "vault_pg_data.tar.gz"}]
+    bundle = _write_bundle(tmp_path, cfg, entries, name="blive")
+    (bundle / "vault_pg_data.tar.gz").write_bytes(b"dummy")
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    touched = []
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: False)          # no clobber gate
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: True)       # DB stays up after stop
+    monkeypatch.setattr(dv, "clear_volume", lambda *a, **k: touched.append("clear") or True)
+    monkeypatch.setattr(dv, "untar_volume", lambda *a, **k: touched.append("untar") or True)
+    monkeypatch.setattr(tool, "_stop_stack", lambda: touched.append("stop"))
+    with pytest.raises(SystemExit):
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=False))
+    assert "clear" not in touched and "untar" not in touched, "must not wipe a volume under a live DB"
+
+
+# --- backup directory resolution ---------------------------------------------------------
+def test_parse_backup_dirs_single_list_and_blanks():
+    assert dv.parse_backup_dirs(None) == [] and dv.parse_backup_dirs("") == []
+    assert dv.parse_backup_dirs("/a/b") == ["/a/b"]
+    assert dv.parse_backup_dirs(os.pathsep.join(["/a", " /b ", ""])) == ["/a", "/b"]   # list + blanks
+    assert dv.parse_backup_dirs("/a\n/b") == ["/a", "/b"]                              # newline-separated
+    expanded = dv.parse_backup_dirs("~/x")[0]                                          # ~ is expanded
+    assert "~" not in expanded and expanded.startswith(os.path.expanduser("~"))
+
+
+def test_app_data_backup_root_per_platform(monkeypatch):
+    home = os.path.expanduser("~")
+    monkeypatch.setattr(dv.os, "name", "nt")
+    monkeypatch.setenv("LOCALAPPDATA", os.path.join("C:", "Local"))
+    assert dv._app_data_backup_root() == os.path.join("C:", "Local", "DockVault", "backups")
+    monkeypatch.setattr(dv.os, "name", "posix")
+    monkeypatch.setattr(dv.sys, "platform", "darwin")
+    assert dv._app_data_backup_root() == os.path.join(home, "Library", "Application Support", "DockVault", "backups")
+    monkeypatch.setattr(dv.sys, "platform", "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", os.path.join("/", "xdg"))
+    assert dv._app_data_backup_root() == os.path.join("/", "xdg", "DockVault", "backups")
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    assert dv._app_data_backup_root() == os.path.join(home, ".local", "share", "DockVault", "backups")
+
+
+def test_default_backup_dir_precedence_and_fallback(tmp_path, monkeypatch):
+    good = tmp_path / "envdir"; good.mkdir()
+    (tmp_path / "nope").write_text("iamafile", encoding="utf-8")     # a FILE, so <file>/x is unwritable
+    monkeypatch.setenv("DOCKVAULT_BACKUP_DIR", os.pathsep.join([str(tmp_path / "nope" / "x"), str(good)]))
+    assert dv.default_backup_dir() == str(good)                       # first WRITABLE of the env list
+    monkeypatch.delenv("DOCKVAULT_BACKUP_DIR", raising=False)
+    appdir = tmp_path / "appdata"
+    monkeypatch.setattr(dv, "_app_data_backup_root", lambda: str(appdir))
+    assert dv.default_backup_dir() == str(appdir) and appdir.is_dir()  # falls to the per-OS app-data dir
+
+
+def test_backup_root_explicit_list_picks_first_writable(tmp_path):
+    (tmp_path / "b1file").write_text("x", encoding="utf-8")           # a FILE -> <file>/sub unwritable
+    good = tmp_path / "b2"
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    args = argparse.Namespace(backup_dir=os.pathsep.join([str(tmp_path / "b1file" / "sub"), str(good)]))
+    assert tool._backup_root(args) == str(good) and good.is_dir()
+
+
+def test_backup_search_roots_includes_legacy(tmp_path, monkeypatch):
+    monkeypatch.delenv("DOCKVAULT_BACKUP_DIR", raising=False)
+    legacy = tmp_path / "backups"; legacy.mkdir()                     # the historical <root>/backups
+    appdir = tmp_path / "app"; appdir.mkdir()
+    monkeypatch.setattr(dv, "_app_data_backup_root", lambda: str(appdir))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    roots = tool._backup_search_roots(argparse.Namespace(backup_dir=None))
+    assert os.path.abspath(str(legacy)) in roots, "the legacy <root>/backups must always be searched"
+    assert os.path.abspath(str(appdir)) in roots
+
+
+def test_list_bundles_newest_first_and_legacy_not_orphaned(tmp_path, monkeypatch):
+    monkeypatch.delenv("DOCKVAULT_BACKUP_DIR", raising=False)
+    r1 = tmp_path / "loc1"; r1.mkdir()
+    legacy = tmp_path / "backups"; legacy.mkdir()
+    monkeypatch.setattr(dv, "_app_data_backup_root", lambda: str(r1))
+    older = legacy / "dockvault-set-20260101-000000"; older.mkdir()
+    newer = r1 / "dockvault-set-20260102-000000"; newer.mkdir()
+    os.utime(older, (1000, 1000)); os.utime(newer, (2000, 2000))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    got = tool._list_bundles(argparse.Namespace(backup_dir=None))
+    assert got and got[0] == os.path.abspath(str(newer)), "newest bundle must be listed first"
+    assert os.path.abspath(str(older)) in got, "a bundle in the legacy dir must not be orphaned"
+
+
+def test_list_backups_shows_candidates_without_creating(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("DOCKVAULT_BACKUP_DIR", raising=False)
+    appdir = tmp_path / "app"            # deliberately NOT pre-created
+    monkeypatch.setattr(dv, "_app_data_backup_root", lambda: str(appdir))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    tool._list_backups(argparse.Namespace(backup_dir=None))
+    out = capsys.readouterr().out
+    assert str(appdir) in out                                   # the write candidate is shown
+    assert not appdir.exists(), "listing must NOT create the backup directory (it is read-only)"
+
+
+# --- stop / down / lock secret-hygiene ----------------------------------------------------
+def _dc_recorder(calls):
+    return lambda *a, **k: (calls.append(a), type("R", (), {"returncode": 0})())[1]
+
+
+def test_stop_keeps_containers_via_compose_stop(tmp_path, monkeypatch, capsys):
+    # Docker-aligned: `stop` keeps the (stopped) containers -> `compose stop`, and warns loudly that
+    # their secrets remain in Docker's on-disk config until `down` removes them.
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    calls = []
+    monkeypatch.setattr(tool, "_run_dc", _dc_recorder(calls))
+    tool.stop(argparse.Namespace())
+    assert calls and calls[0][0] == "stop" and "down" not in calls[0], "stop must keep containers (compose stop)"
+    assert "run 'down'" in capsys.readouterr().out, "stop must point at 'down' to clear the config secrets"
+
+
+def test_down_removes_containers_and_never_passes_v(tmp_path, monkeypatch):
+    # Docker-aligned: `down` runs `compose down` (removing the containers clears their secrets from
+    # Docker's on-disk config) and MUST NEVER pass -v (data volumes must survive). --yes bypasses confirm.
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    calls = []
+    monkeypatch.setattr(tool, "_run_dc", _dc_recorder(calls))
+    tool.down(argparse.Namespace(lock=False, yes=True))
+    assert calls and calls[0][0] == "down", "down must run `compose down`"
+    assert "-v" not in calls[0], "down must NEVER pass -v"
+
+
+def test_down_confirms_and_a_declined_prompt_removes_nothing(tmp_path, monkeypatch, capsys):
+    # Without --yes, `down` asks first; a declined answer removes nothing and seals nothing.
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    calls = []
+    monkeypatch.setattr(tool, "_run_dc", _dc_recorder(calls))
+    monkeypatch.setattr(dv, "confirm", lambda *a, **k: False)        # operator declines
+    locked = []
+    monkeypatch.setattr(tool, "lock", lambda args=None: locked.append(True))
+    tool.down(argparse.Namespace(lock=True, yes=False))
+    assert calls == [], "a declined confirm must remove nothing"
+    assert locked == [], "a declined down must not seal .env either"
+    assert "Cancelled" in capsys.readouterr().out
+
+
+def test_down_non_interactive_without_yes_refuses(tmp_path, monkeypatch):
+    # Automation must be explicit: a --non-interactive run without --yes removes nothing.
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    calls = []
+    monkeypatch.setattr(tool, "_run_dc", _dc_recorder(calls))
+    tool.down(argparse.Namespace(lock=False, yes=False, non_interactive=True))
+    assert calls == [], "non-interactive without --yes must not remove containers"
+
+
+def test_down_removal_confirm_defaults_to_no(tmp_path, monkeypatch):
+    # The reachable automation path is a bare `down` with a piped/closed stdin, where confirm() returns
+    # its DEFAULT. That default must be NO, so a script that forgot --yes does not silently remove the
+    # containers. (This is the path the real argparse can emit -- `down` has no --non-interactive flag.)
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    calls = []
+    monkeypatch.setattr(tool, "_run_dc", _dc_recorder(calls))
+    seen = {}
+
+    def _confirm_returns_default(prompt, pal, default=True):
+        seen["default"] = default
+        return default                      # emulate a piped/EOF stdin (confirm returns its default)
+
+    monkeypatch.setattr(dv, "confirm", _confirm_returns_default)
+    tool.down(argparse.Namespace(lock=False, yes=False))
+    assert seen.get("default") is False, "the removal confirm must default to NO"
+    assert calls == [], "a piped/EOF stdin (default no) must not remove containers"
+
+
+def test_only_down_lock_seals_env(tmp_path, monkeypatch):
+    # --lock lives on `down` only (down --lock removes containers AND seals .env). `stop` never seals.
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    monkeypatch.setattr(tool, "_run_dc", _dc_recorder([]))
+    locked = []
+    monkeypatch.setattr(tool, "lock", lambda args=None: locked.append(True))
+    tool.down(argparse.Namespace(lock=True, yes=True))
+    assert locked == [True], "down --lock must seal .env after removing the containers"
+
+
+def test_status_warns_when_locked_but_container_exists(tmp_path, monkeypatch, capsys):
+    # LOCKED (.env absent) but a container still exists -> warn the secrets remain in Docker's config.
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_is_locked", lambda: True)
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    monkeypatch.setattr(dv, "container_exists", lambda name, **k: True)
+    tool._print_status("combined")            # tmp_path has no .env -> the locked branch
+    out = capsys.readouterr().out
+    assert "STILL in Docker" in out, "status must warn that a lingering container still holds the secrets"
+
+
+def test_status_no_warning_when_locked_and_no_container(tmp_path, monkeypatch, capsys):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_is_locked", lambda: True)
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    monkeypatch.setattr(dv, "container_exists", lambda name, **k: False)
+    tool._print_status("combined")
+    assert "STILL in Docker" not in capsys.readouterr().out
 
 
 # --- update + logs helpers ----------------------------------------------------------------
@@ -2806,3 +3298,19 @@ def test_zero_is_refused_because_it_would_mean_the_opposite(tmp_path, monkeypatc
         tool.storage(argparse.Namespace(set_gb=0, non_interactive=True, no_restart=True))
     assert (tmp_path / ".env").read_text(encoding="utf-8") == before
     assert "no ceiling" in dv.storage_limit_problem(0, 0)
+
+
+# --- at-rest host disk-encryption advisory + docs ----------------------------------------
+def test_setup_summary_advises_host_disk_encryption(capsys):
+    tool = dv.DockVault(dv.Palette(False))
+    tool._print_setup_summary({"server_name": "vault.example", "web_host_port": 443,
+                               "admin_username": "admin"}, healthy=True)
+    out = capsys.readouterr().out
+    assert "ENCRYPT THE HOST DISK" in out and "at-rest control" in out
+
+
+def test_docs_document_host_fde_prerequisite_and_zk_metadata_nongoal():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8").lower()
+    assert "full-disk encryption" in readme and "prerequisite" in readme
+    zk = (ROOT / "docs" / "design" / "vault-zk-envelope-v2.md").read_text(encoding="utf-8").lower()
+    assert "non-goal" in zk and "metadata" in zk

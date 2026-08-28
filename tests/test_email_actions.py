@@ -44,6 +44,8 @@ def _clean(admin):
             admin.put(f"/email/actions/{a['key']}",
                       json={"template_id": None, "enabled": (a["category"] == "system")})
         for t in admin.get("/email/templates").json().get("templates", []):
+            if t.get("is_default"):
+                continue                       # built-in defaults are permanent (undeletable)
             admin.delete(f"/email/templates/{t['id']}")
         # also drop any (Mailpit) profile a send test created, so a leftover default profile doesn't
         # make _smtp_configured true for the email-change tests that expect no SMTP.
@@ -66,8 +68,12 @@ def test_seed_catalog_is_present_and_shaped(admin):
         assert a["enabled"] is True                 # system actions are always on
     opt = acts[_OPTIONAL_SAMPLE]
     assert opt["category"] == "optional" and opt["enabled"] is False   # opt-in, off by default
-    # seeded without a DB template (built-in default body) so the user template grid stays empty
-    assert admin.get("/email/templates").json()["templates"] == []
+    # Every action ships with a built-in DEFAULT template (seeded as a real row, is_default + permanent).
+    # There is one default per action and nothing else after _clean (which drops user templates only).
+    from app.core.email_actions import ACTION_CATALOG
+    tpls = admin.get("/email/templates").json()["templates"]
+    assert all(t["is_default"] for t in tpls), "only built-in defaults should remain after _clean"
+    assert {t["default_key"] for t in tpls} == {a["key"] for a in ACTION_CATALOG}   # one per action
 
 
 def test_seed_created_exactly_the_catalog_no_duplicates(admin):
@@ -93,6 +99,29 @@ def test_bind_template_and_toggle_optional_action(admin):
         assert body["template"]["name"] == t["name"]
         # turn it back off
         assert admin.put(f"/email/actions/{_OPTIONAL_SAMPLE}", json={"enabled": False}).json()["enabled"] is False
+    finally:
+        admin.put(f"/email/actions/{_OPTIONAL_SAMPLE}", json={"template_id": None, "enabled": False})
+        admin.delete(f"/email/templates/{t['id']}")
+
+
+def test_optional_action_cannot_be_enabled_without_a_template(admin):
+    # unbound (the _clean baseline) -> enabling is refused with a clear message
+    admin.put(f"/email/actions/{_OPTIONAL_SAMPLE}", json={"template_id": None, "enabled": False})
+    r = admin.put(f"/email/actions/{_OPTIONAL_SAMPLE}", json={"enabled": True})
+    assert r.status_code == 400 and "template" in r.json()["detail"].lower()
+    assert _actions(admin)[_OPTIONAL_SAMPLE]["enabled"] is False        # still off
+
+
+def test_unbinding_an_enabled_optional_action_forces_it_off(admin):
+    t = _new_template(admin)
+    try:
+        # bind + enable in one request works (template present)
+        r = admin.put(f"/email/actions/{_OPTIONAL_SAMPLE}", json={"template_id": t["id"], "enabled": True})
+        assert r.status_code == 200 and r.json()["enabled"] is True
+        # set the template back to "none" -> the action can no longer send, so it is forced off
+        r2 = admin.put(f"/email/actions/{_OPTIONAL_SAMPLE}", json={"template_id": None})
+        assert r2.status_code == 200
+        assert r2.json()["template_id"] is None and r2.json()["enabled"] is False
     finally:
         admin.put(f"/email/actions/{_OPTIONAL_SAMPLE}", json={"template_id": None, "enabled": False})
         admin.delete(f"/email/templates/{t['id']}")
@@ -203,3 +232,53 @@ def test_disabled_optional_action_test_send_force_delivers(admin):
         if not seen:
             time.sleep(0.5)
     assert seen, "the forced test send of a disabled optional action was not delivered"
+
+
+def _mailpit_wait_for(to, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for m in requests.get(f"{MAILPIT_URL}/api/v1/messages", timeout=10).json().get("messages", []):
+            if to in [a.get("Address", "").lower() for a in m.get("To", [])]:
+                full = requests.get(f"{MAILPIT_URL}/api/v1/message/{m['ID']}", timeout=10).json()
+                return m, full
+        time.sleep(0.5)
+    return None, None
+
+
+@_mailpit
+def test_test_send_to_a_picked_user_is_marked_and_delivered(admin):
+    # A test send addressed to a USER resolves that user's own email server-side and is clearly marked
+    # (subject prefix + footer) so it can't be mistaken for a real notification.
+    requests.delete(f"{MAILPIT_URL}/api/v1/messages", timeout=10)
+    for p in admin.get("/email/profiles").json()["profiles"]:
+        admin.delete(f"/email/profiles/{p['id']}")
+    admin.post("/email/profiles", json={"name": "MP", "smtp_server": MAILPIT_SMTP_HOST,
+                                        "smtp_port": int(MAILPIT_SMTP_PORT), "smtp_username": "",
+                                        "from_email": "sender@example.com", "is_default": True})
+    email = f"picked-{unique('u')}@example.com"
+    u = admin.create_user(email=email)
+    try:
+        r = admin.post("/email/actions/account_welcome/test", json={"to_user_id": u["id"]})
+        assert r.status_code == 200, r.text
+        m, full = _mailpit_wait_for(email.lower())
+        assert m is not None, "the test email never reached the picked user's address"
+        assert (m.get("Subject") or "").startswith("[Test] ")                 # marked in the subject
+        assert "This is a test email" in (full.get("HTML", "") + full.get("Text", ""))   # footer marker
+    finally:
+        admin.delete_user(u["id"])
+
+
+def test_test_send_to_a_user_without_email_is_rejected(admin):
+    # Resolving a picked user with no address on file fails cleanly (no send attempted).
+    u = admin.create_user(email=None)
+    try:
+        r = admin.post("/email/actions/account_welcome/test", json={"to_user_id": u["id"]})
+        assert r.status_code == 400 and "email" in r.json()["detail"].lower()
+    finally:
+        admin.delete_user(u["id"])
+
+
+def test_test_send_to_unknown_user_is_rejected(admin):
+    r = admin.post("/email/actions/account_welcome/test",
+                   json={"to_user_id": "11111111-1111-1111-1111-111111111111"})
+    assert r.status_code == 400 and "not found" in r.json()["detail"].lower()

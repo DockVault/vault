@@ -21,6 +21,14 @@ logger = logging.getLogger(__name__)
 # run yet, so the first eligible cleanup always runs.
 _last_audit_cleanup_at = None
 
+# At-rest privacy: these keys hold plaintext names that are ENCRYPTED in the files/folders/vaults
+# tables (and, for a zero-knowledge vault, the residual plaintext label), so they must never be
+# persisted in an audit row's `details` JSON. log_action() strips them on every write, and the boot
+# migration app/core/audit_migrations.py purges them from legacy rows -- both read THIS ONE list, so
+# adding a key here covers both surfaces at once. Any code that constructs an AuditLog directly
+# (bypassing log_action) must not put one of these keys in `details`.
+REDACTED_NAME_KEYS = ("file_name", "folder_name", "old_name", "new_name", "vault_name")
+
 
 class AuditLogger:
     """Service for audit logging."""
@@ -82,9 +90,13 @@ class AuditLogger:
         if isinstance(details, dict):
             # old_name/new_name are the rename before/after names — just as sensitive as file_name,
             # so redact them too (they otherwise persist in cleartext for Standard-vault renames).
-            _name_keys = ("file_name", "folder_name", "old_name", "new_name")
-            if any(k in details for k in _name_keys):
-                details = {k: v for k, v in details.items() if k not in _name_keys}
+            # vault_name is redacted for the same reason: resource_id already identifies the vault by
+            # UUID, and for a zero-knowledge vault the name is the residual plaintext label. The
+            # transient SSE/monitor broadcast keeps the name because this redacts a COPY (below).
+            # The key set is the module-level REDACTED_NAME_KEYS so the boot purge migration stays in
+            # lockstep with what is redacted on write.
+            if any(k in details for k in REDACTED_NAME_KEYS):
+                details = {k: v for k, v in details.items() if k not in REDACTED_NAME_KEYS}
 
         audit_log = AuditLog(
             user_id=user_id,

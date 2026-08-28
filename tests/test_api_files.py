@@ -4,9 +4,22 @@ Upload contract: multipart form-data, field name ``files`` (repeatable),
 optional ``folder_id`` query param, optional ``X-Vault-Password`` header.
 """
 import os
+import re
+import subprocess
 from datetime import datetime
 
+import pytest
+
 from conftest import unique
+
+_DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
+_OCTET = {"Content-Type": "application/octet-stream"}
+
+
+def _psql(sql):
+    return subprocess.run(
+        ["docker", "exec", _DB_CONTAINER, "psql", "-U", "sftp_user", "-d", "sftp_db", "-c", sql],
+        capture_output=True, text=True, timeout=20)
 
 
 def _upload(client, vault_id, name, content, folder_id=None, password=None):
@@ -14,6 +27,55 @@ def _upload(client, vault_id, name, content, folder_id=None, password=None):
     params = {"folder_id": folder_id} if folder_id else None
     headers = {"X-Vault-Password": password} if password else None
     return client.post(f"/vaults/{vault_id}/files", files=files, params=params, headers=headers)
+
+
+def test_upload_rejects_nul_byte_in_filename(admin, temp_vault):
+    # A NUL byte cannot be stored (the DB driver rejects "\x00" in a string literal) and used to
+    # surface as an opaque 500; it must be a clean 400. No legitimate filename contains a NUL.
+    r = _upload(admin, temp_vault["id"], "bad\x00name.txt", b"x")
+    assert r.status_code == 400, r.text
+
+
+def test_download_content_disposition_strips_forward_slash(admin, temp_vault):
+    # The Content-Disposition ASCII fallback stripped backslashes but kept forward slashes; a
+    # non-browser client honouring the header literally could see a path separator. Both must be gone.
+    vid = temp_vault["id"]
+    r = _upload(admin, vid, "a/b/c.txt", b"hello")
+    assert r.status_code == 200, r.text
+    fid = r.json()["files"][0]["id"]
+    d = admin.get(f"/vaults/{vid}/files/{fid}/download")
+    assert d.status_code == 200
+    cd = d.headers.get("Content-Disposition", "")
+    m = re.search(r'filename="([^"]*)"', cd)
+    assert m and "/" not in m.group(1) and "\\" not in m.group(1), cd
+    # RFC 6266 clients PREFER filename*, and %2F decodes back to '/', so the separator must be gone
+    # from the DECODED filename* value too -- not merely percent-encoded.
+    from urllib.parse import unquote
+    m2 = re.search(r"filename\*=UTF-8''(\S+)", cd)
+    assert m2, cd
+    decoded = unquote(m2.group(1))
+    assert "/" not in decoded and "\\" not in decoded, cd
+
+
+def test_completion_of_an_unreadable_sealed_session_is_409_not_500(admin, temp_vault):
+    # A Standard session whose sealed name cannot be decrypted (e.g. it was sealed by a newer image
+    # and the deployment was rolled back) leaves filename NULL; completing it used to fail as an
+    # opaque 500. It must be a named 409. Simulate by corrupting enc_name so the decrypt event fails
+    # and the plaintext name cannot be recovered.
+    vid = temp_vault["id"]
+    name = unique("orphan") + ".bin"
+    data = b"z" * 64
+    r = admin.post(f"/vaults/{vid}/uploads", json={
+        "file_name": name, "total_size": len(data), "total_chunks": 1,
+        "chunk_size": len(data), "mime_type": "application/octet-stream"})
+    assert r.status_code == 200, r.text
+    sid = r.json()["session_id"]
+    assert admin.put(f"/vaults/{vid}/uploads/{sid}/chunks/0", data=data, headers=_OCTET).status_code == 200
+    up = _psql(f"UPDATE chunked_upload_sessions SET enc_name='not-a-decryptable-blob' WHERE id='{sid}'")
+    if up.returncode != 0:
+        pytest.skip(f"psql unavailable: {up.stderr[:200]}")
+    c = admin.post(f"/vaults/{vid}/uploads/{sid}/complete")
+    assert c.status_code == 409, c.text
 
 
 def test_upload_list_download_roundtrip(admin, temp_vault):

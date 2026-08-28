@@ -317,7 +317,9 @@ class TemporaryCredential(Base):
     
     temp_username = Column(String(255), unique=True, nullable=False, index=True)
     credential_hash = Column(String(255), nullable=False)  # Bcrypt hash for SFTP authentication
-    encrypted_password = Column(Text, nullable=True)  # DEPRECATED - No longer used (security enhancement)
+    # NOTE: the removed `encrypted_password` column stored a retrievable copy of the temp password.
+    # It has been unused (always NULL) since the password became show-once-at-creation; the boot DDL
+    # drops it (ALTER TABLE ... DROP COLUMN IF EXISTS encrypted_password). See docs/upgrade-matrix.json.
     password_shown = Column(Boolean, default=True)  # Tracks if user viewed password at creation
     
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -563,9 +565,26 @@ class Vault(Base):
     __tablename__ = 'vaults'
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name = Column(String(255), nullable=False)
+    # Nullable: STANDARD vaults store the name encrypted at rest (enc_name) with this column NULL;
+    # the load/refresh event decrypts it back into `name` so every read site is unchanged. Legacy
+    # (not-yet-backfilled) and zero-knowledge vaults still carry the plaintext here.
+    name = Column(String(255), nullable=True)
+    # Sealed vault name at rest. Standard: an AES-GCM blob the server seals/decrypts (per-vault key),
+    # with `name` NULL. Zero-knowledge: a browser-sealed blob (zk2: marker) the server stores but
+    # cannot read -- for a ZK vault, `name` instead holds the user's chosen NON-SECRET label (shown
+    # while locked), and the browser decrypts enc_name to the real name once unlocked.
+    enc_name = Column(Text, nullable=True)
+    # Zero-knowledge only: the browser-sealed vault DESCRIPTION (zk2: marker). The server stores it
+    # and never reads it; `description` stays NULL for a ZK vault. Standard vaults keep the plaintext
+    # in `description` and leave this NULL.
+    enc_description = Column(Text, nullable=True)
+    # Zero-knowledge only: the DEK epoch the browser sealed enc_name/enc_description under (mirrors
+    # Folder.name_key_version -- a vault name, like a folder name, has no CONTENT epoch of its own).
+    # retire-version counts this so the name's epoch is never dropped out from under it. NULL/absent
+    # means epoch 1 (how the first sealed build wrote it, and what a fresh read defaults to).
+    name_key_version = Column(Integer, nullable=True)
     description = Column(Text, nullable=True)
-    
+
     owner_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
     
     # Password protection (hashed)
@@ -800,10 +819,24 @@ class File(Base):
     # File metadata
     size_bytes = Column(BigInteger, nullable=False)
     mime_type = Column(String(255), nullable=True)
-    checksum_sha256 = Column(String(64), nullable=False)  # For integrity verification
+    # For integrity verification (internal, never exposed). Nullable because it is sealed at rest into
+    # enc_checksum (the plaintext column is NULLed; the load event restores it in-memory), so a fresh
+    # sealed row stores NULL here.
+    checksum_sha256 = Column(String(64), nullable=True)
+    # AES-GCM seal of the content checksum (per-file key). The plaintext checksum is a SHA-256 of the
+    # content -- a weak confirmation oracle for a DB/backup reader -- so it is sealed at rest like the
+    # file name. Server-computed for EVERY file (ZK + Standard), so unlike enc_name it is never a
+    # browser blob and the load event always decrypts it.
+    enc_checksum = Column(Text, nullable=True)
+    # Keyed MAC over the content (HMAC of checksum_sha256 under a per-file key) used as the ETag,
+    # so the plaintext checksum is never handed to a client. NULL on rows written before this
+    # column: the value is deterministic from (id, checksum_sha256), so it is derived on read.
+    content_mac = Column(String(64), nullable=True)
 
     # Storage information
-    storage_path = Column(String(512), nullable=False)  # Encrypted file path
+    # Cleartext at rest: the on-disk blob is named purely by the file UUID (no name, no
+    # extension). The human name/extension live only in the sealed enc_name/enc_mime below.
+    storage_path = Column(String(512), nullable=False)
     is_encrypted = Column(Boolean, default=True)
     encryption_metadata = Column(JSON, nullable=True)  # Store encryption details
 
@@ -868,11 +901,25 @@ from sqlalchemy.orm import attributes as _sa_attributes
 
 
 def _decrypt_file_names(target, *_args):
+    from app.core.security import decrypt_object_field, is_zk_sealed_name
+    # The content checksum is sealed at rest for EVERY file (server-computed, never a ZK browser blob),
+    # so decrypt it FIRST -- before the name/MIME logic and its ZK early-return, and independently of
+    # whether this file has a sealed name. The ETag/MAC derivation and the integrity read the plaintext.
+    enc_checksum = getattr(target, 'enc_checksum', None)
+    if enc_checksum:
+        try:
+            _sa_attributes.set_committed_value(
+                target, 'checksum_sha256',
+                decrypt_object_field(target.vault_id, target.id, enc_checksum, 'checksum'))
+        except Exception:  # noqa: BLE001 — never let a decrypt error break a load
+            # checksum_sha256 is left None, so the download integrity verifier fails CLOSED (it cannot
+            # confirm the streamed bytes). Intentional: the startup key canary already refuses to boot
+            # on a wrong ENCRYPTION_KEY, so this only bites isolated enc_checksum corruption.
+            print(f"⚠ file checksum decrypt failed for {getattr(target, 'id', None)}")
     enc_name = getattr(target, 'enc_name', None)
     enc_mime = getattr(target, 'enc_mime', None)
     if not enc_name and not enc_mime:
         return
-    from app.core.security import decrypt_object_field, is_zk_sealed_name
     # Zero-knowledge names are encrypted client-side under the vault DEK; the server has
     # no key and MUST leave them opaque (plaintext columns stay NULL — the browser
     # decrypts). Detect by the ZK marker so we never spam decrypt failures or, worse,
@@ -917,10 +964,32 @@ def _decrypt_folder_name(target, *_args):
         print(f"⚠ folder name decrypt failed for {getattr(target, 'id', None)}")
 
 
+def _decrypt_vault_fields(target, *_args):
+    from app.core.security import decrypt_object_field, is_zk_sealed_name
+    # Standard vaults seal both name and description at rest server-side; a ZK vault's enc_name /
+    # enc_description are browser-encrypted under the vault DEK (zk2:) and MUST be left opaque — the
+    # plaintext `name`/`description` columns stay whatever they held (a label / NULL), and the browser
+    # decrypts. A decrypt error (wrong/rotated ENCRYPTION_KEY) leaves the column as-is, never blanked.
+    for _field, _col in (('name', 'enc_name'), ('description', 'enc_description')):
+        _blob = getattr(target, _col, None)
+        if not _blob or is_zk_sealed_name(_blob):
+            continue
+        try:
+            # Keyed per-vault: a vault is its own scope, so (vault_id, obj_id) is (id, id).
+            _sa_attributes.set_committed_value(
+                target, _field,
+                decrypt_object_field(target.id, target.id, _blob, _field))
+        except Exception:  # noqa: BLE001 — never let a decrypt error break a load (SFTP dir name guard)
+            # Log the id (never the plaintext); the value is left as-is rather than blanked.
+            print(f"⚠ vault {_field} decrypt failed for {getattr(target, 'id', None)}")
+
+
 _sa_event.listen(File, 'load', _decrypt_file_names)
 _sa_event.listen(File, 'refresh', _decrypt_file_names)
 _sa_event.listen(Folder, 'load', _decrypt_folder_name)
 _sa_event.listen(Folder, 'refresh', _decrypt_folder_name)
+_sa_event.listen(Vault, 'load', _decrypt_vault_fields)
+_sa_event.listen(Vault, 'refresh', _decrypt_vault_fields)
 
 
 # --- Cross-vault-move guard (at-rest AAD integrity) -------------------------
@@ -1109,6 +1178,36 @@ class EmailChangeCode(Base):
     )
 
 
+class OtpCode(Base):
+    """Durable fallback store for the generalized one-time-code (OTP) service.
+
+    OTPs live in Redis first (fast, auto-expiring); a row is written here only when Redis is
+    unavailable at issue time, and verify consults both stores. A row is bound to one (purpose,
+    user_id) — a new issue for that pair invalidates any prior row — and carries the action's
+    destination (e.g. a pending new email) so a code can't be redeemed for a different target. Only a
+    peppered HMAC-SHA256 hash of the code is stored, never the plaintext. Single-use (consumed_at) with
+    a 3-strike attempt counter. A WHOLE NEW TABLE — created by create_all(), so it needs no
+    lightweight-migration entry (create_all builds it on already-deployed vaults). This supersedes
+    email_change_codes (kept for now, but no longer written)."""
+    __tablename__ = 'otp_codes'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    purpose = Column(String(64), nullable=False)                           # e.g. 'email_change'
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'),
+                     nullable=False, index=True)
+    destination = Column(String(255), nullable=True)                       # e.g. the pending new email
+    code_hash = Column(String(64), nullable=False)                         # peppered HMAC-SHA256 hex
+    attempts = Column(Integer, nullable=False, default=0)                  # wrong-guess counter
+    max_attempts = Column(Integer, nullable=False, default=3)             # invalidate after this many
+    expires_at = Column(DateTime, nullable=False)
+    consumed_at = Column(DateTime, nullable=True)                          # single-use: set on redeem
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_otpcode_purpose_user', 'purpose', 'user_id'),
+    )
+
+
 class AccountInvitation(Base):
     """Admin-minted account invitation.
 
@@ -1143,6 +1242,34 @@ class AccountInvitation(Base):
     __table_args__ = (
         Index('idx_account_invitation_prefix', 'token_prefix'),
         Index('idx_account_invitation_username', 'username'),
+    )
+
+
+class PasswordResetToken(Base):
+    """Single-use, short-lived proof used to reset a forgotten password via a link.
+
+    Same token discipline as AccountInvitation: secrets.token_urlsafe(32) plaintext shown/emailed once,
+    a short indexed prefix for lookup, and only a peppered HMAC-SHA256 stored at rest. Minting a new
+    token invalidates any prior unconsumed one for the user (one active link at a time). A WHOLE NEW
+    TABLE — created by create_all(), so it needs no lightweight-migration entry. ``created_by`` records
+    the admin who triggered it (NULL for a self-service 'forgot password' request)."""
+    __tablename__ = 'password_reset_tokens'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # No column-level index=True on user_id/token_prefix: the explicit named indexes below cover them
+    # (a column index=True would create a redundant second index).
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    token_prefix = Column(String(16), nullable=False)                        # public lookup handle
+    token_hash = Column(String(64), unique=True, nullable=False, index=True)  # HMAC-SHA256 hex
+    expires_at = Column(DateTime, nullable=False)                             # short-lived (<= a few min)
+    consumed_at = Column(DateTime, nullable=True)                             # single-use: set on redeem
+    created_at = Column(DateTime, default=datetime.utcnow)
+    created_by = Column(UUID(as_uuid=True),
+                        ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+
+    __table_args__ = (
+        Index('idx_pwreset_prefix', 'token_prefix'),
+        Index('idx_pwreset_user', 'user_id'),
     )
 
 
@@ -1199,7 +1326,9 @@ class Note(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     owner_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    title = Column(String(255), nullable=False, default='')
+    # Text, not String(255): sealed at rest (marker + ciphertext), which no longer fits 255. The boot
+    # DDL widens the same column on an already-deployed DB; here it makes create_all build it as TEXT.
+    title = Column(Text, nullable=False, default='')
     body = Column(Text, nullable=False, default='')
     is_favorite = Column(Boolean, nullable=False, default=False)
     # A received copy carries who sent it; a self-authored note leaves these NULL. sent_from_user_id
@@ -1286,8 +1415,9 @@ class NoteLink(Base):
     token = Column(String(64), nullable=False, unique=True, index=True)
     token_len = Column(Integer, nullable=False)
 
-    # Frozen content snapshot.
-    title_snapshot = Column(String(255), nullable=False, default='')
+    # Frozen content snapshot. Text (not String(255)): sealed at rest like the note it copies; the
+    # boot DDL widens the same column on an already-deployed DB.
+    title_snapshot = Column(Text, nullable=False, default='')
     body_snapshot = Column(Text, nullable=False, default='')
 
     # Frozen effective policy (resolved from the tag floor + owner tightening at creation).
@@ -1306,6 +1436,70 @@ class NoteLink(Base):
     __table_args__ = (
         Index('idx_note_link_owner', 'owner_id'),
     )
+
+
+# --- Transparent note-content sealing (personal notes + public-link snapshots) ---------------
+# Notes store title/body sealed at rest (a self-describing 'nenc1:' marker + AES-GCM keyed per row);
+# the public note LINK stores a frozen title_snapshot/body_snapshot the same way. Decrypt on
+# load/refresh into the same attribute via set_committed_value (no write-back), so every reader keeps
+# using note.title / note.body / link.*_snapshot unchanged. A legacy plaintext value (unmarked) is
+# left as-is; a marked value that does not decrypt (e.g. a user who literally typed the marker text,
+# before the boot backfill sealed it) is also left as-is -- never surfacing a placeholder as content.
+def _decrypt_note_fields(target, *_args):
+    from app.core.security import decrypt_note_field, is_note_sealed
+    for _field in ('title', 'body'):
+        _v = getattr(target, _field, None)
+        if is_note_sealed(_v):
+            try:
+                _sa_attributes.set_committed_value(
+                    target, _field, decrypt_note_field(target.id, _v, _field))
+            except Exception:  # noqa: BLE001 — marker-prefixed non-seal / wrong key: read as-is
+                pass
+
+
+def _decrypt_notelink_snapshot(target, *_args):
+    from app.core.security import decrypt_note_field, is_note_sealed
+    for _field in ('title_snapshot', 'body_snapshot'):
+        _v = getattr(target, _field, None)
+        if is_note_sealed(_v):
+            try:
+                _sa_attributes.set_committed_value(
+                    target, _field, decrypt_note_field(target.id, _v, _field))
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _seal_note_content_before_flush(session, _flush_context, _instances):
+    """Seal note/link content at flush, so no write site can miss it (the in-place marker diverges the
+    ORM's committed value from the DB, so a plaintext write-back would silently unseal). Seals only
+    content that is NEW or was MODIFIED this flush -- keyed off the attribute HISTORY, not the marker,
+    so an unrelated update never re-encrypts unchanged content and a value whose plaintext starts with
+    the marker is still sealed. Assigns the row id first, since the per-row key needs it."""
+    from sqlalchemy import inspect as _sa_inspect
+    from app.core.security import encrypt_note_field
+    _specs = ((Note, ('title', 'body')), (NoteLink, ('title_snapshot', 'body_snapshot')))
+    for _obj in list(session.new) + list(session.dirty):
+        for _model, _fields in _specs:
+            if not isinstance(_obj, _model):
+                continue
+            _is_new = _obj in session.new
+            if _is_new and getattr(_obj, 'id', None) is None:
+                _obj.id = uuid.uuid4()
+            _insp = _sa_inspect(_obj)
+            for _field in _fields:
+                if _is_new or _insp.attrs[_field].history.has_changes():
+                    _val = getattr(_obj, _field, None)
+                    if _val:                       # empty '' stays '' (read-old returns '')
+                        setattr(_obj, _field, encrypt_note_field(_obj.id, _val, _field))
+            break
+
+
+from sqlalchemy.orm import Session as _SaSessionForNoteSeal
+_sa_event.listen(Note, 'load', _decrypt_note_fields)
+_sa_event.listen(Note, 'refresh', _decrypt_note_fields)
+_sa_event.listen(NoteLink, 'load', _decrypt_notelink_snapshot)
+_sa_event.listen(NoteLink, 'refresh', _decrypt_notelink_snapshot)
+_sa_event.listen(_SaSessionForNoteSeal, 'before_flush', _seal_note_content_before_flush)
 
 
 class RateLimitRecord(Base):
@@ -1695,6 +1889,43 @@ class ChunkedUploadSession(Base):
     )
 
 
+def _decrypt_chunked_session_name(target, *_args):
+    """Transparently restore a Standard-vault upload session's sealed filename/mime at read time.
+
+    enc_name/enc_mime on this table are dual-use: a ZERO-KNOWLEDGE upload carries the browser blob
+    (leave opaque — the server has no key), a Standard upload carries a SERVER seal (AES-GCM keyed
+    per (vault_id, session-id), like a File name). For the server seal, decrypt into the plaintext
+    filename/mime_type columns (stored NULL at rest) so every in-memory read — listing, resume,
+    completion — sees the real name unchanged. A decrypt error leaves the column NULL, never breaks
+    the load. Registered on BOTH load and refresh: expire_on_commit re-reads the attribute after the
+    session's TTL-push commit, so refresh must restore it too or completion would store a wrong name.
+    """
+    from app.core.security import decrypt_object_field, is_zk_sealed_name
+    enc_name = getattr(target, 'enc_name', None)
+    enc_mime = getattr(target, 'enc_mime', None)
+    if not enc_name and not enc_mime:
+        return
+    if is_zk_sealed_name(enc_name) or is_zk_sealed_name(enc_mime):
+        return   # zero-knowledge: opaque browser blob, decrypted client-side
+    if enc_name:
+        try:
+            _sa_attributes.set_committed_value(
+                target, 'filename',
+                decrypt_object_field(target.vault_id, target.id, enc_name, 'name'))
+        except Exception:  # noqa: BLE001 — never let a decrypt error break a load
+            print(f"⚠ upload-session name decrypt failed for {getattr(target, 'id', None)}")
+    if enc_mime:
+        try:
+            _sa_attributes.set_committed_value(
+                target, 'mime_type',
+                decrypt_object_field(target.vault_id, target.id, enc_mime, 'mime'))
+        except Exception:  # noqa: BLE001
+            print(f"⚠ upload-session mime decrypt failed for {getattr(target, 'id', None)}")
+
+
+_sa_event.listen(ChunkedUploadSession, 'load', _decrypt_chunked_session_name)
+_sa_event.listen(ChunkedUploadSession, 'refresh', _decrypt_chunked_session_name)
+
 
 class VaultMemberIndexKey(Base):
     """Per-member wrapped copy of a vault's NAME INDEX key.
@@ -1963,6 +2194,13 @@ class EmailTemplate(Base):
                         ForeignKey('email_profiles.id', ondelete='SET NULL'), nullable=True)
     subject = Column(String(255), nullable=False, default='')
     body_html = Column(Text, nullable=False, default='')
+    # NULL for a user-authored template; set to the action key (e.g. 'password_reset') for a built-in
+    # default template seeded at boot. A seeded default is protected from deletion and badged "Default";
+    # editing it customizes it, and "Load From" restores the code default. Additive column: create_all
+    # builds it on a fresh DB, the boot DDL list ADDs it on an existing one. At most one row per key,
+    # enforced by the partial unique index below (Postgres treats NULLs as distinct, so user templates
+    # are unconstrained) — a hard backstop against a concurrent first-boot seeding two defaults for a key.
+    default_key = Column(String(64), nullable=True)
     created_by = Column(UUID(as_uuid=True),
                         ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     updated_by = Column(UUID(as_uuid=True),
@@ -1978,6 +2216,11 @@ class EmailTemplate(Base):
 
     __table_args__ = (
         Index('idx_email_template_profile', 'profile_id'),
+        # One default template per action key. Partial (NULLs excluded) so user templates — the vast
+        # majority — carry no uniqueness constraint. Same create_all-portable pattern as the
+        # email_profiles single-default index above.
+        Index('idx_email_template_default_key', 'default_key',
+              unique=True, postgresql_where=text('default_key IS NOT NULL')),
     )
 
 
