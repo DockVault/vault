@@ -247,17 +247,22 @@ def test_vault_file_preview_rename_delete(logged_in: Page, admin):
         page.click("#file-preview-modal .close-modal-btn")
         expect(page.locator("#file-preview-modal")).to_be_hidden()
 
-        # Rename via the row action (uses the prompt modal)
-        new_name = _u("renamed") + ".txt"
-        page.click('.action-btn[data-action="rename-file"]')
-        page.fill("#confirm-modal-input", new_name)
-        page.click("#confirm-modal-confirm-btn")
+        # Rename via the row action (uses the dedicated rename modal: separate name + extension fields)
+        new_base = _u("renamed")
+        new_name = new_base + ".txt"
+        # Rename lives in the hover cluster / context menu; open it via the "more" button.
+        page.locator("#vault-files-table-body tr").first.locator('button[data-action="more"]').click()
+        page.locator('#file-context-menu button[data-action="rename-file"]').click()
+        expect(page.locator("#rename-modal")).to_be_visible(timeout=8000)
+        page.fill("#rename-name-input", new_base)   # keep the .txt extension -> no ext-change warning
+        page.click("#rename-save")
         page.wait_for_timeout(1200)
         items = admin.get(f"/vaults/{vid}/files").json()["items"]
         assert any(it["name"] == new_name for it in items), "file was not renamed via the UI"
 
-        # Delete via the row action
-        page.click('.action-btn[data-action="delete-file"]')
+        # Delete via the context menu (opened from the "more" button)
+        page.locator("#vault-files-table-body tr").first.locator('button[data-action="more"]').click()
+        page.locator('#file-context-menu button[data-action="delete-file"]').click()
         page.click("#confirm-modal-confirm-btn")
         page.wait_for_timeout(1200)
         items = admin.get(f"/vaults/{vid}/files").json()["items"]

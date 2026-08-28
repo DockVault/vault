@@ -165,6 +165,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.19.0": {
+      "released": "2026-08-28",
+      "notes": "In-vault file operations & previews. Additive schema: files.modified_by (nullable UUID, FK users.id ON DELETE SET NULL) records who last renamed a file in place; the column AND its foreign key are both added by the boot DDL so a fresh create_all install and an upgraded one match. Adds a safe Markdown/HTML/source preview renderer (server-side nh3 allowlist, CSP-locked empty-sandbox srcdoc iframe), a copyable plaintext SHA-256 (Standard vaults, download-gated), a Move/Copy staging panel, upload fixes, live download progress, and bounded-memory preview (large media refused inline, big text windowed via Range). Depends on Markdown 3.10.3 + Pygments 2.20.0 (hash-pinned, pure-Python). A rollback to 0.18.2 is clean and needs no backup: the modified_by column is left in place and simply ignored by the older image.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -312,6 +320,13 @@
     {
       "from": "0.18.1",
       "to": "0.18.2",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.18.2",
+      "to": "0.19.0",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false

@@ -9699,6 +9699,137 @@ function formatModified(iso) {
     return `${date} · ${time}`;
 }
 
+// Sort the file list for display. Folders always group first; within each group the active column
+// (state.filesSort) drives the order, with a stable tiebreak on name so the result is deterministic.
+function sortFilesForRender(list) {
+    const items = (list || []).slice();
+    const s = state.filesSort || (state.filesSort = { key: 'name', dir: 'asc' });
+    const dir = s.dir === 'desc' ? -1 : 1;
+    const keyVal = (it) => {
+        switch (s.key) {
+            case 'size': return it.type === 'folder' ? -1 : (it.size || 0);
+            case 'type': return (friendlyFileType(it) || '').toLowerCase();
+            case 'modified': { const d = parseServerTime(it.modified); return d ? d.getTime() : 0; }
+            case 'modified_by': return (it.modified_by_name || '').toLowerCase();
+            case 'name':
+            default: return (it.name || '').toLowerCase();
+        }
+    };
+    return items.sort((a, b) => {
+        if (a.type === 'folder' && b.type !== 'folder') return -1;
+        if (a.type !== 'folder' && b.type === 'folder') return 1;
+        const va = keyVal(a), vb = keyVal(b);
+        const cmp = (typeof va === 'number' && typeof vb === 'number')
+            ? va - vb : String(va).localeCompare(String(vb));
+        if (cmp !== 0) return cmp * dir;
+        return (a.name || '').localeCompare(b.name || '');  // stable secondary key, not flipped by dir
+    });
+}
+
+// Wire the sortable table headers once (a header click sets/toggles state.filesSort and re-renders),
+// and reflect the active sort as aria-sort + a small glyph on every render. renderVaultFiles runs on
+// the 5s poll, so the wiring is guarded to attach exactly once.
+function applySortHeaderUI() {
+    const thead = document.querySelector('.files-table thead');
+    if (!thead) return;
+    const s = state.filesSort || { key: 'name', dir: 'asc' };
+    if (!thead.dataset.sortWired) {
+        thead.dataset.sortWired = '1';
+        thead.querySelectorAll('th.sortable[data-sort-key]').forEach(th => {
+            const activate = () => {
+                const key = th.getAttribute('data-sort-key');
+                const cur = state.filesSort || { key: 'name', dir: 'asc' };
+                state.filesSort = (cur.key === key)
+                    ? { key, dir: cur.dir === 'asc' ? 'desc' : 'asc' }
+                    : { key, dir: 'asc' };
+                renderVaultFiles();
+            };
+            th.addEventListener('click', activate);
+            th.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); activate(); }
+            });
+        });
+    }
+    thead.querySelectorAll('th.sortable[data-sort-key]').forEach(th => {
+        const active = th.getAttribute('data-sort-key') === s.key;
+        th.setAttribute('aria-sort', active ? (s.dir === 'desc' ? 'descending' : 'ascending') : 'none');
+        const ind = th.querySelector('.sort-ind');
+        if (ind) ind.textContent = active ? (s.dir === 'desc' ? ' ▼' : ' ▲') : '';
+    });
+}
+
+// File info modal: fetch the metadata, render it, and (Standard vaults) offer the SHA-256 hash.
+async function openFileInfo(fileId, fileName) {
+    const modal = document.getElementById('file-info-modal');
+    if (!modal) return;
+    const titleEl = document.getElementById('file-info-title');
+    if (titleEl) titleEl.textContent = fileName || 'File information';
+    const body = document.getElementById('file-info-body');
+    if (body) { const sp = document.createElement('div'); sp.className = 'spinner'; body.replaceChildren(sp); }
+    openModal('file-info-modal');
+    try {
+        const headers = {};
+        if (state.currentVault && state.currentVault.has_password && state.vaultPassword) headers['X-Vault-Password'] = state.vaultPassword;
+        const info = await apiRequest(`/vaults/${state.currentVault.id}/files/${fileId}/info`, { headers });
+        renderFileInfo(body, info, fileName);
+    } catch (e) {
+        const alert = document.createElement('div');
+        alert.className = 'alert alert-error';
+        alert.textContent = (e && e.message) ? ('Could not load file info: ' + e.message) : 'Could not load file info.';
+        if (body) body.replaceChildren(alert);
+    }
+}
+
+function renderFileInfo(body, info, fallbackName) {
+    if (!body) return;
+    const dl = document.createElement('dl');
+    dl.className = 'file-info-dl';
+    const row = (label, value) => {
+        const dt = document.createElement('dt'); dt.textContent = label;
+        const dd = document.createElement('dd');
+        dd.textContent = (value === null || value === undefined || value === '') ? '—' : String(value);
+        dl.append(dt, dd);
+    };
+    const displayName = info.name || fallbackName || '—';
+    row('Name', displayName);
+    row('Size', formatBytes(info.size || 0));
+    row('Type', info.mime_type || friendlyFileType({ type: 'file', name: displayName }));
+    row('Created', info.created_at ? formatModified(info.created_at) : null);
+    row('Modified', info.modified_at ? formatModified(info.modified_at) : null);
+    if (info.created_by) row('Created by', info.created_by);
+    if (info.modified_by) row('Modified by', info.modified_by);
+    body.replaceChildren(dl);
+
+    // Hash: Standard vaults carry a real plaintext SHA-256; ZK vaults do not (the server holds only
+    // ciphertext), so hash is Standard-only per the owner's decision.
+    const hashWrap = document.createElement('div');
+    hashWrap.className = 'file-info-hash';
+    if (info.checksum_sha256) {
+        const head = document.createElement('div'); head.className = 'file-info-hash-head';
+        const label = document.createElement('span'); label.className = 'file-info-hash-label';
+        label.textContent = info.checksum_algorithm || 'SHA-256';
+        const copy = document.createElement('button');
+        copy.type = 'button'; copy.className = 'btn btn-sm btn-secondary'; copy.textContent = 'Copy';
+        copy.addEventListener('click', async () => {
+            try { await navigator.clipboard.writeText(info.checksum_sha256); showToast('Hash copied to clipboard', 'success'); }
+            catch (_) { showToast('Could not copy to clipboard', 'error'); }
+        });
+        head.append(label, copy);
+        const val = document.createElement('code');
+        val.className = 'file-info-hash-value';
+        val.textContent = info.checksum_sha256;
+        hashWrap.append(head, val);
+    } else {
+        const note = document.createElement('div');
+        note.className = 'text-sm text-secondary';
+        note.textContent = info.is_zero_knowledge
+            ? 'Hash unavailable: a zero-knowledge vault stores only ciphertext, so the server cannot provide the file’s content hash.'
+            : 'Hash unavailable for this file.';
+        hashWrap.append(note);
+    }
+    body.appendChild(hashWrap);
+}
+
 // Render the current vault's files in the active view (table or grid). Reads
 // state.currentFiles (set by loadVaultFiles) so the view can be re-rendered on
 // a view-switch without re-fetching. All dynamic text is escaped via escapeHtml.
@@ -9708,7 +9839,7 @@ function renderVaultFiles() {
     }
     if (!(state.selectedFileIds instanceof Set)) state.selectedFileIds = new Set();
 
-    const items = state.currentFiles || [];
+    const items = sortFilesForRender(state.currentFiles || []);
     const view = state.filesView === 'grid' ? 'grid' : 'table';
     const canWrite = state.canWriteCurrentVault !== false;
 
@@ -9728,6 +9859,7 @@ function renderVaultFiles() {
     if (view === 'table') {
         renderFilesTable(items, canWrite, tbody);
         wireFileItemHandlers(tbody);
+        applySortHeaderUI();
     } else {
         renderFilesGrid(items, canWrite, grid);
         wireFileItemHandlers(grid);
@@ -9744,7 +9876,7 @@ function filesEmptyStateHtml(grid) {
         <p style="color:var(--text-secondary);">Upload files or create folders to get started</p>`;
     return grid
         ? `<div class="empty-state text-center p-xl" style="grid-column:1/-1;">${inner}</div>`
-        : `<tr><td colspan="6" style="text-align:center;padding:40px;"><div class="empty-state">${inner}</div></td></tr>`;
+        : `<tr><td colspan="7" style="text-align:center;padding:40px;"><div class="empty-state">${inner}</div></td></tr>`;
 }
 
 // Build the inline action buttons for a file/folder row or tile. Keeps the
@@ -9759,45 +9891,51 @@ function fileActionButtons(item, canWrite, opts) {
     const id = item.id;
     const nm = escapeHtml(item.name);
     const slot = opts && opts.slot;
+    // The left cluster of a grid tile holds only the checkbox (added by the caller).
+    if (slot === 'primary') return '';
     const btn = (action, icon, label, danger) =>
-        `<button class="action-btn${danger ? ' action-btn-danger' : ''}" data-action="${action}" data-id="${id}" data-name="${nm}" title="${label}" aria-label="${label}">${iconSvg(icon, 'icon-sm')}</button>`;
-    // vaultCapAllowed() is a no-op (true) for non-scoped sessions; for a scoped temp
-    // credential it gates each action by the cap its scope grants on this vault,
-    // matching require_vault_cap server-side (rename=file.rename, delete=file.delete,
-    // folder delete=folder.delete, download=file.download). The same gate applies in
-    // every slot, so splitting the cluster never grants an affordance the scope lacks.
-    const out = [];
+        `<button type="button" class="action-btn${danger ? ' action-btn-danger' : ''}" data-action="${action}" data-id="${id}" data-name="${nm}" title="${label}" aria-label="${label}">${iconSvg(icon, 'icon-sm')}</button>`;
+    // vaultCapAllowed() is a no-op (true) for non-scoped sessions; for a scoped temp credential it
+    // gates each action by the cap its scope grants on this vault, matching require_vault_cap
+    // server-side. The resting row shows at most [more][share][download]; edit/copy/move/delete live
+    // in a hover cluster behind the "more" button (Info + Show-hash live in the right-click menu),
+    // which keeps a tile from overflowing with five-plus icons.
+    const cluster = [];   // revealed on hovering "more"
+    const trailing = [];  // always-visible: share, then download (far right)
     if (isFolder) {
         const canRename = canWrite && vaultCapAllowed('file.rename');
         const canDelete = canWrite && vaultCapAllowed('folder.delete');
-        // Copy/Move a folder needs folder.create (the structural cap); a recursive copy also
-        // reads + writes files, gated server-side. Mirrors require_vault_cap on the endpoints.
+        // Copy/Move a folder needs folder.create (the structural cap); a recursive copy also reads +
+        // writes files, gated server-side. Mirrors require_vault_cap on the endpoints.
         const canStructure = canWrite && vaultCapAllowed('folder.create');
-        if (slot !== 'primary') {  // folders have no download -> primary (left) is empty
-            if (canRename) out.push(btn('rename-folder', 'edit', 'Rename'));
-            if (canStructure) out.push(btn('copy-folder', 'copy', 'Copy'));
-            if (canStructure) out.push(btn('move-folder', 'move', 'Move'));
-            if (canDelete) out.push(btn('delete-folder', 'trash', 'Delete', true));
-            if (vaultShareable()) out.push(btn('share-folder', 'link', 'Share'));
-        }
-        if (out.length === 0 && !slot && (!opts || !opts.grid)) out.push('<span class="text-tertiary text-sm">—</span>');
+        if (canRename) cluster.push(btn('rename-folder', 'edit', 'Rename'));
+        if (canStructure) cluster.push(btn('copy-folder', 'copy', 'Copy'));
+        if (canStructure) cluster.push(btn('move-folder', 'move', 'Move'));
+        if (canDelete) cluster.push(btn('delete-folder', 'trash', 'Delete', true));
+        if (vaultShareable()) trailing.push(btn('share-folder', 'link', 'Share'));
     } else {
         const canDownload = vaultCapAllowed('file.download');
         const canRename = canWrite && vaultCapAllowed('file.rename');
         const canDelete = canWrite && vaultCapAllowed('file.delete');
-        if (slot !== 'primary') {
-            if (canRename) out.push(btn('rename-file', 'edit', 'Rename'));
-            // Copy needs read (file.download); Move removes from the source (file.delete). The
-            // destination write is authorized at paste time, matching the endpoints.
-            if (canDownload) out.push(btn('copy-file', 'copy', 'Copy'));
-            if (canDelete) out.push(btn('move-file', 'move', 'Move'));
-            if (canDelete) out.push(btn('delete-file', 'trash', 'Delete', true));
-            if (vaultShareable()) out.push(btn('share-file', 'link', 'Share'));
-            // Download last so it renders on the far RIGHT of the action cluster (grid + table).
-            if (canDownload) out.push(btn('download', 'download', 'Download'));
-        }
+        if (canRename) cluster.push(btn('rename-file', 'edit', 'Rename'));
+        // Copy needs read (file.download); Move removes from the source (file.delete).
+        if (canDownload) cluster.push(btn('copy-file', 'copy', 'Copy'));
+        if (canDelete) cluster.push(btn('move-file', 'move', 'Move'));
+        if (canDelete) cluster.push(btn('delete-file', 'trash', 'Delete', true));
+        if (vaultShareable()) trailing.push(btn('share-file', 'link', 'Share'));
+        // Download last so it renders on the far RIGHT of the action row (grid + table).
+        if (canDownload) trailing.push(btn('download', 'download', 'Download'));
     }
-    return out.join('');
+    let html = '';
+    if (cluster.length) {
+        html += '<div class="action-more-wrap">'
+            + `<div class="action-cluster" role="group" aria-label="More actions">${cluster.join('')}</div>`
+            + `<button type="button" class="action-btn action-more" data-action="more" aria-haspopup="true" aria-label="More actions" title="More actions">${iconSvg('more', 'icon-sm')}</button>`
+            + '</div>';
+    }
+    html += trailing.join('');
+    if (!html && !slot && (!opts || !opts.grid)) html = '<span class="text-tertiary text-sm">—</span>';
+    return html;
 }
 
 function renderFilesTable(items, canWrite, tbody) {
@@ -9826,6 +9964,7 @@ function renderFilesTable(items, canWrite, tbody) {
                 <td class="col-num"><span class="file-size">${size}</span></td>
                 <td><span class="file-type">${escapeHtml(friendlyFileType(item))}</span></td>
                 <td><span class="file-modified">${formatModified(item.modified)}</span></td>
+                <td><span class="file-modified-by">${escapeHtml(isFolder ? '—' : (item.modified_by_name || '—'))}</span></td>
                 <td class="col-actions"><div class="file-actions">${fileActionButtons(item, canWrite, { grid: false })}</div></td>
             </tr>`;
     }).join('');
@@ -9864,6 +10003,128 @@ function renderFilesGrid(items, canWrite, grid) {
     }).join('');
 }
 
+// Run a file/folder action by its data-action verb. Shared by the row buttons AND the right-click
+// context menu, so the two can never drift.
+function runFileAction(action, id, name) {
+    if (action === 'preview') {
+        const it = (state.currentFiles || []).find(i => i.id === id);
+        openFilePreview(id, name, (it && it.mime_type) || '');
+    }
+    else if (action === 'open-folder') openFolder(id, name);
+    else if (action === 'download') downloadFile(id, name);
+    else if (action === 'rename-file' || action === 'rename-folder') renameVaultItem(id, name, action === 'rename-folder' ? 'folder' : 'file');
+    else if (action === 'delete-file' || action === 'delete-folder') deleteVaultItem(id, name, action === 'delete-folder' ? 'folder' : 'file');
+    else if (action === 'share-file' || action === 'share-folder') openCreateShareModal(action === 'share-folder' ? 'folder' : 'file', id, name);
+    else if (action === 'file-info') openFileInfo(id, name);
+    else if (action === 'copy-sha256') copyFileHash(id, name);
+    else if (action === 'copy-file' || action === 'move-file') stageForMoveCopy(id, name, 'file', action === 'move-file' ? 'move' : 'copy');
+    else if (action === 'copy-folder' || action === 'move-folder') stageForMoveCopy(id, name, 'folder', action === 'move-folder' ? 'move' : 'copy');
+}
+
+// Copy a file's SHA-256 straight to the clipboard (Standard vaults; a zero-knowledge vault has no
+// server-side content hash). Reuses the gated /info endpoint.
+async function copyFileHash(fileId, fileName) {
+    try {
+        const headers = {};
+        if (state.currentVault && state.currentVault.has_password && state.vaultPassword) headers['X-Vault-Password'] = state.vaultPassword;
+        const info = await apiRequest(`/vaults/${state.currentVault.id}/files/${fileId}/info`, { headers });
+        if (info.checksum_sha256) { await navigator.clipboard.writeText(info.checksum_sha256); showToast('SHA-256 copied to clipboard', 'success'); }
+        else showToast(info.is_zero_knowledge ? 'Hash is unavailable for a zero-knowledge vault.' : 'Hash is unavailable for this file.', 'info');
+    } catch (_) { showToast('Could not read the file hash.', 'error'); }
+}
+
+// A right-click context menu for a file/folder row/tile. One reusable floating element; every entry
+// is permission-gated exactly like the row buttons, and labels are set via textContent (XSS-safe).
+let _ctxMenuEl = null;
+function _svgUse(name, cls) {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('class', 'icon ' + (cls || 'icon-sm'));
+    svg.setAttribute('aria-hidden', 'true');
+    const use = document.createElementNS(NS, 'use');
+    use.setAttribute('href', '#i-' + name);
+    svg.appendChild(use);
+    return svg;
+}
+function _ctxOutside(e) { if (_ctxMenuEl && !_ctxMenuEl.contains(e.target)) closeContextMenu(); }
+function _ctxKey(e) { if (e.key === 'Escape') closeContextMenu(); }
+function closeContextMenu() {
+    if (_ctxMenuEl) { _ctxMenuEl.hidden = true; _ctxMenuEl.replaceChildren(); }
+    document.removeEventListener('click', _ctxOutside, true);
+    document.removeEventListener('keydown', _ctxKey, true);
+    window.removeEventListener('scroll', closeContextMenu, true);
+    window.removeEventListener('resize', closeContextMenu, true);
+}
+function openContextMenu(item, x, y) {
+    if (!item) return;
+    if (!_ctxMenuEl) {
+        _ctxMenuEl = document.createElement('div');
+        _ctxMenuEl.id = 'file-context-menu';
+        _ctxMenuEl.className = 'context-menu';
+        _ctxMenuEl.setAttribute('role', 'menu');
+        _ctxMenuEl.hidden = true;
+        document.body.appendChild(_ctxMenuEl);
+    }
+    const isFolder = item.type === 'folder';
+    const canWrite = state.canWriteCurrentVault !== false;
+    const clipHas = (state.moveCopyClip || []).length > 0;
+    const entries = [];
+    const add = (label, icon, action, danger) => entries.push({ label, icon, action, danger });
+    if (isFolder) {
+        add('Open', 'folder', 'open-folder');
+        if (canWrite && vaultCapAllowed('file.rename')) add('Rename', 'edit', 'rename-folder');
+        if (canWrite && vaultCapAllowed('folder.create')) add(clipHas ? 'Add to copy list' : 'Copy', 'copy', 'copy-folder');
+        if (canWrite && vaultCapAllowed('folder.create')) add(clipHas ? 'Add to move list' : 'Move', 'move', 'move-folder');
+        if (vaultShareable()) add('Share', 'link', 'share-folder');
+        if (canWrite && vaultCapAllowed('folder.delete')) add('Delete', 'trash', 'delete-folder', true);
+    } else {
+        const canDownload = vaultCapAllowed('file.download');
+        add('Preview', 'eye', 'preview');
+        if (canWrite && vaultCapAllowed('file.rename')) add('Rename', 'edit', 'rename-file');
+        if (canDownload) add(clipHas ? 'Add to copy list' : 'Copy', 'copy', 'copy-file');
+        if (canWrite && vaultCapAllowed('file.delete')) add(clipHas ? 'Add to move list' : 'Move', 'move', 'move-file');
+        if (vaultShareable()) add('Share', 'link', 'share-file');
+        if (canDownload) add('Download', 'download', 'download');
+        if (vaultCapAllowed('vault.see_files')) add('File info', 'info', 'file-info');
+        // The hash is content-derived, so only offer "Copy SHA-256" to a principal who can download
+        // the file (mirrors the server, which withholds the checksum otherwise) -- and Standard only.
+        if (vaultCapAllowed('vault.see_files') && canDownload && !isZkVault(state.currentVault)) add('Copy SHA-256', 'hash', 'copy-sha256');
+        if (canWrite && vaultCapAllowed('file.delete')) add('Delete', 'trash', 'delete-file', true);
+    }
+    const menu = _ctxMenuEl;
+    menu.replaceChildren();
+    entries.forEach(en => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'context-menu-item' + (en.danger ? ' danger' : '');
+        b.setAttribute('role', 'menuitem');
+        b.setAttribute('data-action', en.action);
+        const lbl = document.createElement('span');
+        lbl.textContent = en.label;
+        b.append(_svgUse(en.icon), lbl);
+        b.addEventListener('click', () => { closeContextMenu(); runFileAction(en.action, item.id, item.name); });
+        menu.appendChild(b);
+    });
+    menu.hidden = false;
+    // Position on the side of the anchor that has room. Extend RIGHT from x when it fits -- this is
+    // what makes a left-column item's menu open rightward and keep every item (rename included) on
+    // screen -- and flip LEFT only when a right-column anchor would push the menu off the edge.
+    const r = menu.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight, pad = 8;
+    let left = x;
+    if (x + r.width + pad > vw) left = x - r.width;          // flip to the left of the anchor
+    left = Math.max(pad, Math.min(left, vw - r.width - pad));
+    let top = y;
+    if (y + r.height + pad > vh) top = y - r.height - 6;     // flip above the anchor
+    top = Math.max(pad, Math.min(top, vh - r.height - pad));
+    menu.style.left = left + 'px';
+    menu.style.top = top + 'px';
+    document.addEventListener('click', _ctxOutside, true);
+    document.addEventListener('keydown', _ctxKey, true);
+    window.addEventListener('scroll', closeContextMenu, true);
+    window.addEventListener('resize', closeContextMenu, true);
+}
+
 // Wire file-name / folder / action / checkbox handlers within a container
 // (called fresh after each render of either view).
 function wireFileItemHandlers(container) {
@@ -9898,18 +10159,47 @@ function wireFileItemHandlers(container) {
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
             const action = btn.getAttribute('data-action');
-            const id = btn.getAttribute('data-id');
-            const name = btn.getAttribute('data-name');
-            if (action === 'download') downloadFile(id, name);
-            else if (action === 'rename-file' || action === 'rename-folder') renameVaultItem(id, name, action === 'rename-folder' ? 'folder' : 'file');
-            else if (action === 'delete-file' || action === 'delete-folder') deleteVaultItem(id, name, action === 'delete-folder' ? 'folder' : 'file');
-            else if (action === 'share-file' || action === 'share-folder') openCreateShareModal(action === 'share-folder' ? 'folder' : 'file', id, name);
-            else if (action === 'copy-file' || action === 'move-file')
-                stageForMoveCopy(id, name, 'file', action === 'move-file' ? 'move' : 'copy');
-            else if (action === 'copy-folder' || action === 'move-folder')
-                stageForMoveCopy(id, name, 'folder', action === 'move-folder' ? 'move' : 'copy');
+            if (action === 'more') {
+                // The "more" button opens the full context menu -- a touch/keyboard path to the same
+                // actions the hover cluster reveals. Anchor it to the button.
+                const row = btn.closest('tr, .file-tile');
+                const fn = row && row.querySelector('.file-name');
+                const fid = fn && (fn.getAttribute('data-file-id') || fn.getAttribute('data-folder-id'));
+                const item = fid && (state.currentFiles || []).find(i => i.id === fid);
+                if (item) { const r = btn.getBoundingClientRect(); openContextMenu(item, r.left, r.bottom + 2); }
+                return;
+            }
+            runFileAction(action, btn.getAttribute('data-id'), btn.getAttribute('data-name'));
         });
     });
+    // The hover cluster opens to the LEFT of the "more" button. Near the left edge of the file area
+    // (a left-column grid tile) that would clip it -- so flip it to open RIGHT there, keeping every
+    // option (rename included) on screen. Decided on hover, since positions shift with scroll/resize.
+    container.querySelectorAll('.action-more-wrap').forEach(wrap => {
+        wrap.addEventListener('mouseenter', () => {
+            const r = wrap.getBoundingClientRect();
+            const host = wrap.closest('#vault-files-grid, #vault-files-table-body, .files-scroll') || document.body;
+            const hostLeft = host.getBoundingClientRect().left;
+            const CLUSTER_EST = 200;   // generous width of the 4-icon cluster + padding
+            // Flip right when opening left would cross the file-area's left edge.
+            wrap.classList.toggle('cluster-right', (r.left - CLUSTER_EST) < hostLeft + 4);
+        });
+    });
+    // Right-click a row/tile -> the context menu with every permitted action. Delegated + wired ONCE
+    // per container (the tbody/grid element persists across the 5s re-render, so re-wiring would stack).
+    if (!container.dataset.ctxWired) {
+        container.dataset.ctxWired = '1';
+        container.addEventListener('contextmenu', (e) => {
+            const row = e.target.closest('tr, .file-tile');
+            const fn = row && row.querySelector('.file-name');
+            const fid = fn && (fn.getAttribute('data-file-id') || fn.getAttribute('data-folder-id'));
+            if (!fid) return;   // right-click on empty space / a header: leave the native menu
+            const item = (state.currentFiles || []).find(i => i.id === fid);
+            if (!item) return;
+            e.preventDefault();
+            openContextMenu(item, e.clientX, e.clientY);
+        });
+    }
     container.querySelectorAll('.file-check').forEach(cb => {
         cb.addEventListener('click', (e) => e.stopPropagation());
         cb.addEventListener('change', () => toggleFileSelected(cb.getAttribute('data-id'), cb.checked));
@@ -9958,27 +10248,198 @@ function _moveCopyClip() {
     return state.moveCopyClip;
 }
 
+function _ciCurrentPath() {
+    return ['Root'].concat((state.currentPath || []).map(f => f.name || '…')).join(' / ');
+}
+
 function stageForMoveCopy(id, name, type, action) {
     const clip = _moveCopyClip();
-    // Re-staging the same item replaces its pending action (Copy then Move, or vice-versa).
+    const src = (state.currentFiles || []).find(e => e.id === id) || {};
+    const meta = {
+        id, name, type, action,
+        sourceVaultId: state.currentVaultId,
+        sourceVaultName: (state.currentVault && state.currentVault.name) || '',
+        sourcePath: _ciCurrentPath(),
+        size: src.size || 0,
+        modified: src.modified || null,
+    };
+    // Re-staging the same item refreshes its action + metadata; keepAfter resets to the action's
+    // default (copy keeps so you can paste into many folders; move leaves once relocated).
     const existing = clip.find(e => e.id === id);
-    if (existing) { existing.action = action; existing.name = name; existing.type = type; }
-    else clip.push({ id, name, type, action, sourceVaultId: state.currentVaultId });
-    updateMoveCopyBar();
-    showToast(`${action === 'move' ? 'Moving' : 'Copying'}: ${name}. Open a folder or vault and Paste here.`, 'info');
+    if (existing) { Object.assign(existing, meta); existing.keepAfter = (action === 'copy'); }
+    else clip.push(Object.assign(meta, { keepAfter: action === 'copy', selected: false }));
+    updateCopiedItemsButton();
+    if (_ciPanelOpen()) renderCopiedItems();
+    showToast(`${action === 'move' ? 'Cut' : 'Copied'}: ${name}. Open "Copied Items" to paste.`, 'info');
 }
 
 function clearMoveCopy() {
     state.moveCopyClip = [];
-    updateMoveCopyBar();
+    updateCopiedItemsButton();
+    if (_ciPanelOpen()) renderCopiedItems();
 }
 
-function updateMoveCopyBar() {
+// The "Copied Items" toolbar button (+ count) replaces the old always-visible bar.
+function updateCopiedItemsButton() {
     const clip = _moveCopyClip();
-    const bar = document.getElementById('move-copy-bar');
-    const countEl = document.getElementById('move-copy-count');
-    if (countEl) countEl.textContent = clip.length;
-    if (bar) bar.hidden = clip.length === 0;
+    const btn = document.getElementById('copied-items-btn');
+    const count = document.getElementById('copied-items-count');
+    if (count) count.textContent = clip.length;
+    if (btn) btn.hidden = clip.length === 0;
+    if (clip.length === 0) closeCopiedItems();
+}
+// Back-compat: loadVaultFiles/renderVaultFiles still call this.
+function updateMoveCopyBar() { updateCopiedItemsButton(); if (_ciPanelOpen()) renderCopiedItems(); }
+
+// ---- Copied Items panel ----------------------------------------------------------------------
+function _ciPanelOpen() { const p = document.getElementById('copied-items-panel'); return !!(p && !p.hidden); }
+function openCopiedItems() { const p = document.getElementById('copied-items-panel'); if (p) { p.hidden = false; renderCopiedItems(); } }
+function closeCopiedItems() { const p = document.getElementById('copied-items-panel'); if (p) p.hidden = true; }
+function toggleCopiedItems() { if (_ciPanelOpen()) closeCopiedItems(); else openCopiedItems(); }
+
+function _ciFiltered() {
+    const clip = _moveCopyClip();
+    const f = state.moveCopyFilter || 'all';
+    return f === 'all' ? clip.slice() : clip.filter(e => e.action === f);
+}
+function _ciSelected() { return _moveCopyClip().filter(e => e.selected); }
+function _ciSetFilter(f) {
+    // Switching the copy/cut filter starts a fresh selection context (so "select all" acts per
+    // type and an action never runs on now-hidden items).
+    _moveCopyClip().forEach(e => { e.selected = false; });
+    state.moveCopyFilter = f;
+    renderCopiedItems();
+}
+
+function renderCopiedItems() {
+    const clip = _moveCopyClip();
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    set('ci-count-all', clip.length);
+    set('ci-count-copy', clip.filter(e => e.action === 'copy').length);
+    set('ci-count-move', clip.filter(e => e.action === 'move').length);
+    document.querySelectorAll('.ci-filter[data-ci-filter]').forEach(b =>
+        b.classList.toggle('active', b.getAttribute('data-ci-filter') === (state.moveCopyFilter || 'all')));
+
+    const list = document.getElementById('ci-list');
+    const empty = document.getElementById('ci-empty');
+    if (empty) empty.hidden = clip.length !== 0;
+    if (!list) return;
+    const shown = _ciFiltered();
+    list.replaceChildren();
+    shown.forEach(e => list.appendChild(_ciItemNode(e)));
+    _ciSyncSelectAll();
+    _ciRenderActions();
+}
+
+function _ciItemNode(e) {
+    const row = document.createElement('div');
+    row.className = 'ci-item ' + (e.keepAfter ? 'ci-keep' : 'ci-remove') + (e.selected ? ' ci-sel' : '');
+    row.setAttribute('data-ci-id', e.id);
+    const check = document.createElement('input');
+    check.type = 'checkbox'; check.className = 'ci-check'; check.checked = !!e.selected;
+    check.setAttribute('aria-label', 'Select ' + e.name);
+    check.addEventListener('change', () => {
+        e.selected = check.checked;
+        row.classList.toggle('ci-sel', e.selected);
+        _ciSyncSelectAll();
+        _ciRenderActions();
+    });
+    const badge = document.createElement('span');
+    badge.className = 'ci-badge ' + (e.action === 'move' ? 'ci-badge-move' : 'ci-badge-copy');
+    badge.textContent = e.action === 'move' ? 'Cut' : 'Copy';
+    const main = document.createElement('div'); main.className = 'ci-item-main';
+    const nm = document.createElement('div'); nm.className = 'ci-item-name'; nm.textContent = e.name;
+    const loc = document.createElement('div'); loc.className = 'ci-item-loc';
+    loc.textContent = (e.sourceVaultName || 'Vault') + ' · ' + (e.sourcePath || 'Root');
+    const meta = document.createElement('div'); meta.className = 'ci-item-meta';
+    meta.textContent = (e.type === 'folder' ? 'Folder' : formatBytes(e.size || 0)) + (e.modified ? ' · ' + formatModified(e.modified) : '');
+    main.append(nm, loc, meta);
+    row.append(check, badge, main);
+    return row;
+}
+
+function _ciSyncSelectAll() {
+    const selAll = document.getElementById('ci-select-all');
+    if (!selAll) return;
+    const shown = _ciFiltered();
+    const n = shown.filter(e => e.selected).length;
+    selAll.checked = shown.length > 0 && n === shown.length;
+    selAll.indeterminate = n > 0 && n < shown.length;
+}
+function _ciToggleSelectAll(on) { _ciFiltered().forEach(e => { e.selected = on; }); renderCopiedItems(); }
+function _ciSetKeepAfter(keep) { _ciSelected().forEach(e => { e.keepAfter = keep; }); renderCopiedItems(); }
+function _ciDeleteSelected() {
+    const ids = new Set(_ciSelected().map(e => e.id));
+    state.moveCopyClip = _moveCopyClip().filter(e => !ids.has(e.id));
+    updateCopiedItemsButton();
+    renderCopiedItems();
+}
+
+// Build the Paste / Move / Paste-Move + Delete + keep/remove settings from the current selection.
+function _ciRenderActions() {
+    const sel = _ciSelected();
+    const actions = document.getElementById('ci-actions');
+    const row = document.getElementById('ci-action-buttons');
+    const settings = document.getElementById('ci-settings');
+    if (!actions || !row) return;
+    actions.hidden = sel.length === 0;
+    row.replaceChildren();
+    if (sel.length === 0) { if (settings) settings.hidden = true; return; }
+    const nCopy = sel.filter(e => e.action === 'copy').length;
+    const nMove = sel.filter(e => e.action === 'move').length;
+    const mk = (label, cls, on, disabled) => {
+        const b = document.createElement('button'); b.type = 'button'; b.className = 'btn btn-sm ' + cls;
+        b.textContent = label;
+        if (disabled) b.disabled = true; else b.addEventListener('click', on);
+        return b;
+    };
+    if (nCopy > 0 && nMove > 0) {
+        row.appendChild(mk(`Paste/Move (${sel.length})`, 'btn-primary', _ciShowMixedModal));
+    } else {
+        row.appendChild(mk(`Paste (${nCopy})`, 'btn-primary', () => pasteMoveCopy('copy'), nCopy === 0));
+        row.appendChild(mk(`Move (${nMove})`, 'btn-secondary', () => pasteMoveCopy('move'), nMove === 0));
+    }
+    row.appendChild(mk(`Delete from list (${sel.length})`, 'btn-danger', _ciDeleteSelected));
+    // Keep/remove-after-action: show only the toggle(s) that would change something; a mixed
+    // selection shows both.
+    if (settings) {
+        const allKeep = sel.every(e => e.keepAfter);
+        const allRemove = sel.every(e => !e.keepAfter);
+        settings.hidden = false;
+        const keepBtn = document.getElementById('ci-keep');
+        const remBtn = document.getElementById('ci-remove');
+        if (keepBtn) keepBtn.hidden = allKeep;    // already all-keep -> nothing to change
+        if (remBtn) remBtn.hidden = allRemove;    // already all-remove -> nothing to change
+    }
+}
+
+function _ciShowMixedModal() {
+    // Close the panel first: it sits above the modal (a taller z-index), so a long staged list
+    // would otherwise cover the modal's confirm button. The selection lives on the entries, so the
+    // confirm still pastes/moves the right subset.
+    closeCopiedItems();
+    const sel = _ciSelected();
+    const copies = sel.filter(e => e.action === 'copy');
+    const moves = sel.filter(e => e.action === 'move');
+    const body = document.getElementById('ci-mixed-body');
+    if (!body) return;
+    body.replaceChildren();
+    const dest = document.createElement('p');
+    dest.className = 'text-sm text-secondary';
+    dest.textContent = `Into ${(state.currentVault && state.currentVault.name) || 'this vault'} · ${_ciCurrentPath()}`;
+    body.appendChild(dest);
+    const section = (title, items) => {
+        if (!items.length) return;
+        const h = document.createElement('div'); h.className = 'ci-mixed-h'; h.textContent = title;
+        const ul = document.createElement('ul'); ul.className = 'ci-mixed-list';
+        items.forEach(e => { const li = document.createElement('li'); li.textContent = e.name; ul.appendChild(li); });
+        body.append(h, ul);
+    };
+    section(`These will be copied (${copies.length})`, copies);
+    section(`These will be moved (${moves.length})`, moves);
+    const confirm = document.getElementById('ci-mixed-confirm');
+    if (confirm) confirm.onclick = () => { closeModal(); pasteMoveCopy('both'); };
+    openModal('ci-mixed-modal');
 }
 
 function _vaultPasswordFor(vaultId) {
@@ -9989,23 +10450,36 @@ function _vaultPasswordFor(vaultId) {
     return state.getRememberedVaultPassword(vaultId) || null;
 }
 
-async function pasteMoveCopy() {
+// Paste/move the selected staged items into the CURRENT vault+folder. verb: 'copy' (only the
+// selected copy items), 'move' (only the selected move items), 'both' (all selected), or 'all'
+// (every staged item, ignoring selection). Each entry either stays staged (keepAfter) or leaves
+// after it succeeds -- so a KEPT copy can be pasted into many folders, and a single item can be
+// removed from the list without clearing the rest.
+async function pasteMoveCopy(verb) {
+    verb = verb || 'both';
     const clip = _moveCopyClip();
-    if (!clip.length) return;
+    let targets;
+    if (verb === 'all') targets = clip.slice();
+    else {
+        const sel = _ciSelected();
+        targets = verb === 'copy' ? sel.filter(e => e.action === 'copy')
+                : verb === 'move' ? sel.filter(e => e.action === 'move')
+                : sel.slice();
+    }
+    if (!targets.length) return;
     const destVaultId = state.currentVaultId;
     if (!destVaultId) { showError('Open a vault to paste into.'); return; }
     const destFolderId = state.currentFolderId || null;
     const destPassword = _vaultPasswordFor(destVaultId);
-    const pasteBtn = document.getElementById('move-copy-paste');
-    if (pasteBtn) pasteBtn.disabled = true;
+    const destPath = _ciCurrentPath();
+    const destName = (state.currentVault && state.currentVault.name) || '';
 
     let ok = 0;
     const failures = [];
-    const relocated = new Set();  // moved items that succeeded (leave the clipboard)
-    for (const entry of clip) {
+    const remove = new Set();  // succeeded AND not kept -> leave the list
+    for (const entry of targets) {
         const isFolder = entry.type === 'folder';
-        const verb = entry.action;  // 'copy' | 'move'
-        const base = `/vaults/${entry.sourceVaultId}/${isFolder ? 'folders' : 'files'}/${entry.id}/${verb}`;
+        const base = `/vaults/${entry.sourceVaultId}/${isFolder ? 'folders' : 'files'}/${entry.id}/${entry.action}`;
         const body = isFolder
             ? { dest_vault_id: destVaultId, dest_parent_folder_id: destFolderId }
             : { dest_vault_id: destVaultId, dest_folder_id: destFolderId };
@@ -10014,18 +10488,28 @@ async function pasteMoveCopy() {
         if (srcPw) headers['X-Vault-Password'] = srcPw;
         if (destPassword) headers['X-Dest-Vault-Password'] = destPassword;
         try {
-            await apiRequest(base, { method: 'POST', body: JSON.stringify(body), headers, silent: true });
+            const resp = await apiRequest(base, { method: 'POST', body: JSON.stringify(body), headers, silent: true });
             ok++;
-            if (verb === 'move') relocated.add(entry.id);
+            if (entry.keepAfter) {
+                // A KEPT move relocated the file, so re-point the entry at its new home for the next
+                // paste -- a CROSS-VAULT move mints a NEW id, so adopt the id the endpoint returns.
+                // (A kept copy left the original where it was, so it keeps its id and location.)
+                if (entry.action === 'move') {
+                    if (resp && resp.id) entry.id = resp.id;
+                    entry.sourceVaultId = destVaultId;
+                    entry.sourceVaultName = destName || entry.sourceVaultName;
+                    entry.sourcePath = destPath;
+                }
+            } else {
+                remove.add(entry.id);
+            }
         } catch (e) {
             failures.push(`${entry.name}: ${(e && e.message) || 'failed'}`);
         }
     }
-
-    // Copies stay staged (paste again elsewhere); successful moves leave; failures stay.
-    state.moveCopyClip = clip.filter(e => !relocated.has(e.id));
-    updateMoveCopyBar();
-    if (pasteBtn) pasteBtn.disabled = false;
+    if (remove.size) state.moveCopyClip = clip.filter(e => !remove.has(e.id));
+    updateCopiedItemsButton();
+    if (_ciPanelOpen()) renderCopiedItems();
     if (ok) showSuccess(`Pasted ${ok} item${ok > 1 ? 's' : ''}`);
     if (failures.length) showError(`Could not paste ${failures.length}: ${failures.slice(0, 3).join('; ')}`);
     await loadVaultFiles();
@@ -10056,10 +10540,19 @@ function setupFilesViewControls() {
     if (del) del.addEventListener('click', bulkDeleteFiles);
     const clear = document.getElementById('files-bulk-clear');
     if (clear) clear.addEventListener('click', () => { if (state.selectedFileIds) state.selectedFileIds.clear(); renderVaultFiles(); });
-    const paste = document.getElementById('move-copy-paste');
-    if (paste) paste.addEventListener('click', pasteMoveCopy);
-    const clipClear = document.getElementById('move-copy-clear');
-    if (clipClear) clipClear.addEventListener('click', clearMoveCopy);
+    // Copied Items staging panel.
+    const ciBtn = document.getElementById('copied-items-btn');
+    if (ciBtn) ciBtn.addEventListener('click', toggleCopiedItems);
+    const ciClose = document.getElementById('copied-items-close');
+    if (ciClose) ciClose.addEventListener('click', closeCopiedItems);
+    document.querySelectorAll('.ci-filter[data-ci-filter]').forEach(b =>
+        b.addEventListener('click', () => _ciSetFilter(b.getAttribute('data-ci-filter'))));
+    const ciSelAll = document.getElementById('ci-select-all');
+    if (ciSelAll) ciSelAll.addEventListener('change', () => _ciToggleSelectAll(ciSelAll.checked));
+    const ciKeep = document.getElementById('ci-keep');
+    if (ciKeep) ciKeep.addEventListener('click', () => _ciSetKeepAfter(true));
+    const ciRem = document.getElementById('ci-remove');
+    if (ciRem) ciRem.addEventListener('click', () => _ciSetKeepAfter(false));
 }
 
 async function bulkDownloadFiles() {
@@ -11949,11 +12442,91 @@ async function zkRotateTeamForRevoke(vaultId, revokedUserId, info, fromVersion) 
 // Download file
 // Downloads share the page's transfer gate with uploads, so a user who starts a batch of
 // downloads while files are uploading does not run both sets at once.
+// Live download progress. A small tray (sibling to the upload tray) shows each active download's
+// name + a byte progress bar. This is PURELY a client-side byte counter over the SAME download
+// fetch -- it reads the response body through a stream reader, counts the bytes as they arrive, and
+// reassembles the exact same blob. It does NOT change the download transfer or write anything to disk
+// differently. Rows are built with textContent/DOM (no markup sink).
+let _dlSeq = 0;
+const downloadProgress = {
+    rows: new Map(),   // id -> { row, fill, sub }
+    _tray() {
+        let t = document.getElementById('download-tray');
+        if (!t) { t = document.createElement('div'); t.id = 'download-tray'; document.body.appendChild(t); }
+        return t;
+    },
+    start(fileName, onCancel) {
+        const id = `dl_${++_dlSeq}`;
+        const tray = this._tray();
+        const row = document.createElement('div'); row.className = 'dl-row'; row.setAttribute('data-dl-row', id);
+        const head = document.createElement('div'); head.className = 'dl-head';
+        const name = document.createElement('div'); name.className = 'dl-name'; name.textContent = fileName; name.title = fileName;
+        head.appendChild(name);
+        if (typeof onCancel === 'function') {
+            const cancel = document.createElement('button');
+            cancel.type = 'button'; cancel.className = 'dl-cancel';
+            cancel.title = 'Cancel download'; cancel.setAttribute('aria-label', 'Cancel download');
+            cancel.textContent = '✕';   // ✕
+            cancel.addEventListener('click', () => { try { onCancel(); } catch (_) {} });
+            head.appendChild(cancel);
+        }
+        const sub = document.createElement('div'); sub.className = 'dl-sub'; sub.textContent = 'Downloading…';
+        const bar = document.createElement('div'); bar.className = 'dl-bar';
+        const fill = document.createElement('div'); fill.className = 'dl-bar-fill';
+        bar.appendChild(fill);
+        row.append(head, sub, bar);
+        tray.appendChild(row); tray.classList.add('show');
+        this.rows.set(id, { row, fill, sub });
+        return id;
+    },
+    update(id, received, total) {
+        const r = this.rows.get(id); if (!r) return;
+        const rec = formatBytes ? formatBytes(received) : `${received} B`;
+        if (total > 0) {
+            const pct = Math.min(100, Math.round(received * 100 / total));
+            r.fill.style.width = pct + '%';
+            r.sub.textContent = `${pct}% · ${rec} of ${formatBytes ? formatBytes(total) : total + ' B'}`;
+        } else {
+            // No Content-Length (e.g. a chunked response): show the running byte count, no percentage.
+            r.sub.textContent = rec;
+        }
+    },
+    done(id) {
+        const r = this.rows.get(id); if (!r) return;
+        r.row.remove(); this.rows.delete(id);
+        if (!this.rows.size) { const t = document.getElementById('download-tray'); if (t) t.classList.remove('show'); }
+    },
+};
+
+// Read a fetch Response body to a Blob while reporting byte progress. Falls back to response.blob()
+// when the body is not a readable stream. Reassembles the exact same bytes -- the transfer is
+// unchanged; this only observes it.
+async function readResponseWithProgress(response, onProgress) {
+    const reader = response.body && response.body.getReader ? response.body.getReader() : null;
+    if (!reader) return await response.blob();
+    const total = Number(response.headers.get('Content-Length')) || 0;
+    const chunks = [];
+    let received = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        try { onProgress(received, total); } catch (_) { /* progress UI must never break the download */ }
+    }
+    return new Blob(chunks, { type: response.headers.get('Content-Type') || 'application/octet-stream' });
+}
+
 async function downloadFile(fileId, fileName) {
     return transferGate.run(() => _downloadFile(fileId, fileName));
 }
 
 async function _downloadFile(fileId, fileName) {
+    // A cancel handle for the download. Aborting it stops the in-flight fetch/read; the Standard
+    // path below wires it to the progress tray's Cancel button. (This does not change the transfer
+    // -- it just lets the user stop one.) Declared before the try so the catch can tell a
+    // user-initiated cancel from a genuine failure.
+    const _dlAbort = new AbortController();
     try {
         // Zero-knowledge: if we couldn't decrypt this item's NAME we also lack the DEK for
         // its content epoch, so a download can't be decrypted here — say so plainly.
@@ -11976,7 +12549,7 @@ async function _downloadFile(fileId, fileName) {
         // Fetch file. Not const: a streaming attempt that cannot proceed has already consumed
         // this body, so the buffered fallback replaces it.
         let response = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, {
-            headers
+            headers, signal: _dlAbort.signal
         });
         
         if (!response.ok) {
@@ -12022,7 +12595,16 @@ async function _downloadFile(fileId, fileName) {
                 return;
             }
         } else {
-            blob = await response.blob();
+            // Standard vault: the server has already decrypted, so we just read the body -- but read
+            // it through a byte-counting reader so the download tray can show live progress. Same
+            // bytes, same resulting blob; the fetch/transfer is untouched.
+            const dlId = downloadProgress.start(fileName, () => _dlAbort.abort());
+            try {
+                blob = await readResponseWithProgress(
+                    response, (rec, tot) => downloadProgress.update(dlId, rec, tot));
+            } finally {
+                downloadProgress.done(dlId);
+            }
         }
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -12035,6 +12617,11 @@ async function _downloadFile(fileId, fileName) {
         
         showSuccess('File downloaded successfully');
     } catch (error) {
+        // A user-initiated cancel aborts the fetch/read -- report it as cancelled, not failed.
+        if (_dlAbort.signal.aborted || (error && error.name === 'AbortError')) {
+            showInfo(`Download of "${fileName}" cancelled.`);
+            return;
+        }
         console.error('Download failed:', error);
         showError('Failed to download file');
     }
@@ -12046,12 +12633,284 @@ async function _downloadFile(fileId, fileName) {
 // nothing decrypted is ever written to disk.
 let _previewUrl = null;
 
+// Build the little in-preview zoom toolbar (- / level / + / reset). Labels are set via
+// textContent, so nothing here is a markup sink.
+function buildZoomControls() {
+    const el = document.createElement('div');
+    el.className = 'preview-zoom-controls';
+    const mk = (label, aria) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = label;
+        b.setAttribute('aria-label', aria);
+        b.title = aria;
+        return b;
+    };
+    const minus = mk('−', 'Zoom out');
+    const level = document.createElement('span');
+    level.className = 'preview-zoom-level';
+    level.setAttribute('aria-live', 'polite');
+    level.textContent = '100%';
+    const plus = mk('+', 'Zoom in');
+    const reset = mk('↺', 'Reset zoom');
+    el.append(minus, level, plus, reset);
+    return { el, minus, level, plus, reset };
+}
+
+// Wire wheel / pinch / drag / button zooming onto one preview image. The transform is
+// applied to the <img> alone inside an overflow:hidden container, so it zooms the preview
+// and never the page. All listeners hang off the (soon-to-be-replaced) wrap element and
+// self-clean when the next preview replaces the body, so there is nothing to tear down.
+function setupImageZoom(img, wrap, controls) {
+    const MIN = 1, MAX = 8;
+    let scale = 1, tx = 0, ty = 0;
+    const apply = () => {
+        img.style.transform = scale === 1 ? '' : `translate(${tx}px, ${ty}px) scale(${scale})`;
+        wrap.classList.toggle('zoomed', scale > 1);
+        if (controls.level) controls.level.textContent = Math.round(scale * 100) + '%';
+        if (controls.minus) controls.minus.disabled = scale <= MIN + 1e-3;
+        if (controls.plus) controls.plus.disabled = scale >= MAX - 1e-3;
+    };
+    const clampPan = () => {
+        const r = wrap.getBoundingClientRect();
+        const maxX = (r.width * (scale - 1)) / 2;
+        const maxY = (r.height * (scale - 1)) / 2;
+        tx = Math.max(-maxX, Math.min(maxX, tx));
+        ty = Math.max(-maxY, Math.min(maxY, ty));
+    };
+    // Zoom so the content point currently under (cx,cy) [relative to the wrap centre]
+    // stays put. transform-origin is centre, transform = translate(t) scale(s), so a point
+    // p maps to s*p + t; solving to hold cx fixed gives t' = cx - (cx - t)*(s'/s).
+    const zoomAt = (cx, cy, next) => {
+        next = Math.max(MIN, Math.min(MAX, next));
+        if (Math.abs(next - scale) < 1e-4) return;
+        const ratio = next / scale;
+        tx = cx - (cx - tx) * ratio;
+        ty = cy - (cy - ty) * ratio;
+        scale = next;
+        if (scale <= MIN + 1e-3) { scale = MIN; tx = 0; ty = 0; }
+        clampPan();
+        apply();
+    };
+    wrap.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const r = wrap.getBoundingClientRect();
+        zoomAt(e.clientX - r.left - r.width / 2, e.clientY - r.top - r.height / 2,
+               scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15));
+    }, { passive: false });
+    wrap.addEventListener('dblclick', (e) => {
+        if (e.target.closest && e.target.closest('.preview-zoom-controls')) return;
+        const r = wrap.getBoundingClientRect();
+        if (scale > 1) { scale = 1; tx = 0; ty = 0; apply(); }
+        else zoomAt(e.clientX - r.left - r.width / 2, e.clientY - r.top - r.height / 2, 2.5);
+    });
+    // Drag-to-pan when zoomed, plus two-finger pinch, via pointer events.
+    const pointers = new Map();
+    let pinchDist = 0, panLast = null;
+    const dist = () => { const p = [...pointers.values()]; return Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y); };
+    const mid = () => {
+        const p = [...pointers.values()];
+        const r = wrap.getBoundingClientRect();
+        return { x: (p[0].x + p[1].x) / 2 - r.left - r.width / 2, y: (p[0].y + p[1].y) / 2 - r.top - r.height / 2 };
+    };
+    wrap.addEventListener('pointerdown', (e) => {
+        // Let the zoom buttons get their own clicks. Capturing the pointer on the wrap retargets
+        // pointerup (and therefore the click) to the wrap, which would swallow a button press.
+        if (e.target.closest && e.target.closest('.preview-zoom-controls')) return;
+        pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (pointers.size === 2) {
+            pinchDist = dist(); panLast = null; wrap.classList.remove('panning');
+            for (const id of pointers.keys()) { try { wrap.setPointerCapture(id); } catch (_) {} }
+        } else if (scale > 1) {
+            panLast = { x: e.clientX, y: e.clientY }; wrap.classList.add('panning');
+            try { wrap.setPointerCapture(e.pointerId); } catch (_) {}
+        }
+    });
+    wrap.addEventListener('pointermove', (e) => {
+        if (!pointers.has(e.pointerId)) return;
+        pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (pointers.size === 2) {
+            const d = dist();
+            if (pinchDist > 0) { const m = mid(); zoomAt(m.x, m.y, scale * (d / pinchDist)); }
+            pinchDist = d;
+        } else if (panLast && scale > 1) {
+            tx += e.clientX - panLast.x; ty += e.clientY - panLast.y;
+            panLast = { x: e.clientX, y: e.clientY };
+            clampPan(); apply();
+        }
+    });
+    const endPointer = (e) => {
+        pointers.delete(e.pointerId);
+        if (pointers.size < 2) pinchDist = 0;
+        if (pointers.size === 0) { panLast = null; wrap.classList.remove('panning'); }
+    };
+    wrap.addEventListener('pointerup', endPointer);
+    wrap.addEventListener('pointercancel', endPointer);
+    controls.plus?.addEventListener('click', () => zoomAt(0, 0, scale * 1.4));
+    controls.minus?.addEventListener('click', () => zoomAt(0, 0, scale / 1.4));
+    controls.reset?.addEventListener('click', () => { scale = 1; tx = 0; ty = 0; apply(); });
+    apply();
+}
+
+// Above this size, a media/image/PDF file is NOT pulled into memory just to preview it inline --
+// loading a multi-GB blob can crash the tab. It is refused with a "download it" message instead.
+const MEDIA_PREVIEW_MAX_BYTES = 150 * 1024 * 1024;   // 150 MB
+// Above this size, a Standard-vault text file is previewed from just its FIRST WINDOW (a Range
+// request) rather than loaded whole; the window itself is capped at MEDIA-independent bytes below.
+const TEXT_PREVIEW_WINDOW_BYTES = 2 * 1024 * 1024;   // 2 MB (matches the whole-blob text cap)
+const TEXT_WINDOW_FETCH_BYTES = 512 * 1024;          // read only the first 512 KB of a big text file
+
+// Media/image/PDF extensions that, when large, we refuse to load whole (paired with the MIME check).
+const LARGE_MEDIA_EXTS = new Set([
+    'mp4', 'webm', 'mov', 'mkv', 'avi', 'm4v', 'mpg', 'mpeg',
+    'mp3', 'wav', 'flac', 'ogg', 'oga', 'm4a', 'aac', 'opus',
+    'pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tiff', 'tif',
+]);
+// Text extensions eligible for the windowed big-text preview.
+const WINDOWABLE_TEXT_EXTS = new Set([
+    'txt', 'md', 'markdown', 'mkd', 'mdown', 'json', 'jsonc', 'csv', 'tsv', 'log', 'xml',
+    'yml', 'yaml', 'toml', 'ini', 'cfg', 'conf', 'html', 'htm', 'js', 'mjs', 'cjs', 'ts', 'tsx',
+    'jsx', 'css', 'scss', 'less', 'py', 'pyw', 'sh', 'bash', 'go', 'rs', 'rb', 'php', 'java',
+    'kt', 'c', 'h', 'cpp', 'cc', 'hpp', 'cs', 'sql', 'diff', 'patch', 'srt', 'vtt',
+]);
+
+// Bounded "too large to preview inline" placeholder (no body is fetched at all).
+function _renderPreviewTooLarge(bodyEl, fsize) {
+    const wrap = document.createElement('div');
+    wrap.className = 'preview-none text-center text-secondary p-xl';
+    const p1 = document.createElement('p');
+    p1.textContent = `This file is ${formatBytes ? formatBytes(fsize) : fsize + ' bytes'} — too large to preview inline.`;
+    const p2 = document.createElement('p');
+    p2.className = 'text-sm';
+    p2.textContent = 'Use Download to save it, then open it locally.';
+    wrap.append(p1, p2);
+    bodyEl.replaceChildren(wrap);
+}
+
+// Preview a big Standard-vault text file from just its first window: fetch the leading bytes with a
+// Range request, read at most TEXT_WINDOW_FETCH_BYTES, then cancel the rest so nothing more is
+// buffered. Shows the window in a <pre> with a note that it is truncated. A trailing multi-byte UTF-8
+// character that the byte window split is dropped by the lenient decoder rather than shown as junk.
+async function _renderTextWindow(bodyEl, fileId, fileName, fsize, headers) {
+    const win = TEXT_WINDOW_FETCH_BYTES;
+    const h = { ...headers, 'Range': `bytes=0-${win - 1}` };
+    const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, { headers: h });
+    if (!resp.ok && resp.status !== 206) throw new Error('Could not load file (status ' + resp.status + ')');
+    let got = 0;
+    const chunks = [];
+    const reader = resp.body && resp.body.getReader ? resp.body.getReader() : null;
+    if (reader) {
+        while (got < win) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const take = value.subarray(0, Math.min(value.length, win - got));
+            chunks.push(take); got += take.length;
+        }
+        try { await reader.cancel(); } catch (_) { /* stop the rest; bounded memory */ }
+    } else {
+        // No stream reader (very old browser): the Range response body is already <= the window.
+        const buf = new Uint8Array(await resp.arrayBuffer());
+        chunks.push(buf.subarray(0, win)); got = Math.min(buf.length, win);
+    }
+    const merged = new Uint8Array(got);
+    let off = 0;
+    for (const c of chunks) { merged.set(c, off); off += c.length; }
+    const text = new TextDecoder('utf-8', { fatal: false }).decode(merged);
+    const container = document.createElement('div');
+    container.className = 'preview-render-container';
+    const note = document.createElement('div');
+    note.className = 'preview-window-note';
+    note.textContent = `Showing the first ${formatBytes ? formatBytes(got) : got + ' B'} of `
+        + `${formatBytes ? formatBytes(fsize) : fsize + ' B'} — download the file to view all of it.`;
+    const pre = document.createElement('pre');
+    pre.className = 'preview-text';
+    pre.textContent = text;
+    container.append(note, pre);
+    bodyEl.replaceChildren(container);
+}
+
+// Extensions offered a "Render" toggle in the preview (Markdown / HTML / source). Kept in step with
+// the server's renderer (app/core/preview_render.py); the server has the final say on the kind.
+const RENDERABLE_PREVIEW_EXTS = new Set([
+    'md', 'markdown', 'mkd', 'mdown', 'html', 'htm', 'xhtml',
+    'py', 'pyw', 'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'css', 'scss', 'less', 'json', 'jsonc',
+    'xml', 'yml', 'yaml', 'toml', 'ini', 'cfg', 'conf', 'sh', 'bash', 'zsh', 'ps1', 'bat',
+    'c', 'h', 'cpp', 'cc', 'hpp', 'cs', 'java', 'kt', 'go', 'rs', 'rb', 'php', 'pl', 'lua',
+    'sql', 'r', 'swift', 'scala', 'clj', 'ex', 'exs', 'erl', 'hs', 'diff', 'patch', 'csv', 'tsv',
+    'vue', 'svelte', 'proto', 'graphql',
+]);
+
+// Build a raw-text preview with a "Render" toggle. Raw shows a <pre>; "Render" fetches the SERVER's
+// sanitized, CSP-locked document and shows it in a fully sandboxed iframe. The iframe is created
+// lazily on first Render and reused; toggling only flips which of {<pre>, <iframe>} is visible.
+function _buildRenderablePreview(fileId, fileName, pre, headers) {
+    const container = document.createElement('div');
+    container.className = 'preview-render-container';
+    const toolbar = document.createElement('div');
+    toolbar.className = 'preview-render-toolbar';
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'btn btn-sm btn-secondary';
+    toggle.textContent = 'Render';
+    toolbar.appendChild(toggle);
+    container.append(toolbar, pre);
+    const vaultId = state.currentVault && state.currentVault.id;
+    let frame = null;
+    let showing = 'raw';
+    toggle.addEventListener('click', async () => {
+        if (showing === 'rendered') {
+            if (frame) frame.hidden = true;
+            pre.hidden = false;
+            toggle.textContent = 'Render';
+            showing = 'raw';
+            return;
+        }
+        toggle.disabled = true;
+        const prev = toggle.textContent;
+        toggle.textContent = 'Rendering…';
+        try {
+            if (!frame) {
+                const r = await fetch(`${API_BASE}/vaults/${vaultId}/files/${fileId}/preview-render`, { headers });
+                if (!r.ok) {
+                    let msg = 'This file could not be rendered.';
+                    try { const e = await r.json(); if (typeof e.detail === 'string') msg = e.detail; } catch (_) {}
+                    throw new Error(msg);
+                }
+                const data = await r.json();
+                frame = document.createElement('iframe');
+                frame.className = 'preview-frame preview-render-frame';
+                // Empty sandbox: scripts never run and the frame has an opaque origin, even if the
+                // server's sanitizer somehow let something through. srcdoc (not src) so no request.
+                frame.setAttribute('sandbox', '');
+                frame.title = fileName;
+                frame.srcdoc = data.html;
+                container.appendChild(frame);
+            }
+            frame.hidden = false;
+            pre.hidden = true;
+            toggle.textContent = 'View raw';
+            showing = 'rendered';
+        } catch (err) {
+            showError((err && err.message) || 'This file could not be rendered.');
+            toggle.textContent = prev;
+        } finally {
+            toggle.disabled = false;
+        }
+    });
+    return container;
+}
+
 async function openFilePreview(fileId, fileName, mime) {
     const modal = document.getElementById('file-preview-modal');
     if (!modal) return;
     document.getElementById('file-preview-title').textContent = fileName;
     const bodyEl = document.getElementById('file-preview-body');
-    bodyEl.innerHTML = '<div class="spinner"></div>';
+    // Clear the image-only sizing up front so the spinner, an error (incl. a fetch/decrypt
+    // failure before the branch), and any non-image preview size to content, not a tall box.
+    bodyEl.classList.remove('preview-has-image');
+    const _spinner = document.createElement('div');
+    _spinner.className = 'spinner';
+    bodyEl.replaceChildren(_spinner);
     const dlBtn = document.getElementById('file-preview-download');
     if (dlBtn) dlBtn.onclick = () => downloadFile(fileId, fileName);
     modal.classList.add('active');
@@ -12059,6 +12918,29 @@ async function openFilePreview(fileId, fileName, mime) {
     try {
         const headers = { 'Authorization': `Bearer ${authToken}` };
         if (state.currentVault.has_password && state.vaultPassword) headers['X-Vault-Password'] = state.vaultPassword;
+
+        // Bound memory BEFORE fetching the body. Type + size come from the listing meta + name/MIME,
+        // so we can decide without loading anything: a large media/image/PDF is refused for inline
+        // preview (download it), and a big text file on a Standard vault is previewed from just its
+        // first window via a Range request. ZK content is decrypted end-to-end in the browser, so a
+        // windowed range can't apply there -- ZK keeps the whole-blob path (its own size guard is the
+        // <2MB text check below).
+        const _meta = (state.currentFiles || []).find(i => i.id === fileId);
+        const _fsize = _meta ? (_meta.size || 0) : 0;
+        const _ext0 = (fileName.split('.').pop() || '').toLowerCase();
+        const _mt0 = (mime || '').toLowerCase();
+        const _isMedia = _mt0.startsWith('video/') || _mt0.startsWith('audio/') || _mt0.startsWith('image/')
+            || _mt0.includes('pdf') || LARGE_MEDIA_EXTS.has(_ext0);
+        if (_isMedia && _fsize > MEDIA_PREVIEW_MAX_BYTES) {
+            _renderPreviewTooLarge(bodyEl, _fsize);
+            return;
+        }
+        const _isTextish = _mt0.startsWith('text/') || WINDOWABLE_TEXT_EXTS.has(_ext0);
+        if (_isTextish && _fsize > TEXT_PREVIEW_WINDOW_BYTES && !isZkVault(state.currentVault)) {
+            await _renderTextWindow(bodyEl, fileId, fileName, _fsize, headers);
+            return;
+        }
+
         const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, { headers });
         if (!resp.ok) throw new Error('Could not load file (status ' + resp.status + ')');
         // Zero-knowledge vault: decrypt the ciphertext in-browser before rendering, reading from
@@ -12085,13 +12967,37 @@ async function openFilePreview(fileId, fileName, mime) {
             const pre = document.createElement('pre');
             pre.className = 'preview-text';
             pre.textContent = await blob.text();
-            bodyEl.replaceChildren(pre);
-        } else if (isImg || isPdf || isVideo || isAudio) {
-            const tag = isImg ? 'img' : isPdf ? 'iframe' : isVideo ? 'video' : 'audio';
+            // A "Render" toggle for Markdown / HTML / source files on a Standard vault. Rendering is
+            // done SERVER-side (sanitized by an nh3 allowlist and wrapped in a CSP-locked document)
+            // and shown in a FULLY SANDBOXED iframe (sandbox="" => no scripts, opaque origin) -- so
+            // no script runs, no external request is made, and the file's markup cannot script the
+            // page. A zero-knowledge vault's content lives only in the browser (the server holds
+            // ciphertext), so it stays raw text there.
+            if (RENDERABLE_PREVIEW_EXTS.has(ext) && !isZkVault(state.currentVault)) {
+                bodyEl.replaceChildren(_buildRenderablePreview(fileId, fileName, pre, headers));
+            } else {
+                bodyEl.replaceChildren(pre);
+            }
+        } else if (isImg) {
+            // Image: fit-to-view (CSS object-fit) inside a clipping container, plus a
+            // zoom control that only ever transforms the <img> -- never the page.
+            const wrap = document.createElement('div');
+            wrap.className = 'preview-zoom';
+            const img = document.createElement('img');
+            img.className = 'preview-media';
+            img.src = _previewUrl;
+            img.alt = fileName;
+            img.draggable = false;
+            const controls = buildZoomControls();
+            wrap.append(img, controls.el);
+            bodyEl.classList.add('preview-has-image');
+            bodyEl.replaceChildren(wrap);
+            setupImageZoom(img, wrap, controls);
+        } else if (isPdf || isVideo || isAudio) {
+            const tag = isPdf ? 'iframe' : isVideo ? 'video' : 'audio';
             const el = document.createElement(tag);
             el.src = _previewUrl;
-            if (isImg) { el.className = 'preview-media'; el.alt = fileName; }
-            else if (isPdf) { el.className = 'preview-frame'; el.title = fileName; }
+            if (isPdf) { el.className = 'preview-frame'; el.title = fileName; }
             else if (isVideo) { el.className = 'preview-media'; el.controls = true; }
             else { el.controls = true; el.style.width = '100%'; }
             bodyEl.replaceChildren(el);
@@ -12119,6 +13025,128 @@ function closeFilePreview() {
 }
 
 // Rename vault item (file or folder)
+// Split a file name into its name + extension at the LAST dot. Folders have no extension; a
+// leading-dot dotfile (.env, .gitignore) or a no-dot / trailing-dot name is all-name (ext null).
+// "archive.tar.gz" -> {name:"archive.tar", ext:"gz"}.
+function _splitNameExt(fullName, isFolder) {
+    if (isFolder) return { name: fullName, ext: null };
+    const dot = fullName.lastIndexOf('.');
+    if (dot <= 0 || dot === fullName.length - 1) return { name: fullName, ext: null };
+    return { name: fullName.slice(0, dot), ext: fullName.slice(dot + 1) };
+}
+
+// A dedicated rename dialog with separate name + extension fields. The extension field is
+// read-only until double-clicked; changing it warns (Windows-style) before saving, and the
+// warning's "Keep extension" returns to the dialog rather than closing it. Resolves with the
+// recombined new name, or null on cancel. Mirrors showPrompt's active-class + backdrop/Esc
+// handling so a backdrop dismissal (closed by the global modal handler) still settles the promise.
+function showRenameDialog(currentName, type) {
+    return new Promise((resolve) => {
+        const modal = document.getElementById('rename-modal');
+        if (!modal) { resolve(null); return; }
+        const isFolder = type === 'folder';
+        const { name, ext } = _splitNameExt(currentName, isFolder);
+        const hasExt = !isFolder && ext !== null;
+
+        const titleEl = document.getElementById('rename-modal-title');
+        const nameInput = document.getElementById('rename-name-input');
+        const extWrap = document.getElementById('rename-ext-wrap');
+        const extInput = document.getElementById('rename-ext-input');
+        const extHint = document.getElementById('rename-ext-hint');
+        const errorEl = document.getElementById('rename-error');
+        const warnEl = document.getElementById('rename-warning');
+        const saveBtn = document.getElementById('rename-save');
+        const cancelBtn = document.getElementById('rename-cancel');
+        const closeBtn = document.getElementById('rename-close-btn');
+        const warnKeep = document.getElementById('rename-warn-keep');
+        const warnProceed = document.getElementById('rename-warn-proceed');
+
+        titleEl.textContent = isFolder ? 'Rename folder' : 'Rename file';
+        nameInput.value = name;
+        errorEl.hidden = true; errorEl.textContent = '';
+        warnEl.hidden = true;
+        extWrap.hidden = !hasExt;
+        if (hasExt) {
+            extInput.value = ext;
+            extInput.readOnly = true;
+            extHint.hidden = false;
+        }
+
+        const recombined = () => (hasExt ? `${nameInput.value.trim()}.${extInput.value.trim()}` : nameInput.value.trim());
+        const extChanged = () => hasExt && extInput.value.trim() !== ext;
+
+        let settled = false;
+        const cleanup = () => {
+            modal.classList.remove('active');
+            saveBtn.removeEventListener('click', onSave);
+            cancelBtn.removeEventListener('click', onCancel);
+            closeBtn.removeEventListener('click', onCancel);
+            extInput.removeEventListener('dblclick', onExtDbl);
+            warnKeep.removeEventListener('click', onWarnKeep);
+            warnProceed.removeEventListener('click', onWarnProceed);
+            document.removeEventListener('keydown', onKey);
+            modal.removeEventListener('click', onBackdrop);
+        };
+        const finish = (val) => { if (settled) return; settled = true; cleanup(); resolve(val); };
+
+        const doSave = () => {
+            const nm = nameInput.value.trim();
+            if (!nm) { errorEl.textContent = 'The name cannot be empty.'; errorEl.hidden = false; nameInput.focus(); return; }
+            if (hasExt && !extInput.value.trim()) {
+                errorEl.textContent = 'The extension cannot be empty. Double-click to edit it, or keep it as it is.';
+                errorEl.hidden = false; return;
+            }
+            if (recombined() === currentName) { finish(null); return; }  // no actual change
+            if (extChanged()) {
+                errorEl.hidden = true;
+                warnEl.hidden = false;   // its "Keep extension" returns here; "Change it anyway" proceeds
+                warnProceed.focus();
+                return;
+            }
+            finish(recombined());
+        };
+        const onSave = () => doSave();
+        const onCancel = () => finish(null);
+        // "Keep extension" reverts the extension to its original value and re-locks the field, then
+        // returns to the (still-open) dialog -- so the label is accurate and a following save of a
+        // name-only change proceeds without re-warning.
+        const onWarnKeep = () => {
+            warnEl.hidden = true;
+            if (hasExt) { extInput.value = ext; extInput.readOnly = true; extHint.hidden = false; }
+            nameInput.focus();
+        };
+        const onWarnProceed = () => finish(recombined());
+        const onExtDbl = () => { extInput.readOnly = false; extHint.hidden = true; extInput.focus(); extInput.select(); };
+        const onKey = (e) => {
+            if (e.key === 'Escape') { e.preventDefault(); finish(null); }
+            else if (e.key === 'Enter') {
+                e.preventDefault();
+                if (!warnEl.hidden) onWarnProceed(); else doSave();
+            }
+        };
+        // A backdrop click is closed by the global modal handler; treat it as cancel so the
+        // promise always settles (same reason as showPrompt).
+        const onBackdrop = (e) => { if (e.target === modal) onCancel(); };
+
+        saveBtn.addEventListener('click', onSave);
+        cancelBtn.addEventListener('click', onCancel);
+        closeBtn.addEventListener('click', onCancel);
+        extInput.addEventListener('dblclick', onExtDbl);
+        warnKeep.addEventListener('click', onWarnKeep);
+        warnProceed.addEventListener('click', onWarnProceed);
+        document.addEventListener('keydown', onKey);
+        modal.addEventListener('click', onBackdrop);
+
+        modal.classList.add('active');
+        // Focus the name field with the caret at the END of the name part.
+        setTimeout(() => {
+            nameInput.focus();
+            const len = nameInput.value.length;
+            try { nameInput.setSelectionRange(len, len); } catch (_) {}
+        }, 40);
+    });
+}
+
 async function renameVaultItem(itemId, currentName, type) {
     // A zero-knowledge item whose name we couldn't decrypt (we lack its DEK epoch) can't
     // be renamed here — we'd have to encrypt under a key we don't hold.
@@ -12127,11 +13155,7 @@ async function renameVaultItem(itemId, currentName, type) {
         showError("This item's name is encrypted under a key version you don't have, so it can't be renamed here.");
         return;
     }
-    const newName = await showPrompt(
-        `Enter a new name for this ${type}.`,
-        'Rename item',
-        { placeholder: 'New name', defaultValue: currentName }
-    );
+    const newName = await showRenameDialog(currentName, type);
     if (newName === null || !newName.trim() || newName === currentName) {
         return;
     }
@@ -12800,16 +13824,6 @@ const uploadManager = {
 
     _newId() { return `up_${Date.now()}_${++this.seq}`; },
 
-    // Self-contained inline icons (the main SPA has no svgIcon sprite loaded).
-    _icon(n) {
-        const P = {
-            pause: '<rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>',
-            play: '<path d="M7 4v16l13-8Z"/>',
-            x: '<path d="M18 6 6 18M6 6l12 12"/>',
-        };
-        return `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[n] || ''}</svg>`;
-    },
-
     // Enqueue freshly-picked File objects for the current vault/folder.
     enqueueFiles(files) {
         if (!files || !files.length || !state.currentVault) return;
@@ -13396,102 +14410,161 @@ const uploadManager = {
         return Math.round(it.percent || 0);
     },
 
+    // Build a control icon as a DOM element (not a markup sink) so a per-tick patch can leave the
+    // buttons untouched.
+    _iconEl(n) {
+        const NS = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(NS, 'svg');
+        svg.setAttribute('width', '15'); svg.setAttribute('height', '15'); svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('fill', 'none'); svg.setAttribute('stroke', 'currentColor'); svg.setAttribute('stroke-width', '2');
+        svg.setAttribute('stroke-linecap', 'round'); svg.setAttribute('stroke-linejoin', 'round'); svg.setAttribute('aria-hidden', 'true');
+        const shapes = {
+            pause: [['rect', { x: 6, y: 5, width: 4, height: 14, rx: 1 }], ['rect', { x: 14, y: 5, width: 4, height: 14, rx: 1 }]],
+            play: [['path', { d: 'M7 4v16l13-8Z' }]],
+            x: [['path', { d: 'M18 6 6 18M6 6l12 12' }]],
+        };
+        (shapes[n] || []).forEach(([tag, attrs]) => {
+            const el = document.createElementNS(NS, tag);
+            for (const k in attrs) el.setAttribute(k, attrs[k]);
+            svg.appendChild(el);
+        });
+        return svg;
+    },
+    _statusLabel(status) {
+        return { queued: 'Queued', uploading: 'Uploading', pausing: 'Pausing…', paused: 'Paused',
+                 completing: 'Finalising…', done: 'Done', error: 'Failed', 'needs-file': 'Resumable' }[status] || status;
+    },
+    // Which control buttons a row should show, as a stable signature. The buttons are rebuilt ONLY
+    // when this changes (a status transition) -- never per progress tick -- so a persisting Resume
+    // button keeps its identity, hover and focus instead of flickering as it did when the whole tray
+    // was re-rendered on every received chunk.
+    _controlSig(it) {
+        const s = [];
+        if (it.status === 'uploading' || it.status === 'queued' || it.status === 'completing' || it.status === 'pausing') s.push('pause');
+        if (it.status === 'paused' || it.status === 'error') s.push('resume');
+        if (it.status === 'needs-file' && !it.isZk) s.push('resume-text');
+        if (it.status !== 'done') s.push('cancel');
+        return s.join(',');
+    },
+    _buildControls(el, it) {
+        el.replaceChildren();
+        const add = (action, iconName, title, text) => {
+            const b = document.createElement('button');
+            b.className = 'up-btn' + (text ? ' up-btn-text' : '');
+            b.setAttribute('data-up-action', action);
+            b.setAttribute('data-up-id', it.id);
+            if (title) { b.title = title; b.setAttribute('aria-label', title); }
+            if (text) b.textContent = text; else b.appendChild(this._iconEl(iconName));
+            b.addEventListener('click', () => {
+                if (action === 'pause') this.pause(it.id);
+                else if (action === 'resume') this.resume(it.id);
+                else if (action === 'cancel') this.cancel(it.id);
+            });
+            el.appendChild(b);
+        };
+        const st = it.status;
+        if (st === 'uploading' || st === 'queued' || st === 'completing' || st === 'pausing') add('pause', 'pause', 'Pause');
+        if (st === 'paused' || st === 'error') add('resume', 'play', 'Resume');
+        // Standard vaults resume by re-selecting the file; a ZK item with no local ciphertext offers
+        // only Cancel (+ the note below).
+        if (st === 'needs-file' && !it.isZk) add('resume', null, null, 'Resume…');
+        if (st !== 'done') add('cancel', 'x', 'Cancel');
+    },
+    _renderSub(sub, it) {
+        const pct = this._percent(it);
+        const size = formatBytes ? formatBytes(it.totalSize) : `${it.totalSize} B`;
+        if (it.status === 'error') { sub.className = 'up-error'; sub.replaceChildren(document.createTextNode(it.error || 'Upload failed')); return; }
+        sub.className = 'up-sub';
+        if (it.status === 'needs-file') {
+            sub.replaceChildren(document.createTextNode(it.isZk
+                ? 'Encrypted data isn\'t on this device — cancel and upload again'
+                : 'Paused — click Resume and re-select the file'));
+            return;
+        }
+        const parts = [document.createTextNode(`${this._statusLabel(it.status)} · ${pct}% · ${size}`)];
+        // A resumed upload that found some chunks no longer match says so.
+        if (it.changedLocally) {
+            parts.push(document.createTextNode(' · '));
+            const w = document.createElement('span'); w.className = 'up-warn';
+            w.textContent = `file changed, re-sending ${it.changedLocally} part${it.changedLocally === 1 ? '' : 's'}`;
+            parts.push(w);
+        }
+        // A ZK upload whose ciphertext couldn't be persisted won't survive a reload.
+        const noResume = it.isZk && it.resumePersisted === false && it.resumeWarning
+            && it.status !== 'done' && it.status !== 'error' && it.status !== 'needs-file';
+        if (noResume) {
+            parts.push(document.createTextNode(' · '));
+            const w = document.createElement('span'); w.className = 'up-warn'; w.textContent = 'not resumable';
+            parts.push(w);
+        }
+        sub.replaceChildren(...parts);
+    },
+    _buildRow(it) {
+        const row = document.createElement('div');
+        row.className = 'up-row'; row.setAttribute('data-up-row', it.id);
+        const main = document.createElement('div'); main.className = 'up-main';
+        const name = document.createElement('div'); name.className = 'up-name'; name.textContent = it.fileName; name.title = it.fileName;
+        const sub = document.createElement('div'); sub.className = 'up-sub';
+        const bar = document.createElement('div'); bar.className = 'up-bar';
+        const fill = document.createElement('div'); fill.className = 'up-bar-fill'; bar.appendChild(fill);
+        main.append(name, sub, bar);
+        const controls = document.createElement('div'); controls.className = 'up-controls';
+        row.append(main, controls);
+        row._sub = sub; row._fill = fill; row._controls = controls; row._sig = null;
+        return row;
+    },
+    _patchRow(row, it) {
+        const pct = this._percent(it);
+        row._fill.style.width = pct + '%';
+        row._fill.className = 'up-bar-fill' + (it.status === 'error' ? ' error' : it.status === 'done' ? ' done' : '');
+        this._renderSub(row._sub, it);
+        const sig = this._controlSig(it);
+        if (sig !== row._sig) { row._sig = sig; this._buildControls(row._controls, it); }
+    },
+    _clearFinished() {
+        for (const [id, it] of this.items) {
+            const finished = it.status === 'done' || it.status === 'needs-file' || it.status === 'error';
+            // Keep a row whose server session is still open, even when it looks finished.
+            const stillOnServer = it.status !== 'done' && it.sessionId;
+            if (finished && !stillOnServer) this.items.delete(id);
+        }
+        this.render();
+    },
+    // Keyed in-place reconcile: the tray header + body are built once, and each render only patches
+    // the bar width / sub text (and rebuilds a row's controls on a status change). Nothing that is
+    // unchanged is recreated, so a per-chunk render can no longer flicker the Resume button.
     render() {
         let tray = document.getElementById('upload-tray');
-        if (!tray) {
-            tray = document.createElement('div');
-            tray.id = 'upload-tray';
-            document.body.appendChild(tray);
-        }
+        if (!tray) { tray = document.createElement('div'); tray.id = 'upload-tray'; document.body.appendChild(tray); }
         const items = [...this.items.values()];
-        if (!items.length) { tray.classList.remove('show'); tray.innerHTML = ''; return; }
+        if (!items.length) { tray.classList.remove('show'); tray.replaceChildren(); tray._body = null; return; }
         tray.classList.add('show');
-
-        const rows = items.map(it => {
-            const pct = this._percent(it);
-            const size = formatBytes ? formatBytes(it.totalSize) : `${it.totalSize} B`;
-            const statusLabel = {
-                queued: 'Queued', uploading: 'Uploading', pausing: 'Pausing…',
-                paused: 'Paused', completing: 'Finalising…', done: 'Done',
-                error: 'Failed', 'needs-file': 'Resumable',
-            }[it.status] || it.status;
-
-            let controls = '';
-            if (it.status === 'uploading' || it.status === 'queued' || it.status === 'completing' || it.status === 'pausing') {
-                controls += `<button class="up-btn" data-up-action="pause" data-up-id="${it.id}" title="Pause">${this._icon('pause')}</button>`;
-            }
-            if (it.status === 'paused' || it.status === 'error') {
-                controls += `<button class="up-btn" data-up-action="resume" data-up-id="${it.id}" title="Resume">${this._icon('play')}</button>`;
-            }
-            if (it.status === 'needs-file' && !it.isZk) {
-                // Standard vaults resume by re-selecting the file; a ZK item with no local
-                // ciphertext can't be replayed here, so it offers only Cancel (+ the note below).
-                controls += `<button class="up-btn up-btn-text" data-up-action="resume" data-up-id="${it.id}">Resume…</button>`;
-            }
-            if (it.status !== 'done') {
-                controls += `<button class="up-btn" data-up-action="cancel" data-up-id="${it.id}" title="Cancel">${this._icon('x')}</button>`;
-            }
-
-            const barClass = it.status === 'error' ? 'up-bar-fill error'
-                : it.status === 'done' ? 'up-bar-fill done' : 'up-bar-fill';
-            // For a ZK upload whose ciphertext couldn't be persisted (storage full / write
-            // failure), flag that it won't survive a reload while it's still in flight.
-            const noResume = it.isZk && it.resumePersisted === false && it.resumeWarning
-                && it.status !== 'done' && it.status !== 'error' && it.status !== 'needs-file';
-            // A resumed upload that found some of its chunks no longer match says so. It is
-            // the only signal that the file changed since the interruption, and without it
-            // the re-upload looks like an ordinary slow resume.
-            const changed = it.changedLocally
-                ? ` · <span class="up-warn">file changed, re-sending ${it.changedLocally} part${it.changedLocally === 1 ? '' : 's'}</span>`
-                : '';
-            const sub = it.status === 'error' ? `<div class="up-error">${escapeHtml(it.error || 'Upload failed')}</div>`
-                : it.status === 'needs-file' ? `<div class="up-sub">${it.isZk ? 'Encrypted data isn\'t on this device — cancel and upload again' : 'Paused — click Resume and re-select the file'}</div>`
-                : `<div class="up-sub">${statusLabel} · ${pct}% · ${size}${changed}${noResume ? ' · <span class="up-warn">not resumable</span>' : ''}</div>`;
-
-            return `
-              <div class="up-row" data-up-row="${it.id}">
-                <div class="up-main">
-                  <div class="up-name" title="${escapeHtml(it.fileName)}">${escapeHtml(it.fileName)}</div>
-                  ${sub}
-                  <div class="up-bar"><div class="${barClass}" style="width:${pct}%"></div></div>
-                </div>
-                <div class="up-controls">${controls}</div>
-              </div>`;
-        }).join('');
-
-        // A failed item (e.g. a rejected 0-byte upload) is finished, not active — exclude 'error'
-        // so it doesn't stick in the tray header as "N active" forever.
-        const active = items.filter(i => i.status !== 'done' && i.status !== 'needs-file'
-            && i.status !== 'error').length;
-        tray.innerHTML = `
-          <div class="up-tray-head">
-            <span>Uploads${active ? ` · ${active} active` : ''}</span>
-            <button class="up-btn" id="up-tray-clear" title="Clear finished">${this._icon('x')}</button>
-          </div>
-          <div class="up-tray-body">${rows}</div>`;
-
-        tray.querySelectorAll('button[data-up-action]').forEach(b => {
-            b.addEventListener('click', () => {
-                const a = b.getAttribute('data-up-action');
-                const id = b.getAttribute('data-up-id');
-                if (a === 'pause') this.pause(id);
-                else if (a === 'resume') this.resume(id);
-                else if (a === 'cancel') this.cancel(id);
-            });
-        });
-        const clear = tray.querySelector('#up-tray-clear');
-        if (clear) clear.addEventListener('click', () => {
-            for (const [id, it] of this.items) {
-                const finished = it.status === 'done' || it.status === 'needs-file'
-                    || it.status === 'error';
-                // Keep a row whose server session is still open, even when it looks finished.
-                // Dropping it hid an upload that still existed, and the next attempt at the same
-                // file was refused by a session the user could no longer see or act on.
-                const stillOnServer = it.status !== 'done' && it.sessionId;
-                if (finished && !stillOnServer) this.items.delete(id);
-            }
-            this.render();
-        });
+        if (!tray._body) {
+            tray.replaceChildren();
+            const head = document.createElement('div'); head.className = 'up-tray-head';
+            const label = document.createElement('span');
+            const clear = document.createElement('button'); clear.className = 'up-btn'; clear.id = 'up-tray-clear';
+            clear.title = 'Clear finished'; clear.setAttribute('aria-label', 'Clear finished');
+            clear.appendChild(this._iconEl('x'));
+            clear.addEventListener('click', () => this._clearFinished());
+            head.append(label, clear);
+            const body = document.createElement('div'); body.className = 'up-tray-body';
+            tray.append(head, body);
+            tray._label = label; tray._body = body;
+        }
+        // A failed item is finished, not active -- exclude 'error' from the header count.
+        const active = items.filter(i => i.status !== 'done' && i.status !== 'needs-file' && i.status !== 'error').length;
+        tray._label.textContent = active ? `Uploads · ${active} active` : 'Uploads';
+        const body = tray._body;
+        const esc = (window.CSS && CSS.escape) ? (s) => CSS.escape(s) : (s) => s;
+        const seen = new Set();
+        for (const it of items) {
+            seen.add(String(it.id));
+            let row = body.querySelector(`.up-row[data-up-row="${esc(String(it.id))}"]`);
+            if (!row) { row = this._buildRow(it); body.appendChild(row); }
+            this._patchRow(row, it);
+        }
+        body.querySelectorAll('.up-row').forEach(row => { if (!seen.has(row.getAttribute('data-up-row'))) row.remove(); });
     },
 };
 
@@ -13564,8 +14637,30 @@ async function uploadFiles(files) {
 
     const existing = new Set((state.currentFiles || []).filter(i => i.type !== 'folder').map(i => i.name));
     const idByName = new Map((state.currentFiles || []).filter(i => i.type !== 'folder').map(i => [i.name, i.id]));
+    // A name that is CURRENTLY UPLOADING into THIS folder is taken too. Without this, a second pick
+    // of the same file races the first and both land (the reported "uploaded twice"), and a single
+    // re-pick while the first is still in flight wouldn't prompt because the name isn't in the file
+    // list yet — the bug where a single-file re-upload silently added a duplicate while a multi-file
+    // batch (which also dedupes within itself) appeared to "always prompt". The in-flight item
+    // carries the plaintext name the user chose, so this also covers zero-knowledge vaults, where
+    // the server never sees the name. An in-flight name has no committed id to delete: choosing
+    // "replace" for one cancels that in-flight upload and uploads the new file in its place (see
+    // toCancelInFlight below), rather than pushing a second copy that would race the first.
+    //
+    // Only NOT-YET-COMMITTED statuses count. A finished ('done') upload has already refreshed the
+    // file list (loadVaultFiles runs on completion), so its name is in state.currentFiles if it is
+    // still there — and NOT here, so a re-upload after that file was deleted is correctly free.
+    const _curFolder = state.currentFolderId || null;
+    const _pendingUpload = (it) => it.status !== 'error' && it.status !== 'done' && !it.cancelled;
+    for (const it of uploadManager.items.values()) {
+        if (it.vaultId !== state.currentVault.id) continue;
+        if ((it.folderId || null) !== _curFolder) continue;
+        if (!_pendingUpload(it)) continue;
+        if (it.fileName) existing.add(it.fileName);
+    }
     let toUpload = [];   // {file, name}
     const toDelete = [];   // existing file ids to remove (overwrite)
+    const toCancelInFlight = new Set();   // in-flight upload names to cancel before re-uploading
     let blanket = null;    // {action} once "apply to all" is chosen
 
     for (const file of arr) {
@@ -13585,7 +14680,14 @@ async function uploadFiles(files) {
             const id = idByName.get(file.name);
             // The name travels with the id: if the delete fails, the replacement that would have
             // taken this name has to be dropped, and it is identified by name rather than id.
-            if (id) toDelete.push({ id, name: file.name });
+            if (id) {
+                toDelete.push({ id, name: file.name });
+            } else {
+                // No committed row -- the name is held by an upload still IN FLIGHT. "Replace"
+                // means replace THAT upload: cancel it (below) before enqueuing this one, so a
+                // second copy of the same name can't race it and both land.
+                toCancelInFlight.add(file.name);
+            }
             toUpload.push({ file, name: file.name });
         } else {
             let name = (choice.action === 'rename' && choice.name) ? choice.name : autoName;
@@ -13593,6 +14695,21 @@ async function uploadFiles(files) {
             toUpload.push({ file, name });
             existing.add(name);
         }
+    }
+
+    // Cancel any in-flight uploads the user chose to REPLACE, before enqueuing their replacements,
+    // so the old and new copies of a name can't both finish. Re-scanned here (the modal ran async,
+    // so the live set may have changed) and matched by vault + folder + name; cancel() deletes the
+    // server session, so the replacement uploads cleanly.
+    if (toCancelInFlight.size) {
+        const victims = [];
+        for (const it of uploadManager.items.values()) {
+            if (it.vaultId !== state.currentVault.id) continue;
+            if ((it.folderId || null) !== _curFolder) continue;
+            if (!_pendingUpload(it)) continue;
+            if (toCancelInFlight.has(it.fileName)) victims.push(it.id);
+        }
+        for (const vid of victims) { try { await uploadManager.cancel(vid); } catch (_) { /* best effort */ } }
     }
 
     if (toUpload.length) {

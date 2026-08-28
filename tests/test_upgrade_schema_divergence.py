@@ -155,6 +155,90 @@ def _table_exists(table):
     return found.strip() not in ("", "0")
 
 
+def _model_fk_columns():
+    """{(tablename, column): ondelete} for every ForeignKey column the model declares.
+
+    Table-AWARE on purpose: the same column name (folder_id, temp_credential_id) exists on several
+    tables, some with a FK and some without, so a name-only match gives false positives. The tuple
+    keys keep each (table, column) distinct.
+    """
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "app" / "core" / "models.py").read_text(encoding="utf-8")
+    out = {}
+    for cls in [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.ClassDef)]:
+        tablename = None
+        cols = {}
+        for stmt in cls.body:
+            if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+                continue
+            target = stmt.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            if target.id == "__tablename__" and isinstance(stmt.value, ast.Constant):
+                tablename = stmt.value.value
+                continue
+            # Look for a ForeignKey(...) call anywhere inside this Column(...) assignment, and read
+            # its ondelete= keyword (defaults to None when the DB's default applies).
+            for node in ast.walk(stmt.value) if isinstance(stmt.value, ast.Call) else []:
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ForeignKey":
+                    ondelete = None
+                    for kw in node.keywords:
+                        if kw.arg == "ondelete" and isinstance(kw.value, ast.Constant):
+                            ondelete = kw.value.value
+                    cols[target.id] = ondelete
+                    break
+        if tablename:
+            for col, ondelete in cols.items():
+                out[(tablename, col)] = ondelete
+    return out
+
+
+def _boot_added_columns():
+    """{(table, column)} added to an existing install by the boot DDL's ADD COLUMN statements."""
+    added = set()
+    for stmt in _boot_statements():
+        m = re.match(r"ALTER TABLE (\w+) ADD COLUMN IF NOT EXISTS (\w+)\b", stmt, re.IGNORECASE)
+        if m:
+            added.add((m.group(1), m.group(2)))
+    return added
+
+
+@pytest.mark.unit
+def test_boot_ddl_adds_the_fk_for_every_model_fk_column_it_introduces():
+    """A model column declared with a ForeignKey, when it also reaches an existing install via an
+    ADD COLUMN in the boot DDL, must have its FK constraint added by the boot DDL too -- or a fresh
+    create_all schema (which has the FK) and an upgraded one (which would not) diverge, and a deleted
+    referent dangles instead of being nulled/cascaded. files.modified_by diverged exactly this way
+    and this test is what keeps the next such column from doing the same.
+
+    Table-aware, so a same-named column on another table (e.g. chunked_upload_sessions.folder_id,
+    which the model declares WITHOUT a FK) is not a false positive.
+    """
+    from pathlib import Path
+    boot_src = (Path(__file__).resolve().parents[1] / "app" / "api" / "api_server.py").read_text(
+        encoding="utf-8")
+    fk_cols = _model_fk_columns()
+    added = _boot_added_columns()
+    assert fk_cols and added, "premise changed: no FK columns and/or no ADD COLUMN statements found"
+
+    # No grandfathered gaps: the one this guard was born with -- temporary_credentials.
+    # created_by_temp_credential_id, which reached upgraded installs without its self-referential FK --
+    # was closed in 0.18.2, so the guard now holds every FK column to the same rule with no exceptions.
+    KNOWN_PREEXISTING_GAPS = set()
+
+    diverging = sorted((t, c) for (t, c) in added
+                       if (t, c) in fk_cols and (t, c) not in KNOWN_PREEXISTING_GAPS)
+    for table, col in diverging:
+        assert re.search(
+            rf"ALTER TABLE {table} ADD CONSTRAINT\s+\w+\s+FOREIGN KEY\s*\(\s*{col}\s*\)",
+            boot_src, re.IGNORECASE), (
+            f"the boot DDL adds {table}.{col} (which the model declares with a ForeignKey) but never "
+            f"adds its FOREIGN KEY constraint. A fresh create_all install gets the FK and an upgraded "
+            f"one does not -- the two schemas diverge and a deleted referent dangles. Add a guarded "
+            f"'ALTER TABLE {table} ADD CONSTRAINT ... FOREIGN KEY ({col}) REFERENCES ... "
+            f"ON DELETE {fk_cols[(table, col)] or '<rule>'}' in the same DDL block.")
+
+
 @pytest.mark.unit
 def test_the_boot_ddl_implements_what_the_model_declares():
     """The source of the old divergence, now the source of its fix.

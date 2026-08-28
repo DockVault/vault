@@ -73,6 +73,8 @@
         <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/></symbol>
         <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
         <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></symbol>
+        <symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="12" cy="19" r="1.6"/></symbol>
+        <symbol id="i-hash" viewBox="0 0 24 24"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></symbol>
         <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
         <symbol id="i-file-text" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v5h5"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></symbol>
         <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></symbol>
@@ -593,6 +595,7 @@
                                 <button id="upload-file-btn" class="btn btn-primary btn-sm"><svg class="icon icon-sm"><use href="#i-upload"/></svg> Upload File</button>
                                 <button id="create-folder-btn" class="btn btn-secondary btn-sm"><svg class="icon icon-sm"><use href="#i-folder"/></svg> New Folder</button>
                                 <button id="share-vault-btn" class="btn btn-secondary btn-sm"><svg class="icon icon-sm"><use href="#i-link"/></svg> Share</button>
+                                <button id="copied-items-btn" class="btn btn-secondary btn-sm" type="button" hidden aria-haspopup="true"><svg class="icon icon-sm"><use href="#i-copy"/></svg> Copied Items <span class="ci-badge-count" id="copied-items-count">0</span></button>
                             </div>
                         </div>
 
@@ -606,16 +609,47 @@
                             </div>
                         </div>
 
-                        <!-- Move/Copy clipboard. Shown while items are staged (via each item's Copy/
-                             Move action). "Paste here" drops them into the current vault + folder;
-                             copied items stay staged so you can paste them in several places, moved
-                             items leave the clipboard once relocated. Rows are rendered with
-                             textContent, so a staged item's name is never HTML. -->
-                        <div id="move-copy-bar" class="bulk-bar" hidden>
-                            <span class="bulk-bar-count"><strong id="move-copy-count">0</strong> item(s) ready to paste</span>
-                            <div class="bulk-bar-actions">
-                                <button id="move-copy-paste" class="btn btn-sm btn-primary" type="button"><svg class="icon icon-sm"><use href="#i-copy"/></svg> Paste here</button>
-                                <button id="move-copy-clear" class="btn btn-sm btn-ghost" type="button">Clear</button>
+                        <!-- Copied Items staging panel. Opened from the "Copied Items" toolbar button.
+                             Lists each staged file/folder (source location, size, date), lets you
+                             select a subset and Paste (copies) / Move (cuts) them into the CURRENT
+                             vault+folder, or Delete-from-list. A copied item can be KEPT after pasting
+                             (paste it into many folders); a per-item border shows keep vs remove.
+                             All names/locations are rendered with textContent -- never HTML. -->
+                        <aside id="copied-items-panel" class="ci-panel" hidden aria-label="Copied items">
+                            <div class="ci-head">
+                                <h3 class="ci-title">Copied Items</h3>
+                                <button class="ci-close" id="copied-items-close" type="button" aria-label="Close">&times;</button>
+                            </div>
+                            <div class="ci-filters" role="group" aria-label="Filter by action">
+                                <button class="ci-filter active" type="button" data-ci-filter="all">All <span id="ci-count-all">0</span></button>
+                                <button class="ci-filter" type="button" data-ci-filter="copy">Copy <span id="ci-count-copy">0</span></button>
+                                <button class="ci-filter" type="button" data-ci-filter="move">Cut <span id="ci-count-move">0</span></button>
+                                <label class="ci-selall"><input type="checkbox" id="ci-select-all"> Select all</label>
+                            </div>
+                            <div class="ci-list" id="ci-list"></div>
+                            <div class="ci-empty" id="ci-empty" hidden>Nothing staged. Right-click a file and choose Copy or Move.</div>
+                            <div class="ci-actions" id="ci-actions" hidden>
+                                <div class="ci-action-row" id="ci-action-buttons"></div>
+                                <div class="ci-settings-row" id="ci-settings" hidden>
+                                    <span class="ci-settings-label">After pasting:</span>
+                                    <button class="btn btn-sm btn-ghost" type="button" id="ci-keep">Keep after</button>
+                                    <button class="btn btn-sm btn-ghost" type="button" id="ci-remove">Remove after</button>
+                                </div>
+                            </div>
+                        </aside>
+
+                        <!-- Mixed Paste/Move confirmation (a selection with both copies and cuts) -->
+                        <div id="ci-mixed-modal" class="modal">
+                            <div class="modal-content" style="max-width: 520px;">
+                                <div class="modal-header">
+                                    <h3>Paste and Move</h3>
+                                    <button class="close-modal-btn modal-close" aria-label="Close">&times;</button>
+                                </div>
+                                <div class="modal-body" id="ci-mixed-body"></div>
+                                <div class="modal-footer">
+                                    <button class="close-modal-btn btn btn-secondary" type="button">Cancel</button>
+                                    <button class="btn btn-primary" type="button" id="ci-mixed-confirm">Paste &amp; Move</button>
+                                </div>
                             </div>
                         </div>
 
@@ -627,16 +661,17 @@
                                         <thead>
                                             <tr>
                                                 <th class="col-check"><input type="checkbox" id="files-select-all" class="files-check" aria-label="Select all files"></th>
-                                                <th>Name</th>
-                                                <th class="col-num">Size</th>
-                                                <th>Type</th>
-                                                <th>Modified</th>
+                                                <th class="sortable" data-sort-key="name" role="button" tabindex="0" aria-sort="none">Name<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="col-num sortable" data-sort-key="size" role="button" tabindex="0" aria-sort="none">Size<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="sortable" data-sort-key="type" role="button" tabindex="0" aria-sort="none">Type<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="sortable" data-sort-key="modified" role="button" tabindex="0" aria-sort="none">Modified<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="sortable" data-sort-key="modified_by" role="button" tabindex="0" aria-sort="none">Modified by<span class="sort-ind" aria-hidden="true"></span></th>
                                                 <th class="col-actions">Actions</th>
                                             </tr>
                                         </thead>
                                         <tbody id="vault-files-table-body">
                                             <tr>
-                                                <td colspan="6" class="text-center p-lg">Loading files...</td>
+                                                <td colspan="7" class="text-center p-lg">Loading files...</td>
                                             </tr>
                                         </tbody>
                                     </table>
@@ -3367,7 +3402,7 @@
 
             <!-- File Preview Modal -->
             <div id="file-preview-modal" class="modal">
-                <div class="modal-content" style="max-width: 900px; width: 92%;">
+                <div class="modal-content modal-preview">
                     <div class="modal-header">
                         <h3 id="file-preview-title" class="mono" style="font-size: var(--text-base); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">Preview</h3>
                         <div class="flex items-center gap-sm">
@@ -3376,6 +3411,53 @@
                         </div>
                     </div>
                     <div class="modal-body" id="file-preview-body"></div>
+                </div>
+            </div>
+
+            <!-- File Info Modal -->
+            <div id="file-info-modal" class="modal">
+                <div class="modal-content" style="max-width: 560px;">
+                    <div class="modal-header">
+                        <h3 id="file-info-title" class="mono" style="font-size: var(--text-base); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">File information</h3>
+                        <button class="close-modal-btn modal-close" aria-label="Close">×</button>
+                    </div>
+                    <div class="modal-body" id="file-info-body"></div>
+                </div>
+            </div>
+
+            <!-- Rename (edit filename) Modal -->
+            <div id="rename-modal" class="modal">
+                <div class="modal-content" style="max-width: 480px;">
+                    <div class="modal-header">
+                        <h3 id="rename-modal-title">Rename</h3>
+                        <button type="button" class="close-modal-btn modal-close" id="rename-close-btn" aria-label="Close">&times;</button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="form-group">
+                            <label for="rename-name-input">Name</label>
+                            <input type="text" id="rename-name-input" class="form-control" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+                        </div>
+                        <div class="form-group" id="rename-ext-wrap">
+                            <label for="rename-ext-input">Extension</label>
+                            <div class="rename-ext-row">
+                                <span class="rename-dot" aria-hidden="true">.</span>
+                                <input type="text" id="rename-ext-input" class="form-control" readonly autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" title="Double-click to change the extension">
+                            </div>
+                            <p class="text-xs text-secondary" id="rename-ext-hint" style="margin:4px 0 0 0;">Double-click to change the extension.</p>
+                        </div>
+                        <p id="rename-error" class="alert alert-error" hidden style="margin-top:12px;"></p>
+                        <div id="rename-warning" class="alert alert-warning" hidden style="margin-top:12px;">
+                            <p style="margin:0 0 8px 0;">If you change a file name extension, the file might become unusable. Are you sure you want to change it?</p>
+                            <div class="flex gap-sm">
+                                <button type="button" class="btn btn-sm btn-secondary" id="rename-warn-keep">Keep extension</button>
+                                <button type="button" class="btn btn-sm btn-danger" id="rename-warn-proceed">Change it anyway</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" id="rename-cancel">Cancel</button>
+                        <button type="button" class="btn btn-primary" id="rename-save">Save</button>
+                    </div>
                 </div>
             </div>
 

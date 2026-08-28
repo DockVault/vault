@@ -49,5 +49,12 @@ keyring==25.7.0
 # (no compiler) on both amd64 and arm64.
 nh3==0.3.6
 
+# In-vault file PREVIEW rendering (Standard vaults only): Markdown -> HTML and Pygments source
+# highlighting. Their output is ALWAYS run back through an nh3 allowlist (app/core/preview_render.py)
+# and shown in a fully-sandboxed, CSP-locked iframe, so neither library's output is trusted markup.
+# Both are pure-Python (no compiler needed for the alpine image).
+Markdown==3.10.3
+Pygments==2.20.0
+
 # NOTE: `requests` was removed — the only outbound HTTP is a stdlib-urllib localhost /health probe.
 # (The test suite's own `requests` dependency lives in tests/requirements-test.txt, not in the image.)

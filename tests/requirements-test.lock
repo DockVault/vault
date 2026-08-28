@@ -68,6 +68,8 @@ invoke==3.0.3
     # via paramiko
 license-expression==30.4.4
     # via cyclonedx-python-lib
+markdown==3.10.3
+    # via -r requirements-test.txt
 markdown-it-py==4.2.0
     # via rich
 mdurl==0.1.2

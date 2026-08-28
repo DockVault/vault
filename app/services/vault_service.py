@@ -1989,6 +1989,7 @@ class VaultService:
             file.name_bi = zk_name_bi
             file.name = None
             file.original_name = None
+            file.modified_by = user.id
             file.updated_at = datetime.now(timezone.utc)
             self.db.commit()
             return {'old_name': None, 'new_name': None, 'file_type': 'file'}
@@ -2059,6 +2060,7 @@ class VaultService:
 
         # Update database record
         file.original_name = new_name
+        file.modified_by = user.id
 
         # NOTE: the on-disk blob is named purely by the file UUID (no extension), so a
         # metadata rename does NOT touch the filesystem — and must NOT write the new
