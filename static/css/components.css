@@ -1898,6 +1898,19 @@ details summary:hover {
 .preview-render-frame { width: 100%; height: 66vh; border: 1px solid var(--border); border-radius: var(--radius-md); background: #fff; }
 .preview-render-container [hidden] { display: none; }
 
+/* Live download progress tray: a small fixed panel (bottom-left, opposite the upload tray) with one
+   row per active download showing the file name + a byte progress bar. */
+#download-tray { position: fixed; left: 1.25rem; bottom: 1.25rem; width: 340px; max-width: calc(100vw - 2rem);
+    background: var(--surface-1); border: 1px solid var(--surface-3); border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-lg); z-index: 1200; overflow: hidden; display: none; padding: 6px; }
+#download-tray.show { display: block; }
+.dl-row { padding: 8px 10px; }
+.dl-row + .dl-row { border-top: 1px solid var(--surface-3); }
+.dl-name { font-size: var(--text-sm); font-weight: 500; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dl-sub { font-size: var(--text-xs); color: var(--text-secondary); margin: 2px 0 6px 0; }
+.dl-bar { height: 5px; background: var(--surface-3); border-radius: 999px; overflow: hidden; }
+.dl-bar-fill { height: 100%; width: 0; background: var(--accent-ok-fg, #16a34a); border-radius: 999px; transition: width 0.15s linear; }
+
 /* Image zoom: the transform lives on the <img> inside an overflow:hidden
    container, so zooming/panning only ever affects the preview, never the page. */
 .preview-zoom {

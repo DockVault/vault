@@ -12422,6 +12422,71 @@ async function zkRotateTeamForRevoke(vaultId, revokedUserId, info, fromVersion) 
 // Download file
 // Downloads share the page's transfer gate with uploads, so a user who starts a batch of
 // downloads while files are uploading does not run both sets at once.
+// Live download progress. A small tray (sibling to the upload tray) shows each active download's
+// name + a byte progress bar. This is PURELY a client-side byte counter over the SAME download
+// fetch -- it reads the response body through a stream reader, counts the bytes as they arrive, and
+// reassembles the exact same blob. It does NOT change the download transfer or write anything to disk
+// differently. Rows are built with textContent/DOM (no markup sink).
+let _dlSeq = 0;
+const downloadProgress = {
+    rows: new Map(),   // id -> { row, fill, sub }
+    _tray() {
+        let t = document.getElementById('download-tray');
+        if (!t) { t = document.createElement('div'); t.id = 'download-tray'; document.body.appendChild(t); }
+        return t;
+    },
+    start(fileName) {
+        const id = `dl_${++_dlSeq}`;
+        const tray = this._tray();
+        const row = document.createElement('div'); row.className = 'dl-row'; row.setAttribute('data-dl-row', id);
+        const name = document.createElement('div'); name.className = 'dl-name'; name.textContent = fileName; name.title = fileName;
+        const sub = document.createElement('div'); sub.className = 'dl-sub'; sub.textContent = 'Downloading…';
+        const bar = document.createElement('div'); bar.className = 'dl-bar';
+        const fill = document.createElement('div'); fill.className = 'dl-bar-fill';
+        bar.appendChild(fill);
+        row.append(name, sub, bar);
+        tray.appendChild(row); tray.classList.add('show');
+        this.rows.set(id, { row, fill, sub });
+        return id;
+    },
+    update(id, received, total) {
+        const r = this.rows.get(id); if (!r) return;
+        const rec = formatBytes ? formatBytes(received) : `${received} B`;
+        if (total > 0) {
+            const pct = Math.min(100, Math.round(received * 100 / total));
+            r.fill.style.width = pct + '%';
+            r.sub.textContent = `${pct}% · ${rec} of ${formatBytes ? formatBytes(total) : total + ' B'}`;
+        } else {
+            // No Content-Length (e.g. a chunked response): show the running byte count, no percentage.
+            r.sub.textContent = rec;
+        }
+    },
+    done(id) {
+        const r = this.rows.get(id); if (!r) return;
+        r.row.remove(); this.rows.delete(id);
+        if (!this.rows.size) { const t = document.getElementById('download-tray'); if (t) t.classList.remove('show'); }
+    },
+};
+
+// Read a fetch Response body to a Blob while reporting byte progress. Falls back to response.blob()
+// when the body is not a readable stream. Reassembles the exact same bytes -- the transfer is
+// unchanged; this only observes it.
+async function readResponseWithProgress(response, onProgress) {
+    const reader = response.body && response.body.getReader ? response.body.getReader() : null;
+    if (!reader) return await response.blob();
+    const total = Number(response.headers.get('Content-Length')) || 0;
+    const chunks = [];
+    let received = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        try { onProgress(received, total); } catch (_) { /* progress UI must never break the download */ }
+    }
+    return new Blob(chunks, { type: response.headers.get('Content-Type') || 'application/octet-stream' });
+}
+
 async function downloadFile(fileId, fileName) {
     return transferGate.run(() => _downloadFile(fileId, fileName));
 }
@@ -12495,7 +12560,16 @@ async function _downloadFile(fileId, fileName) {
                 return;
             }
         } else {
-            blob = await response.blob();
+            // Standard vault: the server has already decrypted, so we just read the body -- but read
+            // it through a byte-counting reader so the download tray can show live progress. Same
+            // bytes, same resulting blob; the fetch/transfer is untouched.
+            const dlId = downloadProgress.start(fileName);
+            try {
+                blob = await readResponseWithProgress(
+                    response, (rec, tot) => downloadProgress.update(dlId, rec, tot));
+            } finally {
+                downloadProgress.done(dlId);
+            }
         }
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
