@@ -101,6 +101,25 @@ def test_image_installs_only_the_hash_locked_production_environment():
     assert "curl" not in _DOCKERFILE
 
 
+def test_apk_upgrade_is_the_only_unpinned_install():
+    """`RUN apk --no-cache upgrade` is the ONE deliberate unpinned network install: it ships the
+    base-OS security patches the release scan requires, at the cost of byte-for-byte reproducibility
+    (documented in docs/supply-chain-controls.md). Keep it the only one, so the exception stays a
+    single reviewed line and a second unpinned install cannot be added quietly under this file's
+    "reproducible images" contract."""
+    apk_lines = [
+        ln.strip() for ln in _DOCKERFILE.splitlines()
+        if re.search(r"\bapk\b", ln) and not ln.lstrip().startswith("#")
+    ]
+    assert apk_lines == ["RUN apk --no-cache upgrade"], (
+        "the only apk line must be the documented `RUN apk --no-cache upgrade`; found: %r" % apk_lines
+    )
+    doc = (_ROOT / "docs" / "supply-chain-controls.md").read_text(encoding="utf-8")
+    assert "apk --no-cache upgrade" in doc and "reproducib" in doc.lower(), (
+        "the apk reproducibility exception must be documented in docs/supply-chain-controls.md"
+    )
+
+
 def test_cpython_security_backports_are_exact_and_verified_during_build():
     readme = (_ROOT / "security" / "cpython-backports" / "README.md").read_text(
         encoding="utf-8"

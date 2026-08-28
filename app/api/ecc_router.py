@@ -1067,8 +1067,23 @@ async def get_vault_keys(
     so a key left active by a failed legacy revoke is dropped before it can be served.
     """
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
-    if not vault:
-        raise HTTPException(status_code=404, detail="Vault not found")
+    # A caller with NO relationship to the vault gets 403 whether or not it exists, so this endpoint no
+    # longer confirms a vault's existence or leaks its key topology (mode / current_dek_version) to a
+    # stranger. "Related" = owner, a direct vault_members row, OR any wrapped-DEK row (VaultMemberKey)
+    # for this vault — active OR revoked. That keeps every legitimate caller: a granted member reaches
+    # it (200, has_access true), and a REVOKED member still reaches it (200, has_access false, which
+    # the revoke flow relies on), while someone who was never a member is refused. can_access_vault is
+    # deliberately NOT used: a zero-knowledge member is tracked by their VaultMemberKey, not a
+    # vault_members row, so it would wrongly 403 legitimate ZK members.
+    _reaches_vault = vault is not None and (
+        _is_member(db, vault, current_user.id)
+        or db.query(VaultMemberKey.id).filter(
+            VaultMemberKey.vault_id == vault_id,
+            VaultMemberKey.user_id == current_user.id,
+        ).first() is not None
+    )
+    if not _reaches_vault:
+        raise HTTPException(status_code=403, detail="No access to this vault's keys")
     if not may_release_vault_key(db, current_user, vault):
         raise HTTPException(
             status_code=403, detail=TEMP_ZK_KEY_ACCESS_DENIED

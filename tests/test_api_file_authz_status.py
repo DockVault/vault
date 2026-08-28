@@ -30,6 +30,22 @@ def test_readonly_member_write_ops_are_403_not_500(admin, temp_user, temp_user_c
         admin.delete_vault(vid)
 
 
+def test_non_member_vault_settings_ops_are_403_not_500(admin, temp_user, temp_user_client):
+    # A non-member updating vault info (PATCH /vaults/{id}) or changing the vault password
+    # (PUT /vaults/{id}/password) used to get a 500: get_vault() raises PermissionDeniedError, which
+    # neither handler caught, so it fell through to the generic 500. Both must be a clean 403.
+    v = admin.create_vault()
+    vid = v["id"]
+    try:
+        assert temp_user_client.patch(f"/vaults/{vid}", json={"name": "hijacked"}).status_code == 403
+        assert temp_user_client.put(
+            f"/vaults/{vid}/password", json={"password": "New-Strong-Pass-1234"}).status_code == 403
+        # get_vault (the endpoint that was always right) still answers 403 for the same input.
+        assert temp_user_client.get(f"/vaults/{vid}").status_code == 403
+    finally:
+        admin.delete_vault(vid)
+
+
 def test_non_member_read_ops_are_403_not_500(admin, temp_user, temp_user_client):
     v = admin.create_vault()
     vid = v["id"]

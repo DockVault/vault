@@ -7665,19 +7665,26 @@ async def redeem_note_link(
     if not token or len(token) > _NOTELINK_TOKEN_MAX_INPUT:
         raise HTTPException(status_code=404, detail="This link is not available.")
 
-    # (1) Redemption rate limit — 10 requests / minute per (IP, link), fail-closed (anonymous
-    # surface). Keying on IP+token means one IP may open many different links, but is throttled on
-    # any single one; the global middleware caps a single IP's overall rate, and the per-token
-    # lockout below stops distributed secret-guessing on one link.
+    # (1) Redemption rate limit, fail-closed (anonymous surface). TWO buckets, because one alone
+    # cannot see both attack shapes:
+    #   - per (IP, link): throttles hammering ONE link (the per-link secret lockout below is the
+    #     stronger guard there, but this bounds request volume on a single token).
+    #   - per IP alone: throttles guessing many DIFFERENT tokens from one IP (enumeration). The
+    #     per-pair bucket gives each new token a fresh allowance, so it is blind to enumeration; this
+    #     is the per-IP throttle GET /invites/{token} and /reset/{token} already apply.
     try:
         allowed, _, reset = _rl.check_rate_limit(
             identifier=f"{client_ip}:{token}", limit=_NOTELINK_REDEEM_LIMIT,
             window=_NOTELINK_REDEEM_WINDOW, prefix="notelink_redeem", fail_open=False)
+        allowed_ip, _, reset_ip = _rl.check_rate_limit(
+            identifier=client_ip, limit=settings.rate_limit_api_auth,
+            window=settings.rate_limit_api_auth_window, prefix="notelink_redeem_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
-    if not allowed:
+    if not allowed or not allowed_ip:
+        _reset = reset if not allowed else reset_ip
         raise HTTPException(status_code=429, detail="Too many requests.",
-                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+                            headers={"Retry-After": str(max(1, _reset - int(_t.time())))})
 
     def _audit(status, reason=None, link_id=None):
         try:
@@ -9982,6 +9989,10 @@ async def update_vault_info(
         )
     except HTTPException:
         raise
+    except PermissionDeniedError as e:
+        # A non-member reaches here via get_vault(); answer 403 like the sixteen handlers that
+        # already do, not a 500 (which mints a spurious error_id and teaches operators to ignore 500s).
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         db.rollback()
         raise HTTPException(
@@ -10058,6 +10069,13 @@ async def change_vault_password(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e)
         )
+    except HTTPException:
+        # The body raises its own HTTPExceptions (e.g. a 400 for a bad/duplicate password); let them
+        # through rather than have the generic handler below re-wrap them as a 500.
+        raise
+    except PermissionDeniedError as e:
+        # A non-member reaches here via get_vault(); answer 403, not a 500.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
         db.rollback()
         raise HTTPException(
@@ -11265,15 +11283,21 @@ def _content_disposition(file_name: str) -> str:
     on a non-Latin-1 character)."""
     from urllib.parse import quote
     name = file_name or 'download'
-    # Strip control chars (incl. CR/LF, which ARE ASCII and survive the ascii encode) plus
-    # quotes/backslashes, so a crafted filename can't inject header content, split the response,
-    # or (on uvicorn) make the whole download 500 on a malformed header. The UTF-8 filename*
-    # below is already safe (quote() percent-encodes control chars).
+    # Path separators must reach NEITHER header parameter, and not survive decoding of filename*
+    # either: a non-browser client that honours the suggested filename literally could otherwise be
+    # steered to write outside its target directory. RFC 6266 clients PREFER filename*, so stripping
+    # only the ASCII filename= fallback (the raw name still fed filename*, and %2F decodes back to '/')
+    # was not enough -- strip both separators from the shared name up front.
+    name = name.replace('/', '').replace('\\', '')
+    # ASCII filename= fallback: additionally drop non-ASCII and control chars (incl. CR/LF, which are
+    # ASCII and survive the ascii encode -> header injection) and quotes.
     ascii_fallback = ''.join(
         c for c in name.encode('ascii', 'ignore').decode('ascii')
-        if 32 <= ord(c) < 127 and c not in '"\\'
+        if 32 <= ord(c) < 127 and c not in '"'
     ).strip() or 'download'
-    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(name)}"
+    # RFC 5987 ext-value: percent-encode everything outside attr-char (safe='' -- the default safe='/'
+    # would leave a separator raw). The name is already separator-free; quote handles control chars.
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(name, safe='')}"
 
 
 
@@ -11479,6 +11503,13 @@ async def upload_file(
             # Validate filename
             if not upload_file.filename:
                 continue  # Skip files without names
+
+            # A NUL byte cannot be stored (the database driver rejects "\x00" in a string literal),
+            # so a name carrying one would surface as an opaque 500 deep in the pipeline. Refuse it up
+            # front with a 400 - no legitimate filename contains a NUL. (The chunked and SFTP paths
+            # already strip control bytes, incl. NUL, so this closes the one path that did not.)
+            if '\x00' in upload_file.filename:
+                raise HTTPException(status_code=400, detail="Filename contains an invalid NUL byte.")
 
             # Reject a disallowed file type up front (before any reservation/streaming work).
             _enforce_file_type(upload_file.filename, _allowed_exts)
@@ -12812,6 +12843,15 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
     # name (the on-disk blob is keyed by the file UUID, and finalize NULLs the plaintext
     # name anyway).
     is_zk = _is_zk_vault(vault)
+    # A Standard session whose sealed name could not be decrypted leaves filename NULL (its enc_name is
+    # set). That happens when the session was started by a NEWER image whose name seal this one cannot
+    # read and the deployment was then rolled back. Completing it would surface deep in the pipeline as
+    # an opaque 500; refuse cleanly with a named 409 so the operator knows to cancel and re-upload, and
+    # the un-nameable file is never half-created.
+    if not is_zk and session.filename is None and session.enc_name:
+        raise HTTPException(status_code=409, detail=(
+            "This upload was started by a different version and cannot be completed here. "
+            "Cancel it and upload the file again."))
     zk_name_bi = session.name_bi if is_zk else None
     # The full set a ZK name may match under (all epochs' candidates + the index-key value),
     # stored at init. Used for BOTH the reject pre-check and the replace at finalize, so an
