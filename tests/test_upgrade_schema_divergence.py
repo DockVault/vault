@@ -280,17 +280,24 @@ def test_the_boot_ddl_adds_the_created_by_temp_credential_fk():
         "ForeignKey) but never adds its FOREIGN KEY; a fresh create_all install gets the constraint "
         "and an upgraded one does not.")
     # Guarded so a re-run, and a fresh install that already carries create_all's identically-named
-    # constraint, are both no-ops rather than a duplicate-constraint error.
-    assert re.search(rf"FROM pg_constraint\s+WHERE conname\s*=\s*'{CREATED_BY_FK}'", boot,
-                     re.IGNORECASE), (
-        "the created_by_temp_credential_id FK add is not guarded by a pg_constraint existence check, "
-        "so it would fail on a fresh install that already has create_all's constraint.")
+    # constraint, are both no-ops rather than a duplicate-constraint error. The guard is qualified by
+    # conrelid: constraint names are unique per TABLE in Postgres, so a name-only check could be
+    # satisfied by a same-named constraint on a different table and skip adding the one it means to.
+    assert re.search(
+        rf"FROM pg_constraint\s+WHERE conname\s*=\s*'{CREATED_BY_FK}'\s+"
+        r"AND conrelid\s*=\s*'temporary_credentials'::regclass",
+        boot, re.IGNORECASE), (
+        "the created_by_temp_credential_id FK add is not guarded by a table-qualified pg_constraint "
+        "existence check (conname AND conrelid), so it could fail on a fresh install that already has "
+        "create_all's constraint, or be fooled by a same-named constraint on another table.")
     # And the FK add is preceded by a backfill that nulls any pre-existing dangling ids -- without it
     # ADD CONSTRAINT fails on a diverged install that accumulated some, rolls back, and crash-loops
-    # that boot step every restart. It is the load-bearing line, so it is pinned too.
+    # that boot step every restart. It is the load-bearing line, so it is pinned too. Written as a
+    # correlated NOT EXISTS (not NOT IN, which is silently never-true if the subquery yields a NULL).
     assert re.search(
-        r"UPDATE temporary_credentials\s+SET created_by_temp_credential_id\s*=\s*NULL"
-        r".*?NOT IN\s*\(\s*SELECT id FROM temporary_credentials\s*\)",
+        r"UPDATE temporary_credentials\b.*?SET created_by_temp_credential_id\s*=\s*NULL"
+        r".*?NOT EXISTS\s*\(\s*SELECT 1 FROM temporary_credentials\b.*?"
+        r"=\s*t\.created_by_temp_credential_id",
         boot, re.IGNORECASE | re.DOTALL), (
         "the FK add is not preceded by a null-the-dangling-ids backfill; ADD CONSTRAINT would fail "
         "and crash-loop the boot on a diverged install that accumulated dangling children.")

@@ -15835,10 +15835,12 @@ def _run_lightweight_migrations():
             # nulling it (the model declares ON DELETE SET NULL).
             """DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                 WHERE conname = 'temporary_credentials_created_by_temp_credential_id_fkey') THEN
-    UPDATE temporary_credentials SET created_by_temp_credential_id = NULL
-      WHERE created_by_temp_credential_id IS NOT NULL
-        AND created_by_temp_credential_id NOT IN (SELECT id FROM temporary_credentials);
+                 WHERE conname = 'temporary_credentials_created_by_temp_credential_id_fkey'
+                   AND conrelid = 'temporary_credentials'::regclass) THEN
+    UPDATE temporary_credentials t SET created_by_temp_credential_id = NULL
+      WHERE t.created_by_temp_credential_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM temporary_credentials p
+                        WHERE p.id = t.created_by_temp_credential_id);
     ALTER TABLE temporary_credentials ADD CONSTRAINT temporary_credentials_created_by_temp_credential_id_fkey
       FOREIGN KEY (created_by_temp_credential_id) REFERENCES temporary_credentials(id) ON DELETE SET NULL;
   END IF;
