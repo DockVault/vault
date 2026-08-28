@@ -16106,8 +16106,24 @@ def _run_lightweight_migrations():
             "ALTER TABLE files ADD COLUMN IF NOT EXISTS name_bi VARCHAR(64)",
             "CREATE INDEX IF NOT EXISTS ix_files_name_bi ON files (name_bi)",
             # Who last renamed the file in place (NULL = never renamed since upload). Nullable, no
-            # backfill: the model declares it nullable, so a fresh install and an upgraded one agree.
+            # backfill. The model declares it with a FOREIGN KEY (users.id ON DELETE SET NULL), so
+            # the column AND the constraint must both reach an upgraded install, or a fresh
+            # create_all schema and an upgraded one diverge: on the upgraded one a deleted user would
+            # leave a dangling modified_by instead of being nulled. The constraint is added in its own
+            # guarded statement below.
             "ALTER TABLE files ADD COLUMN IF NOT EXISTS modified_by UUID",
+            # Add the FK only if it isn't already there (so a re-run is a no-op, and create_all's
+            # own constraint isn't duplicated). Null any pre-existing dangling ids first -- an install
+            # that ran an earlier build of this DDL (column, no FK) could have accumulated some -- so
+            # the ADD CONSTRAINT cannot fail on them.
+            """DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'files_modified_by_fkey') THEN
+    UPDATE files SET modified_by = NULL
+      WHERE modified_by IS NOT NULL AND modified_by NOT IN (SELECT id FROM users);
+    ALTER TABLE files ADD CONSTRAINT files_modified_by_fkey
+      FOREIGN KEY (modified_by) REFERENCES users(id) ON DELETE SET NULL;
+  END IF;
+END $$;""",
             "ALTER TABLE files ALTER COLUMN name DROP NOT NULL",
             "ALTER TABLE files ALTER COLUMN original_name DROP NOT NULL",
             # Keyed content MAC used as the file's ETag (HMAC of checksum_sha256 under a per-file
