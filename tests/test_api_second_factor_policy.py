@@ -9,10 +9,10 @@ def test_matrix_seeded_and_togglable(admin):
     # the catalog is seeded; routes that don't exist yet are absent (they'd trip the boot contract)
     assert "login" in actions and "admin.user.manage" in actions and "vault.delete" in actions
     assert "receiver.create" not in actions
-    # conservative ("B") seed defaults: the admin chain + manage-2FA + login are on; every other action
-    # (incl. delete vault) ships OFF so a fresh deploy forces enrollment on no one; password opt-in off.
-    assert actions["admin.user.manage"]["require_otp"] is True
-    assert actions["account.second_factor"]["require_otp"] is True and actions["login"]["require_otp"] is True
+    # Owner's model B: a fresh deploy forces MFA on NO ONE -- require_otp ships ON only for login +
+    # manage-2FA (both never lock anyone out); admin management + every other action ship OFF (opt-in).
+    assert actions["login"]["require_otp"] is True and actions["account.second_factor"]["require_otp"] is True
+    assert actions["admin.user.manage"]["require_otp"] is False and actions["admin.settings.write"]["require_otp"] is False
     assert actions["vault.delete"]["require_otp"] is False and actions["vault.change_password"]["require_otp"] is False
     assert all(a["require_password"] is False for a in actions.values())
 

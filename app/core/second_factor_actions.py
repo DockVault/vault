@@ -12,12 +12,15 @@ half) are deliberately NOT listed until they ship, so the boot contract that pai
 a guarded route stays satisfiable.
 """
 
-# (key, human name, default require_otp). require_password defaults False for every action; require_otp
-# defaults ON only for the CONSERVATIVE set (owner's pick "B"): the admin-chain (safe — an un-enrolled
-# admin falls back to a password re-auth, so ON never forces enrollment), managing your own two-factor,
-# and login (an enrolled account presents its factor at sign-in). Every other action ships OFF so a fresh
-# deploy does not force enrollment on anyone via the require_otp+not-enrolled block; an admin opts each one
-# in per row from the matrix.
+# (key, human name, default require_otp). require_password defaults False for every action. Owner's model
+# (B): a fresh deploy forces MFA on NO ONE. require_otp ships ON only where it cannot lock anyone out —
+# `login` (an enrolled account presents its factor at sign-in; an un-enrolled one is unaffected) and
+# `account.second_factor` (managing your OWN two-factor, whose first enrollment is exempt so an un-enrolled
+# user still reaches it). EVERY other action — including admin management — ships OFF; an admin opts each
+# one in from the matrix, and turning require_otp on then requires everyone (the admin included) to enroll
+# before that action. Because admin management defaults OFF, a fresh admin is never locked out; and because
+# changing the MFA config is itself gated by `account.second_factor`, an admin who wants to lock actions
+# down enrolls first (via the exempt path) and so always keeps an OTP to reach the matrix and undo it.
 SECOND_FACTOR_ACTIONS = [
     ("login",                          "Log in",                                   True),
     ("account.change_password",        "Change your account password",             False),
@@ -30,8 +33,8 @@ SECOND_FACTOR_ACTIONS = [
     ("share.create",                   "Create an internal share",                 False),
     ("public_link.create",             "Create a public note link",                False),
     ("temp_credential.create",         "Mint a temporary credential",              False),
-    ("admin.user.manage",             "Manage users (create / edit / delete / invite)", True),
-    ("admin.settings.write",           "Change organization settings",             True),
+    ("admin.user.manage",             "Manage users (create / edit / delete / invite)", False),
+    ("admin.settings.write",           "Change organization settings",             False),
 ]
 
 # Fast lookups.

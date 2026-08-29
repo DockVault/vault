@@ -73,15 +73,20 @@ def effective_second_factor(*, mode, required_group_ids, required_user_ids,
 
 
 def resolve_action_requirement(*, require_otp, require_password, has_active_enrollment,
-                               is_admin_action) -> dict:
+                               is_admin_action=False) -> dict:
     """What a step-up action demands of a specific user. Returns {password, otp, must_enroll}.
 
-    - `require_password` on -> always re-enter the password (a re-auth, MFA-independent).
-    - `require_otp` on -> present OTP if enrolled; if NOT enrolled, `must_enroll` (owner's block/enroll
-      model — the action walks the user through enrollment rather than being a silent no-op).
-    - `admin.*` action -> never a no-op: enrolled admin uses OTP, un-enrolled admin re-auths with password.
-    `login` is NOT resolved here — its factor is presented in the login flow, and forced enrollment for
-    login is governed by the effective `pending` state, not by an action requirement."""
+    Owner's model (B): admin management actions carry NO special "never a no-op" rule — they are gated
+    exactly like any other action, only by the toggles an admin chooses to set. You cannot force an admin
+    to own an OTP device, so nothing here forces one; the account-minting chain is protected only once an
+    admin opts in (turns require_otp/require_password on for the admin rows). `is_admin_action` is accepted
+    for call-site symmetry but no longer changes the result.
+
+    - `require_password` on -> always re-enter the account password (a re-auth, MFA-independent).
+    - `require_otp` on -> present OTP if enrolled; if NOT enrolled, `must_enroll` (the action blocks with
+      "enroll to continue" — an admin who turns require_otp on for an action requires everyone, themselves
+      included, to enroll before doing it).
+    `login` is NOT resolved here — its factor is presented in the login flow."""
     need_password = bool(require_password)
     need_otp = False
     must_enroll = False
@@ -90,12 +95,6 @@ def resolve_action_requirement(*, require_otp, require_password, has_active_enro
             need_otp = True
         else:
             must_enroll = True
-    if is_admin_action:
-        if has_active_enrollment:
-            need_otp = True
-        else:
-            need_password = True
-            must_enroll = False   # an un-enrolled admin re-auths with the password, not by enrolling
     return {"password": need_password, "otp": need_otp, "must_enroll": must_enroll}
 
 

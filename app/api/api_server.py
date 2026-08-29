@@ -7970,6 +7970,7 @@ class NoteLinkRedeem(BaseModel):
 
 
 @app.post("/note-links")
+@require_step_up("public_link.create")
 async def create_note_link(
     payload: NoteLinkCreate,
     request: Request,
@@ -8524,6 +8525,7 @@ def _share_dict(db: Session, share: Share, claim_counts: dict = None) -> dict:
 
 
 @app.post("/shares")
+@require_step_up("share.create")
 async def create_share(
     payload: ShareCreate,
     request: Request,
@@ -10634,6 +10636,7 @@ async def update_vault_info(
 @app.put("/vaults/{vault_id}/password")
 @require_endpoint_permission("VAULT_SETTINGS")
 @require_vault_cap("vault.change_password")
+@require_step_up("vault.change_password")
 async def change_vault_password(
     vault_id: uuid.UUID,
     password_update: dict,
@@ -11451,6 +11454,7 @@ async def revoke_vault_group_access(
 @app.post("/vaults/{vault_id}/rotate-key")
 @require_endpoint_permission("VAULT_SETTINGS")
 @require_vault_cap("vault.rotate_key")
+@require_step_up("vault.rotate_key")
 async def rotate_vault_encryption_key(
     vault_id: uuid.UUID,
     request: Request,

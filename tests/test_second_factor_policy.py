@@ -68,13 +68,17 @@ def test_resolve_action_requirement_two_toggles_and_block_enroll():
     assert not any(r.values())
 
 
-def test_admin_action_is_never_a_no_op():
-    # un-enrolled admin: password re-auth (NOT forced enrollment), even with no toggles set
+def test_admin_action_follows_the_general_rule_no_special_gate():
+    # Owner's model B: admin.* has NO special "never a no-op" rule -- you cannot force an admin to own an
+    # OTP device. With no toggles set it is a no-op even for an un-enrolled admin.
     r = pol.resolve_action_requirement(require_otp=False, require_password=False,
                                        has_active_enrollment=False, is_admin_action=True)
-    assert r["password"] and not r["otp"] and not r["must_enroll"]
-    # enrolled admin: OTP
-    r = pol.resolve_action_requirement(require_otp=False, require_password=False,
+    assert not any(r.values())
+    # An admin who opts in (require_otp on) requires everyone, themselves included, to enroll.
+    r = pol.resolve_action_requirement(require_otp=True, require_password=False,
+                                       has_active_enrollment=False, is_admin_action=True)
+    assert r["must_enroll"] and not r["otp"]
+    r = pol.resolve_action_requirement(require_otp=True, require_password=False,
                                        has_active_enrollment=True, is_admin_action=True)
     assert r["otp"] and not r["must_enroll"]
 
