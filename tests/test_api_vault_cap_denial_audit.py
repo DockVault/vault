@@ -80,6 +80,50 @@ def test_a_permitted_vault_action_writes_no_cap_denial_row(admin):
         admin.delete_vault(v["id"])
 
 
+def _assert_cap_denied(admin, client, vault_id, method, path, cap, **kwargs):
+    """A credential that reaches `path` but lacks `cap` is refused by the cap gate (403) and the
+    refusal is recorded as vault_cap_denied for that exact capability -- proving it is the CAP gate
+    that stopped it, not the endpoint-group gate (which would write endpoint_permission_denied)."""
+    before = _count()
+    resp = getattr(client, method.lower())(path, **kwargs)
+    assert resp.status_code == 403, f"{method} {path} without {cap} should be 403, got {resp.status_code}"
+    assert _count() == before + 1, f"{cap} denial was not audited exactly once"
+    assert _latest("details->>'capability'") == cap
+    assert _latest("resource_id") == vault_id
+
+
+def test_destructive_vault_caps_are_denied_without_the_capability(admin):
+    """The four most destructive vault capabilities -- change_info, change_password, change_expiry and
+    delete -- are load-bearing gates with, until now, no test asserting a credential lacking them is
+    refused. A regression that drops one of these decorators would let a credential handed to a
+    contractor change or destroy a vault. Each is checked with a positive control so the denials
+    can't pass vacuously, and the vault is confirmed intact afterwards.
+    """
+    v = admin.create_vault(name=unique("vdestroy"))
+    try:
+        # Holds a read capability and NONE of the four destructive ones.
+        c = _scoped_client(admin, v["id"], ["vault.see_info"])
+        vid = v["id"]
+
+        # Positive control: the granted capability works, so a blanket-403 (e.g. a wholly broken
+        # credential) can't make these denials pass for the wrong reason.
+        assert c.get(f"/vaults/{vid}").status_code == 200
+
+        _assert_cap_denied(admin, c, vid, "PATCH", f"/vaults/{vid}",
+                           "vault.change_info", json={"name": unique("nope")})
+        _assert_cap_denied(admin, c, vid, "PUT", f"/vaults/{vid}/password",
+                           "vault.change_password", json={"new_password": "irrelevant-not-applied"})
+        _assert_cap_denied(admin, c, vid, "PATCH", f"/vaults/{vid}/settings",
+                           "vault.change_expiry", json={})
+        _assert_cap_denied(admin, c, vid, "POST", f"/vaults/{vid}/delete",
+                           "vault.delete", json={})
+
+        # The vault survived every attempt.
+        assert admin.get(f"/vaults/{vid}").status_code == 200
+    finally:
+        admin.delete_vault(v["id"])
+
+
 def test_cap_denial_on_no_request_endpoint_records_client_ip(admin):
     """The client IP is recorded even when the denied endpoint declares no `request` parameter.
 
