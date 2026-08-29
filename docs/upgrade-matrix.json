@@ -181,6 +181,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.19.2": {
+      "released": "2026-08-29",
+      "notes": "No schema change. Follow-up security cleanup from the v0.19.0 security review: the ECC name-index-key GET and the member-keys GET now refuse a non-member with 403 whether or not the vault exists, so neither confirms a vault id to a stranger (parity with the DEK keys endpoint); POST /ecc/keys/register refuses a temporary session before charging the account's ECC register rate budget, so a refused temp request can no longer spend the owner's once-per-account budget; plus regression tests pinning cross-tenant file-plane access at 403-not-500 and the temp-credential scope contract. A rollback to 0.19.1 is clean and needs no backup: no persistent schema or data changed.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -342,6 +350,13 @@
     {
       "from": "0.19.0",
       "to": "0.19.1",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.19.1",
+      "to": "0.19.2",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false

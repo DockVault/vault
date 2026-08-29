@@ -493,17 +493,23 @@ async def register_public_key(
     - Stores in database for ECDH key wrapping
     - Optionally stores password-encrypted private key for recovery
     """
-    _ecc_rate_limit(current_user, "register")
     # A delegated/temp session must NOT set the account's PERMANENT zero-knowledge identity.
     # Registration is first-write-wins and irreversible (no key rotation; re-register 409s;
     # recovery binds to the registered key), so a scoped temp cred could otherwise plant its own
     # key, permanently lock the real owner out, and backdoor every future share. Mirrors the same
     # refusal on PUT /keys/private.
+    #
+    # Refuse BEFORE charging the budget. The limiter keys on the user id, and a temp session is the
+    # OWNER's own User row tagged temporary, so charging a refused temp request would spend the
+    # owner's once-per-account `register` budget (15/60s) — a bounded self-DoS on precisely the op a
+    # legitimate owner must eventually run. A refused caller never registers a key, so excluding it
+    # from the budget costs nothing. The two sibling key-update routes already refuse-then-charge.
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="A temporary session cannot register an account encryption key.",
         )
+    _ecc_rate_limit(current_user, "register")
     try:
         # Validate public key format by trying to import it
         public_key_obj = ECCCryptoService.import_public_key(request.public_key)
@@ -939,8 +945,22 @@ async def get_vault_index_key(
     principals who cannot read the vault at all.
     """
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
-    if not vault:
-        raise HTTPException(status_code=404, detail="Vault not found")
+    # A caller with NO relationship to the vault gets 403 whether or not it exists, so this endpoint
+    # does not confirm a vault's existence to a stranger — parity with the DEK sibling
+    # GET /vaults/{id}/keys, which carries the same _reaches_vault gate. That matters here because the
+    # index key lets its holder CONFIRM a guessed filename against stored indices (see the docstring),
+    # so leaking existence more freely than the DEK would hand a capability to principals who cannot
+    # read the vault at all. "Related" = owner, a direct vault_members row, OR any wrapped-DEK row
+    # (VaultMemberKey) for this vault — the exact reachability test the /keys handler already uses.
+    _reaches_vault = vault is not None and (
+        _is_member(db, vault, current_user.id)
+        or db.query(VaultMemberKey.id).filter(
+            VaultMemberKey.vault_id == vault_id,
+            VaultMemberKey.user_id == current_user.id,
+        ).first() is not None
+    )
+    if not _reaches_vault:
+        raise HTTPException(status_code=403, detail="No access to this vault's keys")
     if not may_release_vault_key(db, current_user, vault):
         raise HTTPException(status_code=403, detail="No access to this vault's keys")
 
@@ -1568,8 +1588,10 @@ async def list_member_keys(
     blobs. The caller must hold an active key for the vault. Runs the orphan reconciler
     first so the target set excludes users whose access was already removed."""
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
-    if not vault:
-        raise HTTPException(status_code=404, detail="Vault not found")
+    # Membership is proven BEFORE existence is revealed: a non-member gets 403 whether or not the
+    # vault exists, so this endpoint is not a vault-existence oracle to a stranger (parity with the
+    # DEK/index-key GETs). enforce_vault + the scoped-cap gate below key on the id only and are safe
+    # on a missing vault; the existence 404 is deferred until after the caller is a proven member.
 
     # Confine a scoped temp credential to its granted vaults (parity with the standard read
     # path). Without it a cred scoped to vault A could enumerate vault B's member roster here.
@@ -1589,6 +1611,10 @@ async def list_member_keys(
     ).first()
     if not caller_key:
         raise HTTPException(status_code=403, detail="You don't hold a key for this vault")
+    # Proven member from here — safe to disclose a genuinely-missing vault (a former member of a
+    # deleted vault, not a stranger enumerating ids).
+    if not vault:
+        raise HTTPException(status_code=404, detail="Vault not found")
 
     _reconcile_orphan_member_keys(db, vault)
 

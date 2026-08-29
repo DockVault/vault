@@ -112,22 +112,24 @@ def test_a_member_who_joined_after_minting_gets_their_wrap(admin, temp_user, tem
     assert seen["index_key"] != owner_wrap["encrypted_index_key"], "a member must not get the owner's wrap"
 
 
-def test_a_non_member_gets_no_key_material(admin, temp_user, temp_user_client, zk_vault):
-    """A user with no wrap gets null, never someone else's wrap. The read is filtered by the
-    caller's own id, which is the property that actually protects the key material -- the same
-    posture as the DEK endpoint, which also returns a caller only their own wrapped copy. (A
-    regular session is not refused outright the way a scoped temp credential is; the protection is
-    that there is nothing there for them.)"""
+def test_a_non_member_is_refused_not_handed_a_null(admin, temp_user, temp_user_client, zk_vault):
+    """A user with no relationship to the vault is REFUSED (403), not handed a 200 {index_key: null}.
+    Answering 200-for-existing / 404-for-absent let any account confirm which vault ids exist;
+    the index key also lets its holder confirm a guessed filename (see the endpoint
+    docstring), so neither it nor its vault's existence may be released to a non-member. Same
+    403-whether-or-not-it-exists posture the DEK endpoint /ecc/vaults/{id}/keys already has. A
+    granted member still reaches it (see the tests above); a scoped temp credential is refused too."""
     vid = zk_vault["id"]
     ensure_ecc_keypair(temp_user_client)
     owner_wrap = _wrap(admin.user["id"])
     admin.put(f"/ecc/vaults/{vid}/index-key", json={"wraps": [owner_wrap]}).raise_for_status()
 
+    # Existing vault, no relationship -> 403 (was 200 {index_key: null}); no wrap ever in the body.
     r = temp_user_client.get(f"/ecc/vaults/{vid}/index-key")
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["index_key"] is None, "a non-member must get null, never the owner's wrap"
+    assert r.status_code == 403, r.text
     assert owner_wrap["encrypted_index_key"] not in r.text
+    # A vault id that does not exist -> also 403, so 403-vs-404 cannot confirm existence.
+    assert temp_user_client.get(f"/ecc/vaults/{uuid.uuid4()}/index-key").status_code == 403
 
 
 def test_a_non_manager_cannot_mint(admin, temp_user, temp_user_client, zk_vault):
