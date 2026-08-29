@@ -6624,7 +6624,8 @@ async def enroll_totp(
         issuer = (get_effective_branding(db).app_name or "DockVault").strip() or "DockVault"
     except Exception:      # noqa: BLE001
         issuer = "DockVault"
-    return {"secret": seed, "otpauth_uri": sf.otpauth_uri(seed, account=user.username, issuer=issuer)}
+    uri = sf.otpauth_uri(seed, account=user.username, issuer=issuer)
+    return {"secret": seed, "otpauth_uri": uri, "qr_svg": sf.otpauth_qr_svg(uri)}
 
 
 @app.post("/users/me/second-factor/totp/confirm")

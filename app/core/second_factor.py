@@ -83,6 +83,25 @@ def otpauth_uri(seed_b32: str, *, account: str, issuer: str) -> str:
             f"&algorithm=SHA1&digits={TOTP_DIGITS}&period={TOTP_STEP_SECONDS}")
 
 
+def otpauth_qr_svg(uri: str) -> Optional[str]:
+    """An inline SVG QR of the otpauth URI, rendered server-side. Uses qrcode's SvgPathImage factory —
+    a single <path>, stdlib xml only, no Pillow. Best-effort: returns None if rendering fails, so a
+    QR hiccup never blocks enrollment (the secret is always shown for manual entry). qrcode is imported
+    lazily so importing this module never depends on it."""
+    try:
+        import io
+        import qrcode
+        from qrcode.image.svg import SvgPathImage
+        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=2)
+        qr.add_data(uri)
+        qr.make(fit=True)
+        buf = io.BytesIO()
+        qr.make_image(image_factory=SvgPathImage).save(buf)
+        return buf.getvalue().decode("utf-8")
+    except Exception:      # noqa: BLE001
+        return None
+
+
 # --- Recovery codes ------------------------------------------------------------------------------
 
 def _normalize_recovery(code: str) -> str:

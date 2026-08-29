@@ -28,6 +28,10 @@ def test_totp_enroll_confirm_acknowledge_lifecycle(temp_user, temp_user_client):
     assert r.status_code == 200, r.text
     secret = r.json()["secret"]
     assert r.json()["otpauth_uri"].startswith("otpauth://totp/") and "secret=" in r.json()["otpauth_uri"]
+    # A server-rendered inline SVG QR of the otpauth URI accompanies the secret (manual entry stays a
+    # fallback). SvgPathImage draws a single <path>, no Pillow.
+    qr = r.json()["qr_svg"]
+    assert qr and qr.lstrip().startswith("<") and "<svg" in qr and "<path" in qr
 
     # A wrong code is refused; the state stays mid-enrollment (no recovery codes yet).
     assert temp_user_client.post("/users/me/second-factor/totp/confirm",
