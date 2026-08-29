@@ -170,12 +170,11 @@ def _strip_ctrl(name: str) -> str:
     return ''.join(c for c in (name or '') if ord(c) >= 32 and ord(c) != 127)
 
 
-def _user_requires_temp_cred_for_sftp(db, user) -> bool:
-    """Org SFTP-auth policy (design §5): a user in any group listed under the global
-    setting ``sftp_require_temp_cred_groups`` may ONLY use a temporary credential for
-    SFTP — direct password and SSH-key auth are refused. Per-group by design (a
-    global force would break SSH-key automation). Reads the admin Settings store
-    (SystemSetting 'global'); fails OPEN (no extra restriction) on any error."""
+def _group_requires_temp_cred_for_sftp(db, user) -> bool:
+    """Org SFTP-auth policy: a user in any group listed under the global setting
+    ``sftp_require_temp_cred_groups`` may ONLY use a temporary credential for SFTP — direct password and
+    SSH-key auth are refused. Per-group by design (a global force would break SSH-key automation). Reads
+    the admin Settings store (SystemSetting 'global'); fails OPEN (no extra restriction) on any error."""
     try:
         from app.core.models import SystemSetting, user_groups
         from sqlalchemy import select
@@ -192,6 +191,45 @@ def _user_requires_temp_cred_for_sftp(db, user) -> bool:
         return bool(required & user_gids)
     except Exception:  # noqa: BLE001
         return False
+
+
+def _mfa_sftp_requires_temp_cred(db, user) -> bool:
+    """MFA SFTP-auth policy: when the org sets ``mfa_sftp_policy=temp_credential_only``, a user whose
+    second factor is IN EFFECT (enrolled, or required by mode / department / user) may reach SFTP ONLY
+    through a temporary credential — direct password / SSH-key auth is refused, so SFTP cannot become a
+    single-factor back door around MFA. Reuses the exact per-group temp-cred mechanism. Reads the admin
+    Settings store; fails OPEN (no extra restriction) on any error."""
+    try:
+        from app.core.models import SystemSetting, SecondFactorEnrollment, user_groups
+        from app.core import second_factor_policy as pol
+        from sqlalchemy import select
+        row = db.query(SystemSetting).filter(SystemSetting.key == "global").first()
+        blob = (row.value or {}) if (row and row.value) else {}
+        p = pol.effective_policy(blob)
+        if p.get("mfa_sftp_policy") != "temp_credential_only":
+            return False
+        has_active = db.query(SecondFactorEnrollment.id).filter(
+            SecondFactorEnrollment.user_id == user.id,
+            SecondFactorEnrollment.status == "active").first() is not None
+        user_gids = [
+            str(r[0]) for r in db.execute(
+                select(user_groups.c.group_id).where(user_groups.c.user_id == user.id)
+            ).fetchall()
+        ]
+        eff = pol.effective_second_factor(
+            mode=p["mfa_mode"], required_group_ids=p["mfa_required_group_ids"],
+            required_user_ids=p["mfa_required_user_ids"], user_group_ids=user_gids,
+            user_id=user.id, has_active_enrollment=has_active)
+        return bool(eff["in_effect"])
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _user_requires_temp_cred_for_sftp(db, user) -> bool:
+    """A non-temp session must use a temporary credential for SFTP when EITHER the per-group rule
+    (``sftp_require_temp_cred_groups``) OR the MFA SFTP policy (``mfa_sftp_policy=temp_credential_only``,
+    for a user whose second factor is in effect) applies. Both fail OPEN independently."""
+    return _group_requires_temp_cred_for_sftp(db, user) or _mfa_sftp_requires_temp_cred(db, user)
 
 
 class _PathNotFound(Exception):
