@@ -1,5 +1,42 @@
 # Design: login MFA and step-up verification (one action-scoped OTP core)
 
+> ## ⚑ Reviewer notes — grade B+ (audit 2026-08-29)
+>
+> Strong, honest, well-grounded spec. Verified sound: the action-binding (a login OTP genuinely can't
+> authorize `vault.delete` because the store key differs), the pre-auth-token confinement (all three
+> session-less decode sites refuse a token with no `session_token`), the encryption-key-lockout handling
+> (§7.4/§9), and the computed enrollment state (no stored flag → no stale-flag bugs). Mandatory recovery
+> codes via the state machine are a correct choice. **Resolve before building:**
+>
+> **Should-fix**
+> - **§3.1/§6.2 — the rate-limit claim is wrong (security), verified.** `/challenge`+`/verify` are said to
+>   ride a fail-*closed* bucket, but the RateLimitMiddleware auth bucket defaults `fail_open=True` (fails OPEN
+>   on a Redis outage) and keys on `user:{sub}`/`ip`, not `(ip,user_id)`. The fail-*closed* property is the
+>   login throttle (`_check_rate_limit`, `fail_open=False` + DB fallback). Wire /verify to a fail-closed
+>   limiter and correct the text. The OTP-service 3-strike applies to `method=email` only.
+> - **§3/§5.3/§6.2 — step-up brute-force (security).** Step-up has no durable per-user attempt counter
+>   (`pending_logins.attempts` is login-only). The `password` step-up method calls `verify_password` without
+>   account lockout, so a stolen un-enrolled-admin bearer could brute-force the password (worse than a 6-digit
+>   TOTP), effectively unbounded during a Redis outage. Route `password` through the login lockout + give
+>   `totp` step-up a durable cap. (Q4's admin-optional→required path removes `password` entirely.)
+> - **§4.1 vs §4.2 — catalog references unbuilt routes (buildability).** `receiver.create` (POST /receivers)
+>   and the `/public-links` half of `public_link.create` don't exist yet, so seeding them trips §4.2's own
+>   boot contract. Scope them as "added when secure-send ships."
+> - **§1.4/§7.2/§10 — factual: password-change revocation IS already built.** The spec says three times it
+>   isn't, but 0.19.1 (`PATCH /users/me` + admin `PATCH /users/{id}`) already durably revokes sessions on a
+>   password change. Drop the caveat/non-goal — it strengthens the enrollment-revokes-sessions design.
+>
+> **Consider**
+> - §5.5 — `_user_requires_temp_cred_for_sftp` keys strictly on GROUP membership; state it's EXTENDED to
+>   return True when the second factor is in effect, and confirm its fail-open behaviour.
+> - §3 recovery — up to 10 argon2 verifies per presented code + a fail-open limiter = a CPU-DoS lever; add a
+>   cheap non-secret lookup prefix so at most one argon2 runs per attempt.
+> - §3.2/§9 (nit) receipt/session compare needs the raw session token at decorator time; §6/§3.1 (nit)
+>   concurrent logins for one account collide on the single-active `sf:login` email key (scope it to the
+>   pending-login id).
+>
+> _(Review comments added on top of the authoring session's spec; the author's text is unchanged below.)_
+
 Status: **proposed — design only, nothing in this document is implemented** · Scope:
 `app/core/otp_service.py`, `app/core/email_actions.py`, `app/core/account_policy.py`,
 `app/api/api_server.py` (`/auth/login`, `get_current_user`, the `/ws/monitor` handshake, the high-risk

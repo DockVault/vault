@@ -1,5 +1,43 @@
 # Design: secure send (public file links) and receivers (upload links)
 
+> ## ⚑ Reviewer notes — grade B+ (audit 2026-08-29)
+>
+> Strong, and notably HONEST on crypto: a password-protected "confidential" receiver is described exactly as
+> a symmetric password envelope, explicitly refuses "zero-knowledge"/"E2E", flags the verifier as an offline
+> guessing oracle, and proposes a static test that the ZK word appears nowhere in receiver code. Correctly
+> reuses the note-link engine + tags/policies. **Resolve before building:**
+>
+> **Should-fix**
+> - **§3.2/§5.1 — name-clash suffixing isn't free (buildability).** The spec treats `name (2).ext` suffixing
+>   as existing, but `finalize_streaming_upload(replace_same_name=False)` raises `DuplicateNameError` (409).
+>   Specify a race-safe suffixing retry loop.
+> - **§5.1/§3.2 — anonymous-flood DoS (security).** `transfer_admission` is ONE global instance
+>   (`max_concurrent_transfers`) shared by every transfer; anonymous receiver uploads draining it can starve
+>   authenticated users. Give anonymous inbound a subordinate budget (a smaller TransferAdmission or a
+>   reserved fraction).
+> - **§3.2 — upload-token exp too short (design-gap).** The 1-hour JWT exp can expire mid-upload for a large
+>   file over a slow link. Scale exp to plausible transfer time, or allow a silent re-redeem.
+>
+> **Consider**
+> - §3.1 receivers are real Vault rows → they pollute the owner's ordinary vault list + storage views; decide
+>   filter/badge behaviour and how the vault picker distinguishes them.
+> - §3.2 the proposed `_session_principal` change hides receiver sessions from the owner's session surfaces —
+>   confirm intended + ensure the sweeper reclaims them and releases reserved size.
+> - §4.1 the `key_wrap_algorithms.py` label is provenance-only; the receiver-envelope wrap lives in
+>   `File.encryption_metadata`, not read through the member-key filter — reword.
+> - §3.2/§4.1 state explicitly `sha256` is over the CIPHERTEXT for `confidential` (what the server receives)
+>   vs plaintext for `standard`.
+> - §4.4 confidential receiver files are browser-only to read (envelope ciphertext) but a receiver is a
+>   Standard (SFTP-reachable) vault — flag/hide them on the SFTP surface or document the limitation.
+> - §5.1 storage exhaustion — bytes aren't reserved atomically like `upload_count`; reserve at session open or
+>   re-check-and-commit atomically at /complete.
+> - (nits) the per-user over-cap response is 409 not 400 (match `create_note_link`); add a threat-table row
+>   for owner-side PREVIEW rendering of anonymous standard uploads (relies on the existing preview sandbox).
+>   Also: the step-up gating on the creation routes depends on the MFA spec's step-up machinery, which isn't
+>   built yet — state the ordering dependency (routes ship un-step-up-gated until it lands).
+>
+> _(Review comments added on top of the authoring session's spec; the author's text is unchanged below.)_
+
 Status: **proposed — design only, nothing in this document is implemented** · Scope:
 `app/core/models.py` (`Share*`, `NoteLink*`, `Vault`, `File`, `ChunkedUploadSession`),
 `app/core/note_link_policy.py`, `app/core/sharing_policy.py`, `app/api/api_server.py` (the share,

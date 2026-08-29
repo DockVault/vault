@@ -1,5 +1,37 @@
 # Design: streaming SFTP uploads (record-by-record encryption, bounded reorder window)
 
+> ## ⚑ Reviewer notes — grade B+ (audit 2026-08-29)
+>
+> Rigorous, source-grounded, and it gets the hard part right: it preserves both invariants (I1 byte-identity
+> via pipeline reuse; I2 authenticated terminator, written only on clean exit) and fails random / out-of-order
+> writes CLOSED rather than storing partials. **Resolve before building:**
+>
+> **Should-fix**
+> - **§3.7/§2 I5 — factual: the HTTP /complete path does NOT lock the vault (verified).** The new FOR UPDATE
+>   close-lock is justified by claiming the HTTP path takes `with_for_update()` on the vault for the size
+>   check; it doesn't — the per-vault `size_limit` is the atomic per-upload guard, with no vault-row lock.
+>   Justify the SFTP-close lock on its own terms instead.
+> - **§3.1/§3.10 — session re-bind at close (buildability).** `file_info['vault']` is captured in the
+>   open-time DB session; at close it must be re-bound to the fresh session before `finalize_streaming_upload`
+>   (reuse the step-4 `get_vault`), else it's a detached/stale ORM object.
+> - **§3.7/§6/Q10 — orphan-blob sweep is unsafe (design-gap).** A start-up sweep of "terminated blobs with no
+>   row" can't tell an SFTP crash orphan from an in-flight WEB resumable upload → it could delete a live
+>   upload. Age-gate it (only terminated blobs older than the longest legitimate upload) or drop it.
+>
+> **Consider**
+> - §3.2/§3.3 specify the reassembly invariant precisely (what the buffer holds vs emits); I1 rests on it.
+> - §3.7 step 4 — add the close-time `written ≤ MAX_FILE_SIZE` per-file recheck for defense in depth (I5 says
+>   "every check _finalize makes today still runs," but step 4 lists only the vault + deployment ceilings).
+> - §3.4/§3.8 name the global handle registry + the global/per-session upload counter as explicit new
+>   components (how they're populated at open / drained at close).
+> - §3.4/§1.4 pin `default_max_packet_size` alongside `default_window_size` so the assembly bound is
+>   `< RECORD_SIZE + max_packet_size` and the memory ceiling is provable.
+> - (nit) §2 I2 — scope "truncated" to format/transport-level (missing terminal, tampered/reordered record,
+>   size cap, disconnect, hole); a client that cleanly closes after writing fewer bytes than intended is a
+>   valid short file, not an I2 violation.
+>
+> _(Review comments added on top of the authoring session's spec; the author's text is unchanged below.)_
+
 Status: **proposed — design only, nothing in this document is implemented** · Scope:
 `app/sftp/sftp_server.py` (`VaultSFTPHandle`, `SFTPServerInterface._open_write`,
 `_make_upload_finalizer`, `session_ended`, `_sweep_sftp_tmp`), `app/services/streaming_upload.py`,
