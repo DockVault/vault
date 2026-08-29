@@ -39,7 +39,7 @@ bootstrap_entrypoint("API")
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
 from app.core.chunk_cleanup import fail_chunk_session
 from app.core.session_hash_utils import hash_session_token
-from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink, SecondFactorEnrollment, SecondFactorRecoveryCode, SecondFactorAction
+from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink, SecondFactorEnrollment, SecondFactorRecoveryCode, SecondFactorAction, PendingLogin
 from app.core import sharing_policy
 from app.core import note_link_policy
 from app.core import storage_quota
@@ -4608,6 +4608,178 @@ async def get_sftp_host_key(current_user: User = Depends(get_current_user)):
 
 # Authentication Endpoints
 
+# --- Second factor: the two-step login (no session until the second factor) -----------------------
+
+PRE_AUTH_TTL_MINUTES = 5
+_SF_LOGIN_MAX_ATTEMPTS = 5
+
+
+def _sf_user_group_ids(db, user) -> list:
+    return [str(r[0]) for r in db.query(user_groups.c.group_id)
+            .filter(user_groups.c.user_id == user.id).all()]
+
+
+def _second_factor_effective(db, user) -> dict:
+    """The user's effective second-factor state from the current policy + their enrollment + groups."""
+    from app.core import second_factor_policy as pol
+    p = pol.effective_policy(_global_settings_blob(db))
+    has_active = db.query(SecondFactorEnrollment.id).filter(
+        SecondFactorEnrollment.user_id == user.id,
+        SecondFactorEnrollment.status == "active").first() is not None
+    return pol.effective_second_factor(
+        mode=p["mfa_mode"], required_group_ids=p["mfa_required_group_ids"],
+        required_user_ids=p["mfa_required_user_ids"], user_group_ids=_sf_user_group_ids(db, user),
+        user_id=user.id, has_active_enrollment=has_active)
+
+
+def _sf_login_methods(db, user) -> list:
+    enr = db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.user_id == user.id, SecondFactorEnrollment.status == "active").first()
+    return [enr.method, "recovery"] if enr else []
+
+
+def _delete_session_by_token(db, session_token):
+    """Delete the ActiveSession the password step just created, so an MFA login leaves no usable session
+    before the second factor. The stored value is the token's SHA-256 hash."""
+    if not session_token:
+        return
+    from app.core.models import ActiveSession
+    db.query(ActiveSession).filter(
+        ActiveSession.session_token == hash_session_token(session_token)).delete(synchronize_session=False)
+    db.commit()
+
+
+def _begin_pending_login(db, user, client_ip, *, enrollment_required: bool) -> str:
+    """Insert a pending_logins row and mint the pre-auth token: stage=second_factor, pre_auth=<id>, and
+    crucially NO session_token, with a 5-minute exp. The missing session_token is the confinement —
+    get_current_user, the /ws/monitor handshake and POST /api/logout each refuse a token without one."""
+    pending = PendingLogin(user_id=user.id, client_ip=client_ip, enrollment_required=enrollment_required,
+                           expires_at=datetime.now(timezone.utc) + timedelta(minutes=PRE_AUTH_TTL_MINUTES))
+    db.add(pending)
+    db.commit()
+    return create_access_token(
+        data={"sub": str(user.id), "username": user.username, "stage": "second_factor",
+              "pre_auth": str(pending.id)},
+        expires_delta=timedelta(minutes=PRE_AUTH_TTL_MINUTES))
+
+
+def _sf_pending_response(db, user, client_ip):
+    """The pre-authenticated login response for an in-effect user: enrolled -> present a factor; required
+    but not enrolled (pending) -> enrollment_required."""
+    eff = _second_factor_effective(db, user)
+    enrollment_required = (eff["state"] == "pending")
+    token = _begin_pending_login(db, user, client_ip, enrollment_required=enrollment_required)
+    return JSONResponse(status_code=200, content={
+        "access_token": None, "second_factor_required": True,
+        "enrollment_required": enrollment_required,
+        "methods": [] if enrollment_required else _sf_login_methods(db, user),
+        "pre_auth_token": token,
+    })
+
+
+async def get_pre_auth_principal(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+):
+    """Resolve a pre-authenticated (password-verified, second-factor-pending) principal from a pre-auth
+    token. Rejects a normal session token (no `stage`), a bad signature, and an expired/consumed row."""
+    payload = verify_access_token(credentials.credentials)
+    if not payload or payload.get("stage") != "second_factor" or not payload.get("pre_auth"):
+        raise HTTPException(status_code=401, detail="A valid pre-authentication token is required.")
+    pending = db.query(PendingLogin).filter(PendingLogin.id == payload["pre_auth"]).first()
+    exp = pending.expires_at if pending else None
+    if exp is not None and exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if not pending or pending.consumed_at is not None or (exp is not None and exp < datetime.now(timezone.utc)):
+        raise HTTPException(status_code=401, detail="This login attempt has expired; start again.")
+    user = db.query(User).filter(User.id == pending.user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid pre-authentication token.")
+    return user, pending
+
+
+class SecondFactorVerifyRequest(BaseModel):
+    method: str = ""
+    code: str = ""
+
+
+@app.post("/auth/second-factor/verify")
+async def second_factor_login_verify(
+    body: SecondFactorVerifyRequest,
+    request: Request,
+    principal=Depends(get_pre_auth_principal),
+    db: Session = Depends(get_db),
+):
+    """The login second step: verify the factor for action=login with the pre-auth token, then mint the
+    real session + full JWT. Bounded by a fail-CLOSED rate limit AND a DURABLE per-attempt cap on the
+    pending row, so online guessing is capped even during a Redis outage."""
+    from app.core import second_factor as sf
+    from app.core.rate_limiter import rate_limiter as _rl
+    user, pending = principal
+    client_ip = get_client_ip(request)
+    allowed, _, reset = _rl.check_rate_limit(identifier=f"{client_ip}:{user.id}",
+                                             limit=10, window=300, prefix="sf_login_verify", fail_open=False)
+    if not allowed:
+        import time as _t
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many attempts; please wait a few minutes.",
+                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    if (pending.attempts or 0) >= _SF_LOGIN_MAX_ATTEMPTS:
+        pending.consumed_at = datetime.now(timezone.utc)
+        db.commit()
+        raise HTTPException(status_code=401, detail="Too many attempts on this login; start again.")
+    if not sf.check_second_factor(db, user=user, action="login", method=body.method, code=body.code):
+        pending.attempts = (pending.attempts or 0) + 1
+        if pending.attempts >= _SF_LOGIN_MAX_ATTEMPTS:
+            pending.consumed_at = datetime.now(timezone.utc)
+        db.commit()
+        raise HTTPException(status_code=401, detail="That code is not valid.")
+    # Consume the pending row (single winner) before minting the session.
+    if db.query(PendingLogin).filter(PendingLogin.id == pending.id, PendingLogin.consumed_at.is_(None)).update(
+            {"consumed_at": datetime.now(timezone.utc)}, synchronize_session=False) != 1:
+        db.commit()
+        raise HTTPException(status_code=401, detail="This login attempt was already completed.")
+    db.commit()
+    auth_service = AuthService(db)
+    session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
+    session_token = auth_service._create_session(user, None, client_ip, expires_at=session_expires_at)
+    _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
+    access_token = create_access_token(
+        data={"sub": str(user.id), "username": user.username, "session_token": session_token,
+              "is_temporary": False, "amr": ["pwd", (body.method or "").lower()],
+              "mfa_at": int(datetime.now(timezone.utc).timestamp())},
+        expires_delta=_expires)
+    recovery_used = (body.method or "").lower() == "recovery"
+    try:
+        AuditLogger(db).log_login_success(user, client_ip, is_temporary=False)
+        if recovery_used:
+            AuditLogger(db).log_action(action="second_factor_recovery_used", status="success", user=user,
+                                       ip_address=client_ip, details={})
+            _notify_users([str(user.id)], "second_factor_recovery_used",
+                          title="A recovery code was used to sign in",
+                          body="A recovery code was used to sign in" + (f" from {client_ip}" if client_ip else ""),
+                          target="#profile")
+    except Exception:  # noqa: BLE001
+        pass
+    return {"access_token": access_token, "token_type": "bearer",
+            "recovery_code_used": recovery_used,
+            "recovery_codes_remaining": _sf_recovery_remaining(db, user.id)}
+
+
+@app.post("/auth/second-factor/cancel")
+async def second_factor_login_cancel(
+    principal=Depends(get_pre_auth_principal),
+    db: Session = Depends(get_db),
+):
+    """Abandon a pending login: consume the pending row without creating a session."""
+    _user, pending = principal
+    db.query(PendingLogin).filter(
+        PendingLogin.id == pending.id, PendingLogin.consumed_at.is_(None)).update(
+        {"consumed_at": datetime.now(timezone.utc)}, synchronize_session=False)
+    db.commit()
+    return {"cancelled": True}
+
+
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(
     login_request: LoginRequest,
@@ -4643,7 +4815,18 @@ async def login(
                 login_identifier=_login_identifier(db),
             )
             is_temporary = False
-        
+            # Two-step login: if the second factor is in effect for this account, hand out NO session
+            # yet. Delete the session authenticate_user just created, stand up a pending_login, and
+            # return a pre-auth response; the real session is minted by /auth/second-factor/verify.
+            if _second_factor_effective(db, user)["in_effect"]:
+                _delete_session_by_token(db, session_token)
+                try:
+                    audit_logger.log_action(action="login_password_ok", status="success", user=user,
+                                            ip_address=client_ip, details={})
+                except Exception:  # noqa: BLE001
+                    pass
+                return _sf_pending_response(db, user, client_ip)
+
         # Create JWT token (include session_token for session validation). A REGULAR session honours
         # the admin 'Session Timeout' setting (falling back to the env default); a temp credential
         # keeps the default token life — its own validity window is enforced separately.

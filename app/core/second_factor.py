@@ -173,23 +173,30 @@ def issue_step_up_receipt(db, *, user_id, action: str, session_hash: str, redis=
                              destination=session_hash, ttl_minutes=RECEIPT_TTL_MINUTES, redis=redis)
 
 
+def check_second_factor(db, *, user, action: str, method: str, code: str, redis=None) -> bool:
+    """Verify a presented factor for (user, action) WITHOUT issuing a receipt — the LOGIN step (which
+    creates the session directly) and anyone who just needs a yes/no. Consumes a TOTP step / a recovery
+    code on success (single-winner). `password` is intended only for admin.* actions by an un-enrolled
+    admin (the caller enforces that policy); this core only checks the credential."""
+    method = (method or "").lower()
+    if method == "totp":
+        return _verify_totp(db, user, code)
+    if method == "recovery":
+        return _verify_recovery(db, user, code)
+    if method == "password":
+        return _verify_password_factor(user, code)
+    if method == "email":
+        return otp_service.verify(db, purpose=f"sf:{action}", user_id=user.id, code=code, redis=redis).ok
+    return False
+
+
 def verify_second_factor(db, *, user, action: str, method: str, code: str,
                          session_hash: str, redis=None) -> SecondFactorResult:
     """Verify one presented second factor for (user, action) and, on success, issue a session-bound
-    receipt. `password` is intended only for admin.* actions by an un-enrolled admin (the caller
-    enforces that policy); this core only checks the credential."""
-    method = (method or "").lower()
-    if method == "totp":
-        ok = _verify_totp(db, user, code)
-    elif method == "recovery":
-        ok = _verify_recovery(db, user, code)
-    elif method == "password":
-        ok = _verify_password_factor(user, code)
-    elif method == "email":
-        ok = otp_service.verify(db, purpose=f"sf:{action}", user_id=user.id, code=code, redis=redis).ok
-    else:
+    step-up receipt (the step-up path — the login path uses check_second_factor and needs no receipt)."""
+    if (method or "").lower() not in ("totp", "recovery", "password", "email"):
         return SecondFactorResult(False, reason="unknown_method")
-    if not ok:
+    if not check_second_factor(db, user=user, action=action, method=method, code=code, redis=redis):
         return SecondFactorResult(False, reason="invalid")
     receipt = issue_step_up_receipt(db, user_id=user.id, action=action,
                                     session_hash=session_hash, redis=redis)
