@@ -189,6 +189,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.19.3": {
+      "released": "2026-08-29",
+      "notes": "No schema change. Collaboration features now default ON for a fresh self-hosted install: internal file sharing, public note links, and admin invite-by-link. These are admin master switches that previously shipped off-by-default; an explicit stored 'off' is still honored, and nothing is exposed until a user actively creates a share or link (invite-by-link is admin-only). Self-signup stays off by default. A rollback to 0.19.2 is clean and needs no backup: no persistent schema or data changed.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -357,6 +365,13 @@
     {
       "from": "0.19.1",
       "to": "0.19.2",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.19.2",
+      "to": "0.19.3",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false

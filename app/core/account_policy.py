@@ -29,10 +29,12 @@ MAX_DOMAIN_LENGTH = 253             # RFC 1035 total length ceiling
 # (which dedup below) still passes.
 _MAX_RAW_DOMAINS = 10 * MAX_SIGNUP_DOMAINS
 
-# Defaults chosen so an install that never opens this tab behaves exactly as it did before it existed.
+# Defaults are conservative EXCEPT admin invite-by-link, which now defaults ON for self-host
+# convenience: it is admin-only (only admins mint invitation links) and exposes nothing until a link
+# is created, so on-by-default is low risk. Self-signup stays OFF (open registration is a bigger call).
 DEFAULTS = {
     "email_requirement": "required",
-    "invite_enabled": False,
+    "invite_enabled": True,
     "invite_ttl_hours": 24,
     "signup_enabled": False,
     "signup_email_domain_mode": "off",
