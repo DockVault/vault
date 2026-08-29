@@ -35,7 +35,7 @@ def test_toggle_and_cap_persist(page: Page, admin, admin_creds, restore_settings
     _open_notelinks(page)
     # The Save-All button is disabled until settings finish loading; wait so the click isn't swallowed.
     expect(page.locator("#save-all-settings-btn")).to_be_enabled(timeout=10000)
-    page.check("#setting-public-note-links-enabled")
+    page.set_checked("#setting-public-note-links-enabled", True)
     page.fill("#setting-public-note-link-user-cap", "25")
     page.click("#save-all-settings-btn")
     page.wait_for_timeout(1500)
