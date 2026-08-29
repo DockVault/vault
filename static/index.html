@@ -117,6 +117,10 @@
                     
                     <div id="login-error" class="alert alert-error mt-md" style="display: none;"></div>
 
+                    <!-- Two-step login: the second-factor code card and the forced-enrollment wizard
+                         are built here in JS when /auth/login returns second_factor_required. -->
+                    <div id="login-second-factor" class="mt-md text-left" style="display: none;"></div>
+
                     <!-- Forgot password: link hidden until /auth/policy confirms self-service reset is on. -->
                     <div id="forgot-toggle" class="mt-sm" style="display: none;">
                         <a href="#" id="show-forgot-link" role="button" style="font-size: 0.9em;">Forgot your password?</a>

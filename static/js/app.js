@@ -1380,6 +1380,15 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         }
         
         const data = await response.json();
+
+        // Two-step login: an account with the second factor in effect (or one the policy requires to
+        // enroll) gets NO session from the password step. Hand off to the second-factor card /
+        // forced-enrollment wizard, which completes the login once the factor is proven.
+        if (data.second_factor_required) {
+            beginSecondFactor(data);
+            return;
+        }
+
         authToken = data.access_token;
 
         // The credentials have been accepted and are no longer needed. Without this the account
@@ -1446,6 +1455,260 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         errorDiv.style.display = 'block';
     }
 });
+
+// ============================================================================
+// TWO-STEP LOGIN: second-factor code card + forced-enrollment wizard
+// ============================================================================
+// The pre-auth token from /auth/login lives only for this in-progress login; it is never stored.
+
+function _sfBox() { return document.getElementById('login-second-factor'); }
+
+function _sfError(node, msg) {
+    node.textContent = msg || 'Something went wrong. Please try again.';
+    node.style.display = 'block';
+}
+
+function _sfRestoreLoginForm() {
+    const box = _sfBox();
+    if (box) { box.replaceChildren(); box.style.display = 'none'; }
+    const form = document.getElementById('login-form');
+    if (form) { form.reset(); form.style.display = ''; }
+    const forgot = document.getElementById('forgot-toggle');
+    if (forgot && typeof applyLoginPolicyLabel === 'function') { try { applyLoginPolicyLabel(); } catch (_) {} }
+    const uf = document.getElementById('username');
+    if (uf) uf.focus();
+}
+
+async function _sfCancel(preAuthToken) {
+    try {
+        await fetch(`${API_BASE}/auth/second-factor/cancel`, {
+            method: 'POST', headers: { 'Authorization': `Bearer ${preAuthToken}` }
+        });
+    } catch (_) {}
+    _sfRestoreLoginForm();
+}
+
+// Entry point from the login handler when /auth/login returns second_factor_required.
+function beginSecondFactor(data) {
+    const form = document.getElementById('login-form');
+    // Capture the just-entered password BEFORE clearing the form: the forced-enrollment path re-proves
+    // it to the enroll endpoint (the account's first-enrollment gate). Used once, then dropped.
+    const pw = (document.getElementById('password') || {}).value || '';
+    if (form) form.style.display = 'none';
+    const forgot = document.getElementById('forgot-toggle');
+    if (forgot) forgot.style.display = 'none';
+    const loginErr = document.getElementById('login-error');
+    if (loginErr) loginErr.style.display = 'none';
+    const box = _sfBox();
+    if (!box) return;
+    box.replaceChildren();
+    box.style.display = '';
+    const pre = data.pre_auth_token;
+    if (data.enrollment_required) {
+        renderEnrollmentWizard(box, { preAuthToken: pre, password: pw });
+    } else {
+        renderVerifyCard(box, { preAuthToken: pre, methods: Array.isArray(data.methods) ? data.methods : ['totp', 'recovery'] });
+    }
+    if (form) form.reset();   // safe now: the password was captured (if needed) and the field is hidden
+}
+
+// Complete a two-step login once the factor is proven (verify) or enrollment finishes (acknowledge).
+async function finishSecondFactorLogin(accessToken) {
+    if (!accessToken) return;
+    // A fresh interactive login — never a scoped temp credential (those don't do MFA).
+    authToken = accessToken;
+    isScopedTemp = false;
+    sessionAccess = null;
+    try { storage.setItem('authToken', accessToken); storage.setItem('isScopedTemp', ''); } catch (_) {}
+    const box = _sfBox();
+    if (box) { box.replaceChildren(); box.style.display = 'none'; }
+    // enterAuthedSession fetches /users/me, applies prefs, loads permissions, and reveals the
+    // dashboard — the same boot a refreshed session runs.
+    await enterAuthedSession();
+    try { connectMonitorWebSocket(); } catch (_) {}
+}
+
+function renderVerifyCard(box, opts) {
+    const preAuthToken = opts.preAuthToken;
+    const methods = opts.methods || ['totp', 'recovery'];
+    const primary = methods[0] || 'totp';   // the enrolled method (totp today; email is future)
+    let mode = primary;                      // 'totp' | 'email' | 'recovery'
+
+    box.appendChild(_el('h2', 'text-lg font-bold mb-xs', 'Two-factor authentication'));
+    const desc = _el('p', 'text-secondary text-sm mb-md');
+    const input = _el('input', 'form-control'); input.id = 'sf-code-input'; input.autocomplete = 'one-time-code';
+    const grp = _el('div', 'form-group'); grp.appendChild(input);
+    const err = _el('div', 'alert alert-error mt-sm'); err.style.display = 'none'; err.setAttribute('role', 'alert');
+    const verify = _el('button', 'btn btn-primary btn-block mt-sm', 'Verify');
+    const toggle = _el('a', 'mt-sm'); toggle.href = '#'; toggle.setAttribute('role', 'button');
+    toggle.style.display = 'inline-block'; toggle.style.fontSize = '0.9em';
+    const back = _el('a', 'mt-md', '← Back to sign in'); back.href = '#'; back.setAttribute('role', 'button'); back.style.display = 'block';
+
+    function applyMode() {
+        if (mode === 'recovery') {
+            desc.textContent = 'Enter one of your saved recovery codes.';
+            input.type = 'text'; input.removeAttribute('inputmode'); input.placeholder = 'xxxx-xxxx-xxxx-xxxx-xxxx';
+            toggle.textContent = 'Use your authenticator app instead';
+        } else {
+            desc.textContent = 'Enter the 6-digit code from your authenticator app.';
+            input.type = 'text'; input.setAttribute('inputmode', 'numeric'); input.placeholder = '123456';
+            toggle.textContent = 'Use a recovery code instead';
+        }
+        input.value = ''; err.style.display = 'none'; input.focus();
+    }
+    toggle.addEventListener('click', (e) => { e.preventDefault(); mode = (mode === 'recovery') ? primary : 'recovery'; applyMode(); });
+
+    async function submit() {
+        const code = (input.value || '').trim();
+        if (!code) { _sfError(err, 'Enter your code.'); return; }
+        verify.disabled = true;
+        try {
+            const method = (mode === 'recovery') ? 'recovery' : primary;
+            const resp = await fetch(`${API_BASE}/auth/second-factor/verify`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${preAuthToken}` },
+                body: JSON.stringify({ method, code })
+            });
+            if (!resp.ok) {
+                const e = await resp.json().catch(() => ({}));
+                _sfError(err, (e && e.detail) || 'That code is not valid.');
+                verify.disabled = false; return;
+            }
+            const d = await resp.json();
+            await finishSecondFactorLogin(d.access_token);
+        } catch (e) {
+            _sfError(err, 'Could not reach the server. Please try again.');
+            verify.disabled = false;
+        }
+    }
+    verify.addEventListener('click', submit);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    back.addEventListener('click', (e) => { e.preventDefault(); _sfCancel(preAuthToken); });
+
+    box.appendChild(desc); box.appendChild(grp); box.appendChild(err);
+    box.appendChild(verify); box.appendChild(toggle); box.appendChild(back);
+    applyMode();
+}
+
+function renderEnrollmentWizard(box, opts) {
+    const preAuthToken = opts.preAuthToken;
+    const password = opts.password || '';
+    const auth = { 'Authorization': `Bearer ${preAuthToken}` };
+    let secret = null, recoveryCodes = null;
+
+    const clear = () => box.replaceChildren();
+    const monoBlock = () => { const d = _el('div', 'mb-md'); d.style.fontFamily = 'monospace'; return d; };
+
+    async function start() {
+        clear();
+        box.appendChild(_el('h2', 'text-lg font-bold mb-xs', 'Set up two-factor authentication'));
+        box.appendChild(_el('p', 'text-secondary text-sm mb-md',
+            'Your administrator requires a second factor. Scan the QR code with an authenticator app, then enter the code it shows.'));
+        const status = _el('div', 'alert alert-info mt-sm', 'Preparing…'); status.setAttribute('role', 'status');
+        box.appendChild(status);
+        try {
+            const resp = await fetch(`${API_BASE}/users/me/second-factor/totp/enroll`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', ...auth },
+                body: JSON.stringify({ current_password: password })
+            });
+            if (!resp.ok) {
+                const e = await resp.json().catch(() => ({}));
+                status.className = 'alert alert-error mt-sm';
+                status.textContent = (e && e.detail) || 'Could not start enrollment.';
+                const back = _el('a', 'mt-md', '← Back to sign in'); back.href = '#'; back.setAttribute('role', 'button'); back.style.display = 'block';
+                back.addEventListener('click', (ev) => { ev.preventDefault(); _sfCancel(preAuthToken); });
+                box.appendChild(back);
+                return;
+            }
+            const d = await resp.json();
+            secret = d.secret;
+            renderQrStep(d);
+        } catch (e) {
+            status.className = 'alert alert-error mt-sm';
+            status.textContent = 'Could not reach the server. Please try again.';
+        }
+    }
+
+    function renderQrStep(d) {
+        clear();
+        box.appendChild(_el('h2', 'text-lg font-bold mb-xs', 'Scan this QR code'));
+        if (d.qr_svg) {
+            // Server-rendered SVG shown as a CSP-safe data: image (img-src allows data:).
+            const img = _el('img', 'mb-sm'); img.alt = 'Two-factor QR code';
+            img.style.width = '180px'; img.style.height = '180px'; img.style.background = '#fff'; img.style.padding = '8px';
+            try { img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(d.qr_svg))); } catch (_) {}
+            box.appendChild(img);
+        }
+        box.appendChild(_el('p', 'text-secondary text-sm', "Can't scan it? Enter this key manually:"));
+        const sec = monoBlock(); sec.id = 'sf-enroll-secret'; sec.style.wordBreak = 'break-all'; sec.textContent = secret || '';
+        box.appendChild(sec);
+
+        box.appendChild(_el('label', 'text-sm', 'Enter the 6-digit code'));
+        const input = _el('input', 'form-control'); input.id = 'sf-enroll-code'; input.setAttribute('inputmode', 'numeric');
+        input.autocomplete = 'one-time-code'; input.placeholder = '123456';
+        const grp = _el('div', 'form-group'); grp.appendChild(input); box.appendChild(grp);
+        const e2 = _el('div', 'alert alert-error mt-sm'); e2.style.display = 'none'; e2.setAttribute('role', 'alert'); box.appendChild(e2);
+        const next = _el('button', 'btn btn-primary btn-block mt-sm', 'Continue'); box.appendChild(next);
+
+        async function confirm() {
+            const code = (input.value || '').trim();
+            if (!code) { _sfError(e2, 'Enter the code.'); return; }
+            next.disabled = true;
+            try {
+                const resp = await fetch(`${API_BASE}/users/me/second-factor/totp/confirm`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json', ...auth },
+                    body: JSON.stringify({ code })
+                });
+                if (!resp.ok) {
+                    const e = await resp.json().catch(() => ({}));
+                    _sfError(e2, (e && e.detail) || 'That code is not valid.'); next.disabled = false; return;
+                }
+                const dd = await resp.json();
+                recoveryCodes = dd.recovery_codes || [];
+                renderRecoveryStep();
+            } catch (_) { _sfError(e2, 'Could not reach the server.'); next.disabled = false; }
+        }
+        next.addEventListener('click', confirm);
+        input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); confirm(); } });
+        input.focus();
+    }
+
+    function renderRecoveryStep() {
+        clear();
+        box.appendChild(_el('h2', 'text-lg font-bold mb-xs', 'Save your recovery codes'));
+        box.appendChild(_el('p', 'text-secondary text-sm mb-sm',
+            'Store these somewhere safe. Each works once if you lose your authenticator. They are shown only now.'));
+        const list = monoBlock(); list.style.lineHeight = '1.8';
+        (recoveryCodes || []).forEach(c => list.appendChild(_el('div', null, c)));
+        box.appendChild(list);
+        const label = _el('label', 'flex items-center gap-sm mb-sm text-sm');
+        const cb = _el('input'); cb.type = 'checkbox'; cb.id = 'sf-ack-cb';
+        label.appendChild(cb); label.appendChild(_el('span', null, "I've saved my recovery codes"));
+        box.appendChild(label);
+        const e3 = _el('div', 'alert alert-error mt-sm'); e3.style.display = 'none'; e3.setAttribute('role', 'alert'); box.appendChild(e3);
+        const done = _el('button', 'btn btn-primary btn-block', 'Finish and sign in'); box.appendChild(done);
+
+        async function ack() {
+            if (!cb.checked) { _sfError(e3, 'Please confirm you saved your recovery codes.'); return; }
+            done.disabled = true;
+            try {
+                const resp = await fetch(`${API_BASE}/users/me/second-factor/recovery/acknowledge`, {
+                    method: 'POST', headers: { ...auth }
+                });
+                if (!resp.ok) {
+                    const e = await resp.json().catch(() => ({}));
+                    _sfError(e3, (e && e.detail) || 'Could not finish enrollment.'); done.disabled = false; return;
+                }
+                const dd = await resp.json();
+                if (dd.access_token) await finishSecondFactorLogin(dd.access_token);
+                else _sfRestoreLoginForm();   // non-forced (settings) path: session already exists elsewhere
+            } catch (_) { _sfError(e3, 'Could not reach the server.'); done.disabled = false; }
+        }
+        done.addEventListener('click', ack);
+    }
+
+    start();
+}
 
 // Logout
 function logout() {
