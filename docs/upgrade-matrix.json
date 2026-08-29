@@ -173,6 +173,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.19.1": {
+      "released": "2026-08-29",
+      "notes": "No schema change. Security & authorization hardening from the v0.19.0 review: an SFTP pre-auth connection admission (a total + per-source-IP connection ceiling and an auth grace timeout, the SSH MaxStartups equivalent) so a no-credential connection flood can't exhaust threads and Transports; a password change now durably revokes the account's sessions on the self-service and admin paths, matching the reset path; regular web sessions get an absolute server-side expiry so abandoned rows age out, and session_timeout is clamped to a 30-day maximum; new password key-encryption-key wraps derive at 600,000 PBKDF2 iterations (existing wraps still open at their stored count); and denial tests plus a coverage guard for the four destructive vault capabilities. Adds SFTP_MAX_CONNECTIONS / SFTP_MAX_CONNECTIONS_PER_IP / SFTP_AUTH_GRACE_SECONDS settings (defaults suit a single tenant). A rollback to 0.19.0 is clean and needs no backup: no persistent schema or data changed.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -327,6 +335,13 @@
     {
       "from": "0.18.2",
       "to": "0.19.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.19.0",
+      "to": "0.19.1",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
