@@ -213,6 +213,20 @@ jobs:
       - name: Run the full test suite
         run: python -m pytest --maxfail=1 --junitxml=pytest-results.xml
 
+      # Keep the JUnit report -- it holds the per-test durations for all ~4,000 tests. Uploaded
+      # always (not only on failure), before the audit step below, so it survives a failing run too:
+      # it is the data for spotting a test that has been quietly getting slower and for informing any
+      # future suite sharding, and it costs seconds. The file itself was previously read once by the
+      # audit and then discarded.
+      - name: Keep the test report (durations + results)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pytest-results
+          path: pytest-results.xml
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Audit the successful full report
         run: >-
           python .github/scripts/pytest_result_audit.py pytest-results.xml
