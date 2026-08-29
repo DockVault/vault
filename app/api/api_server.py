@@ -4904,7 +4904,12 @@ async def second_factor_login_verify(
         pending.consumed_at = datetime.now(timezone.utc)
         db.commit()
         raise HTTPException(status_code=401, detail="Too many attempts on this login; start again.")
-    if not sf.check_second_factor(db, user=user, action="login", method=body.method, code=body.code):
+    # Allowlist the method against what login actually offers this account (the enrolled method +
+    # recovery) — defense in depth so only a genuine second factor is ever presented at login. The
+    # account password is the FIRST factor and is never a login second factor.
+    login_methods = set(_sf_login_methods(db, user))
+    if (body.method or "").lower() not in login_methods or not sf.check_second_factor(
+            db, user=user, action="login", method=body.method, code=body.code):
         pending.attempts = (pending.attempts or 0) + 1
         if pending.attempts >= _SF_LOGIN_MAX_ATTEMPTS:
             pending.consumed_at = datetime.now(timezone.utc)
@@ -5018,9 +5023,14 @@ async def second_factor_step_up(
     if req["must_enroll"]:
         raise HTTPException(status_code=403, detail={
             "second_factor_required": True, "action": body.action, "reason": "enroll_required", "methods": []})
-    if req["otp"] and not sf.check_second_factor(db, user=current_user, action=body.action,
-                                                 method=body.method, code=body.code):
-        raise HTTPException(status_code=403, detail="That code is not valid.")
+    if req["otp"]:
+        # Allowlist the method against the genuine OTP methods this action offers (enrolled method +
+        # recovery, + email when allowed) — never the account password, which is the first factor. The
+        # separate `require_password` re-auth below is what reads body.password.
+        otp_methods = {m for m in _sf_step_up_methods(db, current_user, req, _has) if m != "password"}
+        if (body.method or "").lower() not in otp_methods or not sf.check_second_factor(
+                db, user=current_user, action=body.action, method=body.method, code=body.code):
+            raise HTTPException(status_code=403, detail="That code is not valid.")
     if req["password"]:
         pw = body.password or (body.code if (body.method or "").lower() == "password" else None)
         if not (pw and current_user.password_hash and verify_password(pw, current_user.password_hash)):

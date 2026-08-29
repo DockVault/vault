@@ -63,6 +63,21 @@ def test_step_up_gates_vault_delete_for_an_enrolled_user(admin, temp_user, temp_
         set_action_require_otp(admin, "vault.delete", False)
 
 
+def test_password_cannot_satisfy_an_otp_step_up(admin, temp_user, temp_user_client):
+    """For an OTP-gated action, the account password must NOT mint a step-up receipt (regression for the
+    OTP-bypass where method=password was accepted in the OTP slot)."""
+    _enroll(temp_user, temp_user_client)
+    set_action_require_otp(admin, "vault.delete", True)
+    try:
+        r = temp_user_client.post("/auth/second-factor/step-up",
+                                  json={"action": "vault.delete", "method": "password",
+                                        "code": temp_user["_password"]})
+        assert r.status_code == 403, r.text
+        assert "receipt" not in (r.json() or {})
+    finally:
+        set_action_require_otp(admin, "vault.delete", False)
+
+
 def test_step_up_is_a_noop_when_action_requires_nothing(temp_user, temp_user_client):
     """With vault.delete at its default (require_otp off, B), an enrolled user deletes without a receipt —
     the decorator is a no-op for an action the policy does not gate."""

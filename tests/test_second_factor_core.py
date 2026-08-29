@@ -15,7 +15,20 @@ pytestmark = pytest.mark.unit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import second_factor as sf          # noqa: E402
-from app.core.security import verify_password       # noqa: E402
+from app.core.security import verify_password, hash_password   # noqa: E402
+
+
+def test_password_is_never_accepted_as_a_second_factor():
+    """The account password is the FIRST factor; check_second_factor must never accept it as the
+    SECOND (else a stolen password defeats MFA). method='password' — even with the correct password —
+    and any unknown method short-circuit to False without touching the DB."""
+    class _U:
+        id = "u"
+        password_hash = hash_password("correct horse battery staple")
+    u = _U()
+    assert sf.check_second_factor(None, user=u, action="login", method="password",
+                                  code="correct horse battery staple") is False
+    assert sf.check_second_factor(None, user=u, action="login", method="banana", code="x") is False
 
 
 def test_totp_rfc6238_sha1_vectors():

@@ -180,11 +180,6 @@ def _verify_recovery(db, user, code: str) -> bool:
     return False
 
 
-def _verify_password_factor(user, code: str) -> bool:
-    return bool(user and getattr(user, "password_hash", None)
-                and verify_password(code or "", user.password_hash))
-
-
 def issue_step_up_receipt(db, *, user_id, action: str, session_hash: str, redis=None) -> str:
     """Mint the session-bound step-up receipt (an otp_service code). destination carries the session
     hash so consume_step_up_receipt can refuse a receipt earned in a different session."""
@@ -193,17 +188,19 @@ def issue_step_up_receipt(db, *, user_id, action: str, session_hash: str, redis=
 
 
 def check_second_factor(db, *, user, action: str, method: str, code: str, redis=None) -> bool:
-    """Verify a presented factor for (user, action) WITHOUT issuing a receipt — the LOGIN step (which
-    creates the session directly) and anyone who just needs a yes/no. Consumes a TOTP step / a recovery
-    code on success (single-winner). `password` is intended only for admin.* actions by an un-enrolled
-    admin (the caller enforces that policy); this core only checks the credential."""
+    """Verify a presented OTP second factor for (user, action) WITHOUT issuing a receipt — the LOGIN
+    step (which creates the session directly) and anyone who just needs a yes/no. Consumes a TOTP step /
+    a recovery code on success (single-winner).
+
+    This checks ONLY genuine second factors — totp, recovery, email. It deliberately does NOT accept the
+    account password: the password is the FIRST factor, so honouring it here would let a stolen password
+    satisfy the second factor and defeat MFA entirely. The separate password RE-AUTH that a
+    `require_password` action asks for is verified by the caller with verify_password(), never here."""
     method = (method or "").lower()
     if method == "totp":
         return _verify_totp(db, user, code)
     if method == "recovery":
         return _verify_recovery(db, user, code)
-    if method == "password":
-        return _verify_password_factor(user, code)
     if method == "email":
         return otp_service.verify(db, purpose=f"sf:{action}", user_id=user.id, code=code, redis=redis).ok
     return False
@@ -213,7 +210,7 @@ def verify_second_factor(db, *, user, action: str, method: str, code: str,
                          session_hash: str, redis=None) -> SecondFactorResult:
     """Verify one presented second factor for (user, action) and, on success, issue a session-bound
     step-up receipt (the step-up path — the login path uses check_second_factor and needs no receipt)."""
-    if (method or "").lower() not in ("totp", "recovery", "password", "email"):
+    if (method or "").lower() not in ("totp", "recovery", "email"):
         return SecondFactorResult(False, reason="unknown_method")
     if not check_second_factor(db, user=user, action=action, method=method, code=code, redis=redis):
         return SecondFactorResult(False, reason="invalid")

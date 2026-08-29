@@ -75,6 +75,25 @@ def test_login_action_require_otp_off_skips_the_second_factor(admin, temp_user, 
         set_action_require_otp(admin, "login", True)   # restore the default
 
 
+def test_password_cannot_satisfy_the_login_second_factor(temp_user, temp_user_client):
+    """A stolen password must not complete the second factor. verify with method=password — even the
+    CORRECT account password — is refused; no session is minted. (Regression for the OTP-bypass where the
+    password was accepted in the OTP slot.)"""
+    _enroll(temp_user, temp_user_client)
+    fresh = ApiClient()
+    pre = fresh.session.post(f"{BASE_URL}/auth/login",
+                             json={"username": temp_user["_username"], "password": temp_user["_password"]}
+                             ).json()["pre_auth_token"]
+    ph = {"Authorization": f"Bearer {pre}"}
+    r = fresh.session.post(f"{BASE_URL}/auth/second-factor/verify", headers=ph,
+                           json={"method": "password", "code": temp_user["_password"]})
+    assert r.status_code == 401, r.text
+    assert not (r.json() or {}).get("access_token")
+    # An unknown method is likewise refused.
+    assert fresh.session.post(f"{BASE_URL}/auth/second-factor/verify", headers=ph,
+                              json={"method": "banana", "code": "000000"}).status_code == 401
+
+
 def test_non_enrolled_user_logs_in_in_one_step(temp_user):
     c = ApiClient()
     r = c.session.post(f"{BASE_URL}/auth/login",
