@@ -12,7 +12,12 @@ enrolled admin satisfies them with OTP, an un-enrolled admin re-authenticates wi
 from typing import Optional
 
 _MODES = ("optional", "required")
-_METHODS = ("totp", "email")
+# Selectable second-factor methods. `email` is DEFERRED: the code path exists (check_second_factor +
+# the lockout guards below) but issuance/enrollment is not wired yet, so an email code can never be
+# delivered — offering it would let an admin pick a factor no one can satisfy (a lockout footgun). Keep
+# it out of the selectable set until email issuance ships; then add "email" back here and the guards
+# below arm automatically.
+_METHODS = ("totp",)
 _SFTP = ("allow", "temp_credential_only")
 
 DEFAULTS = {
@@ -112,7 +117,7 @@ def validate_policy(blob: dict, *, active_admins_without_email: int, smtp_config
     if "mfa_allowed_methods" in blob:
         methods = blob["mfa_allowed_methods"]
         if not isinstance(methods, list) or not methods or any(m not in _METHODS for m in methods):
-            raise SecondFactorPolicyError("mfa_allowed_methods must be a non-empty subset of ['totp','email'].")
+            raise SecondFactorPolicyError("mfa_allowed_methods must be a non-empty subset of ['totp'].")
     if "mfa_email_code_ttl_minutes" in blob:
         ttl = blob["mfa_email_code_ttl_minutes"]
         if not isinstance(ttl, int) or not (1 <= ttl <= 60):

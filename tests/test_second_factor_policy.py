@@ -92,12 +92,11 @@ def test_validate_policy_bounds_and_email_lockout_guards():
                 {"mfa_allowed_methods": ["sms"]}, {"mfa_sftp_policy": "never"}):
         with pytest.raises(pol.SecondFactorPolicyError):
             pol.validate_policy(bad, active_admins_without_email=0, smtp_configured=True)
-    # email-only lockout guards
-    with pytest.raises(pol.SecondFactorPolicyError):
-        pol.validate_policy({"mfa_allowed_methods": ["email"]}, active_admins_without_email=0, smtp_configured=False)
-    with pytest.raises(pol.SecondFactorPolicyError):
-        pol.validate_policy({"mfa_allowed_methods": ["email"]}, active_admins_without_email=1, smtp_configured=True)
-    pol.validate_policy({"mfa_allowed_methods": ["email"]}, active_admins_without_email=0, smtp_configured=True)
+    # email is a DEFERRED method (issuance not wired) — not currently selectable, so any policy that
+    # includes it is rejected before it can lock anyone out.
+    for email_blob in ({"mfa_allowed_methods": ["email"]}, {"mfa_allowed_methods": ["totp", "email"]}):
+        with pytest.raises(pol.SecondFactorPolicyError):
+            pol.validate_policy(email_blob, active_admins_without_email=0, smtp_configured=True)
 
 
 def test_catalog_excludes_unbuilt_routes_and_has_metadata():
