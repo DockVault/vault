@@ -9,9 +9,11 @@ def test_matrix_seeded_and_togglable(admin):
     # the catalog is seeded; routes that don't exist yet are absent (they'd trip the boot contract)
     assert "login" in actions and "admin.user.manage" in actions and "vault.delete" in actions
     assert "receiver.create" not in actions
-    # sensible seed defaults: admin management on, a low-risk vault password change off, password opt-in off
+    # conservative ("B") seed defaults: the admin chain + manage-2FA + login are on; every other action
+    # (incl. delete vault) ships OFF so a fresh deploy forces enrollment on no one; password opt-in off.
     assert actions["admin.user.manage"]["require_otp"] is True
-    assert actions["vault.change_password"]["require_otp"] is False
+    assert actions["account.second_factor"]["require_otp"] is True and actions["login"]["require_otp"] is True
+    assert actions["vault.delete"]["require_otp"] is False and actions["vault.change_password"]["require_otp"] is False
     assert all(a["require_password"] is False for a in actions.values())
 
     # toggle require_password on an action (owner's second toggle), leaving require_otp untouched
@@ -19,7 +21,7 @@ def test_matrix_seeded_and_togglable(admin):
     assert r.status_code == 200 and r.json()["require_password"] is True
     actions = {a["key"]: a for a in admin.get("/second-factor/actions").json()["actions"]}
     assert actions["vault.delete"]["require_password"] is True
-    assert actions["vault.delete"]["require_otp"] is True     # its seeded default, unchanged by the toggle
+    assert actions["vault.delete"]["require_otp"] is False     # its B default, unchanged by the toggle
 
     # an unknown key is refused
     assert admin.put("/second-factor/actions/not.a.real.action", json={"require_otp": True}).status_code == 404

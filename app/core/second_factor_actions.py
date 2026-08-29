@@ -12,19 +12,23 @@ half) are deliberately NOT listed until they ship, so the boot contract that pai
 a guarded route stays satisfiable.
 """
 
-# (key, human name, default require_otp). require_password defaults False for every action: it is an
-# admin opt-in per row, never on by default.
+# (key, human name, default require_otp). require_password defaults False for every action; require_otp
+# defaults ON only for the CONSERVATIVE set (owner's pick "B"): the admin-chain (safe — an un-enrolled
+# admin falls back to a password re-auth, so ON never forces enrollment), managing your own two-factor,
+# and login (an enrolled account presents its factor at sign-in). Every other action ships OFF so a fresh
+# deploy does not force enrollment on anyone via the require_otp+not-enrolled block; an admin opts each one
+# in per row from the matrix.
 SECOND_FACTOR_ACTIONS = [
     ("login",                          "Log in",                                   True),
-    ("account.change_password",        "Change your account password",             True),
-    ("account.change_email",           "Change your account email",                True),
+    ("account.change_password",        "Change your account password",             False),
+    ("account.change_email",           "Change your account email",                False),
     ("account.second_factor",          "Manage two-factor / recovery codes",       True),
-    ("account.encryption_key.replace", "Replace your account encryption key",       True),
-    ("vault.delete",                   "Delete a vault",                            True),
+    ("account.encryption_key.replace", "Replace your account encryption key",       False),
+    ("vault.delete",                   "Delete a vault",                            False),
     ("vault.change_password",          "Change a vault password",                   False),
     ("vault.rotate_key",               "Rotate a vault key",                        False),
     ("share.create",                   "Create an internal share",                 False),
-    ("public_link.create",             "Create a public note link",                True),
+    ("public_link.create",             "Create a public note link",                False),
     ("temp_credential.create",         "Mint a temporary credential",              False),
     ("admin.user.manage",             "Manage users (create / edit / delete / invite)", True),
     ("admin.settings.write",           "Change organization settings",             True),
