@@ -6606,6 +6606,57 @@ async def acknowledge_recovery_codes(
     return {"enrolled": True, "method": "totp"}
 
 
+@app.delete("/users/me/second-factor")
+@require_step_up("account.second_factor")
+async def disable_second_factor(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Disable the caller's second factor. Refused (409) while it is REQUIRED for this account (by policy
+    or department) -- a required user cannot opt out. Deletes the enrollment and every recovery code.
+    Gated by the account.second_factor step-up (an enrolled caller presents their factor to turn it off)."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
+    if _second_factor_effective(db, current_user)["required"]:
+        raise HTTPException(status_code=409,
+                            detail="A second factor is required for your account and cannot be disabled.")
+    db.query(SecondFactorRecoveryCode).filter(
+        SecondFactorRecoveryCode.user_id == current_user.id).delete(synchronize_session=False)
+    db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.user_id == current_user.id).delete(synchronize_session=False)
+    db.commit()
+    try:
+        AuditLogger(db).log_action(action="second_factor_disabled", status="success", user=current_user,
+                                   ip_address=get_client_ip(request), details={})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"disabled": True}
+
+
+@app.post("/users/me/second-factor/recovery/regenerate")
+@require_step_up("account.second_factor")
+async def regenerate_recovery_codes(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Invalidate all recovery codes and issue ten new ones, shown once. Requires an active enrollment and
+    the account.second_factor step-up."""
+    from app.core import second_factor as sf
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
+    if not _sf_enrollment(db, current_user.id, status="active"):
+        raise HTTPException(status_code=400, detail="No active second factor to regenerate codes for.")
+    db.query(SecondFactorRecoveryCode).filter(
+        SecondFactorRecoveryCode.user_id == current_user.id).delete(synchronize_session=False)
+    generated = sf.generate_recovery_codes()
+    for _plain, prefix, code_hash in generated:
+        db.add(SecondFactorRecoveryCode(user_id=current_user.id, code_prefix=prefix, code_hash=code_hash))
+    db.commit()
+    return {"recovery_codes": [sf.format_recovery_code(p) for p, _pr, _h in generated]}
+
+
 # --- Second factor: admin policy matrix ------------------------------------------------------------
 
 class SecondFactorActionToggle(BaseModel):
