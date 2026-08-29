@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import second_factor as sf   # noqa: E402
+from _sf_helpers import set_action_require_otp   # noqa: E402
 
 
 def _totp(secret, step_offset=0):
@@ -24,7 +25,7 @@ def _enroll(user, client):
 
 def test_step_up_gates_vault_delete_for_an_enrolled_user(admin, temp_user, temp_user_client):
     secret = _enroll(temp_user, temp_user_client)
-    admin.put("/second-factor/actions/vault.delete", json={"require_otp": True}).raise_for_status()
+    set_action_require_otp(admin, "vault.delete", True)   # gated matrix change via a throwaway enrolled admin
     try:
         vid = temp_user_client.create_vault()["id"]
 
@@ -59,7 +60,7 @@ def test_step_up_gates_vault_delete_for_an_enrolled_user(admin, temp_user, temp_
                                      headers={"X-Second-Factor": receipt}).status_code == 403
         temp_user_client.delete_vault(vid2)   # clean up (require_otp is about to go back off)
     finally:
-        admin.put("/second-factor/actions/vault.delete", json={"require_otp": False}).raise_for_status()
+        set_action_require_otp(admin, "vault.delete", False)
 
 
 def test_step_up_is_a_noop_when_action_requires_nothing(temp_user, temp_user_client):

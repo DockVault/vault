@@ -2,7 +2,8 @@
 each action carries the owner's two independent toggles (require_otp + require_password)."""
 
 
-def test_matrix_seeded_and_togglable(admin):
+def test_matrix_seeded_and_read(admin):
+    # Reading the matrix is not gated.
     r = admin.get("/second-factor/actions")
     assert r.status_code == 200, r.text
     actions = {a["key"]: a for a in r.json()["actions"]}
@@ -15,18 +16,7 @@ def test_matrix_seeded_and_togglable(admin):
     assert actions["admin.user.manage"]["require_otp"] is False and actions["admin.settings.write"]["require_otp"] is False
     assert actions["vault.delete"]["require_otp"] is False and actions["vault.change_password"]["require_otp"] is False
     assert all(a["require_password"] is False for a in actions.values())
-
-    # toggle require_password on an action (owner's second toggle), leaving require_otp untouched
-    r = admin.put("/second-factor/actions/vault.delete", json={"require_password": True})
-    assert r.status_code == 200 and r.json()["require_password"] is True
-    actions = {a["key"]: a for a in admin.get("/second-factor/actions").json()["actions"]}
-    assert actions["vault.delete"]["require_password"] is True
-    assert actions["vault.delete"]["require_otp"] is False     # its B default, unchanged by the toggle
-
-    # an unknown key is refused
-    assert admin.put("/second-factor/actions/not.a.real.action", json={"require_otp": True}).status_code == 404
-    # restore so the shared instance isn't left mutated
-    admin.put("/second-factor/actions/vault.delete", json={"require_password": False}).raise_for_status()
+    # (Changing the matrix is gated by the account.second_factor step-up -- see test_api_second_factor_config.)
 
 
 def test_matrix_is_admin_only(temp_user_client):

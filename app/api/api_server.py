@@ -2859,6 +2859,22 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
         # payload here carries the normalized value into the merge in update_settings.
         payload.update(normalized)
 
+    # MFA policy (mfa_mode / required groups + users / allowed methods / email TTL / sftp policy). Shape
+    # + bounds + the email-only lockout guards are validated with the same DB-derived facts pattern; the
+    # group-id list is validated by the existing DB-bound check, as the account policy's are.
+    from app.core import second_factor_policy as _sfpol
+    if any(k in payload for k in _sfpol.DEFAULTS):
+        try:
+            _mfa_norm = _sfpol.validate_policy(
+                {k: payload[k] for k in _sfpol.DEFAULTS if k in payload},
+                active_admins_without_email=len(_admins_without_email(db)),
+                smtp_configured=_smtp_configured(db))
+        except _sfpol.SecondFactorPolicyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if "mfa_required_group_ids" in payload:
+            _validate_group_id_list(payload, "mfa_required_group_ids", db)
+        payload.update({k: _mfa_norm[k] for k in _sfpol.DEFAULTS if k in payload})
+
 
 @app.get("/settings/login-identifier-readiness")
 async def get_login_identifier_readiness(
@@ -2932,6 +2948,10 @@ async def get_settings(
     # posture and a whole-object save can't persist an unchecked default.
     from app.core.account_policy import effective_account_policy
     data.update(effective_account_policy(row.value if row else None))
+    # Effective MFA policy (mode / required groups + users / allowed methods / email TTL / sftp policy),
+    # defaults filled in, so the Accounts & Access -> Two-factor tab renders the real posture.
+    from app.core import second_factor_policy as _sfpol_get
+    data.update(_sfpol_get.effective_policy(row.value if row else None))
     # Stored zero means "use deployment default"; expose those defaults separately so the UI
     # can explain the effective fallback without persisting it on an unrelated save.
     for key in _RATE_LIMIT_API_SETTING_KEYS:
@@ -2958,6 +2978,12 @@ async def update_settings(
     Gated by require_interactive_admin (NOT plain require_admin): a temporary credential —
     even one minted from an admin — must not rewrite the deployment's org policy
     (zero_knowledge_enabled / force_zero_knowledge / standard_vault_allowed_groups)."""
+    # Changing the MFA policy requires the account.second_factor step-up ("changing OTP settings requires
+    # OTP"): an admin who wants to tighten MFA enrolls first, so they always keep an OTP to loosen it
+    # again — never locked out. Conditional, so ordinary settings saves are untouched.
+    from app.core import second_factor_policy as _sfpol_gate
+    if any(k in payload for k in _sfpol_gate.DEFAULTS):
+        _enforce_step_up(db, current_user, request, "account.second_factor")
     _validate_settings_payload(payload, db)
     from app.core.models import SystemSetting
     row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
@@ -6683,6 +6709,7 @@ async def list_second_factor_actions(
 
 
 @app.put("/second-factor/actions/{key}")
+@require_step_up("account.second_factor")
 async def update_second_factor_action(
     key: str,
     body: SecondFactorActionToggle,
