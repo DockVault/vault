@@ -4845,6 +4845,35 @@ async def get_pre_auth_principal(
     return user, pending
 
 
+async def get_enrolling_principal(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+):
+    """Principal for the TOTP enrollment endpoints, accepting EITHER a normal session OR a
+    forced-enrollment pre-auth token (a pending login with enrollment_required=True). This lets a user
+    the policy REQUIRES to enroll bootstrap their factor before they own a session (forced enrollment). Returns
+    (user, pending_or_None): `pending` is set only on the pre-auth path, so `acknowledge` can mint the
+    real session once activation succeeds. A pre-auth token whose pending row is NOT enrollment_required
+    is refused here — an already-enrolled user finishing login uses /auth/second-factor/verify."""
+    payload = verify_access_token(credentials.credentials)
+    if payload and payload.get("stage") == "second_factor" and payload.get("pre_auth"):
+        pending = db.query(PendingLogin).filter(PendingLogin.id == payload["pre_auth"]).first()
+        exp = pending.expires_at if pending else None
+        if exp is not None and exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if not pending or pending.consumed_at is not None or (exp is not None and exp < datetime.now(timezone.utc)):
+            raise HTTPException(status_code=401, detail="This login attempt has expired; start again.")
+        if not pending.enrollment_required:
+            raise HTTPException(status_code=401, detail="A valid session is required.")
+        user = db.query(User).filter(User.id == pending.user_id).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid pre-authentication token.")
+        return user, pending
+    # Normal session token: delegate to the hardened session dependency.
+    user = await get_current_user(credentials, db)
+    return user, None
+
+
 class SecondFactorVerifyRequest(BaseModel):
     method: str = ""
     code: str = ""
@@ -6559,17 +6588,19 @@ async def get_my_second_factor(
 async def enroll_totp(
     body: TotpEnrollRequest,
     request: Request,
-    current_user: User = Depends(get_current_user),
+    principal=Depends(get_enrolling_principal),
     db: Session = Depends(get_db),
 ):
     """Begin TOTP enrollment: mint a sealed seed, store it 'unconfirmed', and return the otpauth URI +
     base32 secret. Re-proves the account password (first-enrollment gate). An already-active enrollment
-    must be disabled first (re-enroll = disable then enroll), so an active method is never replaced here."""
+    must be disabled first (re-enroll = disable then enroll), so an active method is never replaced here.
+    Reachable with a normal session OR a forced-enrollment pre-auth token."""
     from app.core.security import verify_password, encrypt_secret
     from app.core import second_factor as sf
     from app.core.models import SecondFactorEnrollment
     from app.config.effective import get_effective_branding
 
+    current_user, _pending = principal
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
     user = db.query(User).filter(User.id == current_user.id).first()
@@ -6600,16 +6631,18 @@ async def enroll_totp(
 async def confirm_totp(
     body: TotpConfirmRequest,
     request: Request,
-    current_user: User = Depends(get_current_user),
+    principal=Depends(get_enrolling_principal),
     db: Session = Depends(get_db),
 ):
     """Prove the authenticator by a correct code, then generate the MANDATORY recovery codes and return
-    them ONCE. The enrollment stays 'unconfirmed' until acknowledge — the codes are not optional."""
+    them ONCE. The enrollment stays 'unconfirmed' until acknowledge — the codes are not optional.
+    Reachable with a normal session OR a forced-enrollment pre-auth token."""
     from app.core import second_factor as sf
     from app.core.security import decrypt_secret
     from app.core.models import SecondFactorEnrollment, SecondFactorRecoveryCode
     from datetime import datetime, timezone
 
+    current_user, _pending = principal
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
     enr = db.query(SecondFactorEnrollment).filter(
@@ -6643,14 +6676,18 @@ async def confirm_totp(
 @app.post("/users/me/second-factor/recovery/acknowledge")
 async def acknowledge_recovery_codes(
     request: Request,
-    current_user: User = Depends(get_current_user),
+    principal=Depends(get_enrolling_principal),
     db: Session = Depends(get_db),
 ):
     """Confirm the recovery codes were saved and activate the enrollment. Until this call the user is
-    NOT enrolled. Activating a second factor revokes the account's OTHER sessions."""
+    NOT enrolled. Activating a second factor revokes the account's OTHER sessions.
+
+    On the forced-enrollment path (a pre-auth token) the user had no session: consume the pending
+    login and mint the real session here, returning an access_token so onboarding ends signed in."""
     from app.core.models import SecondFactorEnrollment
     from datetime import datetime, timezone
 
+    current_user, pending = principal
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
     enr = db.query(SecondFactorEnrollment).filter(
@@ -6664,8 +6701,36 @@ async def acknowledge_recovery_codes(
         raise HTTPException(status_code=400, detail="Generate recovery codes before activating.")
     enr.status = "active"
     db.commit()
-    # A change to how the account authenticates should not leave older sessions standing — but keep the
-    # session that just did the enrollment (the user stays logged in).
+
+    if pending is not None:
+        # Forced-enrollment login: consume the pending row (single winner) and mint the real session.
+        # There are no older sessions to revoke — a required-but-unenrolled user never held one.
+        client_ip = get_client_ip(request)
+        if db.query(PendingLogin).filter(
+                PendingLogin.id == pending.id, PendingLogin.consumed_at.is_(None)).update(
+                {"consumed_at": datetime.now(timezone.utc)}, synchronize_session=False) != 1:
+            db.commit()
+            raise HTTPException(status_code=401, detail="This login attempt was already completed.")
+        db.commit()
+        auth_service = AuthService(db)
+        session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
+        session_token = auth_service._create_session(current_user, None, client_ip, expires_at=session_expires_at)
+        _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
+        access_token = create_access_token(
+            data={"sub": str(current_user.id), "username": current_user.username,
+                  "session_token": session_token, "is_temporary": False,
+                  "amr": ["pwd", "totp"], "mfa_at": int(datetime.now(timezone.utc).timestamp())},
+            expires_delta=_expires)
+        try:
+            AuditLogger(db).log_login_success(current_user, client_ip, is_temporary=False)
+            AuditLogger(db).log_action(action="second_factor_enrolled", status="success", user=current_user,
+                                       ip_address=client_ip, details={"method": "totp", "forced": True})
+        except Exception:      # noqa: BLE001
+            pass
+        return {"enrolled": True, "method": "totp", "access_token": access_token, "token_type": "bearer"}
+
+    # Normal (already-signed-in) path: a change to how the account authenticates should not leave older
+    # sessions standing — but keep the session that just did the enrollment (the user stays logged in).
     try:
         _revoke_sessions(db, user_id=current_user.id, actor_username=current_user.username,
                          except_session_token=_current_session_hash(request))
@@ -7301,6 +7366,64 @@ async def delete_ssh_key(
     except Exception:  # noqa: BLE001
         pass
     return {"message": "SSH key removed"}
+
+
+@app.post("/users/{user_id}/second-factor/reset")
+@require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
+async def admin_reset_second_factor(
+    user_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin: clear a user's second-factor enrollment + recovery codes (e.g. a lost device), revoke the
+    user's sessions, and notify them. If MFA is in effect for that account they re-enroll at the next
+    login via forced enrollment. Guard: an admin may not reset their OWN factor while mfa_mode is
+    'required' and they are the only enrolled admin — that would strip the last enrolled admin's
+    factor through this route."""
+    from app.core import second_factor_policy as pol
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.id == current_user.id:
+        mode = pol.effective_policy(_global_settings_blob(db))["mfa_mode"]
+        if mode == "required":
+            enrolled_admins = db.query(User.id).join(
+                SecondFactorEnrollment, SecondFactorEnrollment.user_id == User.id).filter(
+                User.role == RoleEnum.ADMIN, User.is_active.is_(True),
+                SecondFactorEnrollment.status == "active").count()
+            if enrolled_admins <= 1:
+                raise HTTPException(status_code=400, detail=(
+                    "You can't reset your own second factor while MFA is required and you are the only "
+                    "enrolled administrator. Have another admin enroll first, or reset it from the host."))
+    db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.user_id == target.id).delete(synchronize_session=False)
+    db.query(SecondFactorRecoveryCode).filter(
+        SecondFactorRecoveryCode.user_id == target.id).delete(synchronize_session=False)
+    db.commit()
+    # A change to how the account authenticates should not leave standing sessions.
+    try:
+        _revoke_sessions(db, user_id=target.id, actor_username=current_user.username)
+        db.commit()
+    except Exception:      # noqa: BLE001 - the reset already committed; the revoke is best-effort
+        db.rollback()
+    try:
+        AuditLogger(db).log_action(action="second_factor_admin_reset", status="success", user=current_user,
+                                   resource_type="user", resource_id=str(target.id),
+                                   ip_address=get_client_ip(request),
+                                   details={"target_username": target.username})
+    except Exception:      # noqa: BLE001
+        pass
+    try:
+        _notify_users([str(target.id)], "second_factor_admin_reset",
+                      title="Your second factor was reset",
+                      body="An administrator reset your two-factor authentication. You'll set it up "
+                           "again at your next sign-in.",
+                      target="#profile")
+    except Exception:      # noqa: BLE001
+        pass
+    return {"reset": True}
 
 
 @app.post("/users/{user_id}/delete")
