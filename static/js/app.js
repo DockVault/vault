@@ -785,8 +785,28 @@ async function apiRequest(endpoint, options = {}) {
         
         // Handle 403 Forbidden - distinguish between inactive account vs permission denied
         if (response.status === 403) {
+            // A gated action needing a step-up: `detail` is an OBJECT {second_factor_required, action,
+            // reason, methods}. Prove the factor, then retry the SAME request once with the receipt.
+            const sfDetail = data && data.detail;
+            if (sfDetail && typeof sfDetail === 'object' && sfDetail.second_factor_required) {
+                if (sfDetail.reason === 'enroll_required') {
+                    throw new Error('You must set up two-factor authentication for this action. Enable it in your account settings.');
+                }
+                if (!options._sfRetried) {
+                    const receipt = await requestStepUpReceipt(sfDetail.action, sfDetail.methods || []);
+                    if (receipt) {
+                        return apiRequest(endpoint, {
+                            ...options,
+                            _sfRetried: true,
+                            headers: { ...(options.headers || {}), 'X-Second-Factor': receipt },
+                        });
+                    }
+                }
+                throw new Error('This action needs an extra confirmation.');
+            }
+
             const errorDetail = data?.detail || '';
-            
+
             // Check if this is an account issue (inactive/terminated)
             if (errorDetail.includes('inactive') || errorDetail.includes('terminated') || errorDetail.includes('locked')) {
                 // Account issue - log out user
@@ -1708,6 +1728,127 @@ function renderEnrollmentWizard(box, opts) {
     }
 
     start();
+}
+
+// ============================================================================
+// STEP-UP: prove a factor for a gated action, get a session-bound receipt
+// ============================================================================
+// apiRequest calls requestStepUpReceipt() when a gated call returns 403 {second_factor_required},
+// then retries the call once with the X-Second-Factor receipt. The receipt is single-use + session-bound.
+
+let _stepUpResolve = null;
+
+function _stepUpSettle(receipt) {
+    const r = _stepUpResolve;
+    _stepUpResolve = null;
+    if (r) r(receipt);
+}
+
+// Resolve with an X-Second-Factor receipt for `action`, or null if the user cancels. `methods` comes
+// from the gated 403 (e.g. ['totp','recovery'] and/or ['password']).
+function requestStepUpReceipt(action, methods) {
+    _stepUpSettle(null);   // abandon any prior pending step-up
+    const list = (Array.isArray(methods) && methods.length) ? methods : ['totp', 'recovery'];
+    return new Promise((resolve) => {
+        _stepUpResolve = resolve;
+        _buildStepUpBody(action, list);
+        openModal('stepup-modal');
+    });
+}
+
+function _buildStepUpBody(action, methods) {
+    const body = document.getElementById('stepup-modal-body');
+    if (!body) { _stepUpSettle(null); return; }
+    body.replaceChildren();
+
+    const otpMethod = methods.find(m => m === 'totp' || m === 'email') || null;
+    const hasRecovery = methods.includes('recovery');
+    const hasPassword = methods.includes('password');
+    let otpMode = otpMethod ? 'otp' : (hasRecovery ? 'recovery' : null);   // 'otp' | 'recovery'
+
+    body.appendChild(_el('p', 'text-secondary text-sm mb-md', 'This action needs an extra confirmation.'));
+
+    let codeInput = null, codeLabel = null, recoveryToggle = null;
+    if (otpMethod || hasRecovery) {
+        codeLabel = _el('label', 'text-sm');
+        codeInput = _el('input', 'form-control'); codeInput.id = 'stepup-code-input'; codeInput.autocomplete = 'one-time-code';
+        const g = _el('div', 'form-group'); g.appendChild(codeLabel); g.appendChild(codeInput); body.appendChild(g);
+        if (otpMethod && hasRecovery) {
+            recoveryToggle = _el('a', 'text-sm'); recoveryToggle.href = '#'; recoveryToggle.setAttribute('role', 'button');
+            recoveryToggle.style.display = 'inline-block'; body.appendChild(recoveryToggle);
+        }
+    }
+
+    let pwInput = null;
+    if (hasPassword) {
+        const g = _el('div', 'form-group mt-sm');
+        g.appendChild(_el('label', 'text-sm', 'Account password'));
+        pwInput = _el('input', 'form-control'); pwInput.type = 'password'; pwInput.id = 'stepup-password-input'; pwInput.autocomplete = 'current-password';
+        g.appendChild(pwInput); body.appendChild(g);
+    }
+
+    const err = _el('div', 'alert alert-error mt-sm'); err.style.display = 'none'; err.setAttribute('role', 'alert'); body.appendChild(err);
+
+    function applyCodeMode() {
+        if (!codeInput) return;
+        if (otpMode === 'recovery') {
+            codeLabel.textContent = 'Recovery code';
+            codeInput.type = 'text'; codeInput.removeAttribute('inputmode'); codeInput.placeholder = 'xxxx-xxxx-xxxx-xxxx-xxxx';
+            if (recoveryToggle) recoveryToggle.textContent = 'Use your authenticator app instead';
+        } else {
+            codeLabel.textContent = 'Authenticator code';
+            codeInput.type = 'text'; codeInput.setAttribute('inputmode', 'numeric'); codeInput.placeholder = '123456';
+            if (recoveryToggle) recoveryToggle.textContent = 'Use a recovery code instead';
+        }
+        codeInput.value = ''; err.style.display = 'none'; codeInput.focus();
+    }
+    if (recoveryToggle) recoveryToggle.addEventListener('click', (e) => { e.preventDefault(); otpMode = (otpMode === 'recovery') ? 'otp' : 'recovery'; applyCodeMode(); });
+
+    const footer = _el('div', 'modal-footer mt-md');
+    const cancel = _el('button', 'btn btn-secondary', 'Cancel');
+    const confirm = _el('button', 'btn btn-primary', 'Confirm');
+    footer.appendChild(cancel); footer.appendChild(confirm); body.appendChild(footer);
+    cancel.addEventListener('click', () => { closeModal(); });   // closeModal settles the promise null
+
+    async function submit() {
+        const payload = { action };
+        if (codeInput) {
+            const code = (codeInput.value || '').trim();
+            if (!code) { _sfError(err, 'Enter your code.'); return; }
+            payload.method = (otpMode === 'recovery') ? 'recovery' : (otpMethod || 'totp');
+            payload.code = code;
+        }
+        if (pwInput) {
+            const pw = pwInput.value || '';
+            if (!pw) { _sfError(err, 'Enter your account password.'); return; }
+            payload.password = pw;
+            if (!payload.method) payload.method = 'password';
+        }
+        confirm.disabled = true;
+        try {
+            const resp = await fetch(`${API_BASE}/auth/second-factor/step-up`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+                body: JSON.stringify(payload)
+            });
+            if (!resp.ok) {
+                const e = await resp.json().catch(() => ({}));
+                _sfError(err, (e && typeof e.detail === 'string') ? e.detail : 'That was not accepted. Try again.');
+                confirm.disabled = false; return;
+            }
+            const d = await resp.json();
+            _stepUpSettle(d.receipt || null);   // settle BEFORE closing so closeModal's settle(null) is a no-op
+            closeModal();
+        } catch (_) {
+            _sfError(err, 'Could not reach the server. Please try again.');
+            confirm.disabled = false;
+        }
+    }
+    confirm.addEventListener('click', submit);
+    if (codeInput) codeInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    if (pwInput) pwInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    applyCodeMode();
+    if (!codeInput && pwInput) pwInput.focus();
 }
 
 // Logout
@@ -17238,6 +17379,9 @@ function closeModal() {
     });
     closeFilePreview(); // free any in-memory decrypted preview blob
     clearCredentialInputsOnClose();
+    // A step-up modal closed without a receipt (Cancel / ×) resolves its pending request as cancelled.
+    // On a successful step-up the promise is already settled before this runs, so this is a no-op then.
+    if (typeof _stepUpSettle === 'function') _stepUpSettle(null);
 }
 
 // Empty the credential fields of any dialog that just closed.

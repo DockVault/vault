@@ -3066,6 +3066,18 @@
                     </div>
                 </div>
 
+                <!-- Step-up confirmation: shown when a gated action needs a second factor / re-auth.
+                     The body is built in JS to match the action's required methods. -->
+                <div id="stepup-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="stepup-modal-title">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3 id="stepup-modal-title">Confirm it's you</h3>
+                            <button class="close-modal-btn modal-close" aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body" id="stepup-modal-body"></div>
+                    </div>
+                </div>
+
                 <!-- Your Account (self-service) Modal -->
                 <div id="user-settings-modal" class="modal">
                     <div class="modal-content modal-lg">

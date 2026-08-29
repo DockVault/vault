@@ -11,7 +11,7 @@ import pytest                                              # noqa: E402
 from playwright.sync_api import Page, expect               # noqa: E402
 
 from app.core import second_factor as sf                   # noqa: E402
-from _sf_helpers import enroll_totp, enrolled_admin, step_up_receipt   # noqa: E402
+from _sf_helpers import enroll_totp, enrolled_admin, step_up_receipt, set_action_require_otp   # noqa: E402
 
 pytestmark = pytest.mark.ui
 
@@ -97,3 +97,57 @@ def test_forced_enrollment_wizard_completes_in_place(page: Page, admin):
     finally:
         admin.delete_user(newu["id"])
         admin.delete_user(ta["id"])
+
+
+def test_gated_action_triggers_step_up_modal_then_retries(page: Page, admin):
+    """A gated action (vault.delete with require_otp on) surfaces the step-up modal through apiRequest;
+    confirming a factor mints a receipt and the original request is retried and succeeds."""
+    u = admin.create_user(role="user")
+    c = admin.clone_anonymous()
+    c.login(u["_username"], u["_password"])
+    _secret, codes = enroll_totp(u, c)
+    vid = c.create_vault()["id"]
+    set_action_require_otp(admin, "vault.delete", True)
+    try:
+        # Log in through the browser, finishing the second factor with a recovery code.
+        page.goto("/")
+        page.fill("#username", u["_username"])
+        page.fill("#password", u["_password"])
+        page.click("#login-form button[type=submit]")
+        page.get_by_role("button", name="Use a recovery code instead").click()
+        page.fill("#sf-code-input", codes[0])
+        page.click("#login-second-factor button")
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+
+        # Trigger the gated delete via apiRequest; it should surface the step-up modal. Fire-and-forget:
+        # the arrow returns nothing, so evaluate() does NOT await the (still-pending) request — the
+        # request only resolves once we complete the modal below, and awaiting it here would deadlock.
+        page.evaluate(
+            "(vid) => { window.__del = undefined;"
+            " apiRequest('/vaults/' + vid + '/delete', {method:'POST'})"
+            "   .then(() => { window.__del = 'ok'; })"
+            "   .catch(e => { window.__del = 'err:' + (e && e.message); }); }",
+            vid,
+        )
+        expect(page.locator("#stepup-modal.active")).to_be_visible(timeout=10000)
+        expect(page.locator("#stepup-code-input")).to_be_visible()
+
+        # Confirm with a recovery code; the modal mints a receipt and apiRequest retries the delete.
+        page.get_by_role("button", name="Use a recovery code instead").click()
+        page.fill("#stepup-code-input", codes[1])
+        page.get_by_role("button", name="Confirm").click()
+        # Poll for the fire-and-forget result via evaluate() (CDP-based, CSP-safe). wait_for_function's
+        # string form is eval-based and the app's strict CSP (no unsafe-eval) blocks it.
+        result = None
+        for _ in range(50):
+            result = page.evaluate("() => window.__del")
+            if result is not None:
+                break
+            page.wait_for_timeout(200)
+        assert result == "ok", result
+    finally:
+        set_action_require_otp(admin, "vault.delete", False)
+        try:
+            admin.delete_user(u["id"])
+        except Exception:
+            pass
