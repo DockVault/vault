@@ -4780,6 +4780,165 @@ async def second_factor_login_cancel(
     return {"cancelled": True}
 
 
+# --- Second factor: step-up enforcement -----------------------------------------------------------
+
+# Every require_step_up(key) registers `key` here; the boot contract (added once every catalog action is
+# guarded) asserts this equals the catalog keys minus `login` (which the login flow enforces, not a
+# decorator).
+GUARDED_STEP_UP_ACTIONS = set()
+
+
+def _sf_action_toggles(db, action):
+    from app.core import second_factor_actions as acts
+    row = db.query(SecondFactorAction).filter(SecondFactorAction.key == action).first()
+    default_otp = acts.ACTION_META.get(action, {}).get("default_require_otp", False)
+    return (bool(row.require_otp) if row else bool(default_otp),
+            bool(row.require_password) if row else False)
+
+
+def _sf_requirement_for(db, user, action):
+    """(requirement dict, has_active_enrollment) for this user + action, per the two-toggle policy."""
+    from app.core import second_factor_actions as acts
+    from app.core import second_factor_policy as pol
+    require_otp, require_password = _sf_action_toggles(db, action)
+    has_active = db.query(SecondFactorEnrollment.id).filter(
+        SecondFactorEnrollment.user_id == user.id,
+        SecondFactorEnrollment.status == "active").first() is not None
+    req = pol.resolve_action_requirement(require_otp=require_otp, require_password=require_password,
+                                         has_active_enrollment=has_active,
+                                         is_admin_action=acts.is_admin_action(action))
+    return req, has_active
+
+
+def _sf_step_up_methods(db, user, req, has_active) -> list:
+    methods = []
+    if req["otp"] and has_active:
+        enr = db.query(SecondFactorEnrollment).filter(
+            SecondFactorEnrollment.user_id == user.id, SecondFactorEnrollment.status == "active").first()
+        if enr:
+            methods.append(enr.method)
+        methods.append("recovery")
+    if req["password"]:
+        methods.append("password")
+    return methods
+
+
+def _enforce_step_up(db, user, request, action):
+    """Raise 403 second_factor_required unless the caller has satisfied `action`'s step-up for THIS
+    session. A temp session has its own scope gate and never satisfies an account step-up here."""
+    if getattr(user, "_is_temp_session", False):
+        return
+    from app.core import second_factor as sf
+    req, has_active = _sf_requirement_for(db, user, action)
+    if not (req["password"] or req["otp"] or req["must_enroll"]):
+        return
+    if req["must_enroll"]:
+        raise HTTPException(status_code=403, detail={
+            "second_factor_required": True, "action": action, "reason": "enroll_required", "methods": []})
+    receipt = request.headers.get("X-Second-Factor")
+    session_hash = _current_session_hash(request)
+    if not (receipt and sf.consume_step_up_receipt(db, user=user, action=action,
+                                                   receipt=receipt, session_hash=session_hash)):
+        raise HTTPException(status_code=403, detail={
+            "second_factor_required": True, "action": action, "reason": "step_up_required",
+            "methods": _sf_step_up_methods(db, user, req, has_active)})
+
+
+def require_step_up(action: str):
+    """Decorator (stacks UNDER @require_endpoint_permission) enforcing the step-up policy for `action`.
+    Reads current_user + db + request from kwargs — a guarded route MUST accept `request: Request`. It
+    consumes an X-Second-Factor receipt minted by POST /auth/second-factor/step-up; a no-op when the
+    action requires nothing of this user (except admin.* actions, which are never a no-op)."""
+    from functools import wraps
+    GUARDED_STEP_UP_ACTIONS.add(action)
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            user = kwargs.get("current_user")
+            db = kwargs.get("db")
+            request = kwargs.get("request")
+            if user is not None and db is not None and request is not None:
+                _enforce_step_up(db, user, request, action)
+            return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+class SecondFactorChallengeRequest(BaseModel):
+    action: str = ""
+    method: Optional[str] = None
+
+
+class SecondFactorStepUpRequest(BaseModel):
+    action: str = ""
+    method: str = ""
+    code: str = ""
+    password: Optional[str] = None
+
+
+@app.post("/auth/second-factor/challenge")
+async def second_factor_challenge(
+    body: SecondFactorChallengeRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Begin a step-up: resolve what the caller must present for `action` and list the methods. (Email
+    code issuance lands with the email method; TOTP / recovery / password need nothing issued.)"""
+    from app.core import second_factor_actions as acts
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot perform a step-up.")
+    if body.action not in acts.ACTION_KEYS:
+        raise HTTPException(status_code=404, detail="Unknown action.")
+    req, has_active = _sf_requirement_for(db, current_user, body.action)
+    if req["must_enroll"]:
+        return {"second_factor_required": True, "reason": "enroll_required", "methods": []}
+    methods = _sf_step_up_methods(db, current_user, req, has_active)
+    return {"second_factor_required": bool(methods), "methods": methods}
+
+
+@app.post("/auth/second-factor/step-up")
+async def second_factor_step_up(
+    body: SecondFactorStepUpRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Verify every factor `action` requires of the caller and mint a single session-bound receipt to
+    present back in X-Second-Factor. Bounded by a fail-CLOSED rate limit."""
+    from app.core import second_factor as sf
+    from app.core import second_factor_actions as acts
+    from app.core.security import verify_password
+    from app.core.rate_limiter import rate_limiter as _rl
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot perform a step-up.")
+    if body.action not in acts.ACTION_KEYS:
+        raise HTTPException(status_code=404, detail="Unknown action.")
+    client_ip = get_client_ip(request)
+    allowed, _, reset = _rl.check_rate_limit(identifier=f"{client_ip}:{current_user.id}",
+                                             limit=10, window=300, prefix="sf_step_up", fail_open=False)
+    if not allowed:
+        import time as _t
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many attempts; please wait a few minutes.",
+                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    req, _has = _sf_requirement_for(db, current_user, body.action)
+    if req["must_enroll"]:
+        raise HTTPException(status_code=403, detail={
+            "second_factor_required": True, "action": body.action, "reason": "enroll_required", "methods": []})
+    if req["otp"] and not sf.check_second_factor(db, user=current_user, action=body.action,
+                                                 method=body.method, code=body.code):
+        raise HTTPException(status_code=403, detail="That code is not valid.")
+    if req["password"]:
+        pw = body.password or (body.code if (body.method or "").lower() == "password" else None)
+        if not (pw and current_user.password_hash and verify_password(pw, current_user.password_hash)):
+            raise HTTPException(status_code=403, detail="Your account password is required and must be correct.")
+    session_hash = _current_session_hash(request)
+    return {"receipt": sf.issue_step_up_receipt(db, user_id=current_user.id, action=body.action,
+                                                session_hash=session_hash)}
+
+
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(
     login_request: LoginRequest,
@@ -10206,6 +10365,7 @@ async def unset_vault_favorite(
 @app.post("/vaults/{vault_id}/delete")
 @require_endpoint_permission("VAULT_DELETE")
 @require_vault_cap("vault.delete")
+@require_step_up("vault.delete")
 async def delete_vault(
     vault_id: uuid.UUID,
     request: Request,
