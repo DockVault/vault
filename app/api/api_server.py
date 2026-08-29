@@ -39,7 +39,7 @@ bootstrap_entrypoint("API")
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
 from app.core.chunk_cleanup import fail_chunk_session
 from app.core.session_hash_utils import hash_session_token
-from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink
+from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink, SecondFactorEnrollment, SecondFactorRecoveryCode
 from app.core import sharing_policy
 from app.core import note_link_policy
 from app.core import storage_quota
@@ -5129,7 +5129,7 @@ def _guard_temp_session_cred_mutation(current_user, temp_cred, perm: str):
 
 
 def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_username="system",
-                     durable=True):
+                     durable=True, except_session_token=None):
     """Deactivate the matching active sessions AND publish a force-close signal to
     the 'session_terminations' Redis channel so the SFTP server tears down any live
     transport immediately — not just at the connection's next operation. This is
@@ -5166,6 +5166,11 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
         q = q.filter(ActiveSession.temp_credential_id == temp_credential_id)
     count = 0
     for s in q.all():
+        # Optionally keep the caller's OWN session (e.g. enrolling a second factor should revoke the
+        # account's OTHER sessions but leave the one doing the enrollment logged in). The stored token
+        # is a hash, so except_session_token is compared as the same hash.
+        if except_session_token is not None and s.session_token == except_session_token:
+            continue
         s.is_active = False
         if durable:
             s.revoked = True  # durable revocation (web tokens rejected even if Redis is down)
@@ -6071,6 +6076,192 @@ class PreferencesUpdate(BaseModel):
     vault_sort_dir: Optional[str] = None
     vault_fav_group: Optional[str] = None
     download_sink: Optional[str] = None
+
+
+def _current_session_hash(request) -> Optional[str]:
+    """The hash of the CURRENT request's session (matches ActiveSession.session_token), or None. Used to
+    keep the caller's own session when revoking the account's OTHER sessions, and (later) to bind a
+    step-up receipt to the session that earned it."""
+    try:
+        auth = request.headers.get("Authorization") or ""
+        if not auth.lower().startswith("bearer "):
+            return None
+        payload = verify_access_token(auth.split(None, 1)[1].strip())
+        st = (payload or {}).get("session_token")
+        return hash_session_token(st) if st else None
+    except Exception:      # noqa: BLE001
+        return None
+
+
+# --- Second factor: self-service TOTP enrollment ---------------------------------------------------
+# The forward enrollment path (enroll -> confirm -> acknowledge -> active). The FIRST enrollment of an
+# un-enrolled user re-proves the account password in the request body (there is no second factor yet to
+# step up with, per spec 7.2). Recovery codes are mandatory by the STATE MACHINE: the enrollment is not
+# 'active' until the codes are generated (confirm) and acknowledged. Disable/regenerate/re-enroll are
+# step-up-gated and land with the step-up phase.
+
+class TotpEnrollRequest(BaseModel):
+    current_password: str = ""
+
+
+class TotpConfirmRequest(BaseModel):
+    code: str = ""
+
+
+def _sf_enrollment(db, user_id, *, status=None):
+    q = db.query(SecondFactorEnrollment).filter(SecondFactorEnrollment.user_id == user_id)
+    if status is not None:
+        q = q.filter(SecondFactorEnrollment.status == status)
+    return q.first()
+
+
+def _sf_recovery_remaining(db, user_id) -> int:
+    return db.query(SecondFactorRecoveryCode).filter(
+        SecondFactorRecoveryCode.user_id == user_id,
+        SecondFactorRecoveryCode.consumed_at.is_(None),
+    ).count()
+
+
+@app.get("/users/me/second-factor")
+async def get_my_second_factor(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The caller's own second-factor state: the enrolled method (if any), whether it is active or
+    mid-enrollment, and how many recovery codes remain."""
+    enr = _sf_enrollment(db, current_user.id)
+    return {
+        "enrolled": bool(enr and enr.status == "active"),
+        "method": enr.method if enr else None,
+        "status": enr.status if enr else "not_setup",
+        "awaiting_acknowledge": bool(enr and enr.status == "unconfirmed" and enr.confirmed_at is not None),
+        "recovery_codes_remaining": _sf_recovery_remaining(db, current_user.id),
+    }
+
+
+@app.post("/users/me/second-factor/totp/enroll")
+async def enroll_totp(
+    body: TotpEnrollRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Begin TOTP enrollment: mint a sealed seed, store it 'unconfirmed', and return the otpauth URI +
+    base32 secret. Re-proves the account password (first-enrollment gate). An already-active enrollment
+    must be disabled first (re-enroll = disable then enroll), so an active method is never replaced here."""
+    from app.core.security import verify_password, encrypt_secret
+    from app.core import second_factor as sf
+    from app.core.models import SecondFactorEnrollment
+    from app.config.effective import get_effective_branding
+
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
+    user = db.query(User).filter(User.id == current_user.id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if _sf_enrollment(db, user.id, status="active"):
+        raise HTTPException(status_code=409, detail="A second factor is already active; disable it before enrolling a new one.")
+    if not user.password_hash or not verify_password(body.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
+
+    seed = sf.generate_totp_secret()
+    # Replace any prior UNCONFIRMED row (a restarted enrollment); never an active one (guarded above).
+    db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.user_id == user.id,
+        SecondFactorEnrollment.status == "unconfirmed",
+    ).delete(synchronize_session=False)
+    db.add(SecondFactorEnrollment(user_id=user.id, method="totp",
+                                  secret_enc=encrypt_secret(seed), status="unconfirmed"))
+    db.commit()
+    try:
+        issuer = (get_effective_branding(db).app_name or "DockVault").strip() or "DockVault"
+    except Exception:      # noqa: BLE001
+        issuer = "DockVault"
+    return {"secret": seed, "otpauth_uri": sf.otpauth_uri(seed, account=user.username, issuer=issuer)}
+
+
+@app.post("/users/me/second-factor/totp/confirm")
+async def confirm_totp(
+    body: TotpConfirmRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Prove the authenticator by a correct code, then generate the MANDATORY recovery codes and return
+    them ONCE. The enrollment stays 'unconfirmed' until acknowledge — the codes are not optional."""
+    from app.core import second_factor as sf
+    from app.core.security import decrypt_secret
+    from app.core.models import SecondFactorEnrollment, SecondFactorRecoveryCode
+    from datetime import datetime, timezone
+
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
+    enr = db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.user_id == current_user.id,
+        SecondFactorEnrollment.method == "totp",
+        SecondFactorEnrollment.status == "unconfirmed",
+    ).first()
+    if not enr or not enr.secret_enc:
+        raise HTTPException(status_code=400, detail="Start TOTP enrollment first.")
+    try:
+        seed = decrypt_secret(enr.secret_enc)
+    except Exception:      # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Enrollment is corrupt; start again.")
+    step = sf.matching_totp_step(seed, body.code)
+    if step is None:
+        raise HTTPException(status_code=400, detail="That code is not valid. Check your authenticator's clock and try again.")
+    # Record the step so the confirming code can't be replayed as the first login, and mark confirmed.
+    enr.last_used_step = step
+    enr.confirmed_at = datetime.now(timezone.utc)
+    # (Re)issue the mandatory recovery codes: drop any prior set, store (prefix, argon2) for the new ten.
+    db.query(SecondFactorRecoveryCode).filter(
+        SecondFactorRecoveryCode.user_id == current_user.id).delete(synchronize_session=False)
+    generated = sf.generate_recovery_codes()
+    for _plain, prefix, code_hash in generated:
+        db.add(SecondFactorRecoveryCode(user_id=current_user.id, code_prefix=prefix, code_hash=code_hash))
+    db.commit()
+    return {"recovery_codes": [sf.format_recovery_code(plain) for plain, _p, _h in generated],
+            "message": "Save these recovery codes now — they are shown only once."}
+
+
+@app.post("/users/me/second-factor/recovery/acknowledge")
+async def acknowledge_recovery_codes(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Confirm the recovery codes were saved and activate the enrollment. Until this call the user is
+    NOT enrolled. Activating a second factor revokes the account's OTHER sessions."""
+    from app.core.models import SecondFactorEnrollment
+    from datetime import datetime, timezone
+
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
+    enr = db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.user_id == current_user.id,
+        SecondFactorEnrollment.status == "unconfirmed",
+        SecondFactorEnrollment.confirmed_at.isnot(None),
+    ).first()
+    if not enr:
+        raise HTTPException(status_code=400, detail="Confirm a code and generate recovery codes first.")
+    if _sf_recovery_remaining(db, current_user.id) == 0:
+        raise HTTPException(status_code=400, detail="Generate recovery codes before activating.")
+    enr.status = "active"
+    db.commit()
+    # A change to how the account authenticates should not leave older sessions standing — but keep the
+    # session that just did the enrollment (the user stays logged in).
+    try:
+        _revoke_sessions(db, user_id=current_user.id, actor_username=current_user.username,
+                         except_session_token=_current_session_hash(request))
+        db.commit()
+    except Exception:      # noqa: BLE001 - activation already committed; the revoke is best-effort
+        db.rollback()
+    try:
+        AuditLogger(db).log_action(action="second_factor_enrolled", status="success", user=current_user,
+                                   ip_address=get_client_ip(request), details={"method": "totp"})
+    except Exception:      # noqa: BLE001
+        pass
+    return {"enrolled": True, "method": "totp"}
 
 
 @app.get("/users/me/preferences")
