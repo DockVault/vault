@@ -2280,3 +2280,83 @@ class EmailAction(Base):
     __table_args__ = (
         Index('idx_email_action_template', 'template_id'),
     )
+
+
+# --- Second factor (MFA / step-up OTP) ------------------------------------------------------------
+# All four tables are NEW and additive: create_all() builds them cleanly on an existing deployment,
+# no ALTER. Reversible (dropping them loses enrollments, nothing else); declared in the upgrade matrix.
+
+class SecondFactorEnrollment(Base):
+    """A user's enrolled second factor. One active method per user for now (UNIQUE user_id); a later
+    WebAuthn phase relaxes this to UNIQUE(user_id, method). The reversible TOTP seed is sealed with
+    encrypt_secret (Fernet under ENCRYPTION_KEY) — no new key material in .env."""
+    __tablename__ = 'second_factor_enrollments'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'),
+                     nullable=False, unique=True)
+    method = Column(String(16), nullable=False)                     # 'totp' | 'email'
+    secret_enc = Column(Text, nullable=True)                        # encrypt_secret(base32 seed); NULL for 'email'
+    status = Column(String(16), nullable=False, default='unconfirmed')   # 'unconfirmed' | 'active'
+    # Replay counter: the highest TOTP time-step already claimed. A verify wins only by advancing this
+    # in one conditional UPDATE (WHERE last_used_step < :step), so the same 30s code cannot be spent twice.
+    last_used_step = Column(BigInteger, nullable=False, default=0, server_default=text('0'))
+    created_at = Column(DateTime, nullable=False,
+                        server_default=text("(now() AT TIME ZONE 'utc')"), default=datetime.utcnow)
+    confirmed_at = Column(DateTime, nullable=True)
+    last_used_at = Column(DateTime, nullable=True)
+
+    user = relationship("User")
+
+
+class SecondFactorRecoveryCode(Base):
+    """One single-use recovery code for a user's second factor. The code is 80 bits; a NON-SECRET
+    8-hex lookup prefix is stored plaintext so verify selects at most one candidate and runs a single
+    argon2 per attempt (no CPU-DoS), while the remaining 48 bits stay argon2-protected if the DB leaks."""
+    __tablename__ = 'second_factor_recovery_codes'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    code_prefix = Column(String(8), nullable=False)                 # non-secret lookup key (see second_factor.py)
+    code_hash = Column(String(255), nullable=False)                 # argon2 of the FULL code
+    consumed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False,
+                        server_default=text("(now() AT TIME ZONE 'utc')"), default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_sf_recovery_user', 'user_id'),
+        Index('idx_sf_recovery_lookup', 'user_id', 'code_prefix'),
+    )
+
+
+class SecondFactorAction(Base):
+    """The admin policy matrix, one row per cataloged action: whether it requires the OTP second
+    factor. Action keys are SEEDED from SECOND_FACTOR_ACTIONS in code (never created via the API)."""
+    __tablename__ = 'second_factor_actions'
+
+    key = Column(String(64), primary_key=True)
+    require_otp = Column(Boolean, nullable=False, default=False)
+    updated_at = Column(DateTime, nullable=False,
+                        server_default=text("(now() AT TIME ZONE 'utc')"),
+                        default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class PendingLogin(Base):
+    """A login past the password step but not yet the second factor — NO session exists until the
+    second step completes. Carries the durable attempt counter for the second-factor step (a
+    fail-closed brute-force cap that survives a Redis outage). Rows are swept after expiry."""
+    __tablename__ = 'pending_logins'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    client_ip = Column(String(45), nullable=True)
+    enrollment_required = Column(Boolean, nullable=False, default=False)
+    attempts = Column(Integer, nullable=False, default=0, server_default=text('0'))
+    expires_at = Column(DateTime, nullable=True)
+    consumed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False,
+                        server_default=text("(now() AT TIME ZONE 'utc')"), default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_pending_login_user', 'user_id'),
+    )
