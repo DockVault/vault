@@ -67,6 +67,10 @@ def test_sub_controls_follow_their_master_switches(page: Page, admin_creds):
     ttl = page.locator("#setting-invite-ttl-hours")
     mode = page.locator("#setting-signup-domain-mode")
     expect(ttl).to_be_visible(); expect(mode).to_be_visible()
+    # Wait for the async settings load to finish before toggling: invite-by-link defaults ON, so the
+    # load re-checks the box after render — toggling before it settles lets the late load override the
+    # click ("clicking did not change its state"). Waiting for the loaded state races it out.
+    expect(page.locator("#setting-invite-enabled")).to_be_checked()
     # master OFF -> the sub-control is disabled. Set a known OFF state first (invite now defaults ON),
     # so this tests the follow-the-master behavior independent of the shipped default.
     page.set_checked("#setting-invite-enabled", False)
