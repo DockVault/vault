@@ -41,9 +41,10 @@ SECOND_FACTOR_ACTIONS = [
 ACTION_KEYS = [k for (k, _n, _o) in SECOND_FACTOR_ACTIONS]
 ACTION_META = {k: {"name": n, "default_require_otp": o} for (k, n, o) in SECOND_FACTOR_ACTIONS}
 
-# Actions that are NEVER a no-op even when the second factor is not "in effect" for the caller: an
-# admin-management or settings-write route must always demand a re-authentication, so a freshly minted
-# (factor-less) admin session cannot act on the matrix. See spec 5.3.
+# The admin-plane actions, kept only as a CLASSIFICATION (e.g. to group/label the admin rows in the
+# matrix UI). Under the owner's model B these carry NO special "never a no-op" rule — you cannot force
+# an admin to own an OTP device, so an admin who has enabled nothing is not gated. `resolve_action_
+# requirement` accepts `is_admin_action` but does not act on it; forcing must never be reintroduced here.
 ADMIN_ALWAYS_ENFORCED = {"admin.user.manage", "admin.settings.write"}
 
 

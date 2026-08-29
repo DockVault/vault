@@ -2965,6 +2965,107 @@ async def get_settings(
     return data
 
 
+# --- Second factor: step-up enforcement -----------------------------------------------------------
+# Defined here (ahead of the first guarded route) so every @require_step_up-decorated route can see the
+# decorator at import time. The helper bodies reference models/helpers defined later in the module, but
+# only at request time, so their position relative to those definitions does not matter.
+
+# Every require_step_up(key) registers `key` here; the boot contract (_assert_step_up_boot_contract)
+# asserts this equals the catalog keys minus `login` (which the login flow enforces, not a decorator).
+GUARDED_STEP_UP_ACTIONS = set()
+
+# A few actions are enforced in-route (a conditional gate, or a route in another router module whose
+# `request` parameter is a body) rather than via the @require_step_up decorator, so they never register
+# themselves at import. List them here so the boot contract still sees them as guarded:
+#   * admin.settings.write        -- PUT /settings chooses between it and account.second_factor per
+#                                    request, so a single receipt always suffices.
+#   * account.encryption_key.replace -- PUT /keys/private in ecc_router (its `request` param is the body).
+#   * account.change_password / account.change_email -- PATCH /users/me gates each only when that field
+#                                    is actually changing (an SFTP-toggle-only save is never gated).
+GUARDED_STEP_UP_ACTIONS.add("admin.settings.write")
+GUARDED_STEP_UP_ACTIONS.add("account.encryption_key.replace")
+GUARDED_STEP_UP_ACTIONS.add("account.change_password")
+GUARDED_STEP_UP_ACTIONS.add("account.change_email")
+
+
+def _sf_action_toggles(db, action):
+    from app.core import second_factor_actions as acts
+    row = db.query(SecondFactorAction).filter(SecondFactorAction.key == action).first()
+    default_otp = acts.ACTION_META.get(action, {}).get("default_require_otp", False)
+    return (bool(row.require_otp) if row else bool(default_otp),
+            bool(row.require_password) if row else False)
+
+
+def _sf_requirement_for(db, user, action):
+    """(requirement dict, has_active_enrollment) for this user + action, per the two-toggle policy."""
+    from app.core import second_factor_actions as acts
+    from app.core import second_factor_policy as pol
+    require_otp, require_password = _sf_action_toggles(db, action)
+    has_active = db.query(SecondFactorEnrollment.id).filter(
+        SecondFactorEnrollment.user_id == user.id,
+        SecondFactorEnrollment.status == "active").first() is not None
+    req = pol.resolve_action_requirement(require_otp=require_otp, require_password=require_password,
+                                         has_active_enrollment=has_active,
+                                         is_admin_action=acts.is_admin_action(action))
+    return req, has_active
+
+
+def _sf_step_up_methods(db, user, req, has_active) -> list:
+    methods = []
+    if req["otp"] and has_active:
+        enr = db.query(SecondFactorEnrollment).filter(
+            SecondFactorEnrollment.user_id == user.id, SecondFactorEnrollment.status == "active").first()
+        if enr:
+            methods.append(enr.method)
+        methods.append("recovery")
+    if req["password"]:
+        methods.append("password")
+    return methods
+
+
+def _enforce_step_up(db, user, request, action):
+    """Raise 403 second_factor_required unless the caller has satisfied `action`'s step-up for THIS
+    session. A temp session has its own scope gate and never satisfies an account step-up here."""
+    if getattr(user, "_is_temp_session", False):
+        return
+    from app.core import second_factor as sf
+    req, has_active = _sf_requirement_for(db, user, action)
+    if not (req["password"] or req["otp"] or req["must_enroll"]):
+        return
+    if req["must_enroll"]:
+        raise HTTPException(status_code=403, detail={
+            "second_factor_required": True, "action": action, "reason": "enroll_required", "methods": []})
+    receipt = request.headers.get("X-Second-Factor")
+    session_hash = _current_session_hash(request)
+    if not (receipt and sf.consume_step_up_receipt(db, user=user, action=action,
+                                                   receipt=receipt, session_hash=session_hash)):
+        raise HTTPException(status_code=403, detail={
+            "second_factor_required": True, "action": action, "reason": "step_up_required",
+            "methods": _sf_step_up_methods(db, user, req, has_active)})
+
+
+def require_step_up(action: str):
+    """Decorator (stacks UNDER @require_endpoint_permission) enforcing the step-up policy for `action`.
+    Reads current_user + db + request from kwargs — a guarded route MUST accept `request: Request`. It
+    consumes an X-Second-Factor receipt minted by POST /auth/second-factor/step-up; a no-op when the
+    action requires nothing of this user (no action, admin.* included, carries a special 'never a
+    no-op' rule — an admin who has enabled no requirement is not gated, per the owner policy)."""
+    from functools import wraps
+    GUARDED_STEP_UP_ACTIONS.add(action)
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            user = kwargs.get("current_user")
+            db = kwargs.get("db")
+            request = kwargs.get("request")
+            if user is not None and db is not None and request is not None:
+                _enforce_step_up(db, user, request, action)
+            return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
 @app.put("/settings")
 async def update_settings(
     payload: dict,
@@ -2978,12 +3079,18 @@ async def update_settings(
     Gated by require_interactive_admin (NOT plain require_admin): a temporary credential —
     even one minted from an admin — must not rewrite the deployment's org policy
     (zero_knowledge_enabled / force_zero_knowledge / standard_vault_allowed_groups)."""
-    # Changing the MFA policy requires the account.second_factor step-up ("changing OTP settings requires
-    # OTP"): an admin who wants to tighten MFA enrolls first, so they always keep an OTP to loosen it
-    # again — never locked out. Conditional, so ordinary settings saves are untouched.
+    # A settings write is step-up-gated, choosing exactly ONE action so a single X-Second-Factor
+    # receipt always suffices:
+    #  * an MFA-policy change requires the account.second_factor step-up ("changing OTP settings
+    #    requires OTP", default require_otp ON) — an admin who wants to tighten MFA enrolls first, so
+    #    they always keep an OTP to loosen it again and can never lock themselves out;
+    #  * any other settings write requires admin.settings.write (default require_otp OFF — a no-op
+    #    until an admin opts in, so ordinary saves are untouched).
     from app.core import second_factor_policy as _sfpol_gate
     if any(k in payload for k in _sfpol_gate.DEFAULTS):
         _enforce_step_up(db, current_user, request, "account.second_factor")
+    else:
+        _enforce_step_up(db, current_user, request, "admin.settings.write")
     _validate_settings_payload(payload, db)
     from app.core.models import SystemSetting
     row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
@@ -3469,6 +3576,7 @@ def _invite_status(inv, now):
 
 @app.post("/invites")
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def create_invite(
     payload: InviteCreate,
     current_user: User = Depends(require_interactive_admin),
@@ -3606,6 +3714,7 @@ async def list_invites(
 
 @app.delete("/invites/{invite_id}")
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def revoke_invite(
     invite_id: str,
     current_user: User = Depends(require_interactive_admin),
@@ -4075,6 +4184,7 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request, db: Ses
 
 @app.post("/users/{user_id}/send-reset-link")
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
                                 current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Admin action: email a password-reset link to a user. Always available (independent of the public
@@ -4806,91 +4916,6 @@ async def second_factor_login_cancel(
     return {"cancelled": True}
 
 
-# --- Second factor: step-up enforcement -----------------------------------------------------------
-
-# Every require_step_up(key) registers `key` here; the boot contract (added once every catalog action is
-# guarded) asserts this equals the catalog keys minus `login` (which the login flow enforces, not a
-# decorator).
-GUARDED_STEP_UP_ACTIONS = set()
-
-
-def _sf_action_toggles(db, action):
-    from app.core import second_factor_actions as acts
-    row = db.query(SecondFactorAction).filter(SecondFactorAction.key == action).first()
-    default_otp = acts.ACTION_META.get(action, {}).get("default_require_otp", False)
-    return (bool(row.require_otp) if row else bool(default_otp),
-            bool(row.require_password) if row else False)
-
-
-def _sf_requirement_for(db, user, action):
-    """(requirement dict, has_active_enrollment) for this user + action, per the two-toggle policy."""
-    from app.core import second_factor_actions as acts
-    from app.core import second_factor_policy as pol
-    require_otp, require_password = _sf_action_toggles(db, action)
-    has_active = db.query(SecondFactorEnrollment.id).filter(
-        SecondFactorEnrollment.user_id == user.id,
-        SecondFactorEnrollment.status == "active").first() is not None
-    req = pol.resolve_action_requirement(require_otp=require_otp, require_password=require_password,
-                                         has_active_enrollment=has_active,
-                                         is_admin_action=acts.is_admin_action(action))
-    return req, has_active
-
-
-def _sf_step_up_methods(db, user, req, has_active) -> list:
-    methods = []
-    if req["otp"] and has_active:
-        enr = db.query(SecondFactorEnrollment).filter(
-            SecondFactorEnrollment.user_id == user.id, SecondFactorEnrollment.status == "active").first()
-        if enr:
-            methods.append(enr.method)
-        methods.append("recovery")
-    if req["password"]:
-        methods.append("password")
-    return methods
-
-
-def _enforce_step_up(db, user, request, action):
-    """Raise 403 second_factor_required unless the caller has satisfied `action`'s step-up for THIS
-    session. A temp session has its own scope gate and never satisfies an account step-up here."""
-    if getattr(user, "_is_temp_session", False):
-        return
-    from app.core import second_factor as sf
-    req, has_active = _sf_requirement_for(db, user, action)
-    if not (req["password"] or req["otp"] or req["must_enroll"]):
-        return
-    if req["must_enroll"]:
-        raise HTTPException(status_code=403, detail={
-            "second_factor_required": True, "action": action, "reason": "enroll_required", "methods": []})
-    receipt = request.headers.get("X-Second-Factor")
-    session_hash = _current_session_hash(request)
-    if not (receipt and sf.consume_step_up_receipt(db, user=user, action=action,
-                                                   receipt=receipt, session_hash=session_hash)):
-        raise HTTPException(status_code=403, detail={
-            "second_factor_required": True, "action": action, "reason": "step_up_required",
-            "methods": _sf_step_up_methods(db, user, req, has_active)})
-
-
-def require_step_up(action: str):
-    """Decorator (stacks UNDER @require_endpoint_permission) enforcing the step-up policy for `action`.
-    Reads current_user + db + request from kwargs — a guarded route MUST accept `request: Request`. It
-    consumes an X-Second-Factor receipt minted by POST /auth/second-factor/step-up; a no-op when the
-    action requires nothing of this user (except admin.* actions, which are never a no-op)."""
-    from functools import wraps
-    GUARDED_STEP_UP_ACTIONS.add(action)
-
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            user = kwargs.get("current_user")
-            db = kwargs.get("db")
-            request = kwargs.get("request")
-            if user is not None and db is not None and request is not None:
-                _enforce_step_up(db, user, request, action)
-            return await func(*args, **kwargs)
-        return wrapper
-    return decorator
-
-
 class SecondFactorChallengeRequest(BaseModel):
     action: str = ""
     method: Optional[str] = None
@@ -5217,6 +5242,7 @@ async def get_session_access(
 
 @app.post("/auth/temp-credentials", response_model=TempCredentialResponse)
 @require_endpoint_permission("TEMP_CREDS_MANAGE")
+@require_step_up("temp_credential.create")
 async def create_temp_credentials(
     payload: Optional[TempCredentialCreate] = None,
     current_user: User = Depends(get_current_user),
@@ -6104,6 +6130,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
 
 @app.post("/users", response_model=UserResponse)
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def create_user(
     user_create: UserCreate,
     current_user: User = Depends(require_interactive_admin),
@@ -6203,6 +6230,15 @@ async def update_own_account(
     if sensitive:
         if not body.current_password or not user.password_hash or not verify_password(body.current_password, user.password_hash):
             raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
+
+    # Conditional step-up: a self password change and a self email change are each independently
+    # gatable (account.change_password / account.change_email — both default require_otp OFF, so a
+    # no-op until an admin opts in). Enforced only when that field is actually changing, so an SFTP-
+    # toggle-only save is never gated.
+    if body.new_password is not None:
+        _enforce_step_up(db, current_user, request, "account.change_password")
+    if changing_email:
+        _enforce_step_up(db, current_user, request, "account.change_email")
 
     if body.new_password is not None:
         _validate_password_policy(db, body.new_password)
@@ -6944,6 +6980,7 @@ async def get_user_storage(
 
 @app.patch("/users/{user_id}", response_model=UserResponse)
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def update_user(
     user_id: uuid.UUID,
     user_update: UserUpdate,
@@ -7256,6 +7293,7 @@ async def delete_ssh_key(
 
 @app.post("/users/{user_id}/delete")
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def delete_user(
     user_id: uuid.UUID,
     current_user: User = Depends(require_interactive_admin),
@@ -7306,6 +7344,7 @@ async def delete_user(
 
 @app.post("/users/{user_id}/terminate-sessions")
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def terminate_user_sessions(
     user_id: uuid.UUID,
     current_user: User = Depends(require_interactive_admin),
@@ -16488,6 +16527,22 @@ def _seed_second_factor_actions():
         print(f"⚠ Second-factor action seeding skipped: {e}")
 
 
+def _assert_step_up_boot_contract():
+    """Boot contract: every catalog action except `login` must be guarded by a step-up somewhere
+    (a @require_step_up decorator, or an in-route _enforce_step_up registered into GUARDED_STEP_UP_
+    ACTIONS). `login` is enforced by the two-step login flow, not a decorator, so it is excluded. A
+    drift here means a high-risk action shipped ungatable — fail boot loudly rather than serve it."""
+    from app.core.second_factor_actions import ACTION_KEYS
+    expected = set(ACTION_KEYS) - {"login"}
+    missing = expected - GUARDED_STEP_UP_ACTIONS
+    extra = GUARDED_STEP_UP_ACTIONS - expected
+    if missing or extra:
+        raise RuntimeError(
+            "Second-factor step-up boot contract violated: "
+            f"catalog actions not guarded by any route: {sorted(missing)}; "
+            f"guarded actions not in the catalog: {sorted(extra)}.")
+
+
 def _seed_default_share_tags():
     """Seed the starter share-tag set on a FRESH deployment so sharing works out of the box.
 
@@ -17480,6 +17535,7 @@ async def lifespan(app: FastAPI):
     _seed_default_share_tags()  # after the admin exists, so seed tags can record it as creator
     _seed_default_note_link_tags()  # public-note-link starter tags (inert until enabled)
     _seed_second_factor_actions()  # the second-factor step-up policy matrix (one row per catalog key)
+    _assert_step_up_boot_contract()  # fail boot if any catalog action ships ungatable
     _backfill_default_permissions()
     _seed_default_email_profile()
 
