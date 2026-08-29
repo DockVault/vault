@@ -77,7 +77,17 @@ class Settings(BaseSettings):
     # the tmpfs -- e.g. one upgraded in place from before this existed -- must not be silently
     # size-capped while its staging is still on the volume. .env.example ships the recommended 512.
     sftp_staging_tmpfs_mb: int = Field(default=0)
-    
+    # Pre-auth connection admission (the SSH MaxStartups equivalent). The accept loop spawns a
+    # worker thread + a paramiko Transport per accepted TCP connection; without a ceiling a flood of
+    # connections that never authenticate ties up threads and Transports through the handshake window.
+    # sftp_max_connections caps total live handler threads; sftp_max_connections_per_ip caps one
+    # source IP's in-flight share; sftp_auth_grace_seconds bounds how long a pre-auth connection is
+    # held (paramiko banner + auth timeout) before it is dropped. 0 on any of these disables that
+    # particular limit. Blast radius of the gap is one tenant container's SFTP availability only.
+    sftp_max_connections: int = Field(default=100)
+    sftp_max_connections_per_ip: int = Field(default=10)
+    sftp_auth_grace_seconds: int = Field(default=30)
+
     # API Server Configuration
     api_host: str = Field(default="0.0.0.0")  # Bind to all interfaces for network access
     api_port: int = Field(default=8000)

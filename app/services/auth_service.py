@@ -291,9 +291,14 @@ class AuthService:
         
         # Check for existing active sessions (only 1 allowed)
         self._terminate_existing_sessions(user.id)
-        
-        # Create new session
-        session_token = self._create_session(user, None, ip_address)
+
+        # Create new session with an absolute server-side lifetime. Regular logins used to store
+        # expires_at = NULL, which cleanup_expired_sessions never sweeps, so abandoned rows
+        # accumulated forever. This cap (31 days) sits a margin above the session_timeout maximum
+        # (30 days), so the row always outlives any token it backs yet still ages out once nothing
+        # renews it.
+        session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
+        session_token = self._create_session(user, None, ip_address, expires_at=session_expires_at)
         
         # Reset failed login attempts
         user.failed_login_attempts = 0

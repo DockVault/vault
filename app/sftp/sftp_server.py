@@ -82,6 +82,55 @@ from sqlalchemy import or_
 active_transports: Dict[str, paramiko.Transport] = {}
 transport_lock = threading.Lock()
 
+# Pre-auth connection admission (the SSH MaxStartups equivalent; see settings.sftp_max_connections*).
+# The accept loop builds a worker thread + a paramiko Transport per accepted TCP connection, and the
+# auth throttles only fire once a credential is OFFERED -- so a flood of connections that complete the
+# handshake but never authenticate would otherwise tie up threads and Transports through the grace
+# window with nothing metering raw connections. These gate at accept() time, before a thread or
+# Transport is created, and drop the connection when a limit is hit.
+class _ConnectionAdmission:
+    """Non-blocking pre-auth admission for SFTP connections (the SSH MaxStartups equivalent).
+
+    ``max_total`` caps live connections overall; ``max_per_ip`` caps one source IP's in-flight share.
+    Either being <= 0 disables that limit. :meth:`admit` reserves a slot (False when a ceiling is
+    reached); every True MUST be paired with exactly one :meth:`release`, so callers release in a
+    ``finally``. Thread-safe: the accept loop and every worker thread share one instance.
+    """
+
+    def __init__(self, max_total: int, max_per_ip: int):
+        self._max_per_ip = max_per_ip
+        self._sem = (threading.BoundedSemaphore(max_total)
+                     if max_total and max_total > 0 else None)
+        self._per_ip: Dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def admit(self, ip: str) -> bool:
+        if self._sem is not None and not self._sem.acquire(blocking=False):
+            return False
+        if self._max_per_ip and self._max_per_ip > 0:
+            with self._lock:
+                if self._per_ip.get(ip, 0) >= self._max_per_ip:
+                    if self._sem is not None:
+                        self._sem.release()  # give back the total slot we just took
+                    return False
+                self._per_ip[ip] = self._per_ip.get(ip, 0) + 1
+        return True
+
+    def release(self, ip: str) -> None:
+        if self._max_per_ip and self._max_per_ip > 0:
+            with self._lock:
+                remaining = self._per_ip.get(ip, 0) - 1
+                if remaining <= 0:
+                    self._per_ip.pop(ip, None)
+                else:
+                    self._per_ip[ip] = remaining
+        if self._sem is not None:
+            self._sem.release()
+
+
+_connection_admission = _ConnectionAdmission(
+    settings.sftp_max_connections, settings.sftp_max_connections_per_ip)
+
 # Where incoming uploads are buffered (plaintext) before being pushed through the
 # encryption pipeline at handle close. The path sits inside the storage volume, but the compose
 # files mount a size-capped tmpfs (RAM) over this subdirectory, so the plaintext buffer never
@@ -422,10 +471,11 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 if not session:
                     safe_event('session.terminated', session=token[:8])
                     return False
-                # Enforce the session's HARD expiry on every op, not just at login. Regular
-                # account sessions carry a NULL expires_at (no hard bound → skipped); a
-                # temp-credential session carries the credential's expires_at, so a cred with a
-                # short total lifetime can't keep operating over SFTP past it (the web path
+                # Enforce the session's HARD expiry on every op, not just at login. A regular
+                # PASSWORD account session now carries an absolute 31-day expires_at (set in
+                # authenticate_user); a KEY-based SFTP session still carries NULL (no hard bound →
+                # skipped); a temp-credential session carries the credential's expires_at, so a cred
+                # with a short total lifetime can't keep operating over SFTP past it (the web path
                 # rejects per request; nothing on the SFTP path did). Stored naive (UTC).
                 from datetime import datetime, timezone
                 if session.expires_at is not None:
@@ -1742,15 +1792,40 @@ def start_sftp_server():
     while not _stop.is_set():
         try:
             client_socket, client_address = server_socket.accept()
-            safe_event('connection.accepted', peer=client_address)
 
-            # Handle client in a new thread
-            client_thread = threading.Thread(
-                target=handle_sftp_client,
-                args=(client_socket, client_address, host_key)
-            )
-            client_thread.daemon = True
-            client_thread.start()
+            # Pre-auth admission: refuse the connection here -- before a thread or Transport exists --
+            # when the total or per-IP ceiling is reached, so a no-credential flood cannot exhaust
+            # threads/Transports through the handshake window.
+            if not _connection_admission.admit(client_address[0]):
+                safe_event('connection.rejected.overcap', peer=client_address)
+                try:
+                    client_socket.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+
+            # Handle client in a new thread (the handler releases the admission slot in its finally).
+            # Everything after a successful admit() lives in this try, so ANY failure before the
+            # handler thread owns the slot -- including a logging error on a broken stdout pipe --
+            # still releases the slot and closes the socket instead of leaking them.
+            try:
+                safe_event('connection.accepted', peer=client_address)
+                client_thread = threading.Thread(
+                    target=handle_sftp_client,
+                    args=(client_socket, client_address, host_key)
+                )
+                client_thread.daemon = True
+                client_thread.start()
+            except Exception as e:  # noqa: BLE001
+                # Failed after admission (spawn, or the log above) -- release the slot and close, so
+                # neither the slot nor the socket FD is leaked.
+                _connection_admission.release(client_address[0])
+                try:
+                    client_socket.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                safe_event('connection.thread.spawn.failed', e, peer=client_address)
+                continue
 
         except KeyboardInterrupt:
             safe_event('server.shutting-down')
@@ -1797,6 +1872,13 @@ def handle_sftp_client(
         )
         # Neutral version banner — don't leak the exact paramiko library + version pre-auth.
         transport.local_version = "SSH-2.0-DockVault"
+        # Bound how long a connection is held before it authenticates (the SSH LoginGraceTime
+        # equivalent), so a stalled or silent pre-auth connection is dropped instead of occupying a
+        # thread + Transport for paramiko's longer defaults.
+        grace = settings.sftp_auth_grace_seconds
+        if grace and grace > 0:
+            transport.banner_timeout = grace
+            transport.auth_timeout = grace
         transport.add_server_key(host_key)
         transport.set_subsystem_handler(
             'sftp',
@@ -1842,6 +1924,10 @@ def handle_sftp_client(
 
         if transport:
             transport.close()
+
+        # Release the pre-auth admission slot reserved for this connection in the accept loop. In
+        # the finally so it frees on every path -- normal close, exception, or an early return.
+        _connection_admission.release(client_address[0])
 
 
 if __name__ == '__main__':

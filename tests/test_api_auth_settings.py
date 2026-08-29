@@ -58,3 +58,14 @@ def test_auth_settings_validation(admin):
         assert admin.put("/settings", json={"max_login_attempts": 5, "session_timeout": 60}).status_code in (200, 204)
     finally:
         _reset_auth(admin)
+
+
+def test_session_timeout_is_clamped_to_a_maximum(admin):
+    """session_timeout has an upper bound (30 days = 43200 min) so a huge value can't mint an
+    effectively-immortal token; the boundary is accepted, one minute past it is refused."""
+    try:
+        assert admin.put("/settings", json={"session_timeout": 43200}).status_code in (200, 204)  # exactly 30 days
+        assert admin.put("/settings", json={"session_timeout": 43201}).status_code == 400          # one minute over
+        assert admin.put("/settings", json={"session_timeout": 10_000_000}).status_code == 400      # absurd
+    finally:
+        _reset_auth(admin)

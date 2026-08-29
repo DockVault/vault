@@ -26,6 +26,12 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
+# PBKDF2-SHA256 work factor for NEW password KEK wraps (the OWASP 2025 recommendation, matching the
+# ZK identity envelope). The count is stamped into each record's metadata, so this only governs new
+# writes; existing wraps are read back at whatever count they stored (older ones at 100_000), which
+# is why the read fallbacks below stay 100_000 for a record that predates the stored count.
+PBKDF2_KEK_ITERATIONS = 600000
+
 
 class VaultKeyError(Exception):
     """Base exception for vault key operations."""
@@ -78,18 +84,19 @@ def generate_salt() -> str:
 def derive_key_encryption_key(
     password: str,
     salt: str,
-    iterations: int = 100000
+    iterations: int = PBKDF2_KEK_ITERATIONS
 ) -> bytes:
     """
     Derive a key encryption key (KEK) from vault password using PBKDF2.
-    
-    Uses PBKDF2-HMAC-SHA256 with 100,000 iterations (OWASP recommended minimum).
+
+    Uses PBKDF2-HMAC-SHA256 with 600,000 iterations (OWASP 2025 recommendation) for new wraps;
+    callers reading an existing record pass the iteration count stored in its metadata.
     The derived key is suitable for use with Fernet encryption.
     
     Args:
         password: Vault password (plaintext)
         salt: Base64-encoded salt
-        iterations: PBKDF2 iteration count (default 100,000)
+        iterations: PBKDF2 iteration count (default 600,000; readers pass the stored count)
     
     Returns:
         bytes: 32-byte key encryption key (URL-safe base64-encoded)
@@ -105,7 +112,7 @@ def derive_key_encryption_key(
         32
     
     Security Notes:
-        - 100,000 iterations provides ~100ms delay on modern hardware
+        - 600,000 iterations (OWASP 2025) raises the offline password-cracking cost per guess
         - Salt must be unique per vault to prevent rainbow table attacks
         - KEK is used to encrypt/decrypt the vault's encryption key
     """
@@ -201,7 +208,7 @@ def encrypt_vault_key(
                 'encrypted_key': base64.urlsafe_b64encode(encrypted_key).decode(),
                 'salt': salt,
                 'method': 'password',
-                'iterations': 100000,
+                'iterations': PBKDF2_KEK_ITERATIONS,
                 'version': 1
             }
         

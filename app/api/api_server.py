@@ -264,6 +264,11 @@ _MAX_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024  # 64 MiB
 # Decoupling it keeps a large file cap (e.g. 10 GB) from widening this in-memory backstop.
 _MAX_REQUEST_BODY_BYTES = 4 * _MAX_UPLOAD_CHUNK_BYTES  # 256 MiB
 
+# Upper bound on the configurable session_timeout (JWT + web-session lifetime), in minutes. Clamped
+# at settings-write time so a token can't be minted effectively immortal; the session row's absolute
+# expires_at is set a margin above this so cleanup_expired_sessions can age abandoned rows out.
+SESSION_TIMEOUT_MAX_MINUTES = 30 * 24 * 60  # 30 days
+
 
 # The URL-secret redaction (invite/reset/share tokens in the path or landing-page query) lives in a
 # small stdlib-only module so it is unit-testable offline and shared by the in-app sink AND the uvicorn
@@ -2807,6 +2812,15 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             v = payload[int_key]
             if isinstance(v, bool) or not isinstance(v, int) or v < 0:
                 raise HTTPException(status_code=400, detail=f"{int_key} must be a non-negative integer")
+    # session_timeout is the JWT + web-session lifetime in minutes; clamp its UPPER bound so an
+    # accidental or hostile huge value can't mint effectively-immortal tokens. Paired with the
+    # absolute ActiveSession.expires_at now set at login, this keeps session rows ageable rather than
+    # accumulating forever. SESSION_TIMEOUT_MAX_MINUTES = 43200 = 30 days.
+    st = payload.get("session_timeout")
+    if isinstance(st, int) and not isinstance(st, bool) and st > SESSION_TIMEOUT_MAX_MINUTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"session_timeout must be at most {SESSION_TIMEOUT_MAX_MINUTES} minutes (30 days)")
 
     # Temporary Vault Passcode policy. The master switch, the custom-passcode toggle + its complexity
     # toggles, the one-time/single-vault defaults, and whether ZK vaults may sit in a temp credential's
@@ -5861,6 +5875,13 @@ async def update_own_account(
 
     if not changes:
         raise HTTPException(status_code=400, detail="No changes were provided.")
+    # A password change must evict the account's sessions, matching the reset-token path -- a stolen
+    # JWT is indistinguishable from the legitimate one, so it must not outlive the password change
+    # that is the natural response to a suspected compromise. Durable so it holds through a Redis
+    # outage; the caller is forced to re-login, which is the safe default against a token they can't
+    # tell apart from an attacker's.
+    if "password" in changes:
+        _revoke_sessions(db, user_id=user.id, actor_username=user.username)
     db.commit()
     db.refresh(user)
     try:
@@ -6345,6 +6366,12 @@ async def update_user(
         _validate_password_policy(db, user_update.password)
         user.password_hash = hash_password(user_update.password)
         changes['password'] = 'changed'
+
+    # A password change must evict the account's sessions (a stolen token must not survive the
+    # response to a suspected compromise), matching the self-service and reset paths. Deduped against
+    # the lock/deactivate revoke below, which already covers those cases with the same durable revoke.
+    if 'password' in changes and not (user_update.is_locked is True or user_update.is_active is False):
+        _revoke_sessions(db, user_id=user.id, actor_username=current_user.username)
 
     # SFTP controls — a user may manage their own (or an admin, anyone's).
     if user_update.sftp_enabled is not None:
