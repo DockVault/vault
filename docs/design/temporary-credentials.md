@@ -61,15 +61,18 @@ a temp credential can never reach an admin-only endpoint regardless of scope.
 
 ## Enforcement
 
-Three gates stack, checked outermost-first, so the earliest applicable denial wins:
+Two decorator gates, plus an in-handler confinement check:
 
-1. **`require_endpoint_permission(GROUP)`** — does the credential's page scope reach this endpoint
-   group at all? A `__deny__` group, or a page the credential lacks, is refused here.
-2. **`enforce_vault(user, vault_id)`** — temp-scope confinement: is this specific vault in the
-   credential's scope? Out-of-scope vaults are filtered from listings and 403/404 on direct access.
-3. **`require_vault_cap(CAP)` / `require_cap(user, vault_id, cap)`** — does the credential hold the
-   fine-grained capability for this vault? A credential that reaches the endpoint but lacks the cap is
-   refused here and the refusal is audited (`vault_cap_denied`).
+1. **`require_endpoint_permission(GROUP)`** (decorator, outer — runs first) — does the credential's
+   page scope reach this endpoint group at all? A `__deny__` group, or a page the credential lacks,
+   is refused here.
+2. **`require_vault_cap(CAP)`** (decorator, inner; delegates to `require_cap(user, vault_id, cap)`) —
+   does the credential hold the fine-grained capability for this vault? A credential that reaches the
+   endpoint but lacks the cap is refused here and the refusal is audited (`vault_cap_denied`).
+3. **`enforce_vault(user, vault_id)`** — temp-scope confinement, called **in the handler** on routes
+   that address a specific vault's data: is this vault in the credential's scope? Out-of-scope vaults
+   are filtered from listings and 403/404 on direct access. It is not a fixed third decorator; its
+   position relative to the cap check varies by handler, but on a data route both must pass.
 
 Both the **REST API and the SFTP server** apply the same scope. SFTP enforces the eight file/folder
 capabilities (the seven vault-administration capabilities have no SFTP equivalent — correct by
@@ -95,11 +98,13 @@ specific files — a credential scoped below the vault never receives the whole-
 These read like findings but are decisions with a recorded rationale; do not "fix" them without an
 explicit call.
 
-- **Favouriting is keyed to the real user, not to temp-credential scope.** `PUT/DELETE
-  /vaults/{id}/favorite` checks the underlying account's real READ access (uniform 404 otherwise, so
-  no cross-tenant existence oracle) but does **not** apply `enforce_vault`. A favourite is a personal
-  bookmark of the real user, so a temp session favouriting a vault the real user genuinely owns is the
-  user's own action, not a scope bypass. There is no cross-account leak.
+- **Favouriting is keyed to the real user, not to temp-credential scope.** `PUT /vaults/{id}/favorite`
+  checks the underlying account's real READ access (a uniform 404 otherwise, so no cross-tenant
+  existence oracle); `DELETE /vaults/{id}/favorite` performs no access check at all but is harmless —
+  it removes only the caller's own favourite row (keyed to their user id), so un-favouriting a vault
+  they never favourited is a no-op and there is no cross-user or cross-tenant effect. Neither applies
+  `enforce_vault`. A favourite is a personal bookmark of the real user, so a temp session favouriting a
+  vault the real user genuinely owns is the user's own action, not a scope bypass.
 - **Directory search** (`/users/search`) resolves against the real account's directory reach, not the
   credential's vault scope, and can be confined to the searcher's department via
   `directory_search_scope`.

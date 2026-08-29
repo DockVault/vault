@@ -471,10 +471,11 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 if not session:
                     safe_event('session.terminated', session=token[:8])
                     return False
-                # Enforce the session's HARD expiry on every op, not just at login. Regular
-                # account sessions carry a NULL expires_at (no hard bound → skipped); a
-                # temp-credential session carries the credential's expires_at, so a cred with a
-                # short total lifetime can't keep operating over SFTP past it (the web path
+                # Enforce the session's HARD expiry on every op, not just at login. A regular
+                # PASSWORD account session now carries an absolute 31-day expires_at (set in
+                # authenticate_user); a KEY-based SFTP session still carries NULL (no hard bound →
+                # skipped); a temp-credential session carries the credential's expires_at, so a cred
+                # with a short total lifetime can't keep operating over SFTP past it (the web path
                 # rejects per request; nothing on the SFTP path did). Stored naive (UTC).
                 from datetime import datetime, timezone
                 if session.expires_at is not None:
@@ -1803,10 +1804,12 @@ def start_sftp_server():
                     pass
                 continue
 
-            safe_event('connection.accepted', peer=client_address)
-
             # Handle client in a new thread (the handler releases the admission slot in its finally).
+            # Everything after a successful admit() lives in this try, so ANY failure before the
+            # handler thread owns the slot -- including a logging error on a broken stdout pipe --
+            # still releases the slot and closes the socket instead of leaking them.
             try:
+                safe_event('connection.accepted', peer=client_address)
                 client_thread = threading.Thread(
                     target=handle_sftp_client,
                     args=(client_socket, client_address, host_key)
@@ -1814,7 +1817,8 @@ def start_sftp_server():
                 client_thread.daemon = True
                 client_thread.start()
             except Exception as e:  # noqa: BLE001
-                # Spawn failed after admission -- release the slot and close, so it isn't leaked.
+                # Failed after admission (spawn, or the log above) -- release the slot and close, so
+                # neither the slot nor the socket FD is leaked.
                 _connection_admission.release(client_address[0])
                 try:
                     client_socket.close()

@@ -115,6 +115,8 @@ def test_destructive_vault_caps_are_denied_without_the_capability(admin):
                            "vault.change_password", json={"new_password": "irrelevant-not-applied"})
         _assert_cap_denied(admin, c, vid, "PATCH", f"/vaults/{vid}/settings",
                            "vault.change_expiry", json={})
+        _assert_cap_denied(admin, c, vid, "POST", f"/vaults/{vid}/rotate-key",
+                           "vault.rotate_key", json={})
         _assert_cap_denied(admin, c, vid, "POST", f"/vaults/{vid}/delete",
                            "vault.delete", json={})
 

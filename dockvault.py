@@ -420,6 +420,16 @@ def build_env_lines(cfg):
     if sftp_active and cfg.get("sftp_staging_tmpfs_mb") not in (None, "") \
             and int(cfg["sftp_staging_tmpfs_mb"]) != 512:
         bare("SFTP_STAGING_TMPFS_MB", int(cfg["sftp_staging_tmpfs_mb"]))
+    # SFTP pre-auth connection-admission caps (see .env.example). Written only when the operator set a
+    # non-default value; otherwise the app defaults (100 / 10 / 30) apply, so an install that never
+    # mentions them authors the .env it always did.
+    for _cfg_key, _env_name, _default in (
+        ("sftp_max_connections", "SFTP_MAX_CONNECTIONS", 100),
+        ("sftp_max_connections_per_ip", "SFTP_MAX_CONNECTIONS_PER_IP", 10),
+        ("sftp_auth_grace_seconds", "SFTP_AUTH_GRACE_SECONDS", 30),
+    ):
+        if sftp_active and cfg.get(_cfg_key) not in (None, "") and int(cfg[_cfg_key]) != _default:
+            bare(_env_name, int(cfg[_cfg_key]))
     if cfg.get("update_check_enabled"):
         bare("UPDATE_CHECK_ENABLED", "true")
     # Deployment storage ceiling. Only written when the operator chose one: left out, the app's
@@ -1180,6 +1190,10 @@ def new_set_config(current_env, new_prefix, new_id):
         "sftp_host_port": _port_or(current_env.get("SFTP_HOST_PORT"), 2322),
         # Keep a custom SFTP staging size across a fresh volume set, like the ports above.
         "sftp_staging_tmpfs_mb": (current_env.get("SFTP_STAGING_TMPFS_MB") or "").strip() or None,
+        # Keep any custom SFTP connection-admission limits across a fresh volume set too.
+        "sftp_max_connections": (current_env.get("SFTP_MAX_CONNECTIONS") or "").strip() or None,
+        "sftp_max_connections_per_ip": (current_env.get("SFTP_MAX_CONNECTIONS_PER_IP") or "").strip() or None,
+        "sftp_auth_grace_seconds": (current_env.get("SFTP_AUTH_GRACE_SECONDS") or "").strip() or None,
         "update_check_enabled": truthy("UPDATE_CHECK_ENABLED"),
         "plan_log_pull": truthy("PLAN_LOG_PULL"),
         "log_token_pepper": gen_hex(32) if truthy("PLAN_LOG_PULL") else "",
