@@ -4768,6 +4768,17 @@ def _second_factor_effective(db, user) -> dict:
         user_id=user.id, has_active_enrollment=has_active)
 
 
+def _login_second_factor_in_effect(db, user) -> bool:
+    """Whether the login flow presents the second factor for this user. The `login` action row is the
+    admin's master on/off switch (default require_otp ON): with it OFF the login step never asks for a
+    factor, even for an enrolled or policy-required user (they still use their factor for step-ups). With
+    it ON, the factor applies when it is otherwise in effect (enrolled, or required by mode/dept/user)."""
+    login_otp, _ = _sf_action_toggles(db, "login")
+    if not login_otp:
+        return False
+    return _second_factor_effective(db, user)["in_effect"]
+
+
 def _sf_login_methods(db, user) -> list:
     enr = db.query(SecondFactorEnrollment).filter(
         SecondFactorEnrollment.user_id == user.id, SecondFactorEnrollment.status == "active").first()
@@ -5028,7 +5039,8 @@ async def login(
             # Two-step login: if the second factor is in effect for this account, hand out NO session
             # yet. Delete the session authenticate_user just created, stand up a pending_login, and
             # return a pre-auth response; the real session is minted by /auth/second-factor/verify.
-            if _second_factor_effective(db, user)["in_effect"]:
+            # Honours the `login` action's require_otp master switch (off -> no factor at login).
+            if _login_second_factor_in_effect(db, user):
                 _delete_session_by_token(db, session_token)
                 try:
                     audit_logger.log_action(action="login_password_ok", status="success", user=user,

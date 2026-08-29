@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import second_factor as sf          # noqa: E402
 from conftest import ApiClient, BASE_URL          # noqa: E402
+from _sf_helpers import set_action_require_otp     # noqa: E402
 
 
 def _totp(secret, step_offset=0):
@@ -56,6 +57,22 @@ def test_two_step_login_for_an_enrolled_user(temp_user, temp_user_client):
     # The pre-auth token is single-use — it's now consumed.
     assert fresh.session.post(f"{BASE_URL}/auth/second-factor/verify", headers=ph,
                               json={"method": "totp", "code": _totp(secret, 1)}).status_code == 401
+
+
+def test_login_action_require_otp_off_skips_the_second_factor(admin, temp_user, temp_user_client):
+    """The `login` action row is the master on/off for login-OTP. With require_otp OFF, even an ENROLLED
+    user logs in one-step (no pre-auth challenge)."""
+    _enroll(temp_user, temp_user_client)   # enrolled -> normally two-step
+    set_action_require_otp(admin, "login", False)
+    try:
+        c = ApiClient()
+        r = c.session.post(f"{BASE_URL}/auth/login",
+                           json={"username": temp_user["_username"], "password": temp_user["_password"]})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body.get("access_token") and not body.get("second_factor_required"), body
+    finally:
+        set_action_require_otp(admin, "login", True)   # restore the default
 
 
 def test_non_enrolled_user_logs_in_in_one_step(temp_user):
