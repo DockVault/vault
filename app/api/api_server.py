@@ -15809,7 +15809,11 @@ def _seed_default_share_tags():
         from app.core.models import ShareTag, User, RoleEnum
         with get_db_context() as db:
             has_tags = db.query(ShareTag).first() is not None
-            if not sharing_policy.should_seed_default_tags(has_tags, _sharing_enabled(db)):
+            # Gate on the EXPLICIT stored flag, not the effective value: sharing now defaults ON, so a
+            # fresh deploy (key absent) must still be seeded so the feature is usable. Only an admin who
+            # EXPLICITLY enabled sharing (stored True) counts as already-engaged and is not re-seeded.
+            explicitly_enabled = _global_settings_blob(db).get("sharing_enabled") is True
+            if not sharing_policy.should_seed_default_tags(has_tags, explicitly_enabled):
                 return
             admin = db.query(User).filter(User.role == RoleEnum.ADMIN).first()
             created_by = admin.id if admin else None
@@ -15829,8 +15833,12 @@ def _seed_default_note_link_tags():
         from app.core.models import NoteLinkTag, User, RoleEnum
         with get_db_context() as db:
             has_tags = db.query(NoteLinkTag).first() is not None
-            enabled = note_link_policy.public_note_links_enabled(_global_settings_blob(db))
-            if not note_link_policy.should_seed_default_note_link_tags(has_tags, enabled):
+            # Gate on the EXPLICIT stored flag, not the effective value: public note links now default
+            # ON, so a fresh deploy (key absent) must still be seeded so the feature is usable. Only an
+            # admin who EXPLICITLY turned it on (stored True) counts as "already engaged" and is not
+            # re-seeded a permissive starter set on upgrade.
+            explicitly_enabled = _global_settings_blob(db).get("public_note_links_enabled") is True
+            if not note_link_policy.should_seed_default_note_link_tags(has_tags, explicitly_enabled):
                 return
             admin = db.query(User).filter(User.role == RoleEnum.ADMIN).first()
             created_by = admin.id if admin else None

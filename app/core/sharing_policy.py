@@ -21,9 +21,10 @@ MIN_LIFETIME_MINUTES = 1
 
 
 def sharing_enabled(cfg) -> bool:
-    """Master switch. FAIL-CLOSED: default False, and False for any non-bool stored value (strict
-    `is True`, so a stray truthy string can't turn the feature on)."""
-    return (cfg or {}).get("sharing_enabled") is True
+    """Master switch. Default ON — a self-hosted collaboration feature, available out of the box.
+    Only an explicit stored False disables it; a non-bool stored value falls back to the ON default
+    (the admin UI always stores a real bool, so a non-bool only arises from a hand-edited row)."""
+    return (cfg or {}).get("sharing_enabled", True) is not False
 
 
 def normalize_audiences(value) -> list:

@@ -16,13 +16,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core import sharing_policy as sp  # noqa: E402
 
 
-def test_master_switch_fail_closed_default_and_strict_bool():
-    assert sp.sharing_enabled({}) is False            # unset -> OFF
-    assert sp.sharing_enabled(None) is False
+def test_master_switch_default_on_and_only_explicit_false_disables():
+    assert sp.sharing_enabled({}) is True             # unset -> ON (default)
+    assert sp.sharing_enabled(None) is True
     assert sp.sharing_enabled({"sharing_enabled": True}) is True
-    # a truthy NON-bool stored value must NOT turn sharing on (fail closed, strict `is True`)
-    for bad in ("true", "false", 1, "on", [1]):
-        assert sp.sharing_enabled({"sharing_enabled": bad}) is False
+    assert sp.sharing_enabled({"sharing_enabled": False}) is False   # explicit off respected
+    # a non-bool stored value falls back to the ON default -- only a literal False disables
+    for val in ("true", "false", 1, "on", [1]):
+        assert sp.sharing_enabled({"sharing_enabled": val}) is True
 
 
 def test_audiences_normalize_drops_unknown_and_dedupes_order_stable():

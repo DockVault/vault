@@ -66,16 +66,24 @@ def test_sub_controls_follow_their_master_switches(page: Page, admin_creds):
     _open_accounts_tab(page)
     ttl = page.locator("#setting-invite-ttl-hours")
     mode = page.locator("#setting-signup-domain-mode")
-    # off by default -> the sub-controls are disabled
-    expect(ttl).to_be_visible(); expect(ttl).to_be_disabled()
-    expect(mode).to_be_visible(); expect(mode).to_be_disabled()
+    expect(ttl).to_be_visible(); expect(mode).to_be_visible()
+    # Wait for the async settings load to finish before toggling: invite-by-link defaults ON, so the
+    # load re-checks the box after render — toggling before it settles lets the late load override the
+    # click ("clicking did not change its state"). Waiting for the loaded state races it out.
+    expect(page.locator("#setting-invite-enabled")).to_be_checked()
+    # master OFF -> the sub-control is disabled. Set a known OFF state first (invite now defaults ON),
+    # so this tests the follow-the-master behavior independent of the shipped default.
+    page.set_checked("#setting-invite-enabled", False)
+    expect(ttl).to_be_disabled()
+    page.set_checked("#setting-signup-enabled", False)
+    expect(mode).to_be_disabled()
     # turning the masters on enables them
-    page.check("#setting-invite-enabled")
+    page.set_checked("#setting-invite-enabled", True)
     expect(ttl).to_be_enabled()
-    page.check("#setting-signup-enabled")
+    page.set_checked("#setting-signup-enabled", True)
     expect(mode).to_be_enabled()
     # and back off disables again
-    page.uncheck("#setting-invite-enabled")
+    page.set_checked("#setting-invite-enabled", False)
     expect(ttl).to_be_disabled()
 
 
@@ -112,7 +120,9 @@ def test_email_change_toggle_disabled_without_smtp(page: Page, admin_creds, admi
 def test_save_round_trips_through_reload(page: Page, admin_creds, restore_settings):
     _login(page, admin_creds["username"], admin_creds["password"])
     _open_accounts_tab(page)
-    page.check("#setting-invite-enabled")
+    # invite-by-link defaults ON — wait for the loaded state before editing (this also races out the
+    # async settings load, so the fields below aren't touched while the form is still populating).
+    expect(page.locator("#setting-invite-enabled")).to_be_checked()
     page.fill("#setting-invite-ttl-hours", "96")
     page.select_option("#setting-login-identifier", "either")
     page.click("#save-all-settings-btn")

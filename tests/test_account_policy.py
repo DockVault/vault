@@ -32,7 +32,7 @@ def test_effective_all_defaults_when_empty():
     assert set(eff) == set(ACCOUNT_POLICY_KEYS)
     # defaults preserve today's behaviour exactly
     assert eff["email_requirement"] == "required"
-    assert eff["invite_enabled"] is False and eff["signup_enabled"] is False
+    assert eff["invite_enabled"] is True and eff["signup_enabled"] is False
     assert eff["login_identifier"] == "username"
 
 

@@ -53,8 +53,9 @@ def test_user_cap_reader_defaults_and_clamps():
     assert nlp.public_note_link_user_cap({"public_note_link_user_cap": 7}) == 7
     assert nlp.public_note_link_user_cap({"public_note_link_user_cap": 0}) == nlp.DEFAULT_USER_CAP
     assert nlp.public_note_link_user_cap({"public_note_link_user_cap": "x"}) == nlp.DEFAULT_USER_CAP
-    assert nlp.public_note_links_enabled({}) is False
+    assert nlp.public_note_links_enabled({}) is True   # unset -> ON (default)
     assert nlp.public_note_links_enabled({"public_note_links_enabled": True}) is True
+    assert nlp.public_note_links_enabled({"public_note_links_enabled": False}) is False  # explicit off
 
 
 def test_default_catalog_shape():

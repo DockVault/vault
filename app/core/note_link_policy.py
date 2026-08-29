@@ -28,9 +28,9 @@ MAX_TTL_HOURS = 24 * 3650  # 10 years — an admin ceiling, effectively "no expi
 
 
 def public_note_links_enabled(settings_blob: dict) -> bool:
-    # Fail closed on a non-bool stored value (matches sharing_policy.sharing_enabled): only a real
-    # True enables the feature, so a stray truthy string can never silently turn it on.
-    return (settings_blob or {}).get("public_note_links_enabled", False) is True
+    # Default ON (matches sharing_policy.sharing_enabled): available out of the box for self-hosters.
+    # Only an explicit stored False disables it; a non-bool value falls back to the ON default.
+    return (settings_blob or {}).get("public_note_links_enabled", True) is not False
 
 
 def public_note_link_user_cap(settings_blob: dict) -> int:
