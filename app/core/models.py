@@ -2336,6 +2336,8 @@ class SecondFactorAction(Base):
 
     key = Column(String(64), primary_key=True)
     require_otp = Column(Boolean, nullable=False, default=False)
+    # Owner's model: a second, independent admin toggle per action — re-enter the account password.
+    require_password = Column(Boolean, nullable=False, default=False, server_default=text('false'))
     updated_at = Column(DateTime, nullable=False,
                         server_default=text("(now() AT TIME ZONE 'utc')"),
                         default=datetime.utcnow, onupdate=datetime.utcnow)

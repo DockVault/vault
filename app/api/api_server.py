@@ -39,7 +39,7 @@ bootstrap_entrypoint("API")
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
 from app.core.chunk_cleanup import fail_chunk_session
 from app.core.session_hash_utils import hash_session_token
-from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink, SecondFactorEnrollment, SecondFactorRecoveryCode
+from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink, SecondFactorEnrollment, SecondFactorRecoveryCode, SecondFactorAction
 from app.core import sharing_policy
 from app.core import note_link_policy
 from app.core import storage_quota
@@ -6262,6 +6262,62 @@ async def acknowledge_recovery_codes(
     except Exception:      # noqa: BLE001
         pass
     return {"enrolled": True, "method": "totp"}
+
+
+# --- Second factor: admin policy matrix ------------------------------------------------------------
+
+class SecondFactorActionToggle(BaseModel):
+    require_otp: Optional[bool] = None
+    require_password: Optional[bool] = None
+
+
+@app.get("/second-factor/actions")
+async def list_second_factor_actions(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """The admin step-up policy matrix: one row per cataloged action with its two independent toggles
+    (require_otp / require_password). Rendered in catalog order; a key with no stored row yet shows its
+    code default."""
+    from app.core.second_factor_actions import SECOND_FACTOR_ACTIONS
+    rows = {r.key: r for r in db.query(SecondFactorAction).all()}
+    return {"actions": [
+        {"key": key, "name": name,
+         "require_otp": bool(rows[key].require_otp) if key in rows else bool(default_otp),
+         "require_password": bool(rows[key].require_password) if key in rows else False}
+        for key, name, default_otp in SECOND_FACTOR_ACTIONS
+    ]}
+
+
+@app.put("/second-factor/actions/{key}")
+async def update_second_factor_action(
+    key: str,
+    body: SecondFactorActionToggle,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Set an action's require_otp / require_password toggle. Only cataloged keys are configurable."""
+    from app.core.second_factor_actions import ACTION_KEYS
+    if key not in ACTION_KEYS:
+        raise HTTPException(status_code=404, detail="Unknown second-factor action.")
+    row = db.query(SecondFactorAction).filter(SecondFactorAction.key == key).first()
+    if not row:
+        row = SecondFactorAction(key=key)
+        db.add(row)
+    if body.require_otp is not None:
+        row.require_otp = bool(body.require_otp)
+    if body.require_password is not None:
+        row.require_password = bool(body.require_password)
+    db.commit()
+    try:
+        AuditLogger(db).log_action(action="second_factor_action_updated", status="success", user=current_user,
+                                   ip_address=get_client_ip(request),
+                                   details={"key": key, "require_otp": row.require_otp,
+                                            "require_password": row.require_password})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"key": key, "require_otp": row.require_otp, "require_password": row.require_password}
 
 
 @app.get("/users/me/preferences")
@@ -15986,6 +16042,27 @@ _DEFAULT_SHARE_TAGS = [
 ]
 
 
+def _seed_second_factor_actions():
+    """Seed one second_factor_actions row per catalog key. require_otp comes from the catalog default on
+    FIRST creation only; an admin's own toggles are never overwritten on a later boot. New keys added to
+    the catalog appear; keys removed from code are left in place (harmless). Best-effort at startup."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.models import SecondFactorAction
+        from app.core.second_factor_actions import SECOND_FACTOR_ACTIONS
+        with get_db_context() as db:
+            existing = {r[0] for r in db.query(SecondFactorAction.key).all()}
+            added = 0
+            for key, _name, default_otp in SECOND_FACTOR_ACTIONS:
+                if key not in existing:
+                    db.add(SecondFactorAction(key=key, require_otp=bool(default_otp), require_password=False))
+                    added += 1
+            if added:
+                print(f"[OK] Seeded {added} second-factor action(s)")
+    except Exception as e:
+        print(f"⚠ Second-factor action seeding skipped: {e}")
+
+
 def _seed_default_share_tags():
     """Seed the starter share-tag set on a FRESH deployment so sharing works out of the box.
 
@@ -16977,6 +17054,7 @@ async def lifespan(app: FastAPI):
     scrub_bootstrap_password_source(_admin_bootstrap_status)
     _seed_default_share_tags()  # after the admin exists, so seed tags can record it as creator
     _seed_default_note_link_tags()  # public-note-link starter tags (inert until enabled)
+    _seed_second_factor_actions()  # the second-factor step-up policy matrix (one row per catalog key)
     _backfill_default_permissions()
     _seed_default_email_profile()
 
