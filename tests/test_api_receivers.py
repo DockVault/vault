@@ -231,6 +231,37 @@ def test_admin_oversight(admin, receivers_enabled):
         admin.delete_user(u["id"])
 
 
+def test_wrapped_vault_is_policy_frozen(admin, receivers_enabled):
+    # The receiver's vault is frozen: retention can't be changed and size can't be raised above the
+    # receiver's cap through the ordinary vault-settings route, and only READ grants are allowed.
+    rec = _mk_receiver(admin, max_total_bytes=10 * _MB)
+    vid = rec["vault_id"]
+    try:
+        # retention change refused
+        assert admin.patch(f"/vaults/{vid}/settings",
+                           json={"expire_files_after_days": 999}).status_code == 400
+        # raising the size above the receiver cap refused
+        assert admin.patch(f"/vaults/{vid}/settings",
+                           json={"size_limit": 100 * _MB}).status_code == 400
+        # a size within the cap is allowed
+        assert admin.patch(f"/vaults/{vid}/settings",
+                           json={"size_limit": 8 * _MB}).status_code == 200
+        # the storage route can't be a backdoor to inflate the receiver vault above its cap
+        assert admin.put(f"/vaults/{vid}/storage",
+                         json={"granted_bytes": 100 * _MB}).status_code == 400
+        # non-read grant refused; read grant allowed
+        u = admin.create_user(role="user")
+        try:
+            w = admin.post(f"/vaults/{vid}/permissions", json={"user_id": u["id"], "level": "write"})
+            assert w.status_code == 400, w.text
+            r = admin.post(f"/vaults/{vid}/permissions", json={"user_id": u["id"], "level": "read"})
+            assert r.status_code in (200, 201), r.text
+        finally:
+            admin.delete_user(u["id"])
+    finally:
+        admin.delete_vault(vid)
+
+
 def test_temp_session_cannot_create(admin, receivers_enabled):
     tag = _mk_tag(admin)
     tc = admin.post("/auth/temp-credentials", json={"validity_minutes": 30}).json()

@@ -9804,6 +9804,13 @@ def _receiver_random_vault_name() -> str:
     return "recv-" + _notelink_gen_token(12)
 
 
+def _receiver_for_vault(db, vault_id):
+    """Return the Receiver wrapping this vault, or None. A vault that has a receiver row is
+    policy-frozen: three ordinary vault routes are constrained on it so the owner can't rewrite the
+    policy the wrapper enforces."""
+    return db.query(Receiver).filter(Receiver.vault_id == vault_id).first()
+
+
 class ReceiverPauseBody(BaseModel):
     paused: bool = True
 
@@ -12460,7 +12467,26 @@ async def update_vault_settings(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only vault owner can modify settings"
             )
-        
+
+        # A receiver vault is policy-frozen: retention is authoritative from the receiver row, and the
+        # size cap may not be raised above the receiver's frozen max_total_bytes. The owner changes
+        # either through the receiver itself, so it re-runs the tighten-only resolution.
+        _receiver = _receiver_for_vault(db, vault_id)
+        if _receiver is not None:
+            if 'expire_files_after_days' in settings_update or 'expire_files_unit' in settings_update:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="This vault backs an upload link; change its retention through the upload link.")
+            if 'size_limit' in settings_update and _receiver.max_total_bytes is not None:
+                try:
+                    _req = int(settings_update['size_limit'])
+                except (TypeError, ValueError):
+                    _req = None
+                if _req is not None and _req > int(_receiver.max_total_bytes):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="This vault backs an upload link; its size cap is fixed by the link.")
+
         # Update settings
         updated_fields = []
         
@@ -12665,6 +12691,19 @@ async def set_vault_storage(
             status_code=403,
             detail="Only the vault owner or a vault manager can change this vault's storage.",
         )
+    # A receiver vault is funded by a SINGLE owner grant (owner-pays), sized by the wrapper. Refuse a
+    # second contributor, and refuse the owner from inflating their grant above the receiver's frozen
+    # max_total_bytes — otherwise this route would be a backdoor around the vault-settings size clamp.
+    _recv = _receiver_for_vault(db, vault_id)
+    if _recv is not None:
+        if current_user.id != vault.owner_id:
+            raise HTTPException(
+                status_code=400,
+                detail="This vault backs an upload link; only its owner funds it.")
+        if _recv.max_total_bytes is not None and int(payload.granted_bytes) > int(_recv.max_total_bytes):
+            raise HTTPException(
+                status_code=400,
+                detail="This vault backs an upload link; its size is fixed by the link.")
 
     # Take the vault's row lock first, so a second contributor writing at the same moment cannot
     # compute a total that omits this one. Held until the commit below.
@@ -12857,6 +12896,14 @@ async def grant_vault_permission(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only the vault owner or a manager can grant permissions"
             )
+
+        # A receiver vault is share-frozen: only READ grants are allowed, so a colleague can see and
+        # download what arrived but cannot alter the receiver or its contents.
+        if getattr(permission, "level", None) in ("write", "delete", "manage") \
+                and _receiver_for_vault(db, vault_id) is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This vault backs an upload link; only read access can be granted on it.")
 
         # NOTE: a per-user AUTHZ grant IS legitimate on a zero-knowledge vault — it records the
         # vault_members row (membership + read/write/delete/manage), while the wrapped DEK is
