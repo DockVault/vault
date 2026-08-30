@@ -88,6 +88,46 @@ def test_temp_cred_cap_enforced_for_non_admin(admin):
         admin.delete_user(u["id"])
 
 
+def test_temp_cred_cap_exempts_admin_delegated_child(admin):
+    # An admin ACCOUNT is exempt from the temp-cred cap whether it mints directly OR through a
+    # delegated child temp session (the child carries the same admin user_id). Regression: the cap
+    # once keyed on 'direct mint only', so a delegated child on an admin account already at the cap
+    # returned 409 instead of 200 (caught by the full suite once >cap creds had accumulated).
+    before = admin.get("/settings").json()
+    admin.put("/settings", json={"max_temp_creds_per_user": 1})
+    vid = admin.create_vault(name=unique("tcdel"))["id"]
+    made = []
+    try:
+        pcaps = ["vault.see_info"]
+        pscope = {"v": 1, "pages": ["vaults", "temp_creds"], "caps": [], "vault_caps_default": pcaps,
+                  "temp": {"view": True, "create": True, "invalidate": True, "clear": True,
+                           "delegate": True}}
+        # First (direct) admin mint — already at/over the cap of 1, but exempt.
+        parent = admin.post("/auth/temp-credentials", json={
+            "validity_minutes": 60, "scope": pscope, "vault_access_mode": "selected",
+            "selected_vaults": [{"vault_id": vid, "caps": pcaps}]})
+        assert parent.status_code == 200, parent.text
+        made.append(parent.json())
+        pc = admin.clone_anonymous()
+        pc.login(parent.json()["temp_username"], parent.json()["credential"])
+        cscope = {"v": 1, "pages": ["vaults"], "caps": [], "vault_caps_default": pcaps, "temp": {}}
+        # Delegated child on the admin account — exempt too (was 409 before the fix).
+        child = pc.post("/auth/temp-credentials", json={
+            "validity_minutes": 30, "scope": cscope, "vault_access_mode": "selected",
+            "selected_vaults": [{"vault_id": vid, "caps": pcaps}]})
+        assert child.status_code == 200, child.text
+        made.append(child.json())
+    finally:
+        for cred in made:
+            try:
+                admin.post(f"/temp-creds/{cred['temp_username']}/delete")
+            except Exception:
+                pass
+        admin.put("/settings", json={
+            "max_temp_creds_per_user": before.get("max_temp_creds_per_user", 10)})
+        admin.delete_vault(vid)
+
+
 def test_cap_settings_report_effective_defaults(admin):
     s = admin.get("/settings").json()
     # The effective defaults are surfaced so the admin toggles reflect the shipped 50 / 50 / 10.
