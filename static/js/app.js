@@ -287,6 +287,10 @@ async function loadSessionAccess() {
     // cap Set because this probe hadn't resolved yet — recompute + re-gate the open
     // vault so its permitted buttons reappear.
     refreshOpenVaultCapGating();
+    // Reveal the "Upload links" nav when receivers are available to this account (a temp/scoped
+    // session can't create receivers, so hide it for them). Best-effort; never blocks the session.
+    if (sessionAccess && sessionAccess.is_scoped_temp) { const nav = document.getElementById('nav-uploadlinks'); if (nav) nav.style.display = 'none'; }
+    else { refreshReceiverAvailability().catch(() => {}); }
 }
 
 // Recompute a scoped temp credential's caps for the CURRENTLY-OPEN vault and re-apply
@@ -7109,6 +7113,7 @@ function setupSettingsTabs() {
             if (tabId === 'logs') { loadLogSettings(); }  // refresh on tab open
             if (tabId === 'sharing') { setupShareTagsUI(); loadShareTags(); }  // wire (idempotent) + refresh
             if (tabId === 'notelinks') { setupNoteLinkTagsUI(); loadNoteLinkTags(); loadAdminNoteLinks(); setupPublicFileLinkUI(); loadAdminPublicLinks(); }  // wire + refresh (note + file links share this tab)
+            if (tabId === 'uploadlinks') { setupReceiverTagsUI(); loadReceiverTags(); loadAdminReceivers(); }  // wire + refresh receiver tags + oversight
             if (tabId === 'accounts') { setupAccountsPolicyUI(); refreshAccountsPolicyUI(); }  // wire + reflect deps
             if (tabId === 'email') { loadEmailProfiles(); loadEmailTemplates(); loadEmailActions(); }  // refresh profiles + templates + actions on tab open
         });
@@ -8212,6 +8217,10 @@ async function loadSettings() {
         if (nlCap) nlCap.value = settings.public_note_link_user_cap != null ? settings.public_note_link_user_cap : 50;
         const pflEn = document.getElementById('setting-public-file-links-enabled');
         if (pflEn) pflEn.checked = settings.public_file_links_enabled === true;
+        const rcEn = document.getElementById('setting-public-receivers-enabled');
+        if (rcEn) rcEn.checked = settings.public_receivers_enabled === true;
+        const rcCap = document.getElementById('setting-public-receiver-user-cap');
+        if (rcCap) rcCap.value = settings.public_receiver_user_cap != null ? settings.public_receiver_user_cap : 50;
         const nMax = document.getElementById('setting-note-max-chars');
         if (nMax) nMax.value = settings.note_max_chars != null ? settings.note_max_chars : 100000;
         setupNoteLinkTagsUI();
@@ -8321,6 +8330,10 @@ async function saveAllSettings() {
         if (nlCapEl && nlCapEl.value !== '') settings.public_note_link_user_cap = parseInt(nlCapEl.value, 10);
         const pflEnEl = document.getElementById('setting-public-file-links-enabled');
         if (pflEnEl) settings.public_file_links_enabled = pflEnEl.checked;
+        const rcEnEl = document.getElementById('setting-public-receivers-enabled');
+        if (rcEnEl) settings.public_receivers_enabled = rcEnEl.checked;
+        const rcCapEl = document.getElementById('setting-public-receiver-user-cap');
+        if (rcCapEl && rcCapEl.value !== '') settings.public_receiver_user_cap = parseInt(rcCapEl.value, 10);
         const nMaxEl = document.getElementById('setting-note-max-chars');
         if (nMaxEl && nMaxEl.value !== '') settings.note_max_chars = parseInt(nMaxEl.value, 10);
 
@@ -18077,6 +18090,429 @@ function setupPublicFileLinkUI() {
     const aRevokeAll = _pflEl('pfl-admin-revoke-all'); if (aRevokeAll) aRevokeAll.addEventListener('click', adminRevokeAllPublicLinks);
 }
 
+// ======================= Upload links (receivers) ==================================================
+// A receiver is a link anyone can upload files through, into a dedicated vault only the owner opens.
+// The owner section lists their receivers; the create modal enforces the tag floor. The admin surface
+// (Settings -> Upload Links) manages the toggle/cap, receiver-tag floors, and oversight. textContent only.
+function _rcEl(id) { return document.getElementById(id); }
+function _rtEl(id) { return document.getElementById(id); }
+const _MB = 1048576;
+const _RC_STATUS_LABEL = { active: 'Active', paused: 'Paused', revoked: 'Revoked', expired: 'Expired', exhausted: 'Used up' };
+const _RC_SECRET_STRENGTH = { none: 0, pin: 1, password: 2 };
+
+function _mbFromBytes(b) { return (b != null && b > 0) ? Math.round(b / _MB) : ''; }
+function _bytesFromMb(mb) { const n = parseInt(mb, 10); return Number.isFinite(n) && n > 0 ? n * _MB : null; }
+
+// Availability: feature on + at least one tag the user can create with. Toggles the nav item.
+async function refreshReceiverAvailability() {
+    try { state._receiverPolicy = await apiRequest('/receiver-policy', { silent: true }); }
+    catch (_) { state._receiverPolicy = { enabled: false, tags: [] }; }
+    const tags = (state._receiverPolicy.tags || []);
+    state._receiversEnabled = !!state._receiverPolicy.enabled && tags.length > 0;
+    const nav = document.getElementById('nav-uploadlinks');
+    if (nav) nav.style.display = state._receiversEnabled ? '' : 'none';
+    return state._receiversEnabled;
+}
+
+// ---- Owner: my receivers ------------------------------------------------------------------------
+async function loadMyReceivers() {
+    setupReceiverUI();
+    const host = _rcEl('receivers-list'); if (!host) return;
+    host.replaceChildren(_el('div', 'spinner'));
+    try {
+        const data = await apiRequest('/receivers', { silent: true });
+        renderMyReceivers((data && data.receivers) || []);
+    } catch (e) {
+        host.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load your upload links: ' + ((e && e.message) || '')));
+    }
+}
+
+function _rcExpiryText(r) { return r.expires_at ? (typeof _fmtLinkExpiry === 'function' ? _fmtLinkExpiry(r.expires_at).replace(/^Expires /, '') : r.expires_at) : 'Never'; }
+
+function renderMyReceivers(receivers) {
+    const host = _rcEl('receivers-list'); if (!host) return;
+    if (!receivers.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', "You haven't created any upload links yet.")); return; }
+    const table = _el('table', 'data-table');
+    const thead = _el('thead'); const hr = _el('tr');
+    ['Label', 'Type', 'Status', 'Protection', 'Expires', 'Files', 'Budget', ''].forEach(h => hr.appendChild(_el('th', '', h)));
+    thead.appendChild(hr); table.appendChild(thead);
+    const tb = _el('tbody');
+    receivers.forEach(r => {
+        const tr = _el('tr');
+        tr.appendChild(_el('td', '', r.label || '—'));
+        const typeTd = _el('td', 'nl-tag-idlead');
+        const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(r.tag_border_color) : '';
+        if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
+        typeTd.appendChild(_el('span', '', r.tag_name || '—'));
+        tr.appendChild(typeTd);
+        tr.appendChild(_el('td', '', _RC_STATUS_LABEL[r.status] || r.status));
+        tr.appendChild(_el('td', '', r.secret_kind === 'password' ? 'Password' : (r.secret_kind === 'pin' ? 'PIN' : 'None')));
+        tr.appendChild(_el('td', '', _rcExpiryText(r)));
+        tr.appendChild(_el('td', '', (r.max_uploads != null) ? ((r.upload_count || 0) + '/' + r.max_uploads) : String(r.upload_count || 0)));
+        tr.appendChild(_el('td', '', r.max_total_bytes != null ? (_mbFromBytes(r.max_total_bytes) + ' MB') : '—'));
+        const actTd = _el('td', 'flex gap-sm');
+        if (r.status === 'active' || r.status === 'paused') {
+            const pz = _el('button', 'btn btn-ghost btn-sm', r.paused ? 'Resume' : 'Pause'); pz.type = 'button';
+            pz.addEventListener('click', () => pauseReceiver(r.id, !r.paused));
+            actTd.appendChild(pz);
+        }
+        if (r.status !== 'revoked') {
+            const rv = _el('button', 'btn btn-ghost btn-sm', 'Revoke'); rv.type = 'button';
+            rv.addEventListener('click', () => revokeReceiver(r.id));
+            actTd.appendChild(rv);
+        }
+        // Open the receiver's dedicated vault (where the uploads land).
+        if (r.vault_id) {
+            const op = _el('button', 'btn btn-ghost btn-sm', 'Open vault'); op.type = 'button';
+            op.addEventListener('click', () => { closeModal(); openVault(r.vault_id); });
+            actTd.appendChild(op);
+        }
+        tr.appendChild(actTd); tb.appendChild(tr);
+    });
+    table.appendChild(tb); host.replaceChildren(table);
+}
+
+async function pauseReceiver(id, paused) {
+    try { await apiRequest('/receivers/' + id + '/pause', { method: 'POST', body: JSON.stringify({ paused: !!paused }) }); showSuccess(paused ? 'Upload link paused' : 'Upload link resumed'); await loadMyReceivers(); }
+    catch (e) { showError((e && e.message) || 'Could not update the upload link'); }
+}
+
+async function revokeReceiver(id) {
+    const ok = await showConfirm('Revoke this upload link? It stops accepting uploads. The files already received stay in its vault.');
+    if (!ok) return;
+    try { await apiRequest('/receivers/' + id + '/revoke', { method: 'POST' }); showSuccess('Upload link revoked'); await loadMyReceivers(); }
+    catch (e) { showError((e && e.message) || 'Could not revoke the upload link'); }
+}
+
+// ---- Owner: create a receiver -------------------------------------------------------------------
+async function openReceiverCreate() {
+    if (!state._receiverPolicy) { await refreshReceiverAvailability(); }
+    const policy = state._receiverPolicy || { enabled: false, tags: [] };
+    _rcEl('rc-form').hidden = false; _rcEl('rc-result').hidden = true;
+    _rcEl('rc-create').hidden = false;
+    if (_rcEl('rc-cancel')) _rcEl('rc-cancel').hidden = false;
+    if (_rcEl('rc-done')) _rcEl('rc-done').hidden = true;
+    const err = _rcEl('rc-error'); if (err) err.hidden = true;
+    ['rc-label', 'rc-pin', 'rc-password', 'rc-max-uploads', 'rc-retention-days'].forEach(id => { const e = _rcEl(id); if (e) e.value = ''; });
+    const sel = _rcEl('rc-tag'); sel.replaceChildren();
+    const tags = policy.tags || [];
+    if (!tags.length) {
+        const o = _el('option', '', policy.enabled ? 'No link types available to you' : 'Upload links are turned off');
+        o.value = ''; sel.appendChild(o); _rcEl('rc-create').disabled = true;
+    } else {
+        _rcEl('rc-create').disabled = false;
+        tags.forEach(t => { const o = _el('option', '', t.name); o.value = t.id; sel.appendChild(o); });
+    }
+    openModal('receiver-create-modal');
+    onRcTagChange();
+}
+
+function _rcSelectedTag() {
+    const id = (_rcEl('rc-tag') || {}).value || '';
+    return (((state._receiverPolicy || {}).tags) || []).find(t => t.id === id) || null;
+}
+
+function _rcSecretPhrase(kind) { return kind === 'password' ? 'a password' : (kind === 'pin' ? 'a PIN' : 'no code'); }
+
+function onRcTagChange() {
+    const t = _rcSelectedTag();
+    const floor = _rcEl('rc-tag-floor');
+    if (!t) { if (floor) floor.textContent = ''; return; }
+    if (floor) floor.textContent = 'This type requires at least a ' + t.min_token_len + '-char link and ' + _rcSecretPhrase(t.require_secret)
+        + (t.max_ttl_hours ? (', expires within ' + t.max_ttl_hours + 'h') : '') + '. You can only make it stricter.';
+    const tok = _rcEl('rc-token-len'); tok.min = t.min_token_len; tok.value = t.min_token_len;
+    const secret = _rcEl('rc-secret');
+    Array.from(secret.options).forEach(o => { o.disabled = (_RC_SECRET_STRENGTH[o.value] || 0) < (_RC_SECRET_STRENGTH[t.require_secret] || 0); });
+    secret.value = t.require_secret; onRcSecretChange();
+    const pinLen = _rcEl('rc-pin-len'); pinLen.replaceChildren();
+    [4, 6, 8].filter(n => n >= (t.min_pin_len || 4)).forEach(n => { const o = _el('option', '', n + ' digits'); o.value = String(n); pinLen.appendChild(o); });
+    const pwHelp = _rcEl('rc-password-help');
+    if (pwHelp) pwHelp.textContent = 'At least ' + (t.password_min_len || 8) + ' characters' + (t.password_require_alnum ? ', including letters and numbers.' : '.');
+    const ttl = _rcEl('rc-ttl'); const never = _rcEl('rc-never');
+    if (t.max_ttl_hours) {
+        ttl.max = t.max_ttl_hours; ttl.value = t.default_ttl_hours || t.max_ttl_hours; ttl.disabled = false;
+        if (never) { never.checked = false; never.disabled = true; never.title = 'This link type caps the lifetime.'; }
+    } else {
+        ttl.removeAttribute('max'); if (never) { never.disabled = false; never.title = ''; }
+        if (t.default_ttl_hours) { ttl.value = t.default_ttl_hours; if (never) never.checked = false; ttl.disabled = false; }
+        else { if (never) never.checked = true; ttl.value = ''; ttl.disabled = true; }
+    }
+    // Upload caps: the tag's cap is the ceiling for each.
+    const up = _rcEl('rc-max-uploads');
+    if (t.max_uploads_cap) { up.max = t.max_uploads_cap; up.placeholder = 'up to ' + t.max_uploads_cap; } else { up.removeAttribute('max'); up.placeholder = 'unlimited'; }
+    const mf = _rcEl('rc-max-file-mb');
+    if (t.max_file_bytes_cap) { const cap = _mbFromBytes(t.max_file_bytes_cap); mf.max = cap; mf.value = cap; mf.placeholder = 'up to ' + cap; } else { mf.removeAttribute('max'); mf.value = ''; mf.placeholder = 'unlimited'; }
+    const mt = _rcEl('rc-max-total-mb');
+    if (t.max_total_bytes_cap) { const cap = _mbFromBytes(t.max_total_bytes_cap); mt.max = cap; mt.value = cap; mt.placeholder = 'up to ' + cap; } else { mt.removeAttribute('max'); mt.value = mt.value || '100'; mt.placeholder = 'required'; }
+    const rd = _rcEl('rc-retention-days');
+    if (t.retention_max_days) { rd.max = t.retention_max_days; rd.value = t.retention_default_days || ''; rd.placeholder = 'up to ' + t.retention_max_days; } else { rd.removeAttribute('max'); rd.value = t.retention_default_days || ''; rd.placeholder = 'keep'; }
+}
+
+function onRcSecretChange() {
+    const kind = _rcEl('rc-secret').value;
+    _rcEl('rc-pin-group').hidden = (kind !== 'pin');
+    _rcEl('rc-password-group').hidden = (kind !== 'password');
+}
+
+function _rcNeverChecked() { const n = _rcEl('rc-never'); return !!(n && !n.disabled && n.checked); }
+
+function _rcPayload() {
+    const t = _rcSelectedTag();
+    const p = { tag_id: t.id };
+    const label = (_rcEl('rc-label').value || '').trim(); if (label) p.label = label;
+    const tok = parseInt(_rcEl('rc-token-len').value, 10); if (Number.isFinite(tok)) p.token_len = tok;
+    const kind = _rcEl('rc-secret').value; p.secret_kind = kind;
+    if (kind === 'pin') p.pin = (_rcEl('rc-pin').value || '').trim();
+    if (kind === 'password') p.password = _rcEl('rc-password').value || '';
+    if (_rcNeverChecked()) { p.ttl_hours = null; } else { const h = parseInt(_rcEl('rc-ttl').value, 10); if (Number.isFinite(h)) p.ttl_hours = h; }
+    const mu = parseInt(_rcEl('rc-max-uploads').value, 10); if (Number.isFinite(mu)) p.max_uploads = mu;
+    const mfb = _bytesFromMb(_rcEl('rc-max-file-mb').value); if (mfb) p.max_file_bytes = mfb;
+    const mtb = _bytesFromMb(_rcEl('rc-max-total-mb').value); if (mtb) p.max_total_bytes = mtb;
+    const rd = parseInt(_rcEl('rc-retention-days').value, 10); if (Number.isFinite(rd)) p.retention_days = rd;
+    return p;
+}
+
+async function submitReceiver() {
+    const t = _rcSelectedTag();
+    const err = _rcEl('rc-error'); if (err) err.hidden = true;
+    if (!t) { if (err) { err.textContent = 'Choose a link type first.'; err.hidden = false; } return; }
+    const payload = _rcPayload();
+    if (!payload.max_total_bytes) { if (err) { err.textContent = 'Enter a total upload budget (MB).'; err.hidden = false; } return; }
+    const btn = _rcEl('rc-create'); btn.disabled = true;
+    try {
+        const rec = await apiRequest('/receivers', { method: 'POST', body: JSON.stringify(payload) });
+        const url = window.location.origin + (rec.url_path || ('/u/' + rec.token));
+        state._lastRcUrl = url;
+        _rcEl('rc-form').hidden = true; _rcEl('rc-result').hidden = false;
+        _rcEl('rc-link-value').value = url;
+        btn.hidden = true;
+        if (_rcEl('rc-cancel')) _rcEl('rc-cancel').hidden = true;
+        if (_rcEl('rc-done')) _rcEl('rc-done').hidden = false;
+        loadMyReceivers();
+    } catch (e) {
+        if (err) { err.textContent = (e && e.message) || 'Could not create the upload link.'; err.hidden = false; }
+        btn.disabled = false;
+    }
+}
+
+function copyRcLink() {
+    const inp = _rcEl('rc-link-value');
+    const val = (inp && inp.value) || state._lastRcUrl || '';
+    if (!val) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(val).then(() => showSuccess('Link copied')).catch(() => { if (inp) inp.select(); showError('Copy failed — select the link and copy it.'); });
+    } else if (inp) { inp.select(); try { document.execCommand('copy'); showSuccess('Link copied'); } catch (_) { showError('Copy failed.'); } }
+}
+
+// ---- Admin: receiver-tag manager ----------------------------------------------------------------
+let receiverTagsUIWired = false;
+let receiverTagsCache = [];
+
+function setupReceiverTagsUI() {
+    if (receiverTagsUIWired) return;
+    const add = _rtEl('rt-tag-add-btn'), save = _rtEl('rt-tag-save-btn'), cancel = _rtEl('rt-tag-cancel-btn');
+    if (!add || !save || !cancel) return;
+    add.addEventListener('click', () => openReceiverTagEditor(null));
+    save.addEventListener('click', saveReceiverTag);
+    cancel.addEventListener('click', () => { const ed = _rtEl('rt-tag-editor'); if (ed) ed.style.display = 'none'; });
+    const sw = _rtEl('rt-tag-color-swatches');
+    if (sw) sw.addEventListener('click', (e) => { const b = e.target.closest('.accent-swatch'); if (b) { e.preventDefault(); setReceiverTagColor(b.getAttribute('data-color') || ''); } });
+    const cu = _rtEl('rt-tag-color-custom');
+    if (cu) cu.addEventListener('input', () => setReceiverTagColor(cu.value));
+    const ig = _rtEl('rt-tag-icon-grid');
+    if (ig) ig.addEventListener('click', (e) => { const b = e.target.closest('.icon-choice'); if (b) { e.preventDefault(); setReceiverTagIcon(b.getAttribute('data-icon') || ''); } });
+    const refresh = _rtEl('rc-admin-refresh');
+    if (refresh) refresh.addEventListener('click', loadAdminReceivers);
+    receiverTagsUIWired = true;
+}
+
+async function loadReceiverTags() {
+    try { receiverTagsCache = await apiRequest('/receiver-tags', { silent: true }) || []; }
+    catch (_) { receiverTagsCache = []; }
+    renderReceiverTagsList();
+}
+
+function _rtSecretLabel(tag) {
+    return tag.require_secret === 'password' ? 'password required' : (tag.require_secret === 'pin' ? 'PIN required' : 'no code required');
+}
+
+function renderReceiverTagsList() {
+    const host = _rtEl('rt-tags-list'); if (!host) return;
+    host.replaceChildren();
+    if (!receiverTagsCache.length) { host.appendChild(_el('p', 'text-tertiary text-sm', 'No upload-link tags yet. Add one to let users create upload links.')); return; }
+    receiverTagsCache.slice().sort((a, b) => a.name.localeCompare(b.name)).forEach(tag => {
+        const row = _el('div', 'share-tag-row flex justify-between items-center mb-sm');
+        const left = _el('div');
+        const lead = _el('div', 'nl-tag-idlead');
+        const hex = noteLinkColorHex(tag.border_color);
+        if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; lead.appendChild(dot); }
+        if (tag.icon) lead.appendChild(_svgIcon(tag.icon, 'icon-sm'));
+        lead.appendChild(_el('span', 'font-medium', tag.name + (tag.is_active ? '' : ' (inactive)')));
+        left.appendChild(lead);
+        const ttl = tag.max_ttl_hours ? (tag.max_ttl_hours + 'h max') : 'no expiry';
+        const total = tag.max_total_bytes_cap ? (_mbFromBytes(tag.max_total_bytes_cap) + ' MB max') : 'no total cap';
+        left.appendChild(_el('div', 'text-secondary text-sm', `token ≥ ${tag.min_token_len} · ${_rtSecretLabel(tag)} · ${ttl} · ${total}`));
+        row.appendChild(left);
+        const actions = _el('div', 'flex gap-sm');
+        const edit = _el('button', 'btn btn-ghost btn-sm', 'Edit'); edit.type = 'button';
+        edit.addEventListener('click', () => openReceiverTagEditor(tag));
+        actions.appendChild(edit);
+        if (tag.is_active) { const del = _el('button', 'btn btn-ghost btn-sm', 'Deactivate'); del.type = 'button'; del.addEventListener('click', () => deactivateReceiverTag(tag)); actions.appendChild(del); }
+        row.appendChild(actions); host.appendChild(row);
+    });
+}
+
+function setReceiverTagColor(color) {
+    const hidden = _rtEl('rt-tag-color'); if (hidden) hidden.value = color || '';
+    document.querySelectorAll('#rt-tag-color-swatches .accent-swatch').forEach(s => { s.classList.toggle('selected', (s.getAttribute('data-color') || '') === (color || '')); });
+    const custom = _rtEl('rt-tag-color-custom'); if (custom && color && color.charAt(0) === '#') custom.value = color;
+}
+
+function _rtBuildIconGrid() {
+    const grid = _rtEl('rt-tag-icon-grid'); if (!grid || grid._built) return;
+    grid.replaceChildren();
+    const none = _el('button', 'icon-choice', 'None'); none.type = 'button'; none.setAttribute('data-icon', ''); none.setAttribute('title', 'No icon'); none.style.fontSize = '11px';
+    grid.appendChild(none);
+    _NL_ICON_CHOICES.forEach(name => { const b = _el('button', 'icon-choice'); b.type = 'button'; b.setAttribute('data-icon', name); b.setAttribute('title', name); b.setAttribute('aria-label', name); b.appendChild(_svgIcon(name, 'icon-sm')); grid.appendChild(b); });
+    grid._built = true;
+}
+
+function setReceiverTagIcon(icon) {
+    const hidden = _rtEl('rt-tag-icon'); if (hidden) hidden.value = icon || '';
+    document.querySelectorAll('#rt-tag-icon-grid .icon-choice').forEach(c => { c.classList.toggle('selected', (c.getAttribute('data-icon') || '') === (icon || '')); });
+}
+
+function openReceiverTagEditor(tag) {
+    const ed = _rtEl('rt-tag-editor'); if (!ed) return;
+    const t = tag || {};
+    _rtEl('rt-tag-editor-id').value = t.id || '';
+    _rtEl('rt-tag-editor-title').textContent = tag ? 'Edit tag' : 'Add tag';
+    _rtEl('rt-tag-name').value = t.name || '';
+    _rtEl('rt-tag-description').value = t.description || '';
+    _rtBuildIconGrid();
+    setReceiverTagColor(t.border_color || '');
+    setReceiverTagIcon(t.icon || '');
+    _rtEl('rt-tag-min-token-len').value = t.min_token_len != null ? t.min_token_len : 10;
+    _rtEl('rt-tag-max-ttl').value = t.max_ttl_hours != null ? t.max_ttl_hours : '';
+    _rtEl('rt-tag-default-ttl').value = t.default_ttl_hours != null ? t.default_ttl_hours : '';
+    _rtEl('rt-tag-require-secret').value = t.require_secret || 'none';
+    _rtEl('rt-tag-min-pin-len').value = String(t.min_pin_len || 4);
+    _rtEl('rt-tag-password-min-len').value = t.password_min_len != null ? t.password_min_len : 8;
+    _rtEl('rt-tag-password-alnum').checked = t.password_require_alnum === true;
+    _rtEl('rt-tag-max-uploads').value = t.max_uploads_cap != null ? t.max_uploads_cap : '';
+    _rtEl('rt-tag-max-file-mb').value = _mbFromBytes(t.max_file_bytes_cap);
+    _rtEl('rt-tag-max-total-mb').value = _mbFromBytes(t.max_total_bytes_cap);
+    _rtEl('rt-tag-retention-max').value = t.retention_max_days != null ? t.retention_max_days : '';
+    _rtEl('rt-tag-retention-default').value = t.retention_default_days != null ? t.retention_default_days : '';
+    _rtEl('rt-tag-auto-enroll').checked = tag ? (t.auto_enroll_new_users === true) : true;
+    _rtEl('rt-tag-active').checked = tag ? (t.is_active !== false) : true;
+    const err = _rtEl('rt-tag-editor-error'); if (err) err.style.display = 'none';
+    ed.style.display = '';
+}
+
+function _rtNumOrNull(id) { const v = parseInt((_rtEl(id) || {}).value, 10); return Number.isFinite(v) ? v : null; }
+
+function _rtEditorPayload() {
+    return {
+        name: (_rtEl('rt-tag-name').value || '').trim(),
+        description: (_rtEl('rt-tag-description').value || '').trim() || null,
+        border_color: _rtEl('rt-tag-color').value || null,
+        icon: _rtEl('rt-tag-icon').value || null,
+        min_token_len: _rtNumOrNull('rt-tag-min-token-len') != null ? _rtNumOrNull('rt-tag-min-token-len') : 10,
+        max_ttl_hours: _rtNumOrNull('rt-tag-max-ttl'),
+        default_ttl_hours: _rtNumOrNull('rt-tag-default-ttl'),
+        require_secret: _rtEl('rt-tag-require-secret').value || 'none',
+        min_pin_len: parseInt(_rtEl('rt-tag-min-pin-len').value, 10) || 4,
+        password_min_len: _rtNumOrNull('rt-tag-password-min-len') != null ? _rtNumOrNull('rt-tag-password-min-len') : 8,
+        password_require_alnum: _rtEl('rt-tag-password-alnum').checked,
+        max_uploads_cap: _rtNumOrNull('rt-tag-max-uploads'),
+        max_file_bytes_cap: _bytesFromMb(_rtEl('rt-tag-max-file-mb').value),
+        max_total_bytes_cap: _bytesFromMb(_rtEl('rt-tag-max-total-mb').value),
+        retention_max_days: _rtNumOrNull('rt-tag-retention-max'),
+        retention_default_days: _rtNumOrNull('rt-tag-retention-default'),
+        auto_enroll_new_users: _rtEl('rt-tag-auto-enroll').checked,
+        is_active: _rtEl('rt-tag-active').checked,
+    };
+}
+
+async function saveReceiverTag() {
+    const id = _rtEl('rt-tag-editor-id').value;
+    const err = _rtEl('rt-tag-editor-error');
+    const payload = _rtEditorPayload();
+    if (!payload.name) { if (err) { err.textContent = 'Name is required'; err.style.display = ''; } return; }
+    try {
+        if (id) await apiRequest('/receiver-tags/' + id, { method: 'PATCH', body: JSON.stringify(payload) });
+        else await apiRequest('/receiver-tags', { method: 'POST', body: JSON.stringify(payload) });
+        const ed = _rtEl('rt-tag-editor'); if (ed) ed.style.display = 'none';
+        showSuccess('Upload-link tag saved');
+        await loadReceiverTags();
+    } catch (e) { if (err) { err.textContent = (e && e.message) || 'Could not save the tag'; err.style.display = ''; } }
+}
+
+async function deactivateReceiverTag(tag) {
+    const ok = await showConfirm(`Deactivate upload-link tag "${tag.name}"? New links can't use it; existing links keep their policy.`);
+    if (!ok) return;
+    try { await apiRequest('/receiver-tags/' + tag.id, { method: 'DELETE' }); showSuccess('Tag deactivated'); await loadReceiverTags(); }
+    catch (e) { showError((e && e.message) || 'Could not deactivate the tag'); }
+}
+
+// ---- Admin oversight: all receivers -------------------------------------------------------------
+async function loadAdminReceivers() {
+    const host = _rcEl('rc-admin-links'); const summary = _rcEl('rc-admin-summary');
+    if (!host) return;
+    host.replaceChildren(_el('div', 'spinner'));
+    try {
+        const data = await apiRequest('/admin/receivers', { silent: true });
+        renderAdminReceivers(data || { receivers: [] });
+        if (summary) { const total = (data && data.total) || 0, active = (data && data.active_count) || 0; summary.textContent = total + ' link(s), ' + active + ' active' + (data && data.capped ? ' (showing the newest 1000)' : ''); }
+    } catch (e) { host.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load links: ' + ((e && e.message) || ''))); }
+}
+
+function renderAdminReceivers(data) {
+    const host = _rcEl('rc-admin-links'); if (!host) return;
+    const receivers = (data && data.receivers) || [];
+    if (!receivers.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', 'No upload links exist.')); return; }
+    const table = _el('table', 'data-table');
+    const thead = _el('thead'); const hr = _el('tr');
+    ['Owner', 'Label', 'Type', 'Status', 'Expires', 'Files', 'Budget', ''].forEach(h => hr.appendChild(_el('th', '', h)));
+    thead.appendChild(hr); table.appendChild(thead);
+    const tb = _el('tbody');
+    receivers.forEach(r => {
+        const tr = _el('tr');
+        tr.appendChild(_el('td', '', r.owner || '—'));
+        tr.appendChild(_el('td', '', r.label || '—'));
+        tr.appendChild(_el('td', '', r.tag_name || '—'));
+        tr.appendChild(_el('td', '', _RC_STATUS_LABEL[r.status] || r.status));
+        tr.appendChild(_el('td', '', _rcExpiryText(r)));
+        tr.appendChild(_el('td', '', (r.max_uploads != null) ? ((r.upload_count || 0) + '/' + r.max_uploads) : String(r.upload_count || 0)));
+        tr.appendChild(_el('td', '', r.max_total_bytes != null ? (_mbFromBytes(r.max_total_bytes) + ' MB') : '—'));
+        const actTd = _el('td');
+        if (r.status !== 'revoked') { const rv = _el('button', 'btn btn-ghost btn-sm', 'Revoke'); rv.type = 'button'; rv.addEventListener('click', () => adminRevokeReceiver(r.id)); actTd.appendChild(rv); }
+        tr.appendChild(actTd); tb.appendChild(tr);
+    });
+    table.appendChild(tb); host.replaceChildren(table);
+}
+
+async function adminRevokeReceiver(id) {
+    const ok = await showConfirm('Revoke this upload link? It stops accepting uploads. Received files stay in its vault.');
+    if (!ok) return;
+    try { await apiRequest('/admin/receivers/' + id + '/revoke', { method: 'POST' }); showSuccess('Upload link revoked'); await loadAdminReceivers(); }
+    catch (e) { showError((e && e.message) || 'Could not revoke the upload link'); }
+}
+
+// Wire the receiver create modal once.
+function setupReceiverUI() {
+    if (state._rcWired) return;
+    const createBtn = _rcEl('rc-create'); if (!createBtn) return;
+    state._rcWired = true;
+    createBtn.addEventListener('click', submitReceiver);
+    const nb = _rcEl('receiver-new-btn'); if (nb) nb.addEventListener('click', openReceiverCreate);
+    const tag = _rcEl('rc-tag'); if (tag) tag.addEventListener('change', onRcTagChange);
+    const secret = _rcEl('rc-secret'); if (secret) secret.addEventListener('change', onRcSecretChange);
+    const copy = _rcEl('rc-copy'); if (copy) copy.addEventListener('click', copyRcLink);
+    document.querySelectorAll('[data-rc-close]').forEach(el => el.addEventListener('click', () => closeModal()));
+}
+
 function wireNotesOnce() {
     if (state._notesWired) return;
     state._notesWired = true;
@@ -18548,6 +18984,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     loadShared().catch(err => console.error('Failed to load shared items:', err));
                 } else if (section === 'notes') {
                     loadNotes().catch(err => console.error('Failed to load notes:', err));
+                } else if (section === 'uploadlinks') {
+                    loadMyReceivers().catch(err => console.error('Failed to load upload links:', err));
                 } else if (section === 'temp-creds') {
                     loadTempCreds().catch(err => console.error('Failed to load temp creds:', err));
                 } else if (section === 'users') {
@@ -18648,6 +19086,10 @@ document.addEventListener('DOMContentLoaded', () => {
     setupPublicFileLinkUI();
     const publicLinksBtn = document.getElementById('public-links-btn');
     if (publicLinksBtn) publicLinksBtn.addEventListener('click', openPublicLinksManage);
+
+    // Upload links (receivers): wire the create modal + "New upload link" button at init so a fast click
+    // (before the section's list finishes loading) still opens the modal.
+    setupReceiverUI();
 
     // Create vault button
     const createVaultBtn = document.getElementById('create-vault-btn');

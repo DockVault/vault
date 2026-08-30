@@ -327,6 +327,10 @@
                         <span class="sidebar-icon"><svg class="icon"><use href="#i-file-text"/></svg></span>
                         <span class="sidebar-text">Notes</span>
                     </a>
+                    <a href="#" class="sidebar-item" data-section="uploadlinks" id="nav-uploadlinks" style="display:none;">
+                        <span class="sidebar-icon"><svg class="icon"><use href="#i-upload"/></svg></span>
+                        <span class="sidebar-text">Upload links</span>
+                    </a>
                     <a href="#" class="sidebar-item" data-section="temp-creds">
                         <span class="sidebar-icon"><svg class="icon"><use href="#i-clock"/></svg></span>
                         <span class="sidebar-text">Temp Credentials</span>
@@ -949,6 +953,98 @@
                     </div>
                 </div>
 
+                <!-- Upload links (receivers): links that let anyone send YOU files into a dedicated vault. -->
+                <div id="uploadlinks-section" class="content-section">
+                    <div class="flex justify-between items-center mb-lg">
+                        <h2 class="text-2xl font-bold">Upload links</h2>
+                        <button id="receiver-new-btn" class="btn btn-primary btn-sm" type="button"><svg class="icon icon-sm"><use href="#i-plus"/></svg> New upload link</button>
+                    </div>
+                    <p class="text-secondary text-sm mb-md">An upload link lets anyone you share it with send files to you — no account needed. Each link drops uploads into its own dedicated vault that only you can open. Pause a link to stop new uploads without losing what's already in it; revoke it to close it for good.</p>
+                    <div id="receivers-list" style="overflow-x:auto;"></div>
+                </div>
+
+                <!-- Create an upload link (receiver). -->
+                <div id="receiver-create-modal" class="modal" role="dialog" aria-modal="true">
+                    <div class="modal-overlay" data-rc-close></div>
+                    <div class="modal-content" style="max-width: 560px;">
+                        <div class="modal-header">
+                            <h3 class="text-xl font-bold">Create an upload link</h3>
+                            <button class="modal-close" type="button" data-rc-close aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <div id="rc-form">
+                                <p class="text-secondary mb-sm">Anyone with this link can upload files into a new vault only you can open. You can make a link stricter than its type allows, never looser.</p>
+                                <div class="form-group">
+                                    <label for="rc-tag">Link type</label>
+                                    <select id="rc-tag" class="form-control"></select>
+                                    <small id="rc-tag-floor" class="form-help"></small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="rc-label">Label (only you see this)</label>
+                                    <input type="text" id="rc-label" class="form-control" maxlength="120" placeholder="e.g. Contract from Acme">
+                                </div>
+                                <div class="form-group">
+                                    <label for="rc-token-len">Link length (characters)</label>
+                                    <input type="number" id="rc-token-len" class="form-control" min="6" max="64" style="max-width:160px;">
+                                </div>
+                                <div class="form-group">
+                                    <label for="rc-secret">Protect with</label>
+                                    <select id="rc-secret" class="form-control" style="max-width:200px;">
+                                        <option value="none">No code</option>
+                                        <option value="pin">PIN</option>
+                                        <option value="password">Password</option>
+                                    </select>
+                                </div>
+                                <div class="form-group" id="rc-pin-group" hidden>
+                                    <label for="rc-pin">PIN</label>
+                                    <select id="rc-pin-len" class="form-control" style="max-width:140px;"></select>
+                                    <input type="text" id="rc-pin" class="form-control" inputmode="numeric" autocomplete="off" placeholder="digits only" style="margin-top:.4rem; max-width:200px;">
+                                </div>
+                                <div class="form-group" id="rc-password-group" hidden>
+                                    <label for="rc-password">Password</label>
+                                    <input type="password" id="rc-password" class="form-control" autocomplete="new-password" style="max-width:280px;">
+                                    <small id="rc-password-help" class="form-help"></small>
+                                </div>
+                                <div class="form-group" id="rc-expiry-group">
+                                    <label for="rc-ttl">Expires in (hours)</label>
+                                    <input type="number" id="rc-ttl" class="form-control" min="1" style="max-width:160px;">
+                                    <label class="checkbox-label" id="rc-never-group" style="margin-top:.35rem;">
+                                        <input type="checkbox" id="rc-never"><span>Never expires</span>
+                                    </label>
+                                </div>
+                                <div class="flex gap-sm">
+                                    <div class="form-group"><label for="rc-max-uploads">Maximum files</label>
+                                        <input type="number" id="rc-max-uploads" class="form-control" min="1" placeholder="unlimited" style="max-width:150px;"></div>
+                                    <div class="form-group"><label for="rc-max-file-mb">Max size per file (MB)</label>
+                                        <input type="number" id="rc-max-file-mb" class="form-control" min="1" style="max-width:150px;"></div>
+                                </div>
+                                <div class="form-group">
+                                    <label for="rc-max-total-mb">Total upload budget (MB)</label>
+                                    <input type="number" id="rc-max-total-mb" class="form-control" min="1" style="max-width:160px;">
+                                    <small class="form-help">The link stops accepting uploads once this much has been received. Required.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="rc-retention-days">Delete uploads after (days)</label>
+                                    <input type="number" id="rc-retention-days" class="form-control" min="1" placeholder="keep" style="max-width:160px;">
+                                </div>
+                                <p id="rc-error" class="text-sm" style="color:var(--danger,#dc2626);" hidden></p>
+                            </div>
+                            <div id="rc-result" hidden>
+                                <p class="text-secondary mb-sm">Your upload link is ready — copy it now.</p>
+                                <div class="form-group">
+                                    <input type="text" id="rc-link-value" class="form-control" readonly>
+                                </div>
+                                <button type="button" class="btn btn-secondary btn-sm" id="rc-copy">Copy link</button>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button id="rc-cancel" class="btn btn-ghost" type="button" data-rc-close>Cancel</button>
+                            <button id="rc-create" class="btn btn-primary" type="button">Create link</button>
+                            <button id="rc-done" class="btn btn-primary" type="button" data-rc-close hidden>Done</button>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Note create/edit modal -->
                 <div id="note-editor-modal" class="modal" role="dialog" aria-modal="true">
                     <div class="modal-overlay" data-note-close></div>
@@ -1431,6 +1527,7 @@
                         <button class="tab-btn" data-tab="sftp">SFTP &amp; Encryption</button>
                         <button class="tab-btn" data-tab="sharing">Sharing</button>
                         <button class="tab-btn" data-tab="notelinks">Public Links</button>
+                        <button class="tab-btn" data-tab="uploadlinks">Upload Links</button>
                         <button class="tab-btn" data-tab="accounts">Accounts &amp; Access</button>
                         <button class="tab-btn" data-tab="logs">Log access</button>
                         <button class="tab-btn" data-tab="audit">Audit Log</button>
@@ -2458,6 +2555,136 @@
                                 <p class="text-secondary text-sm mb-md">Every public file/folder link across all users. Revoke any link (or all active links at once) without turning the whole feature off.</p>
                                 <div id="pfl-admin-summary" class="text-secondary text-sm mb-sm"></div>
                                 <div id="pfl-admin-links" style="overflow-x:auto;"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Upload Links Tab: receivers (anonymous inbound uploads into a dedicated vault). -->
+                    <div id="settings-tab-uploadlinks" class="settings-tab-content">
+                        <div class="card">
+                            <div class="card-header"><h3>Upload links</h3></div>
+                            <div class="p-lg">
+                                <label class="flex items-center gap-sm">
+                                    <input type="checkbox" id="setting-public-receivers-enabled">
+                                    <span>Allow users to create upload links</span>
+                                </label>
+                                <p class="text-secondary text-sm mt-sm">When enabled, a user can create a link that lets anyone (no sign-in) upload files into a new, dedicated vault that only that user can open. Links are governed by the tags below. Turning this off immediately <strong>pauses</strong> every upload link (they stop accepting uploads) without deleting anything; revoke a link under "All upload links" below to close it permanently.</p>
+                                <div class="form-group mt-md" style="max-width:280px;">
+                                    <label for="setting-public-receiver-user-cap">Maximum active links per user</label>
+                                    <input type="number" id="setting-public-receiver-user-cap" class="form-control" min="1" max="10000" step="1">
+                                    <p class="text-secondary text-sm mt-sm">An anti-abuse cap on how many active upload links one user may hold.</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header flex justify-between items-center">
+                                <h3>Upload-link tags</h3>
+                                <button type="button" id="rt-tag-add-btn" class="btn btn-secondary">Add tag</button>
+                            </div>
+                            <div class="p-lg">
+                                <p class="text-secondary text-sm mb-md">A tag is a security <strong>floor</strong> for an upload link (link length, expiry, whether a password/PIN is required, how many files, size limits, retention). A user creating a link may only make it <em>stronger</em> than its tag, never weaker. Deactivating a tag stops new links under it; existing links keep their policy.</p>
+                                <div id="rt-tags-list"></div>
+
+                                <div id="rt-tag-editor" class="card mt-lg" style="display:none;">
+                                    <div class="card-header"><h4 id="rt-tag-editor-title">Add tag</h4></div>
+                                    <div class="p-lg">
+                                        <input type="hidden" id="rt-tag-editor-id">
+                                        <div class="form-group">
+                                            <label for="rt-tag-name">Name</label>
+                                            <input type="text" id="rt-tag-name" class="form-control" maxlength="120" placeholder="e.g. Intake">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="rt-tag-description">Description</label>
+                                            <input type="text" id="rt-tag-description" class="form-control" placeholder="Optional">
+                                        </div>
+                                        <div class="form-group">
+                                            <label>Tile colour</label>
+                                            <input type="hidden" id="rt-tag-color" value="">
+                                            <div class="accent-swatches" id="rt-tag-color-swatches">
+                                                <button type="button" class="accent-swatch" data-color="" style="background:var(--surface-4)" title="None" aria-label="No colour"></button>
+                                                <button type="button" class="accent-swatch" data-color="green" style="background:#16a34a" title="Green" aria-label="Green"></button>
+                                                <button type="button" class="accent-swatch" data-color="teal" style="background:#0d9488" title="Teal" aria-label="Teal"></button>
+                                                <button type="button" class="accent-swatch" data-color="sky" style="background:#0284c7" title="Sky" aria-label="Sky"></button>
+                                                <button type="button" class="accent-swatch" data-color="indigo" style="background:#4f46e5" title="Indigo" aria-label="Indigo"></button>
+                                                <button type="button" class="accent-swatch" data-color="violet" style="background:#7c3aed" title="Violet" aria-label="Violet"></button>
+                                                <button type="button" class="accent-swatch" data-color="amber" style="background:#d97706" title="Amber" aria-label="Amber"></button>
+                                                <button type="button" class="accent-swatch" data-color="rose" style="background:#e11d48" title="Rose" aria-label="Rose"></button>
+                                                <button type="button" class="accent-swatch" data-color="red" style="background:#dc2626" title="Red" aria-label="Red"></button>
+                                                <input type="color" id="rt-tag-color-custom" class="color-custom" value="#0d9488" title="Custom colour" aria-label="Custom colour">
+                                            </div>
+                                        </div>
+                                        <div class="form-group">
+                                            <label>Icon</label>
+                                            <input type="hidden" id="rt-tag-icon" value="">
+                                            <div class="icon-grid" id="rt-tag-icon-grid"></div>
+                                        </div>
+                                        <div class="form-group mt-md">
+                                            <label for="rt-tag-min-token-len">Minimum link length (characters, ≥ 6)</label>
+                                            <input type="number" id="rt-tag-min-token-len" class="form-control" min="6" max="64" step="1" style="max-width:160px;">
+                                        </div>
+                                        <div class="form-group mt-md">
+                                            <label>Expiry (hours, blank = none)</label>
+                                            <div class="flex gap-sm">
+                                                <div><label class="text-sm text-secondary" for="rt-tag-max-ttl">Maximum</label><input type="number" id="rt-tag-max-ttl" class="form-control" min="1" style="max-width:160px;"></div>
+                                                <div><label class="text-sm text-secondary" for="rt-tag-default-ttl">Default</label><input type="number" id="rt-tag-default-ttl" class="form-control" min="1" style="max-width:160px;"></div>
+                                            </div>
+                                        </div>
+                                        <div class="form-group mt-md">
+                                            <label for="rt-tag-require-secret">Password / PIN requirement</label>
+                                            <select id="rt-tag-require-secret" class="form-control" style="max-width:220px;">
+                                                <option value="none">None (user may add one)</option>
+                                                <option value="pin">Require a PIN</option>
+                                                <option value="password">Require a password</option>
+                                            </select>
+                                            <div class="flex gap-sm mt-sm">
+                                                <div><label class="text-sm text-secondary" for="rt-tag-min-pin-len">PIN length</label>
+                                                    <select id="rt-tag-min-pin-len" class="form-control" style="max-width:120px;">
+                                                        <option value="4">4</option><option value="6">6</option><option value="8">8</option>
+                                                    </select>
+                                                </div>
+                                                <div><label class="text-sm text-secondary" for="rt-tag-password-min-len">Password min length</label><input type="number" id="rt-tag-password-min-len" class="form-control" min="1" max="256" style="max-width:140px;"></div>
+                                            </div>
+                                            <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="rt-tag-password-alnum"><span>Password must mix letters &amp; numbers</span></label>
+                                        </div>
+                                        <div class="form-group mt-md">
+                                            <label>Upload limits (blank = unlimited)</label>
+                                            <div class="flex gap-sm">
+                                                <div><label class="text-sm text-secondary" for="rt-tag-max-uploads">Max files</label><input type="number" id="rt-tag-max-uploads" class="form-control" min="1" style="max-width:140px;"></div>
+                                                <div><label class="text-sm text-secondary" for="rt-tag-max-file-mb">Max file (MB)</label><input type="number" id="rt-tag-max-file-mb" class="form-control" min="1" style="max-width:140px;"></div>
+                                                <div><label class="text-sm text-secondary" for="rt-tag-max-total-mb">Max total (MB)</label><input type="number" id="rt-tag-max-total-mb" class="form-control" min="1" style="max-width:140px;"></div>
+                                            </div>
+                                        </div>
+                                        <div class="form-group mt-md">
+                                            <label>Retention (days, blank = keep)</label>
+                                            <div class="flex gap-sm">
+                                                <div><label class="text-sm text-secondary" for="rt-tag-retention-max">Maximum</label><input type="number" id="rt-tag-retention-max" class="form-control" min="1" style="max-width:140px;"></div>
+                                                <div><label class="text-sm text-secondary" for="rt-tag-retention-default">Default</label><input type="number" id="rt-tag-retention-default" class="form-control" min="1" style="max-width:140px;"></div>
+                                            </div>
+                                        </div>
+                                        <div class="form-group mt-md">
+                                            <label class="flex items-center gap-sm"><input type="checkbox" id="rt-tag-auto-enroll"><span>Everyone may create links with this tag</span></label>
+                                            <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="rt-tag-active"><span>Active</span></label>
+                                        </div>
+                                        <div id="rt-tag-editor-error" class="alert alert-error" style="display:none;"></div>
+                                        <div class="flex gap-sm mt-md">
+                                            <button type="button" id="rt-tag-save-btn" class="btn btn-primary">Save tag</button>
+                                            <button type="button" id="rt-tag-cancel-btn" class="btn btn-secondary">Cancel</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header flex justify-between items-center">
+                                <h3>All upload links</h3>
+                                <button type="button" id="rc-admin-refresh" class="btn btn-secondary btn-sm">Refresh</button>
+                            </div>
+                            <div class="p-lg">
+                                <p class="text-secondary text-sm mb-md">Every upload link across all users. Revoke any link to close it (the received files stay in its vault).</p>
+                                <div id="rc-admin-summary" class="text-secondary text-sm mb-sm"></div>
+                                <div id="rc-admin-links" style="overflow-x:auto;"></div>
                             </div>
                         </div>
                     </div>
