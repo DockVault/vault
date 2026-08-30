@@ -45,9 +45,14 @@ def test_admin_mfa_policy_and_action_matrix(page: Page, admin):
         item.click()
         page.click('.tab-btn[data-tab="security"]')
         expect(page.locator("#setting-mfa-mode")).to_be_visible(timeout=10000)
+        # loadSettings populates the policy select then fetches the matrix asynchronously; wait for the
+        # matrix rows so loadSettings has fully run before we set the select — otherwise a late load can
+        # overwrite our choice back to the stored value and the save persists the wrong mode.
+        expect(page.get_by_label("Require OTP for Delete a vault")).to_be_visible(timeout=10000)
 
         # Change the requirement to 'required' and save -> step-up -> persisted.
         page.select_option("#setting-mfa-mode", "required")
+        expect(page.locator("#setting-mfa-mode")).to_have_value("required")
         page.click("#save-mfa-policy-btn")
         _stepup_with_recovery(page, codes.pop(0))
         expect(page.locator("#mfa-policy-msg")).to_contain_text("saved", timeout=10000)
