@@ -9323,7 +9323,19 @@ async def redeem_public_link(
             _audit("failure", reason="not_available", link_id=link.id)
             raise HTTPException(status_code=404, detail="This link is not available.")
 
-    # (2) Atomically consume one use under a WHERE guard so max-uses/expiry/revoke can't be raced.
+    # Mint the single-use download grant BEFORE consuming a use, so a Redis outage (→ 503) can never
+    # burn a use: nothing is consumed until the grant is safely stored. Fail-closed — a grant that
+    # cannot be stored is never handed out.
+    try:
+        grant = _publiclink_issue_grant(link.id, client_ip)
+    except RuntimeError:
+        _audit("failure", reason="grant_store_unavailable", link_id=link.id)
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+
+    # (2) Atomically consume one use under a WHERE guard so max-uses/expiry/revoke can't be raced. If
+    # this loses the race (the link was exhausted/revoked/expired concurrently) the freshly minted
+    # grant is simply orphaned — it is bound to THIS link, which the download path re-checks as active,
+    # and it expires on its own 60s TTL.
     stmt = (_sa_update(PublicLink)
             .where(PublicLink.id == link.id, PublicLink.revoked.is_(False),
                    _or(PublicLink.max_uses.is_(None), PublicLink.use_count < PublicLink.max_uses),
@@ -9334,14 +9346,6 @@ async def redeem_public_link(
     if res.rowcount == 0:
         _audit("failure", reason="not_available", link_id=link.id)
         raise HTTPException(status_code=404, detail="This link is not available.")
-
-    # Mint the single-use download grant (fail-closed: Redis down → 503, nothing minted, use already
-    # consumed but the link stays usable on retry once Redis is back).
-    try:
-        grant = _publiclink_issue_grant(link.id, client_ip)
-    except RuntimeError:
-        _audit("failure", reason="grant_store_unavailable", link_id=link.id)
-        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
 
     _audit("success", link_id=link.id)
     if link.target_type == "file":
@@ -9373,13 +9377,28 @@ async def download_public_link(
     still holds READ, target present + not password-protected), plus the requested file_id must lie
     inside the link's target subtree (id_scope). Any failure is the uniform 404. No principal is
     synthesised: the blob is opened directly once every gate passes."""
+    import time as _t
     from app.core.id_scope import id_in_scope
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
 
     client_ip = get_client_ip(request)
     if not token or len(token) > _PUBLINK_TOKEN_MAX_INPUT:
         raise HTTPException(status_code=404, detail="This file is not available.")
     if not x_download_grant:
         raise HTTPException(status_code=404, detail="This file is not available.")
+
+    # Per-IP rate limit (fail-closed): this is an anonymous endpoint that does DB work before it can
+    # reject a bad grant, so bound how fast one address can probe it. Generous, like the redeem per-IP
+    # bucket — a real folder download of many files stays well under it.
+    try:
+        allowed_ip, _, reset_ip = _rl.check_rate_limit(
+            identifier=client_ip, limit=_PUBLINK_REDEEM_IP_LIMIT,
+            window=_PUBLINK_REDEEM_IP_WINDOW, prefix="publiclink_download_ip", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+    if not allowed_ip:
+        raise HTTPException(status_code=429, detail="Too many requests.",
+                            headers={"Retry-After": str(max(1, reset_ip - int(_t.time())))})
 
     def _deny():
         raise HTTPException(status_code=404, detail="This file is not available.")
