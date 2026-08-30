@@ -7,9 +7,10 @@ def test_matrix_seeded_and_read(admin):
     r = admin.get("/second-factor/actions")
     assert r.status_code == 200, r.text
     actions = {a["key"]: a for a in r.json()["actions"]}
-    # the catalog is seeded; routes that don't exist yet are absent (they'd trip the boot contract)
+    # the catalog is seeded in catalog order; every guarded route is present (receiver.create is the
+    # built POST /receivers step-up route).
     assert "login" in actions and "admin.user.manage" in actions and "vault.delete" in actions
-    assert "receiver.create" not in actions
+    assert "receiver.create" in actions
     # Owner's model B: a fresh deploy forces MFA on NO ONE -- require_otp ships ON only for login +
     # manage-2FA (both never lock anyone out); admin management + every other action ship OFF (opt-in).
     assert actions["login"]["require_otp"] is True and actions["account.second_factor"]["require_otp"] is True
