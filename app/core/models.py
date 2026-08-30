@@ -1379,6 +1379,10 @@ class NoteLinkTag(Base):
     password_require_alnum = Column(Boolean, nullable=False, default=False)
     # Max redemptions cap. NULL = unlimited (within the tag).
     max_uses_cap = Column(Integer, nullable=True)
+    # The target kinds a link under this tag may expose: any subset of ('note','file','folder').
+    # Default ['note'] so a tag NEVER silently permits file/folder exposure — an admin opts a tag
+    # into files explicitly. On upgrade every existing tag is backfilled to ['note'] (boot DDL).
+    allowed_targets = Column(JSON, nullable=False, default=lambda: ["note"])
 
     # --- Create-allowlist (LIVE; who may create a public link with this tag) — mirrors ShareTag ---
     allowed_department_ids = Column(JSON, nullable=False, default=list)
