@@ -7108,7 +7108,7 @@ function setupSettingsTabs() {
             }
             if (tabId === 'logs') { loadLogSettings(); }  // refresh on tab open
             if (tabId === 'sharing') { setupShareTagsUI(); loadShareTags(); }  // wire (idempotent) + refresh
-            if (tabId === 'notelinks') { setupNoteLinkTagsUI(); loadNoteLinkTags(); loadAdminNoteLinks(); }  // wire + refresh
+            if (tabId === 'notelinks') { setupNoteLinkTagsUI(); loadNoteLinkTags(); loadAdminNoteLinks(); setupPublicFileLinkUI(); loadAdminPublicLinks(); }  // wire + refresh (note + file links share this tab)
             if (tabId === 'accounts') { setupAccountsPolicyUI(); refreshAccountsPolicyUI(); }  // wire + reflect deps
             if (tabId === 'email') { loadEmailProfiles(); loadEmailTemplates(); loadEmailActions(); }  // refresh profiles + templates + actions on tab open
         });
@@ -8210,6 +8210,8 @@ async function loadSettings() {
         if (nlEn) nlEn.checked = settings.public_note_links_enabled === true;
         const nlCap = document.getElementById('setting-public-note-link-user-cap');
         if (nlCap) nlCap.value = settings.public_note_link_user_cap != null ? settings.public_note_link_user_cap : 50;
+        const pflEn = document.getElementById('setting-public-file-links-enabled');
+        if (pflEn) pflEn.checked = settings.public_file_links_enabled === true;
         const nMax = document.getElementById('setting-note-max-chars');
         if (nMax) nMax.value = settings.note_max_chars != null ? settings.note_max_chars : 100000;
         setupNoteLinkTagsUI();
@@ -8317,6 +8319,8 @@ async function saveAllSettings() {
         if (nlEnEl) settings.public_note_links_enabled = nlEnEl.checked;
         const nlCapEl = document.getElementById('setting-public-note-link-user-cap');
         if (nlCapEl && nlCapEl.value !== '') settings.public_note_link_user_cap = parseInt(nlCapEl.value, 10);
+        const pflEnEl = document.getElementById('setting-public-file-links-enabled');
+        if (pflEnEl) settings.public_file_links_enabled = pflEnEl.checked;
         const nMaxEl = document.getElementById('setting-note-max-chars');
         if (nMaxEl && nMaxEl.value !== '') settings.note_max_chars = parseInt(nMaxEl.value, 10);
 
@@ -10327,6 +10331,10 @@ async function openVault(vaultId) {
             }
         }
 
+        // Whether public file/folder links are available (feature on + a tag permits them), so the
+        // file rows can show/hide the "Public link" action on first render. Best-effort; never blocks.
+        await refreshPublicFileLinkAvailability();
+
         // Load vault files — this validates the password. If it fails (wrong /
         // changed password), do NOT show the vault view.
         const loaded = await loadVaultFiles();
@@ -10739,6 +10747,7 @@ function fileActionButtons(item, canWrite, opts) {
         if (canStructure) cluster.push(btn('copy-folder', 'copy', 'Copy'));
         if (canStructure) cluster.push(btn('move-folder', 'move', 'Move'));
         if (canDelete) cluster.push(btn('delete-folder', 'trash', 'Delete', true));
+        if (state._pflEnabled && vaultShareable()) cluster.push(btn('publiclink-folder', 'globe', 'Public link'));
         if (vaultShareable()) trailing.push(btn('share-folder', 'link', 'Share'));
     } else {
         const canDownload = vaultCapAllowed('file.download');
@@ -10749,6 +10758,7 @@ function fileActionButtons(item, canWrite, opts) {
         if (canDownload) cluster.push(btn('copy-file', 'copy', 'Copy'));
         if (canDelete) cluster.push(btn('move-file', 'move', 'Move'));
         if (canDelete) cluster.push(btn('delete-file', 'trash', 'Delete', true));
+        if (state._pflEnabled && vaultShareable()) cluster.push(btn('publiclink-file', 'globe', 'Public link'));
         if (vaultShareable()) trailing.push(btn('share-file', 'link', 'Share'));
         // Download last so it renders on the far RIGHT of the action row (grid + table).
         if (canDownload) trailing.push(btn('download', 'download', 'Download'));
@@ -10842,6 +10852,7 @@ function runFileAction(action, id, name) {
     else if (action === 'rename-file' || action === 'rename-folder') renameVaultItem(id, name, action === 'rename-folder' ? 'folder' : 'file');
     else if (action === 'delete-file' || action === 'delete-folder') deleteVaultItem(id, name, action === 'delete-folder' ? 'folder' : 'file');
     else if (action === 'share-file' || action === 'share-folder') openCreateShareModal(action === 'share-folder' ? 'folder' : 'file', id, name);
+    else if (action === 'publiclink-file' || action === 'publiclink-folder') openPublicFileLink((state.currentVault || {}).id, action === 'publiclink-folder' ? 'folder' : 'file', id, name);
     else if (action === 'file-info') openFileInfo(id, name);
     else if (action === 'copy-sha256') copyFileHash(id, name);
     else if (action === 'copy-file' || action === 'move-file') stageForMoveCopy(id, name, 'file', action === 'move-file' ? 'move' : 'copy');
@@ -10903,6 +10914,7 @@ function openContextMenu(item, x, y) {
         if (canWrite && vaultCapAllowed('folder.create')) add(clipHas ? 'Add to copy list' : 'Copy', 'copy', 'copy-folder');
         if (canWrite && vaultCapAllowed('folder.create')) add(clipHas ? 'Add to move list' : 'Move', 'move', 'move-folder');
         if (vaultShareable()) add('Share', 'link', 'share-folder');
+        if (state._pflEnabled && vaultShareable()) add('Public link', 'globe', 'publiclink-folder');
         if (canWrite && vaultCapAllowed('folder.delete')) add('Delete', 'trash', 'delete-folder', true);
     } else {
         const canDownload = vaultCapAllowed('file.download');
@@ -10911,6 +10923,7 @@ function openContextMenu(item, x, y) {
         if (canDownload) add(clipHas ? 'Add to copy list' : 'Copy', 'copy', 'copy-file');
         if (canWrite && vaultCapAllowed('file.delete')) add(clipHas ? 'Add to move list' : 'Move', 'move', 'move-file');
         if (vaultShareable()) add('Share', 'link', 'share-file');
+        if (state._pflEnabled && vaultShareable()) add('Public link', 'globe', 'publiclink-file');
         if (canDownload) add('Download', 'download', 'download');
         if (vaultCapAllowed('vault.see_files')) add('File info', 'info', 'file-info');
         // The hash is content-derived, so only offer "Copy SHA-256" to a principal who can download
@@ -14093,6 +14106,9 @@ function applyVaultViewPermissions(isOwner, canWrite, canManage) {
     // Share is only for Standard, non-password vaults (the backend refuses zero-knowledge + password-
     // protected); hide the affordance otherwise so it isn't a dead-end.
     show(document.getElementById('share-vault-btn'), vaultShareable());
+    // "Public links" (manage my public file/folder links) shows when the feature is available. The
+    // list itself is account-wide; the button just lives on the vault toolbar for discoverability.
+    show(document.getElementById('public-links-btn'), !!state._pflEnabled && vaultShareable());
     // Permissions is open to the owner AND managers (delegated administration);
     // Settings stays owner-only (rename/password/rotate/delete). Don't show dead tabs.
     // Gate on see_permissions specifically — the tab's initial GET /permissions is
@@ -17017,8 +17033,10 @@ function renderNoteLinkTagsList() {
         left.appendChild(lead);
         const ttl = tag.max_ttl_hours ? (tag.max_ttl_hours + 'h max') : 'no expiry';
         const uses = tag.max_uses_cap ? (tag.max_uses_cap + ' views') : 'unlimited views';
+        const tgts = (Array.isArray(tag.allowed_targets) && tag.allowed_targets.length ? tag.allowed_targets : ['note'])
+            .map(k => k === 'note' ? 'notes' : (k + 's')).join(', ');
         left.appendChild(_el('div', 'text-secondary text-sm',
-            `token ≥ ${tag.min_token_len} · ${_nlSecretLabel(tag)} · ${ttl} · ${uses}`));
+            `${tgts} · token ≥ ${tag.min_token_len} · ${_nlSecretLabel(tag)} · ${ttl} · ${uses}`));
         row.appendChild(left);
         const actions = _el('div', 'flex gap-sm');
         const edit = _el('button', 'btn btn-ghost btn-sm', 'Edit'); edit.type = 'button';
@@ -17055,6 +17073,11 @@ function openNoteLinkTagEditor(tag) {
     _nlEl('nl-tag-max-uses').value = t.max_uses_cap != null ? t.max_uses_cap : '';
     _nlEl('nl-tag-auto-enroll').checked = tag ? (t.auto_enroll_new_users === true) : true;
     _nlEl('nl-tag-active').checked = tag ? (t.is_active !== false) : true;
+    // What this tag can link to (notes / files / folders). A new tag defaults to notes only.
+    const targets = Array.isArray(t.allowed_targets) && t.allowed_targets.length ? t.allowed_targets : ['note'];
+    _nlEl('nl-tag-target-note').checked = targets.indexOf('note') !== -1;
+    _nlEl('nl-tag-target-file').checked = targets.indexOf('file') !== -1;
+    _nlEl('nl-tag-target-folder').checked = targets.indexOf('folder') !== -1;
     const err = _nlEl('nl-tag-editor-error'); if (err) err.style.display = 'none';
     ed.style.display = '';
 }
@@ -17075,6 +17098,9 @@ function _nlEditorPayload() {
         max_uses_cap: _nlNumOrNull('nl-tag-max-uses'),
         auto_enroll_new_users: _nlEl('nl-tag-auto-enroll').checked,
         is_active: _nlEl('nl-tag-active').checked,
+        allowed_targets: ['note', 'file', 'folder'].filter(k => {
+            const el = _nlEl('nl-tag-target-' + k); return el && el.checked;
+        }),
     };
 }
 
@@ -17083,6 +17109,7 @@ async function saveNoteLinkTag() {
     const err = _nlEl('nl-tag-editor-error');
     const payload = _nlEditorPayload();
     if (!payload.name) { if (err) { err.textContent = 'Name is required'; err.style.display = ''; } return; }
+    if (!payload.allowed_targets.length) { if (err) { err.textContent = 'Choose at least one thing this tag can link to (notes, files or folders).'; err.style.display = ''; } return; }
     try {
         if (id) await apiRequest('/note-link-tags/' + id, { method: 'PATCH', body: JSON.stringify(payload) });
         else await apiRequest('/note-link-tags', { method: 'POST', body: JSON.stringify(payload) });
@@ -17743,6 +17770,313 @@ function copyNotePublicLink() {
     }
 }
 
+// ================= Public FILE / FOLDER links (mirrors the note public-link flow) ==================
+// A public link serves the LIVE file/folder (not a snapshot) to anyone with the link. The create modal
+// enforces the tag floor client-side (the server re-enforces). All text via textContent (XSS-safe).
+function _pflEl(id) { return document.getElementById(id); }
+const _PFL_STATUS_LABEL = { active: 'Active', revoked: 'Revoked', expired: 'Expired', exhausted: 'Used up', paused: 'Paused' };
+const _PFL_SECRET_STRENGTH = { none: 0, pin: 1, password: 2 };
+
+// Whether public file links are available to this user right now (feature on + at least one tag that
+// permits file/folder links). Cached from /public-link-policy so the file-browser buttons can gate
+// without a fetch per render. Refreshed when a vault is opened.
+async function refreshPublicFileLinkAvailability() {
+    try {
+        const p = await apiRequest('/public-link-policy', { silent: true });
+        state._pflPolicy = p || { enabled: false, tags: [] };
+    } catch (_) { state._pflPolicy = { enabled: false, tags: [] }; }
+    const tags = (state._pflPolicy.tags || []);
+    state._pflEnabled = !!state._pflPolicy.enabled
+        && tags.some(t => (t.targets || []).length > 0);
+    return state._pflEnabled;
+}
+
+function _pflTagsForTarget(targetType) {
+    const tags = ((state._pflPolicy || {}).tags) || [];
+    return tags.filter(t => (t.targets || []).indexOf(targetType) !== -1);
+}
+
+async function openPublicFileLink(vaultId, targetType, targetId, targetName) {
+    if (!vaultId || !targetId) { showError('Open the item first.'); return; }
+    state._pflTarget = { vaultId, targetType, targetId, targetName: targetName || 'this item' };
+    if (!state._pflPolicy) { await refreshPublicFileLinkAvailability(); }
+    const nameEl = _pflEl('pfl-target-name'); if (nameEl) nameEl.textContent = state._pflTarget.targetName;
+    _pflEl('pfl-form').hidden = false;
+    _pflEl('pfl-result').hidden = true;
+    _pflEl('pfl-create').hidden = false;
+    if (_pflEl('pfl-cancel')) _pflEl('pfl-cancel').hidden = false;
+    if (_pflEl('pfl-done')) _pflEl('pfl-done').hidden = true;
+    const err = _pflEl('pfl-error'); if (err) err.hidden = true;
+    const sel = _pflEl('pfl-tag');
+    sel.replaceChildren();
+    const tags = _pflTagsForTarget(targetType);
+    const enabled = !!(state._pflPolicy && state._pflPolicy.enabled);
+    if (!tags.length) {
+        const o = _el('option', '', enabled ? ('No link types allow ' + targetType + ' links') : 'Public file links are turned off');
+        o.value = ''; sel.appendChild(o);
+        _pflEl('pfl-create').disabled = true;
+    } else {
+        _pflEl('pfl-create').disabled = false;
+        tags.forEach(t => { const o = _el('option', '', t.name); o.value = t.id; sel.appendChild(o); });
+    }
+    openModal('public-file-link-modal');
+    onPflTagChange();
+}
+
+function _pflSelectedTag() {
+    const sel = _pflEl('pfl-tag');
+    const id = sel ? sel.value : '';
+    return _pflTagsForTarget((state._pflTarget || {}).targetType || 'file').find(t => t.id === id) || null;
+}
+
+function _pflSecretPhrase(kind) { return kind === 'password' ? 'a password' : (kind === 'pin' ? 'a PIN' : 'no code'); }
+
+function onPflTagChange() {
+    const t = _pflSelectedTag();
+    const floor = _pflEl('pfl-tag-floor');
+    if (!t) { if (floor) floor.textContent = ''; return; }
+    const ttlTxt = t.max_ttl_hours ? ('expires within ' + t.max_ttl_hours + 'h') : 'no expiry required';
+    const useTxt = t.max_uses_cap ? ('up to ' + t.max_uses_cap + ' download(s)') : 'unlimited downloads';
+    if (floor) floor.textContent = 'This type requires at least: a ' + t.min_token_len + '-char link, '
+        + _pflSecretPhrase(t.require_secret) + ', ' + ttlTxt + ', ' + useTxt + '. You can only make it stricter.';
+    const tok = _pflEl('pfl-token-len'); tok.min = t.min_token_len; tok.value = t.min_token_len;
+    const secret = _pflEl('pfl-secret');
+    Array.from(secret.options).forEach(o => {
+        o.disabled = (_PFL_SECRET_STRENGTH[o.value] || 0) < (_PFL_SECRET_STRENGTH[t.require_secret] || 0);
+    });
+    secret.value = t.require_secret;
+    onPflSecretChange();
+    const pinLen = _pflEl('pfl-pin-len'); pinLen.replaceChildren();
+    [4, 6, 8].filter(n => n >= (t.min_pin_len || 4)).forEach(n => {
+        const o = _el('option', '', n + ' digits'); o.value = String(n); pinLen.appendChild(o);
+    });
+    const pwHelp = _pflEl('pfl-password-help');
+    if (pwHelp) pwHelp.textContent = 'At least ' + (t.password_min_len || 8) + ' characters'
+        + (t.password_require_alnum ? ', including letters and numbers.' : '.');
+    const ttl = _pflEl('pfl-ttl'); const never = _pflEl('pfl-never');
+    if (t.max_ttl_hours) {
+        ttl.max = t.max_ttl_hours; ttl.value = t.default_ttl_hours || t.max_ttl_hours; ttl.disabled = false;
+        if (never) { never.checked = false; never.disabled = true; never.title = 'This link type caps the lifetime, so it cannot be set to never expire.'; }
+    } else {
+        ttl.removeAttribute('max');
+        if (never) { never.disabled = false; never.title = ''; }
+        if (t.default_ttl_hours) { ttl.value = t.default_ttl_hours; if (never) never.checked = false; ttl.disabled = false; }
+        else { if (never) never.checked = true; ttl.value = ''; ttl.disabled = true; }
+    }
+    const uses = _pflEl('pfl-max-uses');
+    if (t.max_uses_cap) { uses.max = t.max_uses_cap; uses.value = t.max_uses_cap; uses.placeholder = 'up to ' + t.max_uses_cap; }
+    else { uses.removeAttribute('max'); uses.value = ''; uses.placeholder = 'unlimited'; }
+}
+
+function onPflSecretChange() {
+    const kind = _pflEl('pfl-secret').value;
+    _pflEl('pfl-pin-group').hidden = (kind !== 'pin');
+    _pflEl('pfl-password-group').hidden = (kind !== 'password');
+}
+
+function _pflNeverChecked() { const n = _pflEl('pfl-never'); return !!(n && !n.disabled && n.checked); }
+
+function _pflPayload() {
+    const t = _pflSelectedTag();
+    const tgt = state._pflTarget || {};
+    const p = { vault_id: tgt.vaultId, target_type: tgt.targetType, tag_id: t.id };
+    if (tgt.targetType === 'folder') p.target_folder_id = tgt.targetId; else p.target_file_id = tgt.targetId;
+    const tok = parseInt(_pflEl('pfl-token-len').value, 10);
+    if (Number.isFinite(tok)) p.token_len = tok;
+    const kind = _pflEl('pfl-secret').value; p.secret_kind = kind;
+    if (kind === 'pin') p.pin = (_pflEl('pfl-pin').value || '').trim();
+    if (kind === 'password') p.password = _pflEl('pfl-password').value || '';
+    if (_pflNeverChecked()) { p.ttl_hours = null; }
+    else { const h = parseInt(_pflEl('pfl-ttl').value, 10); if (Number.isFinite(h)) p.ttl_hours = h; }
+    const mu = parseInt(_pflEl('pfl-max-uses').value, 10);
+    p.max_uses = Number.isFinite(mu) ? mu : null;
+    return p;
+}
+
+async function submitPublicFileLink() {
+    const t = _pflSelectedTag();
+    const err = _pflEl('pfl-error'); if (err) err.hidden = true;
+    if (!t) { if (err) { err.textContent = 'Choose a link type first.'; err.hidden = false; } return; }
+    const btn = _pflEl('pfl-create'); btn.disabled = true;
+    try {
+        const link = await apiRequest('/public-links', { method: 'POST', body: JSON.stringify(_pflPayload()) });
+        const url = window.location.origin + (link.url_path || ('/p/' + link.token));
+        state._lastPflUrl = url;
+        _pflEl('pfl-form').hidden = true;
+        _pflEl('pfl-result').hidden = false;
+        _pflEl('pfl-link-value').value = url;
+        btn.hidden = true;
+        if (_pflEl('pfl-cancel')) _pflEl('pfl-cancel').hidden = true;
+        if (_pflEl('pfl-done')) _pflEl('pfl-done').hidden = false;
+    } catch (e) {
+        if (err) { err.textContent = (e && e.message) || 'Could not create the link.'; err.hidden = false; }
+        btn.disabled = false;
+    }
+}
+
+function copyPflLink() {
+    const inp = _pflEl('pfl-link-value');
+    const val = (inp && inp.value) || state._lastPflUrl || '';
+    if (!val) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(val).then(() => showSuccess('Link copied'))
+            .catch(() => { if (inp) inp.select(); showError('Copy failed — select the link and copy it.'); });
+    } else if (inp) { inp.select(); try { document.execCommand('copy'); showSuccess('Link copied'); } catch (_) { showError('Copy failed.'); } }
+}
+
+// ---- Owner: manage MY public file/folder links -------------------------------------------------
+async function openPublicLinksManage() {
+    openModal('public-links-manage-modal');
+    await loadMyPublicLinks();
+}
+
+async function loadMyPublicLinks() {
+    const host = _pflEl('pflm-list'); if (!host) return;
+    host.replaceChildren(_el('div', 'spinner'));
+    try {
+        const data = await apiRequest('/public-links', { silent: true });
+        renderMyPublicLinks((data && data.links) || []);
+    } catch (e) {
+        host.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load your links: ' + ((e && e.message) || '')));
+    }
+}
+
+function _pflExpiryText(l) { return l.expires_at ? (typeof _fmtLinkExpiry === 'function' ? _fmtLinkExpiry(l.expires_at).replace(/^Expires /, '') : l.expires_at) : 'Never'; }
+
+function renderMyPublicLinks(links) {
+    const host = _pflEl('pflm-list'); if (!host) return;
+    if (!links.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', "You haven't created any public file links yet.")); return; }
+    const table = _el('table', 'data-table');
+    const thead = _el('thead'); const hr = _el('tr');
+    ['Type', 'Item', 'Status', 'Protection', 'Expires', 'Downloads', ''].forEach(h => hr.appendChild(_el('th', '', h)));
+    thead.appendChild(hr); table.appendChild(thead);
+    const tb = _el('tbody');
+    links.forEach(l => {
+        const tr = _el('tr');
+        const typeTd = _el('td', 'nl-tag-idlead');
+        const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
+        if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
+        typeTd.appendChild(_el('span', '', l.tag_name || '—'));
+        tr.appendChild(typeTd);
+        tr.appendChild(_el('td', '', (l.target_type === 'folder' ? 'Folder' : 'File')));
+        tr.appendChild(_el('td', '', _PFL_STATUS_LABEL[l.status] || l.status));
+        tr.appendChild(_el('td', '', l.secret_kind === 'password' ? 'Password' : (l.secret_kind === 'pin' ? 'PIN' : 'None')));
+        tr.appendChild(_el('td', '', _pflExpiryText(l)));
+        tr.appendChild(_el('td', '', (l.max_uses != null) ? ((l.use_count || 0) + '/' + l.max_uses) : String(l.use_count || 0)));
+        // The link URL is shown only once at creation (the token isn't stored in the clear), so there
+        // is no "copy" here — just revoke (while active) and delete.
+        const actTd = _el('td', 'flex gap-sm');
+        if (l.status === 'active') {
+            const rv = _el('button', 'btn btn-ghost btn-sm', 'Revoke'); rv.type = 'button';
+            rv.addEventListener('click', () => revokeMyPublicLink(l.id));
+            actTd.appendChild(rv);
+        }
+        const del = _el('button', 'btn btn-ghost btn-sm', 'Delete'); del.type = 'button';
+        del.addEventListener('click', () => deleteMyPublicLink(l.id));
+        actTd.appendChild(del);
+        tr.appendChild(actTd);
+        tb.appendChild(tr);
+    });
+    table.appendChild(tb); host.replaceChildren(table);
+}
+
+async function revokeMyPublicLink(id) {
+    const ok = await showConfirm('Revoke this public link? Anyone holding it can no longer download.');
+    if (!ok) return;
+    try { await apiRequest('/public-links/' + id + '/revoke', { method: 'POST' }); showSuccess('Link revoked'); await loadMyPublicLinks(); }
+    catch (e) { showError((e && e.message) || 'Could not revoke the link'); }
+}
+
+async function deleteMyPublicLink(id) {
+    const ok = await showConfirm('Delete this public link record? This cannot be undone.');
+    if (!ok) return;
+    try { await apiRequest('/public-links/' + id, { method: 'DELETE' }); showSuccess('Link deleted'); await loadMyPublicLinks(); }
+    catch (e) { showError((e && e.message) || 'Could not delete the link'); }
+}
+
+// ---- Admin oversight: all public file/folder links (Settings -> Public Links) -------------------
+async function loadAdminPublicLinks() {
+    const host = _pflEl('pfl-admin-links'); const summary = _pflEl('pfl-admin-summary');
+    if (!host) return;
+    host.replaceChildren(_el('div', 'spinner'));
+    try {
+        const data = await apiRequest('/admin/public-links', { silent: true });
+        renderAdminPublicLinks(data || { links: [] });
+        if (summary) {
+            const total = (data && data.total) || 0, active = (data && data.active_count) || 0;
+            summary.textContent = total + ' link(s), ' + active + ' active' + (data && data.capped ? ' (showing the newest 1000)' : '');
+        }
+    } catch (e) {
+        host.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load links: ' + ((e && e.message) || '')));
+    }
+}
+
+function renderAdminPublicLinks(data) {
+    const host = _pflEl('pfl-admin-links'); if (!host) return;
+    const links = (data && data.links) || [];
+    if (!links.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', 'No public file/folder links exist.')); return; }
+    const table = _el('table', 'data-table');
+    const thead = _el('thead'); const hr = _el('tr');
+    ['Owner', 'Type', 'Item', 'Status', 'Protection', 'Expires', 'Downloads', ''].forEach(h => hr.appendChild(_el('th', '', h)));
+    thead.appendChild(hr); table.appendChild(thead);
+    const tb = _el('tbody');
+    links.forEach(l => {
+        const tr = _el('tr');
+        tr.appendChild(_el('td', '', l.owner || '—'));
+        const typeTd = _el('td', 'nl-tag-idlead');
+        const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
+        if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
+        typeTd.appendChild(_el('span', '', l.tag_name || '—'));
+        tr.appendChild(typeTd);
+        tr.appendChild(_el('td', '', (l.target_type === 'folder' ? 'Folder' : 'File')));
+        tr.appendChild(_el('td', '', _PFL_STATUS_LABEL[l.status] || l.status));
+        tr.appendChild(_el('td', '', l.secret_kind === 'password' ? 'Password' : (l.secret_kind === 'pin' ? 'PIN' : 'None')));
+        tr.appendChild(_el('td', '', _pflExpiryText(l)));
+        tr.appendChild(_el('td', '', (l.max_uses != null) ? ((l.use_count || 0) + '/' + l.max_uses) : String(l.use_count || 0)));
+        const actTd = _el('td');
+        if (l.status === 'active') {
+            const rv = _el('button', 'btn btn-ghost btn-sm', 'Revoke'); rv.type = 'button';
+            rv.addEventListener('click', () => adminRevokePublicLink(l.id));
+            actTd.appendChild(rv);
+        }
+        tr.appendChild(actTd); tb.appendChild(tr);
+    });
+    table.appendChild(tb); host.replaceChildren(table);
+}
+
+async function adminRevokePublicLink(id) {
+    const ok = await showConfirm('Revoke this public link? Anyone holding it will no longer be able to download.');
+    if (!ok) return;
+    try { await apiRequest('/admin/public-links/' + id + '/revoke', { method: 'POST' }); showSuccess('Link revoked'); await loadAdminPublicLinks(); }
+    catch (e) { showError((e && e.message) || 'Could not revoke the link'); }
+}
+
+async function adminRevokeAllPublicLinks() {
+    const ok = await showConfirm('Revoke ALL currently-active public file/folder links across every user? This cannot be undone.');
+    if (!ok) return;
+    try {
+        const r = await apiRequest('/admin/public-links/revoke-all', { method: 'POST' });
+        showSuccess('Revoked ' + ((r && r.revoked_count) || 0) + ' link(s)');
+        await loadAdminPublicLinks();
+    } catch (e) { showError((e && e.message) || 'Could not revoke links'); }
+}
+
+// Wire the public-file-link modals once (create + manage). Idempotent.
+function setupPublicFileLinkUI() {
+    if (state._pflWired) return;
+    const createBtn = _pflEl('pfl-create');
+    if (!createBtn) return;  // markup not present
+    state._pflWired = true;
+    createBtn.addEventListener('click', submitPublicFileLink);
+    const tag = _pflEl('pfl-tag'); if (tag) tag.addEventListener('change', onPflTagChange);
+    const secret = _pflEl('pfl-secret'); if (secret) secret.addEventListener('change', onPflSecretChange);
+    const copy = _pflEl('pfl-copy'); if (copy) copy.addEventListener('click', copyPflLink);
+    document.querySelectorAll('[data-pfl-close]').forEach(el => el.addEventListener('click', () => closeModal()));
+    document.querySelectorAll('[data-pflm-close]').forEach(el => el.addEventListener('click', () => closeModal()));
+    const aRefresh = _pflEl('pfl-admin-refresh'); if (aRefresh) aRefresh.addEventListener('click', loadAdminPublicLinks);
+    const aRevokeAll = _pflEl('pfl-admin-revoke-all'); if (aRevokeAll) aRevokeAll.addEventListener('click', adminRevokeAllPublicLinks);
+}
+
 function wireNotesOnce() {
     if (state._notesWired) return;
     state._notesWired = true;
@@ -18309,6 +18643,11 @@ document.addEventListener('DOMContentLoaded', () => {
             if (v) openCreateShareModal('vault', v.id, v.name);
         });
     }
+
+    // Public file/folder links: wire the create + manage modals; the toolbar button opens "My public links".
+    setupPublicFileLinkUI();
+    const publicLinksBtn = document.getElementById('public-links-btn');
+    if (publicLinksBtn) publicLinksBtn.addEventListener('click', openPublicLinksManage);
 
     // Create vault button
     const createVaultBtn = document.getElementById('create-vault-btn');
