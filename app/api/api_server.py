@@ -8265,7 +8265,6 @@ async def create_note_link(
     """Create a PUBLIC snapshot link for one of MY notes, under a note-link tag I'm allowed to use.
     The tag is a security FLOOR; my overrides may only TIGHTEN it (note_link_policy.resolve_link_policy).
     The title/body are FROZEN here. Feature-gated, allowlisted, per-user capped, audited."""
-    from sqlalchemy import func as _f, or_ as _or
     from app.core.security import hash_password
     from app.core.models import Note
 
@@ -8292,14 +8291,12 @@ async def create_note_link(
     if not sharing_policy.user_can_create_with_tag(allowlist, current_user.id, user_gids):
         raise HTTPException(status_code=403, detail="You are not permitted to create links with this tag.")
 
-    # Per-user active-link cap (anti-abuse). "Active" = not revoked, not expired, not exhausted.
+    # Per-user active-link cap (anti-abuse). The budget is SHARED across public note links AND public
+    # file/folder links, so both create paths must count both — otherwise a user could hold ~2x the cap
+    # by filling one kind then the other. "Active" = not revoked, not expired, not exhausted.
     now = datetime.utcnow()
     cap = note_link_policy.public_note_link_user_cap(_global_settings_blob(db))
-    active = db.query(_f.count(NoteLink.id)).filter(
-        NoteLink.owner_id == current_user.id, NoteLink.revoked.is_(False),
-        _or(NoteLink.expires_at.is_(None), NoteLink.expires_at > now),
-        _or(NoteLink.max_uses.is_(None), NoteLink.use_count < NoteLink.max_uses)).scalar() or 0
-    if active >= cap:
+    if _publiclink_active_count(db, current_user.id) >= cap:
         raise HTTPException(status_code=409,
                             detail=f"You have reached your limit of {cap} active links. Revoke one first.")
 
@@ -8678,6 +8675,144 @@ async def redeem_note_link(
 def _publiclink_token_hash(token: str) -> str:
     import hashlib as _hashlib
     return _hashlib.sha256(token.encode()).hexdigest()
+
+
+# --- Anonymous redemption + download constants (mirror the note-link redemption contract). ---------
+_PUBLINK_REDEEM_LIMIT = 10           # redemption requests / minute per (IP, token)
+_PUBLINK_REDEEM_WINDOW = 60
+_PUBLINK_REDEEM_IP_LIMIT = 600       # per-IP budget across ALL links (enumeration); generous like notelink
+_PUBLINK_REDEEM_IP_WINDOW = 60
+_PUBLINK_FAIL_MAX = 5                # wrong-secret attempts before a per-link lockout
+_PUBLINK_FAIL_WINDOW = 900          # 15-minute lockout window
+_PUBLINK_TOKEN_MAX_INPUT = 128
+_PUBLINK_SECRET_MAX = note_link_policy.PASSWORD_MAX_LEN
+_PUBLINK_GRANT_TTL = 60             # download grant lifetime, seconds
+
+
+def _publiclink_fail_key(token_hash: str) -> str:
+    return f"publiclink:fail:{token_hash}"
+
+
+def _publiclink_grant_key(grant: str) -> str:
+    # The grant is stored HASHED (its plaintext is a bearer secret held only by the redeeming client).
+    import hashlib as _hashlib
+    return f"publiclink:grant:{_hashlib.sha256(grant.encode()).hexdigest()}"
+
+
+def _publiclink_locked(token_hash: str) -> bool:
+    """True if this link is in failed-secret lockout. Raises on a Redis outage so the caller fails
+    CLOSED — a lockout must never silently lift because the store is unreachable."""
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is None:
+        raise RuntimeError("rate-limit store unavailable")
+    n = r.get(_publiclink_fail_key(token_hash))
+    return n is not None and int(n) >= _PUBLINK_FAIL_MAX
+
+
+def _publiclink_record_fail(token_hash: str) -> int:
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is None:
+        return _PUBLINK_FAIL_MAX
+    try:
+        n = int(r.incr(_publiclink_fail_key(token_hash)))
+        if n == 1:
+            r.expire(_publiclink_fail_key(token_hash), _PUBLINK_FAIL_WINDOW)
+        return n
+    except Exception:
+        return _PUBLINK_FAIL_MAX
+
+
+def _publiclink_clear_fails(token_hash: str) -> None:
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is not None:
+        try:
+            r.delete(_publiclink_fail_key(token_hash))
+        except Exception:
+            pass
+
+
+def _publiclink_issue_grant(link_id, client_ip: str) -> str:
+    """Mint a single-use download grant bound to (link_id, client_ip), stored HASHED in Redis with a
+    short TTL. Raises RuntimeError if Redis is unavailable — a grant that cannot be stored is never
+    handed out (the caller answers 503)."""
+    import secrets as _secrets
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is None:
+        raise RuntimeError("grant store unavailable")
+    grant = _secrets.token_urlsafe(32)
+    payload = f"{link_id}|{client_ip or ''}"
+    try:
+        # NX so a (astronomically unlikely) hash collision never overwrites a live grant.
+        ok = r.set(_publiclink_grant_key(grant), payload, ex=_PUBLINK_GRANT_TTL, nx=True)
+    except Exception as e:
+        raise RuntimeError("grant store unavailable") from e
+    if not ok:
+        raise RuntimeError("grant store unavailable")
+    return grant
+
+
+def _publiclink_consume_grant(grant: str, link_id, client_ip: str) -> bool:
+    """Consume a download grant: it must exist, be bound to THIS link and client IP, and be removed by
+    THIS request (single-winner) — so a grant is good for exactly one download. Any miss returns False
+    (the caller answers with the uniform 404). A Redis outage means the grant can't be found → False."""
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is None:
+        return False
+    key = _publiclink_grant_key(grant)
+    try:
+        raw = r.get(key)
+    except Exception:
+        return False
+    if raw is None:
+        return False
+    val = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
+    want = f"{link_id}|{client_ip or ''}"
+    if val != want:
+        return False
+    # Single-winner delete: two concurrent downloads with the same grant — only the one whose DELETE
+    # actually removed the key proceeds.
+    try:
+        removed = int(r.delete(key) or 0)
+    except Exception:
+        return False
+    return removed >= 1
+
+
+def _publiclink_resolve_live(db, link):
+    """Re-validate a public link against LIVE state and return (vault, owner) — or None if any gate
+    fails (the caller maps that to the uniform 404). Checked every redeem AND every download so a
+    change after minting (revoke, vault password added, owner removed) bites on the next request:
+      * the vault is active, Standard, and NOT password-protected;
+      * the OWNER account is active and not locked and STILL holds READ on the vault (live);
+    The link's own active/expiry/exhaustion status and the target's presence are checked by the caller
+    (they differ between redeem and per-file download)."""
+    vault = db.query(Vault).filter(Vault.id == link.vault_id, Vault.is_active.is_(True)).first()
+    if not vault:
+        return None
+    if getattr(vault, "type", "standard") == "zero_knowledge" or vault.password_hash:
+        return None
+    owner = db.query(User).filter(User.id == link.owner_id).first()
+    if not owner or not getattr(owner, "is_active", True):
+        return None
+    locked_until = getattr(owner, "locked_until", None)
+    if locked_until is not None and locked_until > datetime.utcnow():
+        return None
+    if not PermissionService(db).can_access_vault(owner, vault.id, VaultPermissionEnum.READ):
+        return None
+    return vault, owner
+
+
+def _publiclink_target_scope(link) -> dict:
+    """The id_scope for this link's target subtree: a file link scopes exactly its file; a folder link
+    scopes its folder (and everything under it)."""
+    if link.target_type == "folder" and link.target_folder_id:
+        return {"files": [], "folders": [str(link.target_folder_id)]}
+    return {"files": [str(link.target_file_id)] if link.target_file_id else [], "folders": []}
 
 
 def _publiclink_public_dict(link, tag=None) -> dict:
@@ -9063,6 +9198,314 @@ async def admin_revoke_all_public_links(
     except Exception:
         pass
     return {"ok": True, "revoked_count": n}
+
+
+# --- Anonymous read path: page + redeem + download -------------------------------------------------
+class PublicLinkRedeem(BaseModel):
+    secret: Optional[str] = None
+
+
+@app.get("/p/{token}")
+async def public_link_page(token: str):
+    """PUBLIC: serve the anonymous redemption page. It reads the token from the URL and POSTs to
+    /public-links/{token}/redeem (prompting for a PIN/password only if the link needs one)."""
+    static_dir = str(PROJECT_ROOT / "static")
+    page = os.path.join(static_dir, "public-link.html")
+    if not os.path.exists(page):
+        raise HTTPException(status_code=404, detail="Not found")
+    resp = FileResponse(page)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    return resp
+
+
+@app.post("/public-links/{token}/redeem")
+async def redeem_public_link(
+    token: str,
+    payload: PublicLinkRedeem,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """PUBLIC: redeem a public file/folder link. Rate-limited per IP AND per token (fail-closed); a
+    secret-gated link prompts for its PIN/password with a per-link lockout; expiry/max-uses/revocation
+    and the live vault/owner state are enforced; a missing or unusable link returns the SAME uniform
+    404 (no oracle). On success one use is atomically consumed and a short-lived, single-use download
+    GRANT bound to (link, client IP) is returned. Returns file metadata (file link) or the one-level
+    listing (folder link)."""
+    import time as _t
+    from sqlalchemy import update as _sa_update, or_ as _or
+    from app.core.security import verify_password
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+
+    client_ip = get_client_ip(request)
+    if not token or len(token) > _PUBLINK_TOKEN_MAX_INPUT:
+        raise HTTPException(status_code=404, detail="This link is not available.")
+
+    # (1) Two fail-closed rate-limit buckets: per (IP, token) throttles hammering one link; per IP
+    # alone throttles enumerating many different tokens from one address.
+    try:
+        allowed, _, reset = _rl.check_rate_limit(
+            identifier=f"{client_ip}:{token}", limit=_PUBLINK_REDEEM_LIMIT,
+            window=_PUBLINK_REDEEM_WINDOW, prefix="publiclink_redeem", fail_open=False)
+        allowed_ip, _, reset_ip = _rl.check_rate_limit(
+            identifier=client_ip, limit=_PUBLINK_REDEEM_IP_LIMIT,
+            window=_PUBLINK_REDEEM_IP_WINDOW, prefix="publiclink_redeem_ip", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+    if not allowed or not allowed_ip:
+        _reset = reset if not allowed else reset_ip
+        raise HTTPException(status_code=429, detail="Too many requests.",
+                            headers={"Retry-After": str(max(1, _reset - int(_t.time())))})
+
+    def _audit(status, reason=None, link_id=None):
+        try:
+            AuditLogger(db).log_action(
+                action="public_link_redeem", status=status, resource_type="public_link",
+                resource_id=str(link_id) if link_id else None,
+                details={"reason": reason} if reason else None, ip_address=client_ip)
+        except Exception:
+            pass
+
+    # Kill switch: turning the feature off stops already-minted links from serving too.
+    if not note_link_policy.public_file_links_enabled(_global_settings_blob(db)):
+        _audit("failure", reason="feature_disabled")
+        raise HTTPException(status_code=404, detail="This link is not available.")
+
+    token_hash = _publiclink_token_hash(token)
+    link = db.query(PublicLink).filter(PublicLink.token_hash == token_hash).first()
+    if not link or _notelink_status(link) != "active":
+        _audit("failure", reason="not_available", link_id=(link.id if link else None))
+        raise HTTPException(status_code=404, detail="This link is not available.")
+
+    # Live vault/owner re-validation (revoke of access, vault password added, owner removed → 404).
+    live = _publiclink_resolve_live(db, link)
+    if live is None:
+        _audit("failure", reason="not_available", link_id=link.id)
+        raise HTTPException(status_code=404, detail="This link is not available.")
+    vault, owner = live
+
+    if link.secret_kind != "none":
+        try:
+            locked = _publiclink_locked(token_hash)
+        except Exception:
+            raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+        if locked:
+            _audit("failure", reason="locked_out", link_id=link.id)
+            raise HTTPException(status_code=429, detail="Too many incorrect attempts. Try again later.",
+                                headers={"Retry-After": str(_PUBLINK_FAIL_WINDOW)})
+        raw = (payload.secret if payload else None) or ""
+        if not raw.strip():
+            raise HTTPException(status_code=401,
+                                detail={"error": "secret_required", "secret_kind": link.secret_kind})
+        secret = raw.strip() if link.secret_kind == "pin" else raw
+        if len(secret) > _PUBLINK_SECRET_MAX or not link.password_hash \
+                or not verify_password(secret, link.password_hash):
+            n = _publiclink_record_fail(token_hash)
+            _audit("failure", reason="wrong_secret", link_id=link.id)
+            if n >= _PUBLINK_FAIL_MAX:
+                raise HTTPException(status_code=429, detail="Too many incorrect attempts. Try again later.",
+                                    headers={"Retry-After": str(_PUBLINK_FAIL_WINDOW)})
+            raise HTTPException(status_code=401,
+                                detail={"error": "wrong_secret", "secret_kind": link.secret_kind})
+        _publiclink_clear_fails(token_hash)
+
+    # The target must still exist (and, for a folder, resolve its children). A missing target → 404.
+    now = datetime.utcnow()
+    if link.target_type == "file":
+        f = db.query(File).filter(File.id == link.target_file_id, File.vault_id == vault.id).first()
+        if not f or f.password_hash:
+            _audit("failure", reason="not_available", link_id=link.id)
+            raise HTTPException(status_code=404, detail="This link is not available.")
+    else:  # folder
+        folder = db.query(Folder).filter(Folder.id == link.target_folder_id,
+                                         Folder.vault_id == vault.id).first()
+        if not folder or folder.password_hash:
+            _audit("failure", reason="not_available", link_id=link.id)
+            raise HTTPException(status_code=404, detail="This link is not available.")
+
+    # (2) Atomically consume one use under a WHERE guard so max-uses/expiry/revoke can't be raced.
+    stmt = (_sa_update(PublicLink)
+            .where(PublicLink.id == link.id, PublicLink.revoked.is_(False),
+                   _or(PublicLink.max_uses.is_(None), PublicLink.use_count < PublicLink.max_uses),
+                   _or(PublicLink.expires_at.is_(None), PublicLink.expires_at > now))
+            .values(use_count=PublicLink.use_count + 1, last_used_at=now))
+    res = db.execute(stmt)
+    db.commit()
+    if res.rowcount == 0:
+        _audit("failure", reason="not_available", link_id=link.id)
+        raise HTTPException(status_code=404, detail="This link is not available.")
+
+    # Mint the single-use download grant (fail-closed: Redis down → 503, nothing minted, use already
+    # consumed but the link stays usable on retry once Redis is back).
+    try:
+        grant = _publiclink_issue_grant(link.id, client_ip)
+    except RuntimeError:
+        _audit("failure", reason="grant_store_unavailable", link_id=link.id)
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+
+    _audit("success", link_id=link.id)
+    if link.target_type == "file":
+        # Names are the Standard vault's in-memory-decrypted plaintext (the ORM load event restores it).
+        return {"kind": "file", "name": f.name or "download", "size": f.size_bytes or 0,
+                "file_id": str(f.id), "grant": grant}
+    # Folder: one level of children (files + subfolders), no recursion.
+    child_files = db.query(File).filter(File.vault_id == vault.id,
+                                       File.folder_id == folder.id).all()
+    child_dirs = db.query(Folder).filter(Folder.vault_id == vault.id,
+                                        Folder.parent_folder_id == folder.id).all()
+    entries = [{"id": str(d.id), "name": d.name or "", "size": 0, "is_folder": True} for d in child_dirs]
+    entries += [{"id": str(x.id), "name": x.name or "", "size": x.size_bytes or 0,
+                 "is_folder": False} for x in child_files]
+    return {"kind": "folder", "name": folder.name or "", "entries": entries, "grant": grant}
+
+
+@app.get("/public-links/{token}/download/{file_id}")
+async def download_public_link(
+    token: str,
+    file_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    x_download_grant: Optional[str] = Header(None),
+):
+    """PUBLIC: stream one file of a redeemed public link. The download GRANT rides an X-Download-Grant
+    HEADER (never a query string, which proxies/history record) and is single-use. Every gate from
+    redemption is RE-CHECKED here (master switch, link active, vault Standard+not-pw, owner active +
+    still holds READ, target present + not password-protected), plus the requested file_id must lie
+    inside the link's target subtree (id_scope). Any failure is the uniform 404. No principal is
+    synthesised: the blob is opened directly once every gate passes."""
+    from app.core.id_scope import id_in_scope
+
+    client_ip = get_client_ip(request)
+    if not token or len(token) > _PUBLINK_TOKEN_MAX_INPUT:
+        raise HTTPException(status_code=404, detail="This file is not available.")
+    if not x_download_grant:
+        raise HTTPException(status_code=404, detail="This file is not available.")
+
+    def _deny():
+        raise HTTPException(status_code=404, detail="This file is not available.")
+
+    if not note_link_policy.public_file_links_enabled(_global_settings_blob(db)):
+        _deny()
+
+    token_hash = _publiclink_token_hash(token)
+    link = db.query(PublicLink).filter(PublicLink.token_hash == token_hash).first()
+    if not link or _notelink_status(link) != "active":
+        _deny()
+
+    live = _publiclink_resolve_live(db, link)
+    if live is None:
+        _deny()
+    vault, owner = live
+
+    # The requested file must exist in the vault and carry no file password (added-since-mint → 404).
+    file_record = db.query(File).filter(File.id == file_id, File.vault_id == vault.id).first()
+    if not file_record or file_record.password_hash:
+        _deny()
+
+    # The file must lie inside the link's target subtree, and no ancestor folder up to the target may
+    # have acquired a password since minting (a password added later must bite here).
+    ancestors = folder_ancestry(db, vault.id, file_record.folder_id)
+    if not id_in_scope(_publiclink_target_scope(link), str(file_id), ancestors):
+        _deny()
+    protected = db.query(Folder.id).filter(Folder.vault_id == vault.id,
+                                          Folder.id.in_([a for a in ancestors] or [None]),
+                                          Folder.password_hash.isnot(None)).first()
+    if protected is not None:
+        _deny()
+
+    # Consume the single-use grant (bound to this link + client IP). A miss = uniform 404.
+    if not _publiclink_consume_grant(x_download_grant, link.id, client_ip):
+        _deny()
+
+    # Everything authorized: open the blob for streaming (no principal — the equivalent of the authed
+    # path's _resolve_download checks have all been done above) and serve it under a transfer slot.
+    import asyncio
+    from fastapi.responses import StreamingResponse
+    from app.core.security import EncryptionError, ObjectChangedDuringRead
+    from app.services.download_stream import ChecksumMismatch
+
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    audit_logger = AuditLogger(db)
+
+    try:
+        transfer_slot = await transfer_admission.acquire()
+    except TransferBusy as busy:
+        raise _busy_response(busy)
+
+    try:
+        download = vault_service._open_stored_file(file_record, vault, file_id, whole=False)
+    except Exception:
+        transfer_admission.release(transfer_slot)
+        _deny()
+
+    file_name = download.name or "download"
+    mime_type = download.mime_type
+    try:
+        audit_logger.log_action(
+            action="public_link_download", status="authorized", user=None,
+            resource_type="file", resource_id=str(file_id),
+            details={"vault_id": str(vault.id), "public_link_id": str(link.id),
+                     "file_name": file_name}, ip_address=client_ip)
+    except Exception:
+        pass
+
+    async def file_streamer():
+        served = 0
+        total_size = download.total_length
+        disconnected = False
+        terminal_success = False
+        failure = None
+        try:
+            try:
+                for piece in download.chunks():
+                    if await request.is_disconnected():
+                        disconnected = True
+                        break
+                    yield piece
+                    served += len(piece)
+                    await asyncio.sleep(0)
+                terminal_success = (not disconnected and served == total_size)
+            except (ChecksumMismatch, ObjectChangedDuringRead, EncryptionError) as exc:
+                failure = exc
+        finally:
+            download.close()
+            transfer_admission.release(transfer_slot)
+            if terminal_success:
+                # Count only a completed transfer against the owner's card + oversight counters.
+                try:
+                    from sqlalchemy import update as _sa_update2
+                    db.execute(_sa_update2(PublicLink).where(PublicLink.id == link.id).values(
+                        download_count=PublicLink.download_count + 1,
+                        bytes_served=PublicLink.bytes_served + served))
+                    db.commit()
+                except Exception:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+            try:
+                audit_logger.log_action(
+                    action="public_link_download_completed",
+                    status="success" if terminal_success else "failed", user=None,
+                    resource_type="file", resource_id=str(file_id),
+                    details={"vault_id": str(vault.id), "public_link_id": str(link.id),
+                             "bytes_sent": served, "total_bytes": total_size,
+                             "outcome": ("completed" if terminal_success
+                                         else "disconnected" if disconnected
+                                         else type(failure).__name__ if failure is not None
+                                         else "incomplete")},
+                    ip_address=client_ip)
+            except Exception:
+                pass
+
+    headers = {
+        "Content-Disposition": _content_disposition(file_name),
+        "Content-Length": str(download.total_length),
+        "Cache-Control": "no-store",
+        "X-Robots-Tag": "noindex, nofollow",
+    }
+    return StreamingResponse(file_streamer(), media_type=_safe_media_type(mime_type), headers=headers)
 
 
 @app.get("/share-policy")

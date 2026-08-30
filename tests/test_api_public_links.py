@@ -268,6 +268,11 @@ def test_shared_cap_counts_notes_and_files(admin):
         f2 = user.post("/public-links", json={"vault_id": v["id"], "target_type": "file",
                                               "target_file_id": fid, "tag_id": ftag["id"]})
         assert f2.status_code == 200, f2.text
+        # ...and the reverse direction: the shared budget (now filled by the file link) blocks a NOTE
+        # link too — the note-link create must count public file links, not just its own kind.
+        note_id = user.post("/notes", json={"title": "n2", "body": "b2"}).json()["id"]
+        n2 = user.post("/note-links", json={"note_id": note_id, "tag_id": open_tag["id"]})
+        assert n2.status_code == 409, n2.text
     finally:
         user.delete_vault(v["id"])
         admin.delete_user(u["id"])
