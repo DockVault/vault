@@ -229,6 +229,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.24.0": {
+      "released": "2026-08-31",
+      "notes": "Security-hardening release. Adds admin-configurable per-user resource limits (a vault-count cap, a per-account storage budget defaulting to 50 GB, and a cap on active temporary credentials; 0 means unlimited and administrators are exempt), tightens authorization on the file plane (opening an SFTP/chunked upload session now requires write permission, and a nonexistent vault answers 404 instead of 500), hardens a zero-knowledge vault-name re-seal against a future key epoch that would make the name undecryptable, sandboxes the in-browser PDF/media preview, clears the vault list and upload state on logout, keeps the account second-factor requirement from being switched off, bounds the admin login-attempt override, and removes the Server header. No schema change and no existing data is altered; a rollback to 0.23.0 simply restores the prior limits and header behaviour.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -432,6 +440,13 @@
     {
       "from": "0.22.0",
       "to": "0.23.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.23.0",
+      "to": "0.24.0",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
