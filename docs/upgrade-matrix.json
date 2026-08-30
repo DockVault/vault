@@ -221,6 +221,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.23.0": {
+      "released": "2026-08-30",
+      "notes": "Adds the owner and admin UI for the public file/folder links (\"secure send\", backend added in 0.21.0) and upload links (\"receivers\", 0.22.0), which previously shipped with no interface: create, manage and revoke links, and govern them with tags and per-feature settings. Also a round of two-factor and settings usability fixes -- a full-size enrollment QR code, an MFA column in the accounts list, a single-step-up save for the whole step-up action matrix, an admin \"copy reset link\" action for accounts with no email, and a reworked rate-limit settings surface that shows each limit's read-only deployment value beside an optional, bounded custom override (now extended to the login, vault-unlock and SFTP throttles). No schema change and no existing data is altered; a rollback to 0.22.0 simply hides the new UI.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -417,6 +425,13 @@
     {
       "from": "0.21.0",
       "to": "0.22.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.22.0",
+      "to": "0.23.0",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
