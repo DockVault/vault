@@ -97,7 +97,15 @@ def otpauth_qr_svg(uri: str) -> Optional[str]:
         qr.make(fit=True)
         buf = io.BytesIO()
         qr.make_image(image_factory=SvgPathImage).save(buf)
-        return buf.getvalue().decode("utf-8")
+        svg = buf.getvalue().decode("utf-8")
+        # qrcode emits the root <svg> with a PHYSICAL size (e.g. width="41mm" height="41mm") plus a
+        # viewBox. Physical units do not scale to an <img>'s CSS box, so the QR renders at roughly its
+        # intrinsic size (tiny) inside a larger box. Drop the mm dimensions and let the viewBox drive
+        # sizing at 100% of the <img>, so the QR fills whatever box the page gives it.
+        import re
+        svg = re.sub(r'\s(?:width|height)="[0-9.]+mm"', '', svg, count=2)
+        svg = re.sub(r'<svg\b', '<svg width="100%" height="100%"', svg, count=1)
+        return svg
     except Exception:      # noqa: BLE001
         return None
 

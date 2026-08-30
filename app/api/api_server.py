@@ -844,6 +844,9 @@ class UserResponse(BaseModel):
     created_at: datetime
     last_login: Optional[datetime]
     groups: List[GroupBrief] = []
+    # Whether the account has an active second factor (TOTP) enrolled. Not an ORM column — the
+    # admin users list fills it in from a batched enrollment query; elsewhere it stays False.
+    second_factor_enabled: bool = False
 
     class Config:
         from_attributes = True
@@ -2698,35 +2701,27 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Settings payload must be an object")
 
-    for managed_key in ("rate_limit_api_enabled", "rate_limit_api_deployment_defaults"):
+    # Deployment-managed / server-computed rate-limit fields are READ-ONLY: the deployment value comes
+    # from the environment and the API must never write it (a client cannot edit it via a payload key).
+    for managed_key in ("rate_limit_api_enabled", "rate_limit_api_deployment_defaults",
+                        "rate_limit_settings"):
         if managed_key in payload:
             raise HTTPException(
                 status_code=400,
                 detail=f"{managed_key} is managed by the deployment environment",
             )
 
-    from app.core.rate_limiter import (
-        API_RATE_LIMIT_MAX_REQUESTS,
-        API_RATE_LIMIT_MAX_WINDOW_SECONDS,
-    )
-    for category in _RATE_LIMIT_API_CATEGORIES:
-        for key, maximum in (
-            (f"rate_limit_api_{category}", API_RATE_LIMIT_MAX_REQUESTS),
-            (f"rate_limit_api_{category}_window", API_RATE_LIMIT_MAX_WINDOW_SECONDS),
-        ):
-            if key not in payload:
-                continue
-            value = payload[key]
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
-                or value > maximum
-            ):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"{key} must be an integer from 0 to {maximum}",
-                )
+    # Custom rate-limit overrides (general-API buckets + the login / vault / SFTP throttles) share one
+    # uniform bounds check from the registry: an int in [min, max], or the sentinel 0 meaning "clear the
+    # override and use the deployment default". An out-of-range / malformed value is refused here, and
+    # resolution independently fails safe to the deployment default, so a limit can never be turned off.
+    from app.core import rate_limit_settings as _rl_settings
+    for _rl_key in _rl_settings.OVERRIDE_KEYS:
+        if _rl_key in payload:
+            try:
+                _rl_settings.validate_override(_rl_key, payload[_rl_key])
+            except ValueError as _rl_err:
+                raise HTTPException(status_code=400, detail=str(_rl_err))
 
     for bool_key in ("zero_knowledge_enabled", "force_zero_knowledge", "force_no_remember_vault_password",
                      "sharing_enabled"):
@@ -2823,7 +2818,8 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
 
     # Auth limits (0/absent = keep the deployment env default). Enforced at login / token mint.
     # zk_idle_lock_minutes (0 = disabled) is a client-enforced ZK-key idle auto-lock.
-    for int_key in ("max_login_attempts", "lockout_duration", "session_timeout", "zk_idle_lock_minutes"):
+    # (max_login_attempts / lockout_duration are validated with bounds by the rate-limit registry above.)
+    for int_key in ("session_timeout", "zk_idle_lock_minutes"):
         if int_key in payload and payload[int_key] is not None:
             v = payload[int_key]
             if isinstance(v, bool) or not isinstance(v, int) or v < 0:
@@ -2979,6 +2975,11 @@ async def get_settings(
         data.setdefault(key, 0)
     data["rate_limit_api_enabled"] = bool(settings.rate_limit_api_enabled)
     data["rate_limit_api_deployment_defaults"] = _api_rate_limit_deployment_defaults()
+    # Structured view of EVERY overridable rate limit (login / vault / SFTP throttles + the API
+    # buckets): per limit the read-only deployment value, the custom override (or null), the effective
+    # value, bounds, unit and plain-language help. The Settings UI renders exactly this.
+    from app.core import rate_limit_settings as _rl_settings_view
+    data["rate_limit_settings"] = _rl_settings_view.describe_all(_blob)
     # Whether the deployment can send mail — the default sending profile (or the legacy global SMTP
     # config) is usable. The Accounts tab gates email-change verification on this rather than on the
     # now-removed inline SMTP fields.
@@ -3138,6 +3139,11 @@ async def update_settings(
         and any(key in (payload or {}) for key in _RATE_LIMIT_API_SETTING_KEYS)
     ):
         _api_rate_limit_policy_cache.replace(merged)
+    # Drop the login/vault/SFTP throttle-override cache so a just-saved change takes effect immediately
+    # (the general-API buckets have their own cache, replaced just above).
+    from app.core import rate_limit_settings as _rl_settings_write
+    if any(key in (payload or {}) for key in _rl_settings_write.OVERRIDE_KEYS):
+        _rl_settings_write.invalidate_cache()
     try:
         AuditLogger(db).log_action(
             action="settings_updated",
@@ -4096,31 +4102,46 @@ def _resolve_reset_user(db: Session, identifier: str):
     return u
 
 
+def _mint_reset_link(db: Session, user, base_url: str, *, created_by_id) -> Optional[str]:
+    """Mint a single-use reset token for `user` (invalidating any prior unconsumed one) and return the
+    plaintext reset LINK exactly once. Does NOT email and does NOT require the user to have an email, so
+    an admin can reset an email-less account by copying the link. The token row is identical to the
+    emailed path — same hash-at-rest, same TTL, same single-use / atomic-consume at POST /reset (which
+    also revokes the target's sessions). Returns None only when the reset pepper is unconfigured (no
+    token can be minted). The plaintext is returned to the caller and never logged."""
+    from app.core.password_reset import mint_reset_token, hash_reset_token, pepper_ok
+    from app.core.models import PasswordResetToken
+    pepper = _reset_pepper()
+    if not pepper_ok(pepper):
+        return None
+    _, ttl = _password_reset_policy(db)
+    db.query(PasswordResetToken).filter(
+        PasswordResetToken.user_id == user.id,
+        PasswordResetToken.consumed_at.is_(None)).delete(synchronize_session=False)
+    plaintext, prefix = mint_reset_token()
+    db.add(PasswordResetToken(
+        user_id=user.id, token_prefix=prefix, token_hash=hash_reset_token(plaintext, pepper),
+        expires_at=datetime.utcnow() + timedelta(minutes=ttl), created_by=created_by_id))
+    db.commit()
+    return f"{(base_url or '').rstrip('/')}/?reset={plaintext}"
+
+
 def _mint_and_send_reset(db: Session, user, base_url: str, *, created_by_id) -> bool:
     """Mint a single-use reset token (invalidating any prior unconsumed one), email it through the
     password_reset action with the freshly-minted {{action.link}}, and return whether it was sent.
-    Never raises — the caller (public or admin) must not fail on mail trouble."""
-    from app.core.password_reset import mint_reset_token, hash_reset_token, pepper_ok
-    from app.core.models import PasswordResetToken
+    Never raises — the caller (public or admin) must not fail on mail trouble. Requires an email."""
     from app.core.email_actions import send_action_email
-    pepper = _reset_pepper()
     email = (getattr(user, "email", "") or "").strip()
-    if not pepper_ok(pepper) or not email:
+    if not email:
         return False
-    _, ttl = _password_reset_policy(db)
     try:
-        db.query(PasswordResetToken).filter(
-            PasswordResetToken.user_id == user.id,
-            PasswordResetToken.consumed_at.is_(None)).delete(synchronize_session=False)
-        plaintext, prefix = mint_reset_token()
-        db.add(PasswordResetToken(
-            user_id=user.id, token_prefix=prefix, token_hash=hash_reset_token(plaintext, pepper),
-            expires_at=datetime.utcnow() + timedelta(minutes=ttl), created_by=created_by_id))
-        db.commit()
+        link = _mint_reset_link(db, user, base_url, created_by_id=created_by_id)
     except Exception:
         db.rollback()
         return False
-    link = f"{(base_url or '').rstrip('/')}/?reset={plaintext}"
+    if not link:
+        return False
+    _, ttl = _password_reset_policy(db)
     try:
         return bool(send_action_email(db, "password_reset",
                                       recipient={"email": email, "username": user.username},
@@ -4228,6 +4249,40 @@ async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
     except Exception:  # noqa: BLE001
         pass
     return {"email_sent": bool(sent)}
+
+
+@app.post("/users/{user_id}/reset-link")
+@require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
+async def admin_mint_reset_link(user_id: uuid.UUID, request: Request,
+                                current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Admin action: MINT a password-reset link for a user and return it ONCE for the admin to copy — no
+    email required, so an email-less account can still be reset. The link carries a single-use,
+    hash-at-rest, TTL-bounded token identical to the emailed path; using it (POST /reset) atomically
+    consumes the token and revokes the target's sessions. Interactive-admin only; audited (the target +
+    TTL, never the token). This is a password-reset primitive, not a lockout change, so there is no
+    self-target / last-admin restriction (an admin can already reset/deactivate users they manage)."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage users.")
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not getattr(user, "is_active", True):
+        raise HTTPException(status_code=400,
+                            detail="That account is inactive; reactivate it before issuing a reset link.")
+    link = _mint_reset_link(db, user, _public_base_url(request), created_by_id=current_user.id)
+    if not link:
+        raise HTTPException(status_code=400,
+                            detail="Password reset is not configured on this deployment (LOG_TOKEN_PEPPER is unset).")
+    _, ttl = _password_reset_policy(db)
+    try:
+        # Audit the ACT (who reset whom) — never the token/link, which would defeat single-use secrecy.
+        AuditLogger(db).log_action(action="password_reset_link_minted", status="success", user=current_user,
+                                   ip_address=get_client_ip(request),
+                                   details={"target_user_id": str(user_id), "ttl_minutes": ttl})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"reset_link": link, "expires_in_minutes": ttl, "username": user.username}
 
 
 @app.get("/reset/{token}")
@@ -6260,7 +6315,21 @@ async def list_users(
     List all users (admin only).
     """
     users = db.query(User).all()
-    return [UserResponse.model_validate(user) for user in users]
+    # Batch the "has an active second factor?" lookup so the list stays one extra query, not one
+    # per row. A user with any active TOTP enrollment shows MFA On in the accounts table.
+    mfa_user_ids = {
+        r[0]
+        for r in db.query(SecondFactorEnrollment.user_id)
+        .filter(SecondFactorEnrollment.status == "active")
+        .distinct()
+        .all()
+    }
+    result = []
+    for user in users:
+        item = UserResponse.model_validate(user)
+        item.second_factor_enabled = user.id in mfa_user_ids
+        result.append(item)
+    return result
 
 
 @app.get("/users/me", response_model=UserResponse)
@@ -6897,6 +6966,55 @@ async def update_second_factor_action(
     except Exception:  # noqa: BLE001
         pass
     return {"key": key, "require_otp": row.require_otp, "require_password": row.require_password}
+
+
+class SecondFactorActionsBulk(BaseModel):
+    actions: list = Field(default_factory=list)
+
+
+@app.put("/second-factor/actions")
+@require_step_up("account.second_factor")
+async def update_second_factor_actions_bulk(
+    body: SecondFactorActionsBulk,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Apply several step-up action toggles at once, under a SINGLE account.second_factor step-up — so
+    an admin can edit the whole matrix and confirm their second factor ONCE instead of once per toggle.
+    Validated all-or-nothing (an unknown key rejects the whole batch before anything is written)."""
+    from app.core.second_factor_actions import ACTION_KEYS, ACTION_META
+    items = body.actions or []
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="actions must be a list.")
+    for it in items:
+        if not isinstance(it, dict) or it.get("key") not in ACTION_KEYS:
+            raise HTTPException(status_code=400, detail="actions contains an unknown or malformed entry.")
+    changed = []
+    for it in items:
+        k = it["key"]
+        row = db.query(SecondFactorAction).filter(SecondFactorAction.key == k).first()
+        if row is None:
+            row = SecondFactorAction(key=k)
+            db.add(row)
+        if it.get("require_otp") is not None:
+            row.require_otp = bool(it["require_otp"])
+        if it.get("require_password") is not None:
+            row.require_password = bool(it["require_password"])
+        changed.append(k)
+    db.commit()
+    try:
+        AuditLogger(db).log_action(action="second_factor_actions_bulk_updated", status="success",
+                                   user=current_user, ip_address=get_client_ip(request),
+                                   details={"keys": changed})
+    except Exception:  # noqa: BLE001
+        pass
+    rows = {r.key: r for r in db.query(SecondFactorAction).all()}
+    return {"actions": [
+        {"key": k, "name": ACTION_META[k]["name"],
+         "require_otp": bool(rows[k].require_otp) if k in rows else bool(ACTION_META[k]["default_require_otp"]),
+         "require_password": bool(rows[k].require_password) if k in rows else False}
+        for k in ACTION_KEYS if k != "login"]}
 
 
 @app.get("/users/me/preferences")
