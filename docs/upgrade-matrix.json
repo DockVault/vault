@@ -213,6 +213,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.22.0": {
+      "released": "2026-08-30",
+      "notes": "Adds upload links (\"receivers\"): an admin can enable anonymous, tokenized links that let anyone with the URL upload files into a dedicated, owner-paid Standard vault, governed by receiver tags (token-length floor, optional PIN/password, expiry, per-file and total size caps, retention) and revocable or pausable at any time. The link token is stored hashed and shown once. Anonymous uploads reserve their declared size against the receiver's cap before any bytes move, are admitted on a separate transfer budget so they cannot starve signed-in transfers, and can only ever land in the receiver's own vault. New receivers, receiver_tags and receiver_upload_sessions tables plus a receivers.reserved_bytes column are created automatically at boot -- no migration step, and no existing data is changed. A rollback to 0.21.0 leaves the tables intact but stops serving upload links until you upgrade again.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -402,6 +410,13 @@
     {
       "from": "0.20.0",
       "to": "0.21.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.21.0",
+      "to": "0.22.0",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false

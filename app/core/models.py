@@ -1494,6 +1494,129 @@ class PublicLink(Base):
     )
 
 
+class ReceiverTag(Base):
+    """Admin-owned policy template for a RECEIVER ("Upload links" — anonymous INBOUND uploads).
+
+    The receiver twin of NoteLinkTag: a security FLOOR that a user creating a receiver may only
+    TIGHTEN (stronger link secret, shorter TTL, smaller per-file / total caps, shorter retention,
+    fewer uploads). `kind_floor='confidential'` FORCES the browser password-envelope on every receiver
+    minted under the tag. A WHOLE NEW TABLE, created by create_all (additive; no migration). The
+    create-allowlist mirrors ShareTag / NoteLinkTag and is evaluated LIVE via
+    sharing_policy.user_can_create_with_tag.
+    """
+    __tablename__ = 'receiver_tags'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(120), nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    # Presentation for the "Upload links" tiles.
+    border_color = Column(String(20), nullable=True)
+    icon = Column(String(40), nullable=True)
+
+    # --- Link-reachability floor (how hard the UPLOAD page is to reach) — mirrors NoteLinkTag ---
+    min_token_len = Column(Integer, nullable=False, default=10)
+    default_ttl_hours = Column(Integer, nullable=True)
+    max_ttl_hours = Column(Integer, nullable=True)
+    require_secret = Column(String(16), nullable=False, default='none')   # 'none' | 'pin' | 'password'
+    min_pin_len = Column(Integer, nullable=False, default=4)
+    password_min_len = Column(Integer, nullable=False, default=8)
+    password_require_alnum = Column(Boolean, nullable=False, default=False)
+
+    # --- Receiver-specific floor ---
+    # 'confidential' forces the client-side password envelope; 'standard' leaves it optional-off.
+    kind_floor = Column(String(16), nullable=False, default='standard')
+    # Upload/size/retention ceilings. NULL = unlimited (within the tag).
+    max_uploads_cap = Column(Integer, nullable=True)
+    max_file_bytes_cap = Column(BigInteger, nullable=True)
+    max_total_bytes_cap = Column(BigInteger, nullable=True)
+    retention_max_days = Column(Integer, nullable=True)
+    retention_default_days = Column(Integer, nullable=True)
+
+    # --- Create-allowlist (LIVE; who may create a receiver with this tag) — mirrors ShareTag ---
+    allowed_department_ids = Column(JSON, nullable=False, default=list)
+    allowed_user_ids = Column(JSON, nullable=False, default=list)
+    blocked_user_ids = Column(JSON, nullable=False, default=list)
+    auto_enroll_new_users = Column(Boolean, nullable=False, default=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+
+
+class Receiver(Base):
+    """A RECEIVER ("Upload link"): an anonymous INBOUND drop that lets anyone with the URL upload files
+    into a dedicated Standard vault the owner pays for.
+
+    A receiver WRAPS a Standard vault (one-to-one, `vault_id` UNIQUE): the vault holds the arrived
+    files and the owner browses/downloads them in the ordinary vault view, while this row freezes the
+    policy the wrapper enforces (per-file + total caps, retention, upload count, link secret). The URL
+    token is a bearer credential and is stored HASHED (sha256 `token_hash`), shown once at creation —
+    like PublicLink and the internal share link. A `kind='confidential'` receiver additionally carries
+    a client-side password `envelope`. A WHOLE NEW TABLE (create_all; additive).
+    """
+    __tablename__ = 'receivers'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    # The dedicated vault this receiver drops into (deleting the vault deletes the receiver).
+    vault_id = Column(UUID(as_uuid=True), ForeignKey('vaults.id', ondelete='CASCADE'),
+                      nullable=False, unique=True)
+    tag_id = Column(UUID(as_uuid=True), ForeignKey('receiver_tags.id', ondelete='SET NULL'), nullable=True)
+    label = Column(String(120), nullable=True)                 # owner-facing name (the vault name is random)
+    kind = Column(String(16), nullable=False, default='standard')   # 'standard' | 'confidential'
+
+    # The URL token: stored HASHED, shown once at creation.
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    token_len = Column(Integer, nullable=False)
+    # Optional LINK secret (a PIN/password to reach the upload page — distinct from the file envelope).
+    secret_kind = Column(String(16), nullable=False, default='none')
+    password_hash = Column(String(255), nullable=True)
+    # Confidential only: the client-side password-envelope descriptor {v, kdf, iterations, salt, verifier}.
+    envelope = Column(JSON, nullable=True)
+
+    expires_at = Column(DateTime, nullable=True)               # NULL = never
+    max_uploads = Column(Integer, nullable=True)               # NULL = unlimited
+    upload_count = Column(Integer, nullable=False, default=0)
+    # Frozen policy the wrapper enforces on the vault.
+    max_file_bytes = Column(BigInteger, nullable=True)         # per-file cap; NULL = the vault/deployment cap
+    max_total_bytes = Column(BigInteger, nullable=True)        # the receiver vault's size_limit
+    # In-flight bytes reserved by open anonymous upload sessions (reserve-at-open; refunded on
+    # finalize / abort / expiry). The invariant is stored_bytes + reserved_bytes <= max_total_bytes,
+    # so N concurrent anonymous uploads can't race past the cap.
+    reserved_bytes = Column(BigInteger, nullable=False, default=0)
+    retention_days = Column(Integer, nullable=True)            # uploads expire after this many days
+
+    paused = Column(Boolean, nullable=False, default=False)    # temporarily stop accepting uploads
+    revoked = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_upload_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index('idx_receiver_owner', 'owner_id'),
+        Index('idx_receiver_vault', 'vault_id'),
+    )
+
+
+class ReceiverUploadSession(Base):
+    """Binds one anonymous chunked-upload session to the receiver it belongs to, so a session minted
+    against receiver A can never be finalized against another vault. Carries the IP and (for a
+    secret-gated receiver) the proven link-secret hash the anonymous uploader presented. Deleting the
+    chunked session (or the receiver) deletes this row. A WHOLE NEW TABLE (create_all; additive)."""
+    __tablename__ = 'receiver_upload_sessions'
+
+    session_id = Column(UUID(as_uuid=True),
+                        ForeignKey('chunked_upload_sessions.id', ondelete='CASCADE'), primary_key=True)
+    receiver_id = Column(UUID(as_uuid=True), ForeignKey('receivers.id', ondelete='CASCADE'), nullable=False)
+    secret_hash = Column(String(64), nullable=True)            # proof the link secret was satisfied (if any)
+    client_ip = Column(String(64), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_receiver_upload_session_receiver', 'receiver_id'),
+    )
+
+
 # --- Transparent note-content sealing (personal notes + public-link snapshots) ---------------
 # Notes store title/body sealed at rest (a self-describing 'nenc1:' marker + AES-GCM keyed per row);
 # the public note LINK stores a frozen title_snapshot/body_snapshot the same way. Decrypt on

@@ -39,9 +39,10 @@ bootstrap_entrypoint("API")
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
 from app.core.chunk_cleanup import fail_chunk_session
 from app.core.session_hash_utils import hash_session_token
-from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink, PublicLink, SecondFactorEnrollment, SecondFactorRecoveryCode, SecondFactorAction, PendingLogin
+from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink, PublicLink, ReceiverTag, Receiver, ReceiverUploadSession, SecondFactorEnrollment, SecondFactorRecoveryCode, SecondFactorAction, PendingLogin
 from app.core import sharing_policy
 from app.core import note_link_policy
+from app.core import receiver_policy
 from app.core import storage_quota
 from app.core.email_identity import (
     EMAIL_LOWER_UNIQUE_INDEX, email_in_use, find_email_collisions, normalize_email,
@@ -118,6 +119,15 @@ from app.core.transfer_admission import TransferAdmission, TransferBusy  # noqa:
 transfer_admission = TransferAdmission(
     limit=settings.max_concurrent_transfers,
     max_waiting=settings.max_queued_transfers,
+    wait_seconds=settings.transfer_queue_wait_seconds,
+)
+
+# GATE 1 — a SEPARATE, smaller admission pool for the ANONYMOUS inbound (receiver) upload finalize, so
+# a flood of anonymous uploads can never starve authenticated transfers of the main pool. Sized as a
+# fraction of the main ceiling (at least 1), with a short, shallow queue.
+receiver_transfer_admission = TransferAdmission(
+    limit=max(1, settings.max_concurrent_transfers // 4),
+    max_waiting=max(1, settings.max_queued_transfers // 4),
     wait_seconds=settings.transfer_queue_wait_seconds,
 )
 
@@ -2729,6 +2739,12 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # Receiver (upload-link) settings (feature toggle + the per-user active-receiver cap).
+    try:
+        receiver_policy.validate_settings(payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     # Max note size (chars).
     if "note_max_chars" in payload:
         v = payload["note_max_chars"]
@@ -2944,6 +2960,9 @@ async def get_settings(
     data["public_note_link_user_cap"] = note_link_policy.public_note_link_user_cap(_blob)
     # Public FILE/FOLDER-link master switch (default OFF); shares the per-user cap above.
     data["public_file_links_enabled"] = note_link_policy.public_file_links_enabled(_blob)
+    # Receiver (upload-link) master switch (default OFF) + the per-user active-receiver cap.
+    data["public_receivers_enabled"] = receiver_policy.public_receivers_enabled(_blob)
+    data["public_receiver_user_cap"] = receiver_policy.public_receiver_user_cap(_blob)
     data["note_max_chars"] = _note_max_chars(db)
     # Effective account-onboarding policy (email requirement, invitation + signup switches, domain
     # gate, login identifier) with defaults filled in, so the Accounts & Access tab renders the real
@@ -8134,6 +8153,199 @@ async def deactivate_note_link_tag(
     return {"message": f"Note-link tag '{tag.name}' deactivated", "id": str(tag.id), "is_active": False}
 
 
+# ============================ RECEIVER TAGS (admin policy floors for upload links) =================
+_RECEIVER_TAG_NOT_NULLABLE = (
+    "name", "is_active", "min_token_len", "require_secret", "min_pin_len",
+    "password_min_len", "password_require_alnum", "kind_floor",
+    "allowed_department_ids", "allowed_user_ids", "blocked_user_ids", "auto_enroll_new_users",
+)
+
+
+class ReceiverTagCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    is_active: bool = True
+    border_color: Optional[str] = None
+    icon: Optional[str] = None
+    min_token_len: int = 10
+    default_ttl_hours: Optional[int] = None
+    max_ttl_hours: Optional[int] = None
+    require_secret: str = "none"
+    min_pin_len: int = 4
+    password_min_len: int = 8
+    password_require_alnum: bool = False
+    kind_floor: str = "standard"
+    max_uploads_cap: Optional[int] = None
+    max_file_bytes_cap: Optional[int] = None
+    max_total_bytes_cap: Optional[int] = None
+    retention_max_days: Optional[int] = None
+    retention_default_days: Optional[int] = None
+    allowed_department_ids: list = Field(default_factory=list)
+    allowed_user_ids: list = Field(default_factory=list)
+    blocked_user_ids: list = Field(default_factory=list)
+    auto_enroll_new_users: bool = False
+
+
+class ReceiverTagUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+    border_color: Optional[str] = None
+    icon: Optional[str] = None
+    min_token_len: Optional[int] = None
+    default_ttl_hours: Optional[int] = None
+    max_ttl_hours: Optional[int] = None
+    require_secret: Optional[str] = None
+    min_pin_len: Optional[int] = None
+    password_min_len: Optional[int] = None
+    password_require_alnum: Optional[bool] = None
+    kind_floor: Optional[str] = None
+    max_uploads_cap: Optional[int] = None
+    max_file_bytes_cap: Optional[int] = None
+    max_total_bytes_cap: Optional[int] = None
+    retention_max_days: Optional[int] = None
+    retention_default_days: Optional[int] = None
+    allowed_department_ids: Optional[list] = None
+    allowed_user_ids: Optional[list] = None
+    blocked_user_ids: Optional[list] = None
+    auto_enroll_new_users: Optional[bool] = None
+
+
+def _receiver_tag_dict(t: ReceiverTag) -> dict:
+    return {
+        "id": str(t.id), "name": t.name, "description": t.description, "is_active": bool(t.is_active),
+        "border_color": t.border_color, "icon": t.icon,
+        "min_token_len": t.min_token_len,
+        "default_ttl_hours": t.default_ttl_hours, "max_ttl_hours": t.max_ttl_hours,
+        "require_secret": t.require_secret, "min_pin_len": t.min_pin_len,
+        "password_min_len": t.password_min_len, "password_require_alnum": bool(t.password_require_alnum),
+        "kind_floor": t.kind_floor,
+        "max_uploads_cap": t.max_uploads_cap, "max_file_bytes_cap": t.max_file_bytes_cap,
+        "max_total_bytes_cap": t.max_total_bytes_cap,
+        "retention_max_days": t.retention_max_days, "retention_default_days": t.retention_default_days,
+        "allowed_department_ids": t.allowed_department_ids or [],
+        "allowed_user_ids": t.allowed_user_ids or [],
+        "blocked_user_ids": t.blocked_user_ids or [],
+        "auto_enroll_new_users": bool(t.auto_enroll_new_users),
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+    }
+
+
+def _audit_receiver_tag(db, request, user, action, tag):
+    try:
+        AuditLogger(db).log_action(action=action, status="success", user=user,
+                                   resource_type="receiver_tag", resource_id=str(tag.id),
+                                   details={"name": tag.name}, ip_address=get_client_ip(request))
+    except Exception:
+        pass
+
+
+@app.get("/receiver-tags")
+async def list_receiver_tags(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """List all receiver tags (active AND inactive) for the admin manager."""
+    tags = db.query(ReceiverTag).order_by(ReceiverTag.name).all()
+    return [_receiver_tag_dict(t) for t in tags]
+
+
+@app.post("/receiver-tags")
+async def create_receiver_tag(
+    payload: ReceiverTagCreate,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Create a receiver tag (interactive-admin). Name unique; policy validated against the floor rules."""
+    data = payload.model_dump()
+    data["name"] = (data.get("name") or "").strip()
+    for k in ("allowed_department_ids", "allowed_user_ids", "blocked_user_ids"):
+        data[k] = [str(x) for x in (data.get(k) or [])]
+    try:
+        receiver_policy.validate_tag_fields(data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    existing = db.query(ReceiverTag).filter(ReceiverTag.name == data["name"]).first()
+    if existing:
+        raise HTTPException(status_code=400,
+                            detail="A receiver tag with that name already exists"
+                            if existing.is_active else
+                            "A deactivated tag already uses this name — reactivate it or choose another")
+    tag = ReceiverTag(created_by=current_user.id, **data)
+    db.add(tag)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="A receiver tag with that name already exists")
+    db.refresh(tag)
+    _audit_receiver_tag(db, request, current_user, "receiver_tag_created", tag)
+    return _receiver_tag_dict(tag)
+
+
+@app.patch("/receiver-tags/{tag_id}")
+async def update_receiver_tag(
+    tag_id: uuid.UUID,
+    payload: ReceiverTagUpdate,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Update a receiver tag (interactive-admin). Only PROVIDED keys change."""
+    tag = db.query(ReceiverTag).filter(ReceiverTag.id == tag_id).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Receiver tag not found")
+    data = payload.model_dump(exclude_unset=True)
+    for k in _RECEIVER_TAG_NOT_NULLABLE:
+        if k in data and data[k] is None:
+            raise HTTPException(status_code=400, detail=f"{k} cannot be null")
+    if "name" in data:
+        data["name"] = (data["name"] or "").strip()
+        if not data["name"]:
+            raise HTTPException(status_code=400, detail="Tag name cannot be empty")
+        if db.query(ReceiverTag).filter(ReceiverTag.name == data["name"], ReceiverTag.id != tag_id).first():
+            raise HTTPException(status_code=400, detail="A receiver tag with that name already exists")
+    for k in ("allowed_department_ids", "allowed_user_ids", "blocked_user_ids"):
+        if k in data:
+            data[k] = [str(x) for x in (data[k] or [])]
+    eff = _receiver_tag_dict(tag)
+    eff.update(data)
+    try:
+        receiver_policy.validate_tag_fields(eff)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    for k, v in data.items():
+        setattr(tag, k, v)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="A receiver tag with that name already exists")
+    db.refresh(tag)
+    _audit_receiver_tag(db, request, current_user, "receiver_tag_updated", tag)
+    return _receiver_tag_dict(tag)
+
+
+@app.delete("/receiver-tags/{tag_id}")
+async def deactivate_receiver_tag(
+    tag_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Soft-deactivate a receiver tag (interactive-admin) — stops NEW receivers; existing receivers keep
+    their snapshot policy. Reactivate via PATCH is_active=true."""
+    tag = db.query(ReceiverTag).filter(ReceiverTag.id == tag_id).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Receiver tag not found")
+    tag.is_active = False
+    db.commit()
+    _audit_receiver_tag(db, request, current_user, "receiver_tag_deactivated", tag)
+    return {"message": f"Receiver tag '{tag.name}' deactivated", "id": str(tag.id), "is_active": False}
+
+
 # ============================ PUBLIC NOTE LINKS (anonymous snapshot links) =========================
 # A NoteLink is an anonymous, tokenized SNAPSHOT of one note, governed by a NoteLinkTag floor that the
 # owner may only TIGHTEN. Creation is authenticated + feature-gated + allowlisted + per-user-capped;
@@ -9525,6 +9737,929 @@ async def download_public_link(
         "X-Robots-Tag": "noindex, nofollow",
     }
     return StreamingResponse(file_streamer(), media_type=_safe_media_type(mime_type), headers=headers)
+
+
+# ---------------------------------------------------------------------------
+# RECEIVERS (anonymous INBOUND upload links). A Receiver wraps a dedicated, owner-paid Standard vault:
+# anyone with the link can upload into it, bounded by the wrapper's frozen policy (per-file / total
+# caps, retention, link secret). Creation is authenticated + step-up-gated + feature-gated + allowlisted
+# + per-user capped; the URL token is stored HASHED and shown once. The anonymous UPLOAD path is a
+# separate, later change. v1 is STANDARD receivers only (the confidential envelope is deferred).
+# ---------------------------------------------------------------------------
+def _receiver_token_hash(token: str) -> str:
+    import hashlib as _hashlib
+    return _hashlib.sha256(token.encode()).hexdigest()
+
+
+def _receiver_status(r, now=None) -> str:
+    now = now or datetime.utcnow()
+    if r.revoked:
+        return "revoked"
+    if r.expires_at and r.expires_at <= now:
+        return "expired"
+    if r.max_uploads is not None and r.upload_count >= r.max_uploads:
+        return "exhausted"
+    if r.paused:
+        return "paused"
+    return "active"
+
+
+def _receiver_public_dict(r, tag=None) -> dict:
+    """Owner-facing view of a receiver. NEVER includes the token (stored hashed; the plaintext URL is
+    shown only once, in the create response)."""
+    return {
+        "id": str(r.id),
+        "kind": r.kind,
+        "label": r.label or "",
+        "vault_id": str(r.vault_id),
+        "tag_id": str(r.tag_id) if r.tag_id else None,
+        "tag_name": getattr(tag, "name", None),
+        "tag_border_color": getattr(tag, "border_color", None),
+        "tag_icon": getattr(tag, "icon", None),
+        "secret_kind": r.secret_kind,
+        "expires_at": r.expires_at.isoformat() if r.expires_at else None,
+        "max_uploads": r.max_uploads,
+        "upload_count": r.upload_count,
+        "max_file_bytes": r.max_file_bytes,
+        "max_total_bytes": r.max_total_bytes,
+        "retention_days": r.retention_days,
+        "paused": bool(r.paused),
+        "revoked": bool(r.revoked),
+        "status": _receiver_status(r),
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "last_upload_at": r.last_upload_at.isoformat() if r.last_upload_at else None,
+    }
+
+
+def _receiver_admin_dict(r, tag, owner) -> dict:
+    d = _receiver_public_dict(r, tag)
+    d["owner_id"] = str(r.owner_id)
+    d["owner"] = (getattr(owner, "username", None) or getattr(owner, "email", None)) if owner else None
+    return d
+
+
+def _receiver_active_count(db, owner_id) -> int:
+    """Active receivers held by a user. 'Active' = not revoked, not expired, not exhausted (a paused
+    receiver still counts — it holds a vault + budget)."""
+    from sqlalchemy import func as _f, or_ as _or
+    now = datetime.utcnow()
+    return int(db.query(_f.count(Receiver.id)).filter(
+        Receiver.owner_id == owner_id, Receiver.revoked.is_(False),
+        _or(Receiver.expires_at.is_(None), Receiver.expires_at > now),
+        _or(Receiver.max_uploads.is_(None), Receiver.upload_count < Receiver.max_uploads)).scalar() or 0)
+
+
+def _receiver_random_vault_name() -> str:
+    return "recv-" + _notelink_gen_token(12)
+
+
+def _receiver_for_vault(db, vault_id):
+    """Return the Receiver wrapping this vault, or None. A vault that has a receiver row is
+    policy-frozen: three ordinary vault routes are constrained on it so the owner can't rewrite the
+    policy the wrapper enforces."""
+    return db.query(Receiver).filter(Receiver.vault_id == vault_id).first()
+
+
+def _receiver_reserve_bytes(db, receiver_id, size, stored) -> bool:
+    """GATE 2 — reserve `size` bytes for an in-flight anonymous upload, ATOMICALLY. Increments
+    reserved_bytes only if stored + reserved_bytes + size stays within max_total_bytes; the conditional
+    UPDATE re-reads reserved_bytes on the row, so N concurrent opens can't race past the cap. Returns
+    True if the reservation was made, False if it would exceed the receiver's total cap."""
+    from sqlalchemy import update as _sa_update
+    stmt = (_sa_update(Receiver)
+            .where(Receiver.id == receiver_id,
+                   Receiver.max_total_bytes.isnot(None),
+                   (int(stored) + Receiver.reserved_bytes + int(size)) <= Receiver.max_total_bytes)
+            .values(reserved_bytes=Receiver.reserved_bytes + int(size)))
+    res = db.execute(stmt)
+    db.commit()
+    return (res.rowcount or 0) == 1
+
+
+def _receiver_release_bytes(db, receiver_id, size) -> None:
+    """Refund a reservation (on session-open failure, abort, or expiry). Floors at 0 so a double
+    refund can't drive the counter negative."""
+    from sqlalchemy import update as _sa_update, func as _f
+    try:
+        db.execute(_sa_update(Receiver).where(Receiver.id == receiver_id).values(
+            reserved_bytes=_f.greatest(Receiver.reserved_bytes - int(size), 0)))
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
+class ReceiverPauseBody(BaseModel):
+    paused: bool = True
+
+
+class ReceiverCreate(BaseModel):
+    tag_id: uuid.UUID
+    label: Optional[str] = None
+    token_len: Optional[int] = None
+    secret_kind: Optional[str] = None
+    pin: Optional[str] = None
+    password: Optional[str] = None
+    ttl_hours: Optional[int] = None
+    kind: Optional[str] = None
+    max_uploads: Optional[int] = None
+    max_file_bytes: Optional[int] = None
+    max_total_bytes: Optional[int] = None
+    retention_days: Optional[int] = None
+
+
+@app.post("/receivers")
+@require_step_up("receiver.create")
+async def create_receiver(
+    payload: ReceiverCreate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a RECEIVER (an anonymous upload link) under a receiver tag I'm allowed to use. Creates a
+    dedicated, owner-paid Standard vault and freezes the tighten-only policy onto the receiver row. The
+    URL token is minted, stored HASHED, and returned ONCE. Feature-gated, allowlisted, per-user capped,
+    audited. v1: STANDARD receivers only (confidential is not available yet)."""
+    from app.core.security import hash_password
+
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="A temporary session cannot create upload links.")
+    if not receiver_policy.public_receivers_enabled(_global_settings_blob(db)):
+        raise HTTPException(status_code=403, detail="Upload links are disabled on this deployment.")
+
+    tag = db.query(ReceiverTag).filter(ReceiverTag.id == payload.tag_id).first()
+    if not tag or not tag.is_active:
+        raise HTTPException(status_code=404, detail="Receiver tag not found.")
+    allowlist = {"is_active": tag.is_active, "blocked_user_ids": tag.blocked_user_ids,
+                 "allowed_user_ids": tag.allowed_user_ids,
+                 "allowed_department_ids": tag.allowed_department_ids,
+                 "auto_enroll_new_users": tag.auto_enroll_new_users}
+    if not sharing_policy.user_can_create_with_tag(allowlist, current_user.id,
+                                                   _user_group_ids(db, current_user.id)):
+        raise HTTPException(status_code=403, detail="You are not permitted to create links with this tag.")
+
+    # Per-user active-receiver cap (secondary anti-abuse; the owner-paid budget is the primary control).
+    cap = receiver_policy.public_receiver_user_cap(_global_settings_blob(db))
+    if _receiver_active_count(db, current_user.id) >= cap:
+        raise HTTPException(status_code=409,
+                            detail=f"You have reached your limit of {cap} active upload links. Revoke one first.")
+
+    overrides = payload.model_dump(exclude_unset=True)
+    for k in ("tag_id", "label"):
+        overrides.pop(k, None)
+    try:
+        pol = receiver_policy.resolve_receiver_policy(tag, overrides)
+    except receiver_policy.PolicyViolation as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # v1 gate: confidential receivers (the client-side password envelope) are not available yet.
+    if pol["kind"] != "standard":
+        raise HTTPException(status_code=400,
+                            detail="Confidential upload links are not available yet; use a standard link.")
+
+    # A receiver is owner-paid: it must have a concrete total size so the vault's size_limit can be
+    # funded from the owner's budget. Require it (the tag cap, or the creator's choice within it).
+    total_bytes = pol["max_total_bytes"]
+    if not total_bytes or total_bytes <= 0:
+        raise HTTPException(status_code=400,
+                            detail="Choose a total size for this upload link (max_total_bytes).")
+    _enforce_vault_size(db, current_user, int(total_bytes))
+
+    password_hash = hash_password(pol["secret_value"]) if pol["secret_value"] is not None else None
+    now = datetime.utcnow()
+    expires_at = (now + timedelta(hours=pol["ttl_hours"])) if pol["ttl_hours"] else None
+
+    # Allocate a unique token (stored HASHED).
+    token = token_hash = None
+    for _ in range(8):
+        cand = _notelink_gen_token(pol["token_len"])
+        cand_hash = _receiver_token_hash(cand)
+        if not db.query(Receiver.id).filter(Receiver.token_hash == cand_hash).first():
+            token, token_hash = cand, cand_hash
+            break
+    if token is None:
+        raise HTTPException(status_code=500, detail="Could not allocate a link token; try again.")
+
+    # Create the dedicated Standard vault (random name; the owner-facing label lives on the receiver
+    # row), funded entirely by a single owner grant.
+    vault_service = VaultService(db, PermissionService(db))
+    try:
+        vault = vault_service.create_vault(
+            name=_receiver_random_vault_name(),
+            owner=current_user,
+            description="Upload link drop",
+            vault_type="standard",
+            size_limit=int(total_bytes),
+            expire_files_after_days=pol["retention_days"],
+        )
+    except (ValueError, IntegrityError):
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not create the upload-link vault.")
+    _write_vault_grant(db, vault, current_user.id, int(total_bytes))
+
+    receiver = Receiver(
+        owner_id=current_user.id, vault_id=vault.id, tag_id=tag.id, label=(payload.label or None),
+        kind=pol["kind"], token_hash=token_hash, token_len=pol["token_len"],
+        secret_kind=pol["secret_kind"], password_hash=password_hash, envelope=None,
+        expires_at=expires_at, max_uploads=pol["max_uploads"],
+        max_file_bytes=pol["max_file_bytes"], max_total_bytes=int(total_bytes),
+        retention_days=pol["retention_days"])
+    db.add(receiver)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Link token collision; please try again.")
+    db.refresh(receiver)
+    try:
+        AuditLogger(db).log_action(
+            action="receiver_create", status="success", user=current_user,
+            resource_type="receiver", resource_id=str(receiver.id),
+            details={"vault_id": str(vault.id), "tag": tag.name, "kind": receiver.kind,
+                     "secret_kind": receiver.secret_kind, "token_len": receiver.token_len,
+                     "max_total_bytes": receiver.max_total_bytes, "retention_days": receiver.retention_days},
+            ip_address=get_client_ip(request))
+    except Exception:
+        pass
+    out = _receiver_public_dict(receiver, tag)
+    out["token"] = token
+    out["url_path"] = f"/u/{token}"
+    return out
+
+
+@app.get("/receivers")
+async def list_receivers(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List MY receivers (newest first). The token/URL is NEVER returned (stored hashed; shown once)."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="A temporary session cannot list upload links.")
+    rows = db.query(Receiver).filter(Receiver.owner_id == current_user.id)\
+        .order_by(Receiver.created_at.desc()).all()
+    tag_ids = {r.tag_id for r in rows if r.tag_id}
+    tags = {t.id: t for t in db.query(ReceiverTag).filter(ReceiverTag.id.in_(tag_ids)).all()} if tag_ids else {}
+    return {"receivers": [_receiver_public_dict(r, tags.get(r.tag_id)) for r in rows]}
+
+
+@app.get("/receiver-policy")
+async def get_receiver_policy(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Effective receiver policy for the CURRENT user — non-admin readable, so the create-receiver UI can
+    shape its controls. FAIL-CLOSED: feature off -> no tags; a temp session -> no tags; a tag whose
+    allowlist excludes the user is dropped. v1 hides confidential-floor tags (not creatable yet)."""
+    blob = _global_settings_blob(db)
+    enabled = receiver_policy.public_receivers_enabled(blob)
+    cap = receiver_policy.public_receiver_user_cap(blob)
+    if not enabled or getattr(current_user, "_is_temp_session", False):
+        return {"enabled": enabled, "user_cap": cap, "remaining": 0, "tags": []}
+    remaining = max(0, cap - _receiver_active_count(db, current_user.id))
+    user_gids = _user_group_ids(db, current_user.id)
+    tags = []
+    for t in db.query(ReceiverTag).filter(ReceiverTag.is_active.is_(True)).order_by(ReceiverTag.name).all():
+        # v1: a confidential-floor tag can't be used (confidential receivers are deferred) — hide it.
+        if (t.kind_floor or "standard") != "standard":
+            continue
+        allowlist = {"is_active": t.is_active, "blocked_user_ids": t.blocked_user_ids,
+                     "allowed_user_ids": t.allowed_user_ids,
+                     "allowed_department_ids": t.allowed_department_ids,
+                     "auto_enroll_new_users": t.auto_enroll_new_users}
+        if not sharing_policy.user_can_create_with_tag(allowlist, current_user.id, user_gids):
+            continue
+        tags.append({
+            "id": str(t.id), "name": t.name, "description": t.description,
+            "border_color": t.border_color, "icon": t.icon, "kind_floor": t.kind_floor,
+            "min_token_len": t.min_token_len,
+            "default_ttl_hours": t.default_ttl_hours, "max_ttl_hours": t.max_ttl_hours,
+            "require_secret": t.require_secret, "min_pin_len": t.min_pin_len,
+            "password_min_len": t.password_min_len,
+            "password_require_alnum": bool(t.password_require_alnum),
+            "max_uploads_cap": t.max_uploads_cap, "max_file_bytes_cap": t.max_file_bytes_cap,
+            "max_total_bytes_cap": t.max_total_bytes_cap,
+            "retention_max_days": t.retention_max_days, "retention_default_days": t.retention_default_days,
+        })
+    return {"enabled": True, "user_cap": cap, "remaining": remaining, "tags": tags}
+
+
+@app.post("/receivers/{receiver_id}/pause")
+async def pause_receiver(
+    receiver_id: uuid.UUID,
+    request: Request,
+    body: ReceiverPauseBody = ReceiverPauseBody(),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Pause or resume one of MY receivers (stops/allows new uploads without deleting it). Body:
+    {paused: bool} (default true = pause)."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="A temporary session cannot manage upload links.")
+    r = db.query(Receiver).filter(Receiver.id == receiver_id,
+                                  Receiver.owner_id == current_user.id).first()
+    if not r:
+        raise HTTPException(status_code=404, detail="Upload link not found")
+    want = bool(body.paused)
+    if r.paused != want:
+        r.paused = want
+        db.commit()
+        try:
+            AuditLogger(db).log_action(
+                action="receiver_pause" if want else "receiver_resume", status="success",
+                user=current_user, resource_type="receiver", resource_id=str(r.id),
+                ip_address=get_client_ip(request))
+        except Exception:
+            pass
+    return {"ok": True, "id": str(r.id), "paused": bool(r.paused)}
+
+
+@app.post("/receivers/{receiver_id}/revoke")
+async def revoke_receiver(
+    receiver_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Revoke one of MY receivers (immediate; the link stops accepting uploads). The dedicated vault and
+    its already-received files are KEPT — delete the receiver to remove the vault."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="A temporary session cannot manage upload links.")
+    r = db.query(Receiver).filter(Receiver.id == receiver_id,
+                                  Receiver.owner_id == current_user.id).first()
+    if not r:
+        raise HTTPException(status_code=404, detail="Upload link not found")
+    if not r.revoked:
+        r.revoked = True
+        db.commit()
+        try:
+            AuditLogger(db).log_action(
+                action="receiver_revoke", status="success", user=current_user,
+                resource_type="receiver", resource_id=str(r.id), ip_address=get_client_ip(request))
+        except Exception:
+            pass
+    return {"ok": True, "id": str(r.id), "revoked": True}
+
+
+@app.get("/admin/receivers")
+async def admin_list_receivers(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """List ALL receivers across every user (interactive-admin) so an admin can audit and revoke them.
+    Newest first, capped; each row carries owner/vault/tag/status/counters (NEVER a token)."""
+    _CAP = 1000
+    rows = db.query(Receiver).order_by(Receiver.created_at.desc()).limit(_CAP).all()
+    tag_ids = {r.tag_id for r in rows if r.tag_id}
+    owner_ids = {r.owner_id for r in rows}
+    tags = {t.id: t for t in db.query(ReceiverTag).filter(ReceiverTag.id.in_(tag_ids)).all()} if tag_ids else {}
+    owners = {u.id: u for u in db.query(User).filter(User.id.in_(owner_ids)).all()} if owner_ids else {}
+    active = sum(1 for r in rows if _receiver_status(r) == "active")
+    return {"receivers": [_receiver_admin_dict(r, tags.get(r.tag_id), owners.get(r.owner_id)) for r in rows],
+            "active_count": active, "total": len(rows), "capped": len(rows) >= _CAP}
+
+
+@app.post("/admin/receivers/{receiver_id}/revoke")
+async def admin_revoke_receiver(
+    receiver_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin-revoke ANY user's receiver (immediate; stops new uploads). Does not delete the vault."""
+    r = db.query(Receiver).filter(Receiver.id == receiver_id).first()
+    if not r:
+        raise HTTPException(status_code=404, detail="Upload link not found")
+    if not r.revoked:
+        r.revoked = True
+        db.commit()
+        try:
+            AuditLogger(db).log_action(
+                action="receiver_admin_revoke", status="success", user=current_user,
+                resource_type="receiver", resource_id=str(r.id),
+                details={"owner_id": str(r.owner_id)}, ip_address=get_client_ip(request))
+        except Exception:
+            pass
+    return {"ok": True, "id": str(r.id), "revoked": True}
+
+
+# --- Anonymous upload path: session OPEN (reserve-at-open + bind to receiver) -----------------------
+# Reuses the public-link redemption constants for the rate limits / lockout windows. The chunk PUT and
+# finalize (which stream bytes under a SEPARATE anon-inbound admission budget and land the file into the
+# session-derived vault) are a following change.
+_RECV_FAIL_MAX = _PUBLINK_FAIL_MAX
+_RECV_FAIL_WINDOW = _PUBLINK_FAIL_WINDOW
+_RECV_MAX_OPEN_SESSIONS = 25          # concurrent open anon sessions per receiver (transient-buffer bound)
+
+
+def _receiver_fail_key(token_hash: str) -> str:
+    return f"receiver:fail:{token_hash}"
+
+
+def _receiver_locked(token_hash: str) -> bool:
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is None:
+        raise RuntimeError("rate-limit store unavailable")
+    n = r.get(_receiver_fail_key(token_hash))
+    return n is not None and int(n) >= _RECV_FAIL_MAX
+
+
+def _receiver_record_fail(token_hash: str) -> int:
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is None:
+        return _RECV_FAIL_MAX
+    try:
+        n = int(r.incr(_receiver_fail_key(token_hash)))
+        if n == 1:
+            r.expire(_receiver_fail_key(token_hash), _RECV_FAIL_WINDOW)
+        return n
+    except Exception:
+        return _RECV_FAIL_MAX
+
+
+def _receiver_clear_fails(token_hash: str) -> None:
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is not None:
+        try:
+            r.delete(_receiver_fail_key(token_hash))
+        except Exception:
+            pass
+
+
+def _receiver_resolve_live(db, receiver):
+    """Re-validate a receiver against LIVE state and return (vault, owner) — or None (uniform 404). The
+    wrapped vault must be active + Standard, and the owner active + not locked. Checked every anonymous
+    request so a revoke / owner-lockout after minting bites on the next upload."""
+    vault = db.query(Vault).filter(Vault.id == receiver.vault_id, Vault.is_active.is_(True)).first()
+    if not vault or getattr(vault, "type", "standard") == "zero_knowledge":
+        return None
+    owner = db.query(User).filter(User.id == receiver.owner_id).first()
+    if not owner or not getattr(owner, "is_active", True):
+        return None
+    locked_until = getattr(owner, "locked_until", None)
+    if locked_until is not None and locked_until > datetime.utcnow():
+        return None
+    return vault, owner
+
+
+class ReceiverUploadOpen(BaseModel):
+    filename: str
+    total_size: int
+    total_chunks: int
+    chunk_size: Optional[int] = None
+    secret: Optional[str] = None
+
+
+@app.post("/receivers/{token}/upload-session")
+async def open_receiver_upload_session(
+    token: str,
+    payload: ReceiverUploadOpen,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """PUBLIC: open an anonymous upload session against a receiver. Rate-limited per IP AND per token
+    (fail-closed); a secret-gated receiver prompts for its PIN/password with a per-link lockout; the
+    kill switch, paused / revoked / expired / exhausted states, per-file cap and file-type allowlist are
+    all enforced here; and the declared size is ATOMICALLY RESERVED against the receiver's total cap
+    BEFORE any bytes move (reserve-at-open). The minted chunked-upload session is BOUND to this receiver
+    (and client IP) so it can only ever be finalized into the receiver's own vault. A missing or
+    unusable receiver returns the uniform 404 (no oracle)."""
+    import time as _t
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    from app.core.security import verify_password, encrypt_object_field, name_blind_index
+
+    client_ip = get_client_ip(request)
+    if not token or len(token) > _PUBLINK_TOKEN_MAX_INPUT:
+        raise HTTPException(status_code=404, detail="This upload link is not available.")
+
+    try:
+        allowed, _, reset = _rl.check_rate_limit(
+            identifier=f"{client_ip}:{token}", limit=_PUBLINK_REDEEM_LIMIT,
+            window=_PUBLINK_REDEEM_WINDOW, prefix="receiver_open", fail_open=False)
+        allowed_ip, _, reset_ip = _rl.check_rate_limit(
+            identifier=client_ip, limit=_PUBLINK_REDEEM_IP_LIMIT,
+            window=_PUBLINK_REDEEM_IP_WINDOW, prefix="receiver_open_ip", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+    if not allowed or not allowed_ip:
+        _reset = reset if not allowed else reset_ip
+        raise HTTPException(status_code=429, detail="Too many requests.",
+                            headers={"Retry-After": str(max(1, _reset - int(_t.time())))})
+
+    def _audit(status, reason=None, rid=None):
+        try:
+            AuditLogger(db).log_action(
+                action="receiver_upload_open", status=status, resource_type="receiver",
+                resource_id=str(rid) if rid else None,
+                details={"reason": reason} if reason else None, ip_address=client_ip)
+        except Exception:
+            pass
+
+    if not receiver_policy.public_receivers_enabled(_global_settings_blob(db)):
+        _audit("failure", reason="feature_disabled")
+        raise HTTPException(status_code=404, detail="This upload link is not available.")
+
+    token_hash = _receiver_token_hash(token)
+    receiver = db.query(Receiver).filter(Receiver.token_hash == token_hash).first()
+    if not receiver or _receiver_status(receiver) != "active":
+        _audit("failure", reason="not_available", rid=(receiver.id if receiver else None))
+        raise HTTPException(status_code=404, detail="This upload link is not available.")
+
+    live = _receiver_resolve_live(db, receiver)
+    if live is None:
+        _audit("failure", reason="not_available", rid=receiver.id)
+        raise HTTPException(status_code=404, detail="This upload link is not available.")
+    vault, owner = live
+
+    # Secret gate (a receiver's optional LINK secret — distinct from the file envelope).
+    if receiver.secret_kind != "none":
+        try:
+            locked = _receiver_locked(token_hash)
+        except Exception:
+            raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+        if locked:
+            _audit("failure", reason="locked_out", rid=receiver.id)
+            raise HTTPException(status_code=429, detail="Too many incorrect attempts. Try again later.",
+                                headers={"Retry-After": str(_RECV_FAIL_WINDOW)})
+        raw = (payload.secret or "")
+        if not raw.strip():
+            raise HTTPException(status_code=401,
+                                detail={"error": "secret_required", "secret_kind": receiver.secret_kind})
+        secret = raw.strip() if receiver.secret_kind == "pin" else raw
+        if len(secret) > _PUBLINK_SECRET_MAX or not receiver.password_hash \
+                or not verify_password(secret, receiver.password_hash):
+            n = _receiver_record_fail(token_hash)
+            _audit("failure", reason="wrong_secret", rid=receiver.id)
+            if n >= _RECV_FAIL_MAX:
+                raise HTTPException(status_code=429, detail="Too many incorrect attempts. Try again later.",
+                                    headers={"Retry-After": str(_RECV_FAIL_WINDOW)})
+            raise HTTPException(status_code=401,
+                                detail={"error": "wrong_secret", "secret_kind": receiver.secret_kind})
+        _receiver_clear_fails(token_hash)
+        secret_proof = _receiver_token_hash(secret)   # a stored proof the link secret was satisfied
+    else:
+        secret_proof = None
+
+    # Validate the declared upload shape (mirrors the authenticated init).
+    size = int(payload.total_size or 0)
+    chunks = int(payload.total_chunks or 0)
+    if size <= 0 or chunks <= 0:
+        raise HTTPException(status_code=400, detail="Invalid upload size")
+    if chunks > size or chunks > 200_000:
+        raise HTTPException(status_code=400, detail="Invalid chunk count for the declared size")
+    _min_chunks = (size + _MAX_UPLOAD_CHUNK_BYTES - 1) // _MAX_UPLOAD_CHUNK_BYTES
+    if chunks < _min_chunks:
+        raise HTTPException(status_code=400,
+                            detail=f"Too few chunks for a {size}-byte upload.")
+
+    # Filename + type allowlist (a receiver vault is Standard, so plaintext-name rules apply).
+    fname = ''.join(c for c in (payload.filename or "") if ord(c) >= 32 and ord(c) != 127) or ""
+    if not fname:
+        raise HTTPException(status_code=400, detail="A file name is required.")
+    _allowed_exts, _deploy_max_file = _upload_policy(db)
+    _enforce_file_type(fname, _allowed_exts)
+
+    # Per-file cap: the receiver's max_file_bytes (if set) AND the deployment ceiling.
+    per_file_cap = _deploy_max_file
+    if receiver.max_file_bytes:
+        per_file_cap = min(per_file_cap, int(receiver.max_file_bytes))
+    if size > per_file_cap:
+        raise HTTPException(status_code=413,
+                            detail=f"File exceeds the maximum size of {per_file_cap // (1024 * 1024)} MB.")
+    _enforce_deployment_storage_quota(db, size)
+
+    # Bound concurrent open anon sessions per receiver (transient-buffer DoS bound).
+    now = datetime.utcnow()
+    open_sessions = db.query(ReceiverUploadSession.session_id).join(
+        ChunkedUploadSession, ChunkedUploadSession.id == ReceiverUploadSession.session_id).filter(
+        ReceiverUploadSession.receiver_id == receiver.id,
+        ChunkedUploadSession.status == 'active',
+        ChunkedUploadSession.expires_at > now).count()
+    if open_sessions >= _RECV_MAX_OPEN_SESSIONS:
+        raise HTTPException(status_code=429,
+                            detail="Too many uploads in progress for this link; try again shortly.")
+
+    # GATE 2 — reserve the declared size against the receiver's total cap BEFORE any bytes move.
+    stored = int(getattr(vault, "total_size_bytes", 0) or 0)
+    if not _receiver_reserve_bytes(db, receiver.id, size, stored):
+        _audit("failure", reason="over_capacity", rid=receiver.id)
+        raise HTTPException(status_code=413, detail="This upload would exceed the link's remaining space.")
+
+    # Mint the chunked-upload session owned by the RECEIVER'S OWNER (so the file lands owned by them),
+    # into the receiver's vault at its root. Refund the reservation if anything below fails.
+    try:
+        _sid = uuid.uuid4()
+        enc_name = encrypt_object_field(vault.id, _sid, fname, 'name')
+        name_bi = name_blind_index(vault.id, fname)
+        session = ChunkedUploadSession(
+            id=_sid, vault_id=vault.id, user_id=owner.id,
+            filename=None, mime_type=None, enc_name=enc_name, enc_mime=None, name_bi=name_bi,
+            total_size=size, total_chunks=chunks, chunks_received=0, bytes_received=0,
+            folder_id=None, temp_credential_id=None,
+            created_at=now, last_chunk_at=now,
+            expires_at=now + timedelta(hours=_chunk_session_ttl_hours()), status='active')
+        db.add(session)
+        db.flush()
+        db.add(ReceiverUploadSession(session_id=_sid, receiver_id=receiver.id,
+                                     secret_hash=secret_proof, client_ip=client_ip))
+        db.commit()
+        db.refresh(session)
+    except Exception:
+        db.rollback()
+        _receiver_release_bytes(db, receiver.id, size)
+        raise HTTPException(status_code=500, detail="Could not start the upload; please try again.")
+
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    sdir = _upload_session_dir(vault_service, str(session.id))
+    sdir.mkdir(parents=True, exist_ok=True)
+    if not session.temp_file_path:
+        session.temp_file_path = str(sdir)
+        db.commit()
+
+    _audit("success", rid=receiver.id)
+    return {
+        "session_id": str(session.id),
+        "chunk_size": payload.chunk_size,
+        "total_chunks": session.total_chunks,
+        "received_chunks": [],
+        "expires_at": session.expires_at.isoformat() if session.expires_at else None,
+    }
+
+
+def _receiver_resolve_session(db, token: str, session_id):
+    """Resolve an anonymous upload session from its receiver token + session id, or None (uniform
+    404). GATE 3: the target vault is derived from the SESSION's binding, never from the client — the
+    session must be bound to THIS receiver and its vault must match the receiver's. Also re-validates
+    the kill switch, the receiver's active state, and the session's active/not-expired state, so a
+    revoke / owner-lockout / expiry after opening bites on the next chunk or finalize. Returns
+    (receiver, session, vault, owner)."""
+    if not token or len(token) > _PUBLINK_TOKEN_MAX_INPUT:
+        return None
+    if not receiver_policy.public_receivers_enabled(_global_settings_blob(db)):
+        return None
+    token_hash = _receiver_token_hash(token)
+    receiver = db.query(Receiver).filter(Receiver.token_hash == token_hash).first()
+    if not receiver or _receiver_status(receiver) != "active":
+        return None
+    binding = db.query(ReceiverUploadSession).filter(
+        ReceiverUploadSession.session_id == session_id,
+        ReceiverUploadSession.receiver_id == receiver.id).first()
+    if binding is None:
+        return None
+    session = db.query(ChunkedUploadSession).filter(
+        ChunkedUploadSession.id == session_id).first()
+    if session is None or session.status != 'active':
+        return None
+    if session.expires_at and session.expires_at <= datetime.utcnow():
+        return None
+    live = _receiver_resolve_live(db, receiver)
+    if live is None:
+        return None
+    vault, owner = live
+    # GATE 3 cross-check: the session's vault must be the receiver's own vault. Anything else is a
+    # tampered binding — refuse rather than land bytes anywhere else.
+    if str(session.vault_id) != str(vault.id):
+        return None
+    return receiver, session, vault, owner
+
+
+@app.put("/receivers/{token}/upload-session/{session_id}/chunks/{chunk_index}")
+async def receiver_upload_chunk(
+    token: str,
+    session_id: uuid.UUID,
+    chunk_index: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """PUBLIC: store one chunk of an anonymous upload. No principal — the session is resolved via its
+    receiver binding, and the chunk streams straight to the session's staging dir (bounded by the
+    per-chunk cap and the reserve-at-open allocation, so it holds nothing and needs no admission slot,
+    exactly like the authenticated chunk write). A bad token/session returns the uniform 404."""
+    resolved = _receiver_resolve_session(db, token, session_id)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="This upload is not available.")
+    _receiver, session, vault, _owner = resolved
+    if chunk_index < 0 or chunk_index >= session.total_chunks:
+        raise HTTPException(status_code=400, detail=f"Invalid chunk index (0-{session.total_chunks - 1})")
+
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    sdir = _upload_session_dir(vault_service, str(session.id))
+    sdir.mkdir(parents=True, exist_ok=True)
+    chunk_path = sdir / f"chunk_{chunk_index:06d}"
+    already = chunk_path.exists()
+    existing_size = sealed_plaintext_size(chunk_path) if already else 0
+    base_bytes = max(0, (session.bytes_received or 0) - existing_size)
+    remaining = min(session.total_size - base_bytes, _MAX_UPLOAD_CHUNK_BYTES)
+
+    declared_len = request.headers.get("content-length")
+    if declared_len is not None:
+        try:
+            clen = int(declared_len)
+        except (TypeError, ValueError):
+            clen = None
+        if clen is not None and clen > remaining:
+            raise HTTPException(status_code=413, detail="Chunk data exceeds the declared upload size")
+
+    tmp_path = sdir / f".chunk_{chunk_index:06d}.{uuid.uuid4().hex}.part"
+    try:
+        _written, chunk_digest = await seal_stream_to_file(
+            request.stream(), tmp_path, remaining, session.id, chunk_index)
+    except ChunkTooLarge:
+        raise HTTPException(status_code=413, detail="Chunk data exceeds the declared upload size")
+    except EmptyBody:
+        raise HTTPException(status_code=400, detail="Empty chunk")
+
+    # Publish under the per-session row lock (same reasoning as the authenticated chunk write): the
+    # rename + digest must be atomic against a concurrent re-send, and the counters are recomputed from
+    # the authoritative on-disk chunk set.
+    _total = session.total_chunks
+    locked = db.query(ChunkedUploadSession).filter(
+        ChunkedUploadSession.id == session.id).with_for_update().first()
+    hash_path = _chunk_hash_path(sdir, chunk_index)
+    try:
+        hash_path.unlink()
+    except OSError:
+        pass
+    try:
+        os.replace(tmp_path, chunk_path)
+    except OSError:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+    try:
+        hash_path.write_text(chunk_digest, encoding='ascii')
+    except Exception:
+        pass
+
+    _present = sorted(sdir.glob("chunk_*"))
+    _bytes = sum(sealed_plaintext_size(_p) for _p in _present)
+    received = len(_present)
+    if locked is not None:
+        locked.bytes_received = _bytes
+        locked.chunks_received = received
+        locked.last_chunk_at = datetime.utcnow()
+    db.commit()
+    return {'received': received, 'total': _total, 'bytes_received': _bytes,
+            'percent': round(received * 100 / _total, 1) if _total else 0,
+            'complete': received >= _total}
+
+
+@app.post("/receivers/{token}/upload-session/{session_id}/complete")
+async def receiver_complete_upload(
+    token: str,
+    session_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """PUBLIC: finalize an anonymous upload. Assembles the staged chunks through the SAME encryption
+    pipeline the authenticated upload uses, into the vault DERIVED FROM THE SESSION (never a
+    client-supplied id — GATE 3), owned by the receiver's owner. Admitted under a SEPARATE anon-inbound
+    transfer budget (GATE 1) so a flood of anonymous finalizes can never starve authenticated transfers.
+    Reconciles the reserve-at-open allocation once the bytes are actually stored, and bumps the
+    receiver's upload counters."""
+    from app.core.security import ObjectChangedDuringRead  # noqa: F401 (parity import)
+
+    resolved = _receiver_resolve_session(db, token, session_id)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="This upload is not available.")
+    receiver, session, vault, owner = resolved
+
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    audit_logger = AuditLogger(db)
+
+    # Hold the session open across the (potentially long) assembly so the sweep can't reclaim it.
+    session.expires_at = datetime.utcnow() + timedelta(hours=_chunk_session_ttl_hours())
+    db.commit()
+
+    # GATE 1 — admit the assembling half on the anon-inbound budget.
+    try:
+        transfer_slot = await receiver_transfer_admission.acquire()
+    except TransferBusy as busy:
+        raise _busy_response(busy)
+
+    try:
+        sdir = _upload_session_dir(vault_service, str(session.id))
+        present = _received_chunk_indices(sdir)
+        missing = [i for i in range(session.total_chunks) if i not in present]
+        if missing:
+            raise HTTPException(status_code=409, detail={
+                'error': 'incomplete', 'message': f'{len(missing)} chunk(s) still missing',
+                'missing_chunks': missing[:100], 'missing_count': len(missing)})
+
+        fname = session.filename  # decrypted in-memory by the ORM load event (Standard vault)
+        if not fname:
+            raise HTTPException(status_code=409, detail=(
+                "This upload could not be completed here. Cancel it and upload the file again."))
+
+        file_info = None
+
+        def _remove_orphan_blob():
+            try:
+                if file_info and file_info.get('storage_path'):
+                    vault_service._remove_blobs([file_info['storage_path']])
+            except Exception:
+                pass
+
+        try:
+            file_info, stream_ctx = vault_service.upload_file_streaming(
+                vault_id=vault.id, file_name=fname, user=owner, folder_id=None,
+                mime_type=session.mime_type, file_id=None)
+            with stream_ctx as ctx:
+                for i in range(session.total_chunks):
+                    for buf in open_staged_chunk(sdir / f"chunk_{i:06d}", session.id, i):
+                        if buf:
+                            ctx.write_chunk(buf)
+                final_checksum = ctx.get_checksum()
+                final_size = ctx.get_total_size()
+
+            if final_size != session.total_size:
+                raise HTTPException(status_code=409, detail={
+                    "code": "size_mismatch",
+                    "message": (f"This upload delivered {final_size} bytes but declared "
+                                f"{session.total_size}. Nothing has been stored.")})
+
+            stored_now = db.query(Vault.total_size_bytes).filter(Vault.id == vault.id).scalar() or 0
+            if vault.size_limit and stored_now + final_size > vault.size_limit:
+                raise HTTPException(status_code=413, detail="This upload would exceed the link's space.")
+            _enforce_deployment_storage_quota(db, final_size)
+
+            # An anonymous drop never OVERWRITES an existing file (no delete authority): a same-name
+            # clash is a clean 409, not a silent replace.
+            file = vault_service.finalize_streaming_upload(
+                file_info=file_info, total_size=final_size, checksum=final_checksum,
+                replace_same_name=False)
+        except HTTPException:
+            _remove_orphan_blob()
+            _receiver_release_bytes(db, receiver.id, session.total_size)
+            try:
+                db.delete(session); db.commit()
+            except Exception:
+                db.rollback()
+            shutil.rmtree(sdir, ignore_errors=True)
+            raise
+        except DuplicateNameError as e:
+            _remove_orphan_blob()
+            _receiver_release_bytes(db, receiver.id, session.total_size)
+            try:
+                db.delete(session); db.commit()
+            except Exception:
+                db.rollback()
+            shutil.rmtree(sdir, ignore_errors=True)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        except Exception as e:
+            _remove_orphan_blob()
+            _receiver_release_bytes(db, receiver.id, session.total_size)
+            fail_chunk_session(db, session, sdir, e)
+            raise HTTPException(status_code=500, detail="Failed to finalize the upload.")
+
+        # Success: the bytes are now stored on the vault, so reconcile (refund) the reservation; the
+        # cap invariant stored + reserved <= max_total_bytes is preserved. Bump the receiver counters,
+        # then delete the session (cascading its binding) and clear the staged chunks.
+        _receiver_release_bytes(db, receiver.id, session.total_size)
+        try:
+            receiver.upload_count = int(receiver.upload_count or 0) + 1
+            receiver.last_upload_at = datetime.utcnow()
+            db.delete(session)
+            db.commit()
+        except Exception:
+            db.rollback()
+        shutil.rmtree(sdir, ignore_errors=True)
+
+        try:
+            audit_logger.log_action(
+                action='receiver_upload_complete', status='success', user=None,
+                resource_type='file', resource_id=str(file.id),
+                details={'vault_id': str(vault.id), 'receiver_id': str(receiver.id),
+                         'file_name': file.original_name}, ip_address=get_client_ip(request))
+        except Exception:
+            pass
+        return {'id': str(file.id), 'name': file.original_name, 'size': file.size_bytes}
+    finally:
+        receiver_transfer_admission.release(transfer_slot)
+
+
+@app.get("/u/{token}")
+async def receiver_upload_page(token: str):
+    """PUBLIC: serve the anonymous upload page. It reads the token from the URL, opens an upload
+    session, streams the file in chunks, and finalizes (prompting for a PIN/password only if the link
+    needs one)."""
+    static_dir = str(PROJECT_ROOT / "static")
+    page = os.path.join(static_dir, "upload-link.html")
+    if not os.path.exists(page):
+        raise HTTPException(status_code=404, detail="Not found")
+    resp = FileResponse(page)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    return resp
 
 
 @app.get("/share-policy")
@@ -11890,7 +13025,26 @@ async def update_vault_settings(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only vault owner can modify settings"
             )
-        
+
+        # A receiver vault is policy-frozen: retention is authoritative from the receiver row, and the
+        # size cap may not be raised above the receiver's frozen max_total_bytes. The owner changes
+        # either through the receiver itself, so it re-runs the tighten-only resolution.
+        _receiver = _receiver_for_vault(db, vault_id)
+        if _receiver is not None:
+            if 'expire_files_after_days' in settings_update or 'expire_files_unit' in settings_update:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="This vault backs an upload link; change its retention through the upload link.")
+            if 'size_limit' in settings_update and _receiver.max_total_bytes is not None:
+                try:
+                    _req = int(settings_update['size_limit'])
+                except (TypeError, ValueError):
+                    _req = None
+                if _req is not None and _req > int(_receiver.max_total_bytes):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="This vault backs an upload link; its size cap is fixed by the link.")
+
         # Update settings
         updated_fields = []
         
@@ -12095,6 +13249,19 @@ async def set_vault_storage(
             status_code=403,
             detail="Only the vault owner or a vault manager can change this vault's storage.",
         )
+    # A receiver vault is funded by a SINGLE owner grant (owner-pays), sized by the wrapper. Refuse a
+    # second contributor, and refuse the owner from inflating their grant above the receiver's frozen
+    # max_total_bytes — otherwise this route would be a backdoor around the vault-settings size clamp.
+    _recv = _receiver_for_vault(db, vault_id)
+    if _recv is not None:
+        if current_user.id != vault.owner_id:
+            raise HTTPException(
+                status_code=400,
+                detail="This vault backs an upload link; only its owner funds it.")
+        if _recv.max_total_bytes is not None and int(payload.granted_bytes) > int(_recv.max_total_bytes):
+            raise HTTPException(
+                status_code=400,
+                detail="This vault backs an upload link; its size is fixed by the link.")
 
     # Take the vault's row lock first, so a second contributor writing at the same moment cannot
     # compute a total that omits this one. Held until the commit below.
@@ -12287,6 +13454,14 @@ async def grant_vault_permission(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only the vault owner or a manager can grant permissions"
             )
+
+        # A receiver vault is share-frozen: only READ grants are allowed, so a colleague can see and
+        # download what arrived but cannot alter the receiver or its contents.
+        if getattr(permission, "level", None) in ("write", "delete", "manage") \
+                and _receiver_for_vault(db, vault_id) is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This vault backs an upload link; only read access can be granted on it.")
 
         # NOTE: a per-user AUTHZ grant IS legitimate on a zero-knowledge vault — it records the
         # vault_members row (membership + read/write/delete/manage), while the wrapped DEK is
@@ -12544,6 +13719,12 @@ async def grant_vault_group_access(
         )
     if not db.query(Group).filter(Group.id == payload.group_id).first():
         raise HTTPException(status_code=404, detail="Group not found")
+    # A receiver vault is share-frozen to READ (like the per-user permissions route): a department
+    # granted write could alter or delete the arrived files and upload bypassing the receiver's policy.
+    if payload.permission == 'write' and _receiver_for_vault(db, vault_id) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This vault backs an upload link; only read access can be granted on it.")
     perm = 'write' if payload.permission == 'write' else 'read'
     existing = db.execute(
         select(vault_group_access).where(
@@ -13797,6 +14978,16 @@ def _sweep_orphaned_upload_chunks(db: Session, idle_minutes: Optional[int] = Non
 
     rows_pruned = 0
     for s in remove_rows:
+        # A receiver (anonymous upload) session that never finalized still holds its reserve-at-open
+        # allocation. Refund it BEFORE deleting the row (which cascades the binding) — the binding's
+        # existence is the "not yet refunded" marker, so this reclaims each reservation exactly once.
+        try:
+            _binding = db.query(ReceiverUploadSession).filter(
+                ReceiverUploadSession.session_id == s.id).first()
+            if _binding is not None:
+                _receiver_release_bytes(db, _binding.receiver_id, s.total_size or 0)
+        except Exception:
+            pass
         db.delete(s)
         rows_pruned += 1
     if rows_pruned:
@@ -17626,6 +18817,27 @@ def _seed_default_note_link_tags():
         print(f"⚠ Default note-link-tag seeding skipped: {e}")
 
 
+def _seed_default_receiver_tags():
+    """Seed the starter receiver tags (Drop box / Confidential inbox) on a fresh deployment only — no
+    receiver tags AND receivers not already explicitly enabled. Inert until an admin turns receivers on.
+    Best-effort; never bricks startup."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.models import ReceiverTag, User, RoleEnum
+        with get_db_context() as db:
+            has_tags = db.query(ReceiverTag).first() is not None
+            explicitly_enabled = _global_settings_blob(db).get("public_receivers_enabled") is True
+            if not receiver_policy.should_seed_default_receiver_tags(has_tags, explicitly_enabled):
+                return
+            admin = db.query(User).filter(User.role == RoleEnum.ADMIN).first()
+            created_by = admin.id if admin else None
+            for spec in receiver_policy.DEFAULT_RECEIVER_TAGS:
+                db.add(ReceiverTag(created_by=created_by, **spec))
+            print(f"[OK] Seeded {len(receiver_policy.DEFAULT_RECEIVER_TAGS)} default receiver tags")
+    except Exception as e:
+        print(f"⚠ Default receiver-tag seeding skipped: {e}")
+
+
 def _backfill_default_permissions():
     """Grant role-default endpoint permissions to existing non-admin users
     (idempotent). Picks up newly-added defaults such as temp-credential
@@ -18148,6 +19360,10 @@ END $$;""",
             "ALTER TABLE note_link_tags ADD COLUMN IF NOT EXISTS allowed_targets JSON",
             "UPDATE note_link_tags SET allowed_targets = '[\"note\"]'::json WHERE allowed_targets IS NULL",
             "ALTER TABLE note_link_tags ALTER COLUMN allowed_targets SET NOT NULL",
+            # Receivers: in-flight reserved bytes for the anonymous upload path (reserve-at-open).
+            # create_all adds it on a fresh DB; this backfills a receivers table created on an
+            # intermediate build. Additive + idempotent; defaults to 0.
+            "ALTER TABLE receivers ADD COLUMN IF NOT EXISTS reserved_bytes BIGINT NOT NULL DEFAULT 0",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)
@@ -18571,6 +19787,7 @@ async def lifespan(app: FastAPI):
     scrub_bootstrap_password_source(_admin_bootstrap_status)
     _seed_default_share_tags()  # after the admin exists, so seed tags can record it as creator
     _seed_default_note_link_tags()  # public-note-link starter tags (inert until enabled)
+    _seed_default_receiver_tags()  # receiver (upload-link) starter tags (inert until enabled)
     _seed_second_factor_actions()  # the second-factor step-up policy matrix (one row per catalog key)
     _assert_step_up_boot_contract()  # fail boot if any catalog action ships ungatable
     _backfill_default_permissions()
