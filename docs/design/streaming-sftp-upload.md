@@ -95,6 +95,26 @@ plaintext on tmpfs or disk.
 - Atomic overwrite: a failed streaming replace leaves the existing file intact.
 - Flag off: behaviour is the current staging path (regression).
 
+## Implementation notes (for the handle wiring)
+
+- `VaultService.upload_file_streaming` returns `(file_info, stream_ctx)`. `file_info` is a plain dict
+  **except** it carries `'vault': <ORM Vault>` bound to the session that created it, and
+  `stream_ctx` (`StreamingUploadContext`) is just a file handle + hasher (no DB). Two viable session
+  shapes: (a) hold ONE `get_db_context()` open for the whole upload (simplest; the session is idle
+  between the initial vault lookup and the close-time `File` insert, but a long-lived transaction is a
+  cost worth measuring), or (b) at first write take a brief session to get `file_info` + the open
+  `stream_ctx`, then at close take a FRESH session for the re-authz + `finalize_streaming_upload`,
+  re-fetching the vault by `file_info['vault_id']` so no detached ORM object is used. Prefer (b) if
+  `finalize_streaming_upload` can be given a session-fresh vault; confirm by reading it before wiring.
+- Drive the context manually: `stream_ctx.__enter__()` at first record, `stream_ctx.__exit__(...)` at
+  close — pass an exception on any failure path so it unlinks the blob and writes no terminal.
+- Re-chunk with `UploadAssembler(on_record=stream_ctx.write_chunk, record_size=1 MiB,
+  reorder_window=SFTP_STREAMING_REORDER_MB)`; map `AssemblerError` to the handle's descriptive-failure
+  path (like over-limit today). Enforce `max_bytes` on `assembler.total_bytes` in `write()`.
+- Integration tests (need the stack): sequential large put with flat RSS; reorder within window;
+  random-access beyond window (clean fail, no blob); TOCTOU (revoke mid-transfer → no row, no blob);
+  atomic overwrite survives a failed replace; byte-identical to a web-path upload of the same file.
+
 ## Rollout
 
 Land behind the default-OFF flag. Flip on for a deployment only after the security review and a
