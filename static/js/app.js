@@ -1907,6 +1907,23 @@ function logout() {
     state.currentPath = [];
     state.vaultPassword = null;
 
+    // Drop the previous user's per-user CONTENT — in-memory AND its rendered DOM — so the NEXT user on
+    // this shared tab can't briefly see it (finding F-R015-004). showScreen('login-screen') only toggles
+    // the .screen wrappers, so the dashboard's inner DOM (vault list, open file browser, dashboard tiles)
+    // and the body-level upload tray survive the screen swap unless emptied here. Server authz is intact
+    // (any click 403s); this closes the visual residue.
+    state.currentFiles = [];
+    state.allVaults = [];
+    state.selectedFileIds = new Set();
+    try { clearMoveCopy(); } catch (_) {}          // move/copy clipboard + its floating bar
+    try { uploadManager.reset(); } catch (_) {}    // upload tray items + DOM (no server cancels)
+    ['vaults-list', 'vault-files-grid', 'vault-files-table-body', 'receivers-list',
+     'dashboard-vaults-count', 'dashboard-storage', 'dashboard-temp-creds-count',
+     'dashboard-users-count'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.replaceChildren();
+    });
+
     // Drop remembered vault passwords + restored-view so they can't leak to
     // another user who logs in on this same tab without a refresh.
     state.rememberedVaults = {};
@@ -13820,7 +13837,10 @@ async function openFilePreview(fileId, fileName, mime) {
         const isVideo = type.startsWith('video/') || ['mp4', 'webm', 'mov'].includes(ext);
         const isAudio = type.startsWith('audio/') || ['mp3', 'wav', 'flac'].includes(ext);
         const isText = type.startsWith('text/') || ['txt', 'md', 'json', 'csv', 'log', 'xml', 'yml', 'yaml', 'js', 'css', 'html', 'py', 'sh', 'ini'].includes(ext);
-        _previewUrl = URL.createObjectURL(blob);
+        // For a PDF, re-mint the blob under a FIXED application/pdf type (finding F-R015-001): an
+        // untrusted stored MIME can otherwise coerce the <iframe> into a scriptable HTML/XHTML/SVG
+        // document. Forcing application/pdf lets the browser only route it to its isolated PDF viewer.
+        _previewUrl = URL.createObjectURL(isPdf ? new Blob([blob], { type: 'application/pdf' }) : blob);
 
         if (isText && blob.size < 2 * 1024 * 1024) {
             const pre = document.createElement('pre');
@@ -13856,7 +13876,15 @@ async function openFilePreview(fileId, fileName, mime) {
             const tag = isPdf ? 'iframe' : isVideo ? 'video' : 'audio';
             const el = document.createElement(tag);
             el.src = _previewUrl;
-            if (isPdf) { el.className = 'preview-frame'; el.title = fileName; }
+            if (isPdf) {
+                el.className = 'preview-frame'; el.title = fileName;
+                // Sandbox the PDF frame (finding F-R015-001). A blob: URL is origin-scoped, so an
+                // opaque-origin sandbox would break it; allow-same-origin + allow-scripts keep the
+                // browser's own PDF viewer working while still dropping forms / popups / top-navigation.
+                // The fixed application/pdf blob type above is what actually closes the script-execution
+                // vector; this is defence in depth.
+                el.setAttribute('sandbox', 'allow-same-origin allow-scripts');
+            }
             else if (isVideo) { el.className = 'preview-media'; el.controls = true; }
             else { el.controls = true; el.style.width = '100%'; }
             bodyEl.replaceChildren(el);
@@ -14675,6 +14703,17 @@ const transferGate = new TransferGate(5);
 const uploadManager = {
     items: new Map(),   // uploadId -> item
     seq: 0,
+
+    // Logout scrub (finding F-R015-004): drop the tray's items + its DOM WITHOUT cancelling — cancel()
+    // fires a server DELETE per session, and on logout we only want to clear this browser's view so the
+    // next user on a shared tab can't see the prior user's upload tray. render() with an empty Map
+    // takes the "nothing in flight" branch; then remove the body-level tray element outright.
+    reset() {
+        try { this.items.clear(); } catch (_) {}
+        try { this.render(); } catch (_) {}
+        const tray = document.getElementById('upload-tray');
+        if (tray) tray.remove();
+    },
 
     _vaultHeaders() {
         const h = { 'Authorization': `Bearer ${authToken}` };
