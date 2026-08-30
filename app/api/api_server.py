@@ -5612,9 +5612,10 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
     count = 0
     for s in q.all():
         # Optionally keep the caller's OWN session (e.g. enrolling a second factor should revoke the
-        # account's OTHER sessions but leave the one doing the enrollment logged in). The stored token
-        # is a hash, so except_session_token is compared as the same hash.
-        if except_session_token is not None and s.session_token == except_session_token:
+        # account's OTHER sessions but leave the one doing the enrollment logged in). except_session_token
+        # is the PLAINTEXT token; the stored value is its hash, so we hash at the comparison — never
+        # compare a session token plaintext.
+        if except_session_token is not None and s.session_token == hash_session_token(except_session_token):
             continue
         s.is_active = False
         if durable:
@@ -6548,6 +6549,19 @@ def _current_session_hash(request) -> Optional[str]:
         return None
 
 
+def _current_session_token(request) -> Optional[str]:
+    """The CURRENT request's PLAINTEXT session token (the value inside the JWT), or None. Callers hash
+    it at the comparison site (never store or compare it plaintext) — see _revoke_sessions."""
+    try:
+        auth = request.headers.get("Authorization") or ""
+        if not auth.lower().startswith("bearer "):
+            return None
+        payload = verify_access_token(auth.split(None, 1)[1].strip())
+        return (payload or {}).get("session_token") or None
+    except Exception:      # noqa: BLE001
+        return None
+
+
 # --- Second factor: self-service TOTP enrollment ---------------------------------------------------
 # The forward enrollment path (enroll -> confirm -> acknowledge -> active). The FIRST enrollment of an
 # un-enrolled user re-proves the account password in the request body (there is no second factor yet to
@@ -6744,7 +6758,7 @@ async def acknowledge_recovery_codes(
     # sessions standing — but keep the session that just did the enrollment (the user stays logged in).
     try:
         _revoke_sessions(db, user_id=current_user.id, actor_username=current_user.username,
-                         except_session_token=_current_session_hash(request))
+                         except_session_token=_current_session_token(request))
         db.commit()
     except Exception:      # noqa: BLE001 - activation already committed; the revoke is best-effort
         db.rollback()
