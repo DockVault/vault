@@ -501,8 +501,13 @@ class _StreamingUpload:
             return
         try:
             self._assembler.finish()   # flush the final short record
-        except AssemblerError as e:
-            # A hole in the file (out-of-order data that never became contiguous).
+        except Exception as e:  # noqa: BLE001
+            # finish() emits the tail record, which for a sub-record upload is the FIRST emit -- so it
+            # can trigger _ensure_started (opening the encryptor, which re-checks write permission via
+            # upload_file_streaming) and the encrypt. Any failure here (an out-of-order hole =
+            # AssemblerError, a write-permission denial for a read-only member, or an encryption error)
+            # means the upload cannot complete: discard it and return cleanly (an SFTP close cannot
+            # signal failure to the client). _abort is a no-op when the encryptor never opened.
             safe_event('upload.stream.incomplete', e)
             self._abort()
             return
