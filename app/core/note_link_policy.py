@@ -12,6 +12,10 @@ Settings (in the global settings blob, like sharing_enabled):
 from __future__ import annotations
 
 SECRET_KINDS = ("none", "pin", "password")
+# The target kinds a public-link tag may expose. A note link is always 'note'; a public FILE link is
+# 'file' or 'folder'. A tag's allowed_targets is any non-empty subset of these; it defaults to ['note']
+# so a tag never silently permits file/folder exposure until an admin opts in.
+TARGET_KINDS = ("note", "file", "folder")
 # Strength ordering for the "a user may only TIGHTEN" rule: a link may require a stronger secret
 # than its tag floor, never a weaker one. none < pin < password.
 SECRET_STRENGTH = {"none": 0, "pin": 1, "password": 2}
@@ -33,6 +37,13 @@ def public_note_links_enabled(settings_blob: dict) -> bool:
     return (settings_blob or {}).get("public_note_links_enabled", True) is not False
 
 
+def public_file_links_enabled(settings_blob: dict) -> bool:
+    # Default OFF: public FILE/FOLDER links expose stored files anonymously, so they stay disabled
+    # until an admin explicitly turns them on (unlike public NOTE links, which are text-only and default
+    # ON). Only an explicit stored True enables it.
+    return (settings_blob or {}).get("public_file_links_enabled", False) is True
+
+
 def public_note_link_user_cap(settings_blob: dict) -> int:
     raw = (settings_blob or {}).get("public_note_link_user_cap", DEFAULT_USER_CAP)
     try:
@@ -48,6 +59,9 @@ def validate_settings(payload: dict) -> None:
     if "public_note_links_enabled" in payload and not isinstance(
             payload["public_note_links_enabled"], bool):
         raise ValueError("public_note_links_enabled must be true or false")
+    if "public_file_links_enabled" in payload and not isinstance(
+            payload["public_file_links_enabled"], bool):
+        raise ValueError("public_file_links_enabled must be true or false")
     if "public_note_link_user_cap" in payload:
         v = payload["public_note_link_user_cap"]
         if isinstance(v, bool) or not isinstance(v, int) or not (1 <= v <= MAX_USER_CAP):
@@ -94,6 +108,23 @@ def validate_tag_fields(data: dict, *, partial: bool = False) -> None:
     d_ttl, m_ttl = data.get("default_ttl_hours"), data.get("max_ttl_hours")
     if d_ttl is not None and m_ttl is not None and d_ttl > m_ttl:
         raise ValueError("default_ttl_hours cannot exceed max_ttl_hours")
+    if "allowed_targets" in data or (not partial):
+        at = data.get("allowed_targets", ["note"])
+        if not isinstance(at, (list, tuple)) or not at:
+            raise ValueError("allowed_targets must be a non-empty list of %s" % (TARGET_KINDS,))
+        for k in at:
+            if k not in TARGET_KINDS:
+                raise ValueError("allowed_targets values must be one of %s" % (TARGET_KINDS,))
+
+
+def tag_allows_target(tag, target_kind: str) -> bool:
+    """True if a public link of `target_kind` ('note'|'file'|'folder') may be created under this tag.
+    Reads a NoteLinkTag ORM row OR a plain dict; a missing/blank allowed_targets is treated as the
+    safe default (['note']) so an un-backfilled tag never silently permits file exposure."""
+    at = _tag_attr(tag, "allowed_targets", None)
+    if not at:
+        at = ["note"]
+    return target_kind in at
 
 
 # The seeded catalog: a fresh deployment gets these (inert until public links are enabled). Colours +

@@ -205,6 +205,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.21.0": {
+      "released": "2026-08-30",
+      "notes": "Adds public links for files and folders (\"secure send\"): an admin can enable anonymous, tokenized links that let anyone with the URL download one file or one folder of a Standard vault, governed by the existing public-link tags (token-length floor, optional PIN/password, expiry, use cap) and revocable at any time. The link token is stored hashed and shown once at creation; the anonymous read path re-checks the owner's access on every request. New public_links table and a note_link_tags.allowed_targets column are created automatically at boot -- no migration step, and no existing data is changed. A rollback to 0.20.0 leaves the table and column intact but stops serving public file links until you upgrade again.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -387,6 +395,13 @@
     {
       "from": "0.19.3",
       "to": "0.20.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.20.0",
+      "to": "0.21.0",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false

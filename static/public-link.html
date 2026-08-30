@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Shared files</title>
+  <link rel="icon" href="/static/favicon.ico">
+  <style>
+    :root {
+      --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #e2e8f0;
+      --muted: #94a3b8; --accent: #6366f1; --accent-fg: #ffffff; --danger: #f87171;
+    }
+    @media (prefers-color-scheme: light) {
+      :root { --bg: #f1f5f9; --card: #ffffff; --border: #e2e8f0; --text: #0f172a;
+              --muted: #64748b; --accent: #6366f1; --accent-fg: #ffffff; --danger: #dc2626; }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      display: flex; align-items: flex-start; justify-content: center; padding: 2rem 1rem;
+    }
+    .wrap { width: 100%; max-width: 720px; }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+      padding: 1.75rem; box-shadow: 0 10px 30px rgba(0,0,0,.15);
+    }
+    .brand { color: var(--muted); font-size: .8rem; letter-spacing: .04em; text-transform: uppercase;
+             margin-bottom: 1rem; }
+    h1 { font-size: 1.4rem; margin: 0 0 1rem; word-break: break-word; }
+    label { display: block; font-size: .9rem; margin-bottom: .4rem; color: var(--muted); }
+    input[type="password"], input[type="text"] {
+      width: 100%; padding: .7rem .8rem; font-size: 1rem; border-radius: 9px;
+      border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    }
+    button {
+      margin-top: 1rem; padding: .6rem 1rem; font-size: .95rem; font-weight: 600;
+      border: 0; border-radius: 9px; background: var(--accent); color: var(--accent-fg); cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: default; }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+           padding: .7rem 0; border-top: 1px solid var(--border); }
+    .row:first-child { border-top: 0; }
+    .row .name { word-break: break-word; }
+    .row .sub { color: var(--muted); font-size: .8rem; }
+    .row button { margin-top: 0; }
+    .meta { color: var(--muted); font-size: .82rem; margin-top: 1.25rem; border-top: 1px solid var(--border);
+            padding-top: .9rem; }
+    .msg { margin-top: 1rem; font-size: .92rem; }
+    .msg.error { color: var(--danger); }
+    .center { text-align: center; color: var(--muted); }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="brand">Shared files</div>
+
+      <div id="loading" class="center">Loading&hellip;</div>
+
+      <!-- secret prompt -->
+      <form id="secret-form" class="hidden" autocomplete="off">
+        <label id="secret-label" for="secret-input">This link is protected. Enter the code to open it.</label>
+        <input id="secret-input" type="password" autocomplete="off" inputmode="text" />
+        <button id="secret-submit" type="submit">Unlock</button>
+        <div id="secret-error" class="msg error hidden"></div>
+      </form>
+
+      <!-- content -->
+      <div id="content" class="hidden">
+        <h1 id="title"></h1>
+        <div id="listing"></div>
+        <div id="dl-error" class="msg error hidden"></div>
+        <div class="meta">A read-only link shared with you. It may expire or stop working later.</div>
+      </div>
+
+      <!-- terminal message (not found / errors) -->
+      <div id="notice" class="hidden center"></div>
+    </div>
+  </div>
+  <script src="/static/js/public-link.js" defer></script>
+</body>
+</html>

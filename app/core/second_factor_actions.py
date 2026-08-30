@@ -31,7 +31,7 @@ SECOND_FACTOR_ACTIONS = [
     ("vault.change_password",          "Change a vault password",                   False),
     ("vault.rotate_key",               "Rotate a vault key",                        False),
     ("share.create",                   "Create an internal share",                 False),
-    ("public_link.create",             "Create a public note link",                False),
+    ("public_link.create",             "Create a public link (note or file)",      False),
     ("temp_credential.create",         "Mint a temporary credential",              False),
     ("admin.user.manage",             "Manage users (create / edit / delete / invite)", False),
     ("admin.settings.write",           "Change organization settings",             False),
