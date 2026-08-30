@@ -4970,6 +4970,7 @@ function renderUsersTable() {
                         <th>Role</th>
                         <th>Departments</th>
                         <th>Status</th>
+                        <th>MFA</th>
                     </tr></thead>
                     <tbody>${list.map(renderUserRow).join('')}</tbody>
                 </table>
@@ -5002,9 +5003,12 @@ function renderUserRow(u) {
                 <span class="badge badge-${u.is_active ? 'success' : 'secondary'}">${u.is_active ? 'Active' : 'Inactive'}</span>
                 ${u.is_locked ? `<span class="badge badge-warning">${iconSvg('lock', 'icon-sm')} Locked</span>` : ''}
             </div></td>
+            <td>${u.second_factor_enabled
+                    ? `<span class="badge badge-success">${iconSvg('shield', 'icon-sm')} On</span>`
+                    : `<span class="text-tertiary text-xs">Off</span>`}</td>
         </tr>
         <tr class="exp-detail${open ? ' is-open' : ''}" data-id="${u.id}">
-            <td colspan="5">${renderUserDetail(u)}</td>
+            <td colspan="6">${renderUserDetail(u)}</td>
         </tr>`;
 }
 
@@ -7760,11 +7764,20 @@ async function saveMfaPolicy() {
 async function loadMfaActions() {
     const table = document.getElementById('mfa-actions-table');
     if (!table) return;
+    const saveBtn = document.getElementById('save-mfa-actions-btn');
+    if (saveBtn && !saveBtn.dataset.wired) { saveBtn.dataset.wired = '1'; saveBtn.addEventListener('click', saveMfaActions); }
     table.replaceChildren(_el('div', 'spinner'));
     let data;
     try { data = await apiRequest('/second-factor/actions', { silent: true }); }
     catch (_) { table.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load the action list.')); return; }
     renderMfaActions((data && data.actions) || []);
+}
+
+// Toggles are edited LOCALLY; the admin saves the whole matrix once (one step-up), instead of an OTP
+// prompt on every checkbox. The Save button stays disabled until something changes.
+function _setMfaActionsDirty(dirty) {
+    const btn = document.getElementById('save-mfa-actions-btn');
+    if (btn) btn.disabled = !dirty;
 }
 
 function renderMfaActions(actions) {
@@ -7783,30 +7796,38 @@ function renderMfaActions(actions) {
         const name = _el('div', 'text-sm', a.name || a.key); name.style.flex = '1';
         const otpWrap = _el('div'); otpWrap.style.width = '110px'; otpWrap.style.textAlign = 'center';
         const pwWrap = _el('div'); pwWrap.style.width = '140px'; pwWrap.style.textAlign = 'center';
-        const otp = _el('input'); otp.type = 'checkbox'; otp.checked = !!a.require_otp; otp.setAttribute('aria-label', 'Require OTP for ' + (a.name || a.key));
-        const pw = _el('input'); pw.type = 'checkbox'; pw.checked = !!a.require_password; pw.setAttribute('aria-label', 'Require password for ' + (a.name || a.key));
-        otp.addEventListener('change', () => toggleMfaAction(a, 'require_otp', otp));
-        pw.addEventListener('change', () => toggleMfaAction(a, 'require_password', pw));
+        const otp = _el('input'); otp.type = 'checkbox'; otp.checked = !!a.require_otp;
+        otp.dataset.mfaKey = a.key; otp.dataset.mfaField = 'require_otp';
+        otp.setAttribute('aria-label', 'Require OTP for ' + (a.name || a.key));
+        const pw = _el('input'); pw.type = 'checkbox'; pw.checked = !!a.require_password;
+        pw.dataset.mfaKey = a.key; pw.dataset.mfaField = 'require_password';
+        pw.setAttribute('aria-label', 'Require password for ' + (a.name || a.key));
+        otp.addEventListener('change', () => _setMfaActionsDirty(true));
+        pw.addEventListener('change', () => _setMfaActionsDirty(true));
         otpWrap.appendChild(otp); pwWrap.appendChild(pw);
         row.appendChild(name); row.appendChild(otpWrap); row.appendChild(pwWrap);
         table.appendChild(row);
     });
+    _setMfaActionsDirty(false);   // a fresh render reflects the server state — nothing to save yet
 }
 
-async function toggleMfaAction(a, field, input) {
+async function saveMfaActions() {
+    const btn = document.getElementById('save-mfa-actions-btn');
     document.getElementById('mfa-actions-msg').style.display = 'none';
-    const prev = !!a[field];
-    const patch = {}; patch[field] = input.checked;
-    input.disabled = true;
+    const byKey = {};
+    document.querySelectorAll('#mfa-actions-table input[data-mfa-key]').forEach(inp => {
+        const k = inp.dataset.mfaKey, f = inp.dataset.mfaField;
+        (byKey[k] = byKey[k] || { key: k })[f] = inp.checked;
+    });
+    if (btn) btn.disabled = true;
     try {
-        await apiRequest('/second-factor/actions/' + encodeURIComponent(a.key), { method: 'PUT', body: JSON.stringify(patch) });
-        a[field] = input.checked;   // keep local state accurate for the next toggle
-        input.disabled = false;
-        _mfaMsg('mfa-actions-msg', 'alert-success', 'Updated “' + (a.name || a.key) + '”.');
+        // One request, one step-up (the modal appears once), applies every toggle.
+        const data = await apiRequest('/second-factor/actions', { method: 'PUT', body: JSON.stringify({ actions: Object.values(byKey) }) });
+        renderMfaActions((data && data.actions) || []);   // re-render from the server truth (clean state)
+        _mfaMsg('mfa-actions-msg', 'alert-success', 'Step-up requirements saved.');
     } catch (e) {
-        input.checked = prev;       // cancelled step-up / failure: revert
-        input.disabled = false;
-        _mfaMsg('mfa-actions-msg', 'alert-error', (e && e.message) || 'Could not update — your change was reverted.');
+        if (btn) btn.disabled = false;   // keep the changes + Save enabled so they can retry
+        _mfaMsg('mfa-actions-msg', 'alert-error', (e && e.message) || 'Could not save — your changes were not applied.');
     }
 }
 

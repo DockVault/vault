@@ -1875,7 +1875,7 @@ details summary:hover {
    ============================================================================ */
 /* The preview dialog uses most of the screen (with visible padding around it) so images, PDFs and
    rendered content have room; the base .modal-content 90vh cap is lifted here to 94vh. */
-.modal-content.modal-preview { max-width: min(1500px, 95vw); width: 95vw; max-height: 94vh; }
+.modal-content.modal-preview { max-width: min(1500px, 80vw); width: 80vw; max-height: 94vh; }
 
 #file-preview-body {
     min-height: 220px;

@@ -844,6 +844,9 @@ class UserResponse(BaseModel):
     created_at: datetime
     last_login: Optional[datetime]
     groups: List[GroupBrief] = []
+    # Whether the account has an active second factor (TOTP) enrolled. Not an ORM column — the
+    # admin users list fills it in from a batched enrollment query; elsewhere it stays False.
+    second_factor_enabled: bool = False
 
     class Config:
         from_attributes = True
@@ -6260,7 +6263,21 @@ async def list_users(
     List all users (admin only).
     """
     users = db.query(User).all()
-    return [UserResponse.model_validate(user) for user in users]
+    # Batch the "has an active second factor?" lookup so the list stays one extra query, not one
+    # per row. A user with any active TOTP enrollment shows MFA On in the accounts table.
+    mfa_user_ids = {
+        r[0]
+        for r in db.query(SecondFactorEnrollment.user_id)
+        .filter(SecondFactorEnrollment.status == "active")
+        .distinct()
+        .all()
+    }
+    result = []
+    for user in users:
+        item = UserResponse.model_validate(user)
+        item.second_factor_enabled = user.id in mfa_user_ids
+        result.append(item)
+    return result
 
 
 @app.get("/users/me", response_model=UserResponse)
@@ -6897,6 +6914,55 @@ async def update_second_factor_action(
     except Exception:  # noqa: BLE001
         pass
     return {"key": key, "require_otp": row.require_otp, "require_password": row.require_password}
+
+
+class SecondFactorActionsBulk(BaseModel):
+    actions: list = Field(default_factory=list)
+
+
+@app.put("/second-factor/actions")
+@require_step_up("account.second_factor")
+async def update_second_factor_actions_bulk(
+    body: SecondFactorActionsBulk,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Apply several step-up action toggles at once, under a SINGLE account.second_factor step-up — so
+    an admin can edit the whole matrix and confirm their second factor ONCE instead of once per toggle.
+    Validated all-or-nothing (an unknown key rejects the whole batch before anything is written)."""
+    from app.core.second_factor_actions import ACTION_KEYS, ACTION_META
+    items = body.actions or []
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="actions must be a list.")
+    for it in items:
+        if not isinstance(it, dict) or it.get("key") not in ACTION_KEYS:
+            raise HTTPException(status_code=400, detail="actions contains an unknown or malformed entry.")
+    changed = []
+    for it in items:
+        k = it["key"]
+        row = db.query(SecondFactorAction).filter(SecondFactorAction.key == k).first()
+        if row is None:
+            row = SecondFactorAction(key=k)
+            db.add(row)
+        if it.get("require_otp") is not None:
+            row.require_otp = bool(it["require_otp"])
+        if it.get("require_password") is not None:
+            row.require_password = bool(it["require_password"])
+        changed.append(k)
+    db.commit()
+    try:
+        AuditLogger(db).log_action(action="second_factor_actions_bulk_updated", status="success",
+                                   user=current_user, ip_address=get_client_ip(request),
+                                   details={"keys": changed})
+    except Exception:  # noqa: BLE001
+        pass
+    rows = {r.key: r for r in db.query(SecondFactorAction).all()}
+    return {"actions": [
+        {"key": k, "name": ACTION_META[k]["name"],
+         "require_otp": bool(rows[k].require_otp) if k in rows else bool(ACTION_META[k]["default_require_otp"]),
+         "require_password": bool(rows[k].require_password) if k in rows else False}
+        for k in ACTION_KEYS if k != "login"]}
 
 
 @app.get("/users/me/preferences")
