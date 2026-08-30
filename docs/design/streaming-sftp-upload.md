@@ -106,6 +106,10 @@ plaintext on tmpfs or disk.
   `stream_ctx`, then at close take a FRESH session for the re-authz + `finalize_streaming_upload`,
   re-fetching the vault by `file_info['vault_id']` so no detached ORM object is used. Prefer (b) if
   `finalize_streaming_upload` can be given a session-fresh vault; confirm by reading it before wiring.
+  CONFIRMED: `finalize_streaming_upload` reads `file_info['vault']` (an ORM object) for the same-name
+  replacement + the ZK check, so shape (b) must, at close, re-fetch the vault into the fresh session
+  and set `file_info['vault'] = <fresh vault>` before calling finalize (the streaming phase only needs
+  file_info's scalar fields, so the detached vault from the first-write session is never touched).
 - Drive the context manually: `stream_ctx.__enter__()` at first record, `stream_ctx.__exit__(...)` at
   close — pass an exception on any failure path so it unlinks the blob and writes no terminal.
 - Re-chunk with `UploadAssembler(on_record=stream_ctx.write_chunk, record_size=1 MiB,
