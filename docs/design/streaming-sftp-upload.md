@@ -119,6 +119,34 @@ plaintext on tmpfs or disk.
   random-access beyond window (clean fail, no blob); TOCTOU (revoke mid-transfer → no row, no blob);
   atomic overwrite survives a failed replace; byte-identical to a web-path upload of the same file.
 
+## Concrete wiring steps (mechanical once written)
+
+In `app/sftp/sftp_server.py`:
+1. Extract the re-authorization block from `_make_upload_finalizer._finalize` (size check, principal +
+   `_check_session_valid`, `get_vault` re-authz, `_scope_ok_folder`, `_vault_password_proven`, vault
+   `size_limit`, `would_exceed_deployment_storage`) into a shared method
+   `_authorize_upload_persist(self, db, user, vault_id, folder_id, buffered_size) -> (vault, vault_service) | None`
+   (returns None + logs the specific `safe_event` reason on any failure). Refactor the buffered
+   `_finalize` to call it — behaviour-identical, guarded by the existing SFTP tests.
+2. Add a module-level `_StreamingUpload` holding an `UploadAssembler(on_record=self._emit, 1 MiB,
+   reorder_window)`, a lazily-entered `stream_ctx`, `file_info`, `max_bytes`, and a `_failed` flag.
+   `_emit` calls `stream_ctx.write_chunk`. `write(offset,data)`: reject if
+   `assembler.total_bytes + len(data) > max_bytes` (set `_failed`, descriptive status); else
+   `assembler.feed`, mapping `AssemblerError` to `_failed` + a descriptive status. First write opens
+   the encryptor in a brief `get_db_context()` (`upload_file_streaming` + `stream_ctx.__enter__()`),
+   then closes that session.
+3. `close()`: if `_failed`, `stream_ctx.__exit__(exc)` (unlink blob, no terminal) and return. Else
+   `assembler.finish()` (flush tail), then a fresh `get_db_context()`: `_authorize_upload_persist`;
+   on failure `stream_ctx.__exit__(exc)` + return; on success re-fetch the vault into this session,
+   set `file_info['vault']`, `stream_ctx.__exit__(None)` (terminal), then
+   `finalize_streaming_upload(file_info, total_size=assembler.total_bytes,
+   checksum=stream_ctx.get_checksum(), replace_same_name=can_overwrite)` with the same orphan-unlink
+   except-guard as `_finalize`, then audit.
+4. Handle dispatch: `VaultSFTPHandle.__init__` gains `self.stream = None`; `write()`/`close()` route to
+   `self.stream` when set; the `open()` write-branch builds a `_StreamingUpload` (instead of the
+   staging file) when `settings.sftp_streaming_upload` is on. All existing authz in `open()` (no-clobber,
+   write-permission) stays exactly as-is.
+
 ## Rollout
 
 Land behind the default-OFF flag. Flip on for a deployment only after the security review and a
