@@ -58,11 +58,13 @@ def test_admin_mfa_policy_and_action_matrix(page: Page, admin):
         expect(page.locator("#mfa-policy-msg")).to_contain_text("saved", timeout=10000)
         assert c.get("/settings").json()["mfa_mode"] == "required"
 
-        # Toggle an action in the matrix (require OTP for vault delete) -> step-up -> persisted.
+        # Toggle an action in the matrix, then SAVE the whole matrix once -> a single step-up -> persisted.
+        # (The matrix now edits locally and saves in one shot, instead of an OTP prompt per toggle.)
         expect(page.locator("#mfa-actions-table")).to_be_visible()
         page.get_by_label("Require OTP for Delete a vault").check()
+        page.click("#save-mfa-actions-btn")
         _stepup_with_recovery(page, codes.pop(0))
-        expect(page.locator("#mfa-actions-msg")).to_contain_text("Updated", timeout=10000)
+        expect(page.locator("#mfa-actions-msg")).to_contain_text("saved", timeout=10000)
         acts = c.get("/second-factor/actions").json()["actions"]
         vd = next(a for a in acts if a["key"] == "vault.delete")
         assert vd["require_otp"] is True
