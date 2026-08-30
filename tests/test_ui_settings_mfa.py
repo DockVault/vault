@@ -32,7 +32,10 @@ def test_admin_mfa_policy_and_action_matrix(page: Page, admin):
         page.fill("#password", ta["_password"])
         page.click("#login-form button[type=submit]")
         page.get_by_role("button", name="Use a recovery code instead").click()
-        page.fill("#sf-code-input", codes[0])
+        # Pop recovery codes from the FRONT so the browser and step_up_receipt (which also pops from the
+        # front) never reuse the same single-use code — otherwise the teardown's reset step-up reuses a
+        # spent code, fails, and leaves mfa_mode=required leaking into later tests.
+        page.fill("#sf-code-input", codes.pop(0))
         page.click("#login-second-factor button")
         expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
 
@@ -46,14 +49,14 @@ def test_admin_mfa_policy_and_action_matrix(page: Page, admin):
         # Change the requirement to 'required' and save -> step-up -> persisted.
         page.select_option("#setting-mfa-mode", "required")
         page.click("#save-mfa-policy-btn")
-        _stepup_with_recovery(page, codes[1])
+        _stepup_with_recovery(page, codes.pop(0))
         expect(page.locator("#mfa-policy-msg")).to_contain_text("saved", timeout=10000)
         assert c.get("/settings").json()["mfa_mode"] == "required"
 
         # Toggle an action in the matrix (require OTP for vault delete) -> step-up -> persisted.
         expect(page.locator("#mfa-actions-table")).to_be_visible()
         page.get_by_label("Require OTP for Delete a vault").check()
-        _stepup_with_recovery(page, codes[2])
+        _stepup_with_recovery(page, codes.pop(0))
         expect(page.locator("#mfa-actions-msg")).to_contain_text("Updated", timeout=10000)
         acts = c.get("/second-factor/actions").json()["actions"]
         vd = next(a for a in acts if a["key"] == "vault.delete")
