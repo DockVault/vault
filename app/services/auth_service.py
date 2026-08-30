@@ -567,6 +567,31 @@ class AuthService:
             _pol_raw = {}
         _tp_policy = _tpp.effective_policy(_pol_raw)
 
+        # Per-user cap on ACTIVE temporary credentials (finding F-R015-006): a single account cannot
+        # hold unbounded temp creds. Count only credentials that are BOTH is_active AND not yet expired
+        # (expiry is lazy — is_active flips only on the next auth attempt or the cleanup sweep — so
+        # counting is_active alone would over-count). expires_at is naive UTC, so compare with a naive
+        # utcnow(). 0 = unlimited. A full admin minting directly is exempt (mirrors the vault-count /
+        # storage-budget exemption); a temp session minting a CHILD credential is NOT exempt, so the
+        # delegation-abuse vector the finding cares about stays bounded.
+        _max_temp = _tp_policy.get("max_temp_creds_per_user", 0)
+        if _max_temp > 0:
+            _minter = self.db.query(User).filter(User.id == user_id).first()
+            _exempt = (created_by_temp_credential_id is None
+                       and _minter is not None
+                       and getattr(_minter, "role", None) == RoleEnum.ADMIN)
+            if not _exempt:
+                _active_temp = self.db.query(TemporaryCredential).filter(
+                    TemporaryCredential.user_id == user_id,
+                    TemporaryCredential.is_active == True,  # noqa: E712
+                    TemporaryCredential.expires_at > datetime.utcnow(),
+                ).count()
+                if _active_temp >= _max_temp:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(f"You already have the maximum of {_max_temp} active temporary "
+                                f"credential(s). Revoke one, or ask an administrator to raise the limit."))
+
         # Resolve each selected grant before any database mutation. Every later
         # persistence decision consumes this canonical plan.
         selected_access_plans = []

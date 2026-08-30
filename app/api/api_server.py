@@ -2159,16 +2159,27 @@ def _is_budget_exempt(user: User) -> bool:
     return user.role == RoleEnum.ADMIN and not getattr(user, "_is_temp_session", False)
 
 
+# Default per-account storage budget (GB) when the deployment has not saved one. A fresh install
+# ships with a 50 GB per-account ceiling rather than unlimited (finding F-R015-003), so no single
+# account can consume unbounded storage out of the box. An admin raises it, or sets 0 = unlimited.
+_DEFAULT_ACCOUNT_QUOTA_GB = 50
+# Default per-account cap on OWNED vaults when the deployment has not saved one (finding F-R015-003).
+# 0 = unlimited. Full admins are exempt.
+_DEFAULT_MAX_VAULTS_PER_USER = 50
+
+
 def _account_quota_bytes(db: Session, user: User):
     """This account's EFFECTIVE storage budget in bytes, or None when it has none.
 
     Per-account override first (users.storage_quota_bytes: NULL inherits, -1 exempts, >= 0 is an
-    exact budget), otherwise the deployment default. A budget-exempt identity has no budget at
-    all — the per-vault ceiling still applies to them."""
+    exact budget), otherwise the deployment default. When the deployment never saved a default the
+    account gets the shipped _DEFAULT_ACCOUNT_QUOTA_GB (a stored 0 still means unlimited). A
+    budget-exempt identity has no budget at all — the per-vault ceiling still applies to them."""
     if _is_budget_exempt(user):
         return None
     return storage_quota.account_quota_bytes(
-        getattr(user, "storage_quota_bytes", None), _settings_blob(db).get("default_user_quota"))
+        getattr(user, "storage_quota_bytes", None),
+        _settings_blob(db).get("default_user_quota", _DEFAULT_ACCOUNT_QUOTA_GB))
 
 
 def _account_allocated_bytes(db: Session, user_id, exclude_vault_id=None) -> int:
@@ -2193,6 +2204,38 @@ def _max_allowed_vault_size_bytes(db: Session, owner: User, exclude_vault_id=Non
     headroom = storage_quota.account_headroom_bytes(
         _account_quota_bytes(db, owner), _account_allocated_bytes(db, owner.id, exclude_vault_id))
     return storage_quota.max_vault_total_bytes(ceiling, headroom)
+
+
+def _max_vaults_per_user(db: Session) -> int:
+    """Per-user cap on OWNED vaults (0 = unlimited). Default _DEFAULT_MAX_VAULTS_PER_USER; the admin
+    tunes it in Settings -> Storage. Absent => the default; an explicit 0 => unlimited (distinct from
+    absent); a bool/negative/unparseable stored value falls back to the default (fail-safe)."""
+    raw = _settings_blob(db).get("max_vaults_per_user", _DEFAULT_MAX_VAULTS_PER_USER)
+    if isinstance(raw, bool):
+        return _DEFAULT_MAX_VAULTS_PER_USER
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_VAULTS_PER_USER
+    return n if n >= 0 else _DEFAULT_MAX_VAULTS_PER_USER
+
+
+def _enforce_vault_count(db: Session, owner: User) -> None:
+    """Reject (409) creating a vault past this account's per-user vault cap. Full admins are exempt
+    (mirrors the account-budget exemption; an admin-minted temp credential is NOT a full admin). Only
+    ACTIVE, OWNED vaults count (delete is a hard delete, so the count is exact)."""
+    if _is_budget_exempt(owner):
+        return
+    cap = _max_vaults_per_user(db)
+    if cap <= 0:
+        return
+    count = db.query(Vault).filter(
+        Vault.owner_id == owner.id, Vault.is_active == True).count()  # noqa: E712
+    if count >= cap:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"You have reached the maximum of {cap} vault(s) per account. "
+                    f"Delete a vault or ask an administrator to raise the limit."))
 
 
 def _vault_grant_rows(db: Session, vault, commit: bool = True) -> list:
@@ -2782,6 +2825,12 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             v = payload[gb_key]
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
                 raise HTTPException(status_code=400, detail=f"{gb_key} must be a non-negative number of GB")
+    # Per-user vault-count cap (0 = unlimited).
+    if "max_vaults_per_user" in payload and payload["max_vaults_per_user"] is not None:
+        v = payload["max_vaults_per_user"]
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise HTTPException(status_code=400,
+                                detail="max_vaults_per_user must be a non-negative integer (0 = unlimited)")
 
     # Deployment-wide limit on STORED bytes (GB). Unlike the two quotas above, 0 is a real value
     # here (accept no further bytes) and null clears the override so the deployment runs at its
@@ -2847,7 +2896,8 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     for bkey in _TEMP_PASSCODE_BOOL_KEYS:
         if bkey in payload and not isinstance(payload[bkey], bool):
             raise HTTPException(status_code=400, detail=f"{bkey} must be true or false")
-    for int_key in ("temp_passcode_min_length", "temp_passcode_max_lifetime_minutes"):
+    for int_key in ("temp_passcode_min_length", "temp_passcode_max_lifetime_minutes",
+                    "max_temp_creds_per_user"):
         if int_key in payload and payload[int_key] is not None:
             v = payload[int_key]
             if isinstance(v, bool) or not isinstance(v, int) or v < 0:
@@ -2927,6 +2977,11 @@ async def get_settings(
                                          if (settings.max_storage_gb or 0) > 0 else None)
     data["deployment_storage_limit_bytes"] = deployment_storage_limit_bytes(db)
     data["deployment_storage_used_bytes"] = deployment_storage_used(db)
+    # Report the EFFECTIVE per-account storage default (GB) and the per-user vault cap so the admin
+    # toggles reflect the shipped defaults (50 GB / 50 vaults) even when never explicitly saved. A
+    # stored 0 on either means "unlimited" and is preserved verbatim.
+    data["default_user_quota"] = _settings_blob(db).get("default_user_quota", _DEFAULT_ACCOUNT_QUOTA_GB)
+    data["max_vaults_per_user"] = _max_vaults_per_user(db)
     # The EFFECTIVE per-file SFTP upload limit (MB). A buffered SFTP upload cannot exceed the RAM
     # staging tmpfs, so over SFTP the limit is min(the file-size limit, SFTP_STAGING_TMPFS_MB) — which
     # can be BELOW the web limit. Surface it so the admin sees why SFTP may refuse a file the web UI
@@ -7211,7 +7266,7 @@ async def get_user_storage(
         "allocated_bytes": allocated,
         "available_bytes": storage_quota.account_headroom_bytes(quota, allocated),
         "default_quota_bytes": storage_quota.quota_setting_bytes(
-            _settings_blob(db).get("default_user_quota")),
+            _settings_blob(db).get("default_user_quota", _DEFAULT_ACCOUNT_QUOTA_GB)),
         "budget_exempt": _is_budget_exempt(user),
         "quota_source": ("exempt" if _is_budget_exempt(user) else
                          "account" if override is not None else
@@ -12236,6 +12291,9 @@ async def create_vault(
     # A scoped temp credential may be restricted to a specific vault type (standard vs ZK).
     from app.core.temp_scope import require_create_vault_type
     require_create_vault_type(current_user, vault_type)
+
+    # Per-user vault-count cap (finding F-R015-003): a single account cannot create unbounded vaults.
+    _enforce_vault_count(db, current_user)
 
     # Per-vault size: default 1 GB. Reject a size that is out of range (a sub-nanogigabyte value
     # truncates to 0, which every upload guard reads as UNLIMITED; a huge value overflows the

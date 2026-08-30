@@ -8142,6 +8142,8 @@ async function loadSettings() {
         // Show the actual stored quota, or BLANK when unset/0 (which the backend treats as
         // unlimited) — don't render 10/100 as if a limit were enforced.
         document.getElementById('setting-default-quota').value = (settings.default_user_quota > 0) ? settings.default_user_quota : '';
+        const mvpuEl = document.getElementById('setting-max-vaults-per-user');
+        if (mvpuEl) mvpuEl.value = (settings.max_vaults_per_user > 0) ? settings.max_vaults_per_user : '';
         document.getElementById('setting-max-vault-size').value = (settings.max_vault_size > 0) ? settings.max_vault_size : '';
         document.getElementById('setting-storage-path').value = settings.storage_path || '';
         renderDeploymentStorageSetting(settings);
@@ -8179,6 +8181,8 @@ async function loadSettings() {
         if (tpMinEl) tpMinEl.value = settings.temp_passcode_min_length || 16;
         const tpMaxEl = document.getElementById('setting-temp-passcode-max-lifetime');
         if (tpMaxEl) tpMaxEl.value = (settings.temp_passcode_max_lifetime_minutes > 0) ? settings.temp_passcode_max_lifetime_minutes : '';
+        const mtcEl = document.getElementById('setting-max-temp-creds-per-user');
+        if (mtcEl) mtcEl.value = (settings.max_temp_creds_per_user > 0) ? settings.max_temp_creds_per_user : '';
         // When the PLAN mandates zero-knowledge (Enterprise tier), the local toggles can't
         // lower that floor — show ZK as allowed + required, checked and LOCKED, with an
         // explanatory note, so an unchecked-but-forced box isn't contradictory. Best-effort:
@@ -8267,6 +8271,7 @@ async function saveAllSettings() {
             // Storage
             // Blank -> 0 (unlimited); the backend enforces a positive value and ignores 0.
             default_user_quota: parseInt(document.getElementById('setting-default-quota').value) || 0,
+            max_vaults_per_user: parseInt(document.getElementById('setting-max-vaults-per-user').value) || 0,
             max_vault_size: parseInt(document.getElementById('setting-max-vault-size').value) || 0,
             // The deployment limit is the one field where 0 is a real answer (accept no more
             // bytes), so blank must send null — "run at the deployment maximum" — rather than
@@ -8299,6 +8304,7 @@ async function saveAllSettings() {
             temp_passcode_require_special: document.getElementById('setting-temp-passcode-require-special').checked,
             temp_passcode_min_length: parseInt(document.getElementById('setting-temp-passcode-min-length').value) || 16,
             temp_passcode_max_lifetime_minutes: parseInt(document.getElementById('setting-temp-passcode-max-lifetime').value) || 0,
+            max_temp_creds_per_user: parseInt(document.getElementById('setting-max-temp-creds-per-user').value) || 0,
             temp_cred_allow_zk_vaults: document.getElementById('setting-temp-cred-allow-zk-vaults').checked
         };
 

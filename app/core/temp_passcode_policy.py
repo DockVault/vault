@@ -57,6 +57,23 @@ def max_lifetime_minutes(cfg) -> int:
     return n if n > 0 else 0
 
 
+DEFAULT_MAX_TEMP_CREDS = 10  # per-user cap on simultaneously-ACTIVE temp credentials (0 = unlimited)
+
+
+def max_temp_creds_per_user(cfg) -> int:
+    """Per-user cap on active temporary credentials. Default DEFAULT_MAX_TEMP_CREDS; 0 = unlimited. A
+    bool, negative, or unparseable stored value falls back to the default (fail-safe — a cap stays in
+    force), while an explicit 0 is honoured as unlimited (distinct from absent)."""
+    raw = (cfg or {}).get("max_temp_creds_per_user", DEFAULT_MAX_TEMP_CREDS)
+    if isinstance(raw, bool):
+        return DEFAULT_MAX_TEMP_CREDS
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_TEMP_CREDS
+    return n if n >= 0 else DEFAULT_MAX_TEMP_CREDS
+
+
 def effective_policy(cfg) -> dict:
     """The full effective policy, keyed by the exact setting names so ONE call drives both the mint UI
     (GET /temp-passcode-policy) and the GET /settings overlay. Includes temp_cred_allow_zk_vaults so a
@@ -67,6 +84,7 @@ def effective_policy(cfg) -> dict:
         "temp_passcode_min_length": min_length(cfg),
         "temp_passcode_max_lifetime_minutes": max_lifetime_minutes(cfg),
         "temp_cred_allow_zk_vaults": allow_zk_vaults(cfg),
+        "max_temp_creds_per_user": max_temp_creds_per_user(cfg),
     }
     for key, default in _BOOL_DEFAULTS.items():
         val = cfg.get(key)
