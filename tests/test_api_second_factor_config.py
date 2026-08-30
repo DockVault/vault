@@ -43,4 +43,7 @@ def test_changing_the_mfa_policy_requires_step_up_validates_and_persists(admin):
         assert c.put("/settings", json={"mfa_email_code_ttl_minutes": 999},
                      headers={"X-Second-Factor": _receipt(c, codes)}).status_code == 400
     finally:
+        # Restore note_max_chars to its default so a low value can't leak into later tests (a long-note
+        # test elsewhere in the full suite posts ~5800 chars). admin.settings.write defaults off -> no step-up.
+        admin.put("/settings", json={"note_max_chars": 100000})
         admin.delete_user(ta["id"])

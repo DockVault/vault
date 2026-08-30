@@ -118,5 +118,8 @@ def test_settings_write_gated_but_mfa_keys_still_use_the_account_gate(admin):
                                                                      recovery_codes=codes)}).status_code == 200
         finally:
             set_action_require_otp(admin, "admin.settings.write", False)
+            # Restore note_max_chars (now that admin.settings.write is off -> no step-up) so the lowered
+            # value can't leak into a later full-suite test that posts a long note.
+            admin.put("/settings", json={"note_max_chars": 100000})
     finally:
         admin.delete_user(ta["id"])
