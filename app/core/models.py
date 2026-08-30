@@ -1581,6 +1581,10 @@ class Receiver(Base):
     # Frozen policy the wrapper enforces on the vault.
     max_file_bytes = Column(BigInteger, nullable=True)         # per-file cap; NULL = the vault/deployment cap
     max_total_bytes = Column(BigInteger, nullable=True)        # the receiver vault's size_limit
+    # In-flight bytes reserved by open anonymous upload sessions (reserve-at-open; refunded on
+    # finalize / abort / expiry). The invariant is stored_bytes + reserved_bytes <= max_total_bytes,
+    # so N concurrent anonymous uploads can't race past the cap.
+    reserved_bytes = Column(BigInteger, nullable=False, default=0)
     retention_days = Column(Integer, nullable=True)            # uploads expire after this many days
 
     paused = Column(Boolean, nullable=False, default=False)    # temporarily stop accepting uploads

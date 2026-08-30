@@ -251,11 +251,19 @@ def test_wrapped_vault_is_policy_frozen(admin, receivers_enabled):
                          json={"granted_bytes": 100 * _MB}).status_code == 400
         # non-read grant refused; read grant allowed
         u = admin.create_user(role="user")
+        g = admin.post("/groups", json={"name": unique("recvdept")}).json()
         try:
             w = admin.post(f"/vaults/{vid}/permissions", json={"user_id": u["id"], "level": "write"})
             assert w.status_code == 400, w.text
             r = admin.post(f"/vaults/{vid}/permissions", json={"user_id": u["id"], "level": "read"})
             assert r.status_code in (200, 201), r.text
+            # ...and the DEPARTMENT/group path is frozen the same way (write refused, read allowed).
+            gw = admin.post(f"/vaults/{vid}/group-access",
+                            json={"group_id": g["id"], "permission": "write"})
+            assert gw.status_code == 400, gw.text
+            gr = admin.post(f"/vaults/{vid}/group-access",
+                            json={"group_id": g["id"], "permission": "read"})
+            assert gr.status_code in (200, 201), gr.text
         finally:
             admin.delete_user(u["id"])
     finally:

@@ -9811,6 +9811,37 @@ def _receiver_for_vault(db, vault_id):
     return db.query(Receiver).filter(Receiver.vault_id == vault_id).first()
 
 
+def _receiver_reserve_bytes(db, receiver_id, size, stored) -> bool:
+    """GATE 2 — reserve `size` bytes for an in-flight anonymous upload, ATOMICALLY. Increments
+    reserved_bytes only if stored + reserved_bytes + size stays within max_total_bytes; the conditional
+    UPDATE re-reads reserved_bytes on the row, so N concurrent opens can't race past the cap. Returns
+    True if the reservation was made, False if it would exceed the receiver's total cap."""
+    from sqlalchemy import update as _sa_update
+    stmt = (_sa_update(Receiver)
+            .where(Receiver.id == receiver_id,
+                   Receiver.max_total_bytes.isnot(None),
+                   (int(stored) + Receiver.reserved_bytes + int(size)) <= Receiver.max_total_bytes)
+            .values(reserved_bytes=Receiver.reserved_bytes + int(size)))
+    res = db.execute(stmt)
+    db.commit()
+    return (res.rowcount or 0) == 1
+
+
+def _receiver_release_bytes(db, receiver_id, size) -> None:
+    """Refund a reservation (on session-open failure, abort, or expiry). Floors at 0 so a double
+    refund can't drive the counter negative."""
+    from sqlalchemy import update as _sa_update, func as _f
+    try:
+        db.execute(_sa_update(Receiver).where(Receiver.id == receiver_id).values(
+            reserved_bytes=_f.greatest(Receiver.reserved_bytes - int(size), 0)))
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
 class ReceiverPauseBody(BaseModel):
     paused: bool = True
 
@@ -10102,6 +10133,253 @@ async def admin_revoke_receiver(
         except Exception:
             pass
     return {"ok": True, "id": str(r.id), "revoked": True}
+
+
+# --- Anonymous upload path: session OPEN (reserve-at-open + bind to receiver) -----------------------
+# Reuses the public-link redemption constants for the rate limits / lockout windows. The chunk PUT and
+# finalize (which stream bytes under a SEPARATE anon-inbound admission budget and land the file into the
+# session-derived vault) are a following change.
+_RECV_FAIL_MAX = _PUBLINK_FAIL_MAX
+_RECV_FAIL_WINDOW = _PUBLINK_FAIL_WINDOW
+_RECV_MAX_OPEN_SESSIONS = 25          # concurrent open anon sessions per receiver (transient-buffer bound)
+
+
+def _receiver_fail_key(token_hash: str) -> str:
+    return f"receiver:fail:{token_hash}"
+
+
+def _receiver_locked(token_hash: str) -> bool:
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is None:
+        raise RuntimeError("rate-limit store unavailable")
+    n = r.get(_receiver_fail_key(token_hash))
+    return n is not None and int(n) >= _RECV_FAIL_MAX
+
+
+def _receiver_record_fail(token_hash: str) -> int:
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is None:
+        return _RECV_FAIL_MAX
+    try:
+        n = int(r.incr(_receiver_fail_key(token_hash)))
+        if n == 1:
+            r.expire(_receiver_fail_key(token_hash), _RECV_FAIL_WINDOW)
+        return n
+    except Exception:
+        return _RECV_FAIL_MAX
+
+
+def _receiver_clear_fails(token_hash: str) -> None:
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is not None:
+        try:
+            r.delete(_receiver_fail_key(token_hash))
+        except Exception:
+            pass
+
+
+def _receiver_resolve_live(db, receiver):
+    """Re-validate a receiver against LIVE state and return (vault, owner) — or None (uniform 404). The
+    wrapped vault must be active + Standard, and the owner active + not locked. Checked every anonymous
+    request so a revoke / owner-lockout after minting bites on the next upload."""
+    vault = db.query(Vault).filter(Vault.id == receiver.vault_id, Vault.is_active.is_(True)).first()
+    if not vault or getattr(vault, "type", "standard") == "zero_knowledge":
+        return None
+    owner = db.query(User).filter(User.id == receiver.owner_id).first()
+    if not owner or not getattr(owner, "is_active", True):
+        return None
+    locked_until = getattr(owner, "locked_until", None)
+    if locked_until is not None and locked_until > datetime.utcnow():
+        return None
+    return vault, owner
+
+
+class ReceiverUploadOpen(BaseModel):
+    filename: str
+    total_size: int
+    total_chunks: int
+    chunk_size: Optional[int] = None
+    secret: Optional[str] = None
+
+
+@app.post("/receivers/{token}/upload-session")
+async def open_receiver_upload_session(
+    token: str,
+    payload: ReceiverUploadOpen,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """PUBLIC: open an anonymous upload session against a receiver. Rate-limited per IP AND per token
+    (fail-closed); a secret-gated receiver prompts for its PIN/password with a per-link lockout; the
+    kill switch, paused / revoked / expired / exhausted states, per-file cap and file-type allowlist are
+    all enforced here; and the declared size is ATOMICALLY RESERVED against the receiver's total cap
+    BEFORE any bytes move (reserve-at-open). The minted chunked-upload session is BOUND to this receiver
+    (and client IP) so it can only ever be finalized into the receiver's own vault. A missing or
+    unusable receiver returns the uniform 404 (no oracle)."""
+    import time as _t
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    from app.core.security import verify_password, encrypt_object_field, name_blind_index
+
+    client_ip = get_client_ip(request)
+    if not token or len(token) > _PUBLINK_TOKEN_MAX_INPUT:
+        raise HTTPException(status_code=404, detail="This upload link is not available.")
+
+    try:
+        allowed, _, reset = _rl.check_rate_limit(
+            identifier=f"{client_ip}:{token}", limit=_PUBLINK_REDEEM_LIMIT,
+            window=_PUBLINK_REDEEM_WINDOW, prefix="receiver_open", fail_open=False)
+        allowed_ip, _, reset_ip = _rl.check_rate_limit(
+            identifier=client_ip, limit=_PUBLINK_REDEEM_IP_LIMIT,
+            window=_PUBLINK_REDEEM_IP_WINDOW, prefix="receiver_open_ip", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+    if not allowed or not allowed_ip:
+        _reset = reset if not allowed else reset_ip
+        raise HTTPException(status_code=429, detail="Too many requests.",
+                            headers={"Retry-After": str(max(1, _reset - int(_t.time())))})
+
+    def _audit(status, reason=None, rid=None):
+        try:
+            AuditLogger(db).log_action(
+                action="receiver_upload_open", status=status, resource_type="receiver",
+                resource_id=str(rid) if rid else None,
+                details={"reason": reason} if reason else None, ip_address=client_ip)
+        except Exception:
+            pass
+
+    if not receiver_policy.public_receivers_enabled(_global_settings_blob(db)):
+        _audit("failure", reason="feature_disabled")
+        raise HTTPException(status_code=404, detail="This upload link is not available.")
+
+    token_hash = _receiver_token_hash(token)
+    receiver = db.query(Receiver).filter(Receiver.token_hash == token_hash).first()
+    if not receiver or _receiver_status(receiver) != "active":
+        _audit("failure", reason="not_available", rid=(receiver.id if receiver else None))
+        raise HTTPException(status_code=404, detail="This upload link is not available.")
+
+    live = _receiver_resolve_live(db, receiver)
+    if live is None:
+        _audit("failure", reason="not_available", rid=receiver.id)
+        raise HTTPException(status_code=404, detail="This upload link is not available.")
+    vault, owner = live
+
+    # Secret gate (a receiver's optional LINK secret — distinct from the file envelope).
+    if receiver.secret_kind != "none":
+        try:
+            locked = _receiver_locked(token_hash)
+        except Exception:
+            raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+        if locked:
+            _audit("failure", reason="locked_out", rid=receiver.id)
+            raise HTTPException(status_code=429, detail="Too many incorrect attempts. Try again later.",
+                                headers={"Retry-After": str(_RECV_FAIL_WINDOW)})
+        raw = (payload.secret or "")
+        if not raw.strip():
+            raise HTTPException(status_code=401,
+                                detail={"error": "secret_required", "secret_kind": receiver.secret_kind})
+        secret = raw.strip() if receiver.secret_kind == "pin" else raw
+        if len(secret) > _PUBLINK_SECRET_MAX or not receiver.password_hash \
+                or not verify_password(secret, receiver.password_hash):
+            n = _receiver_record_fail(token_hash)
+            _audit("failure", reason="wrong_secret", rid=receiver.id)
+            if n >= _RECV_FAIL_MAX:
+                raise HTTPException(status_code=429, detail="Too many incorrect attempts. Try again later.",
+                                    headers={"Retry-After": str(_RECV_FAIL_WINDOW)})
+            raise HTTPException(status_code=401,
+                                detail={"error": "wrong_secret", "secret_kind": receiver.secret_kind})
+        _receiver_clear_fails(token_hash)
+        secret_proof = _receiver_token_hash(secret)   # a stored proof the link secret was satisfied
+    else:
+        secret_proof = None
+
+    # Validate the declared upload shape (mirrors the authenticated init).
+    size = int(payload.total_size or 0)
+    chunks = int(payload.total_chunks or 0)
+    if size <= 0 or chunks <= 0:
+        raise HTTPException(status_code=400, detail="Invalid upload size")
+    if chunks > size or chunks > 200_000:
+        raise HTTPException(status_code=400, detail="Invalid chunk count for the declared size")
+    _min_chunks = (size + _MAX_UPLOAD_CHUNK_BYTES - 1) // _MAX_UPLOAD_CHUNK_BYTES
+    if chunks < _min_chunks:
+        raise HTTPException(status_code=400,
+                            detail=f"Too few chunks for a {size}-byte upload.")
+
+    # Filename + type allowlist (a receiver vault is Standard, so plaintext-name rules apply).
+    fname = ''.join(c for c in (payload.filename or "") if ord(c) >= 32 and ord(c) != 127) or ""
+    if not fname:
+        raise HTTPException(status_code=400, detail="A file name is required.")
+    _allowed_exts, _deploy_max_file = _upload_policy(db)
+    _enforce_file_type(fname, _allowed_exts)
+
+    # Per-file cap: the receiver's max_file_bytes (if set) AND the deployment ceiling.
+    per_file_cap = _deploy_max_file
+    if receiver.max_file_bytes:
+        per_file_cap = min(per_file_cap, int(receiver.max_file_bytes))
+    if size > per_file_cap:
+        raise HTTPException(status_code=413,
+                            detail=f"File exceeds the maximum size of {per_file_cap // (1024 * 1024)} MB.")
+    _enforce_deployment_storage_quota(db, size)
+
+    # Bound concurrent open anon sessions per receiver (transient-buffer DoS bound).
+    now = datetime.utcnow()
+    open_sessions = db.query(ReceiverUploadSession.session_id).join(
+        ChunkedUploadSession, ChunkedUploadSession.id == ReceiverUploadSession.session_id).filter(
+        ReceiverUploadSession.receiver_id == receiver.id,
+        ChunkedUploadSession.status == 'active',
+        ChunkedUploadSession.expires_at > now).count()
+    if open_sessions >= _RECV_MAX_OPEN_SESSIONS:
+        raise HTTPException(status_code=429,
+                            detail="Too many uploads in progress for this link; try again shortly.")
+
+    # GATE 2 — reserve the declared size against the receiver's total cap BEFORE any bytes move.
+    stored = int(getattr(vault, "total_size_bytes", 0) or 0)
+    if not _receiver_reserve_bytes(db, receiver.id, size, stored):
+        _audit("failure", reason="over_capacity", rid=receiver.id)
+        raise HTTPException(status_code=413, detail="This upload would exceed the link's remaining space.")
+
+    # Mint the chunked-upload session owned by the RECEIVER'S OWNER (so the file lands owned by them),
+    # into the receiver's vault at its root. Refund the reservation if anything below fails.
+    try:
+        _sid = uuid.uuid4()
+        enc_name = encrypt_object_field(vault.id, _sid, fname, 'name')
+        name_bi = name_blind_index(vault.id, fname)
+        session = ChunkedUploadSession(
+            id=_sid, vault_id=vault.id, user_id=owner.id,
+            filename=None, mime_type=None, enc_name=enc_name, enc_mime=None, name_bi=name_bi,
+            total_size=size, total_chunks=chunks, chunks_received=0, bytes_received=0,
+            folder_id=None, temp_credential_id=None,
+            created_at=now, last_chunk_at=now,
+            expires_at=now + timedelta(hours=_chunk_session_ttl_hours()), status='active')
+        db.add(session)
+        db.flush()
+        db.add(ReceiverUploadSession(session_id=_sid, receiver_id=receiver.id,
+                                     secret_hash=secret_proof, client_ip=client_ip))
+        db.commit()
+        db.refresh(session)
+    except Exception:
+        db.rollback()
+        _receiver_release_bytes(db, receiver.id, size)
+        raise HTTPException(status_code=500, detail="Could not start the upload; please try again.")
+
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    sdir = _upload_session_dir(vault_service, str(session.id))
+    sdir.mkdir(parents=True, exist_ok=True)
+    if not session.temp_file_path:
+        session.temp_file_path = str(sdir)
+        db.commit()
+
+    _audit("success", rid=receiver.id)
+    return {
+        "session_id": str(session.id),
+        "chunk_size": payload.chunk_size,
+        "total_chunks": session.total_chunks,
+        "received_chunks": [],
+        "expires_at": session.expires_at.isoformat() if session.expires_at else None,
+    }
 
 
 @app.get("/share-policy")
@@ -13161,6 +13439,12 @@ async def grant_vault_group_access(
         )
     if not db.query(Group).filter(Group.id == payload.group_id).first():
         raise HTTPException(status_code=404, detail="Group not found")
+    # A receiver vault is share-frozen to READ (like the per-user permissions route): a department
+    # granted write could alter or delete the arrived files and upload bypassing the receiver's policy.
+    if payload.permission == 'write' and _receiver_for_vault(db, vault_id) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This vault backs an upload link; only read access can be granted on it.")
     perm = 'write' if payload.permission == 'write' else 'read'
     existing = db.execute(
         select(vault_group_access).where(
@@ -18786,6 +19070,10 @@ END $$;""",
             "ALTER TABLE note_link_tags ADD COLUMN IF NOT EXISTS allowed_targets JSON",
             "UPDATE note_link_tags SET allowed_targets = '[\"note\"]'::json WHERE allowed_targets IS NULL",
             "ALTER TABLE note_link_tags ALTER COLUMN allowed_targets SET NOT NULL",
+            # Receivers: in-flight reserved bytes for the anonymous upload path (reserve-at-open).
+            # create_all adds it on a fresh DB; this backfills a receivers table created on an
+            # intermediate build. Additive + idempotent; defaults to 0.
+            "ALTER TABLE receivers ADD COLUMN IF NOT EXISTS reserved_bytes BIGINT NOT NULL DEFAULT 0",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)
