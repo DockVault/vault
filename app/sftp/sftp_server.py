@@ -1023,6 +1023,42 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         )
         return handle
 
+    def _authorize_upload_persist(self, db, vault_id, folder_id, size):
+        """Persist-time re-authorization shared by the buffered and streaming SFTP upload paths.
+
+        Runs EVERY TOCTOU gate that must still hold at close — an account locked/deactivated or a
+        session revoked mid-transfer, a temp-credential scope narrowed off the destination folder, a
+        vault password added/rotated, the vault size limit, and the deployment plan ceiling — against a
+        FRESH session. Returns ``(user, vault, vault_service)`` when the write may land, or ``None``
+        (having logged the specific reason) when it must be dropped. `get_vault` can itself raise on a
+        membership/scope loss; that is caught and mapped to a drop so both callers see one contract
+        (a None means "do not persist")."""
+        user = self._load_principal(db)
+        if user is None or not self._check_session_valid():
+            safe_event('upload.aborted.principal-invalid')
+            return None
+        vault_service = VaultService(db, PermissionService(db))
+        try:
+            vault = vault_service.get_vault(vault_id, user, require_password=False)
+        except Exception as e:  # noqa: BLE001 - a membership/scope loss between open() and close()
+            safe_event('upload.aborted.reauthz-failed', e)
+            return None
+        if not self._scope_ok_folder(db, user, vault_id, folder_id):
+            safe_event('upload.aborted.folder-out-of-scope')
+            return None
+        if vault.password_hash is not None and not self._vault_password_proven(user, vault):
+            safe_event('upload.aborted.password-proof-invalid')
+            return None
+        if vault.size_limit and (vault.total_size_bytes or 0) + size > vault.size_limit:
+            safe_event('upload.rejected.vault-limit', vault=vault.id, bytes=size, limit=vault.size_limit)
+            return None
+        from app.services.vault_service import would_exceed_deployment_storage
+        exceeds, _used, _cap = would_exceed_deployment_storage(db, size)
+        if exceeds:
+            safe_event('upload.rejected.plan-limit', bytes=size)
+            return None
+        return user, vault, vault_service
+
     def _make_upload_finalizer(self, vault_id, folder_id, filename, can_overwrite):
         """Build the close-time callback that pushes a buffered plaintext file
         through the canonical (web-identical) encryption pipeline and creates the
@@ -1046,43 +1082,10 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 return
 
             with get_db_context() as db:
-                user = interface._load_principal(db)
-                # Re-validate principal AND session at persist time: an account
-                # locked/deactivated or a session revoked mid-transfer must not
-                # land the write (TOCTOU between open() and close()).
-                if user is None or not interface._check_session_valid():
-                    safe_event('upload.aborted.principal-invalid')
+                authz = interface._authorize_upload_persist(db, vault_id, folder_id, buffered_size)
+                if authz is None:
                     return
-                vault_service = VaultService(db, PermissionService(db))
-                # Re-authorize at persist time (fresh session): membership +
-                # temp-cred vault scope. upload re-checks the real vault.
-                vault = vault_service.get_vault(vault_id, user, require_password=False)
-                # Re-check the destination folder's ID-scope too (parity with the session/password/
-                # quota re-checks): a scoped credential whose scope was narrowed between open() and
-                # close() must not land a write into a now-out-of-scope folder.
-                if not interface._scope_ok_folder(db, user, vault_id, folder_id):
-                    safe_event('upload.aborted.folder-out-of-scope')
-                    return
-                # Re-gate the per-vault password proof too: a password ADDED or rotated
-                # between open() and close() must not let an in-flight write land without
-                # current proof (TOCTOU) — same gate _resolve_vault applies at open().
-                if vault.password_hash is not None and not interface._vault_password_proven(user, vault):
-                    safe_event('upload.aborted.password-proof-invalid')
-                    return
-
-                # Vault quota pre-check (mirror the web upload path) — again before
-                # we write or delete anything.
-                if vault.size_limit and (vault.total_size_bytes or 0) + buffered_size > vault.size_limit:
-                    safe_event('upload.rejected.vault-limit',
-                                vault=vault.id, bytes=buffered_size, limit=vault.size_limit)
-                    return
-                # Deployment-wide plan storage ceiling (aggregate across all vaults) —
-                # same gate the web upload path enforces, so SFTP can't bypass the plan.
-                from app.services.vault_service import would_exceed_deployment_storage
-                exceeds, _used, _cap = would_exceed_deployment_storage(db, buffered_size)
-                if exceeds:
-                    safe_event('upload.rejected.plan-limit', bytes=buffered_size)
-                    return
+                user, vault, vault_service = authz
 
                 mime_type, _ = mimetypes.guess_type(filename)
                 file_info, stream_ctx = vault_service.upload_file_streaming(
