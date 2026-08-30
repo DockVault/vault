@@ -122,6 +122,15 @@ transfer_admission = TransferAdmission(
     wait_seconds=settings.transfer_queue_wait_seconds,
 )
 
+# GATE 1 — a SEPARATE, smaller admission pool for the ANONYMOUS inbound (receiver) upload finalize, so
+# a flood of anonymous uploads can never starve authenticated transfers of the main pool. Sized as a
+# fraction of the main ceiling (at least 1), with a short, shallow queue.
+receiver_transfer_admission = TransferAdmission(
+    limit=max(1, settings.max_concurrent_transfers // 4),
+    max_waiting=max(1, settings.max_queued_transfers // 4),
+    wait_seconds=settings.transfer_queue_wait_seconds,
+)
+
 
 def _busy_response(exc: TransferBusy) -> HTTPException:
     """Turn a refusal into something a client can act on.
@@ -10382,6 +10391,277 @@ async def open_receiver_upload_session(
     }
 
 
+def _receiver_resolve_session(db, token: str, session_id):
+    """Resolve an anonymous upload session from its receiver token + session id, or None (uniform
+    404). GATE 3: the target vault is derived from the SESSION's binding, never from the client — the
+    session must be bound to THIS receiver and its vault must match the receiver's. Also re-validates
+    the kill switch, the receiver's active state, and the session's active/not-expired state, so a
+    revoke / owner-lockout / expiry after opening bites on the next chunk or finalize. Returns
+    (receiver, session, vault, owner)."""
+    if not token or len(token) > _PUBLINK_TOKEN_MAX_INPUT:
+        return None
+    if not receiver_policy.public_receivers_enabled(_global_settings_blob(db)):
+        return None
+    token_hash = _receiver_token_hash(token)
+    receiver = db.query(Receiver).filter(Receiver.token_hash == token_hash).first()
+    if not receiver or _receiver_status(receiver) != "active":
+        return None
+    binding = db.query(ReceiverUploadSession).filter(
+        ReceiverUploadSession.session_id == session_id,
+        ReceiverUploadSession.receiver_id == receiver.id).first()
+    if binding is None:
+        return None
+    session = db.query(ChunkedUploadSession).filter(
+        ChunkedUploadSession.id == session_id).first()
+    if session is None or session.status != 'active':
+        return None
+    if session.expires_at and session.expires_at <= datetime.utcnow():
+        return None
+    live = _receiver_resolve_live(db, receiver)
+    if live is None:
+        return None
+    vault, owner = live
+    # GATE 3 cross-check: the session's vault must be the receiver's own vault. Anything else is a
+    # tampered binding — refuse rather than land bytes anywhere else.
+    if str(session.vault_id) != str(vault.id):
+        return None
+    return receiver, session, vault, owner
+
+
+@app.put("/receivers/{token}/upload-session/{session_id}/chunks/{chunk_index}")
+async def receiver_upload_chunk(
+    token: str,
+    session_id: uuid.UUID,
+    chunk_index: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """PUBLIC: store one chunk of an anonymous upload. No principal — the session is resolved via its
+    receiver binding, and the chunk streams straight to the session's staging dir (bounded by the
+    per-chunk cap and the reserve-at-open allocation, so it holds nothing and needs no admission slot,
+    exactly like the authenticated chunk write). A bad token/session returns the uniform 404."""
+    resolved = _receiver_resolve_session(db, token, session_id)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="This upload is not available.")
+    _receiver, session, vault, _owner = resolved
+    if chunk_index < 0 or chunk_index >= session.total_chunks:
+        raise HTTPException(status_code=400, detail=f"Invalid chunk index (0-{session.total_chunks - 1})")
+
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    sdir = _upload_session_dir(vault_service, str(session.id))
+    sdir.mkdir(parents=True, exist_ok=True)
+    chunk_path = sdir / f"chunk_{chunk_index:06d}"
+    already = chunk_path.exists()
+    existing_size = sealed_plaintext_size(chunk_path) if already else 0
+    base_bytes = max(0, (session.bytes_received or 0) - existing_size)
+    remaining = min(session.total_size - base_bytes, _MAX_UPLOAD_CHUNK_BYTES)
+
+    declared_len = request.headers.get("content-length")
+    if declared_len is not None:
+        try:
+            clen = int(declared_len)
+        except (TypeError, ValueError):
+            clen = None
+        if clen is not None and clen > remaining:
+            raise HTTPException(status_code=413, detail="Chunk data exceeds the declared upload size")
+
+    tmp_path = sdir / f".chunk_{chunk_index:06d}.{uuid.uuid4().hex}.part"
+    try:
+        _written, chunk_digest = await seal_stream_to_file(
+            request.stream(), tmp_path, remaining, session.id, chunk_index)
+    except ChunkTooLarge:
+        raise HTTPException(status_code=413, detail="Chunk data exceeds the declared upload size")
+    except EmptyBody:
+        raise HTTPException(status_code=400, detail="Empty chunk")
+
+    # Publish under the per-session row lock (same reasoning as the authenticated chunk write): the
+    # rename + digest must be atomic against a concurrent re-send, and the counters are recomputed from
+    # the authoritative on-disk chunk set.
+    _total = session.total_chunks
+    locked = db.query(ChunkedUploadSession).filter(
+        ChunkedUploadSession.id == session.id).with_for_update().first()
+    hash_path = _chunk_hash_path(sdir, chunk_index)
+    try:
+        hash_path.unlink()
+    except OSError:
+        pass
+    try:
+        os.replace(tmp_path, chunk_path)
+    except OSError:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+    try:
+        hash_path.write_text(chunk_digest, encoding='ascii')
+    except Exception:
+        pass
+
+    _present = sorted(sdir.glob("chunk_*"))
+    _bytes = sum(sealed_plaintext_size(_p) for _p in _present)
+    received = len(_present)
+    if locked is not None:
+        locked.bytes_received = _bytes
+        locked.chunks_received = received
+        locked.last_chunk_at = datetime.utcnow()
+    db.commit()
+    return {'received': received, 'total': _total, 'bytes_received': _bytes,
+            'percent': round(received * 100 / _total, 1) if _total else 0,
+            'complete': received >= _total}
+
+
+@app.post("/receivers/{token}/upload-session/{session_id}/complete")
+async def receiver_complete_upload(
+    token: str,
+    session_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """PUBLIC: finalize an anonymous upload. Assembles the staged chunks through the SAME encryption
+    pipeline the authenticated upload uses, into the vault DERIVED FROM THE SESSION (never a
+    client-supplied id — GATE 3), owned by the receiver's owner. Admitted under a SEPARATE anon-inbound
+    transfer budget (GATE 1) so a flood of anonymous finalizes can never starve authenticated transfers.
+    Reconciles the reserve-at-open allocation once the bytes are actually stored, and bumps the
+    receiver's upload counters."""
+    from app.core.security import ObjectChangedDuringRead  # noqa: F401 (parity import)
+
+    resolved = _receiver_resolve_session(db, token, session_id)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="This upload is not available.")
+    receiver, session, vault, owner = resolved
+
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    audit_logger = AuditLogger(db)
+
+    # Hold the session open across the (potentially long) assembly so the sweep can't reclaim it.
+    session.expires_at = datetime.utcnow() + timedelta(hours=_chunk_session_ttl_hours())
+    db.commit()
+
+    # GATE 1 — admit the assembling half on the anon-inbound budget.
+    try:
+        transfer_slot = await receiver_transfer_admission.acquire()
+    except TransferBusy as busy:
+        raise _busy_response(busy)
+
+    try:
+        sdir = _upload_session_dir(vault_service, str(session.id))
+        present = _received_chunk_indices(sdir)
+        missing = [i for i in range(session.total_chunks) if i not in present]
+        if missing:
+            raise HTTPException(status_code=409, detail={
+                'error': 'incomplete', 'message': f'{len(missing)} chunk(s) still missing',
+                'missing_chunks': missing[:100], 'missing_count': len(missing)})
+
+        fname = session.filename  # decrypted in-memory by the ORM load event (Standard vault)
+        if not fname:
+            raise HTTPException(status_code=409, detail=(
+                "This upload could not be completed here. Cancel it and upload the file again."))
+
+        file_info = None
+
+        def _remove_orphan_blob():
+            try:
+                if file_info and file_info.get('storage_path'):
+                    vault_service._remove_blobs([file_info['storage_path']])
+            except Exception:
+                pass
+
+        try:
+            file_info, stream_ctx = vault_service.upload_file_streaming(
+                vault_id=vault.id, file_name=fname, user=owner, folder_id=None,
+                mime_type=session.mime_type, file_id=None)
+            with stream_ctx as ctx:
+                for i in range(session.total_chunks):
+                    for buf in open_staged_chunk(sdir / f"chunk_{i:06d}", session.id, i):
+                        if buf:
+                            ctx.write_chunk(buf)
+                final_checksum = ctx.get_checksum()
+                final_size = ctx.get_total_size()
+
+            if final_size != session.total_size:
+                raise HTTPException(status_code=409, detail={
+                    "code": "size_mismatch",
+                    "message": (f"This upload delivered {final_size} bytes but declared "
+                                f"{session.total_size}. Nothing has been stored.")})
+
+            stored_now = db.query(Vault.total_size_bytes).filter(Vault.id == vault.id).scalar() or 0
+            if vault.size_limit and stored_now + final_size > vault.size_limit:
+                raise HTTPException(status_code=413, detail="This upload would exceed the link's space.")
+            _enforce_deployment_storage_quota(db, final_size)
+
+            # An anonymous drop never OVERWRITES an existing file (no delete authority): a same-name
+            # clash is a clean 409, not a silent replace.
+            file = vault_service.finalize_streaming_upload(
+                file_info=file_info, total_size=final_size, checksum=final_checksum,
+                replace_same_name=False)
+        except HTTPException:
+            _remove_orphan_blob()
+            _receiver_release_bytes(db, receiver.id, session.total_size)
+            try:
+                db.delete(session); db.commit()
+            except Exception:
+                db.rollback()
+            shutil.rmtree(sdir, ignore_errors=True)
+            raise
+        except DuplicateNameError as e:
+            _remove_orphan_blob()
+            _receiver_release_bytes(db, receiver.id, session.total_size)
+            try:
+                db.delete(session); db.commit()
+            except Exception:
+                db.rollback()
+            shutil.rmtree(sdir, ignore_errors=True)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        except Exception as e:
+            _remove_orphan_blob()
+            _receiver_release_bytes(db, receiver.id, session.total_size)
+            fail_chunk_session(db, session, sdir, e)
+            raise HTTPException(status_code=500, detail="Failed to finalize the upload.")
+
+        # Success: the bytes are now stored on the vault, so reconcile (refund) the reservation; the
+        # cap invariant stored + reserved <= max_total_bytes is preserved. Bump the receiver counters,
+        # then delete the session (cascading its binding) and clear the staged chunks.
+        _receiver_release_bytes(db, receiver.id, session.total_size)
+        try:
+            receiver.upload_count = int(receiver.upload_count or 0) + 1
+            receiver.last_upload_at = datetime.utcnow()
+            db.delete(session)
+            db.commit()
+        except Exception:
+            db.rollback()
+        shutil.rmtree(sdir, ignore_errors=True)
+
+        try:
+            audit_logger.log_action(
+                action='receiver_upload_complete', status='success', user=None,
+                resource_type='file', resource_id=str(file.id),
+                details={'vault_id': str(vault.id), 'receiver_id': str(receiver.id),
+                         'file_name': file.original_name}, ip_address=get_client_ip(request))
+        except Exception:
+            pass
+        return {'id': str(file.id), 'name': file.original_name, 'size': file.size_bytes}
+    finally:
+        receiver_transfer_admission.release(transfer_slot)
+
+
+@app.get("/u/{token}")
+async def receiver_upload_page(token: str):
+    """PUBLIC: serve the anonymous upload page. It reads the token from the URL, opens an upload
+    session, streams the file in chunks, and finalizes (prompting for a PIN/password only if the link
+    needs one)."""
+    static_dir = str(PROJECT_ROOT / "static")
+    page = os.path.join(static_dir, "upload-link.html")
+    if not os.path.exists(page):
+        raise HTTPException(status_code=404, detail="Not found")
+    resp = FileResponse(page)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    return resp
+
+
 @app.get("/share-policy")
 async def get_share_policy(
     current_user: User = Depends(get_current_user),
@@ -14698,6 +14978,16 @@ def _sweep_orphaned_upload_chunks(db: Session, idle_minutes: Optional[int] = Non
 
     rows_pruned = 0
     for s in remove_rows:
+        # A receiver (anonymous upload) session that never finalized still holds its reserve-at-open
+        # allocation. Refund it BEFORE deleting the row (which cascades the binding) — the binding's
+        # existence is the "not yet refunded" marker, so this reclaims each reservation exactly once.
+        try:
+            _binding = db.query(ReceiverUploadSession).filter(
+                ReceiverUploadSession.session_id == s.id).first()
+            if _binding is not None:
+                _receiver_release_bytes(db, _binding.receiver_id, s.total_size or 0)
+        except Exception:
+            pass
         db.delete(s)
         rows_pruned += 1
     if rows_pruned:

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Upload a file</title>
+  <link rel="icon" href="/static/favicon.ico">
+  <style>
+    :root {
+      --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #e2e8f0;
+      --muted: #94a3b8; --accent: #6366f1; --accent-fg: #ffffff; --danger: #f87171; --ok: #34d399;
+    }
+    @media (prefers-color-scheme: light) {
+      :root { --bg: #f1f5f9; --card: #ffffff; --border: #e2e8f0; --text: #0f172a;
+              --muted: #64748b; --accent: #6366f1; --accent-fg: #ffffff; --danger: #dc2626; --ok: #059669; }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      display: flex; align-items: flex-start; justify-content: center; padding: 2rem 1rem;
+    }
+    .wrap { width: 100%; max-width: 640px; }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+      padding: 1.75rem; box-shadow: 0 10px 30px rgba(0,0,0,.15);
+    }
+    .brand { color: var(--muted); font-size: .8rem; letter-spacing: .04em; text-transform: uppercase;
+             margin-bottom: 1rem; }
+    h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+    label { display: block; font-size: .9rem; margin-bottom: .4rem; color: var(--muted); }
+    input[type="password"], input[type="text"], input[type="file"] {
+      width: 100%; padding: .7rem .8rem; font-size: 1rem; border-radius: 9px;
+      border: 1px solid var(--border); background: var(--bg); color: var(--text); margin-bottom: 1rem;
+    }
+    button {
+      width: 100%; padding: .75rem 1rem; font-size: 1rem; font-weight: 600;
+      border: 0; border-radius: 9px; background: var(--accent); color: var(--accent-fg); cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: default; }
+    .bar { height: 8px; border-radius: 6px; background: var(--border); overflow: hidden; margin: 1rem 0; }
+    .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+    .msg { margin-top: 1rem; font-size: .92rem; }
+    .msg.error { color: var(--danger); }
+    .msg.ok { color: var(--ok); }
+    .meta { color: var(--muted); font-size: .82rem; margin-top: 1.25rem; border-top: 1px solid var(--border);
+            padding-top: .9rem; }
+    .center { text-align: center; color: var(--muted); }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="brand">Upload a file</div>
+
+      <div id="loading" class="center">Loading&hellip;</div>
+
+      <div id="form" class="hidden">
+        <h1 id="title">Send a file</h1>
+        <label id="secret-label" class="hidden" for="secret-input">This link is protected. Enter the code.</label>
+        <input id="secret-input" class="hidden" type="password" autocomplete="off" inputmode="text" />
+        <label for="file-input">Choose a file</label>
+        <input id="file-input" type="file" />
+        <div class="bar hidden" id="bar"><div id="bar-fill"></div></div>
+        <button id="upload-btn" type="button">Upload</button>
+        <div id="msg" class="msg hidden"></div>
+        <div class="meta">Your file is sent directly to the owner of this link. Do not upload anything you were not asked to.</div>
+      </div>
+
+      <div id="notice" class="hidden center"></div>
+    </div>
+  </div>
+  <script src="/static/js/upload-link.js" defer></script>
+</body>
+</html>
