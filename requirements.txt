@@ -58,3 +58,8 @@ Pygments==2.20.0
 
 # NOTE: `requests` was removed — the only outbound HTTP is a stdlib-urllib localhost /health probe.
 # (The test suite's own `requests` dependency lives in tests/requirements-test.txt, not in the image.)
+
+# TOTP enrollment QR. Rendered SERVER-SIDE as an inline SVG (the SvgPathImage factory uses only the
+# stdlib xml module — no Pillow, no compiler), so the browser needs no QR library and the alpine image
+# stays wheel-only. The otpauth secret is also returned for manual entry; the SVG is the convenience.
+qrcode==7.4.2

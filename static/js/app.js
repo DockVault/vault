@@ -785,8 +785,28 @@ async function apiRequest(endpoint, options = {}) {
         
         // Handle 403 Forbidden - distinguish between inactive account vs permission denied
         if (response.status === 403) {
+            // A gated action needing a step-up: `detail` is an OBJECT {second_factor_required, action,
+            // reason, methods}. Prove the factor, then retry the SAME request once with the receipt.
+            const sfDetail = data && data.detail;
+            if (sfDetail && typeof sfDetail === 'object' && sfDetail.second_factor_required) {
+                if (sfDetail.reason === 'enroll_required') {
+                    throw new Error('You must set up two-factor authentication for this action. Enable it in your account settings.');
+                }
+                if (!options._sfRetried) {
+                    const receipt = await requestStepUpReceipt(sfDetail.action, sfDetail.methods || []);
+                    if (receipt) {
+                        return apiRequest(endpoint, {
+                            ...options,
+                            _sfRetried: true,
+                            headers: { ...(options.headers || {}), 'X-Second-Factor': receipt },
+                        });
+                    }
+                }
+                throw new Error('This action needs an extra confirmation.');
+            }
+
             const errorDetail = data?.detail || '';
-            
+
             // Check if this is an account issue (inactive/terminated)
             if (errorDetail.includes('inactive') || errorDetail.includes('terminated') || errorDetail.includes('locked')) {
                 // Account issue - log out user
@@ -1380,6 +1400,15 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         }
         
         const data = await response.json();
+
+        // Two-step login: an account with the second factor in effect (or one the policy requires to
+        // enroll) gets NO session from the password step. Hand off to the second-factor card /
+        // forced-enrollment wizard, which completes the login once the factor is proven.
+        if (data.second_factor_required) {
+            beginSecondFactor(data);
+            return;
+        }
+
         authToken = data.access_token;
 
         // The credentials have been accepted and are no longer needed. Without this the account
@@ -1446,6 +1475,390 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         errorDiv.style.display = 'block';
     }
 });
+
+// ============================================================================
+// TWO-STEP LOGIN: second-factor code card + forced-enrollment wizard
+// ============================================================================
+// The pre-auth token from /auth/login lives only for this in-progress login; it is never stored.
+
+function _sfBox() { return document.getElementById('login-second-factor'); }
+
+function _sfError(node, msg) {
+    node.textContent = msg || 'Something went wrong. Please try again.';
+    node.style.display = 'block';
+}
+
+function _sfRestoreLoginForm() {
+    const box = _sfBox();
+    if (box) { box.replaceChildren(); box.style.display = 'none'; }
+    const form = document.getElementById('login-form');
+    if (form) { form.reset(); form.style.display = ''; }
+    const forgot = document.getElementById('forgot-toggle');
+    if (forgot && typeof applyLoginPolicyLabel === 'function') { try { applyLoginPolicyLabel(); } catch (_) {} }
+    const uf = document.getElementById('username');
+    if (uf) uf.focus();
+}
+
+async function _sfCancel(preAuthToken) {
+    try {
+        await fetch(`${API_BASE}/auth/second-factor/cancel`, {
+            method: 'POST', headers: { 'Authorization': `Bearer ${preAuthToken}` }
+        });
+    } catch (_) {}
+    _sfRestoreLoginForm();
+}
+
+// Entry point from the login handler when /auth/login returns second_factor_required.
+function beginSecondFactor(data) {
+    const form = document.getElementById('login-form');
+    // Capture the just-entered password BEFORE clearing the form: the forced-enrollment path re-proves
+    // it to the enroll endpoint (the account's first-enrollment gate). Used once, then dropped.
+    const pw = (document.getElementById('password') || {}).value || '';
+    if (form) form.style.display = 'none';
+    const forgot = document.getElementById('forgot-toggle');
+    if (forgot) forgot.style.display = 'none';
+    const loginErr = document.getElementById('login-error');
+    if (loginErr) loginErr.style.display = 'none';
+    const box = _sfBox();
+    if (!box) return;
+    box.replaceChildren();
+    box.style.display = '';
+    const pre = data.pre_auth_token;
+    if (data.enrollment_required) {
+        renderEnrollmentWizard(box, { preAuthToken: pre, password: pw });
+    } else {
+        renderVerifyCard(box, { preAuthToken: pre, methods: Array.isArray(data.methods) ? data.methods : ['totp', 'recovery'] });
+    }
+    if (form) form.reset();   // safe now: the password was captured (if needed) and the field is hidden
+}
+
+// Complete a two-step login once the factor is proven (verify) or enrollment finishes (acknowledge).
+async function finishSecondFactorLogin(accessToken) {
+    if (!accessToken) return;
+    // A fresh interactive login — never a scoped temp credential (those don't do MFA).
+    authToken = accessToken;
+    isScopedTemp = false;
+    sessionAccess = null;
+    try { storage.setItem('authToken', accessToken); storage.setItem('isScopedTemp', ''); } catch (_) {}
+    const box = _sfBox();
+    if (box) { box.replaceChildren(); box.style.display = 'none'; }
+    // enterAuthedSession fetches /users/me, applies prefs, loads permissions, and reveals the
+    // dashboard — the same boot a refreshed session runs.
+    await enterAuthedSession();
+    try { connectMonitorWebSocket(); } catch (_) {}
+}
+
+function renderVerifyCard(box, opts) {
+    const preAuthToken = opts.preAuthToken;
+    const methods = opts.methods || ['totp', 'recovery'];
+    const primary = methods[0] || 'totp';   // the enrolled method (totp today; email is future)
+    let mode = primary;                      // 'totp' | 'email' | 'recovery'
+
+    box.appendChild(_el('h2', 'text-lg font-bold mb-xs', 'Two-factor authentication'));
+    const desc = _el('p', 'text-secondary text-sm mb-md');
+    const input = _el('input', 'form-control'); input.id = 'sf-code-input'; input.autocomplete = 'one-time-code';
+    const grp = _el('div', 'form-group'); grp.appendChild(input);
+    const err = _el('div', 'alert alert-error mt-sm'); err.style.display = 'none'; err.setAttribute('role', 'alert');
+    const verify = _el('button', 'btn btn-primary btn-block mt-sm', 'Verify');
+    const toggle = _el('a', 'mt-sm'); toggle.href = '#'; toggle.setAttribute('role', 'button');
+    toggle.style.display = 'inline-block'; toggle.style.fontSize = '0.9em';
+    const back = _el('a', 'mt-md', '← Back to sign in'); back.href = '#'; back.setAttribute('role', 'button'); back.style.display = 'block';
+
+    function applyMode() {
+        if (mode === 'recovery') {
+            desc.textContent = 'Enter one of your saved recovery codes.';
+            input.type = 'text'; input.removeAttribute('inputmode'); input.placeholder = 'xxxx-xxxx-xxxx-xxxx-xxxx';
+            toggle.textContent = 'Use your authenticator app instead';
+        } else {
+            desc.textContent = 'Enter the 6-digit code from your authenticator app.';
+            input.type = 'text'; input.setAttribute('inputmode', 'numeric'); input.placeholder = '123456';
+            toggle.textContent = 'Use a recovery code instead';
+        }
+        input.value = ''; err.style.display = 'none'; input.focus();
+    }
+    toggle.addEventListener('click', (e) => { e.preventDefault(); mode = (mode === 'recovery') ? primary : 'recovery'; applyMode(); });
+
+    async function submit() {
+        const code = (input.value || '').trim();
+        if (!code) { _sfError(err, 'Enter your code.'); return; }
+        verify.disabled = true;
+        try {
+            const method = (mode === 'recovery') ? 'recovery' : primary;
+            const resp = await fetch(`${API_BASE}/auth/second-factor/verify`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${preAuthToken}` },
+                body: JSON.stringify({ method, code })
+            });
+            if (!resp.ok) {
+                const e = await resp.json().catch(() => ({}));
+                _sfError(err, (e && e.detail) || 'That code is not valid.');
+                verify.disabled = false; return;
+            }
+            const d = await resp.json();
+            await finishSecondFactorLogin(d.access_token);
+        } catch (e) {
+            _sfError(err, 'Could not reach the server. Please try again.');
+            verify.disabled = false;
+        }
+    }
+    verify.addEventListener('click', submit);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    back.addEventListener('click', (e) => { e.preventDefault(); _sfCancel(preAuthToken); });
+
+    box.appendChild(desc); box.appendChild(grp); box.appendChild(err);
+    box.appendChild(verify); box.appendChild(toggle); box.appendChild(back);
+    applyMode();
+}
+
+function renderEnrollmentWizard(box, opts) {
+    // token: a forced-enrollment pre-auth token (login) OR the current session token (account settings).
+    // The enroll endpoints accept either. onComplete: called after a successful acknowledge on the
+    // settings path (where acknowledge returns NO access_token because the user is already signed in).
+    const token = opts.token || opts.preAuthToken || authToken;
+    const password = opts.password || '';
+    const onComplete = typeof opts.onComplete === 'function' ? opts.onComplete : null;
+    const auth = { 'Authorization': `Bearer ${token}` };
+    let secret = null, recoveryCodes = null;
+
+    const clear = () => box.replaceChildren();
+    const monoBlock = () => { const d = _el('div', 'mb-md'); d.style.fontFamily = 'monospace'; return d; };
+
+    async function start() {
+        clear();
+        box.appendChild(_el('h2', 'text-lg font-bold mb-xs', 'Set up two-factor authentication'));
+        box.appendChild(_el('p', 'text-secondary text-sm mb-md',
+            'Your administrator requires a second factor. Scan the QR code with an authenticator app, then enter the code it shows.'));
+        const status = _el('div', 'alert alert-info mt-sm', 'Preparing…'); status.setAttribute('role', 'status');
+        box.appendChild(status);
+        try {
+            const resp = await fetch(`${API_BASE}/users/me/second-factor/totp/enroll`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', ...auth },
+                body: JSON.stringify({ current_password: password })
+            });
+            if (!resp.ok) {
+                const e = await resp.json().catch(() => ({}));
+                status.className = 'alert alert-error mt-sm';
+                status.textContent = (e && e.detail) || 'Could not start enrollment.';
+                const back = _el('a', 'mt-md', '← Back to sign in'); back.href = '#'; back.setAttribute('role', 'button'); back.style.display = 'block';
+                back.addEventListener('click', (ev) => { ev.preventDefault(); _sfCancel(preAuthToken); });
+                box.appendChild(back);
+                return;
+            }
+            const d = await resp.json();
+            secret = d.secret;
+            renderQrStep(d);
+        } catch (e) {
+            status.className = 'alert alert-error mt-sm';
+            status.textContent = 'Could not reach the server. Please try again.';
+        }
+    }
+
+    function renderQrStep(d) {
+        clear();
+        box.appendChild(_el('h2', 'text-lg font-bold mb-xs', 'Scan this QR code'));
+        if (d.qr_svg) {
+            // Server-rendered SVG shown as a CSP-safe data: image (img-src allows data:).
+            const img = _el('img', 'mb-sm'); img.alt = 'Two-factor QR code';
+            img.style.width = '180px'; img.style.height = '180px'; img.style.background = '#fff'; img.style.padding = '8px';
+            try { img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(d.qr_svg))); } catch (_) {}
+            box.appendChild(img);
+        }
+        box.appendChild(_el('p', 'text-secondary text-sm', "Can't scan it? Enter this key manually:"));
+        const sec = monoBlock(); sec.id = 'sf-enroll-secret'; sec.style.wordBreak = 'break-all'; sec.textContent = secret || '';
+        box.appendChild(sec);
+
+        box.appendChild(_el('label', 'text-sm', 'Enter the 6-digit code'));
+        const input = _el('input', 'form-control'); input.id = 'sf-enroll-code'; input.setAttribute('inputmode', 'numeric');
+        input.autocomplete = 'one-time-code'; input.placeholder = '123456';
+        const grp = _el('div', 'form-group'); grp.appendChild(input); box.appendChild(grp);
+        const e2 = _el('div', 'alert alert-error mt-sm'); e2.style.display = 'none'; e2.setAttribute('role', 'alert'); box.appendChild(e2);
+        const next = _el('button', 'btn btn-primary btn-block mt-sm', 'Continue'); box.appendChild(next);
+
+        async function confirm() {
+            const code = (input.value || '').trim();
+            if (!code) { _sfError(e2, 'Enter the code.'); return; }
+            next.disabled = true;
+            try {
+                const resp = await fetch(`${API_BASE}/users/me/second-factor/totp/confirm`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json', ...auth },
+                    body: JSON.stringify({ code })
+                });
+                if (!resp.ok) {
+                    const e = await resp.json().catch(() => ({}));
+                    _sfError(e2, (e && e.detail) || 'That code is not valid.'); next.disabled = false; return;
+                }
+                const dd = await resp.json();
+                recoveryCodes = dd.recovery_codes || [];
+                renderRecoveryStep();
+            } catch (_) { _sfError(e2, 'Could not reach the server.'); next.disabled = false; }
+        }
+        next.addEventListener('click', confirm);
+        input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); confirm(); } });
+        input.focus();
+    }
+
+    function renderRecoveryStep() {
+        clear();
+        box.appendChild(_el('h2', 'text-lg font-bold mb-xs', 'Save your recovery codes'));
+        box.appendChild(_el('p', 'text-secondary text-sm mb-sm',
+            'Store these somewhere safe. Each works once if you lose your authenticator. They are shown only now.'));
+        const list = monoBlock(); list.style.lineHeight = '1.8';
+        (recoveryCodes || []).forEach(c => list.appendChild(_el('div', null, c)));
+        box.appendChild(list);
+        const label = _el('label', 'flex items-center gap-sm mb-sm text-sm');
+        const cb = _el('input'); cb.type = 'checkbox'; cb.id = 'sf-ack-cb';
+        label.appendChild(cb); label.appendChild(_el('span', null, "I've saved my recovery codes"));
+        box.appendChild(label);
+        const e3 = _el('div', 'alert alert-error mt-sm'); e3.style.display = 'none'; e3.setAttribute('role', 'alert'); box.appendChild(e3);
+        const done = _el('button', 'btn btn-primary btn-block', onComplete ? 'Finish' : 'Finish and sign in'); box.appendChild(done);
+
+        async function ack() {
+            if (!cb.checked) { _sfError(e3, 'Please confirm you saved your recovery codes.'); return; }
+            done.disabled = true;
+            try {
+                const resp = await fetch(`${API_BASE}/users/me/second-factor/recovery/acknowledge`, {
+                    method: 'POST', headers: { ...auth }
+                });
+                if (!resp.ok) {
+                    const e = await resp.json().catch(() => ({}));
+                    _sfError(e3, (e && e.detail) || 'Could not finish enrollment.'); done.disabled = false; return;
+                }
+                const dd = await resp.json();
+                if (dd.access_token) await finishSecondFactorLogin(dd.access_token);
+                else if (onComplete) onComplete();          // settings path: already signed in
+                else _sfRestoreLoginForm();
+            } catch (_) { _sfError(e3, 'Could not reach the server.'); done.disabled = false; }
+        }
+        done.addEventListener('click', ack);
+    }
+
+    start();
+}
+
+// ============================================================================
+// STEP-UP: prove a factor for a gated action, get a session-bound receipt
+// ============================================================================
+// apiRequest calls requestStepUpReceipt() when a gated call returns 403 {second_factor_required},
+// then retries the call once with the X-Second-Factor receipt. The receipt is single-use + session-bound.
+
+let _stepUpResolve = null;
+
+function _stepUpSettle(receipt) {
+    const r = _stepUpResolve;
+    _stepUpResolve = null;
+    if (r) r(receipt);
+}
+
+// Resolve with an X-Second-Factor receipt for `action`, or null if the user cancels. `methods` comes
+// from the gated 403 (e.g. ['totp','recovery'] and/or ['password']).
+function requestStepUpReceipt(action, methods) {
+    _stepUpSettle(null);   // abandon any prior pending step-up
+    const list = (Array.isArray(methods) && methods.length) ? methods : ['totp', 'recovery'];
+    return new Promise((resolve) => {
+        _stepUpResolve = resolve;
+        _buildStepUpBody(action, list);
+        // The step-up can be summoned from within another open modal (e.g. Your Account), so lift it
+        // above the default modal layer (z-index 1000) — otherwise it renders behind and is unusable.
+        const m = document.getElementById('stepup-modal');
+        if (m) m.style.zIndex = '1100';
+        openModal('stepup-modal');
+    });
+}
+
+function _buildStepUpBody(action, methods) {
+    const body = document.getElementById('stepup-modal-body');
+    if (!body) { _stepUpSettle(null); return; }
+    body.replaceChildren();
+
+    const otpMethod = methods.find(m => m === 'totp' || m === 'email') || null;
+    const hasRecovery = methods.includes('recovery');
+    const hasPassword = methods.includes('password');
+    let otpMode = otpMethod ? 'otp' : (hasRecovery ? 'recovery' : null);   // 'otp' | 'recovery'
+
+    body.appendChild(_el('p', 'text-secondary text-sm mb-md', 'This action needs an extra confirmation.'));
+
+    let codeInput = null, codeLabel = null, recoveryToggle = null;
+    if (otpMethod || hasRecovery) {
+        codeLabel = _el('label', 'text-sm');
+        codeInput = _el('input', 'form-control'); codeInput.id = 'stepup-code-input'; codeInput.autocomplete = 'one-time-code';
+        const g = _el('div', 'form-group'); g.appendChild(codeLabel); g.appendChild(codeInput); body.appendChild(g);
+        if (otpMethod && hasRecovery) {
+            recoveryToggle = _el('a', 'text-sm'); recoveryToggle.href = '#'; recoveryToggle.setAttribute('role', 'button');
+            recoveryToggle.style.display = 'inline-block'; body.appendChild(recoveryToggle);
+        }
+    }
+
+    let pwInput = null;
+    if (hasPassword) {
+        const g = _el('div', 'form-group mt-sm');
+        g.appendChild(_el('label', 'text-sm', 'Account password'));
+        pwInput = _el('input', 'form-control'); pwInput.type = 'password'; pwInput.id = 'stepup-password-input'; pwInput.autocomplete = 'current-password';
+        g.appendChild(pwInput); body.appendChild(g);
+    }
+
+    const err = _el('div', 'alert alert-error mt-sm'); err.style.display = 'none'; err.setAttribute('role', 'alert'); body.appendChild(err);
+
+    function applyCodeMode() {
+        if (!codeInput) return;
+        if (otpMode === 'recovery') {
+            codeLabel.textContent = 'Recovery code';
+            codeInput.type = 'text'; codeInput.removeAttribute('inputmode'); codeInput.placeholder = 'xxxx-xxxx-xxxx-xxxx-xxxx';
+            if (recoveryToggle) recoveryToggle.textContent = 'Use your authenticator app instead';
+        } else {
+            codeLabel.textContent = 'Authenticator code';
+            codeInput.type = 'text'; codeInput.setAttribute('inputmode', 'numeric'); codeInput.placeholder = '123456';
+            if (recoveryToggle) recoveryToggle.textContent = 'Use a recovery code instead';
+        }
+        codeInput.value = ''; err.style.display = 'none'; codeInput.focus();
+    }
+    if (recoveryToggle) recoveryToggle.addEventListener('click', (e) => { e.preventDefault(); otpMode = (otpMode === 'recovery') ? 'otp' : 'recovery'; applyCodeMode(); });
+
+    const footer = _el('div', 'modal-footer mt-md');
+    const cancel = _el('button', 'btn btn-secondary', 'Cancel');
+    const confirm = _el('button', 'btn btn-primary', 'Confirm');
+    footer.appendChild(cancel); footer.appendChild(confirm); body.appendChild(footer);
+    cancel.addEventListener('click', () => { closeModal(); });   // closeModal settles the promise null
+
+    async function submit() {
+        const payload = { action };
+        if (codeInput) {
+            const code = (codeInput.value || '').trim();
+            if (!code) { _sfError(err, 'Enter your code.'); return; }
+            payload.method = (otpMode === 'recovery') ? 'recovery' : (otpMethod || 'totp');
+            payload.code = code;
+        }
+        if (pwInput) {
+            const pw = pwInput.value || '';
+            if (!pw) { _sfError(err, 'Enter your account password.'); return; }
+            payload.password = pw;
+            if (!payload.method) payload.method = 'password';
+        }
+        confirm.disabled = true;
+        try {
+            const resp = await fetch(`${API_BASE}/auth/second-factor/step-up`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+                body: JSON.stringify(payload)
+            });
+            if (!resp.ok) {
+                const e = await resp.json().catch(() => ({}));
+                _sfError(err, (e && typeof e.detail === 'string') ? e.detail : 'That was not accepted. Try again.');
+                confirm.disabled = false; return;
+            }
+            const d = await resp.json();
+            _stepUpSettle(d.receipt || null);   // settle BEFORE closing so closeModal's settle(null) is a no-op
+            closeModal();
+        } catch (_) {
+            _sfError(err, 'Could not reach the server. Please try again.');
+            confirm.disabled = false;
+        }
+    }
+    confirm.addEventListener('click', submit);
+    if (codeInput) codeInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    if (pwInput) pwInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    applyCodeMode();
+    if (!codeInput && pwInput) pwInput.focus();
+}
 
 // Logout
 function logout() {
@@ -4816,6 +5229,94 @@ function _usHideEmailCodeRow() {
     if (inp) inp.value = '';
 }
 
+// ============================================================================
+// ACCOUNT SETTINGS: two-factor (TOTP) enroll / disable / regenerate
+// ============================================================================
+// Disable + regenerate hit account.second_factor-gated endpoints; apiRequest surfaces the step-up modal
+// automatically, so the user must prove their current factor to change it.
+
+async function renderAccount2FA() {
+    const body = document.getElementById('us-2fa-body');
+    if (!body) return;
+    body.replaceChildren(_el('div', 'spinner'));
+    let st;
+    try { st = await apiRequest('/users/me/second-factor', { silent: true }); }
+    catch (_) { body.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load two-factor status.')); return; }
+    body.replaceChildren();
+    const enabled = !!(st && (st.enrolled === true || st.status === 'active'));
+    if (enabled) {
+        const remaining = (st.recovery_codes_remaining != null) ? st.recovery_codes_remaining : 0;
+        body.appendChild(_el('p', 'text-sm mb-sm',
+            'Two-factor authentication is on (authenticator app). ' + remaining +
+            ' recovery code' + (remaining === 1 ? '' : 's') + ' remaining.'));
+        const row = _el('div', 'flex gap-sm');
+        const regen = _el('button', 'btn btn-secondary btn-sm', 'Regenerate recovery codes');
+        const off = _el('button', 'btn btn-secondary btn-sm', 'Turn off');
+        row.appendChild(regen); row.appendChild(off); body.appendChild(row);
+        const msg = _el('div', 'mt-sm'); body.appendChild(msg);
+        regen.addEventListener('click', () => account2FARegenerate(msg));
+        off.addEventListener('click', () => account2FADisable(msg));
+    } else {
+        body.appendChild(_el('p', 'text-secondary text-sm mb-sm',
+            'Two-factor authentication is off. Add an authenticator app for a second sign-in factor.'));
+        const start = _el('button', 'btn btn-primary btn-sm', 'Set up two-factor');
+        body.appendChild(start);
+        start.addEventListener('click', () => account2FASetup(body));
+    }
+}
+
+function account2FASetup(body) {
+    body.replaceChildren();
+    body.appendChild(_el('h4', 'text-sm font-bold mb-xs', 'Set up two-factor authentication'));
+    const g = _el('div', 'form-group');
+    g.appendChild(_el('label', 'text-sm', 'Confirm your current password'));
+    const pw = _el('input', 'form-control'); pw.type = 'password'; pw.autocomplete = 'current-password'; pw.id = 'us-2fa-cur-pw';
+    g.appendChild(pw); body.appendChild(g);
+    const err = _el('div', 'alert alert-error mt-sm'); err.style.display = 'none'; err.setAttribute('role', 'alert'); body.appendChild(err);
+    const row = _el('div', 'flex gap-sm mt-sm');
+    const cont = _el('button', 'btn btn-primary btn-sm', 'Continue');
+    const cancel = _el('button', 'btn btn-secondary btn-sm', 'Cancel');
+    row.appendChild(cont); row.appendChild(cancel); body.appendChild(row);
+    cancel.addEventListener('click', () => renderAccount2FA());
+    function go() {
+        if (!pw.value) { _sfError(err, 'Enter your current password.'); return; }
+        const wiz = _el('div'); body.replaceChildren(wiz);
+        renderEnrollmentWizard(wiz, { token: authToken, password: pw.value, onComplete: renderAccount2FA });
+    }
+    cont.addEventListener('click', go);
+    pw.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+    pw.focus();
+}
+
+async function account2FADisable(msg) {
+    if (!window.confirm('Turn off two-factor authentication? You will sign in with your password only.')) return;
+    msg.replaceChildren();
+    try {
+        await apiRequest('/users/me/second-factor', { method: 'DELETE' });
+        renderAccount2FA();
+    } catch (e) {
+        msg.replaceChildren(_el('div', 'alert alert-error', (e && e.message) || 'Could not turn off two-factor.'));
+    }
+}
+
+async function account2FARegenerate(msg) {
+    msg.replaceChildren();
+    try {
+        const r = await apiRequest('/users/me/second-factor/recovery/regenerate', { method: 'POST' });
+        const codes = (r && r.recovery_codes) || [];
+        msg.replaceChildren();
+        msg.appendChild(_el('p', 'text-sm mb-xs', 'New recovery codes — save them now, they are shown only once:'));
+        const list = _el('div', 'id-2fa-newcodes'); list.style.fontFamily = 'monospace'; list.style.lineHeight = '1.8';
+        codes.forEach(c => list.appendChild(_el('div', null, c)));
+        msg.appendChild(list);
+        const done = _el('button', 'btn btn-secondary btn-sm mt-sm', 'Done');
+        done.addEventListener('click', () => renderAccount2FA());
+        msg.appendChild(done);
+    } catch (e) {
+        msg.replaceChildren(_el('div', 'alert alert-error', (e && e.message) || 'Could not regenerate recovery codes.'));
+    }
+}
+
 // Open the account modal for the CURRENT user. Credential-write sections are hidden for a temporary
 // credential (the server rejects those writes too — this is UX, not the security boundary).
 function openUserSettingsModal() {
@@ -4843,6 +5344,7 @@ function openUserSettingsModal() {
         modal.querySelectorAll('.ssh-keys-list, .ssh-key-name, .ssh-key-public')
             .forEach(el => el.setAttribute('data-user-id', String(currentUser.id)));
         loadUserSshKeys(currentUser.id, modal);
+        renderAccount2FA();   // populate the Two-factor section from GET /users/me/second-factor
     }
     const tm = window.themeManager;
     const themeSel = document.getElementById('us-theme'); if (themeSel && tm) themeSel.value = (tm.currentTheme === 'dark') ? 'dark' : 'light';
@@ -7204,10 +7706,116 @@ function collectAccountsPolicy(settings) {
     if (!Number.isNaN(prTtl)) settings.password_reset_ttl_minutes = prTtl;
 }
 
+// ============================================================================
+// ADMIN: MFA policy + step-up action matrix (Security settings tab)
+// ============================================================================
+// Saves go through apiRequest, which surfaces the step-up modal because these endpoints are
+// account.second_factor-gated. Kept SEPARATE from the general settings Save so an ordinary settings
+// save is never OTP-gated.
+
+function _mfaSftpWarningText(policy) {
+    return (policy === 'temp_credential_only')
+        ? 'MFA users must connect over SFTP through a temporary credential — direct password/key SFTP is refused.'
+        : 'With "Allow", SFTP stays single-factor: anyone who knows the account password (or holds an SSH key) can read and write Standard vaults over SFTP, even for MFA-enabled users.';
+}
+
+function loadMfaPolicy(settings) {
+    const mode = document.getElementById('setting-mfa-mode');
+    const sftp = document.getElementById('setting-mfa-sftp-policy');
+    const ttl = document.getElementById('setting-mfa-email-ttl');
+    const warn = document.getElementById('setting-mfa-sftp-warning');
+    if (mode) mode.value = (settings.mfa_mode === 'required') ? 'required' : 'optional';
+    if (sftp) sftp.value = (settings.mfa_sftp_policy === 'temp_credential_only') ? 'temp_credential_only' : 'allow';
+    if (ttl) ttl.value = settings.mfa_email_code_ttl_minutes || 5;
+    if (warn && sftp) warn.textContent = _mfaSftpWarningText(sftp.value);
+    if (sftp && !sftp.dataset.wired) {
+        sftp.dataset.wired = '1';
+        sftp.addEventListener('change', () => { if (warn) warn.textContent = _mfaSftpWarningText(sftp.value); });
+    }
+    const btn = document.getElementById('save-mfa-policy-btn');
+    if (btn && !btn.dataset.wired) { btn.dataset.wired = '1'; btn.addEventListener('click', saveMfaPolicy); }
+}
+
+function _mfaMsg(id, cls, text) {
+    const m = document.getElementById(id);
+    if (m) { m.className = 'alert ' + cls + ' mt-sm'; m.textContent = text; m.style.display = 'block'; }
+}
+
+async function saveMfaPolicy() {
+    document.getElementById('mfa-policy-msg').style.display = 'none';
+    const body = {
+        mfa_mode: document.getElementById('setting-mfa-mode').value,
+        mfa_sftp_policy: document.getElementById('setting-mfa-sftp-policy').value,
+    };
+    const ttl = parseInt(document.getElementById('setting-mfa-email-ttl').value, 10);
+    if (!isNaN(ttl)) body.mfa_email_code_ttl_minutes = ttl;
+    try {
+        await apiRequest('/settings', { method: 'PUT', body: JSON.stringify(body) });
+        _mfaMsg('mfa-policy-msg', 'alert-success', 'MFA policy saved.');
+    } catch (e) {
+        _mfaMsg('mfa-policy-msg', 'alert-error', (e && e.message) || 'Could not save the MFA policy.');
+    }
+}
+
+async function loadMfaActions() {
+    const table = document.getElementById('mfa-actions-table');
+    if (!table) return;
+    table.replaceChildren(_el('div', 'spinner'));
+    let data;
+    try { data = await apiRequest('/second-factor/actions', { silent: true }); }
+    catch (_) { table.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load the action list.')); return; }
+    renderMfaActions((data && data.actions) || []);
+}
+
+function renderMfaActions(actions) {
+    const table = document.getElementById('mfa-actions-table');
+    if (!table) return;
+    table.replaceChildren();
+    const head = _el('div', 'flex gap-sm text-tertiary text-sm mb-xs');
+    const hName = _el('div', null, 'Action'); hName.style.flex = '1';
+    const hOtp = _el('div', null, 'Require OTP'); hOtp.style.width = '110px'; hOtp.style.textAlign = 'center';
+    const hPw = _el('div', null, 'Require password'); hPw.style.width = '140px'; hPw.style.textAlign = 'center';
+    head.appendChild(hName); head.appendChild(hOtp); head.appendChild(hPw);
+    table.appendChild(head);
+    (actions || []).forEach(a => {
+        const row = _el('div', 'flex gap-sm items-center');
+        row.style.padding = '6px 0'; row.style.borderTop = '1px solid var(--border, #e5e7eb)';
+        const name = _el('div', 'text-sm', a.name || a.key); name.style.flex = '1';
+        const otpWrap = _el('div'); otpWrap.style.width = '110px'; otpWrap.style.textAlign = 'center';
+        const pwWrap = _el('div'); pwWrap.style.width = '140px'; pwWrap.style.textAlign = 'center';
+        const otp = _el('input'); otp.type = 'checkbox'; otp.checked = !!a.require_otp; otp.setAttribute('aria-label', 'Require OTP for ' + (a.name || a.key));
+        const pw = _el('input'); pw.type = 'checkbox'; pw.checked = !!a.require_password; pw.setAttribute('aria-label', 'Require password for ' + (a.name || a.key));
+        otp.addEventListener('change', () => toggleMfaAction(a, 'require_otp', otp));
+        pw.addEventListener('change', () => toggleMfaAction(a, 'require_password', pw));
+        otpWrap.appendChild(otp); pwWrap.appendChild(pw);
+        row.appendChild(name); row.appendChild(otpWrap); row.appendChild(pwWrap);
+        table.appendChild(row);
+    });
+}
+
+async function toggleMfaAction(a, field, input) {
+    document.getElementById('mfa-actions-msg').style.display = 'none';
+    const prev = !!a[field];
+    const patch = {}; patch[field] = input.checked;
+    input.disabled = true;
+    try {
+        await apiRequest('/second-factor/actions/' + encodeURIComponent(a.key), { method: 'PUT', body: JSON.stringify(patch) });
+        a[field] = input.checked;   // keep local state accurate for the next toggle
+        input.disabled = false;
+        _mfaMsg('mfa-actions-msg', 'alert-success', 'Updated “' + (a.name || a.key) + '”.');
+    } catch (e) {
+        input.checked = prev;       // cancelled step-up / failure: revert
+        input.disabled = false;
+        _mfaMsg('mfa-actions-msg', 'alert-error', (e && e.message) || 'Could not update — your change was reverted.');
+    }
+}
+
 async function loadSettings() {
     try {
         const settings = await apiRequest('/settings', { silent: true });
         currentSettings = settings;
+        loadMfaPolicy(settings);   // populate the MFA policy card
+        loadMfaActions();          // load the step-up action matrix
         
         // Populate form fields
         // General
@@ -16970,11 +17578,23 @@ function openModal(id) {
 
 // Close Modal
 function closeModal() {
+    // The step-up modal floats ABOVE any other open modal (it can be summoned from within one, e.g.
+    // Your Account). When it's up, close ONLY it — leave the underlying modal open — and settle its
+    // pending request (a no-op on success, which settles the receipt first; a cancel otherwise).
+    const su = document.getElementById('stepup-modal');
+    if (su && su.classList.contains('active')) {
+        su.classList.remove('active');
+        su.style.zIndex = '';
+        clearCredentialInputsOnClose();
+        if (typeof _stepUpSettle === 'function') _stepUpSettle(null);
+        return;
+    }
     document.querySelectorAll('.modal').forEach(modal => {
         modal.classList.remove('active');
     });
     closeFilePreview(); // free any in-memory decrypted preview blob
     clearCredentialInputsOnClose();
+    if (typeof _stepUpSettle === 'function') _stepUpSettle(null);
 }
 
 // Empty the credential fields of any dialog that just closed.

@@ -117,6 +117,10 @@
                     
                     <div id="login-error" class="alert alert-error mt-md" style="display: none;"></div>
 
+                    <!-- Two-step login: the second-factor code card and the forced-enrollment wizard
+                         are built here in JS when /auth/login returns second_factor_required. -->
+                    <div id="login-second-factor" class="mt-md text-left" style="display: none;"></div>
+
                     <!-- Forgot password: link hidden until /auth/policy confirms self-service reset is on. -->
                     <div id="forgot-toggle" class="mt-sm" style="display: none;">
                         <a href="#" id="show-forgot-link" role="button" style="font-size: 0.9em;">Forgot your password?</a>
@@ -1658,6 +1662,53 @@
                                 </div>
                             </div>
                         </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header">
+                                <h3>Two-factor authentication (MFA)</h3>
+                            </div>
+                            <div class="p-lg">
+                                <div class="form-group">
+                                    <label for="setting-mfa-mode">Requirement</label>
+                                    <select id="setting-mfa-mode" class="form-control">
+                                        <option value="optional">Optional — users may enable it themselves</option>
+                                        <option value="required">Required — every user must enroll</option>
+                                    </select>
+                                    <small class="text-secondary">When required, every user is prompted to set up an authenticator app at their next sign-in.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Allowed methods</label>
+                                    <p class="text-secondary text-sm" style="margin-top:4px;">Authenticator app (TOTP) only. Email codes are not available yet.</p>
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-mfa-sftp-policy">SFTP access for MFA users</label>
+                                    <select id="setting-mfa-sftp-policy" class="form-control">
+                                        <option value="allow">Allow — SFTP uses the account password / SSH key</option>
+                                        <option value="temp_credential_only">Require a temporary credential</option>
+                                    </select>
+                                    <small id="setting-mfa-sftp-warning" class="text-secondary"></small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-mfa-email-ttl">Email code lifetime (minutes)</label>
+                                    <input type="number" id="setting-mfa-email-ttl" class="form-control" min="1" max="60">
+                                    <small class="text-secondary">Applies once email codes are available (1–60).</small>
+                                </div>
+                                <div id="mfa-policy-msg" class="alert mt-sm" role="status" style="display:none;"></div>
+                                <button type="button" id="save-mfa-policy-btn" class="btn btn-primary">Save MFA policy</button>
+                                <small class="text-secondary" style="display:block; margin-top:8px;">Changing MFA settings requires you to confirm your own second factor.</small>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header">
+                                <h3>Step-up: actions that require a second factor</h3>
+                            </div>
+                            <div class="p-lg">
+                                <p class="text-secondary text-sm mb-md">Per action, choose whether the user must present their authenticator (OTP) and/or re-enter their password. Turning OTP on for an action requires everyone — admins included — to enroll before performing it.</p>
+                                <div id="mfa-actions-msg" class="alert mt-sm" role="status" style="display:none;"></div>
+                                <div id="mfa-actions-table"></div>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Storage Settings Tab -->
@@ -3062,6 +3113,18 @@
                     </div>
                 </div>
 
+                <!-- Step-up confirmation: shown when a gated action needs a second factor / re-auth.
+                     The body is built in JS to match the action's required methods. -->
+                <div id="stepup-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="stepup-modal-title">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3 id="stepup-modal-title">Confirm it's you</h3>
+                            <button class="close-modal-btn modal-close" aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body" id="stepup-modal-body"></div>
+                    </div>
+                </div>
+
                 <!-- Your Account (self-service) Modal -->
                 <div id="user-settings-modal" class="modal">
                     <div class="modal-content modal-lg">
@@ -3122,6 +3185,11 @@
                                     </div>
                                 </div>
                             </form>
+
+                            <div class="us-section us-credential" id="us-2fa-section">
+                                <h4 class="us-section-title">Two-factor authentication</h4>
+                                <div id="us-2fa-body"></div>
+                            </div>
 
                             <div class="us-section us-credential">
                                 <h4 class="us-section-title">SFTP</h4>

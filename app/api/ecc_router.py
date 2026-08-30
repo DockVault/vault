@@ -2,7 +2,7 @@
 ECC Router - FastAPI router for ECC Zero-Trust encryption endpoints
 Implements ECC P-384 based key management and vault wrapping.
 """
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 from sqlalchemy import select
@@ -756,6 +756,7 @@ async def update_private_key(
     request: PrivateKeyUpdateRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    http_request: Request = None,
 ):
     """Change the encryption passphrase: store a private-key blob the browser RE-ENCRYPTED under
     a new passphrase, WITHOUT touching the public key.
@@ -775,6 +776,12 @@ async def update_private_key(
     # shares the owner's rate-limit bucket, so a charged refusal is an owner lockout.
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="A temporary credential cannot change the account encryption passphrase.")
+    # Replacing the account encryption key is step-up-gated (account.encryption_key.replace). Enforced
+    # in-route (this route lives in a separate router and its `request` parameter is the body) via the
+    # shared enforcement in api_server; the action is registered into the guarded set there so the boot
+    # contract sees it. Checked before charging the rate-limit budget so a step-up failure costs nothing.
+    from app.api.api_server import _enforce_step_up
+    _enforce_step_up(db, current_user, http_request, "account.encryption_key.replace")
     _ecc_rate_limit(current_user, "key_update")
 
     # STEP 1 - validate the request WITHOUT parsing the envelope. A malformed request is refused

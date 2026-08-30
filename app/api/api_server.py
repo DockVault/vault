@@ -39,7 +39,7 @@ bootstrap_entrypoint("API")
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
 from app.core.chunk_cleanup import fail_chunk_session
 from app.core.session_hash_utils import hash_session_token
-from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink
+from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink, SecondFactorEnrollment, SecondFactorRecoveryCode, SecondFactorAction, PendingLogin
 from app.core import sharing_policy
 from app.core import note_link_policy
 from app.core import storage_quota
@@ -2859,6 +2859,22 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
         # payload here carries the normalized value into the merge in update_settings.
         payload.update(normalized)
 
+    # MFA policy (mfa_mode / required groups + users / allowed methods / email TTL / sftp policy). Shape
+    # + bounds + the email-only lockout guards are validated with the same DB-derived facts pattern; the
+    # group-id list is validated by the existing DB-bound check, as the account policy's are.
+    from app.core import second_factor_policy as _sfpol
+    if any(k in payload for k in _sfpol.DEFAULTS):
+        try:
+            _mfa_norm = _sfpol.validate_policy(
+                {k: payload[k] for k in _sfpol.DEFAULTS if k in payload},
+                active_admins_without_email=len(_admins_without_email(db)),
+                smtp_configured=_smtp_configured(db))
+        except _sfpol.SecondFactorPolicyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if "mfa_required_group_ids" in payload:
+            _validate_group_id_list(payload, "mfa_required_group_ids", db)
+        payload.update({k: _mfa_norm[k] for k in _sfpol.DEFAULTS if k in payload})
+
 
 @app.get("/settings/login-identifier-readiness")
 async def get_login_identifier_readiness(
@@ -2932,6 +2948,10 @@ async def get_settings(
     # posture and a whole-object save can't persist an unchecked default.
     from app.core.account_policy import effective_account_policy
     data.update(effective_account_policy(row.value if row else None))
+    # Effective MFA policy (mode / required groups + users / allowed methods / email TTL / sftp policy),
+    # defaults filled in, so the Accounts & Access -> Two-factor tab renders the real posture.
+    from app.core import second_factor_policy as _sfpol_get
+    data.update(_sfpol_get.effective_policy(row.value if row else None))
     # Stored zero means "use deployment default"; expose those defaults separately so the UI
     # can explain the effective fallback without persisting it on an unrelated save.
     for key in _RATE_LIMIT_API_SETTING_KEYS:
@@ -2943,6 +2963,107 @@ async def get_settings(
     # now-removed inline SMTP fields.
     data["smtp_configured"] = _smtp_configured(db)
     return data
+
+
+# --- Second factor: step-up enforcement -----------------------------------------------------------
+# Defined here (ahead of the first guarded route) so every @require_step_up-decorated route can see the
+# decorator at import time. The helper bodies reference models/helpers defined later in the module, but
+# only at request time, so their position relative to those definitions does not matter.
+
+# Every require_step_up(key) registers `key` here; the boot contract (_assert_step_up_boot_contract)
+# asserts this equals the catalog keys minus `login` (which the login flow enforces, not a decorator).
+GUARDED_STEP_UP_ACTIONS = set()
+
+# A few actions are enforced in-route (a conditional gate, or a route in another router module whose
+# `request` parameter is a body) rather than via the @require_step_up decorator, so they never register
+# themselves at import. List them here so the boot contract still sees them as guarded:
+#   * admin.settings.write        -- PUT /settings chooses between it and account.second_factor per
+#                                    request, so a single receipt always suffices.
+#   * account.encryption_key.replace -- PUT /keys/private in ecc_router (its `request` param is the body).
+#   * account.change_password / account.change_email -- PATCH /users/me gates each only when that field
+#                                    is actually changing (an SFTP-toggle-only save is never gated).
+GUARDED_STEP_UP_ACTIONS.add("admin.settings.write")
+GUARDED_STEP_UP_ACTIONS.add("account.encryption_key.replace")
+GUARDED_STEP_UP_ACTIONS.add("account.change_password")
+GUARDED_STEP_UP_ACTIONS.add("account.change_email")
+
+
+def _sf_action_toggles(db, action):
+    from app.core import second_factor_actions as acts
+    row = db.query(SecondFactorAction).filter(SecondFactorAction.key == action).first()
+    default_otp = acts.ACTION_META.get(action, {}).get("default_require_otp", False)
+    return (bool(row.require_otp) if row else bool(default_otp),
+            bool(row.require_password) if row else False)
+
+
+def _sf_requirement_for(db, user, action):
+    """(requirement dict, has_active_enrollment) for this user + action, per the two-toggle policy."""
+    from app.core import second_factor_actions as acts
+    from app.core import second_factor_policy as pol
+    require_otp, require_password = _sf_action_toggles(db, action)
+    has_active = db.query(SecondFactorEnrollment.id).filter(
+        SecondFactorEnrollment.user_id == user.id,
+        SecondFactorEnrollment.status == "active").first() is not None
+    req = pol.resolve_action_requirement(require_otp=require_otp, require_password=require_password,
+                                         has_active_enrollment=has_active,
+                                         is_admin_action=acts.is_admin_action(action))
+    return req, has_active
+
+
+def _sf_step_up_methods(db, user, req, has_active) -> list:
+    methods = []
+    if req["otp"] and has_active:
+        enr = db.query(SecondFactorEnrollment).filter(
+            SecondFactorEnrollment.user_id == user.id, SecondFactorEnrollment.status == "active").first()
+        if enr:
+            methods.append(enr.method)
+        methods.append("recovery")
+    if req["password"]:
+        methods.append("password")
+    return methods
+
+
+def _enforce_step_up(db, user, request, action):
+    """Raise 403 second_factor_required unless the caller has satisfied `action`'s step-up for THIS
+    session. A temp session has its own scope gate and never satisfies an account step-up here."""
+    if getattr(user, "_is_temp_session", False):
+        return
+    from app.core import second_factor as sf
+    req, has_active = _sf_requirement_for(db, user, action)
+    if not (req["password"] or req["otp"] or req["must_enroll"]):
+        return
+    if req["must_enroll"]:
+        raise HTTPException(status_code=403, detail={
+            "second_factor_required": True, "action": action, "reason": "enroll_required", "methods": []})
+    receipt = request.headers.get("X-Second-Factor")
+    session_hash = _current_session_hash(request)
+    if not (receipt and sf.consume_step_up_receipt(db, user=user, action=action,
+                                                   receipt=receipt, session_hash=session_hash)):
+        raise HTTPException(status_code=403, detail={
+            "second_factor_required": True, "action": action, "reason": "step_up_required",
+            "methods": _sf_step_up_methods(db, user, req, has_active)})
+
+
+def require_step_up(action: str):
+    """Decorator (stacks UNDER @require_endpoint_permission) enforcing the step-up policy for `action`.
+    Reads current_user + db + request from kwargs — a guarded route MUST accept `request: Request`. It
+    consumes an X-Second-Factor receipt minted by POST /auth/second-factor/step-up; a no-op when the
+    action requires nothing of this user (no action, admin.* included, carries a special 'never a
+    no-op' rule — an admin who has enabled no requirement is not gated, per the owner policy)."""
+    from functools import wraps
+    GUARDED_STEP_UP_ACTIONS.add(action)
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            user = kwargs.get("current_user")
+            db = kwargs.get("db")
+            request = kwargs.get("request")
+            if user is not None and db is not None and request is not None:
+                _enforce_step_up(db, user, request, action)
+            return await func(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
 @app.put("/settings")
@@ -2958,6 +3079,18 @@ async def update_settings(
     Gated by require_interactive_admin (NOT plain require_admin): a temporary credential —
     even one minted from an admin — must not rewrite the deployment's org policy
     (zero_knowledge_enabled / force_zero_knowledge / standard_vault_allowed_groups)."""
+    # A settings write is step-up-gated, choosing exactly ONE action so a single X-Second-Factor
+    # receipt always suffices:
+    #  * an MFA-policy change requires the account.second_factor step-up ("changing OTP settings
+    #    requires OTP", default require_otp ON) — an admin who wants to tighten MFA enrolls first, so
+    #    they always keep an OTP to loosen it again and can never lock themselves out;
+    #  * any other settings write requires admin.settings.write (default require_otp OFF — a no-op
+    #    until an admin opts in, so ordinary saves are untouched).
+    from app.core import second_factor_policy as _sfpol_gate
+    if any(k in payload for k in _sfpol_gate.DEFAULTS):
+        _enforce_step_up(db, current_user, request, "account.second_factor")
+    else:
+        _enforce_step_up(db, current_user, request, "admin.settings.write")
     _validate_settings_payload(payload, db)
     from app.core.models import SystemSetting
     row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
@@ -3443,6 +3576,7 @@ def _invite_status(inv, now):
 
 @app.post("/invites")
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def create_invite(
     payload: InviteCreate,
     current_user: User = Depends(require_interactive_admin),
@@ -3580,6 +3714,7 @@ async def list_invites(
 
 @app.delete("/invites/{invite_id}")
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def revoke_invite(
     invite_id: str,
     current_user: User = Depends(require_interactive_admin),
@@ -4049,6 +4184,7 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request, db: Ses
 
 @app.post("/users/{user_id}/send-reset-link")
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
                                 current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Admin action: email a password-reset link to a user. Always available (independent of the public
@@ -4608,6 +4744,302 @@ async def get_sftp_host_key(current_user: User = Depends(get_current_user)):
 
 # Authentication Endpoints
 
+# --- Second factor: the two-step login (no session until the second factor) -----------------------
+
+PRE_AUTH_TTL_MINUTES = 5
+_SF_LOGIN_MAX_ATTEMPTS = 5
+
+
+def _sf_user_group_ids(db, user) -> list:
+    return [str(r[0]) for r in db.query(user_groups.c.group_id)
+            .filter(user_groups.c.user_id == user.id).all()]
+
+
+def _second_factor_effective(db, user) -> dict:
+    """The user's effective second-factor state from the current policy + their enrollment + groups."""
+    from app.core import second_factor_policy as pol
+    p = pol.effective_policy(_global_settings_blob(db))
+    has_active = db.query(SecondFactorEnrollment.id).filter(
+        SecondFactorEnrollment.user_id == user.id,
+        SecondFactorEnrollment.status == "active").first() is not None
+    return pol.effective_second_factor(
+        mode=p["mfa_mode"], required_group_ids=p["mfa_required_group_ids"],
+        required_user_ids=p["mfa_required_user_ids"], user_group_ids=_sf_user_group_ids(db, user),
+        user_id=user.id, has_active_enrollment=has_active)
+
+
+def _login_second_factor_in_effect(db, user) -> bool:
+    """Whether the login flow presents the second factor for this user. The `login` action row is the
+    admin's master on/off switch (default require_otp ON): with it OFF the login step never asks for a
+    factor, even for an enrolled or policy-required user (they still use their factor for step-ups). With
+    it ON, the factor applies when it is otherwise in effect (enrolled, or required by mode/dept/user)."""
+    login_otp, _ = _sf_action_toggles(db, "login")
+    if not login_otp:
+        return False
+    return _second_factor_effective(db, user)["in_effect"]
+
+
+def _sf_login_methods(db, user) -> list:
+    enr = db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.user_id == user.id, SecondFactorEnrollment.status == "active").first()
+    return [enr.method, "recovery"] if enr else []
+
+
+def _delete_session_by_token(db, session_token):
+    """Delete the ActiveSession the password step just created, so an MFA login leaves no usable session
+    before the second factor. The stored value is the token's SHA-256 hash."""
+    if not session_token:
+        return
+    from app.core.models import ActiveSession
+    db.query(ActiveSession).filter(
+        ActiveSession.session_token == hash_session_token(session_token)).delete(synchronize_session=False)
+    db.commit()
+
+
+def _begin_pending_login(db, user, client_ip, *, enrollment_required: bool) -> str:
+    """Insert a pending_logins row and mint the pre-auth token: stage=second_factor, pre_auth=<id>, and
+    crucially NO session_token, with a 5-minute exp. The missing session_token is the confinement —
+    get_current_user, the /ws/monitor handshake and POST /api/logout each refuse a token without one."""
+    pending = PendingLogin(user_id=user.id, client_ip=client_ip, enrollment_required=enrollment_required,
+                           expires_at=datetime.now(timezone.utc) + timedelta(minutes=PRE_AUTH_TTL_MINUTES))
+    db.add(pending)
+    db.commit()
+    return create_access_token(
+        data={"sub": str(user.id), "username": user.username, "stage": "second_factor",
+              "pre_auth": str(pending.id)},
+        expires_delta=timedelta(minutes=PRE_AUTH_TTL_MINUTES))
+
+
+def _sf_pending_response(db, user, client_ip):
+    """The pre-authenticated login response for an in-effect user: enrolled -> present a factor; required
+    but not enrolled (pending) -> enrollment_required."""
+    eff = _second_factor_effective(db, user)
+    enrollment_required = (eff["state"] == "pending")
+    token = _begin_pending_login(db, user, client_ip, enrollment_required=enrollment_required)
+    return JSONResponse(status_code=200, content={
+        "access_token": None, "second_factor_required": True,
+        "enrollment_required": enrollment_required,
+        "methods": [] if enrollment_required else _sf_login_methods(db, user),
+        "pre_auth_token": token,
+    })
+
+
+async def get_pre_auth_principal(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+):
+    """Resolve a pre-authenticated (password-verified, second-factor-pending) principal from a pre-auth
+    token. Rejects a normal session token (no `stage`), a bad signature, and an expired/consumed row."""
+    payload = verify_access_token(credentials.credentials)
+    if not payload or payload.get("stage") != "second_factor" or not payload.get("pre_auth"):
+        raise HTTPException(status_code=401, detail="A valid pre-authentication token is required.")
+    pending = db.query(PendingLogin).filter(PendingLogin.id == payload["pre_auth"]).first()
+    exp = pending.expires_at if pending else None
+    if exp is not None and exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if not pending or pending.consumed_at is not None or (exp is not None and exp < datetime.now(timezone.utc)):
+        raise HTTPException(status_code=401, detail="This login attempt has expired; start again.")
+    user = db.query(User).filter(User.id == pending.user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid pre-authentication token.")
+    return user, pending
+
+
+async def get_enrolling_principal(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+):
+    """Principal for the TOTP enrollment endpoints, accepting EITHER a normal session OR a
+    forced-enrollment pre-auth token (a pending login with enrollment_required=True). This lets a user
+    the policy REQUIRES to enroll bootstrap their factor before they own a session (forced enrollment). Returns
+    (user, pending_or_None): `pending` is set only on the pre-auth path, so `acknowledge` can mint the
+    real session once activation succeeds. A pre-auth token whose pending row is NOT enrollment_required
+    is refused here — an already-enrolled user finishing login uses /auth/second-factor/verify."""
+    payload = verify_access_token(credentials.credentials)
+    if payload and payload.get("stage") == "second_factor" and payload.get("pre_auth"):
+        pending = db.query(PendingLogin).filter(PendingLogin.id == payload["pre_auth"]).first()
+        exp = pending.expires_at if pending else None
+        if exp is not None and exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if not pending or pending.consumed_at is not None or (exp is not None and exp < datetime.now(timezone.utc)):
+            raise HTTPException(status_code=401, detail="This login attempt has expired; start again.")
+        if not pending.enrollment_required:
+            raise HTTPException(status_code=401, detail="A valid session is required.")
+        user = db.query(User).filter(User.id == pending.user_id).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid pre-authentication token.")
+        return user, pending
+    # Normal session token: delegate to the hardened session dependency.
+    user = await get_current_user(credentials, db)
+    return user, None
+
+
+class SecondFactorVerifyRequest(BaseModel):
+    method: str = ""
+    code: str = ""
+
+
+@app.post("/auth/second-factor/verify")
+async def second_factor_login_verify(
+    body: SecondFactorVerifyRequest,
+    request: Request,
+    principal=Depends(get_pre_auth_principal),
+    db: Session = Depends(get_db),
+):
+    """The login second step: verify the factor for action=login with the pre-auth token, then mint the
+    real session + full JWT. Bounded by a fail-CLOSED rate limit AND a DURABLE per-attempt cap on the
+    pending row, so online guessing is capped even during a Redis outage."""
+    from app.core import second_factor as sf
+    from app.core.rate_limiter import rate_limiter as _rl
+    user, pending = principal
+    client_ip = get_client_ip(request)
+    allowed, _, reset = _rl.check_rate_limit(identifier=f"{client_ip}:{user.id}",
+                                             limit=10, window=300, prefix="sf_login_verify", fail_open=False)
+    if not allowed:
+        import time as _t
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many attempts; please wait a few minutes.",
+                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    if (pending.attempts or 0) >= _SF_LOGIN_MAX_ATTEMPTS:
+        pending.consumed_at = datetime.now(timezone.utc)
+        db.commit()
+        raise HTTPException(status_code=401, detail="Too many attempts on this login; start again.")
+    # Allowlist the method against what login actually offers this account (the enrolled method +
+    # recovery) — defense in depth so only a genuine second factor is ever presented at login. The
+    # account password is the FIRST factor and is never a login second factor.
+    login_methods = set(_sf_login_methods(db, user))
+    if (body.method or "").lower() not in login_methods or not sf.check_second_factor(
+            db, user=user, action="login", method=body.method, code=body.code):
+        pending.attempts = (pending.attempts or 0) + 1
+        if pending.attempts >= _SF_LOGIN_MAX_ATTEMPTS:
+            pending.consumed_at = datetime.now(timezone.utc)
+        db.commit()
+        raise HTTPException(status_code=401, detail="That code is not valid.")
+    # Consume the pending row (single winner) before minting the session.
+    if db.query(PendingLogin).filter(PendingLogin.id == pending.id, PendingLogin.consumed_at.is_(None)).update(
+            {"consumed_at": datetime.now(timezone.utc)}, synchronize_session=False) != 1:
+        db.commit()
+        raise HTTPException(status_code=401, detail="This login attempt was already completed.")
+    db.commit()
+    auth_service = AuthService(db)
+    session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
+    session_token = auth_service._create_session(user, None, client_ip, expires_at=session_expires_at)
+    _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
+    access_token = create_access_token(
+        data={"sub": str(user.id), "username": user.username, "session_token": session_token,
+              "is_temporary": False, "amr": ["pwd", (body.method or "").lower()],
+              "mfa_at": int(datetime.now(timezone.utc).timestamp())},
+        expires_delta=_expires)
+    recovery_used = (body.method or "").lower() == "recovery"
+    try:
+        AuditLogger(db).log_login_success(user, client_ip, is_temporary=False)
+        if recovery_used:
+            AuditLogger(db).log_action(action="second_factor_recovery_used", status="success", user=user,
+                                       ip_address=client_ip, details={})
+            _notify_users([str(user.id)], "second_factor_recovery_used",
+                          title="A recovery code was used to sign in",
+                          body="A recovery code was used to sign in" + (f" from {client_ip}" if client_ip else ""),
+                          target="#profile")
+    except Exception:  # noqa: BLE001
+        pass
+    return {"access_token": access_token, "token_type": "bearer",
+            "recovery_code_used": recovery_used,
+            "recovery_codes_remaining": _sf_recovery_remaining(db, user.id)}
+
+
+@app.post("/auth/second-factor/cancel")
+async def second_factor_login_cancel(
+    principal=Depends(get_pre_auth_principal),
+    db: Session = Depends(get_db),
+):
+    """Abandon a pending login: consume the pending row without creating a session."""
+    _user, pending = principal
+    db.query(PendingLogin).filter(
+        PendingLogin.id == pending.id, PendingLogin.consumed_at.is_(None)).update(
+        {"consumed_at": datetime.now(timezone.utc)}, synchronize_session=False)
+    db.commit()
+    return {"cancelled": True}
+
+
+class SecondFactorChallengeRequest(BaseModel):
+    action: str = ""
+    method: Optional[str] = None
+
+
+class SecondFactorStepUpRequest(BaseModel):
+    action: str = ""
+    method: str = ""
+    code: str = ""
+    password: Optional[str] = None
+
+
+@app.post("/auth/second-factor/challenge")
+async def second_factor_challenge(
+    body: SecondFactorChallengeRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Begin a step-up: resolve what the caller must present for `action` and list the methods. (Email
+    code issuance lands with the email method; TOTP / recovery / password need nothing issued.)"""
+    from app.core import second_factor_actions as acts
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot perform a step-up.")
+    if body.action not in acts.ACTION_KEYS:
+        raise HTTPException(status_code=404, detail="Unknown action.")
+    req, has_active = _sf_requirement_for(db, current_user, body.action)
+    if req["must_enroll"]:
+        return {"second_factor_required": True, "reason": "enroll_required", "methods": []}
+    methods = _sf_step_up_methods(db, current_user, req, has_active)
+    return {"second_factor_required": bool(methods), "methods": methods}
+
+
+@app.post("/auth/second-factor/step-up")
+async def second_factor_step_up(
+    body: SecondFactorStepUpRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Verify every factor `action` requires of the caller and mint a single session-bound receipt to
+    present back in X-Second-Factor. Bounded by a fail-CLOSED rate limit."""
+    from app.core import second_factor as sf
+    from app.core import second_factor_actions as acts
+    from app.core.security import verify_password
+    from app.core.rate_limiter import rate_limiter as _rl
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot perform a step-up.")
+    if body.action not in acts.ACTION_KEYS:
+        raise HTTPException(status_code=404, detail="Unknown action.")
+    client_ip = get_client_ip(request)
+    allowed, _, reset = _rl.check_rate_limit(identifier=f"{client_ip}:{current_user.id}",
+                                             limit=10, window=300, prefix="sf_step_up", fail_open=False)
+    if not allowed:
+        import time as _t
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many attempts; please wait a few minutes.",
+                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+    req, _has = _sf_requirement_for(db, current_user, body.action)
+    if req["must_enroll"]:
+        raise HTTPException(status_code=403, detail={
+            "second_factor_required": True, "action": body.action, "reason": "enroll_required", "methods": []})
+    if req["otp"]:
+        # Allowlist the method against the genuine OTP methods this action offers (enrolled method +
+        # recovery, + email when allowed) — never the account password, which is the first factor. The
+        # separate `require_password` re-auth below is what reads body.password.
+        otp_methods = {m for m in _sf_step_up_methods(db, current_user, req, _has) if m != "password"}
+        if (body.method or "").lower() not in otp_methods or not sf.check_second_factor(
+                db, user=current_user, action=body.action, method=body.method, code=body.code):
+            raise HTTPException(status_code=403, detail="That code is not valid.")
+    if req["password"]:
+        pw = body.password or (body.code if (body.method or "").lower() == "password" else None)
+        if not (pw and current_user.password_hash and verify_password(pw, current_user.password_hash)):
+            raise HTTPException(status_code=403, detail="Your account password is required and must be correct.")
+    session_hash = _current_session_hash(request)
+    return {"receipt": sf.issue_step_up_receipt(db, user_id=current_user.id, action=body.action,
+                                                session_hash=session_hash)}
+
+
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(
     login_request: LoginRequest,
@@ -4643,7 +5075,19 @@ async def login(
                 login_identifier=_login_identifier(db),
             )
             is_temporary = False
-        
+            # Two-step login: if the second factor is in effect for this account, hand out NO session
+            # yet. Delete the session authenticate_user just created, stand up a pending_login, and
+            # return a pre-auth response; the real session is minted by /auth/second-factor/verify.
+            # Honours the `login` action's require_otp master switch (off -> no factor at login).
+            if _login_second_factor_in_effect(db, user):
+                _delete_session_by_token(db, session_token)
+                try:
+                    audit_logger.log_action(action="login_password_ok", status="success", user=user,
+                                            ip_address=client_ip, details={})
+                except Exception:  # noqa: BLE001
+                    pass
+                return _sf_pending_response(db, user, client_ip)
+
         # Create JWT token (include session_token for session validation). A REGULAR session honours
         # the admin 'Session Timeout' setting (falling back to the env default); a temp credential
         # keeps the default token life — its own validity window is enforced separately.
@@ -4849,6 +5293,7 @@ async def get_session_access(
 
 @app.post("/auth/temp-credentials", response_model=TempCredentialResponse)
 @require_endpoint_permission("TEMP_CREDS_MANAGE")
+@require_step_up("temp_credential.create")
 async def create_temp_credentials(
     payload: Optional[TempCredentialCreate] = None,
     current_user: User = Depends(get_current_user),
@@ -5129,7 +5574,7 @@ def _guard_temp_session_cred_mutation(current_user, temp_cred, perm: str):
 
 
 def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_username="system",
-                     durable=True):
+                     durable=True, except_session_token=None):
     """Deactivate the matching active sessions AND publish a force-close signal to
     the 'session_terminations' Redis channel so the SFTP server tears down any live
     transport immediately — not just at the connection's next operation. This is
@@ -5166,6 +5611,12 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
         q = q.filter(ActiveSession.temp_credential_id == temp_credential_id)
     count = 0
     for s in q.all():
+        # Optionally keep the caller's OWN session (e.g. enrolling a second factor should revoke the
+        # account's OTHER sessions but leave the one doing the enrollment logged in). except_session_token
+        # is the PLAINTEXT token; the stored value is its hash, so we hash at the comparison — never
+        # compare a session token plaintext.
+        if except_session_token is not None and s.session_token == hash_session_token(except_session_token):
+            continue
         s.is_active = False
         if durable:
             s.revoked = True  # durable revocation (web tokens rejected even if Redis is down)
@@ -5731,6 +6182,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
 
 @app.post("/users", response_model=UserResponse)
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def create_user(
     user_create: UserCreate,
     current_user: User = Depends(require_interactive_admin),
@@ -5830,6 +6282,15 @@ async def update_own_account(
     if sensitive:
         if not body.current_password or not user.password_hash or not verify_password(body.current_password, user.password_hash):
             raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
+
+    # Conditional step-up: a self password change and a self email change are each independently
+    # gatable (account.change_password / account.change_email — both default require_otp OFF, so a
+    # no-op until an admin opts in). Enforced only when that field is actually changing, so an SFTP-
+    # toggle-only save is never gated.
+    if body.new_password is not None:
+        _enforce_step_up(db, current_user, request, "account.change_password")
+    if changing_email:
+        _enforce_step_up(db, current_user, request, "account.change_email")
 
     if body.new_password is not None:
         _validate_password_policy(db, body.new_password)
@@ -6073,6 +6534,350 @@ class PreferencesUpdate(BaseModel):
     download_sink: Optional[str] = None
 
 
+def _current_session_hash(request) -> Optional[str]:
+    """The hash of the CURRENT request's session (matches ActiveSession.session_token), or None. Used to
+    keep the caller's own session when revoking the account's OTHER sessions, and (later) to bind a
+    step-up receipt to the session that earned it."""
+    try:
+        auth = request.headers.get("Authorization") or ""
+        if not auth.lower().startswith("bearer "):
+            return None
+        payload = verify_access_token(auth.split(None, 1)[1].strip())
+        st = (payload or {}).get("session_token")
+        return hash_session_token(st) if st else None
+    except Exception:      # noqa: BLE001
+        return None
+
+
+def _current_session_token(request) -> Optional[str]:
+    """The CURRENT request's PLAINTEXT session token (the value inside the JWT), or None. Callers hash
+    it at the comparison site (never store or compare it plaintext) — see _revoke_sessions."""
+    try:
+        auth = request.headers.get("Authorization") or ""
+        if not auth.lower().startswith("bearer "):
+            return None
+        payload = verify_access_token(auth.split(None, 1)[1].strip())
+        return (payload or {}).get("session_token") or None
+    except Exception:      # noqa: BLE001
+        return None
+
+
+# --- Second factor: self-service TOTP enrollment ---------------------------------------------------
+# The forward enrollment path (enroll -> confirm -> acknowledge -> active). The FIRST enrollment of an
+# un-enrolled user re-proves the account password in the request body (there is no second factor yet to
+# step up with, per spec 7.2). Recovery codes are mandatory by the STATE MACHINE: the enrollment is not
+# 'active' until the codes are generated (confirm) and acknowledged. Disable/regenerate/re-enroll are
+# step-up-gated and land with the step-up phase.
+
+class TotpEnrollRequest(BaseModel):
+    current_password: str = ""
+
+
+class TotpConfirmRequest(BaseModel):
+    code: str = ""
+
+
+def _sf_enrollment(db, user_id, *, status=None):
+    q = db.query(SecondFactorEnrollment).filter(SecondFactorEnrollment.user_id == user_id)
+    if status is not None:
+        q = q.filter(SecondFactorEnrollment.status == status)
+    return q.first()
+
+
+def _sf_recovery_remaining(db, user_id) -> int:
+    return db.query(SecondFactorRecoveryCode).filter(
+        SecondFactorRecoveryCode.user_id == user_id,
+        SecondFactorRecoveryCode.consumed_at.is_(None),
+    ).count()
+
+
+@app.get("/users/me/second-factor")
+async def get_my_second_factor(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The caller's own second-factor state: the enrolled method (if any), whether it is active or
+    mid-enrollment, and how many recovery codes remain."""
+    enr = _sf_enrollment(db, current_user.id)
+    return {
+        "enrolled": bool(enr and enr.status == "active"),
+        "method": enr.method if enr else None,
+        "status": enr.status if enr else "not_setup",
+        "awaiting_acknowledge": bool(enr and enr.status == "unconfirmed" and enr.confirmed_at is not None),
+        "recovery_codes_remaining": _sf_recovery_remaining(db, current_user.id),
+    }
+
+
+@app.post("/users/me/second-factor/totp/enroll")
+async def enroll_totp(
+    body: TotpEnrollRequest,
+    request: Request,
+    principal=Depends(get_enrolling_principal),
+    db: Session = Depends(get_db),
+):
+    """Begin TOTP enrollment: mint a sealed seed, store it 'unconfirmed', and return the otpauth URI +
+    base32 secret. Re-proves the account password (first-enrollment gate). An already-active enrollment
+    must be disabled first (re-enroll = disable then enroll), so an active method is never replaced here.
+    Reachable with a normal session OR a forced-enrollment pre-auth token."""
+    from app.core.security import verify_password, encrypt_secret
+    from app.core import second_factor as sf
+    from app.core.models import SecondFactorEnrollment
+    from app.config.effective import get_effective_branding
+
+    current_user, _pending = principal
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
+    user = db.query(User).filter(User.id == current_user.id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if _sf_enrollment(db, user.id, status="active"):
+        raise HTTPException(status_code=409, detail="A second factor is already active; disable it before enrolling a new one.")
+    if not user.password_hash or not verify_password(body.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
+
+    seed = sf.generate_totp_secret()
+    # Replace any prior UNCONFIRMED row (a restarted enrollment); never an active one (guarded above).
+    db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.user_id == user.id,
+        SecondFactorEnrollment.status == "unconfirmed",
+    ).delete(synchronize_session=False)
+    db.add(SecondFactorEnrollment(user_id=user.id, method="totp",
+                                  secret_enc=encrypt_secret(seed), status="unconfirmed"))
+    db.commit()
+    try:
+        issuer = (get_effective_branding(db).app_name or "DockVault").strip() or "DockVault"
+    except Exception:      # noqa: BLE001
+        issuer = "DockVault"
+    uri = sf.otpauth_uri(seed, account=user.username, issuer=issuer)
+    return {"secret": seed, "otpauth_uri": uri, "qr_svg": sf.otpauth_qr_svg(uri)}
+
+
+@app.post("/users/me/second-factor/totp/confirm")
+async def confirm_totp(
+    body: TotpConfirmRequest,
+    request: Request,
+    principal=Depends(get_enrolling_principal),
+    db: Session = Depends(get_db),
+):
+    """Prove the authenticator by a correct code, then generate the MANDATORY recovery codes and return
+    them ONCE. The enrollment stays 'unconfirmed' until acknowledge — the codes are not optional.
+    Reachable with a normal session OR a forced-enrollment pre-auth token."""
+    from app.core import second_factor as sf
+    from app.core.security import decrypt_secret
+    from app.core.models import SecondFactorEnrollment, SecondFactorRecoveryCode
+    from datetime import datetime, timezone
+
+    current_user, _pending = principal
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
+    enr = db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.user_id == current_user.id,
+        SecondFactorEnrollment.method == "totp",
+        SecondFactorEnrollment.status == "unconfirmed",
+    ).first()
+    if not enr or not enr.secret_enc:
+        raise HTTPException(status_code=400, detail="Start TOTP enrollment first.")
+    try:
+        seed = decrypt_secret(enr.secret_enc)
+    except Exception:      # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Enrollment is corrupt; start again.")
+    step = sf.matching_totp_step(seed, body.code)
+    if step is None:
+        raise HTTPException(status_code=400, detail="That code is not valid. Check your authenticator's clock and try again.")
+    # Record the step so the confirming code can't be replayed as the first login, and mark confirmed.
+    enr.last_used_step = step
+    enr.confirmed_at = datetime.now(timezone.utc)
+    # (Re)issue the mandatory recovery codes: drop any prior set, store (prefix, argon2) for the new ten.
+    db.query(SecondFactorRecoveryCode).filter(
+        SecondFactorRecoveryCode.user_id == current_user.id).delete(synchronize_session=False)
+    generated = sf.generate_recovery_codes()
+    for _plain, prefix, code_hash in generated:
+        db.add(SecondFactorRecoveryCode(user_id=current_user.id, code_prefix=prefix, code_hash=code_hash))
+    db.commit()
+    return {"recovery_codes": [sf.format_recovery_code(plain) for plain, _p, _h in generated],
+            "message": "Save these recovery codes now — they are shown only once."}
+
+
+@app.post("/users/me/second-factor/recovery/acknowledge")
+async def acknowledge_recovery_codes(
+    request: Request,
+    principal=Depends(get_enrolling_principal),
+    db: Session = Depends(get_db),
+):
+    """Confirm the recovery codes were saved and activate the enrollment. Until this call the user is
+    NOT enrolled. Activating a second factor revokes the account's OTHER sessions.
+
+    On the forced-enrollment path (a pre-auth token) the user had no session: consume the pending
+    login and mint the real session here, returning an access_token so onboarding ends signed in."""
+    from app.core.models import SecondFactorEnrollment
+    from datetime import datetime, timezone
+
+    current_user, pending = principal
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
+    enr = db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.user_id == current_user.id,
+        SecondFactorEnrollment.status == "unconfirmed",
+        SecondFactorEnrollment.confirmed_at.isnot(None),
+    ).first()
+    if not enr:
+        raise HTTPException(status_code=400, detail="Confirm a code and generate recovery codes first.")
+    if _sf_recovery_remaining(db, current_user.id) == 0:
+        raise HTTPException(status_code=400, detail="Generate recovery codes before activating.")
+    enr.status = "active"
+    db.commit()
+
+    if pending is not None:
+        # Forced-enrollment login: consume the pending row (single winner) and mint the real session.
+        # There are no older sessions to revoke — a required-but-unenrolled user never held one.
+        client_ip = get_client_ip(request)
+        if db.query(PendingLogin).filter(
+                PendingLogin.id == pending.id, PendingLogin.consumed_at.is_(None)).update(
+                {"consumed_at": datetime.now(timezone.utc)}, synchronize_session=False) != 1:
+            db.commit()
+            raise HTTPException(status_code=401, detail="This login attempt was already completed.")
+        db.commit()
+        auth_service = AuthService(db)
+        session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
+        session_token = auth_service._create_session(current_user, None, client_ip, expires_at=session_expires_at)
+        _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
+        access_token = create_access_token(
+            data={"sub": str(current_user.id), "username": current_user.username,
+                  "session_token": session_token, "is_temporary": False,
+                  "amr": ["pwd", "totp"], "mfa_at": int(datetime.now(timezone.utc).timestamp())},
+            expires_delta=_expires)
+        try:
+            AuditLogger(db).log_login_success(current_user, client_ip, is_temporary=False)
+            AuditLogger(db).log_action(action="second_factor_enrolled", status="success", user=current_user,
+                                       ip_address=client_ip, details={"method": "totp", "forced": True})
+        except Exception:      # noqa: BLE001
+            pass
+        return {"enrolled": True, "method": "totp", "access_token": access_token, "token_type": "bearer"}
+
+    # Normal (already-signed-in) path: a change to how the account authenticates should not leave older
+    # sessions standing — but keep the session that just did the enrollment (the user stays logged in).
+    try:
+        _revoke_sessions(db, user_id=current_user.id, actor_username=current_user.username,
+                         except_session_token=_current_session_token(request))
+        db.commit()
+    except Exception:      # noqa: BLE001 - activation already committed; the revoke is best-effort
+        db.rollback()
+    try:
+        AuditLogger(db).log_action(action="second_factor_enrolled", status="success", user=current_user,
+                                   ip_address=get_client_ip(request), details={"method": "totp"})
+    except Exception:      # noqa: BLE001
+        pass
+    return {"enrolled": True, "method": "totp"}
+
+
+@app.delete("/users/me/second-factor")
+@require_step_up("account.second_factor")
+async def disable_second_factor(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Disable the caller's second factor. Refused (409) while it is REQUIRED for this account (by policy
+    or department) -- a required user cannot opt out. Deletes the enrollment and every recovery code.
+    Gated by the account.second_factor step-up (an enrolled caller presents their factor to turn it off)."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
+    if _second_factor_effective(db, current_user)["required"]:
+        raise HTTPException(status_code=409,
+                            detail="A second factor is required for your account and cannot be disabled.")
+    db.query(SecondFactorRecoveryCode).filter(
+        SecondFactorRecoveryCode.user_id == current_user.id).delete(synchronize_session=False)
+    db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.user_id == current_user.id).delete(synchronize_session=False)
+    db.commit()
+    try:
+        AuditLogger(db).log_action(action="second_factor_disabled", status="success", user=current_user,
+                                   ip_address=get_client_ip(request), details={})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"disabled": True}
+
+
+@app.post("/users/me/second-factor/recovery/regenerate")
+@require_step_up("account.second_factor")
+async def regenerate_recovery_codes(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Invalidate all recovery codes and issue ten new ones, shown once. Requires an active enrollment and
+    the account.second_factor step-up."""
+    from app.core import second_factor as sf
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
+    if not _sf_enrollment(db, current_user.id, status="active"):
+        raise HTTPException(status_code=400, detail="No active second factor to regenerate codes for.")
+    db.query(SecondFactorRecoveryCode).filter(
+        SecondFactorRecoveryCode.user_id == current_user.id).delete(synchronize_session=False)
+    generated = sf.generate_recovery_codes()
+    for _plain, prefix, code_hash in generated:
+        db.add(SecondFactorRecoveryCode(user_id=current_user.id, code_prefix=prefix, code_hash=code_hash))
+    db.commit()
+    return {"recovery_codes": [sf.format_recovery_code(p) for p, _pr, _h in generated]}
+
+
+# --- Second factor: admin policy matrix ------------------------------------------------------------
+
+class SecondFactorActionToggle(BaseModel):
+    require_otp: Optional[bool] = None
+    require_password: Optional[bool] = None
+
+
+@app.get("/second-factor/actions")
+async def list_second_factor_actions(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """The admin step-up policy matrix: one row per cataloged action with its two independent toggles
+    (require_otp / require_password). Rendered in catalog order; a key with no stored row yet shows its
+    code default."""
+    from app.core.second_factor_actions import SECOND_FACTOR_ACTIONS
+    rows = {r.key: r for r in db.query(SecondFactorAction).all()}
+    return {"actions": [
+        {"key": key, "name": name,
+         "require_otp": bool(rows[key].require_otp) if key in rows else bool(default_otp),
+         "require_password": bool(rows[key].require_password) if key in rows else False}
+        for key, name, default_otp in SECOND_FACTOR_ACTIONS
+    ]}
+
+
+@app.put("/second-factor/actions/{key}")
+@require_step_up("account.second_factor")
+async def update_second_factor_action(
+    key: str,
+    body: SecondFactorActionToggle,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Set an action's require_otp / require_password toggle. Only cataloged keys are configurable."""
+    from app.core.second_factor_actions import ACTION_KEYS
+    if key not in ACTION_KEYS:
+        raise HTTPException(status_code=404, detail="Unknown second-factor action.")
+    row = db.query(SecondFactorAction).filter(SecondFactorAction.key == key).first()
+    if not row:
+        row = SecondFactorAction(key=key)
+        db.add(row)
+    if body.require_otp is not None:
+        row.require_otp = bool(body.require_otp)
+    if body.require_password is not None:
+        row.require_password = bool(body.require_password)
+    db.commit()
+    try:
+        AuditLogger(db).log_action(action="second_factor_action_updated", status="success", user=current_user,
+                                   ip_address=get_client_ip(request),
+                                   details={"key": key, "require_otp": row.require_otp,
+                                            "require_password": row.require_password})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"key": key, "require_otp": row.require_otp, "require_password": row.require_password}
+
+
 @app.get("/users/me/preferences")
 async def get_my_preferences(
     current_user: User = Depends(get_current_user),
@@ -6277,6 +7082,7 @@ async def get_user_storage(
 
 @app.patch("/users/{user_id}", response_model=UserResponse)
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def update_user(
     user_id: uuid.UUID,
     user_update: UserUpdate,
@@ -6587,8 +7393,67 @@ async def delete_ssh_key(
     return {"message": "SSH key removed"}
 
 
+@app.post("/users/{user_id}/second-factor/reset")
+@require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
+async def admin_reset_second_factor(
+    user_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin: clear a user's second-factor enrollment + recovery codes (e.g. a lost device), revoke the
+    user's sessions, and notify them. If MFA is in effect for that account they re-enroll at the next
+    login via forced enrollment. Guard: an admin may not reset their OWN factor while mfa_mode is
+    'required' and they are the only enrolled admin — that would strip the last enrolled admin's
+    factor through this route."""
+    from app.core import second_factor_policy as pol
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.id == current_user.id:
+        mode = pol.effective_policy(_global_settings_blob(db))["mfa_mode"]
+        if mode == "required":
+            enrolled_admins = db.query(User.id).join(
+                SecondFactorEnrollment, SecondFactorEnrollment.user_id == User.id).filter(
+                User.role == RoleEnum.ADMIN, User.is_active.is_(True),
+                SecondFactorEnrollment.status == "active").count()
+            if enrolled_admins <= 1:
+                raise HTTPException(status_code=400, detail=(
+                    "You can't reset your own second factor while MFA is required and you are the only "
+                    "enrolled administrator. Have another admin enroll first, or reset it from the host."))
+    db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.user_id == target.id).delete(synchronize_session=False)
+    db.query(SecondFactorRecoveryCode).filter(
+        SecondFactorRecoveryCode.user_id == target.id).delete(synchronize_session=False)
+    db.commit()
+    # A change to how the account authenticates should not leave standing sessions.
+    try:
+        _revoke_sessions(db, user_id=target.id, actor_username=current_user.username)
+        db.commit()
+    except Exception:      # noqa: BLE001 - the reset already committed; the revoke is best-effort
+        db.rollback()
+    try:
+        AuditLogger(db).log_action(action="second_factor_admin_reset", status="success", user=current_user,
+                                   resource_type="user", resource_id=str(target.id),
+                                   ip_address=get_client_ip(request),
+                                   details={"target_username": target.username})
+    except Exception:      # noqa: BLE001
+        pass
+    try:
+        _notify_users([str(target.id)], "second_factor_admin_reset",
+                      title="Your second factor was reset",
+                      body="An administrator reset your two-factor authentication. You'll set it up "
+                           "again at your next sign-in.",
+                      target="#profile")
+    except Exception:      # noqa: BLE001
+        pass
+    return {"reset": True}
+
+
 @app.post("/users/{user_id}/delete")
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def delete_user(
     user_id: uuid.UUID,
     current_user: User = Depends(require_interactive_admin),
@@ -6639,6 +7504,7 @@ async def delete_user(
 
 @app.post("/users/{user_id}/terminate-sessions")
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def terminate_user_sessions(
     user_id: uuid.UUID,
     current_user: User = Depends(require_interactive_admin),
@@ -7381,6 +8247,7 @@ class NoteLinkRedeem(BaseModel):
 
 
 @app.post("/note-links")
+@require_step_up("public_link.create")
 async def create_note_link(
     payload: NoteLinkCreate,
     request: Request,
@@ -7935,6 +8802,7 @@ def _share_dict(db: Session, share: Share, claim_counts: dict = None) -> dict:
 
 
 @app.post("/shares")
+@require_step_up("share.create")
 async def create_share(
     payload: ShareCreate,
     request: Request,
@@ -9776,6 +10644,7 @@ async def unset_vault_favorite(
 @app.post("/vaults/{vault_id}/delete")
 @require_endpoint_permission("VAULT_DELETE")
 @require_vault_cap("vault.delete")
+@require_step_up("vault.delete")
 async def delete_vault(
     vault_id: uuid.UUID,
     request: Request,
@@ -10044,6 +10913,7 @@ async def update_vault_info(
 @app.put("/vaults/{vault_id}/password")
 @require_endpoint_permission("VAULT_SETTINGS")
 @require_vault_cap("vault.change_password")
+@require_step_up("vault.change_password")
 async def change_vault_password(
     vault_id: uuid.UUID,
     password_update: dict,
@@ -10861,6 +11731,7 @@ async def revoke_vault_group_access(
 @app.post("/vaults/{vault_id}/rotate-key")
 @require_endpoint_permission("VAULT_SETTINGS")
 @require_vault_cap("vault.rotate_key")
+@require_step_up("vault.rotate_key")
 async def rotate_vault_encryption_key(
     vault_id: uuid.UUID,
     request: Request,
@@ -15795,6 +16666,43 @@ _DEFAULT_SHARE_TAGS = [
 ]
 
 
+def _seed_second_factor_actions():
+    """Seed one second_factor_actions row per catalog key. require_otp comes from the catalog default on
+    FIRST creation only; an admin's own toggles are never overwritten on a later boot. New keys added to
+    the catalog appear; keys removed from code are left in place (harmless). Best-effort at startup."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.models import SecondFactorAction
+        from app.core.second_factor_actions import SECOND_FACTOR_ACTIONS
+        with get_db_context() as db:
+            existing = {r[0] for r in db.query(SecondFactorAction.key).all()}
+            added = 0
+            for key, _name, default_otp in SECOND_FACTOR_ACTIONS:
+                if key not in existing:
+                    db.add(SecondFactorAction(key=key, require_otp=bool(default_otp), require_password=False))
+                    added += 1
+            if added:
+                print(f"[OK] Seeded {added} second-factor action(s)")
+    except Exception as e:
+        print(f"⚠ Second-factor action seeding skipped: {e}")
+
+
+def _assert_step_up_boot_contract():
+    """Boot contract: every catalog action except `login` must be guarded by a step-up somewhere
+    (a @require_step_up decorator, or an in-route _enforce_step_up registered into GUARDED_STEP_UP_
+    ACTIONS). `login` is enforced by the two-step login flow, not a decorator, so it is excluded. A
+    drift here means a high-risk action shipped ungatable — fail boot loudly rather than serve it."""
+    from app.core.second_factor_actions import ACTION_KEYS
+    expected = set(ACTION_KEYS) - {"login"}
+    missing = expected - GUARDED_STEP_UP_ACTIONS
+    extra = GUARDED_STEP_UP_ACTIONS - expected
+    if missing or extra:
+        raise RuntimeError(
+            "Second-factor step-up boot contract violated: "
+            f"catalog actions not guarded by any route: {sorted(missing)}; "
+            f"guarded actions not in the catalog: {sorted(extra)}.")
+
+
 def _seed_default_share_tags():
     """Seed the starter share-tag set on a FRESH deployment so sharing works out of the box.
 
@@ -16786,6 +17694,8 @@ async def lifespan(app: FastAPI):
     scrub_bootstrap_password_source(_admin_bootstrap_status)
     _seed_default_share_tags()  # after the admin exists, so seed tags can record it as creator
     _seed_default_note_link_tags()  # public-note-link starter tags (inert until enabled)
+    _seed_second_factor_actions()  # the second-factor step-up policy matrix (one row per catalog key)
+    _assert_step_up_boot_contract()  # fail boot if any catalog action ships ungatable
     _backfill_default_permissions()
     _seed_default_email_profile()
 

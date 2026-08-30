@@ -124,6 +124,30 @@ async def require_interactive_admin(
         )
     return current_user
 
+
+def require_step_up(action: str):
+    """Enforce the second-factor step-up policy for `action` on this router's routes, reusing the
+    single enforcement + registry that lives in api_server (imported lazily to avoid a circular
+    import — api_server includes this router at load). The FastAPI ``Request`` is located by TYPE,
+    not by parameter name, so a route whose ``request`` parameter is a request BODY (e.g.
+    change_user_role) still works as long as it also declares a ``Request`` parameter."""
+    from functools import wraps
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            from app.api.api_server import _enforce_step_up, GUARDED_STEP_UP_ACTIONS
+            GUARDED_STEP_UP_ACTIONS.add(action)
+            user = kwargs.get("current_user")
+            db = kwargs.get("db")
+            req = next((v for v in kwargs.values() if isinstance(v, Request)), None)
+            if user is not None and db is not None and req is not None:
+                _enforce_step_up(db, user, req, action)
+            return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
 # =============================================================================
 # Pydantic Models
 # =============================================================================
@@ -482,6 +506,7 @@ def _blacklist_user_vault_keys(db: Session, user_id, revoked_by) -> int:
 
 @router.put("/users/{user_id}", response_model=UserDetailResponse)
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def update_user(
     user_id: uuid.UUID,
     update_data: UserUpdateRequest,
@@ -550,10 +575,12 @@ async def update_user(
 
 @router.post("/users/{user_id}/toggle-active")
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def toggle_user_active(
     user_id: uuid.UUID,
     current_user: User = Depends(require_interactive_admin),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    request: Request = None,
 ):
     """Toggle user active status (interactive admin only)"""
     
@@ -598,10 +625,12 @@ async def toggle_user_active(
 
 @router.post("/users/{user_id}/toggle-locked")
 @require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
 async def toggle_user_locked(
     user_id: uuid.UUID,
     current_user: User = Depends(require_interactive_admin),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    request: Request = None,
 ):
     """Toggle user locked status (interactive admin only)"""
     
@@ -1038,11 +1067,13 @@ async def get_role_definitions(
 
 
 @router.patch("/users/{user_id}/role", response_model=ChangeRoleResponse)
+@require_step_up("admin.user.manage")
 async def change_user_role(
     user_id: uuid.UUID,
     request: ChangeRoleRequest,
     current_user: User = Depends(require_interactive_admin),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    http_request: Request = None,
 ):
     """
     Change a user's role. Only an interactive admin can perform this action (a temp

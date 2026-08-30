@@ -197,6 +197,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.20.0": {
+      "released": "2026-08-30",
+      "notes": "Adds optional two-factor authentication. A user can enroll an authenticator app (TOTP) with mandatory recovery codes; login becomes two-step for an enrolled or required account. An admin can require two-factor (forced enrollment at next sign-in), scope step-up per high-risk action (require the authenticator and/or a password re-authentication), and require a temporary credential for SFTP when an account's second factor is in effect. New two-factor tables are created automatically by the app on first start -- no migration step. A rollback to 0.19.3 leaves those tables and their data intact but DISABLES two-factor enforcement (accounts then sign in with their password only) until you upgrade again.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -372,6 +380,13 @@
     {
       "from": "0.19.2",
       "to": "0.19.3",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.19.3",
+      "to": "0.20.0",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
