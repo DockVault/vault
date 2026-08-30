@@ -1,6 +1,10 @@
 """Per-user resource caps (findings F-R015-003 + F-R015-006): a per-user vault-count cap, a 50 GB
 default per-account storage budget, and a cap on simultaneously-active temporary credentials. Regular
 users are bounded; full admins are exempt."""
+import json
+import os
+import subprocess
+
 import pytest
 
 from conftest import ApiClient, BASE_URL, unique
@@ -9,12 +13,55 @@ pytestmark = pytest.mark.integration
 
 _GIB = 1024 ** 3
 
+# The three per-user cap keys. When ABSENT from the settings blob (a fresh deployment), the server
+# falls back to the shipped defaults 50 / 50 / 10 -- which is the fix under test.
+_CAP_KEYS = ("default_user_quota", "max_vaults_per_user", "max_temp_creds_per_user")
+
 
 def _user_client(admin):
     u = admin.create_user(role="user")
     c = ApiClient(BASE_URL)
     c.login(u["_username"], u["_password"])
     return u, c
+
+
+def _psql(sql):
+    container = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
+    probe = subprocess.run(
+        ["docker", "exec", container, "sh", "-c", "echo $POSTGRES_USER; echo $POSTGRES_DB"],
+        capture_output=True, text=True, timeout=60)
+    if probe.returncode != 0:
+        pytest.skip("cannot reach the database container %s" % container)
+    lines = [ln.strip() for ln in probe.stdout.splitlines() if ln.strip()]
+    out = subprocess.run(
+        ["docker", "exec", container, "psql", "-U", lines[0], "-d", lines[1], "-tAc", sql],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, "psql failed: %s" % (out.stderr or "")[:300]
+    return out.stdout.strip()
+
+
+def _sql_literal(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+@pytest.fixture
+def caps_defaults_absent():
+    """Remove the three per-user cap keys from the settings blob (the fresh-deploy state), so a test
+    exercises the server's fallback DEFAULTS rather than a value it set itself. Not `PUT {key: 50}` --
+    that returns the value it stored and never touches the `.get(key, DEFAULT)` fallback under test.
+    The whole blob is restored afterwards (the API cannot un-set a key, only set it)."""
+    before = _psql("SELECT value FROM system_settings WHERE key = 'global'")
+    if not before:
+        _psql("INSERT INTO system_settings (key, value) VALUES ('global', '{}') "
+              "ON CONFLICT (key) DO NOTHING")
+        before = _psql("SELECT value FROM system_settings WHERE key = 'global'") or "{}"
+    stripped = json.loads(before)
+    for key in _CAP_KEYS:
+        stripped.pop(key, None)
+    _psql("UPDATE system_settings SET value = %s WHERE key = 'global'"
+          % _sql_literal(json.dumps(stripped)))
+    yield
+    _psql("UPDATE system_settings SET value = %s WHERE key = 'global'" % _sql_literal(before))
 
 
 def test_vault_count_cap_enforced_for_non_admin(admin):
@@ -28,9 +75,20 @@ def test_vault_count_cap_enforced_for_non_admin(admin):
         made.append(c.create_vault(name=unique("cap2"))["id"])
         third = c.post("/vaults", json={"name": unique("cap3")})
         assert third.status_code == 409, third.text
-        # A full admin is exempt from the per-user cap.
-        av = admin.create_vault(name=unique("cap-admin"))
-        admin.delete_vault(av["id"])
+        # A full admin is EXEMPT: it can create MORE than the cap. A single admin create would pass via
+        # the ordinary count<cap path (the admin usually owns 0-1 vaults here), so create cap+1 fresh
+        # vaults as admin — a non-admin is refused at the (cap+1)th, so all succeeding proves the
+        # exemption early-return actually fires.
+        admin_made = []
+        try:
+            for i in range(3):  # cap is 2; the 3rd necessarily crosses the cap
+                r = admin.post("/vaults", json={"name": unique(f"cap-admin{i}")})
+                assert r.status_code in (200, 201), \
+                    f"admin create #{i + 1} refused — exemption not firing: {r.text}"
+                admin_made.append(r.json()["id"])
+        finally:
+            for vid in admin_made:
+                admin.delete_vault(vid)
     finally:
         for vid in made:
             c.delete_vault(vid)
@@ -40,14 +98,15 @@ def test_vault_count_cap_enforced_for_non_admin(admin):
         admin.delete_user(u["id"])
 
 
-def test_default_account_quota_is_50gb_for_non_admin(admin):
-    before = admin.get("/settings").json()
-    admin.put("/settings", json={"default_user_quota": 50, "max_vaults_per_user": 0})
+def test_default_account_quota_is_50gb_for_non_admin(admin, caps_defaults_absent):
+    # default_user_quota is ABSENT, so the 50 GB budget is the server's FALLBACK default (the actual
+    # F-R015-003 fix: `_settings_blob(db).get("default_user_quota", _DEFAULT_ACCOUNT_QUOTA_GB)`), not a
+    # value this test set. A non-admin's vaults are then bounded to that 50 GB aggregate.
     u, c = _user_client(admin)
     try:
         s = admin.get(f"/users/{u['id']}/storage").json()
         assert s["default_quota_bytes"] == 50 * _GIB, s
-        # A 60 GB vault exceeds the 50 GB account budget -> refused.
+        # A 60 GB vault exceeds the fallback 50 GB account budget -> refused.
         big = c.post("/vaults", json={"name": unique("big"), "size_limit_gb": 60})
         assert big.status_code == 400, big.text
         # A 10 GB vault fits.
@@ -55,9 +114,6 @@ def test_default_account_quota_is_50gb_for_non_admin(admin):
         assert ok.status_code in (200, 201), ok.text
         c.delete_vault(ok.json()["id"])
     finally:
-        admin.put("/settings", json={
-            "default_user_quota": before.get("default_user_quota", 50),
-            "max_vaults_per_user": before.get("max_vaults_per_user", 50)})
         admin.delete_user(u["id"])
 
 
@@ -168,12 +224,13 @@ def test_temp_cred_cap_exempts_admin_delegated_child(admin):
         admin.delete_vault(vid)
 
 
-def test_cap_settings_report_effective_defaults(admin):
+def test_cap_settings_report_effective_defaults(admin, caps_defaults_absent):
+    # With the three keys ABSENT, /settings surfaces the shipped fallback defaults exactly (50 / 50 /
+    # 10) -- not merely "some int". Reverting any default to 0/unlimited (or a wrong number) fails here.
     s = admin.get("/settings").json()
-    # The effective defaults are surfaced so the admin toggles reflect the shipped 50 / 50 / 10.
-    assert isinstance(s.get("max_vaults_per_user"), int)
-    assert isinstance(s.get("default_user_quota"), (int, float))
-    assert isinstance(s.get("max_temp_creds_per_user"), int)
+    assert s.get("max_vaults_per_user") == 50, s
+    assert s.get("default_user_quota") == 50, s
+    assert s.get("max_temp_creds_per_user") == 10, s
 
 
 def test_cap_settings_validate(admin):

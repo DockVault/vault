@@ -7008,7 +7008,7 @@ async def update_second_factor_action(
     # its OTP requirement (R018-INFO-1): otherwise turning off this one switch would silently drop the
     # step-up from every later matrix edit. body.require_otp is Optional[bool], so `is False` fires only
     # on an explicit false, never on an omitted field.
-    if key == "account.second_factor" and body.require_otp is False:
+    if key == "account.second_factor" and body.require_otp is not None and not bool(body.require_otp):
         raise HTTPException(status_code=400,
                             detail="account.second_factor must keep OTP required — it is the gate that "
                                    "protects the two-factor policy itself.")
@@ -7018,6 +7018,11 @@ async def update_second_factor_action(
         db.add(row)
     if body.require_otp is not None:
         row.require_otp = bool(body.require_otp)
+    if key == "account.second_factor":
+        # Pin the gate's OTP requirement ON regardless of an omitted field or the fresh-row column
+        # default (require_otp defaults False) — the invariant is the EFFECTIVE state, not just the
+        # incoming field (R018-INFO-1).
+        row.require_otp = True
     if body.require_password is not None:
         row.require_password = bool(body.require_password)
     db.commit()
@@ -7054,8 +7059,11 @@ async def update_second_factor_actions_bulk(
         if not isinstance(it, dict) or it.get("key") not in ACTION_KEYS:
             raise HTTPException(status_code=400, detail="actions contains an unknown or malformed entry.")
         # R018-INFO-1: refuse to disable OTP on the action that gates the matrix itself (all-or-nothing,
-        # so the whole batch is rejected before anything is written).
-        if it.get("key") == "account.second_factor" and it.get("require_otp") is False:
+        # so the whole batch is rejected before anything is written). The items are RAW dicts (the model
+        # field is an untyped list), so a falsy-but-not-False JSON value (0, "", [], {}) must be caught
+        # with bool() -- an identity `is False` check would let it slip the guard yet be written as False.
+        if it.get("key") == "account.second_factor" and it.get("require_otp") is not None \
+                and not bool(it.get("require_otp")):
             raise HTTPException(status_code=400,
                                 detail="account.second_factor must keep OTP required — it is the gate "
                                        "that protects the two-factor policy itself.")
@@ -7070,6 +7078,10 @@ async def update_second_factor_actions_bulk(
             row.require_otp = bool(it["require_otp"])
         if it.get("require_password") is not None:
             row.require_password = bool(it["require_password"])
+        if k == "account.second_factor":
+            # Pin the gate's OTP requirement ON (covers a falsy value that reached here, an omitted
+            # field, or a fresh-row column default) -- defence in depth behind the guard above.
+            row.require_otp = True
         changed.append(k)
     db.commit()
     try:
@@ -13321,7 +13333,9 @@ async def update_vault_settings(
         return {"message": "Vault settings updated successfully",
                 "unlock_remember_minutes": vault.unlock_remember_minutes}
         
-    except ResourceNotFoundError as e:
+    except (ResourceNotFoundError, VaultNotFoundError, FolderNotFoundError, FileNotFoundError) as e:
+        # A missing vault/folder/file is a clean 404, not a 500 (finding F-R001-001): the catch-all
+        # below would otherwise swallow VaultNotFoundError into a generic 500.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e)
@@ -15044,6 +15058,10 @@ async def upload_file(
         raise
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except (VaultNotFoundError, FolderNotFoundError, ResourceNotFoundError):
+        # A missing vault/folder is a clean 404, not a 500 (finding F-R001-001).
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vault not found")
     except Exception as e:
         db.rollback()
         # Broadcast error event
@@ -17334,6 +17352,11 @@ async def get_file_info(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except (VaultNotFoundError, FolderNotFoundError, FileNotFoundError, ResourceNotFoundError):
+        # A missing vault/folder/file is a clean 404, not a 500 (finding F-R001-001). The catch-all
+        # below would otherwise swallow VaultNotFoundError into a generic 500 before it reached the
+        # global handler that maps it — same fix as the other file-plane endpoints.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
     except HTTPException:
         raise
     except Exception:
@@ -17559,10 +17582,12 @@ async def rename_file(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
         )
-    except FileNotFoundError as e:
+    except (FileNotFoundError, VaultNotFoundError, FolderNotFoundError, ResourceNotFoundError):
+        # A missing file/vault/folder is a clean 404, not a 500 (finding F-R001-001): the catch-all
+        # below would otherwise swallow VaultNotFoundError/FolderNotFoundError into a generic 500.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
+            detail="File not found"
         )
     except PermissionDeniedError as e:
         raise HTTPException(
@@ -17987,6 +18012,10 @@ async def create_folder(
         raise
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except (VaultNotFoundError, FolderNotFoundError, ResourceNotFoundError):
+        # A missing vault/parent-folder is a clean 404, not a 500 (finding F-R001-001).
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vault or folder not found")
     except Exception as e:
         db.rollback()
         raise HTTPException(
@@ -18074,6 +18103,10 @@ async def delete_folder(
     except PermissionDeniedError as e:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except (VaultNotFoundError, FolderNotFoundError, FileNotFoundError, ResourceNotFoundError):
+        # A missing vault/folder is a clean 404, not a 500 (finding F-R001-001).
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vault or folder not found")
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to delete folder: {str(e)}")

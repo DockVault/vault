@@ -20,6 +20,18 @@ def test_missing_vault_is_404_not_500(admin):
     assert admin.patch(f"/vaults/{fake}", json={"name": "x"}).status_code == 404
     assert admin.put(f"/vaults/{fake}/password",
                      json={"password": "New-Strong-Pass-1234"}).status_code == 404
+    # get-file-info + rename had a local `except Exception` catch-all that swallowed VaultNotFoundError
+    # into a 500 before it reached the global 404 mapper (F-R001-001 follow-up); both must 404 too.
+    assert admin.get(f"/vaults/{fake}/files/{uuid.uuid4()}/info").status_code == 404
+    assert admin.put(f"/vaults/{fake}/files/{uuid.uuid4()}/rename",
+                     json={"new_name": "x.txt"}).status_code == 404
+    # Same catch-all pattern on settings / upload / folder create+delete (found by a full file-plane
+    # sweep) — all must 404 on a nonexistent vault, not 500.
+    assert admin.patch(f"/vaults/{fake}/settings", json={"description": "x"}).status_code == 404
+    assert admin.post(f"/vaults/{fake}/files",
+                      files=[("files", ("a.txt", b"x", "text/plain"))]).status_code == 404
+    assert admin.post(f"/vaults/{fake}/folders", json={"name": "f"}).status_code == 404
+    assert admin.post(f"/vaults/{fake}/folders/{uuid.uuid4()}/delete").status_code == 404
 
 
 def test_readonly_member_cannot_open_upload_session(admin, temp_user, temp_user_client):
@@ -54,6 +66,27 @@ def test_account_second_factor_otp_cannot_be_disabled(admin):
                    headers={"X-Second-Factor": step_up_receipt(
                        c, action="account.second_factor", recovery_codes=codes)})
         assert rb.status_code == 400, rb.text
+        # BYPASS regression: a falsy-but-not-False JSON value (0, "", []) must NOT slip the bulk guard.
+        # The items are raw dicts, so an identity `is False` check would let these through yet store
+        # bool(x) == False — flipping the gate off. Each must be refused, on BOTH endpoints.
+        for bad in (0, "", []):
+            # BULK: raw dicts (untyped list), so every falsy value reaches the guard -> 400.
+            rz = c.put("/second-factor/actions",
+                       json={"actions": [{"key": "account.second_factor", "require_otp": bad}]},
+                       headers={"X-Second-Factor": step_up_receipt(
+                           c, action="account.second_factor", recovery_codes=codes)})
+            assert rz.status_code == 400, f"bulk require_otp={bad!r} bypassed the guard: {rz.text}"
+            # SINGLE: typed Optional[bool], so 0 coerces to False and the guard rejects it (400), while
+            # "" / [] fail model validation first (422). Both mean the request is REFUSED and OTP is
+            # left required -- the key property is that neither disables it.
+            rs = c.put("/second-factor/actions/account.second_factor", json={"require_otp": bad},
+                       headers={"X-Second-Factor": step_up_receipt(
+                           c, action="account.second_factor", recovery_codes=codes)})
+            assert rs.status_code in (400, 422), f"single require_otp={bad!r} was not refused: {rs.text}"
+        # After every rejected attempt the EFFECTIVE requirement is still on.
+        acts = c.get("/second-factor/actions").json()["actions"]
+        gate = next(a for a in acts if a["key"] == "account.second_factor")
+        assert gate["require_otp"] is True, gate
         # The guard is specific: a different action can still be turned off.
         ok = c.put("/second-factor/actions/vault.delete", json={"require_otp": False},
                    headers={"X-Second-Factor": step_up_receipt(
