@@ -71,7 +71,8 @@ def test_temp_cred_cap_enforced_for_non_admin(admin):
         assert r1.status_code == 200, r1.text
         made.append(r1.json())
         r2 = c.post("/auth/temp-credentials", json={"note": unique("tccap")})
-        assert r2.status_code == 400, r2.text
+        # 409 Conflict — at the active-credential cap (matches the vault-count cap's status).
+        assert r2.status_code == 409, r2.text
         # A full admin is exempt.
         ra = admin.post("/auth/temp-credentials", json={"note": unique("tccap-admin")})
         assert ra.status_code == 200, ra.text

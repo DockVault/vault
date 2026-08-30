@@ -587,8 +587,11 @@ class AuthService:
                     TemporaryCredential.expires_at > datetime.utcnow(),
                 ).count()
                 if _active_temp >= _max_temp:
+                    # 409 (not 400): the request is well-formed; it conflicts with the current state
+                    # (already at the active-credential cap). Matches the per-user vault-count cap so
+                    # the two resource-count limits answer with the same status.
                     raise HTTPException(
-                        status_code=400,
+                        status_code=status.HTTP_409_CONFLICT,
                         detail=(f"You already have the maximum of {_max_temp} active temporary "
                                 f"credential(s). Revoke one, or ask an administrator to raise the limit."))
 
