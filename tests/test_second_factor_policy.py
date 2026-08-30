@@ -99,10 +99,11 @@ def test_validate_policy_bounds_and_email_lockout_guards():
             pol.validate_policy(email_blob, active_admins_without_email=0, smtp_configured=True)
 
 
-def test_catalog_excludes_unbuilt_routes_and_has_metadata():
+def test_catalog_has_built_routes_and_metadata():
     assert "login" in acts.ACTION_KEYS and "admin.user.manage" in acts.ACTION_KEYS
-    # routes that don't exist yet must NOT be seeded (they'd trip the boot contract)
-    assert "receiver.create" not in acts.ACTION_KEYS
+    # receiver.create is a built, step-up-guarded route (POST /receivers), so it belongs in the
+    # catalog and satisfies the boot contract.
+    assert "receiver.create" in acts.ACTION_KEYS
     assert acts.is_admin_action("admin.settings.write") and not acts.is_admin_action("vault.delete")
     for k in acts.ACTION_KEYS:
         assert k in acts.ACTION_META and acts.ACTION_META[k]["name"]
