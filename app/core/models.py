@@ -1438,6 +1438,58 @@ class NoteLink(Base):
     )
 
 
+class PublicLink(Base):
+    """A PUBLIC, anonymous, tokenized grant to download one FILE or one FOLDER (one level) of a
+    Standard vault -- the file/folder counterpart of NoteLink ("secure send"). Reachable by anyone
+    holding the token (no login), optionally behind a PIN/password. Unlike NoteLink it does NOT snapshot
+    content: it points at the LIVE file/folder and streams it on demand, and its FKs cascade from the
+    target (vault/file/folder), so a link can never outlive what it points at. The effective policy is
+    frozen at creation from the NoteLinkTag floor + the owner's tightening (note_link_policy.
+    resolve_link_policy, reused unchanged) and PERSISTED here, so a later tag edit never changes an
+    existing link. A whole new table, created by create_all (additive; no migration).
+
+    The URL token is stored HASHED (sha256), NEVER in plaintext: the token IS the credential and lives
+    only in the shared URL, so a database leak must not hand an attacker working links. Lookups hash the
+    presented token; the plaintext is shown to the owner exactly once, at creation.
+    """
+    __tablename__ = 'public_links'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    # The tag it was created under (colour/icon on the owner's card). SET NULL so an admin can delete a
+    # tag without destroying links -- the frozen policy below still governs the link.
+    tag_id = Column(UUID(as_uuid=True), ForeignKey('note_link_tags.id', ondelete='SET NULL'), nullable=True)
+
+    # sha256 of the opaque base62 URL token (never the token itself). Unique + indexed for O(1) lookup.
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    token_len = Column(Integer, nullable=False)   # length of the plaintext token (for the policy display)
+
+    # The LIVE target. Cascades from vault/file/folder, so the link dies with what it points at.
+    vault_id = Column(UUID(as_uuid=True), ForeignKey('vaults.id', ondelete='CASCADE'), nullable=False)
+    target_type = Column(String(8), nullable=False)   # 'file' | 'folder'
+    target_file_id = Column(UUID(as_uuid=True), ForeignKey('files.id', ondelete='CASCADE'), nullable=True)
+    target_folder_id = Column(UUID(as_uuid=True), ForeignKey('folders.id', ondelete='CASCADE'), nullable=True)
+
+    # Frozen effective policy (resolved from the tag floor + owner tightening at creation).
+    secret_kind = Column(String(16), nullable=False, default='none')   # none | pin | password
+    password_hash = Column(String(255), nullable=True)                 # Argon2 of the PIN/password
+    expires_at = Column(DateTime, nullable=True)                       # NULL = no expiry
+    max_uses = Column(Integer, nullable=True)                          # NULL = unlimited
+
+    use_count = Column(Integer, nullable=False, default=0)             # successful redemptions (caps at max_uses)
+    download_count = Column(Integer, nullable=False, default=0)        # files streamed (owner card / admin oversight)
+    bytes_served = Column(BigInteger, nullable=False, default=0)
+    revoked = Column(Boolean, nullable=False, default=False)
+
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_used_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index('idx_public_link_owner', 'owner_id'),
+        Index('idx_public_link_vault', 'vault_id'),
+    )
+
+
 # --- Transparent note-content sealing (personal notes + public-link snapshots) ---------------
 # Notes store title/body sealed at rest (a self-describing 'nenc1:' marker + AES-GCM keyed per row);
 # the public note LINK stores a frozen title_snapshot/body_snapshot the same way. Decrypt on
