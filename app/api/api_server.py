@@ -13010,6 +13010,15 @@ async def update_vault_info(
         # fields, so a plaintext name can never overwrite a ZK vault's seal.
         if vault.type == 'zero_knowledge' and ('enc_name' in vault_update or 'enc_description' in vault_update):
             from app.core.security import is_zk_sealed_name
+            # Serialize the seal-epoch read+write against retire_dek_versions (which holds the SAME
+            # Vault-row lock): without this a name (re)sealed at an old epoch could land in retire's
+            # scan->delete window and lose its member key -> a permanently undecryptable vault name.
+            # Mirrors the file/folder rename guard; same lock order (Vault row first) -> no deadlock.
+            # populate_existing() refreshes `vault` in place under the lock so the writes below land on
+            # the freshly-locked row.
+            _locked_vault = (db.query(Vault).populate_existing()
+                             .filter(Vault.id == vault_id).with_for_update().first())
+            _cur_epoch = getattr(_locked_vault, 'dek_version', 1) or 1
             if 'enc_name' in vault_update:
                 _en = vault_update['enc_name']
                 if _en is not None and not is_zk_sealed_name(_en):
@@ -13039,6 +13048,11 @@ async def update_vault_info(
                     if _nkv < 1 or _nkv > 2147483647:
                         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                                             detail="name_key_version out of range.")
+                    # Never pin the name to a future DEK epoch no member holds a key for yet (would
+                    # make the name undecryptable) -- same guard as the file/folder rename path.
+                    if _nkv > _cur_epoch:
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                            detail="Vault name epoch is ahead of the vault's current key epoch.")
                     vault.name_key_version = _nkv
             if 'enc_description' in vault_update:
                 _ed = vault_update['enc_description']

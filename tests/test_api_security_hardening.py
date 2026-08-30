@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-from conftest import ApiClient, BASE_URL, unique
+from conftest import ApiClient, BASE_URL, unique, create_zk_vault, ZK_ENC_NAME_STUB
 from _sf_helpers import enrolled_admin, step_up_receipt
 
 pytestmark = pytest.mark.integration
@@ -81,3 +81,28 @@ def test_no_server_header(admin):
     r = admin.get("/health")
     assert r.status_code == 200
     assert "server" not in {k.lower() for k in r.headers.keys()}, dict(r.headers)
+
+
+def test_zk_vault_reseal_rejects_future_epoch(admin):
+    # A ZK vault-name re-seal (PATCH /vaults/{id}) must not pin the name to a DEK epoch ahead of the
+    # vault's current one (no member holds a key for it yet -> the name would be undecryptable). This
+    # mirrors the guard already on the file/folder rename path.
+    before = admin.get("/settings").json().get("zero_knowledge_enabled", False)
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    zk = create_zk_vault(admin, name=unique("zk"))
+    vid = zk["id"]
+    try:
+        # A fresh vault sits at epoch 1; sealing the name at a far-future epoch is refused as a 400,
+        # not stored (and not a 500 from a downstream DataError).
+        r = admin.patch(f"/vaults/{vid}",
+                        json={"enc_name": ZK_ENC_NAME_STUB, "name_key_version": 999})
+        assert r.status_code == 400, r.text
+        assert "epoch" in r.json().get("detail", "").lower(), r.text
+        # A re-seal at the current epoch (1) is accepted, proving the 400 is the epoch guard and not a
+        # blanket rejection of the re-seal.
+        ok = admin.patch(f"/vaults/{vid}",
+                         json={"enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1})
+        assert ok.status_code == 200, ok.text
+    finally:
+        admin.delete_vault(vid)
+        admin.put("/settings", json={"zero_knowledge_enabled": bool(before)})
