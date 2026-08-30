@@ -4102,31 +4102,46 @@ def _resolve_reset_user(db: Session, identifier: str):
     return u
 
 
+def _mint_reset_link(db: Session, user, base_url: str, *, created_by_id) -> Optional[str]:
+    """Mint a single-use reset token for `user` (invalidating any prior unconsumed one) and return the
+    plaintext reset LINK exactly once. Does NOT email and does NOT require the user to have an email, so
+    an admin can reset an email-less account by copying the link. The token row is identical to the
+    emailed path — same hash-at-rest, same TTL, same single-use / atomic-consume at POST /reset (which
+    also revokes the target's sessions). Returns None only when the reset pepper is unconfigured (no
+    token can be minted). The plaintext is returned to the caller and never logged."""
+    from app.core.password_reset import mint_reset_token, hash_reset_token, pepper_ok
+    from app.core.models import PasswordResetToken
+    pepper = _reset_pepper()
+    if not pepper_ok(pepper):
+        return None
+    _, ttl = _password_reset_policy(db)
+    db.query(PasswordResetToken).filter(
+        PasswordResetToken.user_id == user.id,
+        PasswordResetToken.consumed_at.is_(None)).delete(synchronize_session=False)
+    plaintext, prefix = mint_reset_token()
+    db.add(PasswordResetToken(
+        user_id=user.id, token_prefix=prefix, token_hash=hash_reset_token(plaintext, pepper),
+        expires_at=datetime.utcnow() + timedelta(minutes=ttl), created_by=created_by_id))
+    db.commit()
+    return f"{(base_url or '').rstrip('/')}/?reset={plaintext}"
+
+
 def _mint_and_send_reset(db: Session, user, base_url: str, *, created_by_id) -> bool:
     """Mint a single-use reset token (invalidating any prior unconsumed one), email it through the
     password_reset action with the freshly-minted {{action.link}}, and return whether it was sent.
-    Never raises — the caller (public or admin) must not fail on mail trouble."""
-    from app.core.password_reset import mint_reset_token, hash_reset_token, pepper_ok
-    from app.core.models import PasswordResetToken
+    Never raises — the caller (public or admin) must not fail on mail trouble. Requires an email."""
     from app.core.email_actions import send_action_email
-    pepper = _reset_pepper()
     email = (getattr(user, "email", "") or "").strip()
-    if not pepper_ok(pepper) or not email:
+    if not email:
         return False
-    _, ttl = _password_reset_policy(db)
     try:
-        db.query(PasswordResetToken).filter(
-            PasswordResetToken.user_id == user.id,
-            PasswordResetToken.consumed_at.is_(None)).delete(synchronize_session=False)
-        plaintext, prefix = mint_reset_token()
-        db.add(PasswordResetToken(
-            user_id=user.id, token_prefix=prefix, token_hash=hash_reset_token(plaintext, pepper),
-            expires_at=datetime.utcnow() + timedelta(minutes=ttl), created_by=created_by_id))
-        db.commit()
+        link = _mint_reset_link(db, user, base_url, created_by_id=created_by_id)
     except Exception:
         db.rollback()
         return False
-    link = f"{(base_url or '').rstrip('/')}/?reset={plaintext}"
+    if not link:
+        return False
+    _, ttl = _password_reset_policy(db)
     try:
         return bool(send_action_email(db, "password_reset",
                                       recipient={"email": email, "username": user.username},
@@ -4234,6 +4249,40 @@ async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
     except Exception:  # noqa: BLE001
         pass
     return {"email_sent": bool(sent)}
+
+
+@app.post("/users/{user_id}/reset-link")
+@require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
+async def admin_mint_reset_link(user_id: uuid.UUID, request: Request,
+                                current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Admin action: MINT a password-reset link for a user and return it ONCE for the admin to copy — no
+    email required, so an email-less account can still be reset. The link carries a single-use,
+    hash-at-rest, TTL-bounded token identical to the emailed path; using it (POST /reset) atomically
+    consumes the token and revokes the target's sessions. Interactive-admin only; audited (the target +
+    TTL, never the token). This is a password-reset primitive, not a lockout change, so there is no
+    self-target / last-admin restriction (an admin can already reset/deactivate users they manage)."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage users.")
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not getattr(user, "is_active", True):
+        raise HTTPException(status_code=400,
+                            detail="That account is inactive; reactivate it before issuing a reset link.")
+    link = _mint_reset_link(db, user, _public_base_url(request), created_by_id=current_user.id)
+    if not link:
+        raise HTTPException(status_code=400,
+                            detail="Password reset is not configured on this deployment (LOG_TOKEN_PEPPER is unset).")
+    _, ttl = _password_reset_policy(db)
+    try:
+        # Audit the ACT (who reset whom) — never the token/link, which would defeat single-use secrecy.
+        AuditLogger(db).log_action(action="password_reset_link_minted", status="success", user=current_user,
+                                   ip_address=get_client_ip(request),
+                                   details={"target_user_id": str(user_id), "ttl_minutes": ttl})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"reset_link": link, "expires_in_minutes": ttl, "username": user.username}
 
 
 @app.get("/reset/{token}")

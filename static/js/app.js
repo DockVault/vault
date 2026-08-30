@@ -4979,6 +4979,50 @@ function renderUsersTable() {
     attachUserListeners();
 }
 
+// Show an admin-minted password-reset link ONCE in a copyable overlay. The link is a single-use secret
+// (never logged server-side); this modal is the only place it appears. DOM-built (no innerHTML).
+function _showResetLinkModal(link, username, ttlMinutes) {
+    document.querySelectorAll('.reset-link-overlay').forEach(o => o.remove());
+    const overlay = _el('div', 'reset-link-overlay');
+    overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.5); display:flex; align-items:center; justify-content:center; z-index:10000; padding:16px;';
+    overlay.setAttribute('role', 'dialog'); overlay.setAttribute('aria-modal', 'true'); overlay.setAttribute('aria-label', 'Password reset link');
+
+    const card = _el('div');
+    card.style.cssText = 'background:var(--surface, #fff); color:var(--text, #111); border-radius:12px; max-width:560px; width:100%; padding:20px; box-shadow:0 10px 40px rgba(0,0,0,0.3);';
+    card.addEventListener('click', e => e.stopPropagation());
+
+    card.appendChild(_el('h3', null, 'Password reset link for ' + username));
+    const warn = _el('p', 'text-sm');
+    warn.style.cssText = 'margin:8px 0; color:var(--text-secondary, #64748b);';
+    warn.textContent = 'Copy this link and give it to ' + username + ' over a trusted channel. It is shown only once, '
+        + (ttlMinutes ? ('expires in about ' + ttlMinutes + ' minutes, ') : '') + 'can be used only once, and signs the account out everywhere when used.';
+    card.appendChild(warn);
+
+    const input = _el('input', 'form-control'); input.type = 'text'; input.readOnly = true; input.value = link;
+    input.style.cssText = 'width:100%; font-family:monospace; margin:8px 0;';
+    input.addEventListener('focus', () => input.select());
+    card.appendChild(input);
+
+    const actions = _el('div'); actions.style.cssText = 'display:flex; gap:8px; justify-content:flex-end; margin-top:12px;';
+    const copyBtn = _el('button', 'btn btn-primary', 'Copy link'); copyBtn.type = 'button';
+    copyBtn.addEventListener('click', () => {
+        const done = () => { copyBtn.textContent = '✓ Copied'; setTimeout(() => { copyBtn.textContent = 'Copy link'; }, 2000); };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(link).then(done).catch(() => { input.focus(); input.select(); });
+        } else { input.focus(); input.select(); }
+    });
+    const closeBtn = _el('button', 'btn btn-secondary', 'Close'); closeBtn.type = 'button';
+    closeBtn.addEventListener('click', () => overlay.remove());
+    actions.appendChild(copyBtn); actions.appendChild(closeBtn);
+    card.appendChild(actions);
+
+    overlay.appendChild(card);
+    overlay.addEventListener('click', () => overlay.remove());   // click backdrop to dismiss
+    document.addEventListener('keydown', function esc(e) { if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', esc); } });
+    document.body.appendChild(overlay);
+    input.focus(); input.select();
+}
+
 function renderUserRow(u) {
     const initials = (u.username || '?').substring(0, 2).toUpperCase();
     const groupChips = (u.groups || []).length
@@ -5065,6 +5109,7 @@ function renderUserDetail(u) {
                     : `<button class="btn btn-sm btn-warning lock-user-btn" data-user-id="${u.id}">${iconSvg('lock', 'icon-sm')} Lock</button>`}
                 <button class="btn btn-sm btn-secondary change-password-btn" data-user-id="${u.id}">${iconSvg('key', 'icon-sm')} Change Password</button>
                 ${u.email ? `<button class="btn btn-sm btn-secondary send-reset-link-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('key', 'icon-sm')} Send reset link</button>` : ''}
+                <button class="btn btn-sm btn-secondary copy-reset-link-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('link', 'icon-sm')} Copy reset link</button>
                 ${currentUser.role === 'admin' && u.role !== 'admin' ? `<button class="btn btn-sm btn-secondary manage-perms-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('shield', 'icon-sm')} Permissions</button>` : ''}
                 ${currentUser.role === 'admin' && u.username !== currentUser.username ? `<button class="btn btn-sm btn-warning terminate-user-sessions-btn" data-user-id="${u.id}">${iconSvg('alert-triangle', 'icon-sm')} Terminate Sessions</button>` : ''}
                 ${u.username !== currentUser.username ? `<button class="btn btn-sm btn-danger delete-user-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('trash', 'icon-sm')} Delete</button>` : ''}
@@ -5508,7 +5553,24 @@ function attachUserListeners() {
             } finally { btn.disabled = false; }
         });
     });
-    
+
+    // Copy password-reset link buttons (no email needed — shows the link ONCE to copy).
+    document.querySelectorAll('.copy-reset-link-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const userId = btn.getAttribute('data-user-id');
+            const username = btn.getAttribute('data-username') || 'this user';
+            if (!confirm('Create a one-time password-reset link for ' + username + '?\n\nAnyone with the link can set a new password for this account. It is shown once, expires, and can be used only once; using it signs the account out everywhere.')) return;
+            btn.disabled = true;
+            try {
+                const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/reset-link', { method: 'POST' });
+                if (r && r.reset_link) _showResetLinkModal(r.reset_link, r.username || username, r.expires_in_minutes);
+                else showError('Could not create a reset link.');
+            } catch (e) {
+                showError('Could not create a reset link: ' + (e.message || ''));
+            } finally { btn.disabled = false; }
+        });
+    });
+
     // Lock user buttons
     document.querySelectorAll('.lock-user-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
