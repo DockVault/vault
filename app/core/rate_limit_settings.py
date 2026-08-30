@@ -68,6 +68,11 @@ class RateLimitSpec:
     # Floor applied when clamping the DEPLOYMENT value (not a custom override). Defaults to `minimum`;
     # set 0 only where a deployment 0 is a meaningful setting (lockout_duration 0 = permanent lock).
     deployment_min: Optional[int] = None
+    # Ceiling applied to an ADMIN CUSTOM override (the UI slider), independent of the deployment clamp.
+    # Defaults to `maximum`. Set it lower to bound what an admin may set from the panel without also
+    # clamping a deliberate deployment .env value (R018-INFO-2: cap the login-attempts override at 1000
+    # so a fat-finger can't widen the brute-force window, while the operator's env value is untouched).
+    custom_max: Optional[int] = None
 
 
 # NOTE: `max_login_attempts` and `lockout_duration` keep their LEGACY blob key names (the login
@@ -82,6 +87,7 @@ REGISTRY: tuple[RateLimitSpec, ...] = (
         "The number of wrong-password attempts allowed for one account within the login window.",
         "Triggers on repeated failed logins for the same account; the account is locked when the "
         "count is exceeded.",
+        custom_max=1_000,  # an admin override may not widen the brute-force window past 1000 (INFO-2)
     ),
     RateLimitSpec(
         "rate_limit_login_window_seconds", "rate_limit_login_window_seconds", 10, _WINDOW_MAX,
@@ -241,13 +247,19 @@ def deployment_default(key: str) -> int:
     return max(floor, min(spec.maximum, raw))
 
 
+def _custom_ceiling(spec: RateLimitSpec) -> int:
+    """The upper bound an admin CUSTOM override may take (custom_max, else maximum)."""
+    return spec.custom_max if spec.custom_max is not None else spec.maximum
+
+
 def _valid_custom(value: object, spec: RateLimitSpec) -> Optional[int]:
     """Return the custom override as an int iff it is a real, in-bounds integer; else None (meaning
     'no usable override' -> caller uses the deployment default). Booleans are rejected (bool is an int
-    subclass, and a stored `true` must never coerce to 1)."""
+    subclass, and a stored `true` must never coerce to 1). Bounded by the custom ceiling, which may be
+    tighter than the deployment clamp maximum."""
     if isinstance(value, bool) or not isinstance(value, int):
         return None
-    if spec.minimum <= value <= spec.maximum:
+    if spec.minimum <= value <= _custom_ceiling(spec):
         return value
     return None
 
@@ -280,8 +292,9 @@ def validate_override(key: str, value: object) -> None:
         raise ValueError(f"{key} must be an integer")
     if value == 0:
         return
-    if not (spec.minimum <= value <= spec.maximum):
-        raise ValueError(f"{key} must be {spec.minimum}..{spec.maximum} (or 0 to use the deployment default)")
+    ceiling = _custom_ceiling(spec)
+    if not (spec.minimum <= value <= ceiling):
+        raise ValueError(f"{key} must be {spec.minimum}..{ceiling} (or 0 to use the deployment default)")
 
 
 def describe_all(blob: Optional[Mapping]) -> list[dict]:
@@ -297,7 +310,7 @@ def describe_all(blob: Optional[Mapping]) -> list[dict]:
             "when": spec.when,
             "unit": spec.unit,
             "min": spec.minimum,
-            "max": spec.maximum,
+            "max": _custom_ceiling(spec),
             "deployment": deployment_default(spec.key),
             "custom": custom_value(spec.key, blob),
             "effective": resolve(spec.key, blob),

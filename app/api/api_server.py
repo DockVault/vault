@@ -7004,6 +7004,14 @@ async def update_second_factor_action(
     from app.core.second_factor_actions import ACTION_KEYS
     if key not in ACTION_KEYS:
         raise HTTPException(status_code=404, detail="Unknown second-factor action.")
+    # account.second_factor is the gate that protects the two-factor policy itself. Refuse to disable
+    # its OTP requirement (R018-INFO-1): otherwise turning off this one switch would silently drop the
+    # step-up from every later matrix edit. body.require_otp is Optional[bool], so `is False` fires only
+    # on an explicit false, never on an omitted field.
+    if key == "account.second_factor" and body.require_otp is False:
+        raise HTTPException(status_code=400,
+                            detail="account.second_factor must keep OTP required — it is the gate that "
+                                   "protects the two-factor policy itself.")
     row = db.query(SecondFactorAction).filter(SecondFactorAction.key == key).first()
     if not row:
         row = SecondFactorAction(key=key)
@@ -7045,6 +7053,12 @@ async def update_second_factor_actions_bulk(
     for it in items:
         if not isinstance(it, dict) or it.get("key") not in ACTION_KEYS:
             raise HTTPException(status_code=400, detail="actions contains an unknown or malformed entry.")
+        # R018-INFO-1: refuse to disable OTP on the action that gates the matrix itself (all-or-nothing,
+        # so the whole batch is rejected before anything is written).
+        if it.get("key") == "account.second_factor" and it.get("require_otp") is False:
+            raise HTTPException(status_code=400,
+                                detail="account.second_factor must keep OTP required — it is the gate "
+                                       "that protects the two-factor policy itself.")
     changed = []
     for it in items:
         k = it["key"]
@@ -13070,8 +13084,11 @@ async def update_vault_info(
             "created_at": vault.created_at.isoformat() if vault.created_at else None,
             "updated_at": vault.updated_at.isoformat() if vault.updated_at else None
         }
-        
-    except ResourceNotFoundError as e:
+
+    except (VaultNotFoundError, ResourceNotFoundError) as e:
+        # A missing vault is a clean 404 (finding F-R001-001). VaultNotFoundError subclasses
+        # FileServiceError (not ResourceNotFoundError), so it must be named here or the `except
+        # Exception` below re-wraps it as a 500.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e)
@@ -13154,7 +13171,9 @@ async def change_vault_password(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(e)
         )
-    except ResourceNotFoundError as e:
+    except (VaultNotFoundError, ResourceNotFoundError) as e:
+        # A missing vault is a clean 404 (finding F-R001-001); VaultNotFoundError subclasses
+        # FileServiceError, not ResourceNotFoundError, so it must be named here.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e)
@@ -14300,6 +14319,10 @@ async def list_vault_files(
         )
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except VaultNotFoundError as e:
+        # A missing vault is a clean 404 (finding F-R001-001), not a 500 — the per-route `except
+        # Exception` below would otherwise shadow the global FileServiceError->404 handler.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -15397,6 +15420,13 @@ async def init_chunked_upload(
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+
+    # Require WRITE to OPEN an upload session (finding F-R015-002). get_vault only proves READ, so
+    # without this a read-only member could stream chunks to staging (only /complete refused them). A
+    # whole-vault SHARE does not grant upload (allow_share defaults False). Gating session creation is
+    # enough — a chunk PUT needs a session that only this endpoint mints.
+    if not permission_service.can_access_vault(current_user, vault_id, VaultPermissionEnum.WRITE):
+        raise HTTPException(status_code=403, detail="You do not have write access to this vault.")
 
     if body.total_size <= 0 or body.total_chunks <= 0:
         raise HTTPException(status_code=400, detail="Invalid upload size")
@@ -17046,7 +17076,10 @@ async def download_file(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(e),
         )
-    except FileNotFoundError as e:
+    except (VaultNotFoundError, FolderNotFoundError, FileNotFoundError) as e:
+        # A missing vault / folder / file is a clean 404 (finding F-R001-001). VaultNotFoundError and
+        # FolderNotFoundError are FileServiceError SIBLINGS of FileNotFoundError, so they must be named
+        # here or the `except Exception` below re-wraps them as a 500.
         if burned_share_claim_ids:
             try:
                 permission_service.refund_share_download(burned_share_claim_ids)
@@ -17198,6 +17231,9 @@ async def delete_file(
         raise
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except VaultNotFoundError as e:
+        # A missing vault is a clean 404 (finding F-R001-001), not a 500.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         db.rollback()
         raise HTTPException(
@@ -20053,5 +20089,9 @@ if __name__ == "__main__":
         host=settings.api_host,
         port=settings.api_port,
         log_level=settings.log_level.lower(),
+        # Do not advertise the server software (finding F-R015-008). uvicorn adds its `Server:` header
+        # at the transport layer, below the app, so a response-header middleware cannot strip it — it
+        # has to be turned off here in the server config.
+        server_header=False,
         **ssl_config
     )

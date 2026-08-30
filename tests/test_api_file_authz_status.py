@@ -62,9 +62,10 @@ def test_non_member_read_ops_are_403_not_500(admin, temp_user, temp_user_client)
         admin.delete_vault(vid)
 
 
-def test_readonly_member_chunked_complete_is_403(admin, temp_user, temp_user_client):
-    # A read-only member CAN init a chunked upload + push chunks (those only need READ);
-    # the write-permission denial surfaces at /complete and must be 403, not 500.
+def test_readonly_member_cannot_open_chunked_upload(admin, temp_user, temp_user_client):
+    # A read-only member is refused at OPEN of a chunked upload session (finding F-R015-002): the write
+    # gate now runs when the session is created, so they can't stream chunks to staging at all. (The
+    # older behaviour let them init + chunk and only refused at /complete.)
     v = admin.create_vault()
     vid = v["id"]
     admin.post(f"/vaults/{vid}/permissions", json={"user_id": temp_user["id"], "level": "read"})
@@ -75,11 +76,13 @@ def test_readonly_member_chunked_complete_is_403(admin, temp_user, temp_user_cli
             "total_chunks": 1, "chunk_size": 1024 * 1024,
             "mime_type": "application/octet-stream",
         })
-        assert r.status_code == 200, r.text
-        sid = r.json()["session_id"]
-        assert temp_user_client.put(
-            f"/vaults/{vid}/uploads/{sid}/chunks/0", data=data, headers=_OCTET
-        ).status_code == 200
-        assert temp_user_client.post(f"/vaults/{vid}/uploads/{sid}/complete").status_code == 403
+        assert r.status_code == 403, r.text
+        # The owner (write) opens the same session fine.
+        ro = admin.post(f"/vaults/{vid}/uploads", json={
+            "file_name": "owner-chunked.bin", "total_size": len(data),
+            "total_chunks": 1, "chunk_size": 1024 * 1024,
+            "mime_type": "application/octet-stream",
+        })
+        assert ro.status_code == 200, ro.text
     finally:
         admin.delete_vault(vid)
