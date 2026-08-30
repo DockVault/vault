@@ -1428,8 +1428,11 @@ def _sftp_key_throttled(ip: str, username: str) -> bool:
     in AuthService): a Redis outage must not silently lift the flood / username-enumeration bound on
     key offers, which is exactly what returning "not throttled" here used to do."""
     from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
-    limit = settings.rate_limit_sftp_key_attempts
-    window = settings.rate_limit_login_window_seconds
+    from app.core import rate_limit_settings
+    # Resolved through the rate-limit registry so an admin override applies (bounded + fail-safe to the
+    # deployment default); the SFTP key throttle shares the login window.
+    limit = rate_limit_settings.effective("rate_limit_sftp_key_attempts")
+    window = rate_limit_settings.effective("rate_limit_login_window_seconds")
     try:
         allowed, _, _ = rate_limiter.check_rate_limit(
             _sftp_key_id(ip, username), limit, window, fail_open=False,

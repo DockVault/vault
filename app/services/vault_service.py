@@ -741,8 +741,12 @@ class VaultService:
         if vault.password_hash and (require_password or vault_password):
             rate_key = f"rate_limit:vault:{vault_id}:{user.id}"
             from app.core.models import RoleEnum
-            # Different limits based on role (admins get higher limit)
-            limit = settings.rate_limit_vault_attempts_admin if user.role == RoleEnum.ADMIN else settings.rate_limit_vault_attempts
+            from app.core import rate_limit_settings
+            # Different limits based on role (admins get higher limit); resolved through the rate-limit
+            # registry so an admin override applies (bounded + fail-safe to the deployment default).
+            limit = rate_limit_settings.effective(
+                "rate_limit_vault_attempts_admin" if user.role == RoleEnum.ADMIN
+                else "rate_limit_vault_attempts")
             attempts = redis_client.get(rate_key)
             if attempts and int(attempts) >= limit:
                 raise RateLimitExceededError("Too many vault access attempts. Please try again later.")
@@ -755,7 +759,7 @@ class VaultService:
                 # trade-off (a separate bucket would grant an attacker 2x total guesses).
                 pipe = redis_client.pipeline()
                 pipe.incr(rate_key)
-                pipe.expire(rate_key, settings.rate_limit_vault_window_seconds)
+                pipe.expire(rate_key, rate_limit_settings.effective("rate_limit_vault_window_seconds"))
                 pipe.execute()
 
             if require_password:

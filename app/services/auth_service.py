@@ -25,6 +25,7 @@ from app.core.email_identity import email_in_use, normalize_email, find_user_by_
 from app.core.session_hash_utils import hash_session_token
 from app.core.database import redis_client, get_db_context
 from app.core.config import settings
+from app.core import rate_limit_settings
 
 
 # Precomputed Argon2 hash used to equalize login timing: verifying the supplied password
@@ -772,9 +773,10 @@ class AuthService:
                 # (vault, account) counter get_vault uses, so the mint proof is not an unthrottled
                 # brute-force surface (reachable only by a member, after the pre-check above).
                 _rl_key = f"rate_limit:vault:{plan['vault_id']}:{user_id}"
-                _rl_limit = (settings.rate_limit_vault_attempts_admin
-                             if (minting_user and minting_user.role == RoleEnum.ADMIN)
-                             else settings.rate_limit_vault_attempts)
+                _rl_limit = rate_limit_settings.effective(
+                    "rate_limit_vault_attempts_admin"
+                    if (minting_user and minting_user.role == RoleEnum.ADMIN)
+                    else "rate_limit_vault_attempts")
                 _rl_attempts = redis_client.get(_rl_key)
                 if _rl_attempts and int(_rl_attempts) >= _rl_limit:
                     raise HTTPException(
@@ -786,7 +788,7 @@ class AuthService:
                     # Burn one failed attempt on the shared (vault, account) counter.
                     _pipe = redis_client.pipeline()
                     _pipe.incr(_rl_key)
-                    _pipe.expire(_rl_key, settings.rate_limit_vault_window_seconds)
+                    _pipe.expire(_rl_key, rate_limit_settings.effective("rate_limit_vault_window_seconds"))
                     _pipe.execute()
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
@@ -1219,10 +1221,11 @@ class AuthService:
         """
         from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
 
-        # The admin 'Max Login Attempts' setting overrides the env default when configured.
-        user_limit = self._global_setting("max_login_attempts", settings.rate_limit_login_attempts)
+        # The admin 'Max Login Attempts' / 'Login window' settings override the env defaults when
+        # configured (bounded + fail-safe-to-deployment via the rate-limit registry).
+        user_limit = rate_limit_settings.effective("max_login_attempts")
         ip_limit = user_limit * 2  # 2x threshold for IPs
-        window = settings.rate_limit_login_window_seconds
+        window = rate_limit_settings.effective("rate_limit_login_window_seconds")
 
         try:
             return self._redis_rate_limit(
@@ -1378,11 +1381,11 @@ class AuthService:
             # locked_until=NULL). Do NOT downgrade such a standing lock into an auto-expiring
             # one — only arm a fresh auto-lock when the account is not already permanently
             # locked (regression guard).
-            if user.failed_login_attempts >= self._global_setting(
-                "max_login_attempts", settings.rate_limit_login_attempts
+            if user.failed_login_attempts >= rate_limit_settings.effective(
+                "max_login_attempts"
             ) and not (user.is_locked and user.locked_until is None):
                 user.is_locked = True
-                ttl = self._global_setting("lockout_duration", getattr(settings, 'account_lockout_minutes', 0) or 0)
+                ttl = rate_limit_settings.effective("lockout_duration")
                 user.locked_until = (
                     datetime.utcnow() + timedelta(minutes=ttl) if ttl > 0 else None
                 )

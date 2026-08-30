@@ -2701,35 +2701,27 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Settings payload must be an object")
 
-    for managed_key in ("rate_limit_api_enabled", "rate_limit_api_deployment_defaults"):
+    # Deployment-managed / server-computed rate-limit fields are READ-ONLY: the deployment value comes
+    # from the environment and the API must never write it (a client cannot edit it via a payload key).
+    for managed_key in ("rate_limit_api_enabled", "rate_limit_api_deployment_defaults",
+                        "rate_limit_settings"):
         if managed_key in payload:
             raise HTTPException(
                 status_code=400,
                 detail=f"{managed_key} is managed by the deployment environment",
             )
 
-    from app.core.rate_limiter import (
-        API_RATE_LIMIT_MAX_REQUESTS,
-        API_RATE_LIMIT_MAX_WINDOW_SECONDS,
-    )
-    for category in _RATE_LIMIT_API_CATEGORIES:
-        for key, maximum in (
-            (f"rate_limit_api_{category}", API_RATE_LIMIT_MAX_REQUESTS),
-            (f"rate_limit_api_{category}_window", API_RATE_LIMIT_MAX_WINDOW_SECONDS),
-        ):
-            if key not in payload:
-                continue
-            value = payload[key]
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
-                or value > maximum
-            ):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"{key} must be an integer from 0 to {maximum}",
-                )
+    # Custom rate-limit overrides (general-API buckets + the login / vault / SFTP throttles) share one
+    # uniform bounds check from the registry: an int in [min, max], or the sentinel 0 meaning "clear the
+    # override and use the deployment default". An out-of-range / malformed value is refused here, and
+    # resolution independently fails safe to the deployment default, so a limit can never be turned off.
+    from app.core import rate_limit_settings as _rl_settings
+    for _rl_key in _rl_settings.OVERRIDE_KEYS:
+        if _rl_key in payload:
+            try:
+                _rl_settings.validate_override(_rl_key, payload[_rl_key])
+            except ValueError as _rl_err:
+                raise HTTPException(status_code=400, detail=str(_rl_err))
 
     for bool_key in ("zero_knowledge_enabled", "force_zero_knowledge", "force_no_remember_vault_password",
                      "sharing_enabled"):
@@ -2826,7 +2818,8 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
 
     # Auth limits (0/absent = keep the deployment env default). Enforced at login / token mint.
     # zk_idle_lock_minutes (0 = disabled) is a client-enforced ZK-key idle auto-lock.
-    for int_key in ("max_login_attempts", "lockout_duration", "session_timeout", "zk_idle_lock_minutes"):
+    # (max_login_attempts / lockout_duration are validated with bounds by the rate-limit registry above.)
+    for int_key in ("session_timeout", "zk_idle_lock_minutes"):
         if int_key in payload and payload[int_key] is not None:
             v = payload[int_key]
             if isinstance(v, bool) or not isinstance(v, int) or v < 0:
@@ -2982,6 +2975,11 @@ async def get_settings(
         data.setdefault(key, 0)
     data["rate_limit_api_enabled"] = bool(settings.rate_limit_api_enabled)
     data["rate_limit_api_deployment_defaults"] = _api_rate_limit_deployment_defaults()
+    # Structured view of EVERY overridable rate limit (login / vault / SFTP throttles + the API
+    # buckets): per limit the read-only deployment value, the custom override (or null), the effective
+    # value, bounds, unit and plain-language help. The Settings UI renders exactly this.
+    from app.core import rate_limit_settings as _rl_settings_view
+    data["rate_limit_settings"] = _rl_settings_view.describe_all(_blob)
     # Whether the deployment can send mail — the default sending profile (or the legacy global SMTP
     # config) is usable. The Accounts tab gates email-change verification on this rather than on the
     # now-removed inline SMTP fields.
@@ -3141,6 +3139,11 @@ async def update_settings(
         and any(key in (payload or {}) for key in _RATE_LIMIT_API_SETTING_KEYS)
     ):
         _api_rate_limit_policy_cache.replace(merged)
+    # Drop the login/vault/SFTP throttle-override cache so a just-saved change takes effect immediately
+    # (the general-API buckets have their own cache, replaced just above).
+    from app.core import rate_limit_settings as _rl_settings_write
+    if any(key in (payload or {}) for key in _rl_settings_write.OVERRIDE_KEYS):
+        _rl_settings_write.invalidate_cache()
     try:
         AuditLogger(db).log_action(
             action="settings_updated",

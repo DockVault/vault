@@ -7831,6 +7831,180 @@ async function saveMfaActions() {
     }
 }
 
+// ---- Rate limits (login / lockout / vault-unlock / SFTP / API) --------------------------------
+// Rendered from GET /settings' structured `rate_limit_settings` feed. Each row shows the read-only
+// deployment value and an optional custom override (gated by an "Override" checkbox). Saving sends the
+// custom int for overridden rows and 0 (clear) for the rest — the server bounds + fail-safes every
+// value, so nothing here can turn a limit off. All text is set via textContent (XSS-safe).
+const _RL_GROUP_LABELS = {
+    login: 'Login & lockout',
+    vault: 'Vault unlock',
+    sftp: 'SFTP',
+    api: 'General API',
+};
+const _RL_GROUP_ORDER = ['login', 'vault', 'sftp', 'api'];
+
+function _setRateLimitsDirty(dirty) {
+    const btn = document.getElementById('save-rate-limits-btn');
+    if (btn) btn.disabled = !dirty;
+}
+
+function _rlUpdateEffective(rowEl, row) {
+    const cb = rowEl.querySelector('.rl-override');
+    const input = rowEl.querySelector('.rl-custom');
+    const eff = rowEl.querySelector('.rl-effective-val');
+    let value = row.deployment;
+    if (cb.checked) {
+        const n = parseInt(input.value, 10);
+        if (Number.isInteger(n) && n >= row.min && n <= row.max) value = n;
+    }
+    if (eff) eff.textContent = String(value);
+}
+
+function renderRateLimitSettings(rows, apiEnabled) {
+    const host = document.getElementById('rate-limit-settings');
+    if (!host) return;
+    const saveBtn = document.getElementById('save-rate-limits-btn');
+    if (saveBtn && !saveBtn.dataset.wired) { saveBtn.dataset.wired = '1'; saveBtn.addEventListener('click', saveRateLimits); }
+    host.replaceChildren();
+    _setRateLimitsDirty(false);
+    if (!Array.isArray(rows) || !rows.length) {
+        host.appendChild(_el('p', 'text-secondary text-sm', 'No configurable rate limits.'));
+        return;
+    }
+    const byGroup = {};
+    rows.forEach(r => { (byGroup[r.group] = byGroup[r.group] || []).push(r); });
+    const groups = _RL_GROUP_ORDER.filter(g => byGroup[g]).concat(
+        Object.keys(byGroup).filter(g => !_RL_GROUP_ORDER.includes(g)));
+
+    groups.forEach(group => {
+        const section = _el('div', 'mb-lg');
+        section.appendChild(_el('h4', 'text-sm', _RL_GROUP_LABELS[group] || group)).style.marginBottom = '6px';
+        if (group === 'api') {
+            const note = _el('p', 'text-secondary text-xs',
+                apiEnabled
+                    ? 'Redis-backed request budgets — applied live when saved.'
+                    : 'General API rate limiting is disabled by the deployment; saved values stay inactive until it is enabled.');
+            note.style.marginBottom = '8px';
+            section.appendChild(note);
+        }
+        byGroup[group].forEach(row => section.appendChild(_rlBuildRow(row)));
+        host.appendChild(section);
+    });
+}
+
+function _rlBuildRow(row) {
+    const wrap = _el('div', 'rl-row');
+    wrap.dataset.key = row.key;
+    wrap.style.cssText = 'border:1px solid var(--border, #e5e7eb); border-radius:8px; padding:10px 12px; margin-bottom:8px;';
+
+    // Header: label (+unit) and an info toggle.
+    const head = _el('div'); head.style.cssText = 'display:flex; align-items:center; gap:8px;';
+    const title = _el('strong', null, row.label); title.style.flex = '1';
+    head.appendChild(title);
+    head.appendChild(_el('span', 'text-secondary text-xs', row.unit));
+    const info = _el('button', null, 'ⓘ');
+    info.type = 'button'; info.setAttribute('aria-label', 'What is "' + row.label + '"?');
+    info.setAttribute('aria-expanded', 'false');
+    info.style.cssText = 'cursor:pointer; border:1px solid var(--border, #cbd5e1); background:transparent; color:var(--text-secondary, #64748b); border-radius:50%; width:22px; height:22px; line-height:1; padding:0; font-size:13px;';
+    head.appendChild(info);
+    wrap.appendChild(head);
+
+    // Info panel (hidden until toggled): what it is + when it triggers.
+    const infoPanel = _el('div', 'text-secondary text-sm');
+    infoPanel.style.cssText = 'margin:6px 0; padding:8px; border-radius:6px; background:var(--surface-2, #f8fafc);';
+    infoPanel.hidden = true;
+    infoPanel.appendChild(_el('div', null, row.description));
+    const whenLine = _el('div', null); whenLine.style.marginTop = '4px';
+    whenLine.appendChild(_el('strong', null, 'When: '));
+    whenLine.appendChild(document.createTextNode(row.when));
+    infoPanel.appendChild(whenLine);
+    wrap.appendChild(infoPanel);
+    info.addEventListener('click', () => {
+        infoPanel.hidden = !infoPanel.hidden;
+        info.setAttribute('aria-expanded', infoPanel.hidden ? 'false' : 'true');
+    });
+
+    // Controls: deployment (read-only) · Override checkbox · custom input · effective.
+    const controls = _el('div');
+    controls.style.cssText = 'display:flex; flex-wrap:wrap; align-items:center; gap:14px; margin-top:6px;';
+
+    const dep = _el('div', 'text-sm');
+    dep.appendChild(_el('span', 'text-secondary', 'Deployment: '));
+    const depVal = _el('strong', 'rl-deployment-val', String(row.deployment)); depVal.style.fontVariantNumeric = 'tabular-nums';
+    dep.appendChild(depVal);
+    dep.title = 'Set by the environment / .env — read-only here.';
+    controls.appendChild(dep);
+
+    const ovLabel = _el('label', 'flex items-center gap-sm'); ovLabel.style.cssText = 'display:flex; align-items:center; gap:6px;';
+    const ov = _el('input'); ov.type = 'checkbox'; ov.className = 'rl-override'; ov.checked = (row.custom != null);
+    ov.setAttribute('aria-label', 'Override ' + row.label);
+    ovLabel.appendChild(ov);
+    ovLabel.appendChild(_el('span', 'text-sm', 'Override'));
+    controls.appendChild(ovLabel);
+
+    const custom = _el('input'); custom.type = 'number'; custom.className = 'rl-custom form-control';
+    custom.min = String(row.min); custom.max = String(row.max); custom.step = '1';
+    custom.style.cssText = 'width:130px;';
+    custom.setAttribute('aria-label', 'Custom ' + row.label + ' (' + row.min + '–' + row.max + ')');
+    custom.value = (row.custom != null) ? String(row.custom) : '';
+    custom.placeholder = row.min + '–' + row.max;
+    custom.disabled = !ov.checked;
+    controls.appendChild(custom);
+
+    const eff = _el('div', 'text-sm text-secondary');
+    eff.appendChild(document.createTextNode('Effective: '));
+    const effVal = _el('strong', 'rl-effective-val', String(row.effective)); effVal.style.color = 'var(--text, inherit)';
+    eff.appendChild(effVal);
+    controls.appendChild(eff);
+
+    wrap.appendChild(controls);
+
+    ov.addEventListener('change', () => {
+        custom.disabled = !ov.checked;
+        if (ov.checked && !custom.value) custom.value = String(row.deployment);
+        _rlUpdateEffective(wrap, row);
+        _setRateLimitsDirty(true);
+    });
+    custom.addEventListener('input', () => { _rlUpdateEffective(wrap, row); _setRateLimitsDirty(true); });
+
+    return wrap;
+}
+
+async function saveRateLimits() {
+    const host = document.getElementById('rate-limit-settings');
+    const btn = document.getElementById('save-rate-limits-btn');
+    const msgId = 'rate-limit-msg';
+    document.getElementById(msgId).style.display = 'none';
+    if (!host) return;
+    const payload = {};
+    for (const rowEl of host.querySelectorAll('.rl-row')) {
+        const key = rowEl.dataset.key;
+        const ov = rowEl.querySelector('.rl-override');
+        const input = rowEl.querySelector('.rl-custom');
+        if (!ov.checked) { payload[key] = 0; continue; }   // untick = clear override -> deployment
+        const n = parseInt(input.value, 10);
+        const min = parseInt(input.min, 10), max = parseInt(input.max, 10);
+        if (!Number.isInteger(n) || n < min || n > max) {
+            input.focus();
+            _mfaMsg(msgId, 'alert-error', 'Enter a whole number between ' + min + ' and ' + max + ' for the overridden limits (or untick Override to use the deployment value).');
+            return;
+        }
+        payload[key] = n;
+    }
+    if (btn) btn.disabled = true;
+    try {
+        await apiRequest('/settings', { method: 'PUT', body: JSON.stringify(payload) });
+        // Re-render from the server truth so deployment/custom/effective are all authoritative.
+        const fresh = await apiRequest('/settings', { silent: true });
+        renderRateLimitSettings((fresh && fresh.rate_limit_settings) || [], !!(fresh && fresh.rate_limit_api_enabled));
+        _mfaMsg(msgId, 'alert-success', 'Rate limits saved.');
+    } catch (e) {
+        if (btn) btn.disabled = false;   // keep edits + Save enabled so they can retry
+        _mfaMsg(msgId, 'alert-error', (e && e.message) || 'Could not save — your changes were not applied.');
+    }
+}
+
 async function loadSettings() {
     try {
         const settings = await apiRequest('/settings', { silent: true });
@@ -7893,36 +8067,10 @@ async function loadSettings() {
         // Changes" then PERSISTED 5, dropping an operator who set RATE_LIMIT_LOGIN_ATTEMPTS=50 in .env
         // back to 5 without touching a field. Same footgun as the old `|| 1` share lifetime.
         document.getElementById('setting-session-timeout').value = (settings.session_timeout > 0) ? settings.session_timeout : '';
-        document.getElementById('setting-max-login-attempts').value = (settings.max_login_attempts > 0) ? settings.max_login_attempts : '';
-        document.getElementById('setting-lockout-duration').value = (settings.lockout_duration > 0) ? settings.lockout_duration : '';
-        const apiRateDefaults = settings.rate_limit_api_deployment_defaults || {};
-        const apiRateFields = [
-            ['rate_limit_api_default', 'setting-rate-limit-api-default'],
-            ['rate_limit_api_default_window', 'setting-rate-limit-api-default-window'],
-            ['rate_limit_api_auth', 'setting-rate-limit-api-auth'],
-            ['rate_limit_api_auth_window', 'setting-rate-limit-api-auth-window'],
-            ['rate_limit_api_upload', 'setting-rate-limit-api-upload'],
-            ['rate_limit_api_upload_window', 'setting-rate-limit-api-upload-window'],
-            ['rate_limit_api_upload_chunk', 'setting-rate-limit-api-upload-chunk'],
-            ['rate_limit_api_upload_chunk_window', 'setting-rate-limit-api-upload-chunk-window'],
-            ['rate_limit_api_download', 'setting-rate-limit-api-download'],
-            ['rate_limit_api_download_window', 'setting-rate-limit-api-download-window'],
-            ['rate_limit_api_poll', 'setting-rate-limit-api-poll'],
-            ['rate_limit_api_poll_window', 'setting-rate-limit-api-poll-window'],
-        ];
-        for (const [key, id] of apiRateFields) {
-            const el = document.getElementById(id);
-            if (!el) continue;
-            el.value = (settings[key] > 0) ? settings[key] : '';
-            if (apiRateDefaults[key] > 0) el.placeholder = `Deployment default: ${apiRateDefaults[key]}`;
-        }
-        const apiRateStatus = document.getElementById('setting-rate-limit-api-status');
-        if (apiRateStatus) {
-            apiRateStatus.textContent = settings.rate_limit_api_enabled
-                ? 'General API rate limiting is enabled by the deployment; saved changes apply live.'
-                : 'General API rate limiting is disabled by the deployment; saved values remain inactive until an operator enables it.';
-        }
-        
+        // Every rate limit (login / lockout / vault-unlock / SFTP / API) renders from the structured
+        // rate_limit_settings feed: a read-only deployment value + an optional custom override.
+        renderRateLimitSettings(settings.rate_limit_settings || [], !!settings.rate_limit_api_enabled);
+
         // Storage
         // Show the actual stored quota, or BLANK when unset/0 (which the backend treats as
         // unlimited) — don't render 10/100 as if a limit were enforced.
@@ -8040,21 +8188,9 @@ async function saveAllSettings() {
             // Blank -> 0 (keep the deployment's env value); the backend ignores 0. NEVER substitute
             // the shipped default here — that is what silently overrode a configured .env limit.
             session_timeout: parseInt(document.getElementById('setting-session-timeout').value) || 0,
-            max_login_attempts: parseInt(document.getElementById('setting-max-login-attempts').value) || 0,
-            lockout_duration: parseInt(document.getElementById('setting-lockout-duration').value) || 0,
-            rate_limit_api_default: parseInt(document.getElementById('setting-rate-limit-api-default').value) || 0,
-            rate_limit_api_default_window: parseInt(document.getElementById('setting-rate-limit-api-default-window').value) || 0,
-            rate_limit_api_auth: parseInt(document.getElementById('setting-rate-limit-api-auth').value) || 0,
-            rate_limit_api_auth_window: parseInt(document.getElementById('setting-rate-limit-api-auth-window').value) || 0,
-            rate_limit_api_upload: parseInt(document.getElementById('setting-rate-limit-api-upload').value) || 0,
-            rate_limit_api_upload_window: parseInt(document.getElementById('setting-rate-limit-api-upload-window').value) || 0,
-            rate_limit_api_upload_chunk: parseInt(document.getElementById('setting-rate-limit-api-upload-chunk').value) || 0,
-            rate_limit_api_upload_chunk_window: parseInt(document.getElementById('setting-rate-limit-api-upload-chunk-window').value) || 0,
-            rate_limit_api_download: parseInt(document.getElementById('setting-rate-limit-api-download').value) || 0,
-            rate_limit_api_download_window: parseInt(document.getElementById('setting-rate-limit-api-download-window').value) || 0,
-            rate_limit_api_poll: parseInt(document.getElementById('setting-rate-limit-api-poll').value) || 0,
-            rate_limit_api_poll_window: parseInt(document.getElementById('setting-rate-limit-api-poll-window').value) || 0,
-            
+            // Rate limits (login / lockout / vault-unlock / SFTP / API) are saved by their own
+            // "Save rate limits" button (see saveRateLimits) — not bundled into this whole-page save.
+
             // Storage
             // Blank -> 0 (unlimited); the backend enforces a positive value and ignores 0.
             default_user_quota: parseInt(document.getElementById('setting-default-quota').value) || 0,

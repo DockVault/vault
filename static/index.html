@@ -1591,75 +1591,7 @@
                                     <input type="number" id="setting-session-timeout" class="form-control" placeholder="Deployment default" min="5" max="1440">
                                     <small class="text-secondary">Overrides <code>JWT_ACCESS_TOKEN_EXPIRE_MINUTES</code>. <strong>Blank = use the deployment's value.</strong></small>
                                 </div>
-                                <div class="form-group">
-                                    <label for="setting-max-login-attempts">Max Login Attempts</label>
-                                    <input type="number" id="setting-max-login-attempts" class="form-control" placeholder="Deployment default" min="1" max="10000">
-                                    <small class="text-secondary">Failed logins per username per window (the per-IP limit is twice this). Overrides <code>RATE_LIMIT_LOGIN_ATTEMPTS</code>. <strong>Blank = use the deployment's value.</strong></small>
-                                </div>
-                                <div class="form-group">
-                                    <label for="setting-lockout-duration">Account Lockout Duration (minutes)</label>
-                                    <input type="number" id="setting-lockout-duration" class="form-control" placeholder="Deployment default" min="1" max="1440">
-                                    <small class="text-secondary">Overrides <code>ACCOUNT_LOCKOUT_MINUTES</code>. <strong>Blank = use the deployment's value.</strong></small>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="card mt-lg">
-                            <div class="card-header">
-                                <h3>General API Rate Limits</h3>
-                            </div>
-                            <div class="p-lg">
-                                <p id="setting-rate-limit-api-status" class="text-secondary mb-md"></p>
-                                <p class="text-secondary text-sm mb-md">These Redis-backed budgets are separate from the dedicated login, vault-unlock, and SFTP security throttles. Enter 0 or leave blank to use the deployment value.</p>
-                                <div class="grid grid-cols-2 gap-md">
-                                    <div class="form-group">
-                                        <label for="setting-rate-limit-api-default">Default requests</label>
-                                        <input type="number" id="setting-rate-limit-api-default" class="form-control" min="0" max="1000000">
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="setting-rate-limit-api-default-window">Default window (seconds)</label>
-                                        <input type="number" id="setting-rate-limit-api-default-window" class="form-control" min="0" max="86400">
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="setting-rate-limit-api-auth">Authentication requests</label>
-                                        <input type="number" id="setting-rate-limit-api-auth" class="form-control" min="0" max="1000000">
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="setting-rate-limit-api-auth-window">Authentication window (seconds)</label>
-                                        <input type="number" id="setting-rate-limit-api-auth-window" class="form-control" min="0" max="86400">
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="setting-rate-limit-api-upload">Upload requests</label>
-                                        <input type="number" id="setting-rate-limit-api-upload" class="form-control" min="0" max="1000000">
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="setting-rate-limit-api-upload-window">Upload window (seconds)</label>
-                                        <input type="number" id="setting-rate-limit-api-upload-window" class="form-control" min="0" max="86400">
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="setting-rate-limit-api-upload-chunk">Upload chunk requests</label>
-                                        <input type="number" id="setting-rate-limit-api-upload-chunk" class="form-control" min="0" max="1000000">
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="setting-rate-limit-api-upload-chunk-window">Upload chunk window (seconds)</label>
-                                        <input type="number" id="setting-rate-limit-api-upload-chunk-window" class="form-control" min="0" max="86400">
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="setting-rate-limit-api-download">Download requests</label>
-                                        <input type="number" id="setting-rate-limit-api-download" class="form-control" min="0" max="1000000">
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="setting-rate-limit-api-download-window">Download window (seconds)</label>
-                                        <input type="number" id="setting-rate-limit-api-download-window" class="form-control" min="0" max="86400">
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="setting-rate-limit-api-poll">Poll requests (security events, notifications)</label>
-                                        <input type="number" id="setting-rate-limit-api-poll" class="form-control" min="0" max="1000000">
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="setting-rate-limit-api-poll-window">Poll window (seconds)</label>
-                                        <input type="number" id="setting-rate-limit-api-poll-window" class="form-control" min="0" max="86400">
-                                    </div>
-                                </div>
+                                <p class="text-secondary text-sm" style="margin-top:4px;">Login, lockout, vault-unlock, SFTP and API rate limits are configured in <strong>Rate limits</strong> at the bottom of this tab.</p>
                             </div>
                         </div>
 
@@ -1709,6 +1641,19 @@
                                 <div id="mfa-actions-table"></div>
                                 <button type="button" id="save-mfa-actions-btn" class="btn btn-primary mt-md" disabled>Save requirements</button>
                                 <small class="text-secondary" style="display:block; margin-top:8px;">Toggle the options above, then save once — you'll confirm your second factor a single time.</small>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header">
+                                <h3>Rate limits</h3>
+                            </div>
+                            <div class="p-lg">
+                                <p class="text-secondary text-sm mb-md">Each limit shows the read-only <strong>deployment</strong> value (from the environment / <code>.env</code>) and an optional <strong>custom</strong> value that overrides it. Tick <em>Override</em> to edit a custom value; untick it to fall back to the deployment value. Use the <span aria-hidden="true">ⓘ</span> button to see what a limit does and when it triggers. A blank or out-of-range custom value always falls back to the deployment default — a limit can never be turned off here.</p>
+                                <div id="rate-limit-settings" aria-live="polite"></div>
+                                <div id="rate-limit-msg" class="alert mt-sm" role="status" style="display:none;"></div>
+                                <button type="button" id="save-rate-limits-btn" class="btn btn-primary mt-md" disabled>Save rate limits</button>
+                                <small class="text-secondary" style="display:block; margin-top:8px;">Editing a rate limit is a security-control change; it may prompt you to confirm your second factor.</small>
                             </div>
                         </div>
                     </div>
