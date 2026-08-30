@@ -40,9 +40,17 @@ def test_file_links_toggle_persists(page: Page, admin, admin_creds, restore_file
     # The Save-All button is disabled until settings finish loading; wait so an async load doesn't
     # reset the box after we check it (and so the click isn't swallowed).
     expect(page.locator("#save-all-settings-btn")).to_be_enabled(timeout=10000)
+
+    # Prove the key round-trips in BOTH directions (a False-baseline first, so a broken save wiring
+    # can't pass on already-True state).
+    page.set_checked("#setting-public-file-links-enabled", False)
+    page.click("#save-all-settings-btn")
+    page.wait_for_timeout(1200)
+    assert admin.get("/settings").json().get("public_file_links_enabled", False) is False
+
     page.set_checked("#setting-public-file-links-enabled", True)
     page.click("#save-all-settings-btn")
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(1200)
     assert admin.get("/settings").json().get("public_file_links_enabled") is True
 
 

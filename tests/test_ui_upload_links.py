@@ -90,12 +90,80 @@ def test_nav_and_create_modal_when_enabled(page: Page, admin, admin_creds):
         expect(nav).to_be_visible(timeout=10000)
         nav.click()
         expect(page.locator("#uploadlinks-section")).to_be_visible()
-        # Open the create modal -> tag dropdown is populated + total-budget defaulted from the cap.
+        # Open the create modal -> a real tag reaches the dropdown, so Create is ENABLED (it is disabled
+        # only in the no-usable-tag placeholder path). Selecting OUR tag defaults the budget to its cap.
         page.click("#receiver-new-btn")
         expect(page.locator("#receiver-create-modal")).to_be_visible()
-        # (<option>s are never "visible" to Playwright until the select is opened; assert on count.)
-        assert page.locator("#rc-tag").evaluate("el => el.options.length") >= 1
-        # The total-budget field is pre-filled from a tag's cap (each seeded/created tag caps it here).
-        assert (page.locator("#rc-max-total-mb").input_value() or "").strip() != ""
+        expect(page.locator("#rc-create")).to_be_enabled()
+        expect(page.locator("#rc-tag option", has_text=tag_name)).to_have_count(1)
+        page.select_option("#rc-tag", label=tag_name)
+        expect(page.locator("#rc-max-total-mb")).to_have_value("100")  # from max_total_bytes_cap 100 MB
+    finally:
+        admin.put("/settings", json={"public_receivers_enabled": False})
+
+
+def test_create_payload_converts_mb_to_bytes(page: Page, admin, admin_creds):
+    # The most error-prone new logic: MB inputs -> bytes in the POST body. Intercept the POST so no real
+    # receiver is created (there is NO DELETE /receivers to clean one up).
+    import json as _json
+    admin.put("/settings", json={"public_receivers_enabled": True})
+    tag_name = unique("Payload")
+    admin.post("/receiver-tags", json={"name": tag_name, "min_token_len": 10, "auto_enroll_new_users": True, "is_active": True})
+    try:
+        _login(page, admin_creds["username"], admin_creds["password"])
+        expect(page.locator("#nav-uploadlinks")).to_be_visible(timeout=10000)
+        page.locator("#nav-uploadlinks").click()
+        expect(page.locator("#uploadlinks-section")).to_be_visible()
+
+        captured = {}
+
+        def _handle(route):
+            req = route.request
+            if req.method == "POST":
+                captured["body"] = _json.loads(req.post_data or "{}")
+                route.fulfill(status=200, content_type="application/json", body='{"token":"tk","url_path":"/u/tk"}')
+            else:
+                route.continue_()
+
+        page.route("**/receivers", _handle)
+        try:
+            page.click("#receiver-new-btn")
+            expect(page.locator("#receiver-create-modal")).to_be_visible()
+            page.select_option("#rc-tag", label=tag_name)
+            page.fill("#rc-max-file-mb", "10")
+            page.fill("#rc-max-total-mb", "100")
+            page.click("#rc-create")
+            page.wait_for_timeout(1000)
+            body = captured.get("body")
+            assert body, "POST /receivers was never sent"
+            assert body["max_total_bytes"] == 100 * _MB, body
+            assert body["max_file_bytes"] == 10 * _MB, body
+            assert body.get("tag_id")
+        finally:
+            page.unroute("**/receivers")
+    finally:
+        admin.put("/settings", json={"public_receivers_enabled": False})
+
+
+def test_create_requires_total_budget(page: Page, admin, admin_creds):
+    # Clearing the required total budget is refused client-side (no POST is sent).
+    admin.put("/settings", json={"public_receivers_enabled": True})
+    tag_name = unique("NoBudget")
+    admin.post("/receiver-tags", json={"name": tag_name, "min_token_len": 10, "auto_enroll_new_users": True, "is_active": True})
+    try:
+        _login(page, admin_creds["username"], admin_creds["password"])
+        expect(page.locator("#nav-uploadlinks")).to_be_visible(timeout=10000)
+        page.locator("#nav-uploadlinks").click()
+        expect(page.locator("#uploadlinks-section")).to_be_visible()
+        page.click("#receiver-new-btn")
+        expect(page.locator("#receiver-create-modal")).to_be_visible()
+        page.select_option("#rc-tag", label=tag_name)
+        page.fill("#rc-max-total-mb", "")  # clear the required budget
+        page.click("#rc-create")
+        err = page.locator("#rc-error")
+        expect(err).to_be_visible()
+        expect(err).to_contain_text("budget")
+        # The form (not the "link ready" result) is still showing — nothing was created.
+        expect(page.locator("#rc-result")).to_be_hidden()
     finally:
         admin.put("/settings", json={"public_receivers_enabled": False})
