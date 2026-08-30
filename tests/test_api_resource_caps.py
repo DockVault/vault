@@ -88,6 +88,46 @@ def test_temp_cred_cap_enforced_for_non_admin(admin):
         admin.delete_user(u["id"])
 
 
+def test_temp_cred_cap_caps_non_admin_delegated_child(admin):
+    # Symmetric to the admin-exemption test: a NON-admin account is capped for delegated child mints
+    # too. The cap count includes children (same owning user_id) AND a non-admin never reaches the
+    # exempt branch, so a delegated child on a non-admin account already at the cap is refused (409).
+    # This pins the load-bearing invariant that delegation cannot amplify a non-admin past the cap.
+    before = admin.get("/settings").json()
+    admin.put("/settings", json={"max_temp_creds_per_user": 1})
+    u, c = _user_client(admin)
+    vid = c.create_vault(name=unique("tcndel"))["id"]
+    made = []
+    try:
+        pcaps = ["vault.see_info"]
+        pscope = {"v": 1, "pages": ["vaults", "temp_creds"], "caps": [], "vault_caps_default": pcaps,
+                  "temp": {"view": True, "create": True, "invalidate": True, "clear": True,
+                           "delegate": True}}
+        # The non-admin's first (direct) mint takes it to the cap of 1.
+        parent = c.post("/auth/temp-credentials", json={
+            "validity_minutes": 60, "scope": pscope, "vault_access_mode": "selected",
+            "selected_vaults": [{"vault_id": vid, "caps": pcaps}]})
+        assert parent.status_code == 200, parent.text
+        made.append(parent.json())
+        pc = c.clone_anonymous()
+        pc.login(parent.json()["temp_username"], parent.json()["credential"])
+        cscope = {"v": 1, "pages": ["vaults"], "caps": [], "vault_caps_default": pcaps, "temp": {}}
+        # Delegated child on the non-admin account, already at the cap -> refused (409), NOT exempt.
+        child = pc.post("/auth/temp-credentials", json={
+            "validity_minutes": 30, "scope": cscope, "vault_access_mode": "selected",
+            "selected_vaults": [{"vault_id": vid, "caps": pcaps}]})
+        assert child.status_code == 409, child.text
+    finally:
+        for cred in made:
+            try:
+                c.post(f"/temp-creds/{cred['temp_username']}/delete")
+            except Exception:
+                pass
+        admin.put("/settings", json={
+            "max_temp_creds_per_user": before.get("max_temp_creds_per_user", 10)})
+        admin.delete_user(u["id"])
+
+
 def test_temp_cred_cap_exempts_admin_delegated_child(admin):
     # An admin ACCOUNT is exempt from the temp-cred cap whether it mints directly OR through a
     # delegated child temp session (the child carries the same admin user_id). Regression: the cap
