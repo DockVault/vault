@@ -7706,10 +7706,116 @@ function collectAccountsPolicy(settings) {
     if (!Number.isNaN(prTtl)) settings.password_reset_ttl_minutes = prTtl;
 }
 
+// ============================================================================
+// ADMIN: MFA policy + step-up action matrix (Security settings tab)
+// ============================================================================
+// Saves go through apiRequest, which surfaces the step-up modal because these endpoints are
+// account.second_factor-gated. Kept SEPARATE from the general settings Save so an ordinary settings
+// save is never OTP-gated.
+
+function _mfaSftpWarningText(policy) {
+    return (policy === 'temp_credential_only')
+        ? 'MFA users must connect over SFTP through a temporary credential — direct password/key SFTP is refused.'
+        : 'With "Allow", SFTP stays single-factor: anyone who knows the account password (or holds an SSH key) can read and write Standard vaults over SFTP, even for MFA-enabled users.';
+}
+
+function loadMfaPolicy(settings) {
+    const mode = document.getElementById('setting-mfa-mode');
+    const sftp = document.getElementById('setting-mfa-sftp-policy');
+    const ttl = document.getElementById('setting-mfa-email-ttl');
+    const warn = document.getElementById('setting-mfa-sftp-warning');
+    if (mode) mode.value = (settings.mfa_mode === 'required') ? 'required' : 'optional';
+    if (sftp) sftp.value = (settings.mfa_sftp_policy === 'temp_credential_only') ? 'temp_credential_only' : 'allow';
+    if (ttl) ttl.value = settings.mfa_email_code_ttl_minutes || 5;
+    if (warn && sftp) warn.textContent = _mfaSftpWarningText(sftp.value);
+    if (sftp && !sftp.dataset.wired) {
+        sftp.dataset.wired = '1';
+        sftp.addEventListener('change', () => { if (warn) warn.textContent = _mfaSftpWarningText(sftp.value); });
+    }
+    const btn = document.getElementById('save-mfa-policy-btn');
+    if (btn && !btn.dataset.wired) { btn.dataset.wired = '1'; btn.addEventListener('click', saveMfaPolicy); }
+}
+
+function _mfaMsg(id, cls, text) {
+    const m = document.getElementById(id);
+    if (m) { m.className = 'alert ' + cls + ' mt-sm'; m.textContent = text; m.style.display = 'block'; }
+}
+
+async function saveMfaPolicy() {
+    document.getElementById('mfa-policy-msg').style.display = 'none';
+    const body = {
+        mfa_mode: document.getElementById('setting-mfa-mode').value,
+        mfa_sftp_policy: document.getElementById('setting-mfa-sftp-policy').value,
+    };
+    const ttl = parseInt(document.getElementById('setting-mfa-email-ttl').value, 10);
+    if (!isNaN(ttl)) body.mfa_email_code_ttl_minutes = ttl;
+    try {
+        await apiRequest('/settings', { method: 'PUT', body: JSON.stringify(body) });
+        _mfaMsg('mfa-policy-msg', 'alert-success', 'MFA policy saved.');
+    } catch (e) {
+        _mfaMsg('mfa-policy-msg', 'alert-error', (e && e.message) || 'Could not save the MFA policy.');
+    }
+}
+
+async function loadMfaActions() {
+    const table = document.getElementById('mfa-actions-table');
+    if (!table) return;
+    table.replaceChildren(_el('div', 'spinner'));
+    let data;
+    try { data = await apiRequest('/second-factor/actions', { silent: true }); }
+    catch (_) { table.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load the action list.')); return; }
+    renderMfaActions((data && data.actions) || []);
+}
+
+function renderMfaActions(actions) {
+    const table = document.getElementById('mfa-actions-table');
+    if (!table) return;
+    table.replaceChildren();
+    const head = _el('div', 'flex gap-sm text-tertiary text-sm mb-xs');
+    const hName = _el('div', null, 'Action'); hName.style.flex = '1';
+    const hOtp = _el('div', null, 'Require OTP'); hOtp.style.width = '110px'; hOtp.style.textAlign = 'center';
+    const hPw = _el('div', null, 'Require password'); hPw.style.width = '140px'; hPw.style.textAlign = 'center';
+    head.appendChild(hName); head.appendChild(hOtp); head.appendChild(hPw);
+    table.appendChild(head);
+    (actions || []).forEach(a => {
+        const row = _el('div', 'flex gap-sm items-center');
+        row.style.padding = '6px 0'; row.style.borderTop = '1px solid var(--border, #e5e7eb)';
+        const name = _el('div', 'text-sm', a.name || a.key); name.style.flex = '1';
+        const otpWrap = _el('div'); otpWrap.style.width = '110px'; otpWrap.style.textAlign = 'center';
+        const pwWrap = _el('div'); pwWrap.style.width = '140px'; pwWrap.style.textAlign = 'center';
+        const otp = _el('input'); otp.type = 'checkbox'; otp.checked = !!a.require_otp; otp.setAttribute('aria-label', 'Require OTP for ' + (a.name || a.key));
+        const pw = _el('input'); pw.type = 'checkbox'; pw.checked = !!a.require_password; pw.setAttribute('aria-label', 'Require password for ' + (a.name || a.key));
+        otp.addEventListener('change', () => toggleMfaAction(a, 'require_otp', otp));
+        pw.addEventListener('change', () => toggleMfaAction(a, 'require_password', pw));
+        otpWrap.appendChild(otp); pwWrap.appendChild(pw);
+        row.appendChild(name); row.appendChild(otpWrap); row.appendChild(pwWrap);
+        table.appendChild(row);
+    });
+}
+
+async function toggleMfaAction(a, field, input) {
+    document.getElementById('mfa-actions-msg').style.display = 'none';
+    const prev = !!a[field];
+    const patch = {}; patch[field] = input.checked;
+    input.disabled = true;
+    try {
+        await apiRequest('/second-factor/actions/' + encodeURIComponent(a.key), { method: 'PUT', body: JSON.stringify(patch) });
+        a[field] = input.checked;   // keep local state accurate for the next toggle
+        input.disabled = false;
+        _mfaMsg('mfa-actions-msg', 'alert-success', 'Updated “' + (a.name || a.key) + '”.');
+    } catch (e) {
+        input.checked = prev;       // cancelled step-up / failure: revert
+        input.disabled = false;
+        _mfaMsg('mfa-actions-msg', 'alert-error', (e && e.message) || 'Could not update — your change was reverted.');
+    }
+}
+
 async function loadSettings() {
     try {
         const settings = await apiRequest('/settings', { silent: true });
         currentSettings = settings;
+        loadMfaPolicy(settings);   // populate the MFA policy card
+        loadMfaActions();          // load the step-up action matrix
         
         // Populate form fields
         // General

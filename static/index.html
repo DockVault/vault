@@ -1662,6 +1662,53 @@
                                 </div>
                             </div>
                         </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header">
+                                <h3>Two-factor authentication (MFA)</h3>
+                            </div>
+                            <div class="p-lg">
+                                <div class="form-group">
+                                    <label for="setting-mfa-mode">Requirement</label>
+                                    <select id="setting-mfa-mode" class="form-control">
+                                        <option value="optional">Optional — users may enable it themselves</option>
+                                        <option value="required">Required — every user must enroll</option>
+                                    </select>
+                                    <small class="text-secondary">When required, every user is prompted to set up an authenticator app at their next sign-in.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Allowed methods</label>
+                                    <p class="text-secondary text-sm" style="margin-top:4px;">Authenticator app (TOTP) only. Email codes are not available yet.</p>
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-mfa-sftp-policy">SFTP access for MFA users</label>
+                                    <select id="setting-mfa-sftp-policy" class="form-control">
+                                        <option value="allow">Allow — SFTP uses the account password / SSH key</option>
+                                        <option value="temp_credential_only">Require a temporary credential</option>
+                                    </select>
+                                    <small id="setting-mfa-sftp-warning" class="text-secondary"></small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-mfa-email-ttl">Email code lifetime (minutes)</label>
+                                    <input type="number" id="setting-mfa-email-ttl" class="form-control" min="1" max="60">
+                                    <small class="text-secondary">Applies once email codes are available (1–60).</small>
+                                </div>
+                                <div id="mfa-policy-msg" class="alert mt-sm" role="status" style="display:none;"></div>
+                                <button type="button" id="save-mfa-policy-btn" class="btn btn-primary">Save MFA policy</button>
+                                <small class="text-secondary" style="display:block; margin-top:8px;">Changing MFA settings requires you to confirm your own second factor.</small>
+                            </div>
+                        </div>
+
+                        <div class="card mt-lg">
+                            <div class="card-header">
+                                <h3>Step-up: actions that require a second factor</h3>
+                            </div>
+                            <div class="p-lg">
+                                <p class="text-secondary text-sm mb-md">Per action, choose whether the user must present their authenticator (OTP) and/or re-enter their password. Turning OTP on for an action requires everyone — admins included — to enroll before performing it.</p>
+                                <div id="mfa-actions-msg" class="alert mt-sm" role="status" style="display:none;"></div>
+                                <div id="mfa-actions-table"></div>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Storage Settings Tab -->
