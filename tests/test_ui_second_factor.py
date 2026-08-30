@@ -151,3 +151,68 @@ def test_gated_action_triggers_step_up_modal_then_retries(page: Page, admin):
             admin.delete_user(u["id"])
         except Exception:
             pass
+
+
+def test_account_settings_enable_2fa_end_to_end(page: Page, admin):
+    """A signed-in user turns ON 2FA from Your Account: password -> QR/secret -> confirm code ->
+    recovery codes -> the section shows it enabled."""
+    u = admin.create_user(role="user")
+    try:
+        page.goto("/")
+        page.fill("#username", u["_username"])
+        page.fill("#password", u["_password"])
+        page.click("#login-form button[type=submit]")
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+
+        page.evaluate("openUserSettingsModal()")
+        expect(page.locator("#us-2fa-section")).to_be_visible()
+        page.get_by_role("button", name="Set up two-factor").click()
+        page.fill("#us-2fa-cur-pw", u["_password"])
+        page.get_by_role("button", name="Continue").click()
+
+        expect(page.locator("#sf-enroll-secret")).to_be_visible(timeout=10000)
+        secret = page.locator("#sf-enroll-secret").inner_text().strip()
+        page.fill("#sf-enroll-code", _totp_now(secret))
+        page.get_by_role("button", name="Continue").click()
+        expect(page.locator("#sf-ack-cb")).to_be_visible(timeout=10000)
+        page.check("#sf-ack-cb")
+        page.get_by_role("button", name="Finish").click()
+
+        # The section reflects the enabled state (the "Turn off" control appears).
+        expect(page.get_by_role("button", name="Turn off")).to_be_visible(timeout=10000)
+    finally:
+        admin.delete_user(u["id"])
+
+
+def test_account_settings_disable_2fa_requires_step_up(page: Page, admin):
+    """Turning OFF 2FA is gated by the step-up modal (account.second_factor); confirming a recovery code
+    disables it and the section returns to the off state."""
+    u = admin.create_user(role="user")
+    c = admin.clone_anonymous()
+    c.login(u["_username"], u["_password"])
+    _secret, codes = enroll_totp(u, c)
+    try:
+        page.on("dialog", lambda d: d.accept())   # accept the native 'turn off?' confirm
+        page.goto("/")
+        page.fill("#username", u["_username"])
+        page.fill("#password", u["_password"])
+        page.click("#login-form button[type=submit]")
+        page.get_by_role("button", name="Use a recovery code instead").click()
+        page.fill("#sf-code-input", codes[0])
+        page.click("#login-second-factor button")
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+
+        page.evaluate("openUserSettingsModal()")
+        expect(page.get_by_role("button", name="Turn off")).to_be_visible(timeout=10000)
+        page.get_by_role("button", name="Turn off").click()
+        # The gated DELETE surfaces the step-up modal (on top of the account modal); confirm with a
+        # recovery code. Scope to the modal so locators aren't ambiguous across the two open modals.
+        expect(page.locator("#stepup-modal.active")).to_be_visible(timeout=10000)
+        modal = page.locator("#stepup-modal")
+        modal.get_by_role("button", name="Use a recovery code instead").click()
+        page.fill("#stepup-code-input", codes[1])
+        modal.get_by_role("button", name="Confirm").click()
+        # Back to the off state.
+        expect(page.get_by_role("button", name="Set up two-factor")).to_be_visible(timeout=10000)
+    finally:
+        admin.delete_user(u["id"])

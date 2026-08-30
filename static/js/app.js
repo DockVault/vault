@@ -1611,9 +1611,13 @@ function renderVerifyCard(box, opts) {
 }
 
 function renderEnrollmentWizard(box, opts) {
-    const preAuthToken = opts.preAuthToken;
+    // token: a forced-enrollment pre-auth token (login) OR the current session token (account settings).
+    // The enroll endpoints accept either. onComplete: called after a successful acknowledge on the
+    // settings path (where acknowledge returns NO access_token because the user is already signed in).
+    const token = opts.token || opts.preAuthToken || authToken;
     const password = opts.password || '';
-    const auth = { 'Authorization': `Bearer ${preAuthToken}` };
+    const onComplete = typeof opts.onComplete === 'function' ? opts.onComplete : null;
+    const auth = { 'Authorization': `Bearer ${token}` };
     let secret = null, recoveryCodes = null;
 
     const clear = () => box.replaceChildren();
@@ -1706,7 +1710,7 @@ function renderEnrollmentWizard(box, opts) {
         label.appendChild(cb); label.appendChild(_el('span', null, "I've saved my recovery codes"));
         box.appendChild(label);
         const e3 = _el('div', 'alert alert-error mt-sm'); e3.style.display = 'none'; e3.setAttribute('role', 'alert'); box.appendChild(e3);
-        const done = _el('button', 'btn btn-primary btn-block', 'Finish and sign in'); box.appendChild(done);
+        const done = _el('button', 'btn btn-primary btn-block', onComplete ? 'Finish' : 'Finish and sign in'); box.appendChild(done);
 
         async function ack() {
             if (!cb.checked) { _sfError(e3, 'Please confirm you saved your recovery codes.'); return; }
@@ -1721,7 +1725,8 @@ function renderEnrollmentWizard(box, opts) {
                 }
                 const dd = await resp.json();
                 if (dd.access_token) await finishSecondFactorLogin(dd.access_token);
-                else _sfRestoreLoginForm();   // non-forced (settings) path: session already exists elsewhere
+                else if (onComplete) onComplete();          // settings path: already signed in
+                else _sfRestoreLoginForm();
             } catch (_) { _sfError(e3, 'Could not reach the server.'); done.disabled = false; }
         }
         done.addEventListener('click', ack);
@@ -1752,6 +1757,10 @@ function requestStepUpReceipt(action, methods) {
     return new Promise((resolve) => {
         _stepUpResolve = resolve;
         _buildStepUpBody(action, list);
+        // The step-up can be summoned from within another open modal (e.g. Your Account), so lift it
+        // above the default modal layer (z-index 1000) — otherwise it renders behind and is unusable.
+        const m = document.getElementById('stepup-modal');
+        if (m) m.style.zIndex = '1100';
         openModal('stepup-modal');
     });
 }
@@ -5220,6 +5229,94 @@ function _usHideEmailCodeRow() {
     if (inp) inp.value = '';
 }
 
+// ============================================================================
+// ACCOUNT SETTINGS: two-factor (TOTP) enroll / disable / regenerate
+// ============================================================================
+// Disable + regenerate hit account.second_factor-gated endpoints; apiRequest surfaces the step-up modal
+// automatically, so the user must prove their current factor to change it.
+
+async function renderAccount2FA() {
+    const body = document.getElementById('us-2fa-body');
+    if (!body) return;
+    body.replaceChildren(_el('div', 'spinner'));
+    let st;
+    try { st = await apiRequest('/users/me/second-factor', { silent: true }); }
+    catch (_) { body.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load two-factor status.')); return; }
+    body.replaceChildren();
+    const enabled = !!(st && (st.enrolled === true || st.status === 'active'));
+    if (enabled) {
+        const remaining = (st.recovery_codes_remaining != null) ? st.recovery_codes_remaining : 0;
+        body.appendChild(_el('p', 'text-sm mb-sm',
+            'Two-factor authentication is on (authenticator app). ' + remaining +
+            ' recovery code' + (remaining === 1 ? '' : 's') + ' remaining.'));
+        const row = _el('div', 'flex gap-sm');
+        const regen = _el('button', 'btn btn-secondary btn-sm', 'Regenerate recovery codes');
+        const off = _el('button', 'btn btn-secondary btn-sm', 'Turn off');
+        row.appendChild(regen); row.appendChild(off); body.appendChild(row);
+        const msg = _el('div', 'mt-sm'); body.appendChild(msg);
+        regen.addEventListener('click', () => account2FARegenerate(msg));
+        off.addEventListener('click', () => account2FADisable(msg));
+    } else {
+        body.appendChild(_el('p', 'text-secondary text-sm mb-sm',
+            'Two-factor authentication is off. Add an authenticator app for a second sign-in factor.'));
+        const start = _el('button', 'btn btn-primary btn-sm', 'Set up two-factor');
+        body.appendChild(start);
+        start.addEventListener('click', () => account2FASetup(body));
+    }
+}
+
+function account2FASetup(body) {
+    body.replaceChildren();
+    body.appendChild(_el('h4', 'text-sm font-bold mb-xs', 'Set up two-factor authentication'));
+    const g = _el('div', 'form-group');
+    g.appendChild(_el('label', 'text-sm', 'Confirm your current password'));
+    const pw = _el('input', 'form-control'); pw.type = 'password'; pw.autocomplete = 'current-password'; pw.id = 'us-2fa-cur-pw';
+    g.appendChild(pw); body.appendChild(g);
+    const err = _el('div', 'alert alert-error mt-sm'); err.style.display = 'none'; err.setAttribute('role', 'alert'); body.appendChild(err);
+    const row = _el('div', 'flex gap-sm mt-sm');
+    const cont = _el('button', 'btn btn-primary btn-sm', 'Continue');
+    const cancel = _el('button', 'btn btn-secondary btn-sm', 'Cancel');
+    row.appendChild(cont); row.appendChild(cancel); body.appendChild(row);
+    cancel.addEventListener('click', () => renderAccount2FA());
+    function go() {
+        if (!pw.value) { _sfError(err, 'Enter your current password.'); return; }
+        const wiz = _el('div'); body.replaceChildren(wiz);
+        renderEnrollmentWizard(wiz, { token: authToken, password: pw.value, onComplete: renderAccount2FA });
+    }
+    cont.addEventListener('click', go);
+    pw.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+    pw.focus();
+}
+
+async function account2FADisable(msg) {
+    if (!window.confirm('Turn off two-factor authentication? You will sign in with your password only.')) return;
+    msg.replaceChildren();
+    try {
+        await apiRequest('/users/me/second-factor', { method: 'DELETE' });
+        renderAccount2FA();
+    } catch (e) {
+        msg.replaceChildren(_el('div', 'alert alert-error', (e && e.message) || 'Could not turn off two-factor.'));
+    }
+}
+
+async function account2FARegenerate(msg) {
+    msg.replaceChildren();
+    try {
+        const r = await apiRequest('/users/me/second-factor/recovery/regenerate', { method: 'POST' });
+        const codes = (r && r.recovery_codes) || [];
+        msg.replaceChildren();
+        msg.appendChild(_el('p', 'text-sm mb-xs', 'New recovery codes — save them now, they are shown only once:'));
+        const list = _el('div', 'id-2fa-newcodes'); list.style.fontFamily = 'monospace'; list.style.lineHeight = '1.8';
+        codes.forEach(c => list.appendChild(_el('div', null, c)));
+        msg.appendChild(list);
+        const done = _el('button', 'btn btn-secondary btn-sm mt-sm', 'Done');
+        done.addEventListener('click', () => renderAccount2FA());
+        msg.appendChild(done);
+    } catch (e) {
+        msg.replaceChildren(_el('div', 'alert alert-error', (e && e.message) || 'Could not regenerate recovery codes.'));
+    }
+}
+
 // Open the account modal for the CURRENT user. Credential-write sections are hidden for a temporary
 // credential (the server rejects those writes too — this is UX, not the security boundary).
 function openUserSettingsModal() {
@@ -5247,6 +5344,7 @@ function openUserSettingsModal() {
         modal.querySelectorAll('.ssh-keys-list, .ssh-key-name, .ssh-key-public')
             .forEach(el => el.setAttribute('data-user-id', String(currentUser.id)));
         loadUserSshKeys(currentUser.id, modal);
+        renderAccount2FA();   // populate the Two-factor section from GET /users/me/second-factor
     }
     const tm = window.themeManager;
     const themeSel = document.getElementById('us-theme'); if (themeSel && tm) themeSel.value = (tm.currentTheme === 'dark') ? 'dark' : 'light';
@@ -17374,13 +17472,22 @@ function openModal(id) {
 
 // Close Modal
 function closeModal() {
+    // The step-up modal floats ABOVE any other open modal (it can be summoned from within one, e.g.
+    // Your Account). When it's up, close ONLY it — leave the underlying modal open — and settle its
+    // pending request (a no-op on success, which settles the receipt first; a cancel otherwise).
+    const su = document.getElementById('stepup-modal');
+    if (su && su.classList.contains('active')) {
+        su.classList.remove('active');
+        su.style.zIndex = '';
+        clearCredentialInputsOnClose();
+        if (typeof _stepUpSettle === 'function') _stepUpSettle(null);
+        return;
+    }
     document.querySelectorAll('.modal').forEach(modal => {
         modal.classList.remove('active');
     });
     closeFilePreview(); // free any in-memory decrypted preview blob
     clearCredentialInputsOnClose();
-    // A step-up modal closed without a receipt (Cancel / ×) resolves its pending request as cancelled.
-    // On a successful step-up the promise is already settled before this runs, so this is a no-op then.
     if (typeof _stepUpSettle === 'function') _stepUpSettle(null);
 }
 
