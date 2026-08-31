@@ -5045,6 +5045,26 @@ async def second_factor_login_verify(
         if pending.attempts >= _SF_LOGIN_MAX_ATTEMPTS:
             pending.consumed_at = datetime.now(timezone.utc)
         db.commit()
+        # A wrong login second factor was previously invisible in both the audit log and the live
+        # monitor. Record it as a failed action and push it to the monitor as a security event.
+        try:
+            AuditLogger(db).log_action(action="second_factor_failed", status="failed", user=user,
+                                       ip_address=client_ip,
+                                       details={"method": (body.method or "").lower()})
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            broadcast_event({"event": {
+                "type": "security_incident",
+                "title": "Failed second factor",
+                "description": f"{user.username} entered an invalid login code",
+                "user": user.username,
+                "ip": client_ip,
+                "is_temporary": False,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }})
+        except Exception:  # noqa: BLE001
+            pass
         raise HTTPException(status_code=401, detail="That code is not valid.")
     # Consume the pending row (single winner) before minting the session.
     if db.query(PendingLogin).filter(PendingLogin.id == pending.id, PendingLogin.consumed_at.is_(None)).update(

@@ -6228,6 +6228,10 @@ let monitorWebSocket = null;
 let monitorReconnectTimer = null;   // single pending reconnect timer (coalesced; never stacks)
 let monitorEvents = [];
 let monitorCurrentFilter = 'all';
+// Live-monitor pagination: page 0 is the newest events (kept live); older pages page back through the
+// buffered set. New events prepend, so page 0 stays fresh; a filter change resets to page 0.
+let _monitorPage = 0;
+const _MONITOR_PAGE_SIZE = 25;
 let monitorMetrics = {
     activeUsers: 0,
     eventsRate: 0,
@@ -6632,7 +6636,12 @@ function updateMonitorUI() {
         'error': 'danger'
     };
 
-    eventsList.innerHTML = filteredEvents.map(event => {
+    const _monPages = Math.max(1, Math.ceil(filteredEvents.length / _MONITOR_PAGE_SIZE));
+    if (_monitorPage >= _monPages) _monitorPage = _monPages - 1;
+    if (_monitorPage < 0) _monitorPage = 0;
+    const _monHtml = filteredEvents
+        .slice(_monitorPage * _MONITOR_PAGE_SIZE, (_monitorPage + 1) * _MONITOR_PAGE_SIZE)
+        .map(event => {
         const time = parseServerTime(event.timestamp);
         const timeStr = time ? time.toLocaleTimeString() : '—';
         const badgeClass = typeColors[event.type] || 'secondary';
@@ -6679,6 +6688,25 @@ function updateMonitorUI() {
             </div>
         `;
     }).join('');
+    eventsList.replaceChildren();
+    eventsList.insertAdjacentHTML('beforeend', _monHtml);
+    renderMonitorPagination(filteredEvents.length, _monPages);
+}
+
+function renderMonitorPagination(total, pages) {
+    const host = document.getElementById('monitor-pagination');
+    if (!host) return;
+    host.replaceChildren();
+    if (total <= _MONITOR_PAGE_SIZE) return;
+    const prev = document.createElement('button'); prev.type = 'button'; prev.className = 'btn btn-secondary btn-sm'; prev.textContent = '‹ Newer'; prev.disabled = _monitorPage === 0;
+    prev.addEventListener('click', () => { if (_monitorPage > 0) { _monitorPage--; updateMonitorUI(); } });
+    const next = document.createElement('button'); next.type = 'button'; next.className = 'btn btn-secondary btn-sm'; next.textContent = 'Older ›'; next.disabled = _monitorPage >= pages - 1;
+    next.addEventListener('click', () => { if (_monitorPage < pages - 1) { _monitorPage++; updateMonitorUI(); } });
+    const label = document.createElement('span'); label.className = 'text-secondary text-sm';
+    const from = _monitorPage * _MONITOR_PAGE_SIZE + 1;
+    const to = Math.min(total, (_monitorPage + 1) * _MONITOR_PAGE_SIZE);
+    label.textContent = `${from}–${to} of ${total} · page ${_monitorPage + 1} of ${pages}`;
+    host.appendChild(prev); host.appendChild(label); host.appendChild(next);
 }
 
 // Fetch monitor statistics
@@ -6713,8 +6741,9 @@ function attachMonitorListeners() {
             document.querySelectorAll('.event-filter-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             
-            // Update filter
+            // Update filter (back to the newest page — the filtered set changed)
             monitorCurrentFilter = btn.dataset.type;
+            _monitorPage = 0;
             updateMonitorUI();
         });
     });
