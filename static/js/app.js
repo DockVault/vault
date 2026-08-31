@@ -2395,7 +2395,10 @@ async function loadVaults() {
     if (favBtn) favBtn.onclick = () => { state.vaultFilter = 'favorites'; renderVaults(); };
 
     try {
-        state.allVaults = await apiRequest('/vaults');
+        const _allV = await apiRequest('/vaults');
+        // The main Vaults page shows only real vaults; the throwaway drop vaults behind upload links
+        // are managed from the Upload Links page (which opens straight into them), so keep them out here.
+        state.allVaults = Array.isArray(_allV) ? _allV.filter(v => !v.is_receiver) : _allV;
         // Decrypt any zero-knowledge vault names/descriptions IN PLACE if the account key is already
         // unlocked; otherwise they keep their non-secret labels (no prompt). Best-effort — a decrypt
         // hiccup must not stop the list from rendering.

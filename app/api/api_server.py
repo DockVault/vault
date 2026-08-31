@@ -12567,6 +12567,16 @@ async def list_vaults(
     # When did the CALLER last open each of these? One query, like fav_ids above — never per row.
     view_times = _vault_view_times(db, current_user)
 
+    # Which of these are the dedicated drop vault behind an upload link (receiver)? Those "throwaway"
+    # vaults are managed from the Upload Links page, so the client can keep them out of the main vault
+    # list. One query, flagged per row below.
+    from app.core.models import Receiver as _Receiver
+    _receiver_vault_ids = {
+        r[0] for r in db.execute(
+            _select(_Receiver.vault_id).where(_Receiver.vault_id.isnot(None))
+        ).fetchall()
+    }
+
     from app.core.temp_scope import scope_ids as _scope_ids
     _fnr = _force_no_remember_vault_password(db)
     result = []
@@ -12608,6 +12618,9 @@ async def list_vaults(
             'my_permission': _effective_vault_permission(vault, perms, current_user),
             'is_favorite': vault.id in fav_ids,
             'last_viewed_at': view_times.get(vault.id),
+            # True when this vault is the dedicated drop vault behind an upload link; the main Vaults
+            # page hides these (they're managed from Upload Links), the ETag still covers them.
+            'is_receiver': vault.id in _receiver_vault_ids,
         }
         result.append(vault_dict)
     
