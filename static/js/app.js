@@ -3521,6 +3521,11 @@ async function showCreateVault() {
     document.getElementById('create-vault-modal').classList.add('active');
 }
 
+// Set when a ZK vault create is interrupted to set up the account encryption key, so that finishing
+// the key setup re-opens the create-vault modal (with the entered values intact) instead of leaving
+// the user to start over — closeModal() closes every modal, so the create modal is otherwise lost.
+let _reopenCreateVaultAfterKey = false;
+
 document.getElementById('create-vault-form').addEventListener('submit', async (e) => {
     e.preventDefault();
 
@@ -3625,8 +3630,11 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                 if (err && err.code === 'zk_no_encryption_key') {
                     // First ZK vault with no encryption key yet: guide the user to set the key up
                     // deliberately (and open that flow for them), rather than confusing the key
-                    // passphrase with a vault password. Abort this create; they re-create afterward.
-                    showWarning(err.message);
+                    // passphrase with a vault password. Keep this create pending — finishing the key
+                    // setup re-opens the create-vault modal (values intact) so they just click Create.
+                    showWarning((err.message || 'Set up your encryption key first.')
+                        + ' Your vault details are kept — finish the key setup and this form reopens.');
+                    _reopenCreateVaultAfterKey = true;
                     try { openEncryptionKeyModal(); } catch (_) { /* modal optional */ }
                     return;
                 }
@@ -12282,6 +12290,14 @@ async function setupEncryptionKey() {
         if (setupBtn) setupBtn.disabled = true;
         await zkRegisterNewKeypair();
         showSuccess('Encryption key set up. You can now use and be granted zero-knowledge vaults.');
+        // If we got here from an interrupted ZK vault create, close the key modal and re-open the
+        // create-vault modal (its entered values are intact) so the user just clicks Create again.
+        if (_reopenCreateVaultAfterKey) {
+            _reopenCreateVaultAfterKey = false;
+            const km = document.getElementById('encryption-key-modal'); if (km) km.classList.remove('active');
+            const cvm = document.getElementById('create-vault-modal'); if (cvm) cvm.classList.add('active');
+            showInfo('Encryption key ready — finish creating your zero-knowledge vault.');
+        }
     } catch (e) {
         const msg = (e && e.message) || '';
         if (e && e.status === 409) {
@@ -18754,6 +18770,7 @@ function closeModal() {
     document.querySelectorAll('.modal').forEach(modal => {
         modal.classList.remove('active');
     });
+    _reopenCreateVaultAfterKey = false;  // a manual close cancels a pending "reopen create after key setup"
     closeFilePreview(); // free any in-memory decrypted preview blob
     clearCredentialInputsOnClose();
     if (typeof _stepUpSettle === 'function') _stepUpSettle(null);
