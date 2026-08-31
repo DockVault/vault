@@ -245,6 +245,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.26.0": {
+      "released": "2026-08-31",
+      "notes": "UI polish across the app — no schema change and no new required configuration. Vault cards show a Standard/Zero-knowledge badge; the department access list in a vault's Permissions tab is now the same table as the per-user list with inline level editing, a members modal, and member/granted columns; the audit log paginates and each row opens an 80vw event modal with a table-of-contents of the page's events; the live monitor paginates and a failed login second factor is now recorded and broadcast; the Upload Links page has Links and Drop-vaults tabs (the throwaway drop vaults are also hidden from the main Vaults page); a public file link now counts a use on the actual download rather than on the landing-page visit (a peek returns metadata without consuming a use); native confirm()/alert() dialogs are replaced by the app's themed ones; several tables and the settings tab strip are tightened; and the anonymous share pages get calmer styling. Adds no new environment settings; a rollback to 0.25.0 is clean.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -462,6 +470,13 @@
     {
       "from": "0.24.0",
       "to": "0.25.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.25.0",
+      "to": "0.26.0",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false

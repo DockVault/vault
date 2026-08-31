@@ -5045,6 +5045,26 @@ async def second_factor_login_verify(
         if pending.attempts >= _SF_LOGIN_MAX_ATTEMPTS:
             pending.consumed_at = datetime.now(timezone.utc)
         db.commit()
+        # A wrong login second factor was previously invisible in both the audit log and the live
+        # monitor. Record it as a failed action and push it to the monitor as a security event.
+        try:
+            AuditLogger(db).log_action(action="second_factor_failed", status="failed", user=user,
+                                       ip_address=client_ip,
+                                       details={"method": (body.method or "").lower()})
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            broadcast_event({"event": {
+                "type": "security_incident",
+                "title": "Failed second factor",
+                "description": f"{user.username} entered an invalid login code",
+                "user": user.username,
+                "ip": client_ip,
+                "is_temporary": False,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }})
+        except Exception:  # noqa: BLE001
+            pass
         raise HTTPException(status_code=401, detail="That code is not valid.")
     # Consume the pending row (single winner) before minting the session.
     if db.query(PendingLogin).filter(PendingLogin.id == pending.id, PendingLogin.consumed_at.is_(None)).update(
@@ -9614,6 +9634,10 @@ async def admin_revoke_all_public_links(
 # --- Anonymous read path: page + redeem + download -------------------------------------------------
 class PublicLinkRedeem(BaseModel):
     secret: Optional[str] = None
+    # A peek returns the link's metadata (name/size or folder listing) to render the landing page
+    # WITHOUT consuming a use or minting a download grant — a visit is not a download. The actual
+    # download click re-redeems with peek=false, which is where the single use is spent.
+    peek: bool = False
 
 
 @app.get("/p/{token}")
@@ -9734,6 +9758,25 @@ async def redeem_public_link(
             _audit("failure", reason="not_available", link_id=link.id)
             raise HTTPException(status_code=404, detail="This link is not available.")
 
+    # Build the response metadata now (no grant yet); a peek returns it without spending a use.
+    if link.target_type == "file":
+        meta = {"kind": "file", "name": f.name or "download", "size": f.size_bytes or 0,
+                "file_id": str(f.id)}
+    else:
+        child_files = db.query(File).filter(File.vault_id == vault.id,
+                                            File.folder_id == folder.id).all()
+        child_dirs = db.query(Folder).filter(Folder.vault_id == vault.id,
+                                             Folder.parent_folder_id == folder.id).all()
+        entries = [{"id": str(d.id), "name": d.name or "", "size": 0, "is_folder": True} for d in child_dirs]
+        entries += [{"id": str(x.id), "name": x.name or "", "size": x.size_bytes or 0,
+                     "is_folder": False} for x in child_files]
+        meta = {"kind": "folder", "name": folder.name or "", "entries": entries}
+
+    if bool(getattr(payload, "peek", False)):
+        # A visit is not a download: return metadata only, consuming no use and minting no grant.
+        _audit("success", reason="peek", link_id=link.id)
+        return {**meta, "grant": None}
+
     # Mint the single-use download grant BEFORE consuming a use, so a Redis outage (→ 503) can never
     # burn a use: nothing is consumed until the grant is safely stored. Fail-closed — a grant that
     # cannot be stored is never handed out.
@@ -9758,20 +9801,9 @@ async def redeem_public_link(
         _audit("failure", reason="not_available", link_id=link.id)
         raise HTTPException(status_code=404, detail="This link is not available.")
 
+    # Names are the Standard vault's in-memory-decrypted plaintext (the ORM load event restores it).
     _audit("success", link_id=link.id)
-    if link.target_type == "file":
-        # Names are the Standard vault's in-memory-decrypted plaintext (the ORM load event restores it).
-        return {"kind": "file", "name": f.name or "download", "size": f.size_bytes or 0,
-                "file_id": str(f.id), "grant": grant}
-    # Folder: one level of children (files + subfolders), no recursion.
-    child_files = db.query(File).filter(File.vault_id == vault.id,
-                                       File.folder_id == folder.id).all()
-    child_dirs = db.query(Folder).filter(Folder.vault_id == vault.id,
-                                        Folder.parent_folder_id == folder.id).all()
-    entries = [{"id": str(d.id), "name": d.name or "", "size": 0, "is_folder": True} for d in child_dirs]
-    entries += [{"id": str(x.id), "name": x.name or "", "size": x.size_bytes or 0,
-                 "is_folder": False} for x in child_files]
-    return {"kind": "folder", "name": folder.name or "", "entries": entries, "grant": grant}
+    return {**meta, "grant": grant}
 
 
 @app.get("/public-links/{token}/download/{file_id}")
@@ -9987,6 +10019,8 @@ def _receiver_public_dict(r, tag=None) -> dict:
         "status": _receiver_status(r),
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "last_upload_at": r.last_upload_at.isoformat() if r.last_upload_at else None,
+        # Bytes already used in the drop vault, for a storage indicator (ring) against max_total_bytes.
+        "reserved_bytes": r.reserved_bytes or 0,
     }
 
 
@@ -12567,6 +12601,16 @@ async def list_vaults(
     # When did the CALLER last open each of these? One query, like fav_ids above — never per row.
     view_times = _vault_view_times(db, current_user)
 
+    # Which of these are the dedicated drop vault behind an upload link (receiver)? Those "throwaway"
+    # vaults are managed from the Upload Links page, so the client can keep them out of the main vault
+    # list. One query, flagged per row below.
+    from app.core.models import Receiver as _Receiver
+    _receiver_vault_ids = {
+        r[0] for r in db.execute(
+            _select(_Receiver.vault_id).where(_Receiver.vault_id.isnot(None))
+        ).fetchall()
+    }
+
     from app.core.temp_scope import scope_ids as _scope_ids
     _fnr = _force_no_remember_vault_password(db)
     result = []
@@ -12608,6 +12652,9 @@ async def list_vaults(
             'my_permission': _effective_vault_permission(vault, perms, current_user),
             'is_favorite': vault.id in fav_ids,
             'last_viewed_at': view_times.get(vault.id),
+            # True when this vault is the dedicated drop vault behind an upload link; the main Vaults
+            # page hides these (they're managed from Upload Links), the ETag still covers them.
+            'is_receiver': vault.id in _receiver_vault_ids,
         }
         result.append(vault_dict)
     
@@ -13905,12 +13952,15 @@ async def list_vault_group_access(
     if not _can_manage_vault(db, vault, current_user):
         raise HTTPException(status_code=403, detail="Only the vault owner or a manager can view access")
     rows = db.execute(
-        select(vault_group_access.c.group_id, vault_group_access.c.permission, Group.name, Group.color)
+        select(vault_group_access.c.group_id, vault_group_access.c.permission,
+               vault_group_access.c.added_at, Group.name, Group.color)
         .join(Group, Group.id == vault_group_access.c.group_id)
         .where(vault_group_access.c.vault_id == vault_id)
         .order_by(Group.name)
     ).all()
-    return [{"group_id": str(r[0]), "permission": r[1], "name": r[2], "color": r[3]} for r in rows]
+    return [{"group_id": str(r[0]), "permission": r[1],
+             "added_at": r[2].isoformat() if r[2] else None,
+             "name": r[3], "color": r[4]} for r in rows]
 
 
 @app.post("/vaults/{vault_id}/group-access")

@@ -91,7 +91,6 @@ def test_create_modal_layout_rows_and_buttons_in_view(admin_page: Page):
 
 def test_create_edit_delete_profile_roundtrip(admin_page: Page, admin):
     page = admin_page
-    page.on("dialog", lambda d: d.accept())      # auto-confirm the delete dialog
     _open_email_tab(page)
     page.click("#email-profile-add")
     _fill_profile(page, name="Primary")
@@ -107,6 +106,7 @@ def test_create_edit_delete_profile_roundtrip(admin_page: Page, admin):
     expect(page.locator('.email-profile-card:has-text("Renamed")')).to_be_visible(timeout=10000)
 
     page.locator('.email-profile-card:has-text("Renamed") .epc-delete').click()
+    page.click("#confirm-modal-confirm-btn")         # themed confirm for the delete
     expect(page.locator('.email-profile-card:has-text("Renamed")')).to_have_count(0, timeout=10000)
     assert admin.get("/email/profiles").json()["profiles"] == []
 

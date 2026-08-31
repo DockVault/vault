@@ -2395,7 +2395,10 @@ async function loadVaults() {
     if (favBtn) favBtn.onclick = () => { state.vaultFilter = 'favorites'; renderVaults(); };
 
     try {
-        state.allVaults = await apiRequest('/vaults');
+        const _allV = await apiRequest('/vaults');
+        // The main Vaults page shows only real vaults; the throwaway drop vaults behind upload links
+        // are managed from the Upload Links page (which opens straight into them), so keep them out here.
+        state.allVaults = Array.isArray(_allV) ? _allV.filter(v => !v.is_receiver) : _allV;
         // Decrypt any zero-knowledge vault names/descriptions IN PLACE if the account key is already
         // unlocked; otherwise they keep their non-secret labels (no prompt). Best-effort — a decrypt
         // hiccup must not stop the list from rendering.
@@ -2635,6 +2638,7 @@ function renderVaults() {
                 <div class="vault-tile${locked ? ' vault-tile-locked' : ''}">${locked ? iconSvg('lock') : iconSvg('vault')}</div>
                 <div class="vault-card-main">
                     <h3 class="vault-name"><span class="zk-field" data-zk-field="name">${nameHtml}</span></h3>
+                    <span class="vault-badge ${isZk ? 'vault-badge-zk' : 'vault-badge-std'}">${iconSvg(isZk ? 'shield' : 'vault', 'icon-xs')}${isZk ? 'Zero-knowledge' : 'Standard'}</span>
                     <p class="vault-desc"><span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="desc">${descHtml}</span></p>
                     <div class="vault-meta">
                         <span>${iconSvg('folder', 'icon-sm')} <span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="files">${filesHtml}</span> files</span>
@@ -3517,6 +3521,11 @@ async function showCreateVault() {
     document.getElementById('create-vault-modal').classList.add('active');
 }
 
+// Set when a ZK vault create is interrupted to set up the account encryption key, so that finishing
+// the key setup re-opens the create-vault modal (with the entered values intact) instead of leaving
+// the user to start over — closeModal() closes every modal, so the create modal is otherwise lost.
+let _reopenCreateVaultAfterKey = false;
+
 document.getElementById('create-vault-form').addEventListener('submit', async (e) => {
     e.preventDefault();
 
@@ -3621,8 +3630,11 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                 if (err && err.code === 'zk_no_encryption_key') {
                     // First ZK vault with no encryption key yet: guide the user to set the key up
                     // deliberately (and open that flow for them), rather than confusing the key
-                    // passphrase with a vault password. Abort this create; they re-create afterward.
-                    showWarning(err.message);
+                    // passphrase with a vault password. Keep this create pending — finishing the key
+                    // setup re-opens the create-vault modal (values intact) so they just click Create.
+                    showWarning((err.message || 'Set up your encryption key first.')
+                        + ' Your vault details are kept — finish the key setup and this form reopens.');
+                    _reopenCreateVaultAfterKey = true;
                     try { openEncryptionKeyModal(); } catch (_) { /* modal optional */ }
                     return;
                 }
@@ -4337,7 +4349,7 @@ function showTempCredsModal(creds) {
                 </div>
                 <div class="modal-body">
                     <div class="alert alert-warning mb-md">
-                        ${iconSvg('alert-triangle', 'icon-sm')} <strong>Copy these now.</strong> The password${hasPasscodes ? ' and vault passcode(s)' : ''} ${hasPasscodes ? 'are' : 'is'} shown once and can't be retrieved later.
+                        ${iconSvg('alert-triangle', 'icon-sm')}<div class="alert-content"><strong>Copy these now.</strong> The password${hasPasscodes ? ' and vault passcode(s)' : ''} ${hasPasscodes ? 'are' : 'is'} shown once and can't be retrieved later.</div>
                     </div>
                     ${field('Username', creds.temp_username || 'N/A')}
                     ${field('Password', creds.credential || 'N/A')}
@@ -5563,7 +5575,7 @@ function attachUserListeners() {
         btn.addEventListener('click', async () => {
             const userId = btn.getAttribute('data-user-id');
             const username = btn.getAttribute('data-username') || 'this user';
-            if (!confirm('Email a password-reset link to ' + username + '?')) return;
+            if (!await showConfirm('Email a password-reset link to ' + username + '?', 'Send reset link')) return;
             btn.disabled = true;
             try {
                 const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/send-reset-link', { method: 'POST' });
@@ -5580,7 +5592,7 @@ function attachUserListeners() {
         btn.addEventListener('click', async () => {
             const userId = btn.getAttribute('data-user-id');
             const username = btn.getAttribute('data-username') || 'this user';
-            if (!confirm('Create a one-time password-reset link for ' + username + '?\n\nAnyone with the link can set a new password for this account. It is shown once, expires, and can be used only once; using it signs the account out everywhere.')) return;
+            if (!await showConfirm('Create a one-time password-reset link for ' + username + '? Anyone with the link can set a new password for this account. It is shown once, expires, and can be used only once; using it signs the account out everywhere.', 'Create reset link')) return;
             btn.disabled = true;
             try {
                 const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/reset-link', { method: 'POST' });
@@ -5906,7 +5918,7 @@ async function toggleUserStatus(userId, activate) {
         });
         loadUsers();
     } catch (error) {
-        alert('Failed to update user: ' + error.message);
+        showError('Failed to update user: ' + error.message);
     }
 }
 
@@ -6216,6 +6228,10 @@ let monitorWebSocket = null;
 let monitorReconnectTimer = null;   // single pending reconnect timer (coalesced; never stacks)
 let monitorEvents = [];
 let monitorCurrentFilter = 'all';
+// Live-monitor pagination: page 0 is the newest events (kept live); older pages page back through the
+// buffered set. New events prepend, so page 0 stays fresh; a filter change resets to page 0.
+let _monitorPage = 0;
+const _MONITOR_PAGE_SIZE = 25;
 let monitorMetrics = {
     activeUsers: 0,
     eventsRate: 0,
@@ -6620,7 +6636,12 @@ function updateMonitorUI() {
         'error': 'danger'
     };
 
-    eventsList.innerHTML = filteredEvents.map(event => {
+    const _monPages = Math.max(1, Math.ceil(filteredEvents.length / _MONITOR_PAGE_SIZE));
+    if (_monitorPage >= _monPages) _monitorPage = _monPages - 1;
+    if (_monitorPage < 0) _monitorPage = 0;
+    const _monHtml = filteredEvents
+        .slice(_monitorPage * _MONITOR_PAGE_SIZE, (_monitorPage + 1) * _MONITOR_PAGE_SIZE)
+        .map(event => {
         const time = parseServerTime(event.timestamp);
         const timeStr = time ? time.toLocaleTimeString() : '—';
         const badgeClass = typeColors[event.type] || 'secondary';
@@ -6667,6 +6688,25 @@ function updateMonitorUI() {
             </div>
         `;
     }).join('');
+    eventsList.replaceChildren();
+    eventsList.insertAdjacentHTML('beforeend', _monHtml);
+    renderMonitorPagination(filteredEvents.length, _monPages);
+}
+
+function renderMonitorPagination(total, pages) {
+    const host = document.getElementById('monitor-pagination');
+    if (!host) return;
+    host.replaceChildren();
+    if (total <= _MONITOR_PAGE_SIZE) return;
+    const prev = document.createElement('button'); prev.type = 'button'; prev.className = 'btn btn-secondary btn-sm'; prev.textContent = '‹ Newer'; prev.disabled = _monitorPage === 0;
+    prev.addEventListener('click', () => { if (_monitorPage > 0) { _monitorPage--; updateMonitorUI(); } });
+    const next = document.createElement('button'); next.type = 'button'; next.className = 'btn btn-secondary btn-sm'; next.textContent = 'Older ›'; next.disabled = _monitorPage >= pages - 1;
+    next.addEventListener('click', () => { if (_monitorPage < pages - 1) { _monitorPage++; updateMonitorUI(); } });
+    const label = document.createElement('span'); label.className = 'text-secondary text-sm';
+    const from = _monitorPage * _MONITOR_PAGE_SIZE + 1;
+    const to = Math.min(total, (_monitorPage + 1) * _MONITOR_PAGE_SIZE);
+    label.textContent = `${from}–${to} of ${total} · page ${_monitorPage + 1} of ${pages}`;
+    host.appendChild(prev); host.appendChild(label); host.appendChild(next);
 }
 
 // Fetch monitor statistics
@@ -6701,8 +6741,9 @@ function attachMonitorListeners() {
             document.querySelectorAll('.event-filter-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             
-            // Update filter
+            // Update filter (back to the newest page — the filtered set changed)
             monitorCurrentFilter = btn.dataset.type;
+            _monitorPage = 0;
             updateMonitorUI();
         });
     });
@@ -7319,7 +7360,7 @@ function renderLogTokens(tokens) {
 }
 
 async function disableLogToken(id) {
-    if (!confirm('Disable this token? Any monitoring system using it will stop receiving logs.')) return;
+    if (!await showConfirm('Disable this token? Any monitoring system using it will stop receiving logs.', 'Disable token')) return;
     try {
         await apiRequest(`/settings/logs/${encodeURIComponent(id)}/disable`, { method: 'POST', body: '{}' });
         showSuccess('Token disabled');
@@ -8506,14 +8547,21 @@ function renderShareTagsList() {
         row.setAttribute('data-tag-id', tag.id);
 
         const left = document.createElement('div');
+        // Colour dot + icon + name in one flex lead, so the tag's presentation shows at a glance and
+        // the name and its active/inactive label no longer run together.
+        const lead = document.createElement('div');
+        lead.className = 'flex items-center gap-sm';
+        if (tag.color) { const dot = document.createElement('span'); dot.className = 'nl-color-dot'; dot.style.background = chipColorValue(tag.color); lead.appendChild(dot); }
+        if (tag.icon) lead.appendChild(_svgIcon(tag.icon, 'icon-sm'));
         const title = document.createElement('span');
         title.className = 'font-medium';
         title.textContent = tag.name;
-        left.appendChild(title);
+        lead.appendChild(title);
         const badge = document.createElement('span');
-        badge.className = 'chip ml-sm';
+        badge.className = 'chip';
         badge.textContent = tag.is_active ? 'active' : 'inactive';
-        left.appendChild(badge);
+        lead.appendChild(badge);
+        left.appendChild(lead);
         const summary = document.createElement('div');
         summary.className = 'text-tertiary text-sm';
         const parts = [
@@ -9254,8 +9302,8 @@ async function sendEmailProfileTest() {
 }
 
 async function deleteEmailProfile(p) {
-    if (!confirm('Delete the sending profile "' + (p.name || '') +
-                 '"? Templates using it will fall back to the default.')) return;
+    if (!await showConfirm('Delete the sending profile "' + (p.name || '') +
+                 '"? Templates using it will fall back to the default.', 'Delete profile')) return;
     try {
         await apiRequest('/email/profiles/' + p.id, { method: 'DELETE' });
         await loadEmailProfiles();
@@ -9649,7 +9697,7 @@ async function saveTemplate() {
 }
 
 async function deleteTemplate(t) {
-    if (!confirm('Delete the template "' + (t.name || '') + '"?')) return;
+    if (!await showConfirm('Delete the template "' + (t.name || '') + '"?', 'Delete template')) return;
     try {
         await apiRequest('/email/templates/' + t.id, { method: 'DELETE' });
         if (_editingTemplateId === t.id) closeTemplateEditor();
@@ -9794,9 +9842,9 @@ function _loadFromRow(label, onPick) {
     return b;
 }
 
-function _loadFromApply(name, subject, body) {
+async function _loadFromApply(name, subject, body) {
     // Replacing the current editor content is destructive, so confirm first.
-    if (!confirm('Replace the current subject and body with “' + name + '”?')) return;
+    if (!await showConfirm('Replace the current subject and body with “' + name + '”?', 'Replace content')) return;
     document.getElementById('et-subject').value = subject || '';
     document.getElementById('et-body').value = body || '';
     closeLoadFromMenu();
@@ -10018,6 +10066,121 @@ async function loadAuditFilterUsers() {
 }
 
 // Search audit log
+// --- Audit log: client-side pagination + an event-detail modal with a page table-of-contents -------
+let _auditLogs = [];
+let _auditPage = 0;
+const _AUDIT_PAGE_SIZE = 25;
+
+function _auditPageSlice() {
+    const start = _auditPage * _AUDIT_PAGE_SIZE;
+    return { start, logs: _auditLogs.slice(start, start + _AUDIT_PAGE_SIZE) };
+}
+
+function renderAuditPage() {
+    const tbody = document.getElementById('audit-log-body');
+    if (!tbody) return;
+    const total = _auditLogs.length;
+    const pages = Math.max(1, Math.ceil(total / _AUDIT_PAGE_SIZE));
+    if (_auditPage >= pages) _auditPage = pages - 1;
+    const { start, logs } = _auditPageSlice();
+    tbody.replaceChildren();
+    if (!total) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 6; td.className = 'text-center py-xl text-secondary';
+        td.textContent = 'No audit log entries found for the selected filters';
+        tr.appendChild(td); tbody.appendChild(tr);
+    } else {
+        logs.forEach((log, i) => {
+            const gi = start + i;
+            const tr = document.createElement('tr');
+            const tdTime = document.createElement('td'); tdTime.textContent = formatServerTime(log.timestamp); tr.appendChild(tdTime);
+            const tdUser = document.createElement('td'); tdUser.textContent = log.username || '-'; tr.appendChild(tdUser);
+            const tdAction = document.createElement('td');
+            const ab = document.createElement('span'); ab.className = 'badge badge-secondary'; ab.textContent = (log.action || '').replace(/_/g, ' '); tdAction.appendChild(ab); tr.appendChild(tdAction);
+            const tdStatus = document.createElement('td');
+            const sb = document.createElement('span'); sb.className = 'badge badge-' + (log.status === 'success' ? 'success' : 'danger'); sb.textContent = log.status || '-'; tdStatus.appendChild(sb); tr.appendChild(tdStatus);
+            const tdIp = document.createElement('td'); tdIp.textContent = log.ip_address || '-'; tr.appendChild(tdIp);
+            const tdDet = document.createElement('td');
+            const view = document.createElement('button'); view.type = 'button'; view.className = 'btn btn-ghost btn-sm'; view.textContent = 'View';
+            view.addEventListener('click', () => openAuditEventModal(gi));
+            tdDet.appendChild(view); tr.appendChild(tdDet);
+            tbody.appendChild(tr);
+        });
+    }
+    const countBadge = document.getElementById('audit-count');
+    if (countBadge) countBadge.textContent = total + (total === 1 ? ' entry' : ' entries');
+    renderAuditPagination(total, pages);
+}
+
+function renderAuditPagination(total, pages) {
+    const host = document.getElementById('audit-pagination');
+    if (!host) return;
+    host.replaceChildren();
+    if (total <= _AUDIT_PAGE_SIZE) return;
+    const prev = document.createElement('button'); prev.type = 'button'; prev.className = 'btn btn-secondary btn-sm'; prev.textContent = '‹ Prev'; prev.disabled = _auditPage === 0;
+    prev.addEventListener('click', () => { if (_auditPage > 0) { _auditPage--; renderAuditPage(); } });
+    const next = document.createElement('button'); next.type = 'button'; next.className = 'btn btn-secondary btn-sm'; next.textContent = 'Next ›'; next.disabled = _auditPage >= pages - 1;
+    next.addEventListener('click', () => { if (_auditPage < pages - 1) { _auditPage++; renderAuditPage(); } });
+    const label = document.createElement('span'); label.className = 'text-secondary text-sm';
+    const from = _auditPage * _AUDIT_PAGE_SIZE + 1;
+    const to = Math.min(total, (_auditPage + 1) * _AUDIT_PAGE_SIZE);
+    label.textContent = `${from}–${to} of ${total} · page ${_auditPage + 1} of ${pages}`;
+    host.appendChild(prev); host.appendChild(label); host.appendChild(next);
+}
+
+function openAuditEventModal(index) {
+    const modal = document.getElementById('audit-event-modal');
+    if (!modal) return;
+    _renderAuditEventModal(index);
+    modal.classList.add('active');
+}
+
+function _renderAuditEventModal(selectedIndex) {
+    const toc = document.getElementById('audit-event-toc');
+    const detail = document.getElementById('audit-event-detail');
+    if (!toc || !detail) return;
+    const { start, logs } = _auditPageSlice();
+    // Left: a table of contents of every event on the current page (the page is shown in the header).
+    toc.replaceChildren();
+    const head = document.createElement('div'); head.className = 'audit-toc-head text-tertiary text-xs';
+    head.textContent = `Page ${_auditPage + 1} · ${logs.length} event${logs.length === 1 ? '' : 's'}`;
+    toc.appendChild(head);
+    logs.forEach((log, i) => {
+        const gi = start + i;
+        const item = document.createElement('button'); item.type = 'button';
+        item.className = 'audit-toc-item' + (gi === selectedIndex ? ' active' : '');
+        const a = document.createElement('div'); a.className = 'audit-toc-action'; a.textContent = (log.action || '').replace(/_/g, ' '); item.appendChild(a);
+        const m = document.createElement('div'); m.className = 'audit-toc-meta text-tertiary text-xs'; m.textContent = `${log.username || '-'} · ${formatServerTime(log.timestamp)}`; item.appendChild(m);
+        item.addEventListener('click', () => _renderAuditEventModal(gi));
+        toc.appendChild(item);
+    });
+    // Right: every field of the selected event, then the full details payload.
+    detail.replaceChildren();
+    const log = _auditLogs[selectedIndex];
+    if (!log) { const p = document.createElement('p'); p.className = 'text-tertiary'; p.textContent = 'Event not found.'; detail.appendChild(p); return; }
+    const fields = [
+        ['Timestamp', formatServerTime(log.timestamp)],
+        ['User', log.username || '-'],
+        ['Action', (log.action || '').replace(/_/g, ' ')],
+        ['Status', log.status || '-'],
+        ['IP address', log.ip_address || '-'],
+    ];
+    ['resource', 'resource_type', 'target', 'vault_name', 'user_agent', 'user_id'].forEach(k => { if (log[k]) fields.push([k.replace(/_/g, ' '), String(log[k])]); });
+    const grid = document.createElement('div'); grid.className = 'audit-detail-fields';
+    fields.forEach(([k, v]) => {
+        const row = document.createElement('div'); row.className = 'audit-detail-row';
+        const key = document.createElement('div'); key.className = 'audit-detail-key'; key.textContent = k; row.appendChild(key);
+        const val = document.createElement('div'); val.className = 'audit-detail-val'; val.textContent = v; row.appendChild(val);
+        grid.appendChild(row);
+    });
+    detail.appendChild(grid);
+    if (log.details && typeof log.details === 'object' && Object.keys(log.details).length) {
+        const h = document.createElement('div'); h.className = 'audit-detail-key mt-md'; h.textContent = 'Full details'; detail.appendChild(h);
+        const pre = document.createElement('pre'); pre.className = 'audit-detail-json'; pre.textContent = JSON.stringify(log.details, null, 2); detail.appendChild(pre);
+    }
+}
+
 async function searchAuditLog() {
     const tbody = document.getElementById('audit-log-body');
     const countBadge = document.getElementById('audit-count');
@@ -10042,44 +10205,11 @@ async function searchAuditLog() {
         
         const logs = await apiRequest(`/audit/log?${queryParams.toString()}`, { silent: true });
         
-        if (countBadge) {
-            countBadge.textContent = `${logs.length} entries`;
-        }
-        
-        if (logs.length === 0) {
-            tbody.innerHTML = `
-                <tr>
-                    <td colspan="6" class="text-center py-xl text-secondary">
-                        No audit log entries found for the selected filters
-                    </td>
-                </tr>
-            `;
-            return;
-        }
-        
-        tbody.innerHTML = logs.map(log => {
-            // Audit rows are a security record: an unreadable timestamp must not
-            // render as the current instant, which would make an old or corrupted
-            // event look like it just happened.
-            const timestampText = formatServerTime(log.timestamp);
-            const statusClass = log.status === 'success' ? 'success' : 'danger';
-            
-            return `
-                <tr>
-                    <td>${timestampText}</td>
-                    <td>${escapeHtml(log.username || '-')}</td>
-                    <td><span class="badge badge-secondary">${escapeHtml(log.action.replace('_', ' '))}</span></td>
-                    <td><span class="badge badge-${statusClass}">${log.status}</span></td>
-                    <td>${escapeHtml(log.ip_address || '-')}</td>
-                    <td>
-                        <details>
-                            <summary class="cursor-pointer text-primary">View</summary>
-                            <pre class="text-xs mt-sm">${escapeHtml(JSON.stringify(log.details || {}, null, 2))}</pre>
-                        </details>
-                    </td>
-                </tr>
-            `;
-        }).join('');
+        // Store the fetched set and render the first page. Rows and the event modal are built with
+        // DOM APIs (below) so all values go through textContent.
+        _auditLogs = Array.isArray(logs) ? logs : [];
+        _auditPage = 0;
+        renderAuditPage();
     } catch (error) {
         console.error('Failed to search audit log:', error);
         tbody.innerHTML = `
@@ -10248,6 +10378,12 @@ function attachSettingsListeners() {
     if (clearBtn) {
         clearBtn.addEventListener('click', clearAuditFilters);
     }
+
+    // Audit event modal: close on the × and on a backdrop click.
+    const aeModal = document.getElementById('audit-event-modal');
+    const aeClose = document.getElementById('audit-event-close');
+    if (aeClose && aeModal) aeClose.addEventListener('click', () => aeModal.classList.remove('active'));
+    if (aeModal) aeModal.addEventListener('click', (e) => { if (e.target === aeModal) aeModal.classList.remove('active'); });
 }
 
 // Open Vault (Placeholder - needs SFTP integration or file listing)
@@ -10256,7 +10392,7 @@ async function openVault(vaultId) {
         // Validate vault ID
         if (!vaultId) {
             console.error('Invalid vault ID:', vaultId);
-            alert('Invalid vault ID');
+            showError('Invalid vault ID');
             return;
         }
         
@@ -10266,7 +10402,7 @@ async function openVault(vaultId) {
         // Validate vault data
         if (!vault || !vault.id) {
             console.error('Invalid vault data received');
-            alert('Failed to load vault');
+            showError('Failed to load vault');
             return;
         }
         
@@ -10943,7 +11079,11 @@ function openContextMenu(item, x, y) {
     const canWrite = state.canWriteCurrentVault !== false;
     const clipHas = (state.moveCopyClip || []).length > 0;
     const entries = [];
-    const add = (label, icon, action, danger) => entries.push({ label, icon, action, danger });
+    const add = (label, icon, action, danger, disabled, title) => entries.push({ label, icon, action, danger, disabled, title });
+    // When public file/folder links are ENABLED as a feature but no Link tag permits files/folders,
+    // the create action is hidden — surface it as a disabled hint so the setup gap is discoverable.
+    const pflFeatureOn = !!(state._pflPolicy && state._pflPolicy.enabled);
+    const pflHintTitle = 'Enable Files/Folders on a Link tag (Settings → Public Links) to create public links';
     if (isFolder) {
         add('Open', 'folder', 'open-folder');
         if (canWrite && vaultCapAllowed('file.rename')) add('Rename', 'edit', 'rename-folder');
@@ -10951,6 +11091,7 @@ function openContextMenu(item, x, y) {
         if (canWrite && vaultCapAllowed('folder.create')) add(clipHas ? 'Add to move list' : 'Move', 'move', 'move-folder');
         if (vaultShareable()) add('Share', 'link', 'share-folder');
         if (state._pflEnabled && vaultShareable()) add('Public link', 'globe', 'publiclink-folder');
+        else if (pflFeatureOn && vaultShareable()) add('Public link', 'globe', null, false, true, pflHintTitle);
         if (canWrite && vaultCapAllowed('folder.delete')) add('Delete', 'trash', 'delete-folder', true);
     } else {
         const canDownload = vaultCapAllowed('file.download');
@@ -10960,6 +11101,7 @@ function openContextMenu(item, x, y) {
         if (canWrite && vaultCapAllowed('file.delete')) add(clipHas ? 'Add to move list' : 'Move', 'move', 'move-file');
         if (vaultShareable()) add('Share', 'link', 'share-file');
         if (state._pflEnabled && vaultShareable()) add('Public link', 'globe', 'publiclink-file');
+        else if (pflFeatureOn && vaultShareable()) add('Public link', 'globe', null, false, true, pflHintTitle);
         if (canDownload) add('Download', 'download', 'download');
         if (vaultCapAllowed('vault.see_files')) add('File info', 'info', 'file-info');
         // The hash is content-derived, so only offer "Copy SHA-256" to a principal who can download
@@ -10972,13 +11114,15 @@ function openContextMenu(item, x, y) {
     entries.forEach(en => {
         const b = document.createElement('button');
         b.type = 'button';
-        b.className = 'context-menu-item' + (en.danger ? ' danger' : '');
+        b.className = 'context-menu-item' + (en.danger ? ' danger' : '') + (en.disabled ? ' is-hint' : '');
         b.setAttribute('role', 'menuitem');
-        b.setAttribute('data-action', en.action);
+        if (en.action) b.setAttribute('data-action', en.action);
+        if (en.title) b.title = en.title;
         const lbl = document.createElement('span');
         lbl.textContent = en.label;
         b.append(_svgUse(en.icon), lbl);
-        b.addEventListener('click', () => { closeContextMenu(); runFileAction(en.action, item.id, item.name); });
+        if (en.disabled) { b.disabled = true; }
+        else b.addEventListener('click', () => { closeContextMenu(); runFileAction(en.action, item.id, item.name); });
         menu.appendChild(b);
     });
     menu.hidden = false;
@@ -12183,6 +12327,14 @@ async function setupEncryptionKey() {
         if (setupBtn) setupBtn.disabled = true;
         await zkRegisterNewKeypair();
         showSuccess('Encryption key set up. You can now use and be granted zero-knowledge vaults.');
+        // If we got here from an interrupted ZK vault create, close the key modal and re-open the
+        // create-vault modal (its entered values are intact) so the user just clicks Create again.
+        if (_reopenCreateVaultAfterKey) {
+            _reopenCreateVaultAfterKey = false;
+            const km = document.getElementById('encryption-key-modal'); if (km) km.classList.remove('active');
+            const cvm = document.getElementById('create-vault-modal'); if (cvm) cvm.classList.add('active');
+            showInfo('Encryption key ready — finish creating your zero-knowledge vault.');
+        }
     } catch (e) {
         const msg = (e && e.message) || '';
         if (e && e.status === 409) {
@@ -16102,29 +16254,59 @@ async function loadVaultGroupAccess() {
         const accessList = Array.isArray(access) ? access : [];
         const accessIds = new Set(accessList.map(a => a.group_id));
         const addable = (Array.isArray(groups) ? groups : []).filter(g => !accessIds.has(g.id));
-        el.innerHTML = `
-            ${addable.length ? `
+        // Department access rendered as the SAME .data-table as the per-user permissions table:
+        // member count, an inline editable access level (the grant endpoint upserts), granted date,
+        // and revoke. Member counts come from /groups (admin only) and degrade to a dash otherwise.
+        const memberCount = new Map((Array.isArray(groups) ? groups : []).map(g => [g.id, g.member_count]));
+        const fmtCount = (n) => (n == null ? '—' : (n + (n === 1 ? ' member' : ' members')));
+        const grantedDate = (iso) => { const d = iso ? parseServerTime(iso) : null; return (d && !isNaN(d)) ? d.toLocaleDateString() : '—'; };
+        const addRow = addable.length ? `
                 <div class="group-add-member mb-md">
                     <select id="vga-group-select" class="form-control"><option value="">Add a department…</option>${addable.map(g => `<option value="${g.id}">${escapeHtml(g.name)}</option>`).join('')}</select>
                     <select id="vga-perm-select" class="form-control" style="max-width:160px"><option value="read">Read only</option><option value="write">Read &amp; write</option></select>
                     <button id="vga-add-btn" class="btn btn-secondary">${iconSvg('plus', 'icon-sm')} Add</button>
-                </div>` : ''}
-            <div class="member-list">
-                ${accessList.length ? accessList.map(a => `
-                    <div class="member-row">
-                        <span class="tree-dot" style="--chip:${chipColorValue(a.color)}"></span>
-                        <div class="cell-user-text"><span class="cell-user-name">${escapeHtml(a.name)}</span></div>
-                        <span class="badge badge-${a.permission === 'write' ? 'success' : 'info'}">${a.permission === 'write' ? 'Read & write' : 'Read only'}</span>
-                        <button class="btn btn-sm btn-ghost vga-remove" data-group-id="${a.group_id}" title="Revoke access">${iconSvg('x', 'icon-sm')}</button>
-                    </div>`).join('') : '<div class="text-tertiary text-sm p-sm">No departments have access — only the owner and individually-added users can open this vault.</div>'}
-            </div>`;
+                </div>` : '';
+        let body;
+        if (accessList.length) {
+            body = `
+            <table class="data-table">
+                <thead><tr><th>Department</th><th>Members</th><th>Access</th><th>Granted</th><th></th></tr></thead>
+                <tbody>
+                ${accessList.map(a => `
+                    <tr>
+                        <td><span style="display:inline-flex;align-items:center;gap:8px"><span class="tree-dot" style="--chip:${chipColorValue(a.color)}"></span>${escapeHtml(a.name)}</span></td>
+                        <td>${memberCount.get(a.group_id) == null ? '—' : `<button type="button" class="vga-members" data-group-id="${a.group_id}" data-group-name="${escapeHtml(a.name)}">${fmtCount(memberCount.get(a.group_id))}</button>`}</td>
+                        <td>
+                            <select class="form-control form-control-sm vga-level-select" data-group-id="${a.group_id}" style="max-width:170px">
+                                <option value="read" ${a.permission !== 'write' ? 'selected' : ''}>Read only</option>
+                                <option value="write" ${a.permission === 'write' ? 'selected' : ''}>Read &amp; write</option>
+                            </select>
+                        </td>
+                        <td>${grantedDate(a.added_at)}</td>
+                        <td><button class="action-btn action-btn-danger vga-remove" data-group-id="${a.group_id}">Revoke</button></td>
+                    </tr>`).join('')}
+                </tbody>
+            </table>`;
+        } else {
+            const noneExist = currentUser.role === 'admin' && (Array.isArray(groups) ? groups : []).length === 0;
+            body = `<div class="text-tertiary text-sm p-sm">${noneExist
+                ? 'No departments exist yet. Create departments in the admin Groups area, then grant them access here.'
+                : 'No departments have access yet — only the owner and individually-added users can open this vault. Use “Add a department” above to grant a whole department access.'}</div>`;
+        }
+        el.replaceChildren();
+        el.insertAdjacentHTML('beforeend', addRow + body);
         const addBtn = document.getElementById('vga-add-btn');
         if (addBtn) addBtn.onclick = () => {
             const gid = document.getElementById('vga-group-select').value;
             const perm = document.getElementById('vga-perm-select').value;
             if (gid) addVaultGroupAccess(gid, perm);
         };
+        // Inline access change — grant endpoint upserts, so re-POSTing updates in place (matches users).
+        el.querySelectorAll('select.vga-level-select').forEach(sel => {
+            sel.addEventListener('change', () => addVaultGroupAccess(sel.dataset.groupId, sel.value));
+        });
         el.querySelectorAll('.vga-remove').forEach(b => { b.onclick = () => removeVaultGroupAccess(b.dataset.groupId); });
+        el.querySelectorAll('.vga-members').forEach(b => { b.onclick = () => openGroupMembersModal(b.dataset.groupId, b.dataset.groupName); });
     } catch (e) {
         el.innerHTML = `<div class="alert alert-error">Failed to load department access: ${escapeHtml(e.message)}</div>`;
     }
@@ -16144,6 +16326,49 @@ async function removeVaultGroupAccess(groupId) {
         showSuccess('Department access revoked');
         await loadVaultGroupAccess();
     } catch (e) { showError('Failed to revoke access: ' + e.message); }
+}
+
+// Show the members of a department (group) in a modal — opened from the Members count in the vault
+// Permissions tab. Uses the admin group-detail endpoint; built with DOM APIs (textContent only).
+async function openGroupMembersModal(groupId, groupName) {
+    let members = [];
+    try {
+        const g = await apiRequest('/groups/' + encodeURIComponent(groupId), { silent: true });
+        members = (g && g.members) || [];
+    } catch (e) { showError('Could not load department members.'); return; }
+    document.querySelectorAll('.vga-members-modal').forEach(m => m.remove());
+    const modal = document.createElement('div');
+    modal.className = 'modal active vga-members-modal';
+    modal.setAttribute('role', 'dialog'); modal.setAttribute('aria-modal', 'true');
+    const content = document.createElement('div'); content.className = 'modal-content'; content.style.maxWidth = '540px';
+    const header = document.createElement('div'); header.className = 'modal-header';
+    const h = document.createElement('h3'); h.textContent = 'Members of ' + (groupName || 'department'); header.appendChild(h);
+    const close = document.createElement('button'); close.className = 'modal-close'; close.type = 'button';
+    close.setAttribute('aria-label', 'Close'); close.textContent = '×';
+    close.addEventListener('click', () => modal.remove());
+    header.appendChild(close);
+    const body = document.createElement('div'); body.className = 'modal-body';
+    if (!members.length) {
+        const p = document.createElement('p'); p.className = 'text-tertiary text-sm';
+        p.textContent = 'This department has no members yet.'; body.appendChild(p);
+    } else {
+        const table = document.createElement('table'); table.className = 'data-table';
+        const thead = document.createElement('thead'); const hr = document.createElement('tr');
+        ['User', 'Email', 'Role'].forEach(t => { const th = document.createElement('th'); th.textContent = t; hr.appendChild(th); });
+        thead.appendChild(hr); table.appendChild(thead);
+        const tb = document.createElement('tbody');
+        members.forEach(m => {
+            const tr = document.createElement('tr');
+            const u = document.createElement('td'); u.textContent = m.username || '—'; tr.appendChild(u);
+            const e = document.createElement('td'); e.textContent = m.email || '—'; tr.appendChild(e);
+            const r = document.createElement('td'); r.textContent = m.group_role || m.role || '—'; tr.appendChild(r);
+            tb.appendChild(tr);
+        });
+        table.appendChild(tb); body.appendChild(table);
+    }
+    content.appendChild(header); content.appendChild(body); modal.appendChild(content);
+    modal.addEventListener('click', (ev) => { if (ev.target === modal) modal.remove(); });
+    document.body.appendChild(modal);
 }
 
 // --- Searchable "Grant access" modal for individual users -------------------
@@ -16958,7 +17183,7 @@ function renderAdminNoteLinks(data) {
     links.forEach(l => {
         const tr = _el('tr');
         tr.appendChild(_el('td', '', l.owner || '—'));
-        const typeTd = _el('td', 'nl-tag-idlead');
+        const typeTd = _el('td', 'nl-tag-cell');
         const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
         if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
         typeTd.appendChild(_el('span', '', l.tag_name || '—'));
@@ -17063,6 +17288,20 @@ async function loadNoteLinkTags() {
         noteLinkTagsCache = Array.isArray(tags) ? tags : [];
     } catch (_) { noteLinkTagsCache = []; }
     renderNoteLinkTagsList();
+    updatePflTagWarning();
+}
+
+// Warn (in Settings) when public file/folder links are enabled but no Link tag actually permits files
+// or folders — the toggle alone can't create anything, which is an easy trap. Shown/hidden from the
+// tag list load, the toggle change, and settings load.
+function updatePflTagWarning() {
+    const warn = document.getElementById('pfl-no-tag-warning');
+    if (!warn) return;
+    const toggle = document.getElementById('setting-public-file-links-enabled');
+    const enabled = !!(toggle && toggle.checked);
+    const anyFileFolderTag = noteLinkTagsCache.some(t =>
+        (t.allowed_targets || []).some(x => x === 'file' || x === 'folder'));
+    warn.hidden = !(enabled && !anyFileFolderTag);
 }
 
 function _nlSecretLabel(t) {
@@ -18011,7 +18250,7 @@ function renderMyPublicLinks(links) {
     const tb = _el('tbody');
     links.forEach(l => {
         const tr = _el('tr');
-        const typeTd = _el('td', 'nl-tag-idlead');
+        const typeTd = _el('td', 'nl-tag-cell');
         const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
         if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
         typeTd.appendChild(_el('span', '', l.tag_name || '—'));
@@ -18081,7 +18320,7 @@ function renderAdminPublicLinks(data) {
     links.forEach(l => {
         const tr = _el('tr');
         tr.appendChild(_el('td', '', l.owner || '—'));
-        const typeTd = _el('td', 'nl-tag-idlead');
+        const typeTd = _el('td', 'nl-tag-cell');
         const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
         if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
         typeTd.appendChild(_el('span', '', l.tag_name || '—'));
@@ -18133,6 +18372,9 @@ function setupPublicFileLinkUI() {
     document.querySelectorAll('[data-pflm-close]').forEach(el => el.addEventListener('click', () => closeModal()));
     const aRefresh = _pflEl('pfl-admin-refresh'); if (aRefresh) aRefresh.addEventListener('click', loadAdminPublicLinks);
     const aRevokeAll = _pflEl('pfl-admin-revoke-all'); if (aRevokeAll) aRevokeAll.addEventListener('click', adminRevokeAllPublicLinks);
+    // Toggling the file-links feature updates the "no file/folder tag" warning immediately.
+    const pflToggle = document.getElementById('setting-public-file-links-enabled');
+    if (pflToggle) pflToggle.addEventListener('change', updatePflTagWarning);
 }
 
 // ======================= Upload links (receivers) ==================================================
@@ -18166,10 +18408,90 @@ async function loadMyReceivers() {
     host.replaceChildren(_el('div', 'spinner'));
     try {
         const data = await apiRequest('/receivers', { silent: true });
-        renderMyReceivers((data && data.receivers) || []);
+        const receivers = (data && data.receivers) || [];
+        renderMyReceivers(receivers);            // Links tab (table)
+        renderReceiverVaults(receivers);          // Drop vaults tab (cards)
     } catch (e) {
         host.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load your upload links: ' + ((e && e.message) || '')));
     }
+}
+
+// Drop-vaults tab: each upload link's dedicated vault as a card with a storage ring, an Open action
+// (opens the vault in place), and an Info action (the link's full details). DOM APIs only.
+function renderReceiverVaults(receivers) {
+    const host = _rcEl('receivers-vaults'); if (!host) return;
+    host.replaceChildren();
+    if (!receivers.length) {
+        host.appendChild(_el('p', 'text-tertiary text-sm', 'No upload links yet — create one to get a drop vault.'));
+        return;
+    }
+    const grid = document.createElement('div'); grid.className = 'rc-vault-grid';
+    receivers.forEach(r => {
+        const card = document.createElement('div'); card.className = 'card rc-vault-card';
+        const head = document.createElement('div'); head.className = 'rc-vault-head';
+        if (r.tag_icon) head.appendChild(_svgIcon(r.tag_icon, 'icon-sm'));
+        const nm = document.createElement('div'); nm.className = 'rc-vault-name font-medium'; nm.textContent = r.label || 'Upload link'; head.appendChild(nm);
+        const st = document.createElement('span'); st.className = 'badge badge-' + (r.status === 'active' ? 'success' : 'secondary'); st.textContent = _RC_STATUS_LABEL[r.status] || r.status; head.appendChild(st);
+        card.appendChild(head);
+        const pct = (r.max_total_bytes && r.max_total_bytes > 0)
+            ? Math.min(100, Math.round(((r.reserved_bytes || 0) / r.max_total_bytes) * 100)) : null;
+        const ringWrap = document.createElement('div'); ringWrap.className = 'rc-ring-wrap';
+        const ring = document.createElement('div'); ring.className = 'rc-ring';
+        ring.style.background = pct != null
+            ? `conic-gradient(var(--info) ${pct * 3.6}deg, var(--surface-3) 0)` : 'var(--surface-3)';
+        const hole = document.createElement('div'); hole.className = 'rc-ring-hole'; hole.textContent = pct != null ? (pct + '%') : '∞';
+        ring.appendChild(hole); ringWrap.appendChild(ring);
+        const usage = document.createElement('div'); usage.className = 'text-tertiary text-xs';
+        usage.textContent = r.max_total_bytes
+            ? (_mbFromBytes(r.reserved_bytes || 0) + ' / ' + _mbFromBytes(r.max_total_bytes) + ' MB')
+            : (_mbFromBytes(r.reserved_bytes || 0) + ' MB used');
+        ringWrap.appendChild(usage); card.appendChild(ringWrap);
+        const files = document.createElement('div'); files.className = 'text-tertiary text-xs';
+        files.textContent = (r.max_uploads != null) ? ((r.upload_count || 0) + ' / ' + r.max_uploads + ' files') : ((r.upload_count || 0) + ' files');
+        card.appendChild(files);
+        const actions = document.createElement('div'); actions.className = 'rc-vault-actions flex gap-sm';
+        const open = _el('button', 'btn btn-primary btn-sm', 'Open vault'); open.type = 'button';
+        open.addEventListener('click', () => openVault(r.vault_id));
+        const info = _el('button', 'btn btn-secondary btn-sm', 'Info'); info.type = 'button';
+        info.addEventListener('click', () => openReceiverInfoModal(r));
+        actions.appendChild(open); actions.appendChild(info); card.appendChild(actions);
+        grid.appendChild(card);
+    });
+    host.appendChild(grid);
+}
+
+// The Info action on a drop-vault card: the upload link's full details in a modal (same facts as the
+// Links table). DOM APIs only.
+function openReceiverInfoModal(r) {
+    document.querySelectorAll('.rc-info-modal').forEach(m => m.remove());
+    const rows = [
+        ['Label', r.label || '—'],
+        ['Type', r.tag_name || '—'],
+        ['Status', _RC_STATUS_LABEL[r.status] || r.status],
+        ['Protection', r.secret_kind === 'password' ? 'Password' : (r.secret_kind === 'pin' ? 'PIN' : 'None')],
+        ['Expires', _rcExpiryText(r)],
+        ['Files', (r.max_uploads != null) ? ((r.upload_count || 0) + ' / ' + r.max_uploads) : String(r.upload_count || 0)],
+        ['Storage', r.max_total_bytes ? (_mbFromBytes(r.reserved_bytes || 0) + ' / ' + _mbFromBytes(r.max_total_bytes) + ' MB') : (_mbFromBytes(r.reserved_bytes || 0) + ' MB used')],
+        ['Retention', r.retention_days ? (r.retention_days + ' days') : 'Kept'],
+    ];
+    const modal = document.createElement('div'); modal.className = 'modal active rc-info-modal';
+    modal.setAttribute('role', 'dialog'); modal.setAttribute('aria-modal', 'true');
+    const content = document.createElement('div'); content.className = 'modal-content'; content.style.maxWidth = '480px';
+    const header = document.createElement('div'); header.className = 'modal-header';
+    const h = document.createElement('h3'); h.textContent = r.label || 'Upload link'; header.appendChild(h);
+    const close = document.createElement('button'); close.className = 'modal-close'; close.type = 'button'; close.setAttribute('aria-label', 'Close'); close.textContent = '×';
+    close.addEventListener('click', () => modal.remove()); header.appendChild(close);
+    const body = document.createElement('div'); body.className = 'modal-body';
+    const grid = document.createElement('div'); grid.className = 'audit-detail-fields';
+    rows.forEach(([k, v]) => {
+        const key = document.createElement('div'); key.className = 'audit-detail-key'; key.textContent = k;
+        const val = document.createElement('div'); val.className = 'audit-detail-val'; val.textContent = v;
+        grid.appendChild(key); grid.appendChild(val);
+    });
+    body.appendChild(grid);
+    content.appendChild(header); content.appendChild(body); modal.appendChild(content);
+    modal.addEventListener('click', (ev) => { if (ev.target === modal) modal.remove(); });
+    document.body.appendChild(modal);
 }
 
 function _rcExpiryText(r) { return r.expires_at ? (typeof _fmtLinkExpiry === 'function' ? _fmtLinkExpiry(r.expires_at).replace(/^Expires /, '') : r.expires_at) : 'Never'; }
@@ -18185,7 +18507,7 @@ function renderMyReceivers(receivers) {
     receivers.forEach(r => {
         const tr = _el('tr');
         tr.appendChild(_el('td', '', r.label || '—'));
-        const typeTd = _el('td', 'nl-tag-idlead');
+        const typeTd = _el('td', 'nl-tag-cell');
         const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(r.tag_border_color) : '';
         if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
         typeTd.appendChild(_el('span', '', r.tag_name || '—'));
@@ -18556,6 +18878,17 @@ function setupReceiverUI() {
     const secret = _rcEl('rc-secret'); if (secret) secret.addEventListener('change', onRcSecretChange);
     const copy = _rcEl('rc-copy'); if (copy) copy.addEventListener('click', copyRcLink);
     document.querySelectorAll('[data-rc-close]').forEach(el => el.addEventListener('click', () => closeModal()));
+    // Links / Drop-vaults tab switching on the Upload Links page.
+    document.querySelectorAll('#uploadlinks-section [data-rc-tab]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const tab = btn.dataset.rcTab;
+            document.querySelectorAll('#uploadlinks-section [data-rc-tab]').forEach(b => b.classList.toggle('active', b === btn));
+            const links = document.getElementById('receivers-tab-links');
+            const vaults = document.getElementById('receivers-tab-vaults');
+            if (links) links.style.display = tab === 'links' ? '' : 'none';
+            if (vaults) vaults.style.display = tab === 'vaults' ? '' : 'none';
+        });
+    });
 }
 
 function wireNotesOnce() {
@@ -18626,6 +18959,7 @@ function closeModal() {
     document.querySelectorAll('.modal').forEach(modal => {
         modal.classList.remove('active');
     });
+    _reopenCreateVaultAfterKey = false;  // a manual close cancels a pending "reopen create after key setup"
     closeFilePreview(); // free any in-memory decrypted preview blob
     clearCredentialInputsOnClose();
     if (typeof _stepUpSettle === 'function') _stepUpSettle(null);
@@ -18663,7 +18997,7 @@ function copyToClipboard(elementId) {
             element.textContent = originalText;
         }, 2000);
     }).catch(err => {
-        alert('Failed to copy: ' + err);
+        showError('Failed to copy: ' + err);
     });
 }
 

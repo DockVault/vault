@@ -9,11 +9,11 @@
   <style>
     :root {
       --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #e2e8f0;
-      --muted: #94a3b8; --accent: #6366f1; --accent-fg: #ffffff; --danger: #f87171; --ok: #34d399;
+      --muted: #94a3b8; --accent: #2563eb; --accent-fg: #ffffff; --danger: #f87171; --ok: #34d399;
     }
     @media (prefers-color-scheme: light) {
       :root { --bg: #f1f5f9; --card: #ffffff; --border: #e2e8f0; --text: #0f172a;
-              --muted: #64748b; --accent: #6366f1; --accent-fg: #ffffff; --danger: #dc2626; --ok: #059669; }
+              --muted: #64748b; --accent: #2563eb; --accent-fg: #ffffff; --danger: #dc2626; --ok: #059669; }
     }
     * { box-sizing: border-box; }
     body {
@@ -23,20 +23,20 @@
     }
     .wrap { width: 100%; max-width: 640px; }
     .card {
-      background: var(--card); border: 1px solid var(--border); border-radius: 14px;
-      padding: 1.75rem; box-shadow: 0 10px 30px rgba(0,0,0,.15);
+      background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+      padding: 1.75rem; box-shadow: 0 4px 14px rgba(0,0,0,.10);
     }
     .brand { color: var(--muted); font-size: .8rem; letter-spacing: .04em; text-transform: uppercase;
              margin-bottom: 1rem; }
     h1 { font-size: 1.4rem; margin: 0 0 1rem; }
     label { display: block; font-size: .9rem; margin-bottom: .4rem; color: var(--muted); }
     input[type="password"], input[type="text"], input[type="file"] {
-      width: 100%; padding: .7rem .8rem; font-size: 1rem; border-radius: 9px;
+      width: 100%; padding: .7rem .8rem; font-size: 1rem; border-radius: 8px;
       border: 1px solid var(--border); background: var(--bg); color: var(--text); margin-bottom: 1rem;
     }
     button {
-      width: 100%; padding: .75rem 1rem; font-size: 1rem; font-weight: 600;
-      border: 0; border-radius: 9px; background: var(--accent); color: var(--accent-fg); cursor: pointer;
+      width: 100%; padding: .75rem 1rem; font-size: 1rem; font-weight: 550;
+      border: 0; border-radius: 8px; background: var(--accent); color: var(--accent-fg); cursor: pointer;
     }
     button:disabled { opacity: .6; cursor: default; }
     .bar { height: 8px; border-radius: 6px; background: var(--border); overflow: hidden; margin: 1rem 0; }

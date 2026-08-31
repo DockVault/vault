@@ -77,12 +77,12 @@ def test_load_from_default_replaces_subject_and_body(admin_page: Page, admin):
     dt = {p["key"]: p for p in admin.get("/email/default-templates").json()["templates"]}
     welcome = dt["account_welcome"]
     page = admin_page
-    page.on("dialog", lambda d: d.accept())          # confirm the destructive replace
     _open_email_tab(page)
     _new_template(page, name="LF2", subject="orig subject", body="<p>orig body</p>")
     page.click("#et-load-from")
     expect(page.locator("#et-loadfrom-menu")).to_be_visible()
     page.locator('.et-loadfrom-item:has-text("Welcome email")').first.click()
+    page.click("#confirm-modal-confirm-btn")         # themed confirm for the destructive replace
     # subject + body now hold the default's content
     expect(page.locator("#et-subject")).to_have_value(welcome["subject"])
     expect(page.locator("#et-body")).to_have_value(welcome["body_html"])
@@ -93,10 +93,10 @@ def test_load_from_your_template_loads_its_body(admin_page: Page, admin):
     admin.post("/email/templates", json={"name": "Source Copy", "subject": "src subj",
                                          "body_html": "<p>source body {{user.username}}</p>"})
     page = admin_page
-    page.on("dialog", lambda d: d.accept())
     _open_email_tab(page)
     _new_template(page, name="LF3", subject="x", body="<p>x</p>")
     page.click("#et-load-from")
     page.locator('.et-loadfrom-item:has-text("Source Copy")').first.click()
+    page.click("#confirm-modal-confirm-btn")         # themed confirm for the destructive replace
     expect(page.locator("#et-subject")).to_have_value("src subj")
     expect(page.locator("#et-body")).to_have_value("<p>source body {{user.username}}</p>")

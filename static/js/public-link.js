@@ -40,9 +40,11 @@
     return (d && typeof d === "object") ? d : {};
   }
 
-  function redeem() {
+  function redeem(peek) {
     var body = {};
     if (secret != null) { body.secret = secret; }
+    // A peek renders the landing page WITHOUT spending a use; the download click re-redeems for real.
+    if (peek) { body.peek = true; }
     return fetch("/public-links/" + encodeURIComponent(token) + "/redeem", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -174,7 +176,7 @@
     var btn = $("secret-submit"); var input = $("secret-input");
     secret = input.value;
     btn.disabled = true;
-    redeem().then(handle)
+    redeem(true).then(handle)
       .catch(function () { notice("Network error. Please try again."); })
       .then(function () { btn.disabled = false; });
   }
@@ -184,7 +186,7 @@
     $("secret-form").addEventListener("submit", submitSecret);
     // First try with no secret: a public link renders immediately; a protected one returns 401 with
     // its secret_kind and we prompt (no use consumed, no failed attempt recorded).
-    redeem().then(handle).catch(function () { notice("Network error. Please try again."); });
+    redeem(true).then(handle).catch(function () { notice("Network error. Please try again."); });
   }
 
   if (document.readyState === "loading") {

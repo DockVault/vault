@@ -202,12 +202,12 @@ def test_client_script_pre_check_blocks_save(admin_page: Page, admin):
 
 def test_delete_template(admin_page: Page, admin):
     page = admin_page
-    page.on("dialog", lambda d: d.accept())
     _open_email_tab(page)
     _new_template(page, name="Doomed")
     page.click("#et-save")
     expect(page.locator('.email-profile-card:has-text("Doomed")')).to_be_visible(timeout=10000)
     page.locator('.email-profile-card:has-text("Doomed") .etc-delete').click()
+    page.click("#confirm-modal-confirm-btn")         # themed confirm for the delete
     expect(page.locator('.email-profile-card:has-text("Doomed")')).to_have_count(0, timeout=10000)
 
 

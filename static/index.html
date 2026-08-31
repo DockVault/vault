@@ -960,7 +960,16 @@
                         <button id="receiver-new-btn" class="btn btn-primary btn-sm" type="button"><svg class="icon icon-sm"><use href="#i-plus"/></svg> New upload link</button>
                     </div>
                     <p class="text-secondary text-sm mb-md">An upload link lets anyone you share it with send files to you — no account needed. Each link drops uploads into its own dedicated vault that only you can open. Pause a link to stop new uploads without losing what's already in it; revoke it to close it for good.</p>
-                    <div id="receivers-list" style="overflow-x:auto;"></div>
+                    <div class="tabs mb-lg" role="tablist">
+                        <button class="tab-btn active" type="button" data-rc-tab="links">Links</button>
+                        <button class="tab-btn" type="button" data-rc-tab="vaults">Drop vaults</button>
+                    </div>
+                    <div id="receivers-tab-links" class="rc-tab-panel">
+                        <div id="receivers-list" style="overflow-x:auto;"></div>
+                    </div>
+                    <div id="receivers-tab-vaults" class="rc-tab-panel" style="display:none;">
+                        <div id="receivers-vaults"></div>
+                    </div>
                 </div>
 
                 <!-- Create an upload link (receiver). -->
@@ -1434,7 +1443,7 @@
                     </div>
 
                     <!-- Metrics Cards -->
-                    <div class="grid grid-cols-3 gap-lg mb-xl">
+                    <div class="grid grid-cols-3 gap-md mb-lg monitor-metrics">
                         <div class="card">
                             <div class="flex items-center gap-md">
                                 <div class="monitor-metric-icon mm-accent">
@@ -1504,6 +1513,7 @@
                                 <p class="text-sm">Real-time events will appear here</p>
                             </div>
                         </div>
+                        <div id="monitor-pagination" class="audit-pagination mt-md"></div>
                     </div>
                 </div>
 
@@ -1824,7 +1834,7 @@
                                 <div id="mfa-actions-msg" class="alert mt-sm" role="status" style="display:none;"></div>
                                 <div id="mfa-actions-table"></div>
                                 <button type="button" id="save-mfa-actions-btn" class="btn btn-primary mt-md" disabled>Save requirements</button>
-                                <small class="text-secondary" style="display:block; margin-top:8px;">Toggle the options above, then save once — you'll confirm your second factor a single time.</small>
+                                <small class="text-secondary" style="display:block; margin-top:8px;">Toggle the options above, then save once.</small>
                             </div>
                         </div>
 
@@ -2435,6 +2445,10 @@
                                     <span>Allow users to create public links to files and folders</span>
                                 </label>
                                 <p class="text-secondary text-sm mt-sm">When enabled, a user can turn a file or folder in a Standard vault into a link that anyone can download from (no sign-in). Unlike note links these serve the <strong>live</strong> file, not a snapshot. They are governed by the <strong>same tags below</strong> — a tag only offers file/folder links when its "Can be used for" list includes them — and share the <strong>same per-user cap</strong> as note links. Turning this off immediately <strong>pauses</strong> every public file link (they stop opening) without deleting them; revoke them under "All public file &amp; folder links" below to stop them permanently.</p>
+                                <div id="pfl-no-tag-warning" class="alert alert-warning mt-md" hidden>
+                                    <svg class="icon icon-sm"><use href="#i-alert-triangle"/></svg>
+                                    <div class="alert-content">This is <strong>on</strong>, but no Link tag allows files or folders yet — so no one can actually create these links. Edit a tag below (or add one) and include <strong>Files</strong> and/or <strong>Folders</strong> in its “Can be used for” list.</div>
+                                </div>
                             </div>
                         </div>
 
@@ -2881,6 +2895,7 @@
                                     </tbody>
                                 </table>
                             </div>
+                            <div id="audit-pagination" class="audit-pagination mt-md"></div>
                         </div>
                     </div>
 
@@ -3068,7 +3083,7 @@
                                         <label class="checkbox-label" style="margin-top:8px;">
                                             <input type="checkbox" id="vault-hierarchical"> Team mode (hierarchical key)
                                         </label>
-                                        <small class="form-help">For large teams: the vault key is wrapped once to a shared team key, so adding members and routine key rotation stay fast (O(1)). Removing a member still rotates the team key. Zero-knowledge — the server never sees the key.</small>
+                                        <small class="form-help">For large teams: the vault key is wrapped once to a shared team key, so adding members and routine key rotation stay fast. Removing a member still rotates the team key. Zero-knowledge — the server never sees the key.</small>
                                     </div>
                                 </div>
                                 <small class="form-help" id="zk-unavailable-note" style="display:none;"></small>
@@ -3888,6 +3903,20 @@
                     <div class="modal-footer">
                         <button type="button" class="btn btn-secondary" id="confirm-modal-cancel-btn">Cancel</button>
                         <button type="button" id="confirm-modal-confirm-btn" class="btn btn-primary">Confirm</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Audit event detail modal (80vw): left = the page's events (TOC), right = full detail -->
+            <div id="audit-event-modal" class="modal" role="dialog" aria-modal="true" aria-label="Audit event details">
+                <div class="modal-content audit-event-content">
+                    <div class="modal-header">
+                        <h3>Audit event</h3>
+                        <button class="close-modal-btn modal-close" id="audit-event-close" aria-label="Close">×</button>
+                    </div>
+                    <div class="modal-body audit-event-body">
+                        <div class="audit-event-toc" id="audit-event-toc"></div>
+                        <div class="audit-event-detail" id="audit-event-detail"></div>
                     </div>
                 </div>
             </div>

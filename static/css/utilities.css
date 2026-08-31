@@ -124,6 +124,10 @@
     animation: slideInRight var(--transition-base);
 }
 
+/* Raw-icon alerts (a leading <svg> followed by .alert-content or inline text): keep the icon from
+   squishing under flex and nudge it onto the first text line instead of the line-box top. */
+.alert > svg { flex-shrink: 0; margin-top: 0.15em; }
+
 @keyframes slideInRight {
     from {
         transform: translateX(-20px);

@@ -1694,6 +1694,11 @@ button.vault-sort-dir {
     gap: var(--spacing-sm);
     border-bottom: 2px solid var(--surface-2);
     margin-bottom: var(--spacing-lg);
+    /* Keep the tab strip on ONE row and scroll horizontally when it overflows, instead of wrapping
+       to several rows (which grew the strip's height and showed a vertical scrollbar). */
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
 }
 
 .tab-btn {
@@ -1707,6 +1712,8 @@ button.vault-sort-dir {
     transition: all var(--transition-base);
     position: relative;
     bottom: -2px;
+    flex-shrink: 0;        /* never squeeze a tab; the strip scrolls instead */
+    white-space: nowrap;
 }
 
 .tab-btn:hover {
@@ -2177,6 +2184,81 @@ details summary:hover {
 .ci-mixed-h { font-size: var(--text-sm); font-weight: 600; margin: var(--space-sm) 0 4px 0; color: var(--text-primary); }
 .ci-mixed-list { margin: 0 0 var(--space-sm) 0; padding-left: 20px; max-height: 30vh; overflow-y: auto; }
 .ci-mixed-list li { font-size: var(--text-sm); color: var(--text-secondary); word-break: break-word; }
+
+/* Vault type badge (Standard vs Zero-knowledge) — shown on vault cards and the vault Info panel so
+   the encryption model is visible at a glance. Shared across skins; colours ride the theme tokens. */
+.vault-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 0.7rem; font-weight: 600; letter-spacing: .01em;
+    padding: 2px 8px; border-radius: 999px; line-height: 1.35;
+    border: 1px solid transparent; width: fit-content; margin: 2px 0 4px;
+}
+.vault-badge .icon { width: 12px; height: 12px; flex-shrink: 0; }
+.vault-badge-zk  { background: color-mix(in srgb, var(--info) 14%, transparent);          color: var(--info);            border-color: color-mix(in srgb, var(--info) 34%, transparent); }
+.vault-badge-std { background: color-mix(in srgb, var(--text-tertiary) 14%, transparent); color: var(--text-secondary);  border-color: color-mix(in srgb, var(--text-tertiary) 26%, transparent); }
+
+/* Compact Live-Monitor metric tiles — the default cards were oversized for three small counters. */
+.monitor-metrics .card { padding: var(--space-md) var(--space-lg); }
+.monitor-metrics .monitor-metric-icon { width: 36px; height: 36px; }
+.monitor-metrics .monitor-metric-icon .icon { width: 18px; height: 18px; }
+.monitor-metrics .text-2xl { font-size: 1.5rem; line-height: 1.15; }
+
+/* Settings description/hint paragraphs fill their card width. The global p{max-width:70ch} reading
+   cap otherwise renders them as a narrow left column inside a wide settings card (e.g. the link-tag
+   explainer), wasting the right half of the row. */
+.settings-tab-content .p-lg > p { max-width: none; }
+
+/* Type/tag cell in the public-link and upload-link admin tables. It previously reused
+   .nl-tag-idlead (display:inline-flex) directly on the <td>, which stops it being a table cell —
+   the column stopped aligning and the row grew taller than its siblings. Keep the <td> a real cell
+   and lay out the colour dot + icon + name inline instead. */
+.nl-tag-cell { white-space: nowrap; }
+.nl-tag-cell .nl-color-dot { margin-right: 6px; vertical-align: middle; }
+.nl-tag-cell .icon { vertical-align: middle; margin-right: 4px; }
+.nl-tag-cell > span { vertical-align: middle; }
+
+/* Settings tag lists are capped to a few rows and scroll, so a long list doesn't push the tag editor
+   that sits below it out of view. Covers share tags, note-link tags, and upload-link (receiver) tags. */
+#share-tags-list, #nl-tags-list, #rt-tags-list { max-height: 260px; overflow-y: auto; }
+
+/* Link-styled Members count in the vault Permissions department table (opens the members modal). */
+.vga-members { background: none; border: none; padding: 0; font: inherit; cursor: pointer; color: var(--info); text-decoration: underline; text-underline-offset: 2px; }
+.vga-members:hover { color: var(--text-primary); }
+
+/* Upload Links -> Drop vaults tab: each link's dedicated vault as a card with a storage ring. */
+.rc-vault-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: var(--space-md); }
+.rc-vault-card { display: flex; flex-direction: column; align-items: center; gap: var(--space-sm); text-align: center; padding: var(--space-lg); background: var(--surface-1); }
+.rc-vault-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: center; }
+.rc-vault-name { overflow-wrap: anywhere; }
+.rc-ring-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.rc-ring { width: 84px; height: 84px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
+.rc-ring-hole { width: 62px; height: 62px; border-radius: 50%; background: var(--surface-1); display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 0.95rem; color: var(--text-primary); }
+.rc-vault-actions { margin-top: auto; }
+
+/* Disabled "hint" item in the file context menu (e.g. Public link when no Link tag permits files). */
+.context-menu-item:disabled, .context-menu-item.is-hint { opacity: .5; cursor: default; }
+
+/* Audit event modal: an 80vw dialog with a scrollable table-of-contents of the page's events on the
+   left and the selected event's full detail on the right, plus the audit pagination strip. */
+.audit-event-content { width: 80vw; max-width: 80vw; }
+.audit-event-body { display: flex; gap: var(--space-lg); align-items: stretch; }
+.audit-event-toc { flex: 0 0 300px; width: 300px; max-height: 65vh; overflow-y: auto; padding-right: var(--space-md); border-right: 1px solid var(--border-color); }
+.audit-event-detail { flex: 1; min-width: 0; max-height: 65vh; overflow-y: auto; }
+.audit-toc-head { padding: 2px 2px 8px; }
+.audit-toc-item { display: block; width: 100%; text-align: left; background: transparent; border: none; border-left: 3px solid transparent; border-radius: var(--radius-md); padding: 8px 10px; margin-bottom: 2px; cursor: pointer; color: var(--text-secondary); }
+.audit-toc-item:hover { background: var(--surface-2); }
+.audit-toc-item.active { background: var(--surface-2); border-left-color: var(--brand-accent, var(--info)); color: var(--text-primary); }
+.audit-toc-action { font-weight: 600; font-size: var(--text-sm); }
+.audit-detail-fields { display: grid; grid-template-columns: 160px 1fr; gap: 6px 16px; margin-bottom: var(--space-md); }
+.audit-detail-key { color: var(--text-tertiary); font-size: var(--text-sm); }
+.audit-detail-val { color: var(--text-primary); word-break: break-word; }
+.audit-detail-json { background: var(--surface-1); padding: var(--space-md); border-radius: var(--radius-md); overflow-x: auto; font-size: var(--text-xs); white-space: pre-wrap; word-break: break-word; }
+.audit-pagination { display: flex; align-items: center; gap: var(--space-md); flex-wrap: wrap; }
+@media (max-width: 768px) {
+    .audit-event-content { width: 96vw; max-width: 96vw; }
+    .audit-event-body { flex-direction: column; }
+    .audit-event-toc { flex: none; width: auto; max-height: 30vh; border-right: none; border-bottom: 1px solid var(--border-color); padding-right: 0; }
+}
 
 /* ============================================================================
    CONTINUED IN NEXT FILE...

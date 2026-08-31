@@ -105,8 +105,10 @@ def test_hostile_origin_gets_no_cors_grant(admin):
 # Client-side output encoding (shipped app.js source)
 # --------------------------------------------------------------------------------------------------
 def test_audit_log_serialised_details_are_escaped():
-    # The audit-log <pre> must escape the serialised details blob (low-priv name -> admin session).
-    assert "escapeHtml(JSON.stringify(log.details" in APP_JS
+    # The audit-event modal renders the serialised details blob into a <pre> via textContent (never
+    # innerHTML/string interpolation), so an attacker-influenced value carried in a low-priv name
+    # cannot inject markup into an admin's session.
+    assert "pre.textContent = JSON.stringify(log.details" in APP_JS
     assert "<pre class=\"text-xs mt-sm\">${JSON.stringify(log.details" not in APP_JS
 
 
