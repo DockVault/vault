@@ -8507,14 +8507,21 @@ function renderShareTagsList() {
         row.setAttribute('data-tag-id', tag.id);
 
         const left = document.createElement('div');
+        // Colour dot + icon + name in one flex lead, so the tag's presentation shows at a glance and
+        // the name and its active/inactive label no longer run together.
+        const lead = document.createElement('div');
+        lead.className = 'flex items-center gap-sm';
+        if (tag.color) { const dot = document.createElement('span'); dot.className = 'nl-color-dot'; dot.style.background = chipColorValue(tag.color); lead.appendChild(dot); }
+        if (tag.icon) lead.appendChild(_svgIcon(tag.icon, 'icon-sm'));
         const title = document.createElement('span');
         title.className = 'font-medium';
         title.textContent = tag.name;
-        left.appendChild(title);
+        lead.appendChild(title);
         const badge = document.createElement('span');
-        badge.className = 'chip ml-sm';
+        badge.className = 'chip';
         badge.textContent = tag.is_active ? 'active' : 'inactive';
-        left.appendChild(badge);
+        lead.appendChild(badge);
+        left.appendChild(lead);
         const summary = document.createElement('div');
         summary.className = 'text-tertiary text-sm';
         const parts = [

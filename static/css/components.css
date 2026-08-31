@@ -1694,6 +1694,11 @@ button.vault-sort-dir {
     gap: var(--spacing-sm);
     border-bottom: 2px solid var(--surface-2);
     margin-bottom: var(--spacing-lg);
+    /* Keep the tab strip on ONE row and scroll horizontally when it overflows, instead of wrapping
+       to several rows (which grew the strip's height and showed a vertical scrollbar). */
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
 }
 
 .tab-btn {
@@ -1707,6 +1712,8 @@ button.vault-sort-dir {
     transition: all var(--transition-base);
     position: relative;
     bottom: -2px;
+    flex-shrink: 0;        /* never squeeze a tab; the strip scrolls instead */
+    white-space: nowrap;
 }
 
 .tab-btn:hover {
@@ -2195,6 +2202,11 @@ details summary:hover {
 .monitor-metrics .monitor-metric-icon { width: 36px; height: 36px; }
 .monitor-metrics .monitor-metric-icon .icon { width: 18px; height: 18px; }
 .monitor-metrics .text-2xl { font-size: 1.5rem; line-height: 1.15; }
+
+/* Settings description/hint paragraphs fill their card width. The global p{max-width:70ch} reading
+   cap otherwise renders them as a narrow left column inside a wide settings card (e.g. the link-tag
+   explainer), wasting the right half of the row. */
+.settings-tab-content .p-lg > p { max-width: none; }
 
 /* ============================================================================
    CONTINUED IN NEXT FILE...
