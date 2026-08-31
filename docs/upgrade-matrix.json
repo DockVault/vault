@@ -237,6 +237,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.25.0": {
+      "released": "2026-08-31",
+      "notes": "Adds a memory-bounded streaming SFTP upload behind a default-OFF flag (SFTP_STREAMING_UPLOAD). When enabled, an SFTP upload encrypts and persists 1 MiB records as they arrive instead of buffering the whole plaintext to the .sftp_tmp staging tmpfs, so RAM/tmpfs use is bounded to one record plus a small reorder window regardless of file size, and the per-file limit is no longer tied to the tmpfs size. The at-rest format is byte-identical to the buffered/web upload path (same codec, 1 MiB records, monotonic AEAD index), so streamed and web-uploaded files are mutually decryptable. All the close-time authorization gates (membership, folder scope, vault password, vault size limit, plan ceiling, and a write-permission re-check) run before the file record commits, and any failure leaves no orphan blob and never destroys an existing same-name file. Adds SFTP_STREAMING_UPLOAD and SFTP_STREAMING_REORDER_MB settings. No schema change; ships OFF, so a rollback to 0.24.0 is clean.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -447,6 +455,13 @@
     {
       "from": "0.23.0",
       "to": "0.24.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.24.0",
+      "to": "0.25.0",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
