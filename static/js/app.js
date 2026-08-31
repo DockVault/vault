@@ -16267,7 +16267,7 @@ async function loadVaultGroupAccess() {
                 ${accessList.map(a => `
                     <tr>
                         <td><span style="display:inline-flex;align-items:center;gap:8px"><span class="tree-dot" style="--chip:${chipColorValue(a.color)}"></span>${escapeHtml(a.name)}</span></td>
-                        <td>${fmtCount(memberCount.get(a.group_id))}</td>
+                        <td>${memberCount.get(a.group_id) == null ? '—' : `<button type="button" class="vga-members" data-group-id="${a.group_id}" data-group-name="${escapeHtml(a.name)}">${fmtCount(memberCount.get(a.group_id))}</button>`}</td>
                         <td>
                             <select class="form-control form-control-sm vga-level-select" data-group-id="${a.group_id}" style="max-width:170px">
                                 <option value="read" ${a.permission !== 'write' ? 'selected' : ''}>Read only</option>
@@ -16298,6 +16298,7 @@ async function loadVaultGroupAccess() {
             sel.addEventListener('change', () => addVaultGroupAccess(sel.dataset.groupId, sel.value));
         });
         el.querySelectorAll('.vga-remove').forEach(b => { b.onclick = () => removeVaultGroupAccess(b.dataset.groupId); });
+        el.querySelectorAll('.vga-members').forEach(b => { b.onclick = () => openGroupMembersModal(b.dataset.groupId, b.dataset.groupName); });
     } catch (e) {
         el.innerHTML = `<div class="alert alert-error">Failed to load department access: ${escapeHtml(e.message)}</div>`;
     }
@@ -16317,6 +16318,49 @@ async function removeVaultGroupAccess(groupId) {
         showSuccess('Department access revoked');
         await loadVaultGroupAccess();
     } catch (e) { showError('Failed to revoke access: ' + e.message); }
+}
+
+// Show the members of a department (group) in a modal — opened from the Members count in the vault
+// Permissions tab. Uses the admin group-detail endpoint; built with DOM APIs (textContent only).
+async function openGroupMembersModal(groupId, groupName) {
+    let members = [];
+    try {
+        const g = await apiRequest('/groups/' + encodeURIComponent(groupId), { silent: true });
+        members = (g && g.members) || [];
+    } catch (e) { showError('Could not load department members.'); return; }
+    document.querySelectorAll('.vga-members-modal').forEach(m => m.remove());
+    const modal = document.createElement('div');
+    modal.className = 'modal active vga-members-modal';
+    modal.setAttribute('role', 'dialog'); modal.setAttribute('aria-modal', 'true');
+    const content = document.createElement('div'); content.className = 'modal-content'; content.style.maxWidth = '540px';
+    const header = document.createElement('div'); header.className = 'modal-header';
+    const h = document.createElement('h3'); h.textContent = 'Members of ' + (groupName || 'department'); header.appendChild(h);
+    const close = document.createElement('button'); close.className = 'modal-close'; close.type = 'button';
+    close.setAttribute('aria-label', 'Close'); close.textContent = '×';
+    close.addEventListener('click', () => modal.remove());
+    header.appendChild(close);
+    const body = document.createElement('div'); body.className = 'modal-body';
+    if (!members.length) {
+        const p = document.createElement('p'); p.className = 'text-tertiary text-sm';
+        p.textContent = 'This department has no members yet.'; body.appendChild(p);
+    } else {
+        const table = document.createElement('table'); table.className = 'data-table';
+        const thead = document.createElement('thead'); const hr = document.createElement('tr');
+        ['User', 'Email', 'Role'].forEach(t => { const th = document.createElement('th'); th.textContent = t; hr.appendChild(th); });
+        thead.appendChild(hr); table.appendChild(thead);
+        const tb = document.createElement('tbody');
+        members.forEach(m => {
+            const tr = document.createElement('tr');
+            const u = document.createElement('td'); u.textContent = m.username || '—'; tr.appendChild(u);
+            const e = document.createElement('td'); e.textContent = m.email || '—'; tr.appendChild(e);
+            const r = document.createElement('td'); r.textContent = m.group_role || m.role || '—'; tr.appendChild(r);
+            tb.appendChild(tr);
+        });
+        table.appendChild(tb); body.appendChild(table);
+    }
+    content.appendChild(header); content.appendChild(body); modal.appendChild(content);
+    modal.addEventListener('click', (ev) => { if (ev.target === modal) modal.remove(); });
+    document.body.appendChild(modal);
 }
 
 // --- Searchable "Grant access" modal for individual users -------------------

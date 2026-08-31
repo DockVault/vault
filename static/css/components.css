@@ -2221,6 +2221,10 @@ details summary:hover {
    that sits below it out of view. Covers share tags, note-link tags, and upload-link (receiver) tags. */
 #share-tags-list, #nl-tags-list, #rt-tags-list { max-height: 260px; overflow-y: auto; }
 
+/* Link-styled Members count in the vault Permissions department table (opens the members modal). */
+.vga-members { background: none; border: none; padding: 0; font: inherit; cursor: pointer; color: var(--info); text-decoration: underline; text-underline-offset: 2px; }
+.vga-members:hover { color: var(--text-primary); }
+
 /* Audit event modal: an 80vw dialog with a scrollable table-of-contents of the page's events on the
    left and the selected event's full detail on the right, plus the audit pagination strip. */
 .audit-event-content { width: 80vw; max-width: 80vw; }
