@@ -39,17 +39,27 @@ class UploadAssembler:
             at once. A write that would push the held out-of-order bytes past this raises. ``0``
             disables reordering entirely (any gap fails immediately).
 
-    Memory held is at most ``record_size`` (the pending contiguous tail) plus ``reorder_window``.
+    Memory held is at most ``record_size`` (the pending contiguous tail) plus ``reorder_window``
+    bytes, across at most ``max_gaps`` distinct out-of-order regions (so a 1-byte fragmentation
+    pattern cannot amplify entry overhead or the overlap scan).
     """
 
-    def __init__(self, on_record, record_size: int = DEFAULT_RECORD_SIZE, reorder_window: int = 16 * 1024 * 1024):
+    def __init__(self, on_record, record_size: int = DEFAULT_RECORD_SIZE,
+                 reorder_window: int = 16 * 1024 * 1024, max_gaps: int = 4096):
         if record_size <= 0:
             raise ValueError("record_size must be positive")
         if reorder_window < 0:
             raise ValueError("reorder_window must be >= 0")
+        if max_gaps < 1:
+            raise ValueError("max_gaps must be >= 1")
         self._on_record = on_record
         self._record_size = record_size
         self._reorder_window = reorder_window
+        # Cap on the NUMBER of distinct out-of-order regions held at once (not just their bytes). A
+        # near-sequential client holds a handful; a hostile 1-byte fragmentation pattern would stay
+        # within the byte window yet create millions of dict entries with an O(N) scan each -> O(N^2)
+        # CPU + huge memory. This bounds both, failing a pathological pattern fast.
+        self._max_gaps = max_gaps
         # The contiguous frontier: every byte in [0, _frontier) has been received.
         self._frontier = 0
         # Contiguous bytes received but not yet emitted as a record (always < record_size after a flush).
@@ -114,8 +124,15 @@ class UploadAssembler:
             del self._pending[:rs]
 
     def _add_gap(self, offset: int, end: int, data: bytes) -> None:
-        # A write strictly ahead of the frontier. Reject any overlap with an existing gap span (a
-        # client re-sending an already-buffered future record) rather than guessing which copy wins.
+        # A write strictly ahead of the frontier. Bound the NUMBER of gap regions BEFORE the O(N)
+        # overlap scan below, so a hostile 1-byte fragmentation pattern (which stays within the byte
+        # window) can't grow the dict/scan without limit -- fail fast instead of amplifying memory + CPU.
+        if len(self._gaps) >= self._max_gaps:
+            raise AssemblerError(
+                f"too many out-of-order regions ({self._max_gaps}); the streaming path needs "
+                f"near-sequential writes")
+        # Reject any overlap with an existing gap span (a client re-sending an already-buffered future
+        # record) rather than guessing which copy wins.
         for g_off, g_data in self._gaps.items():
             if offset < g_off + len(g_data) and end > g_off:
                 raise AssemblerError(f"overlapping out-of-order write at offset {offset}")

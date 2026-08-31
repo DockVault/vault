@@ -106,6 +106,19 @@ def test_out_of_order_beyond_window_raises():
         a.feed(16, b"DDDD")    # would push held out-of-order bytes past the window
 
 
+def test_gap_count_is_bounded_against_fragmentation():
+    # A hostile 1-byte fragmentation pattern (strided, byte 0 withheld so nothing ever drains) stays
+    # well within a huge byte window, but must NOT create unbounded gap entries: the assembler caps the
+    # gap COUNT and fails fast. This is the memory-amplification / O(N^2) DoS guard.
+    recs = []
+    a = UploadAssembler(recs.append, record_size=1024, reorder_window=64 * 1024 * 1024, max_gaps=8)
+    for k in range(1, 9):
+        a.feed(2 * k, b"x")    # offsets 2,4,...,16 -> 8 non-adjacent 1-byte gaps, exactly at the cap
+    with pytest.raises(AssemblerError):
+        a.feed(100, b"x")      # the 9th distinct region exceeds max_gaps despite a near-empty byte budget
+    assert recs == []
+
+
 def test_reorder_window_zero_rejects_any_gap():
     a, recs = _collect(record_size=4, reorder_window=0)
     with pytest.raises(AssemblerError):

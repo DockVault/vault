@@ -150,3 +150,28 @@ def test_streaming_read_only_member_cannot_open(admin, temp_user, temp_user_clie
         assert _file_id(admin, vid, "nope.bin") is None, "a read-only member must land no file"
     finally:
         admin.delete_vault(vid)
+
+
+def test_streaming_path_is_active_not_buffered_fallback(admin):
+    # PROVES the streaming path is the one running (not the buffered fallback), so the rest of this
+    # file can't silently pass against a flag-off stack. A write that leaves an UNFILLED HOLE is handled
+    # differently by the two paths: the streaming assembler rejects the incomplete stream at close and
+    # lands NO file; the buffered path seeks + writes a SPARSE file and lands it. So "no file after a
+    # hole" only holds when streaming is on — this test fails on a buffered stack.
+    v = admin.create_vault(name=unique("strm"))
+    vid, vname = v["id"], v["name"]
+    tu, tc = _mint_upload_cred(admin, vid)
+    try:
+        with sftp_session(tu, tc) as sftp:
+            with sftp.open(f"/{vname}/hole.bin", "wb") as fh:
+                fh.write(b"start")
+                fh.seek(1024 * 1024)          # a 1 MiB hole that is never filled
+                try:
+                    fh.write(b"end")
+                    fh.flush()
+                except Exception:
+                    pass
+        assert _file_id(admin, vid, "hole.bin") is None, \
+            "a streaming upload with an unfilled hole must land no file (buffered would land a sparse file)"
+    finally:
+        admin.delete_vault(vid)

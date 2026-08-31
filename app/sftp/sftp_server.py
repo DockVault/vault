@@ -1142,9 +1142,12 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             if not _up.file_type_allowed(filename, _up.parse_allowed_exts(_sblob.get("allowed_file_types"))):
                 return paramiko.SFTP_PERMISSION_DENIED
             _eff_max = _up.effective_max_file_bytes((settings.max_file_size_mb or 0) * 1024 * 1024, _sblob.get("max_file_size"))
-            # A buffered upload can't exceed the staging tmpfs; refuse an oversized one in-stream
-            # rather than filling the tmpfs mid-write.
-            _eff_max = _staging_capped_max(_eff_max, settings.sftp_staging_tmpfs_mb)
+            # A BUFFERED upload can't exceed the staging tmpfs; refuse an oversized one in-stream rather
+            # than filling the tmpfs mid-write. The STREAMING path never stages to .sftp_tmp, so the
+            # tmpfs budget is irrelevant to it -- clamping it there would wrongly cap streaming uploads
+            # to a RAM budget they don't consume (and the .env.example ships a non-zero tmpfs value).
+            if not settings.sftp_streaming_upload:
+                _eff_max = _staging_capped_max(_eff_max, settings.sftp_staging_tmpfs_mb)
             try:
                 folder_id = self._resolve_folder(db, vault.id, segments[1:-1])
             except _PathNotFound:
@@ -1235,6 +1238,14 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             vault = vault_service.get_vault(vault_id, user, require_password=False)
         except Exception as e:  # noqa: BLE001 - a membership/scope loss between open() and close()
             safe_event('upload.aborted.reauthz-failed', e)
+            return None
+        # Re-check WRITE at persist time, not just membership/READ (get_vault above): a member
+        # downgraded write->read between stream-start and close must drop the upload. Shared, so this
+        # hardens the buffered path AND the large-streaming case, where the stream-start WRITE check
+        # (upload_file_streaming's require_vault_permission) fires at the FIRST record, early.
+        from app.core.models import VaultPermissionEnum
+        if not vault_service.permission_service.can_access_vault(user, vault_id, VaultPermissionEnum.WRITE):
+            safe_event('upload.aborted.write-denied')
             return None
         if not self._scope_ok_folder(db, user, vault_id, folder_id):
             safe_event('upload.aborted.folder-out-of-scope')
