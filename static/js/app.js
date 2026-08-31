@@ -16103,28 +16103,57 @@ async function loadVaultGroupAccess() {
         const accessList = Array.isArray(access) ? access : [];
         const accessIds = new Set(accessList.map(a => a.group_id));
         const addable = (Array.isArray(groups) ? groups : []).filter(g => !accessIds.has(g.id));
-        el.innerHTML = `
-            ${addable.length ? `
+        // Department access rendered as the SAME .data-table as the per-user permissions table:
+        // member count, an inline editable access level (the grant endpoint upserts), granted date,
+        // and revoke. Member counts come from /groups (admin only) and degrade to a dash otherwise.
+        const memberCount = new Map((Array.isArray(groups) ? groups : []).map(g => [g.id, g.member_count]));
+        const fmtCount = (n) => (n == null ? '—' : (n + (n === 1 ? ' member' : ' members')));
+        const grantedDate = (iso) => { const d = iso ? parseServerTime(iso) : null; return (d && !isNaN(d)) ? d.toLocaleDateString() : '—'; };
+        const addRow = addable.length ? `
                 <div class="group-add-member mb-md">
                     <select id="vga-group-select" class="form-control"><option value="">Add a department…</option>${addable.map(g => `<option value="${g.id}">${escapeHtml(g.name)}</option>`).join('')}</select>
                     <select id="vga-perm-select" class="form-control" style="max-width:160px"><option value="read">Read only</option><option value="write">Read &amp; write</option></select>
                     <button id="vga-add-btn" class="btn btn-secondary">${iconSvg('plus', 'icon-sm')} Add</button>
-                </div>` : ''}
-            <div class="member-list">
-                ${accessList.length ? accessList.map(a => `
-                    <div class="member-row">
-                        <span class="tree-dot" style="--chip:${chipColorValue(a.color)}"></span>
-                        <div class="cell-user-text"><span class="cell-user-name">${escapeHtml(a.name)}</span></div>
-                        <span class="badge badge-${a.permission === 'write' ? 'success' : 'info'}">${a.permission === 'write' ? 'Read & write' : 'Read only'}</span>
-                        <button class="btn btn-sm btn-ghost vga-remove" data-group-id="${a.group_id}" title="Revoke access">${iconSvg('x', 'icon-sm')}</button>
-                    </div>`).join('') : '<div class="text-tertiary text-sm p-sm">No departments have access — only the owner and individually-added users can open this vault.</div>'}
-            </div>`;
+                </div>` : '';
+        let body;
+        if (accessList.length) {
+            body = `
+            <table class="data-table">
+                <thead><tr><th>Department</th><th>Members</th><th>Access</th><th>Granted</th><th></th></tr></thead>
+                <tbody>
+                ${accessList.map(a => `
+                    <tr>
+                        <td><span style="display:inline-flex;align-items:center;gap:8px"><span class="tree-dot" style="--chip:${chipColorValue(a.color)}"></span>${escapeHtml(a.name)}</span></td>
+                        <td>${fmtCount(memberCount.get(a.group_id))}</td>
+                        <td>
+                            <select class="form-control form-control-sm vga-level-select" data-group-id="${a.group_id}" style="max-width:170px">
+                                <option value="read" ${a.permission !== 'write' ? 'selected' : ''}>Read only</option>
+                                <option value="write" ${a.permission === 'write' ? 'selected' : ''}>Read &amp; write</option>
+                            </select>
+                        </td>
+                        <td>${grantedDate(a.added_at)}</td>
+                        <td><button class="action-btn action-btn-danger vga-remove" data-group-id="${a.group_id}">Revoke</button></td>
+                    </tr>`).join('')}
+                </tbody>
+            </table>`;
+        } else {
+            const noneExist = currentUser.role === 'admin' && (Array.isArray(groups) ? groups : []).length === 0;
+            body = `<div class="text-tertiary text-sm p-sm">${noneExist
+                ? 'No departments exist yet. Create departments in the admin Groups area, then grant them access here.'
+                : 'No departments have access yet — only the owner and individually-added users can open this vault. Use “Add a department” above to grant a whole department access.'}</div>`;
+        }
+        el.replaceChildren();
+        el.insertAdjacentHTML('beforeend', addRow + body);
         const addBtn = document.getElementById('vga-add-btn');
         if (addBtn) addBtn.onclick = () => {
             const gid = document.getElementById('vga-group-select').value;
             const perm = document.getElementById('vga-perm-select').value;
             if (gid) addVaultGroupAccess(gid, perm);
         };
+        // Inline access change — grant endpoint upserts, so re-POSTing updates in place (matches users).
+        el.querySelectorAll('select.vga-level-select').forEach(sel => {
+            sel.addEventListener('change', () => addVaultGroupAccess(sel.dataset.groupId, sel.value));
+        });
         el.querySelectorAll('.vga-remove').forEach(b => { b.onclick = () => removeVaultGroupAccess(b.dataset.groupId); });
     } catch (e) {
         el.innerHTML = `<div class="alert alert-error">Failed to load department access: ${escapeHtml(e.message)}</div>`;

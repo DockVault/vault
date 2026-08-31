@@ -13905,12 +13905,15 @@ async def list_vault_group_access(
     if not _can_manage_vault(db, vault, current_user):
         raise HTTPException(status_code=403, detail="Only the vault owner or a manager can view access")
     rows = db.execute(
-        select(vault_group_access.c.group_id, vault_group_access.c.permission, Group.name, Group.color)
+        select(vault_group_access.c.group_id, vault_group_access.c.permission,
+               vault_group_access.c.added_at, Group.name, Group.color)
         .join(Group, Group.id == vault_group_access.c.group_id)
         .where(vault_group_access.c.vault_id == vault_id)
         .order_by(Group.name)
     ).all()
-    return [{"group_id": str(r[0]), "permission": r[1], "name": r[2], "color": r[3]} for r in rows]
+    return [{"group_id": str(r[0]), "permission": r[1],
+             "added_at": r[2].isoformat() if r[2] else None,
+             "name": r[3], "color": r[4]} for r in rows]
 
 
 @app.post("/vaults/{vault_id}/group-access")
