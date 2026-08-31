@@ -9634,6 +9634,10 @@ async def admin_revoke_all_public_links(
 # --- Anonymous read path: page + redeem + download -------------------------------------------------
 class PublicLinkRedeem(BaseModel):
     secret: Optional[str] = None
+    # A peek returns the link's metadata (name/size or folder listing) to render the landing page
+    # WITHOUT consuming a use or minting a download grant — a visit is not a download. The actual
+    # download click re-redeems with peek=false, which is where the single use is spent.
+    peek: bool = False
 
 
 @app.get("/p/{token}")
@@ -9754,6 +9758,25 @@ async def redeem_public_link(
             _audit("failure", reason="not_available", link_id=link.id)
             raise HTTPException(status_code=404, detail="This link is not available.")
 
+    # Build the response metadata now (no grant yet); a peek returns it without spending a use.
+    if link.target_type == "file":
+        meta = {"kind": "file", "name": f.name or "download", "size": f.size_bytes or 0,
+                "file_id": str(f.id)}
+    else:
+        child_files = db.query(File).filter(File.vault_id == vault.id,
+                                            File.folder_id == folder.id).all()
+        child_dirs = db.query(Folder).filter(Folder.vault_id == vault.id,
+                                             Folder.parent_folder_id == folder.id).all()
+        entries = [{"id": str(d.id), "name": d.name or "", "size": 0, "is_folder": True} for d in child_dirs]
+        entries += [{"id": str(x.id), "name": x.name or "", "size": x.size_bytes or 0,
+                     "is_folder": False} for x in child_files]
+        meta = {"kind": "folder", "name": folder.name or "", "entries": entries}
+
+    if bool(getattr(payload, "peek", False)):
+        # A visit is not a download: return metadata only, consuming no use and minting no grant.
+        _audit("success", reason="peek", link_id=link.id)
+        return {**meta, "grant": None}
+
     # Mint the single-use download grant BEFORE consuming a use, so a Redis outage (→ 503) can never
     # burn a use: nothing is consumed until the grant is safely stored. Fail-closed — a grant that
     # cannot be stored is never handed out.
@@ -9778,20 +9801,9 @@ async def redeem_public_link(
         _audit("failure", reason="not_available", link_id=link.id)
         raise HTTPException(status_code=404, detail="This link is not available.")
 
+    # Names are the Standard vault's in-memory-decrypted plaintext (the ORM load event restores it).
     _audit("success", link_id=link.id)
-    if link.target_type == "file":
-        # Names are the Standard vault's in-memory-decrypted plaintext (the ORM load event restores it).
-        return {"kind": "file", "name": f.name or "download", "size": f.size_bytes or 0,
-                "file_id": str(f.id), "grant": grant}
-    # Folder: one level of children (files + subfolders), no recursion.
-    child_files = db.query(File).filter(File.vault_id == vault.id,
-                                       File.folder_id == folder.id).all()
-    child_dirs = db.query(Folder).filter(Folder.vault_id == vault.id,
-                                        Folder.parent_folder_id == folder.id).all()
-    entries = [{"id": str(d.id), "name": d.name or "", "size": 0, "is_folder": True} for d in child_dirs]
-    entries += [{"id": str(x.id), "name": x.name or "", "size": x.size_bytes or 0,
-                 "is_folder": False} for x in child_files]
-    return {"kind": "folder", "name": folder.name or "", "entries": entries, "grant": grant}
+    return {**meta, "grant": grant}
 
 
 @app.get("/public-links/{token}/download/{file_id}")
