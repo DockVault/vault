@@ -2635,6 +2635,7 @@ function renderVaults() {
                 <div class="vault-tile${locked ? ' vault-tile-locked' : ''}">${locked ? iconSvg('lock') : iconSvg('vault')}</div>
                 <div class="vault-card-main">
                     <h3 class="vault-name"><span class="zk-field" data-zk-field="name">${nameHtml}</span></h3>
+                    <span class="vault-badge ${isZk ? 'vault-badge-zk' : 'vault-badge-std'}">${iconSvg(isZk ? 'shield' : 'vault', 'icon-xs')}${isZk ? 'Zero-knowledge' : 'Standard'}</span>
                     <p class="vault-desc"><span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="desc">${descHtml}</span></p>
                     <div class="vault-meta">
                         <span>${iconSvg('folder', 'icon-sm')} <span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="files">${filesHtml}</span> files</span>
@@ -4337,7 +4338,7 @@ function showTempCredsModal(creds) {
                 </div>
                 <div class="modal-body">
                     <div class="alert alert-warning mb-md">
-                        ${iconSvg('alert-triangle', 'icon-sm')} <strong>Copy these now.</strong> The password${hasPasscodes ? ' and vault passcode(s)' : ''} ${hasPasscodes ? 'are' : 'is'} shown once and can't be retrieved later.
+                        ${iconSvg('alert-triangle', 'icon-sm')}<div class="alert-content"><strong>Copy these now.</strong> The password${hasPasscodes ? ' and vault passcode(s)' : ''} ${hasPasscodes ? 'are' : 'is'} shown once and can't be retrieved later.</div>
                     </div>
                     ${field('Username', creds.temp_username || 'N/A')}
                     ${field('Password', creds.credential || 'N/A')}

@@ -2178,6 +2178,24 @@ details summary:hover {
 .ci-mixed-list { margin: 0 0 var(--space-sm) 0; padding-left: 20px; max-height: 30vh; overflow-y: auto; }
 .ci-mixed-list li { font-size: var(--text-sm); color: var(--text-secondary); word-break: break-word; }
 
+/* Vault type badge (Standard vs Zero-knowledge) — shown on vault cards and the vault Info panel so
+   the encryption model is visible at a glance. Shared across skins; colours ride the theme tokens. */
+.vault-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 0.7rem; font-weight: 600; letter-spacing: .01em;
+    padding: 2px 8px; border-radius: 999px; line-height: 1.35;
+    border: 1px solid transparent; width: fit-content; margin: 2px 0 4px;
+}
+.vault-badge .icon { width: 12px; height: 12px; flex-shrink: 0; }
+.vault-badge-zk  { background: color-mix(in srgb, var(--info) 14%, transparent);          color: var(--info);            border-color: color-mix(in srgb, var(--info) 34%, transparent); }
+.vault-badge-std { background: color-mix(in srgb, var(--text-tertiary) 14%, transparent); color: var(--text-secondary);  border-color: color-mix(in srgb, var(--text-tertiary) 26%, transparent); }
+
+/* Compact Live-Monitor metric tiles — the default cards were oversized for three small counters. */
+.monitor-metrics .card { padding: var(--space-md) var(--space-lg); }
+.monitor-metrics .monitor-metric-icon { width: 36px; height: 36px; }
+.monitor-metrics .monitor-metric-icon .icon { width: 18px; height: 18px; }
+.monitor-metrics .text-2xl { font-size: 1.5rem; line-height: 1.15; }
+
 /* ============================================================================
    CONTINUED IN NEXT FILE...
    ============================================================================ */
