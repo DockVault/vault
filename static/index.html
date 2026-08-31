@@ -2445,6 +2445,10 @@
                                     <span>Allow users to create public links to files and folders</span>
                                 </label>
                                 <p class="text-secondary text-sm mt-sm">When enabled, a user can turn a file or folder in a Standard vault into a link that anyone can download from (no sign-in). Unlike note links these serve the <strong>live</strong> file, not a snapshot. They are governed by the <strong>same tags below</strong> — a tag only offers file/folder links when its "Can be used for" list includes them — and share the <strong>same per-user cap</strong> as note links. Turning this off immediately <strong>pauses</strong> every public file link (they stop opening) without deleting them; revoke them under "All public file &amp; folder links" below to stop them permanently.</p>
+                                <div id="pfl-no-tag-warning" class="alert alert-warning mt-md" hidden>
+                                    <svg class="icon icon-sm"><use href="#i-alert-triangle"/></svg>
+                                    <div class="alert-content">This is <strong>on</strong>, but no Link tag allows files or folders yet — so no one can actually create these links. Edit a tag below (or add one) and include <strong>Files</strong> and/or <strong>Folders</strong> in its “Can be used for” list.</div>
+                                </div>
                             </div>
                         </div>
 

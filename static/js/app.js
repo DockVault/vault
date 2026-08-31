@@ -11079,7 +11079,11 @@ function openContextMenu(item, x, y) {
     const canWrite = state.canWriteCurrentVault !== false;
     const clipHas = (state.moveCopyClip || []).length > 0;
     const entries = [];
-    const add = (label, icon, action, danger) => entries.push({ label, icon, action, danger });
+    const add = (label, icon, action, danger, disabled, title) => entries.push({ label, icon, action, danger, disabled, title });
+    // When public file/folder links are ENABLED as a feature but no Link tag permits files/folders,
+    // the create action is hidden — surface it as a disabled hint so the setup gap is discoverable.
+    const pflFeatureOn = !!(state._pflPolicy && state._pflPolicy.enabled);
+    const pflHintTitle = 'Enable Files/Folders on a Link tag (Settings → Public Links) to create public links';
     if (isFolder) {
         add('Open', 'folder', 'open-folder');
         if (canWrite && vaultCapAllowed('file.rename')) add('Rename', 'edit', 'rename-folder');
@@ -11087,6 +11091,7 @@ function openContextMenu(item, x, y) {
         if (canWrite && vaultCapAllowed('folder.create')) add(clipHas ? 'Add to move list' : 'Move', 'move', 'move-folder');
         if (vaultShareable()) add('Share', 'link', 'share-folder');
         if (state._pflEnabled && vaultShareable()) add('Public link', 'globe', 'publiclink-folder');
+        else if (pflFeatureOn && vaultShareable()) add('Public link', 'globe', null, false, true, pflHintTitle);
         if (canWrite && vaultCapAllowed('folder.delete')) add('Delete', 'trash', 'delete-folder', true);
     } else {
         const canDownload = vaultCapAllowed('file.download');
@@ -11096,6 +11101,7 @@ function openContextMenu(item, x, y) {
         if (canWrite && vaultCapAllowed('file.delete')) add(clipHas ? 'Add to move list' : 'Move', 'move', 'move-file');
         if (vaultShareable()) add('Share', 'link', 'share-file');
         if (state._pflEnabled && vaultShareable()) add('Public link', 'globe', 'publiclink-file');
+        else if (pflFeatureOn && vaultShareable()) add('Public link', 'globe', null, false, true, pflHintTitle);
         if (canDownload) add('Download', 'download', 'download');
         if (vaultCapAllowed('vault.see_files')) add('File info', 'info', 'file-info');
         // The hash is content-derived, so only offer "Copy SHA-256" to a principal who can download
@@ -11108,13 +11114,15 @@ function openContextMenu(item, x, y) {
     entries.forEach(en => {
         const b = document.createElement('button');
         b.type = 'button';
-        b.className = 'context-menu-item' + (en.danger ? ' danger' : '');
+        b.className = 'context-menu-item' + (en.danger ? ' danger' : '') + (en.disabled ? ' is-hint' : '');
         b.setAttribute('role', 'menuitem');
-        b.setAttribute('data-action', en.action);
+        if (en.action) b.setAttribute('data-action', en.action);
+        if (en.title) b.title = en.title;
         const lbl = document.createElement('span');
         lbl.textContent = en.label;
         b.append(_svgUse(en.icon), lbl);
-        b.addEventListener('click', () => { closeContextMenu(); runFileAction(en.action, item.id, item.name); });
+        if (en.disabled) { b.disabled = true; }
+        else b.addEventListener('click', () => { closeContextMenu(); runFileAction(en.action, item.id, item.name); });
         menu.appendChild(b);
     });
     menu.hidden = false;
@@ -17280,6 +17288,20 @@ async function loadNoteLinkTags() {
         noteLinkTagsCache = Array.isArray(tags) ? tags : [];
     } catch (_) { noteLinkTagsCache = []; }
     renderNoteLinkTagsList();
+    updatePflTagWarning();
+}
+
+// Warn (in Settings) when public file/folder links are enabled but no Link tag actually permits files
+// or folders — the toggle alone can't create anything, which is an easy trap. Shown/hidden from the
+// tag list load, the toggle change, and settings load.
+function updatePflTagWarning() {
+    const warn = document.getElementById('pfl-no-tag-warning');
+    if (!warn) return;
+    const toggle = document.getElementById('setting-public-file-links-enabled');
+    const enabled = !!(toggle && toggle.checked);
+    const anyFileFolderTag = noteLinkTagsCache.some(t =>
+        (t.allowed_targets || []).some(x => x === 'file' || x === 'folder'));
+    warn.hidden = !(enabled && !anyFileFolderTag);
 }
 
 function _nlSecretLabel(t) {
@@ -18350,6 +18372,9 @@ function setupPublicFileLinkUI() {
     document.querySelectorAll('[data-pflm-close]').forEach(el => el.addEventListener('click', () => closeModal()));
     const aRefresh = _pflEl('pfl-admin-refresh'); if (aRefresh) aRefresh.addEventListener('click', loadAdminPublicLinks);
     const aRevokeAll = _pflEl('pfl-admin-revoke-all'); if (aRevokeAll) aRevokeAll.addEventListener('click', adminRevokeAllPublicLinks);
+    // Toggling the file-links feature updates the "no file/folder tag" warning immediately.
+    const pflToggle = document.getElementById('setting-public-file-links-enabled');
+    if (pflToggle) pflToggle.addEventListener('change', updatePflTagWarning);
 }
 
 // ======================= Upload links (receivers) ==================================================

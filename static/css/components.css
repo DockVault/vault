@@ -2235,6 +2235,9 @@ details summary:hover {
 .rc-ring-hole { width: 62px; height: 62px; border-radius: 50%; background: var(--surface-1); display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 0.95rem; color: var(--text-primary); }
 .rc-vault-actions { margin-top: auto; }
 
+/* Disabled "hint" item in the file context menu (e.g. Public link when no Link tag permits files). */
+.context-menu-item:disabled, .context-menu-item.is-hint { opacity: .5; cursor: default; }
+
 /* Audit event modal: an 80vw dialog with a scrollable table-of-contents of the page's events on the
    left and the selected event's full detail on the right, plus the audit pagination strip. */
 .audit-event-content { width: 80vw; max-width: 80vw; }
