@@ -26,15 +26,17 @@ SFTP_PORT = int(os.environ.get("VAULT_SFTP_PORT", "2322"))
 # These exercise the STREAMING upload path specifically, so they must run against a stack booted with
 # SFTP_STREAMING_UPLOAD=on. Some assertions hold ONLY on the streaming path (e.g. an unfilled-hole write
 # lands no file — the buffered fallback would seek+write a sparse file and land it), so running them on
-# a default (buffered) stack would fail by design. Skip the module unless the harness confirms streaming
-# is enabled server-side by exporting VAULT_SFTP_STREAMING=1; the dedicated streaming harness does. The
-# assembler's pure logic (incl. the gap-count DoS bound) is covered separately by the unit tests, which
-# need no stack or flag and always run.
-if os.environ.get("VAULT_SFTP_STREAMING") != "1":
-    pytest.skip("SFTP streaming not enabled (run with SFTP_STREAMING_UPLOAD=on and VAULT_SFTP_STREAMING=1)",
-                allow_module_level=True)
-
-pytestmark = pytest.mark.sftp
+# a default (buffered) stack would fail by design. Skip them unless the harness confirms streaming is
+# enabled server-side by exporting VAULT_SFTP_STREAMING=1; the dedicated streaming harness does. A
+# per-test skipif (not a module-level skip) so the tests are COLLECTED-but-skipped consistently in both
+# the offline preflight and the full run — a module-level skip makes the module uncollectable in
+# preflight yet reports one skipped item in the run, tripping the report/preflight test-count audit. The
+# assembler's pure logic (incl. the gap-count DoS bound) is covered by the unit tests, which always run.
+pytestmark = [
+    pytest.mark.sftp,
+    pytest.mark.skipif(os.environ.get("VAULT_SFTP_STREAMING") != "1",
+                       reason="SFTP streaming not enabled (SFTP_STREAMING_UPLOAD=on + VAULT_SFTP_STREAMING=1)"),
+]
 
 # file.upload also needs vault.see_files/see_info to place + read back; file.delete lets the
 # atomic-overwrite test replace an existing same-name file.
