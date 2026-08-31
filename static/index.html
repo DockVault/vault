@@ -2881,6 +2881,7 @@
                                     </tbody>
                                 </table>
                             </div>
+                            <div id="audit-pagination" class="audit-pagination mt-md"></div>
                         </div>
                     </div>
 
@@ -3888,6 +3889,20 @@
                     <div class="modal-footer">
                         <button type="button" class="btn btn-secondary" id="confirm-modal-cancel-btn">Cancel</button>
                         <button type="button" id="confirm-modal-confirm-btn" class="btn btn-primary">Confirm</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Audit event detail modal (80vw): left = the page's events (TOC), right = full detail -->
+            <div id="audit-event-modal" class="modal" role="dialog" aria-modal="true" aria-label="Audit event details">
+                <div class="modal-content audit-event-content">
+                    <div class="modal-header">
+                        <h3>Audit event</h3>
+                        <button class="close-modal-btn modal-close" id="audit-event-close" aria-label="Close">×</button>
+                    </div>
+                    <div class="modal-body audit-event-body">
+                        <div class="audit-event-toc" id="audit-event-toc"></div>
+                        <div class="audit-event-detail" id="audit-event-detail"></div>
                     </div>
                 </div>
             </div>

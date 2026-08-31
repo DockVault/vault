@@ -10026,6 +10026,121 @@ async function loadAuditFilterUsers() {
 }
 
 // Search audit log
+// --- Audit log: client-side pagination + an event-detail modal with a page table-of-contents -------
+let _auditLogs = [];
+let _auditPage = 0;
+const _AUDIT_PAGE_SIZE = 25;
+
+function _auditPageSlice() {
+    const start = _auditPage * _AUDIT_PAGE_SIZE;
+    return { start, logs: _auditLogs.slice(start, start + _AUDIT_PAGE_SIZE) };
+}
+
+function renderAuditPage() {
+    const tbody = document.getElementById('audit-log-body');
+    if (!tbody) return;
+    const total = _auditLogs.length;
+    const pages = Math.max(1, Math.ceil(total / _AUDIT_PAGE_SIZE));
+    if (_auditPage >= pages) _auditPage = pages - 1;
+    const { start, logs } = _auditPageSlice();
+    tbody.replaceChildren();
+    if (!total) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 6; td.className = 'text-center py-xl text-secondary';
+        td.textContent = 'No audit log entries found for the selected filters';
+        tr.appendChild(td); tbody.appendChild(tr);
+    } else {
+        logs.forEach((log, i) => {
+            const gi = start + i;
+            const tr = document.createElement('tr');
+            const tdTime = document.createElement('td'); tdTime.textContent = formatServerTime(log.timestamp); tr.appendChild(tdTime);
+            const tdUser = document.createElement('td'); tdUser.textContent = log.username || '-'; tr.appendChild(tdUser);
+            const tdAction = document.createElement('td');
+            const ab = document.createElement('span'); ab.className = 'badge badge-secondary'; ab.textContent = (log.action || '').replace(/_/g, ' '); tdAction.appendChild(ab); tr.appendChild(tdAction);
+            const tdStatus = document.createElement('td');
+            const sb = document.createElement('span'); sb.className = 'badge badge-' + (log.status === 'success' ? 'success' : 'danger'); sb.textContent = log.status || '-'; tdStatus.appendChild(sb); tr.appendChild(tdStatus);
+            const tdIp = document.createElement('td'); tdIp.textContent = log.ip_address || '-'; tr.appendChild(tdIp);
+            const tdDet = document.createElement('td');
+            const view = document.createElement('button'); view.type = 'button'; view.className = 'btn btn-ghost btn-sm'; view.textContent = 'View';
+            view.addEventListener('click', () => openAuditEventModal(gi));
+            tdDet.appendChild(view); tr.appendChild(tdDet);
+            tbody.appendChild(tr);
+        });
+    }
+    const countBadge = document.getElementById('audit-count');
+    if (countBadge) countBadge.textContent = total + (total === 1 ? ' entry' : ' entries');
+    renderAuditPagination(total, pages);
+}
+
+function renderAuditPagination(total, pages) {
+    const host = document.getElementById('audit-pagination');
+    if (!host) return;
+    host.replaceChildren();
+    if (total <= _AUDIT_PAGE_SIZE) return;
+    const prev = document.createElement('button'); prev.type = 'button'; prev.className = 'btn btn-secondary btn-sm'; prev.textContent = '‹ Prev'; prev.disabled = _auditPage === 0;
+    prev.addEventListener('click', () => { if (_auditPage > 0) { _auditPage--; renderAuditPage(); } });
+    const next = document.createElement('button'); next.type = 'button'; next.className = 'btn btn-secondary btn-sm'; next.textContent = 'Next ›'; next.disabled = _auditPage >= pages - 1;
+    next.addEventListener('click', () => { if (_auditPage < pages - 1) { _auditPage++; renderAuditPage(); } });
+    const label = document.createElement('span'); label.className = 'text-secondary text-sm';
+    const from = _auditPage * _AUDIT_PAGE_SIZE + 1;
+    const to = Math.min(total, (_auditPage + 1) * _AUDIT_PAGE_SIZE);
+    label.textContent = `${from}–${to} of ${total} · page ${_auditPage + 1} of ${pages}`;
+    host.appendChild(prev); host.appendChild(label); host.appendChild(next);
+}
+
+function openAuditEventModal(index) {
+    const modal = document.getElementById('audit-event-modal');
+    if (!modal) return;
+    _renderAuditEventModal(index);
+    modal.classList.add('active');
+}
+
+function _renderAuditEventModal(selectedIndex) {
+    const toc = document.getElementById('audit-event-toc');
+    const detail = document.getElementById('audit-event-detail');
+    if (!toc || !detail) return;
+    const { start, logs } = _auditPageSlice();
+    // Left: a table of contents of every event on the current page (the page is shown in the header).
+    toc.replaceChildren();
+    const head = document.createElement('div'); head.className = 'audit-toc-head text-tertiary text-xs';
+    head.textContent = `Page ${_auditPage + 1} · ${logs.length} event${logs.length === 1 ? '' : 's'}`;
+    toc.appendChild(head);
+    logs.forEach((log, i) => {
+        const gi = start + i;
+        const item = document.createElement('button'); item.type = 'button';
+        item.className = 'audit-toc-item' + (gi === selectedIndex ? ' active' : '');
+        const a = document.createElement('div'); a.className = 'audit-toc-action'; a.textContent = (log.action || '').replace(/_/g, ' '); item.appendChild(a);
+        const m = document.createElement('div'); m.className = 'audit-toc-meta text-tertiary text-xs'; m.textContent = `${log.username || '-'} · ${formatServerTime(log.timestamp)}`; item.appendChild(m);
+        item.addEventListener('click', () => _renderAuditEventModal(gi));
+        toc.appendChild(item);
+    });
+    // Right: every field of the selected event, then the full details payload.
+    detail.replaceChildren();
+    const log = _auditLogs[selectedIndex];
+    if (!log) { const p = document.createElement('p'); p.className = 'text-tertiary'; p.textContent = 'Event not found.'; detail.appendChild(p); return; }
+    const fields = [
+        ['Timestamp', formatServerTime(log.timestamp)],
+        ['User', log.username || '-'],
+        ['Action', (log.action || '').replace(/_/g, ' ')],
+        ['Status', log.status || '-'],
+        ['IP address', log.ip_address || '-'],
+    ];
+    ['resource', 'resource_type', 'target', 'vault_name', 'user_agent', 'user_id'].forEach(k => { if (log[k]) fields.push([k.replace(/_/g, ' '), String(log[k])]); });
+    const grid = document.createElement('div'); grid.className = 'audit-detail-fields';
+    fields.forEach(([k, v]) => {
+        const row = document.createElement('div'); row.className = 'audit-detail-row';
+        const key = document.createElement('div'); key.className = 'audit-detail-key'; key.textContent = k; row.appendChild(key);
+        const val = document.createElement('div'); val.className = 'audit-detail-val'; val.textContent = v; row.appendChild(val);
+        grid.appendChild(row);
+    });
+    detail.appendChild(grid);
+    if (log.details && typeof log.details === 'object' && Object.keys(log.details).length) {
+        const h = document.createElement('div'); h.className = 'audit-detail-key mt-md'; h.textContent = 'Full details'; detail.appendChild(h);
+        const pre = document.createElement('pre'); pre.className = 'audit-detail-json'; pre.textContent = JSON.stringify(log.details, null, 2); detail.appendChild(pre);
+    }
+}
+
 async function searchAuditLog() {
     const tbody = document.getElementById('audit-log-body');
     const countBadge = document.getElementById('audit-count');
@@ -10050,44 +10165,11 @@ async function searchAuditLog() {
         
         const logs = await apiRequest(`/audit/log?${queryParams.toString()}`, { silent: true });
         
-        if (countBadge) {
-            countBadge.textContent = `${logs.length} entries`;
-        }
-        
-        if (logs.length === 0) {
-            tbody.innerHTML = `
-                <tr>
-                    <td colspan="6" class="text-center py-xl text-secondary">
-                        No audit log entries found for the selected filters
-                    </td>
-                </tr>
-            `;
-            return;
-        }
-        
-        tbody.innerHTML = logs.map(log => {
-            // Audit rows are a security record: an unreadable timestamp must not
-            // render as the current instant, which would make an old or corrupted
-            // event look like it just happened.
-            const timestampText = formatServerTime(log.timestamp);
-            const statusClass = log.status === 'success' ? 'success' : 'danger';
-            
-            return `
-                <tr>
-                    <td>${timestampText}</td>
-                    <td>${escapeHtml(log.username || '-')}</td>
-                    <td><span class="badge badge-secondary">${escapeHtml(log.action.replace('_', ' '))}</span></td>
-                    <td><span class="badge badge-${statusClass}">${log.status}</span></td>
-                    <td>${escapeHtml(log.ip_address || '-')}</td>
-                    <td>
-                        <details>
-                            <summary class="cursor-pointer text-primary">View</summary>
-                            <pre class="text-xs mt-sm">${escapeHtml(JSON.stringify(log.details || {}, null, 2))}</pre>
-                        </details>
-                    </td>
-                </tr>
-            `;
-        }).join('');
+        // Store the fetched set and render the first page. Rows and the event modal are built with
+        // DOM APIs (below) so all values go through textContent.
+        _auditLogs = Array.isArray(logs) ? logs : [];
+        _auditPage = 0;
+        renderAuditPage();
     } catch (error) {
         console.error('Failed to search audit log:', error);
         tbody.innerHTML = `
@@ -10256,6 +10338,12 @@ function attachSettingsListeners() {
     if (clearBtn) {
         clearBtn.addEventListener('click', clearAuditFilters);
     }
+
+    // Audit event modal: close on the × and on a backdrop click.
+    const aeModal = document.getElementById('audit-event-modal');
+    const aeClose = document.getElementById('audit-event-close');
+    if (aeClose && aeModal) aeClose.addEventListener('click', () => aeModal.classList.remove('active'));
+    if (aeModal) aeModal.addEventListener('click', (e) => { if (e.target === aeModal) aeModal.classList.remove('active'); });
 }
 
 // Open Vault (Placeholder - needs SFTP integration or file listing)
