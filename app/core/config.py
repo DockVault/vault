@@ -87,6 +87,17 @@ class Settings(BaseSettings):
     sftp_max_connections: int = Field(default=100)
     sftp_max_connections_per_ip: int = Field(default=10)
     sftp_auth_grace_seconds: int = Field(default=30)
+    # Memory-bounded streaming upload (experimental, default OFF). When on, an SFTP upload is
+    # encrypted and persisted record-by-record as it arrives instead of being buffered whole to the
+    # .sftp_tmp staging tmpfs, so RAM/tmpfs use is bounded to one 1 MiB record plus the reorder
+    # window regardless of file size (the at-rest format is byte-identical to the buffered/web path).
+    # sftp_streaming_reorder_mb caps how much out-of-order data is held to bridge a client that writes
+    # records slightly out of order; a write beyond it (or a rewrite of an already-sealed region)
+    # fails the upload with a descriptive error -- sftp put / scp write sequentially, so only an
+    # exotic random-access client hits it. Ships OFF; flip on after a large-file measurement confirms
+    # flat RSS and a byte-identical round-trip. Rollback is just flipping it back (no format change).
+    sftp_streaming_upload: bool = Field(default=False)
+    sftp_streaming_reorder_mb: int = Field(default=16)
 
     # API Server Configuration
     api_host: str = Field(default="0.0.0.0")  # Bind to all interfaces for network access

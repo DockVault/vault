@@ -72,6 +72,7 @@ from app.services.vault_service import FileNotFoundError as VaultFileNotFoundErr
 from app.services.audit_logger import AuditLogger
 from app.core.config import settings
 from app.sftp.host_key import generate_ed25519_host_key, load_host_key
+from app.sftp.upload_assembler import UploadAssembler, AssemblerError
 from app.core.session_hash_utils import hash_session_token
 from app.core.safe_log import safe_event
 from app.core.temp_scope import is_scoped, effective_vault_caps, scope_ids
@@ -263,6 +264,10 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         self.writepath: Optional[str] = None
         self.writefile = None
         self.finalizer = None  # callable(temp_path) -> None
+        # Streaming write mode (SFTP_STREAMING_UPLOAD): a _StreamingUpload that encrypts + persists
+        # records as they arrive instead of buffering to `writefile`. Mutually exclusive with the
+        # buffered path — exactly one of `stream` / `writefile` is set on an upload handle.
+        self.stream = None
         # In-stream upload bound: cap the plaintext buffered to the shared volume so a
         # client can't fill it before the close-time size check. 0 = no bound. overlimit
         # marks the upload for discard at close (an SFTP close can't signal failure).
@@ -303,6 +308,8 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
             return paramiko.SFTP_FAILURE
 
     def write(self, offset: int, data: bytes):
+        if self.stream is not None:
+            return self.stream.write(offset, data)
         if self.writefile is None:
             return paramiko.SFTP_OP_UNSUPPORTED
         # In-stream size bound: reject any write that would push the buffered file past the
@@ -352,6 +359,13 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
                 pass
             self.reader = None
 
+        # Streaming write mode: the encryptor was fed records as they arrived; finalize (re-authorize
+        # + insert the File row) or discard the uncommitted blob.
+        if self.stream is not None:
+            self.stream.close()
+            self.stream = None
+            return
+
         # Write mode: assemble + encrypt + persist.
         if self.writefile is not None:
             # Flush and close are SEPARATE: the buffer is a BufferedWriter, so the final
@@ -389,6 +403,170 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
                     os.remove(self.writepath)
             except Exception:  # noqa: BLE001
                 pass
+
+
+class _StreamingUpload:
+    """Memory-bounded SFTP upload driver (used only when SFTP_STREAMING_UPLOAD is on).
+
+    Re-chunks the client's ``write(offset, data)`` calls into ordered 1 MiB records via an
+    :class:`UploadAssembler` and feeds them to the live chunked-encryption pipeline AS THEY ARRIVE, so
+    the plaintext is never staged whole (RAM/tmpfs use is bounded to one record plus the reorder
+    window regardless of file size; the at-rest format is byte-identical to the buffered path).
+
+    Holds no DB transaction during the byte stream: the encryptor is opened in a BRIEF session on the
+    first record (``upload_file_streaming`` is read-only and re-checks write permission there), and a
+    FRESH session runs the close-time re-authorization + File-row insert via the SAME
+    ``_authorize_upload_persist`` gate the buffered path uses. On any failure — over the size limit, an
+    out-of-order/rewrite the streaming path cannot honour, a lost authorization at close, or a persist
+    error — the UNCOMMITTED encrypted blob is unlinked and no terminal is written, so a rejected upload
+    leaves no orphan blob and never destroys the existing same-name file (the File row is the commit
+    point, exactly as in the buffered path)."""
+
+    RECORD_SIZE = 1024 * 1024
+
+    def __init__(self, handle, interface, vault_id, folder_id, filename,
+                 can_overwrite, max_bytes, reorder_bytes):
+        self._handle = handle
+        self._interface = interface
+        self._vault_id = vault_id
+        self._folder_id = folder_id
+        self._filename = filename
+        self._can_overwrite = can_overwrite
+        self._max_bytes = max_bytes
+        self._assembler = UploadAssembler(self._emit, record_size=self.RECORD_SIZE,
+                                          reorder_window=max(0, reorder_bytes))
+        self._ctx = None          # StreamingUploadContext (a file handle), entered on the first record
+        self._file_info = None
+        self._started = False
+        self._failed = False      # over-limit / bad-order / write error -> discard at close
+
+    # -- write path ---------------------------------------------------------
+    def _ensure_started(self):
+        """Open the encryptor on the first record (or an empty upload at close). Brief read-only
+        session; the returned context is a file handle held open across the transfer."""
+        if self._started:
+            return
+        with get_db_context() as db:
+            user = self._interface._load_principal(db)
+            if user is None or not self._interface._check_session_valid():
+                raise PermissionError("principal invalid at stream start")
+            vs = VaultService(db, PermissionService(db))
+            mime_type, _ = mimetypes.guess_type(self._filename)
+            # upload_file_streaming re-checks write permission and is read-only (no reservation), so it
+            # is safe to run in a session that closes before the bytes stream.
+            self._file_info, self._ctx = vs.upload_file_streaming(
+                vault_id=self._vault_id, file_name=self._filename, user=user,
+                folder_id=self._folder_id, mime_type=mime_type)
+        self._ctx.__enter__()     # opens the blob + writes the codec header (no DB)
+        self._started = True
+
+    def _emit(self, record):
+        self._ensure_started()
+        self._ctx.write_chunk(record)
+
+    def write(self, offset, data):
+        if self._failed:
+            return paramiko.SFTP_FAILURE
+        # In-stream size bound on the highest byte position written, before any record is sealed.
+        if self._max_bytes and (offset + len(data)) > self._max_bytes:
+            self._failed = True
+            self._set_status("upload rejected: file exceeds the %d MB SFTP limit "
+                             "(raise MAX_FILE_SIZE_MB)" % (self._max_bytes // (1024 * 1024)))
+            return paramiko.SFTP_FAILURE
+        try:
+            self._assembler.feed(offset, data)
+            return paramiko.SFTP_OK
+        except AssemblerError as e:
+            # A rewrite of an already-sealed region, or out-of-order data past the reorder window: the
+            # streaming path cannot honour it (records are sealed in order). Fail the upload.
+            self._failed = True
+            self._set_status("upload rejected: %s" % str(e))
+            safe_event('upload.stream.bad-order', e)
+            return paramiko.SFTP_FAILURE
+        except Exception as e:  # noqa: BLE001
+            self._failed = True
+            safe_event('upload.stream.write-failed', e)
+            return paramiko.SFTP_FAILURE
+
+    def _set_status(self, desc):
+        try:
+            self._handle._set_status_desc(desc)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # -- close path ---------------------------------------------------------
+    def close(self):
+        if self._failed:
+            self._abort()
+            return
+        try:
+            self._assembler.finish()   # flush the final short record
+        except Exception as e:  # noqa: BLE001
+            # finish() emits the tail record, which for a sub-record upload is the FIRST emit -- so it
+            # can trigger _ensure_started (opening the encryptor, which re-checks write permission via
+            # upload_file_streaming) and the encrypt. Any failure here (an out-of-order hole =
+            # AssemblerError, a write-permission denial for a read-only member, or an encryption error)
+            # means the upload cannot complete: discard it and return cleanly (an SFTP close cannot
+            # signal failure to the client). _abort is a no-op when the encryptor never opened.
+            safe_event('upload.stream.incomplete', e)
+            self._abort()
+            return
+        # Ensure the encryptor is open even for a 0-byte upload (opened, never written), so an empty
+        # file is persisted like the buffered path.
+        try:
+            self._ensure_started()
+        except Exception as e:  # noqa: BLE001
+            safe_event('upload.stream.start-failed', e)
+            self._abort()
+            return
+        try:
+            checksum = self._ctx.get_checksum()
+            total_size = self._ctx.get_total_size()
+            with get_db_context() as db:
+                authz = self._interface._authorize_upload_persist(
+                    db, self._vault_id, self._folder_id, total_size)
+                if authz is None:
+                    self._abort()
+                    return
+                user, vault, vault_service = authz
+                # file_info's vault ORM came from the (now-closed) first-write session; re-bind it to
+                # this session for finalize's same-name replacement + ZK check.
+                self._file_info['vault'] = vault
+                # Clean-exit the encryptor: writes the terminal that marks the blob complete. Do this
+                # only after re-authz passes, and null the ctx so _abort below never double-exits it.
+                self._ctx.__exit__(None, None, None)
+                self._ctx = None
+                try:
+                    new_file = vault_service.finalize_streaming_upload(
+                        file_info=self._file_info, total_size=total_size, checksum=checksum,
+                        replace_same_name=self._can_overwrite)
+                except Exception:
+                    # finalize failed AFTER the terminal was written -> unlink the orphan blob so a
+                    # failed put leaves no encrypted file with no File row.
+                    try:
+                        orphan = vault_service.storage_path / self._file_info["storage_path"]
+                        if orphan.exists():
+                            orphan.unlink()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise
+                self._interface._audit(user, "file_upload", str(new_file.id),
+                                       {"vault_id": str(self._vault_id), "file_name": self._filename,
+                                        "via": "sftp"})
+                safe_event('upload.stored', file=new_file.id, vault=self._vault_id, bytes=total_size)
+        except Exception as e:  # noqa: BLE001
+            safe_event('upload.stream.finalize-failed', e)
+            self._abort()
+
+    def _abort(self):
+        """Discard the uncommitted upload: exit the encryptor with an error so it unlinks the blob and
+        writes NO terminal (a partial blob is thus never mistaken for a complete file)."""
+        if self._ctx is not None:
+            try:
+                self._ctx.__exit__(RuntimeError, RuntimeError("sftp streaming upload discarded"), None)
+            except Exception:  # noqa: BLE001
+                pass
+            self._ctx = None
 
 
 class SFTPServerInterface(paramiko.SFTPServerInterface):
@@ -964,9 +1142,12 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             if not _up.file_type_allowed(filename, _up.parse_allowed_exts(_sblob.get("allowed_file_types"))):
                 return paramiko.SFTP_PERMISSION_DENIED
             _eff_max = _up.effective_max_file_bytes((settings.max_file_size_mb or 0) * 1024 * 1024, _sblob.get("max_file_size"))
-            # A buffered upload can't exceed the staging tmpfs; refuse an oversized one in-stream
-            # rather than filling the tmpfs mid-write.
-            _eff_max = _staging_capped_max(_eff_max, settings.sftp_staging_tmpfs_mb)
+            # A BUFFERED upload can't exceed the staging tmpfs; refuse an oversized one in-stream rather
+            # than filling the tmpfs mid-write. The STREAMING path never stages to .sftp_tmp, so the
+            # tmpfs budget is irrelevant to it -- clamping it there would wrongly cap streaming uploads
+            # to a RAM budget they don't consume (and the .env.example ships a non-zero tmpfs value).
+            if not settings.sftp_streaming_upload:
+                _eff_max = _staging_capped_max(_eff_max, settings.sftp_staging_tmpfs_mb)
             try:
                 folder_id = self._resolve_folder(db, vault.id, segments[1:-1])
             except _PathNotFound:
@@ -999,6 +1180,21 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 if clash is not None:
                     return paramiko.SFTP_PERMISSION_DENIED
 
+        # Streaming upload (opt-in via SFTP_STREAMING_UPLOAD): encrypt + persist records as they
+        # arrive, so the plaintext is never staged whole to the .sftp_tmp tmpfs. All the open()-time
+        # authorization above (no-clobber + write permission) already ran and applies unchanged; the
+        # close-time re-authorization is the SAME _authorize_upload_persist the buffered path uses.
+        if settings.sftp_streaming_upload:
+            handle = VaultSFTPHandle(flags=os.O_WRONLY)
+            handle.max_bytes = _eff_max
+            handle._sftp_server = getattr(self, "_sftp_server", None)
+            handle.stream = _StreamingUpload(
+                handle=handle, interface=self, vault_id=vault_id, folder_id=folder_id,
+                filename=filename, can_overwrite=can_overwrite, max_bytes=_eff_max,
+                reorder_bytes=max(0, settings.sftp_streaming_reorder_mb) * 1024 * 1024,
+            )
+            return handle
+
         # Buffer the plaintext to a temp file; encrypt + persist at close().
         try:
             _SFTP_TMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -1023,6 +1219,50 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         )
         return handle
 
+    def _authorize_upload_persist(self, db, vault_id, folder_id, size):
+        """Persist-time re-authorization shared by the buffered and streaming SFTP upload paths.
+
+        Runs EVERY TOCTOU gate that must still hold at close — an account locked/deactivated or a
+        session revoked mid-transfer, a temp-credential scope narrowed off the destination folder, a
+        vault password added/rotated, the vault size limit, and the deployment plan ceiling — against a
+        FRESH session. Returns ``(user, vault, vault_service)`` when the write may land, or ``None``
+        (having logged the specific reason) when it must be dropped. `get_vault` can itself raise on a
+        membership/scope loss; that is caught and mapped to a drop so both callers see one contract
+        (a None means "do not persist")."""
+        user = self._load_principal(db)
+        if user is None or not self._check_session_valid():
+            safe_event('upload.aborted.principal-invalid')
+            return None
+        vault_service = VaultService(db, PermissionService(db))
+        try:
+            vault = vault_service.get_vault(vault_id, user, require_password=False)
+        except Exception as e:  # noqa: BLE001 - a membership/scope loss between open() and close()
+            safe_event('upload.aborted.reauthz-failed', e)
+            return None
+        # Re-check WRITE at persist time, not just membership/READ (get_vault above): a member
+        # downgraded write->read between stream-start and close must drop the upload. Shared, so this
+        # hardens the buffered path AND the large-streaming case, where the stream-start WRITE check
+        # (upload_file_streaming's require_vault_permission) fires at the FIRST record, early.
+        from app.core.models import VaultPermissionEnum
+        if not vault_service.permission_service.can_access_vault(user, vault_id, VaultPermissionEnum.WRITE):
+            safe_event('upload.aborted.write-denied')
+            return None
+        if not self._scope_ok_folder(db, user, vault_id, folder_id):
+            safe_event('upload.aborted.folder-out-of-scope')
+            return None
+        if vault.password_hash is not None and not self._vault_password_proven(user, vault):
+            safe_event('upload.aborted.password-proof-invalid')
+            return None
+        if vault.size_limit and (vault.total_size_bytes or 0) + size > vault.size_limit:
+            safe_event('upload.rejected.vault-limit', vault=vault.id, bytes=size, limit=vault.size_limit)
+            return None
+        from app.services.vault_service import would_exceed_deployment_storage
+        exceeds, _used, _cap = would_exceed_deployment_storage(db, size)
+        if exceeds:
+            safe_event('upload.rejected.plan-limit', bytes=size)
+            return None
+        return user, vault, vault_service
+
     def _make_upload_finalizer(self, vault_id, folder_id, filename, can_overwrite):
         """Build the close-time callback that pushes a buffered plaintext file
         through the canonical (web-identical) encryption pipeline and creates the
@@ -1046,43 +1286,10 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 return
 
             with get_db_context() as db:
-                user = interface._load_principal(db)
-                # Re-validate principal AND session at persist time: an account
-                # locked/deactivated or a session revoked mid-transfer must not
-                # land the write (TOCTOU between open() and close()).
-                if user is None or not interface._check_session_valid():
-                    safe_event('upload.aborted.principal-invalid')
+                authz = interface._authorize_upload_persist(db, vault_id, folder_id, buffered_size)
+                if authz is None:
                     return
-                vault_service = VaultService(db, PermissionService(db))
-                # Re-authorize at persist time (fresh session): membership +
-                # temp-cred vault scope. upload re-checks the real vault.
-                vault = vault_service.get_vault(vault_id, user, require_password=False)
-                # Re-check the destination folder's ID-scope too (parity with the session/password/
-                # quota re-checks): a scoped credential whose scope was narrowed between open() and
-                # close() must not land a write into a now-out-of-scope folder.
-                if not interface._scope_ok_folder(db, user, vault_id, folder_id):
-                    safe_event('upload.aborted.folder-out-of-scope')
-                    return
-                # Re-gate the per-vault password proof too: a password ADDED or rotated
-                # between open() and close() must not let an in-flight write land without
-                # current proof (TOCTOU) — same gate _resolve_vault applies at open().
-                if vault.password_hash is not None and not interface._vault_password_proven(user, vault):
-                    safe_event('upload.aborted.password-proof-invalid')
-                    return
-
-                # Vault quota pre-check (mirror the web upload path) — again before
-                # we write or delete anything.
-                if vault.size_limit and (vault.total_size_bytes or 0) + buffered_size > vault.size_limit:
-                    safe_event('upload.rejected.vault-limit',
-                                vault=vault.id, bytes=buffered_size, limit=vault.size_limit)
-                    return
-                # Deployment-wide plan storage ceiling (aggregate across all vaults) —
-                # same gate the web upload path enforces, so SFTP can't bypass the plan.
-                from app.services.vault_service import would_exceed_deployment_storage
-                exceeds, _used, _cap = would_exceed_deployment_storage(db, buffered_size)
-                if exceeds:
-                    safe_event('upload.rejected.plan-limit', bytes=buffered_size)
-                    return
+                user, vault, vault_service = authz
 
                 mime_type, _ = mimetypes.guess_type(filename)
                 file_info, stream_ctx = vault_service.upload_file_streaming(
