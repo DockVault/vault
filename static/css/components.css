@@ -2217,6 +2217,10 @@ details summary:hover {
 .nl-tag-cell .icon { vertical-align: middle; margin-right: 4px; }
 .nl-tag-cell > span { vertical-align: middle; }
 
+/* Settings tag lists are capped to a few rows and scroll, so a long list doesn't push the tag editor
+   that sits below it out of view. Covers share tags, note-link tags, and upload-link (receiver) tags. */
+#share-tags-list, #nl-tags-list, #rt-tags-list { max-height: 260px; overflow-y: auto; }
+
 /* Audit event modal: an 80vw dialog with a scrollable table-of-contents of the page's events on the
    left and the selected event's full detail on the right, plus the audit pagination strip. */
 .audit-event-content { width: 80vw; max-width: 80vw; }
