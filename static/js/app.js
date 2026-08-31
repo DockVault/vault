@@ -18383,10 +18383,90 @@ async function loadMyReceivers() {
     host.replaceChildren(_el('div', 'spinner'));
     try {
         const data = await apiRequest('/receivers', { silent: true });
-        renderMyReceivers((data && data.receivers) || []);
+        const receivers = (data && data.receivers) || [];
+        renderMyReceivers(receivers);            // Links tab (table)
+        renderReceiverVaults(receivers);          // Drop vaults tab (cards)
     } catch (e) {
         host.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load your upload links: ' + ((e && e.message) || '')));
     }
+}
+
+// Drop-vaults tab: each upload link's dedicated vault as a card with a storage ring, an Open action
+// (opens the vault in place), and an Info action (the link's full details). DOM APIs only.
+function renderReceiverVaults(receivers) {
+    const host = _rcEl('receivers-vaults'); if (!host) return;
+    host.replaceChildren();
+    if (!receivers.length) {
+        host.appendChild(_el('p', 'text-tertiary text-sm', 'No upload links yet — create one to get a drop vault.'));
+        return;
+    }
+    const grid = document.createElement('div'); grid.className = 'rc-vault-grid';
+    receivers.forEach(r => {
+        const card = document.createElement('div'); card.className = 'card rc-vault-card';
+        const head = document.createElement('div'); head.className = 'rc-vault-head';
+        if (r.tag_icon) head.appendChild(_svgIcon(r.tag_icon, 'icon-sm'));
+        const nm = document.createElement('div'); nm.className = 'rc-vault-name font-medium'; nm.textContent = r.label || 'Upload link'; head.appendChild(nm);
+        const st = document.createElement('span'); st.className = 'badge badge-' + (r.status === 'active' ? 'success' : 'secondary'); st.textContent = _RC_STATUS_LABEL[r.status] || r.status; head.appendChild(st);
+        card.appendChild(head);
+        const pct = (r.max_total_bytes && r.max_total_bytes > 0)
+            ? Math.min(100, Math.round(((r.reserved_bytes || 0) / r.max_total_bytes) * 100)) : null;
+        const ringWrap = document.createElement('div'); ringWrap.className = 'rc-ring-wrap';
+        const ring = document.createElement('div'); ring.className = 'rc-ring';
+        ring.style.background = pct != null
+            ? `conic-gradient(var(--info) ${pct * 3.6}deg, var(--surface-3) 0)` : 'var(--surface-3)';
+        const hole = document.createElement('div'); hole.className = 'rc-ring-hole'; hole.textContent = pct != null ? (pct + '%') : '∞';
+        ring.appendChild(hole); ringWrap.appendChild(ring);
+        const usage = document.createElement('div'); usage.className = 'text-tertiary text-xs';
+        usage.textContent = r.max_total_bytes
+            ? (_mbFromBytes(r.reserved_bytes || 0) + ' / ' + _mbFromBytes(r.max_total_bytes) + ' MB')
+            : (_mbFromBytes(r.reserved_bytes || 0) + ' MB used');
+        ringWrap.appendChild(usage); card.appendChild(ringWrap);
+        const files = document.createElement('div'); files.className = 'text-tertiary text-xs';
+        files.textContent = (r.max_uploads != null) ? ((r.upload_count || 0) + ' / ' + r.max_uploads + ' files') : ((r.upload_count || 0) + ' files');
+        card.appendChild(files);
+        const actions = document.createElement('div'); actions.className = 'rc-vault-actions flex gap-sm';
+        const open = _el('button', 'btn btn-primary btn-sm', 'Open vault'); open.type = 'button';
+        open.addEventListener('click', () => openVault(r.vault_id));
+        const info = _el('button', 'btn btn-secondary btn-sm', 'Info'); info.type = 'button';
+        info.addEventListener('click', () => openReceiverInfoModal(r));
+        actions.appendChild(open); actions.appendChild(info); card.appendChild(actions);
+        grid.appendChild(card);
+    });
+    host.appendChild(grid);
+}
+
+// The Info action on a drop-vault card: the upload link's full details in a modal (same facts as the
+// Links table). DOM APIs only.
+function openReceiverInfoModal(r) {
+    document.querySelectorAll('.rc-info-modal').forEach(m => m.remove());
+    const rows = [
+        ['Label', r.label || '—'],
+        ['Type', r.tag_name || '—'],
+        ['Status', _RC_STATUS_LABEL[r.status] || r.status],
+        ['Protection', r.secret_kind === 'password' ? 'Password' : (r.secret_kind === 'pin' ? 'PIN' : 'None')],
+        ['Expires', _rcExpiryText(r)],
+        ['Files', (r.max_uploads != null) ? ((r.upload_count || 0) + ' / ' + r.max_uploads) : String(r.upload_count || 0)],
+        ['Storage', r.max_total_bytes ? (_mbFromBytes(r.reserved_bytes || 0) + ' / ' + _mbFromBytes(r.max_total_bytes) + ' MB') : (_mbFromBytes(r.reserved_bytes || 0) + ' MB used')],
+        ['Retention', r.retention_days ? (r.retention_days + ' days') : 'Kept'],
+    ];
+    const modal = document.createElement('div'); modal.className = 'modal active rc-info-modal';
+    modal.setAttribute('role', 'dialog'); modal.setAttribute('aria-modal', 'true');
+    const content = document.createElement('div'); content.className = 'modal-content'; content.style.maxWidth = '480px';
+    const header = document.createElement('div'); header.className = 'modal-header';
+    const h = document.createElement('h3'); h.textContent = r.label || 'Upload link'; header.appendChild(h);
+    const close = document.createElement('button'); close.className = 'modal-close'; close.type = 'button'; close.setAttribute('aria-label', 'Close'); close.textContent = '×';
+    close.addEventListener('click', () => modal.remove()); header.appendChild(close);
+    const body = document.createElement('div'); body.className = 'modal-body';
+    const grid = document.createElement('div'); grid.className = 'audit-detail-fields';
+    rows.forEach(([k, v]) => {
+        const key = document.createElement('div'); key.className = 'audit-detail-key'; key.textContent = k;
+        const val = document.createElement('div'); val.className = 'audit-detail-val'; val.textContent = v;
+        grid.appendChild(key); grid.appendChild(val);
+    });
+    body.appendChild(grid);
+    content.appendChild(header); content.appendChild(body); modal.appendChild(content);
+    modal.addEventListener('click', (ev) => { if (ev.target === modal) modal.remove(); });
+    document.body.appendChild(modal);
 }
 
 function _rcExpiryText(r) { return r.expires_at ? (typeof _fmtLinkExpiry === 'function' ? _fmtLinkExpiry(r.expires_at).replace(/^Expires /, '') : r.expires_at) : 'Never'; }
@@ -18773,6 +18853,17 @@ function setupReceiverUI() {
     const secret = _rcEl('rc-secret'); if (secret) secret.addEventListener('change', onRcSecretChange);
     const copy = _rcEl('rc-copy'); if (copy) copy.addEventListener('click', copyRcLink);
     document.querySelectorAll('[data-rc-close]').forEach(el => el.addEventListener('click', () => closeModal()));
+    // Links / Drop-vaults tab switching on the Upload Links page.
+    document.querySelectorAll('#uploadlinks-section [data-rc-tab]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const tab = btn.dataset.rcTab;
+            document.querySelectorAll('#uploadlinks-section [data-rc-tab]').forEach(b => b.classList.toggle('active', b === btn));
+            const links = document.getElementById('receivers-tab-links');
+            const vaults = document.getElementById('receivers-tab-vaults');
+            if (links) links.style.display = tab === 'links' ? '' : 'none';
+            if (vaults) vaults.style.display = tab === 'vaults' ? '' : 'none';
+        });
+    });
 }
 
 function wireNotesOnce() {

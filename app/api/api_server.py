@@ -10019,6 +10019,8 @@ def _receiver_public_dict(r, tag=None) -> dict:
         "status": _receiver_status(r),
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "last_upload_at": r.last_upload_at.isoformat() if r.last_upload_at else None,
+        # Bytes already used in the drop vault, for a storage indicator (ring) against max_total_bytes.
+        "reserved_bytes": r.reserved_bytes or 0,
     }
 
 

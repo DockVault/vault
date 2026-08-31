@@ -960,7 +960,16 @@
                         <button id="receiver-new-btn" class="btn btn-primary btn-sm" type="button"><svg class="icon icon-sm"><use href="#i-plus"/></svg> New upload link</button>
                     </div>
                     <p class="text-secondary text-sm mb-md">An upload link lets anyone you share it with send files to you — no account needed. Each link drops uploads into its own dedicated vault that only you can open. Pause a link to stop new uploads without losing what's already in it; revoke it to close it for good.</p>
-                    <div id="receivers-list" style="overflow-x:auto;"></div>
+                    <div class="tabs mb-lg" role="tablist">
+                        <button class="tab-btn active" type="button" data-rc-tab="links">Links</button>
+                        <button class="tab-btn" type="button" data-rc-tab="vaults">Drop vaults</button>
+                    </div>
+                    <div id="receivers-tab-links" class="rc-tab-panel">
+                        <div id="receivers-list" style="overflow-x:auto;"></div>
+                    </div>
+                    <div id="receivers-tab-vaults" class="rc-tab-panel" style="display:none;">
+                        <div id="receivers-vaults"></div>
+                    </div>
                 </div>
 
                 <!-- Create an upload link (receiver). -->

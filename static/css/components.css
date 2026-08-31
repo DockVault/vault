@@ -2225,6 +2225,16 @@ details summary:hover {
 .vga-members { background: none; border: none; padding: 0; font: inherit; cursor: pointer; color: var(--info); text-decoration: underline; text-underline-offset: 2px; }
 .vga-members:hover { color: var(--text-primary); }
 
+/* Upload Links -> Drop vaults tab: each link's dedicated vault as a card with a storage ring. */
+.rc-vault-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: var(--space-md); }
+.rc-vault-card { display: flex; flex-direction: column; align-items: center; gap: var(--space-sm); text-align: center; padding: var(--space-lg); background: var(--surface-1); }
+.rc-vault-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: center; }
+.rc-vault-name { overflow-wrap: anywhere; }
+.rc-ring-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.rc-ring { width: 84px; height: 84px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
+.rc-ring-hole { width: 62px; height: 62px; border-radius: 50%; background: var(--surface-1); display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 0.95rem; color: var(--text-primary); }
+.rc-vault-actions { margin-top: auto; }
+
 /* Audit event modal: an 80vw dialog with a scrollable table-of-contents of the page's events on the
    left and the selected event's full detail on the right, plus the audit pagination strip. */
 .audit-event-content { width: 80vw; max-width: 80vw; }
