@@ -2208,6 +2208,15 @@ details summary:hover {
    explainer), wasting the right half of the row. */
 .settings-tab-content .p-lg > p { max-width: none; }
 
+/* Type/tag cell in the public-link and upload-link admin tables. It previously reused
+   .nl-tag-idlead (display:inline-flex) directly on the <td>, which stops it being a table cell —
+   the column stopped aligning and the row grew taller than its siblings. Keep the <td> a real cell
+   and lay out the colour dot + icon + name inline instead. */
+.nl-tag-cell { white-space: nowrap; }
+.nl-tag-cell .nl-color-dot { margin-right: 6px; vertical-align: middle; }
+.nl-tag-cell .icon { vertical-align: middle; margin-right: 4px; }
+.nl-tag-cell > span { vertical-align: middle; }
+
 /* ============================================================================
    CONTINUED IN NEXT FILE...
    ============================================================================ */

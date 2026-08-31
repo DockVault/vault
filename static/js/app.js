@@ -16995,7 +16995,7 @@ function renderAdminNoteLinks(data) {
     links.forEach(l => {
         const tr = _el('tr');
         tr.appendChild(_el('td', '', l.owner || '—'));
-        const typeTd = _el('td', 'nl-tag-idlead');
+        const typeTd = _el('td', 'nl-tag-cell');
         const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
         if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
         typeTd.appendChild(_el('span', '', l.tag_name || '—'));
@@ -18048,7 +18048,7 @@ function renderMyPublicLinks(links) {
     const tb = _el('tbody');
     links.forEach(l => {
         const tr = _el('tr');
-        const typeTd = _el('td', 'nl-tag-idlead');
+        const typeTd = _el('td', 'nl-tag-cell');
         const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
         if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
         typeTd.appendChild(_el('span', '', l.tag_name || '—'));
@@ -18118,7 +18118,7 @@ function renderAdminPublicLinks(data) {
     links.forEach(l => {
         const tr = _el('tr');
         tr.appendChild(_el('td', '', l.owner || '—'));
-        const typeTd = _el('td', 'nl-tag-idlead');
+        const typeTd = _el('td', 'nl-tag-cell');
         const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
         if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
         typeTd.appendChild(_el('span', '', l.tag_name || '—'));
@@ -18222,7 +18222,7 @@ function renderMyReceivers(receivers) {
     receivers.forEach(r => {
         const tr = _el('tr');
         tr.appendChild(_el('td', '', r.label || '—'));
-        const typeTd = _el('td', 'nl-tag-idlead');
+        const typeTd = _el('td', 'nl-tag-cell');
         const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(r.tag_border_color) : '';
         if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
         typeTd.appendChild(_el('span', '', r.tag_name || '—'));
