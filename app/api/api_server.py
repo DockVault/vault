@@ -2159,16 +2159,27 @@ def _is_budget_exempt(user: User) -> bool:
     return user.role == RoleEnum.ADMIN and not getattr(user, "_is_temp_session", False)
 
 
+# Default per-account storage budget (GB) when the deployment has not saved one. A fresh install
+# ships with a 50 GB per-account ceiling rather than unlimited (finding F-R015-003), so no single
+# account can consume unbounded storage out of the box. An admin raises it, or sets 0 = unlimited.
+_DEFAULT_ACCOUNT_QUOTA_GB = 50
+# Default per-account cap on OWNED vaults when the deployment has not saved one (finding F-R015-003).
+# 0 = unlimited. Full admins are exempt.
+_DEFAULT_MAX_VAULTS_PER_USER = 50
+
+
 def _account_quota_bytes(db: Session, user: User):
     """This account's EFFECTIVE storage budget in bytes, or None when it has none.
 
     Per-account override first (users.storage_quota_bytes: NULL inherits, -1 exempts, >= 0 is an
-    exact budget), otherwise the deployment default. A budget-exempt identity has no budget at
-    all — the per-vault ceiling still applies to them."""
+    exact budget), otherwise the deployment default. When the deployment never saved a default the
+    account gets the shipped _DEFAULT_ACCOUNT_QUOTA_GB (a stored 0 still means unlimited). A
+    budget-exempt identity has no budget at all — the per-vault ceiling still applies to them."""
     if _is_budget_exempt(user):
         return None
     return storage_quota.account_quota_bytes(
-        getattr(user, "storage_quota_bytes", None), _settings_blob(db).get("default_user_quota"))
+        getattr(user, "storage_quota_bytes", None),
+        _settings_blob(db).get("default_user_quota", _DEFAULT_ACCOUNT_QUOTA_GB))
 
 
 def _account_allocated_bytes(db: Session, user_id, exclude_vault_id=None) -> int:
@@ -2193,6 +2204,38 @@ def _max_allowed_vault_size_bytes(db: Session, owner: User, exclude_vault_id=Non
     headroom = storage_quota.account_headroom_bytes(
         _account_quota_bytes(db, owner), _account_allocated_bytes(db, owner.id, exclude_vault_id))
     return storage_quota.max_vault_total_bytes(ceiling, headroom)
+
+
+def _max_vaults_per_user(db: Session) -> int:
+    """Per-user cap on OWNED vaults (0 = unlimited). Default _DEFAULT_MAX_VAULTS_PER_USER; the admin
+    tunes it in Settings -> Storage. Absent => the default; an explicit 0 => unlimited (distinct from
+    absent); a bool/negative/unparseable stored value falls back to the default (fail-safe)."""
+    raw = _settings_blob(db).get("max_vaults_per_user", _DEFAULT_MAX_VAULTS_PER_USER)
+    if isinstance(raw, bool):
+        return _DEFAULT_MAX_VAULTS_PER_USER
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_VAULTS_PER_USER
+    return n if n >= 0 else _DEFAULT_MAX_VAULTS_PER_USER
+
+
+def _enforce_vault_count(db: Session, owner: User) -> None:
+    """Reject (409) creating a vault past this account's per-user vault cap. Full admins are exempt
+    (mirrors the account-budget exemption; an admin-minted temp credential is NOT a full admin). Only
+    ACTIVE, OWNED vaults count (delete is a hard delete, so the count is exact)."""
+    if _is_budget_exempt(owner):
+        return
+    cap = _max_vaults_per_user(db)
+    if cap <= 0:
+        return
+    count = db.query(Vault).filter(
+        Vault.owner_id == owner.id, Vault.is_active == True).count()  # noqa: E712
+    if count >= cap:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"You have reached the maximum of {cap} vault(s) per account. "
+                    f"Delete a vault or ask an administrator to raise the limit."))
 
 
 def _vault_grant_rows(db: Session, vault, commit: bool = True) -> list:
@@ -2782,6 +2825,12 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             v = payload[gb_key]
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
                 raise HTTPException(status_code=400, detail=f"{gb_key} must be a non-negative number of GB")
+    # Per-user vault-count cap (0 = unlimited).
+    if "max_vaults_per_user" in payload and payload["max_vaults_per_user"] is not None:
+        v = payload["max_vaults_per_user"]
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise HTTPException(status_code=400,
+                                detail="max_vaults_per_user must be a non-negative integer (0 = unlimited)")
 
     # Deployment-wide limit on STORED bytes (GB). Unlike the two quotas above, 0 is a real value
     # here (accept no further bytes) and null clears the override so the deployment runs at its
@@ -2847,7 +2896,8 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     for bkey in _TEMP_PASSCODE_BOOL_KEYS:
         if bkey in payload and not isinstance(payload[bkey], bool):
             raise HTTPException(status_code=400, detail=f"{bkey} must be true or false")
-    for int_key in ("temp_passcode_min_length", "temp_passcode_max_lifetime_minutes"):
+    for int_key in ("temp_passcode_min_length", "temp_passcode_max_lifetime_minutes",
+                    "max_temp_creds_per_user"):
         if int_key in payload and payload[int_key] is not None:
             v = payload[int_key]
             if isinstance(v, bool) or not isinstance(v, int) or v < 0:
@@ -2927,6 +2977,11 @@ async def get_settings(
                                          if (settings.max_storage_gb or 0) > 0 else None)
     data["deployment_storage_limit_bytes"] = deployment_storage_limit_bytes(db)
     data["deployment_storage_used_bytes"] = deployment_storage_used(db)
+    # Report the EFFECTIVE per-account storage default (GB) and the per-user vault cap so the admin
+    # toggles reflect the shipped defaults (50 GB / 50 vaults) even when never explicitly saved. A
+    # stored 0 on either means "unlimited" and is preserved verbatim.
+    data["default_user_quota"] = _settings_blob(db).get("default_user_quota", _DEFAULT_ACCOUNT_QUOTA_GB)
+    data["max_vaults_per_user"] = _max_vaults_per_user(db)
     # The EFFECTIVE per-file SFTP upload limit (MB). A buffered SFTP upload cannot exceed the RAM
     # staging tmpfs, so over SFTP the limit is min(the file-size limit, SFTP_STAGING_TMPFS_MB) — which
     # can be BELOW the web limit. Surface it so the admin sees why SFTP may refuse a file the web UI
@@ -6949,12 +7004,25 @@ async def update_second_factor_action(
     from app.core.second_factor_actions import ACTION_KEYS
     if key not in ACTION_KEYS:
         raise HTTPException(status_code=404, detail="Unknown second-factor action.")
+    # account.second_factor is the gate that protects the two-factor policy itself. Refuse to disable
+    # its OTP requirement (R018-INFO-1): otherwise turning off this one switch would silently drop the
+    # step-up from every later matrix edit. body.require_otp is Optional[bool], so `is False` fires only
+    # on an explicit false, never on an omitted field.
+    if key == "account.second_factor" and body.require_otp is not None and not bool(body.require_otp):
+        raise HTTPException(status_code=400,
+                            detail="account.second_factor must keep OTP required — it is the gate that "
+                                   "protects the two-factor policy itself.")
     row = db.query(SecondFactorAction).filter(SecondFactorAction.key == key).first()
     if not row:
         row = SecondFactorAction(key=key)
         db.add(row)
     if body.require_otp is not None:
         row.require_otp = bool(body.require_otp)
+    if key == "account.second_factor":
+        # Pin the gate's OTP requirement ON regardless of an omitted field or the fresh-row column
+        # default (require_otp defaults False) — the invariant is the EFFECTIVE state, not just the
+        # incoming field (R018-INFO-1).
+        row.require_otp = True
     if body.require_password is not None:
         row.require_password = bool(body.require_password)
     db.commit()
@@ -6990,6 +7058,15 @@ async def update_second_factor_actions_bulk(
     for it in items:
         if not isinstance(it, dict) or it.get("key") not in ACTION_KEYS:
             raise HTTPException(status_code=400, detail="actions contains an unknown or malformed entry.")
+        # R018-INFO-1: refuse to disable OTP on the action that gates the matrix itself (all-or-nothing,
+        # so the whole batch is rejected before anything is written). The items are RAW dicts (the model
+        # field is an untyped list), so a falsy-but-not-False JSON value (0, "", [], {}) must be caught
+        # with bool() -- an identity `is False` check would let it slip the guard yet be written as False.
+        if it.get("key") == "account.second_factor" and it.get("require_otp") is not None \
+                and not bool(it.get("require_otp")):
+            raise HTTPException(status_code=400,
+                                detail="account.second_factor must keep OTP required — it is the gate "
+                                       "that protects the two-factor policy itself.")
     changed = []
     for it in items:
         k = it["key"]
@@ -7001,6 +7078,10 @@ async def update_second_factor_actions_bulk(
             row.require_otp = bool(it["require_otp"])
         if it.get("require_password") is not None:
             row.require_password = bool(it["require_password"])
+        if k == "account.second_factor":
+            # Pin the gate's OTP requirement ON (covers a falsy value that reached here, an omitted
+            # field, or a fresh-row column default) -- defence in depth behind the guard above.
+            row.require_otp = True
         changed.append(k)
     db.commit()
     try:
@@ -7211,7 +7292,7 @@ async def get_user_storage(
         "allocated_bytes": allocated,
         "available_bytes": storage_quota.account_headroom_bytes(quota, allocated),
         "default_quota_bytes": storage_quota.quota_setting_bytes(
-            _settings_blob(db).get("default_user_quota")),
+            _settings_blob(db).get("default_user_quota", _DEFAULT_ACCOUNT_QUOTA_GB)),
         "budget_exempt": _is_budget_exempt(user),
         "quota_source": ("exempt" if _is_budget_exempt(user) else
                          "account" if override is not None else
@@ -12237,6 +12318,9 @@ async def create_vault(
     from app.core.temp_scope import require_create_vault_type
     require_create_vault_type(current_user, vault_type)
 
+    # Per-user vault-count cap (finding F-R015-003): a single account cannot create unbounded vaults.
+    _enforce_vault_count(db, current_user)
+
     # Per-vault size: default 1 GB. Reject a size that is out of range (a sub-nanogigabyte value
     # truncates to 0, which every upload guard reads as UNLIMITED; a huge value overflows the
     # BigInteger column and 500s) BEFORE the quota check, then enforce the ceiling / account budget.
@@ -12938,6 +13022,15 @@ async def update_vault_info(
         # fields, so a plaintext name can never overwrite a ZK vault's seal.
         if vault.type == 'zero_knowledge' and ('enc_name' in vault_update or 'enc_description' in vault_update):
             from app.core.security import is_zk_sealed_name
+            # Serialize the seal-epoch read+write against retire_dek_versions (which holds the SAME
+            # Vault-row lock): without this a name (re)sealed at an old epoch could land in retire's
+            # scan->delete window and lose its member key -> a permanently undecryptable vault name.
+            # Mirrors the file/folder rename guard; same lock order (Vault row first) -> no deadlock.
+            # populate_existing() refreshes `vault` in place under the lock so the writes below land on
+            # the freshly-locked row.
+            _locked_vault = (db.query(Vault).populate_existing()
+                             .filter(Vault.id == vault_id).with_for_update().first())
+            _cur_epoch = getattr(_locked_vault, 'dek_version', 1) or 1
             if 'enc_name' in vault_update:
                 _en = vault_update['enc_name']
                 if _en is not None and not is_zk_sealed_name(_en):
@@ -12967,6 +13060,11 @@ async def update_vault_info(
                     if _nkv < 1 or _nkv > 2147483647:
                         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                                             detail="name_key_version out of range.")
+                    # Never pin the name to a future DEK epoch no member holds a key for yet (would
+                    # make the name undecryptable) -- same guard as the file/folder rename path.
+                    if _nkv > _cur_epoch:
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                            detail="Vault name epoch is ahead of the vault's current key epoch.")
                     vault.name_key_version = _nkv
             if 'enc_description' in vault_update:
                 _ed = vault_update['enc_description']
@@ -13012,8 +13110,11 @@ async def update_vault_info(
             "created_at": vault.created_at.isoformat() if vault.created_at else None,
             "updated_at": vault.updated_at.isoformat() if vault.updated_at else None
         }
-        
-    except ResourceNotFoundError as e:
+
+    except (VaultNotFoundError, ResourceNotFoundError) as e:
+        # A missing vault is a clean 404 (finding F-R001-001). VaultNotFoundError subclasses
+        # FileServiceError (not ResourceNotFoundError), so it must be named here or the `except
+        # Exception` below re-wraps it as a 500.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e)
@@ -13096,7 +13197,9 @@ async def change_vault_password(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(e)
         )
-    except ResourceNotFoundError as e:
+    except (VaultNotFoundError, ResourceNotFoundError) as e:
+        # A missing vault is a clean 404 (finding F-R001-001); VaultNotFoundError subclasses
+        # FileServiceError, not ResourceNotFoundError, so it must be named here.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e)
@@ -13230,7 +13333,9 @@ async def update_vault_settings(
         return {"message": "Vault settings updated successfully",
                 "unlock_remember_minutes": vault.unlock_remember_minutes}
         
-    except ResourceNotFoundError as e:
+    except (ResourceNotFoundError, VaultNotFoundError, FolderNotFoundError, FileNotFoundError) as e:
+        # A missing vault/folder/file is a clean 404, not a 500 (finding F-R001-001): the catch-all
+        # below would otherwise swallow VaultNotFoundError into a generic 500.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e)
@@ -14242,6 +14347,10 @@ async def list_vault_files(
         )
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except VaultNotFoundError as e:
+        # A missing vault is a clean 404 (finding F-R001-001), not a 500 — the per-route `except
+        # Exception` below would otherwise shadow the global FileServiceError->404 handler.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -14949,6 +15058,10 @@ async def upload_file(
         raise
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except (VaultNotFoundError, FolderNotFoundError, ResourceNotFoundError):
+        # A missing vault/folder is a clean 404, not a 500 (finding F-R001-001).
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vault not found")
     except Exception as e:
         db.rollback()
         # Broadcast error event
@@ -15339,6 +15452,13 @@ async def init_chunked_upload(
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
+
+    # Require WRITE to OPEN an upload session (finding F-R015-002). get_vault only proves READ, so
+    # without this a read-only member could stream chunks to staging (only /complete refused them). A
+    # whole-vault SHARE does not grant upload (allow_share defaults False). Gating session creation is
+    # enough — a chunk PUT needs a session that only this endpoint mints.
+    if not permission_service.can_access_vault(current_user, vault_id, VaultPermissionEnum.WRITE):
+        raise HTTPException(status_code=403, detail="You do not have write access to this vault.")
 
     if body.total_size <= 0 or body.total_chunks <= 0:
         raise HTTPException(status_code=400, detail="Invalid upload size")
@@ -16988,7 +17108,10 @@ async def download_file(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(e),
         )
-    except FileNotFoundError as e:
+    except (VaultNotFoundError, FolderNotFoundError, FileNotFoundError) as e:
+        # A missing vault / folder / file is a clean 404 (finding F-R001-001). VaultNotFoundError and
+        # FolderNotFoundError are FileServiceError SIBLINGS of FileNotFoundError, so they must be named
+        # here or the `except Exception` below re-wraps them as a 500.
         if burned_share_claim_ids:
             try:
                 permission_service.refund_share_download(burned_share_claim_ids)
@@ -17140,6 +17263,9 @@ async def delete_file(
         raise
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except VaultNotFoundError as e:
+        # A missing vault is a clean 404 (finding F-R001-001), not a 500.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         db.rollback()
         raise HTTPException(
@@ -17226,6 +17352,11 @@ async def get_file_info(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except (VaultNotFoundError, FolderNotFoundError, FileNotFoundError, ResourceNotFoundError):
+        # A missing vault/folder/file is a clean 404, not a 500 (finding F-R001-001). The catch-all
+        # below would otherwise swallow VaultNotFoundError into a generic 500 before it reached the
+        # global handler that maps it — same fix as the other file-plane endpoints.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
     except HTTPException:
         raise
     except Exception:
@@ -17451,10 +17582,12 @@ async def rename_file(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
         )
-    except FileNotFoundError as e:
+    except (FileNotFoundError, VaultNotFoundError, FolderNotFoundError, ResourceNotFoundError):
+        # A missing file/vault/folder is a clean 404, not a 500 (finding F-R001-001): the catch-all
+        # below would otherwise swallow VaultNotFoundError/FolderNotFoundError into a generic 500.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
+            detail="File not found"
         )
     except PermissionDeniedError as e:
         raise HTTPException(
@@ -17879,6 +18012,10 @@ async def create_folder(
         raise
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except (VaultNotFoundError, FolderNotFoundError, ResourceNotFoundError):
+        # A missing vault/parent-folder is a clean 404, not a 500 (finding F-R001-001).
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vault or folder not found")
     except Exception as e:
         db.rollback()
         raise HTTPException(
@@ -17966,6 +18103,10 @@ async def delete_folder(
     except PermissionDeniedError as e:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except (VaultNotFoundError, FolderNotFoundError, FileNotFoundError, ResourceNotFoundError):
+        # A missing vault/folder is a clean 404, not a 500 (finding F-R001-001).
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vault or folder not found")
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to delete folder: {str(e)}")
@@ -19995,5 +20136,9 @@ if __name__ == "__main__":
         host=settings.api_host,
         port=settings.api_port,
         log_level=settings.log_level.lower(),
+        # Do not advertise the server software (finding F-R015-008). uvicorn adds its `Server:` header
+        # at the transport layer, below the app, so a response-header middleware cannot strip it — it
+        # has to be turned off here in the server config.
+        server_header=False,
         **ssl_config
     )

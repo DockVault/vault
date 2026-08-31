@@ -567,6 +567,36 @@ class AuthService:
             _pol_raw = {}
         _tp_policy = _tpp.effective_policy(_pol_raw)
 
+        # Per-user cap on ACTIVE temporary credentials (finding F-R015-006): a single account cannot
+        # hold unbounded temp creds. Count only credentials that are BOTH is_active AND not yet expired
+        # (expiry is lazy — is_active flips only on the next auth attempt or the cleanup sweep — so
+        # counting is_active alone would over-count). expires_at is naive UTC, so compare with a naive
+        # utcnow(). 0 = unlimited. An admin ACCOUNT is exempt (mirrors the vault-count / storage-budget
+        # exemption). The exemption keys on the OWNING account (user_id), not on whether this is a
+        # direct or a delegated mint: a temp session's child credential carries the same user_id, so an
+        # admin's own delegation is exempt too, while every NON-admin account stays capped whether it
+        # mints directly or through a delegated child — which is the delegation-abuse vector the finding
+        # cares about (a non-admin cannot amplify past the cap by minting children).
+        _max_temp = _tp_policy.get("max_temp_creds_per_user", 0)
+        if _max_temp > 0:
+            _owner = self.db.query(User).filter(User.id == user_id).first()
+            _exempt = (_owner is not None
+                       and getattr(_owner, "role", None) == RoleEnum.ADMIN)
+            if not _exempt:
+                _active_temp = self.db.query(TemporaryCredential).filter(
+                    TemporaryCredential.user_id == user_id,
+                    TemporaryCredential.is_active == True,  # noqa: E712
+                    TemporaryCredential.expires_at > datetime.utcnow(),
+                ).count()
+                if _active_temp >= _max_temp:
+                    # 409 (not 400): the request is well-formed; it conflicts with the current state
+                    # (already at the active-credential cap). Matches the per-user vault-count cap so
+                    # the two resource-count limits answer with the same status.
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(f"You already have the maximum of {_max_temp} active temporary "
+                                f"credential(s). Revoke one, or ask an administrator to raise the limit."))
+
         # Resolve each selected grant before any database mutation. Every later
         # persistence decision consumes this canonical plan.
         selected_access_plans = []

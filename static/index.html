@@ -1863,7 +1863,12 @@
                                 <div class="form-group">
                                     <label for="setting-default-quota">Default per-account storage quota (GB)</label>
                                     <input type="number" id="setting-default-quota" class="form-control" placeholder="Unlimited" min="0" step="1">
-                                    <small class="text-secondary">How much storage one account may allocate to vaults, in total. Spent when storage is allocated, refunded when it is reclaimed. <strong>Blank = unlimited.</strong> Admins are exempt, and a single account can be given its own quota in <strong>Users</strong>.</small>
+                                    <small class="text-secondary">How much storage one account may allocate to vaults, in total. Spent when storage is allocated, refunded when it is reclaimed. <strong>Defaults to 50 GB; blank = unlimited.</strong> Admins are exempt, and a single account can be given its own quota in <strong>Users</strong>.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="setting-max-vaults-per-user">Maximum vaults per user</label>
+                                    <input type="number" id="setting-max-vaults-per-user" class="form-control" placeholder="Unlimited" min="0" step="1">
+                                    <small class="text-secondary">The most vaults one account may own. <strong>Defaults to 50; blank = unlimited.</strong> Admins are exempt.</small>
                                 </div>
                                 <div class="form-group">
                                     <label for="setting-max-vault-size">Maximum size per vault (GB)</label>
@@ -2211,6 +2216,12 @@
                                     <label for="setting-temp-passcode-min-length">Minimum passcode length (also the generated length)</label>
                                     <input type="number" id="setting-temp-passcode-min-length" class="form-control" min="8" max="128" style="max-width:200px;">
                                     <p class="text-secondary text-sm mt-sm">At least 8. Applies to custom passcodes and sets the length of generated ones.</p>
+                                </div>
+
+                                <div class="form-group mt-md">
+                                    <label for="setting-max-temp-creds-per-user">Maximum active temporary credentials per user</label>
+                                    <input type="number" id="setting-max-temp-creds-per-user" class="form-control" min="0" max="100000" step="1" placeholder="Unlimited" style="max-width:200px;">
+                                    <p class="text-secondary text-sm mt-sm">The most simultaneously-active temporary credentials one account may hold (all temporary credentials, not only passcode-protected ones). <strong>Defaults to 10; blank = unlimited.</strong></p>
                                 </div>
 
                                 <div class="form-group mt-md">
@@ -3887,7 +3898,7 @@
     <script src="/static/js/ui-v2.js?v=20260703a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260808b"></script>
-    <script src="/static/js/app.js?v=20260824l"></script>
+    <script src="/static/js/app.js?v=20260831a"></script>
 </body>
 </html>
 
