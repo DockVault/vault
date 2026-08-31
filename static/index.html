@@ -1974,7 +1974,7 @@
                         <div class="card mt-lg">
                             <div class="card-header"><h3>Email templates</h3></div>
                             <div class="p-lg">
-                                <div class="email-hint">Author HTML emails that send through a chosen profile. Insert images from your resource folder and personalization tokens; the preview renders exactly what recipients receive.</div>
+                                <div class="email-hint">Author HTML emails sent through a chosen profile, with images from your resource folder and personalization tokens. The preview matches what recipients see.</div>
                                 <div id="email-templates-grid" class="email-card-grid" role="list" aria-label="Email templates"></div>
                             </div>
                         </div>
@@ -3068,7 +3068,7 @@
                                         <label class="checkbox-label" style="margin-top:8px;">
                                             <input type="checkbox" id="vault-hierarchical"> Team mode (hierarchical key)
                                         </label>
-                                        <small class="form-help">For large teams: the vault key is wrapped once to a shared team key, so adding members and routine key rotation stay fast (O(1)). Removing a member still rotates the team key. Zero-knowledge — the server never sees the key.</small>
+                                        <small class="form-help">For large teams: adding members and routine key rotation stay fast, and removing a member rotates the shared key. Zero-knowledge — the server never sees it.</small>
                                     </div>
                                 </div>
                                 <small class="form-help" id="zk-unavailable-note" style="display:none;"></small>
@@ -3141,14 +3141,14 @@
                                 <div class="form-group">
                                     <label for="temp-cred-note">Note <span class="text-tertiary">(optional)</span></label>
                                     <textarea id="temp-cred-note" class="form-control" rows="2" maxlength="500" placeholder="Why is this credential being issued? e.g. Vendor X — Q3 audit files"></textarea>
-                                    <small class="form-help">Recorded with the credential so its purpose is clear later.</small>
+                                    <small class="form-help">For your reference; recorded with the credential.</small>
                                 </div>
                                 <div class="form-group" id="tc-legacy-cancreate-group">
                                     <label class="checkbox-row">
                                         <input type="checkbox" id="temp-cred-can-create">
                                         <span>Allow this credential to create temporary credentials</span>
                                     </label>
-                                    <small class="form-help">Off by default — leave unchecked so the holder can't mint and hand out further accounts.</small>
+                                    <small class="form-help">Off by default. Lets the holder mint further credentials.</small>
                                 </div>
 
                                 <div class="form-group">
