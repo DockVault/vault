@@ -5564,7 +5564,7 @@ function attachUserListeners() {
         btn.addEventListener('click', async () => {
             const userId = btn.getAttribute('data-user-id');
             const username = btn.getAttribute('data-username') || 'this user';
-            if (!confirm('Email a password-reset link to ' + username + '?')) return;
+            if (!await showConfirm('Email a password-reset link to ' + username + '?', 'Send reset link')) return;
             btn.disabled = true;
             try {
                 const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/send-reset-link', { method: 'POST' });
@@ -5581,7 +5581,7 @@ function attachUserListeners() {
         btn.addEventListener('click', async () => {
             const userId = btn.getAttribute('data-user-id');
             const username = btn.getAttribute('data-username') || 'this user';
-            if (!confirm('Create a one-time password-reset link for ' + username + '?\n\nAnyone with the link can set a new password for this account. It is shown once, expires, and can be used only once; using it signs the account out everywhere.')) return;
+            if (!await showConfirm('Create a one-time password-reset link for ' + username + '? Anyone with the link can set a new password for this account. It is shown once, expires, and can be used only once; using it signs the account out everywhere.', 'Create reset link')) return;
             btn.disabled = true;
             try {
                 const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/reset-link', { method: 'POST' });
@@ -5907,7 +5907,7 @@ async function toggleUserStatus(userId, activate) {
         });
         loadUsers();
     } catch (error) {
-        alert('Failed to update user: ' + error.message);
+        showError('Failed to update user: ' + error.message);
     }
 }
 
@@ -7320,7 +7320,7 @@ function renderLogTokens(tokens) {
 }
 
 async function disableLogToken(id) {
-    if (!confirm('Disable this token? Any monitoring system using it will stop receiving logs.')) return;
+    if (!await showConfirm('Disable this token? Any monitoring system using it will stop receiving logs.', 'Disable token')) return;
     try {
         await apiRequest(`/settings/logs/${encodeURIComponent(id)}/disable`, { method: 'POST', body: '{}' });
         showSuccess('Token disabled');
@@ -9255,8 +9255,8 @@ async function sendEmailProfileTest() {
 }
 
 async function deleteEmailProfile(p) {
-    if (!confirm('Delete the sending profile "' + (p.name || '') +
-                 '"? Templates using it will fall back to the default.')) return;
+    if (!await showConfirm('Delete the sending profile "' + (p.name || '') +
+                 '"? Templates using it will fall back to the default.', 'Delete profile')) return;
     try {
         await apiRequest('/email/profiles/' + p.id, { method: 'DELETE' });
         await loadEmailProfiles();
@@ -9650,7 +9650,7 @@ async function saveTemplate() {
 }
 
 async function deleteTemplate(t) {
-    if (!confirm('Delete the template "' + (t.name || '') + '"?')) return;
+    if (!await showConfirm('Delete the template "' + (t.name || '') + '"?', 'Delete template')) return;
     try {
         await apiRequest('/email/templates/' + t.id, { method: 'DELETE' });
         if (_editingTemplateId === t.id) closeTemplateEditor();
@@ -9795,9 +9795,9 @@ function _loadFromRow(label, onPick) {
     return b;
 }
 
-function _loadFromApply(name, subject, body) {
+async function _loadFromApply(name, subject, body) {
     // Replacing the current editor content is destructive, so confirm first.
-    if (!confirm('Replace the current subject and body with “' + name + '”?')) return;
+    if (!await showConfirm('Replace the current subject and body with “' + name + '”?', 'Replace content')) return;
     document.getElementById('et-subject').value = subject || '';
     document.getElementById('et-body').value = body || '';
     closeLoadFromMenu();
@@ -10257,7 +10257,7 @@ async function openVault(vaultId) {
         // Validate vault ID
         if (!vaultId) {
             console.error('Invalid vault ID:', vaultId);
-            alert('Invalid vault ID');
+            showError('Invalid vault ID');
             return;
         }
         
@@ -10267,7 +10267,7 @@ async function openVault(vaultId) {
         // Validate vault data
         if (!vault || !vault.id) {
             console.error('Invalid vault data received');
-            alert('Failed to load vault');
+            showError('Failed to load vault');
             return;
         }
         
@@ -18664,7 +18664,7 @@ function copyToClipboard(elementId) {
             element.textContent = originalText;
         }, 2000);
     }).catch(err => {
-        alert('Failed to copy: ' + err);
+        showError('Failed to copy: ' + err);
     });
 }
 
