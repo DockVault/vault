@@ -277,8 +277,9 @@ def test_password_added_after_mint_voids_sftp_temp_cred(admin):
 
 
 def test_sftp_host_key_fingerprint_endpoint_matches_server(admin):
-    """GET /sftp/host-key returns the SHA256 fingerprint of the ACTUAL serving host key, so
-    a customer can verify it out-of-band against their SFTP client's first-connect prompt."""
+    """GET /sftp/host-key returns the SHA256 fingerprint AND the full public key of the ACTUAL
+    serving host key, so a customer can verify the fingerprint out-of-band and a client can PIN
+    the full key (fail closed, no trust-on-first-use)."""
     import hashlib
     import base64
     r = admin.get("/sftp/host-key").json()
@@ -296,6 +297,15 @@ def test_sftp_host_key_fingerprint_endpoint_matches_server(admin):
         t.close()
     actual = "SHA256:" + base64.b64encode(hashlib.sha256(hk.asbytes()).digest()).decode().rstrip("=")
     assert fp == actual, f"endpoint fingerprint {fp} != serving host key {actual}"
+
+    # The full public key lets a client PIN the host — a fingerprint alone cannot build a
+    # known_hosts entry. It must be the OpenSSH form ("<algorithm> <base64>") of the SAME key the
+    # server presents, and must never carry private-key material.
+    pub = r.get("public_key", "")
+    assert pub == f"{hk.get_name()} {hk.get_base64()}", f"endpoint public_key {pub!r} != serving key"
+    assert pub.count(" ") == 1 and pub.split(" ")[0] == hk.get_name(), \
+        f"public_key is not OpenSSH '<algorithm> <base64>': {pub!r}"
+    assert "PRIVATE" not in pub and "BEGIN" not in pub, "public_key must never contain private material"
 
 
 # ---------------------------------------------------------------------------

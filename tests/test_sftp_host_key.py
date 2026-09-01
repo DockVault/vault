@@ -109,3 +109,22 @@ def test_the_loader_propagates_a_missing_file(tmp_path):
     None. Both call sites guard existence first, so this only guards the fallback's blast radius."""
     with pytest.raises((FileNotFoundError, OSError)):
         load_host_key(tmp_path / "does_not_exist")
+
+
+def test_the_public_key_export_is_openssh_form_and_public_only(tmp_path):
+    """The /sftp/host-key endpoint returns the full public key in OpenSSH form ('<algorithm>
+    <base64>') so a client can PIN the host — a fingerprint can verify a key already shown but
+    cannot reconstruct a known_hosts entry. It must be exactly two fields, describe the same key
+    as the fingerprint, and carry the PUBLIC blob only, never private material."""
+    path = tmp_path / "ssh_host_rsa_key"
+    generate_ed25519_host_key(path)
+    key = load_host_key(path)
+
+    # Built exactly as the endpoint builds it.
+    public_key = f"{key.get_name()} {key.get_base64()}"
+    algo, sep, b64 = public_key.partition(" ")
+    assert sep == " " and public_key.count(" ") == 1, "OpenSSH form is exactly '<algorithm> <base64>'"
+    assert algo == key.get_name() == "ssh-ed25519"
+    assert "PRIVATE" not in public_key and "BEGIN" not in public_key, "never any private-key material"
+    # The base64 field decodes to the key's PUBLIC blob — the same bytes the fingerprint hashes.
+    assert base64.b64decode(b64) == key.asbytes()

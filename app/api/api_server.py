@@ -4852,11 +4852,13 @@ async def zk_unsealed_count(
 
 @app.get("/sftp/host-key")
 async def get_sftp_host_key(current_user: User = Depends(get_current_user)):
-    """The SFTP server's public host-key SHA256 fingerprint, so a customer can verify it
-    against their SFTP client's first-connect prompt (defends against MITM / blind TOFU).
-    Read from the shared keys volume that the SFTP server generates on first boot. The
-    fingerprint is a public value (any client sees it on connect), so any authenticated
-    user may read it. Returns available=false until the SFTP server has created the key."""
+    """The SFTP server's public host key: the SHA256 fingerprint (for a human to verify against
+    their SFTP client's first-connect prompt) and the full public key in OpenSSH form (so a
+    client can PIN the host — e.g. build a known_hosts entry — and fail closed instead of
+    trusting on first use). Both defend against MITM / blind TOFU. Read from the shared keys
+    volume that the SFTP server generates on first boot. Both values are public (any client sees
+    the key on connect) — never the private key — so any authenticated user may read them.
+    Returns available=false until the SFTP server has created the key."""
     import hashlib
     import base64
     from app.sftp.host_key import load_host_key
@@ -4867,7 +4869,14 @@ async def get_sftp_host_key(current_user: User = Depends(get_current_user)):
         # Ed25519 on new installs, RSA on ones that predate it -- report whichever this is.
         host_key = load_host_key(key_path)
         fp = "SHA256:" + base64.b64encode(hashlib.sha256(host_key.asbytes()).digest()).decode().rstrip("=")
-        return {"available": True, "algorithm": host_key.get_name(), "fingerprint_sha256": fp}
+        # The full public key in OpenSSH form ("<algorithm> <base64>"), so a client can PIN the
+        # host — a fingerprint can only verify a key already shown, it cannot reconstruct a
+        # known_hosts entry, so pinning needs the key itself. This is the PUBLIC key only (never
+        # the private key) and is the same value the server presents on every SFTP connect, so it
+        # is no more sensitive than the fingerprint already returned here.
+        public_key = f"{host_key.get_name()} {host_key.get_base64()}"
+        return {"available": True, "algorithm": host_key.get_name(),
+                "fingerprint_sha256": fp, "public_key": public_key}
     except Exception as e:  # noqa: BLE001 — best-effort; never 500 on a missing/odd key file
         print(f"⚠️ host-key fingerprint read failed: {e}")
         return {"available": False}
