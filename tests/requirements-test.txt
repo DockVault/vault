@@ -20,22 +20,22 @@ starlette==1.6.0
 python-multipart==0.0.32
 pydantic==2.13.4
 pydantic-settings==2.15.0
-python-dotenv==1.2.2
+python-dotenv==1.2.3
 email-validator==2.3.0
 sqlalchemy==2.0.52
 psycopg2-binary==2.9.12
 redis==8.1.0
 paramiko==5.0.0
-cryptography==50.0.0
+cryptography==50.0.1
 argon2-cffi==25.1.0
 bcrypt==5.0.0
 PyJWT==2.13.0
 # Host tests import app.core.email_sanitize, which imports nh3. Keep in lock-step with
 # requirements.txt (the common-package version check in test_supply_chain_contract enforces it).
-nh3==0.3.6
+nh3==0.3.7
 # Host tests import app.core.preview_render, which imports Markdown + Pygments. Same lock-step rule.
 Markdown==3.10.3
-Pygments==2.20.0
+Pygments==2.21.0
 
 # Test runners, clients, and supply-chain tooling.
 pytest>=9.1.1,<10.0
@@ -46,7 +46,7 @@ websocket-client>=1.9.0
 
 # Static analysis. Pinned exactly: it runs in CI as a gate, so moving it changes what the
 # gate accepts. Only the undefined-name rule is enforced -- see the preflight step.
-ruff==0.16.3
+ruff==0.16.5
 
 # Preflight regenerates and audits the production lock with these pinned supply-chain tools.
 pip-tools==7.6.1
