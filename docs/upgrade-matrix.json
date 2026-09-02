@@ -253,6 +253,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.27.0": {
+      "released": "2026-09-02",
+      "notes": "Adds the full SFTP host public key to the host-key endpoint (GET /sftp/host-key) so a client can pin the server's SFTP identity, alongside the existing fingerprint. No schema change, no new required configuration, and no new environment settings; a rollback to 0.26.0 is clean.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -477,6 +485,13 @@
     {
       "from": "0.25.0",
       "to": "0.26.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.26.0",
+      "to": "0.27.0",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
