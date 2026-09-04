@@ -64,8 +64,13 @@ class Settings(BaseSettings):
     redis_socket_timeout: float = Field(default=2.0)
     
     # SFTP Server Configuration
-    sftp_host: str = Field(default="0.0.0.0")
+    sftp_host: str = Field(default="0.0.0.0")  # the address the SFTP server BINDS (not client-reachable)
     sftp_port: int = Field(default=2222)
+    # The externally-reachable SFTP hostname a deployment ADVERTISES to sync clients in a device
+    # mint response (distinct from sftp_host, which is the bind address). Empty = not advertised, in
+    # which case the client falls back to the API host it already connects to. The host KEY in that
+    # response is what a client pins; this host/port is a convenience that retires a hard-coded port.
+    sftp_public_host: str = Field(default="")
     # Keeps its historical filename so an existing deployment's key is found unchanged on upgrade;
     # new installs write an Ed25519 key at this path (the loader accepts either kind).
     sftp_host_key_path: str = Field(default="./keys/ssh_host_rsa_key")
@@ -176,6 +181,31 @@ class Settings(BaseSettings):
     temp_cred_validity_minutes: int = Field(default=65)
     temp_cred_session_grace_minutes: int = Field(default=65)
     temp_cred_total_lifetime_minutes: int = Field(default=65)
+    # Per-DEVICE cap on active device-sync credentials — a SEPARATE bound from the per-user
+    # interactive cap (max_temp_creds_per_user), so a compromised device is bounded on its own and
+    # neither minting path starves or exhausts the other. 0 = unlimited. Mirrors the interactive
+    # default of 10 as a starting point; a deployment tunes it, and the exact number is a security
+    # decision. The desktop also releases each sync cred at run-end, so the live count stays low.
+    max_device_sync_creds_per_device: int = Field(default=10)
+    # Grace window (minutes) during which a device's PREVIOUS sync secret is still accepted after a
+    # rotation, so an in-flight request or a client that just rotated is not falsely rejected. Kept
+    # short: past this window a retired secret is treated as a reuse/replay signal and revokes the
+    # device (fail-closed). Rotation is a proactive online action — an offline client does not rotate
+    # — so a few minutes covers the legitimate catch-up without leaving a long replay window.
+    # Bounded [0, 1440]: 0 = NO catch-up window (any retired-secret presentation is immediately
+    # treated as reuse and revokes the device); the upper bound stops a value so large it defeats
+    # rotation by keeping a retired secret acceptable indefinitely.
+    device_secret_rotation_grace_minutes: int = Field(default=5, ge=0, le=1440)
+    # Per-ACCOUNT cap on registered devices (counts is_active devices; an admin account is exempt,
+    # mirroring max_temp_creds_per_user). 0 = unlimited. Bounds total active device sync credentials
+    # per account together with max_device_sync_creds_per_device (e.g. 10 devices x 10 creds = 100).
+    max_devices_per_user: int = Field(default=10, ge=0)
+    # Response posture when a device's RETIRED secret is replayed past its grace (a reuse/replay
+    # signal). Default False = the SOFTENED response: kill the retired secret + SUSPEND the device
+    # (reversible; grants + current secret preserved) + deactivate its in-flight creds + alert +
+    # audit. True = the hard fail-closed response: fully revoke the device and every credential it
+    # minted (the old auto-revoke-all). A deployment opts into the hard response deliberately.
+    device_secret_reuse_hard_revoke: bool = Field(default=False)
     
     # File Storage Configuration
     file_storage_path: str = Field(default="./storage")

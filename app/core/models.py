@@ -345,6 +345,12 @@ class TemporaryCredential(Base):
     # Powers "a temp account may invalidate only the creds it created".
     created_by_temp_credential_id = Column(
         UUID(as_uuid=True), ForeignKey('temporary_credentials.id', ondelete='SET NULL'), nullable=True)
+    # The device that minted this credential (NULL = not a device mint). The primary join key
+    # for the device-revocation cascade: revoking a device deactivates every cred with its id.
+    # SET NULL keeps the audit row — a device DELETE runs the cascade FIRST (same txn), so SET
+    # NULL only ever applies to an already-deactivated cred, never orphaning a live one.
+    device_id = Column(
+        UUID(as_uuid=True), ForeignKey('devices.id', ondelete='SET NULL'), nullable=True)
 
     # Relationships
     user = relationship('User', back_populates='temporary_credentials')
@@ -400,6 +406,113 @@ class TempCredentialVaultAccess(Base):
         UniqueConstraint('temp_credential_id', 'vault_id', name='uq_temp_cred_vault'),
         Index('idx_temp_cred_vault_cred', 'temp_credential_id'),
         Index('idx_temp_cred_vault_vault', 'vault_id'),
+    )
+
+
+class Device(Base):
+    """A registered end-user device authorized to mint single-use SFTP sync credentials.
+
+    The device proves the vault password ONCE at grant time (recorded per-vault on
+    DeviceGrant, never here) and thereafter holds only this opaque, per-device, revocable
+    server secret — NOT a JWT and NOT any vault password. Because the secret is not a JWT,
+    `verify_access_token` raises on it, so every `get_current_user` route 401s it by
+    construction; only the device routes (via `get_current_device_principal`) accept it.
+
+    The secret is 32 CSPRNG bytes shown to the client once and stored here ONLY as its
+    sha256 (`secret_hash`, unique); it is compared constant-time on every device request.
+    On rotation the outgoing hash moves to `prev_secret_hash` for a bounded TIME grace; a
+    secret presented after that grace is treated as reuse and triggers a full device
+    revocation (fail-closed). (v1 uses the time window only. Closing the grace early once the
+    NEW secret is first used — a tighter replay bound — is a tracked enhancement that needs a
+    successor-use marker; it is deliberately not implemented yet.) Deleting the owning user
+    takes the device with it."""
+    __tablename__ = 'devices'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+
+    # User-chosen, deliberately non-identifying label (no hostname/username/path/IP/version —
+    # the registration endpoint enforces that). Purely for the owner to tell their devices apart.
+    label = Column(String(100), nullable=True)
+
+    # sha256 of the 32-byte CSPRNG secret. Only the hash is ever stored; the raw secret is
+    # returned once at register/rotate and never again. Unique so a hashed-value lookup finds
+    # at most one row; the resolve still does a constant-time compare (hmac.compare_digest).
+    secret_hash = Column(String(64), nullable=False)
+    # The immediately-previous secret's hash, kept valid for a short TIME grace after a rotation so a
+    # refresh that crosses the rotation is not falsely rejected. A token hashing to this AFTER the
+    # grace is reuse -> device revocation (fail-closed). Only ONE generation is retained (a new
+    # rotation overwrites it), so a two-generations-old secret degrades to a plain invalid-credential
+    # 401, not a revoke. (Closing the grace early on first use of the new secret is a tracked
+    # enhancement — see the class docstring — not yet implemented.)
+    prev_secret_hash = Column(String(64), nullable=True)
+    prev_secret_retired_at = Column(DateTime, nullable=True)
+    # Bumped on every rotation. Lets a refresh response tell the client which epoch it now holds.
+    epoch = Column(Integer, nullable=False, default=1)
+
+    # Set on device sync ACTIVITY — a successful mint or refresh (the meaningful device-principal
+    # operations) — and never at registration, so a registered-but-never-synced device stays NULL and
+    # the devices list can honestly show "not synced yet" rather than a fabricated timestamp.
+    last_seen = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+    # A REVERSIBLE, distinct-from-revoked state ('device-suspended' / needs-attention). is_active is
+    # the REVOKED flag (permanent, cascades); `suspended` is the softened response to a retired-secret
+    # replay: the current secret + grants are preserved, but the resolver refuses the device on every
+    # route (freezing mint + refresh) until an owner account-session restore flips it back. Never
+    # overload is_active for this — the two states are semantically different (revoked vs frozen).
+    suspended = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    # Optional device lifetime. NULL = no expiry; a mint requires (expires_at IS NULL OR future).
+    expires_at = Column(DateTime, nullable=True)
+
+    user = relationship('User')
+    # DB-level ON DELETE CASCADE removes the grants; passive_deletes lets the database do it
+    # without the ORM loading every child first.
+    grants = relationship(
+        'DeviceGrant', back_populates='device',
+        cascade='all, delete-orphan', passive_deletes=True)
+
+    __table_args__ = (
+        Index('idx_device_user', 'user_id'),
+        Index('idx_device_secret_hash', 'secret_hash', unique=True),
+        Index('idx_device_prev_secret_hash', 'prev_secret_hash'),
+    )
+
+
+class DeviceGrant(Base):
+    """A per-(device, vault) authorization to mint sync credentials for that vault.
+
+    Written only under a live account session (never by the device principal itself), which is
+    where the vault password is proven ONCE. For a password-protected vault that proof is frozen
+    here as `vault_password_fingerprint` (the fingerprint of the vault's password hash at grant
+    time). The device mint never re-proves the password: it matches this fingerprint against the
+    vault's CURRENT one — a server-side add/change/rotation of the vault password changes the
+    fingerprint, voids the grant, and yields a distinct `grant-needs-reproof` (one re-proof fixes
+    it), all without ever touching the vault-password rate limiter. NULL = a no-password vault."""
+    __tablename__ = 'device_grants'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    device_id = Column(UUID(as_uuid=True), ForeignKey('devices.id', ondelete='CASCADE'), nullable=False)
+    vault_id = Column(UUID(as_uuid=True), ForeignKey('vaults.id', ondelete='CASCADE'), nullable=False)
+    # Fingerprint of the vault's password hash proven when this grant was written (only for a
+    # password-protected vault; NULL otherwise). Same value/shape as
+    # TempCredentialVaultAccess.vault_password_fingerprint — the mint copies it straight onto the
+    # issued credential so the transfer-time proof (_vault_password_proven) passes, without a fresh
+    # password test. Re-matched against the live fingerprint on every mint (the 5th predicate).
+    vault_password_fingerprint = Column(String(64), nullable=True)
+    is_active = Column(Boolean, default=True)
+    granted_at = Column(DateTime, default=datetime.utcnow)
+    # The account session (user) that wrote this grant, for audit. SET NULL keeps the grant's
+    # history if that user is later deleted.
+    granted_by_user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+
+    device = relationship('Device', back_populates='grants')
+    vault = relationship('Vault')
+
+    __table_args__ = (
+        UniqueConstraint('device_id', 'vault_id', name='uq_device_grant_device_vault'),
+        Index('idx_device_grant_device', 'device_id'),
+        Index('idx_device_grant_vault', 'vault_id'),
     )
 
 

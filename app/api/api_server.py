@@ -77,6 +77,7 @@ from app.core import download_sink as _download_sink
 from app.services import log_pull  # pure helpers for the authenticated log-pull endpoint
 from app.core.security import (
     create_access_token, verify_access_token, EncryptionError, ObjectChangedDuringRead,
+    hash_device_secret,
 )
 from app.core.config import initialize_runtime, settings
 from app.core.endpoint_permissions import (
@@ -1295,6 +1296,143 @@ class GrantPermissionRequest(BaseModel):
 
 
 # Dependencies
+
+class DevicePrincipal:
+    """The authenticated identity behind a device sync credential — deliberately NOT a User.
+
+    A device presents an opaque (non-JWT) bearer secret; get_current_device_principal resolves it
+    to the owning `devices` row and returns this. Because the type AND the resolving dependency are
+    distinct from get_current_user's, a device token reaches ONLY the routes that explicitly depend
+    on get_current_device_principal: every get_current_user route 401s a device token (it fails
+    jwt.decode), and this dependency 401s an account JWT (it never hashes to a stored device
+    secret). `in_grace` is True when the device authenticated with its PREVIOUS secret inside the
+    rotation grace window — i.e. it has not caught up to the latest rotation. It is surfaced to the
+    client in the refresh response so the client knows to ensure it holds the current secret; it
+    grants no extra authority, and no route gates on it."""
+
+    def __init__(self, device, in_grace: bool = False):
+        self.device = device
+        self.device_id = device.id
+        self.user_id = device.user_id
+        self.in_grace = in_grace
+
+
+def _device_auth_401(reason: str) -> HTTPException:
+    """A 401 for the device principal, carrying a typed `reason` so the desktop can tell a REVOKED
+    device ("removed from sync") from an EXPIRED one ("access expired") from an unrecognised secret.
+    The generic 'invalid-device-credential' covers both no-match and a malformed/absent secret, so
+    a 401 never reveals whether a particular secret exists."""
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={"reason": reason, "message": "Device authentication failed"},
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _device_prev_secret_within_grace(device) -> bool:
+    """True when a device's PREVIOUS (retired) secret is still inside the post-rotation grace window
+    — a legitimate catch-up (a just-rotated client or an in-flight request), not a replay.
+    prev_secret_retired_at is naive-UTC (set by the rotation), so it is compared with a naive
+    utcnow(). A missing retired-at is NOT within grace (fail-closed)."""
+    retired_at = getattr(device, "prev_secret_retired_at", None)
+    if retired_at is None:
+        return False
+    minutes = getattr(settings, "device_secret_rotation_grace_minutes", 5) or 0
+    elapsed = datetime.utcnow() - retired_at
+    # Guard BOTH ends: elapsed must be in [0, grace]. The lower bound rejects a FUTURE retired_at
+    # (a negative elapsed would otherwise read as within-grace and widen the window). retired_at is
+    # always server-set (refresh = utcnow, restore-rotate = NULL), so a future value should never
+    # occur — this is defensive belt-and-suspenders against clock skew / any non-server-now value.
+    return timedelta(0) <= elapsed <= timedelta(minutes=max(0, minutes))
+
+
+async def get_current_device_principal(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> DevicePrincipal:
+    """Resolve a device sync secret to its DevicePrincipal, or 401.
+
+    The ONLY dependency the device routes use, and no account/admin/ZK/ungranted route depends on
+    it (the route-sweep test pins that boundary both ways). The secret is looked up by its sha256
+    (indexed) and confirmed with a constant-time compare; a revoked or expired device is refused
+    HERE — fail closed — so a device whose access is gone cannot reach even a device route.
+
+    Per-vault authorization (an active grant, a Standard vault, a live account, a still-matching
+    password fingerprint) is NOT decided here: that is the mint's scope check, which needs the
+    vault id. This layer answers only 'does this secret belong to a live device?'."""
+    import hmac
+    from datetime import datetime
+    from app.core.models import Device
+
+    token = credentials.credentials or ""
+    # Reject an empty/absent secret up front rather than hashing "" and leaning on the fact that no
+    # device has sha256("") — secrets are server-generated, but this is cheaper and clearer.
+    if not token:
+        raise _device_auth_401("invalid-device-credential")
+    token_hash = hash_device_secret(token)
+
+    # Resolve the secret by its sha256 (indexed), CONFIRMED with a constant-time compare. Security
+    # rests on the secret's 256-bit entropy, not on the DB lookup being constant-time (an indexed hit
+    # vs miss is not, and need not be — the timing reveals only "this exact hash is stored", which the
+    # holder of the token already knows); compare_digest guards the final comparison. An account JWT
+    # reaches here too — it never hashes to a stored secret — and is refused (the route-sweep pins it).
+    in_grace = False
+    device = db.query(Device).filter(Device.secret_hash == token_hash).first()
+    if device is not None and hmac.compare_digest(device.secret_hash, token_hash):
+        pass  # the CURRENT secret
+    else:
+        # Not the current secret. Try the PREVIOUS (retired) secret — set only by a rotation. A hit is
+        # EITHER a legitimate catch-up (a client that just rotated, or an in-flight request) still
+        # inside the bounded grace window, OR a replay of a retired secret past that window. The
+        # former is accepted and flagged in_grace (so the refresh route can nudge a re-rotate); the
+        # latter is a reuse/compromise signal, handled below (a reversible suspend by default, or a
+        # full revoke by config) — never a soft refusal, always fail-closed.
+        device = db.query(Device).filter(Device.prev_secret_hash == token_hash).first()
+        if (device is None or not device.prev_secret_hash
+                or not hmac.compare_digest(device.prev_secret_hash, token_hash)):
+            raise _device_auth_401("invalid-device-credential")
+        # Classify a retired-secret presentation ONLY against a LIVE device. A straggler request
+        # carrying the just-retired secret of a device that is already revoked / suspended / expired
+        # is NOT a reuse attack — fall through to the liveness gate below for the accurate typed
+        # reason, and never fire a spurious reuse suspend/alert on an already-dead device.
+        _live = (device.is_active and not device.suspended
+                 and (device.expires_at is None or device.expires_at > datetime.utcnow()))
+        if _live and _device_prev_secret_within_grace(device):
+            in_grace = True  # a legitimate catch-up across a rotation
+        elif _live:
+            # A LIVE device presenting a PAST-GRACE retired secret = a reuse/replay signal. The
+            # handler applies the softened SUSPEND (default) or the hard revoke (config) — killing
+            # the retired secret, deactivating in-flight creds, alerting+auditing, all committed under
+            # the device-row lock — and RETURNS the matching typed reason so the desktop can tell a
+            # reversible suspend from a terminal revoke. Fail-closed either way.
+            reason = _handle_retired_secret_reuse(db, device)
+            raise _device_auth_401(reason)
+        # else: not live — fall through to the liveness gate, which raises the accurate typed reason.
+
+    # The device must still be live. A revoked device and an expired one are different user-facing
+    # states, so they carry distinct typed reasons. device.expires_at is stored naive-UTC (like
+    # temp_cred.expires_at), so it is compared with a naive utcnow() — never an aware value.
+    if not device.is_active:
+        raise _device_auth_401("device-revoked")
+    # A SUSPENDED device is frozen but REVERSIBLE (distinct from revoked): refuse EVERY route
+    # (mint/refresh/list) until an owner account-session restore. Checked here so no valid secret
+    # gets a suspended device through — an invalid secret already 401s as invalid-device-credential.
+    if device.suspended:
+        raise _device_auth_401("device-suspended")
+    if device.expires_at is not None and device.expires_at <= datetime.utcnow():
+        raise _device_auth_401("device-expired")
+
+    # The OWNING ACCOUNT must be active and not locked, so a locked/deactivated account's devices
+    # are fully INERT — no mint, no refresh, no grant listing. The mint re-checks this (predicate 3),
+    # but enforcing it in the resolver means EVERY device route inherits it, mirroring on the server
+    # side the desktop's lock-state purge (a locked account performs no key operation).
+    from app.services.auth_service import account_locked
+    owner = db.query(User).filter(User.id == device.user_id).first()
+    if owner is None or not owner.is_active or account_locked(owner):
+        raise _device_auth_401("account-inactive")
+
+    return DevicePrincipal(device, in_grace=in_grace)
+
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -4882,6 +5020,171 @@ async def get_sftp_host_key(current_user: User = Depends(get_current_user)):
         return {"available": False}
 
 
+# Device sync endpoints
+#
+# The ONLY routes a device sync credential can reach. Each depends on get_current_device_principal;
+# none uses get_current_user, and no get_current_user route accepts a device principal — the
+# allowlist route-sweep test pins that boundary both ways.
+
+class DeviceSyncCredentialRequest(BaseModel):
+    """Body for minting a device sync credential: the vault to sync (must be device-granted), plus an
+    optional shorter validity the client may request. validity_minutes only ever SHORTENS the TTL —
+    the mint clamps it to the server's own configured default, so a client can never mint a
+    longer-lived credential than an interactive one; it lets the desktop request a tighter usable
+    window for a credential it expects to spend quickly."""
+    vault_id: uuid.UUID
+    validity_minutes: Optional[int] = Field(None, gt=0, le=43200)
+
+
+@app.post("/device/sync-credential")
+async def mint_device_sync_credential_endpoint(
+    body: DeviceSyncCredentialRequest,
+    principal: DevicePrincipal = Depends(get_current_device_principal),
+    db: Session = Depends(get_db),
+):
+    """Mint a single-use SFTP credential for one device-granted vault.
+
+    Authorized by the device grant — the device carries no vault password, so this never runs a
+    password proof and never touches the per-vault rate limiter. The credential and the SFTP host
+    key to PIN are returned together, so the device path needs no separate GET /sftp/host-key call
+    (that endpoint is behind get_current_user, which a device principal cannot reach)."""
+    from app.sftp.host_key import load_host_key
+
+    # Read the host key FIRST and FAIL CLOSED if it is unavailable: never issue a credential whose
+    # host key the desktop cannot pin — that would force a blind trust-on-first-use. Doing this
+    # before the mint also means an unavailable key costs no credential and no per-device cap slot.
+    key_path = settings.sftp_host_key_path
+    host_public_key = None
+    try:
+        if os.path.exists(key_path):
+            host_key = load_host_key(key_path)
+            # The FULL OpenSSH public-key line ("<algorithm> <base64>") — never a fingerprint, which
+            # can only verify a key already shown, not reconstruct a pin. Same value GET /sftp/host-key
+            # returns and the server presents on every connect.
+            host_public_key = f"{host_key.get_name()} {host_key.get_base64()}"
+    except Exception as exc:  # noqa: BLE001 — a bad/odd key file is fail-closed below, never a 500
+        print(f"⚠️ device mint host-key read failed: {exc}")
+        host_public_key = None
+    if not host_public_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"reason": "host-key-unavailable",
+                    "message": "The server host key is not available yet; sync cannot be set up safely."},
+        )
+
+    auth_service = AuthService(db)
+    cred = auth_service.mint_device_sync_credential(
+        principal.device, body.vault_id, validity_minutes=body.validity_minutes)
+    _audit_device("device_sync_cred_mint", principal.device, vault_id=body.vault_id,
+                  details={"cred_id": cred.get("id")})
+
+    # Return the host key to pin, the SFTP port (retires the desktop's hard-coded 2222), and the
+    # advertised host when the deployment set one (else null → the desktop uses the API host it
+    # already connects to).
+    cred["host_public_key"] = host_public_key
+    cred["port"] = settings.sftp_port
+    advertised = (getattr(settings, "sftp_public_host", "") or "").strip()
+    cred["host"] = advertised or None
+    return cred
+
+
+@app.get("/device/grants")
+async def list_device_grants_endpoint(
+    principal: DevicePrincipal = Depends(get_current_device_principal),
+    db: Session = Depends(get_db)
+):
+    """List the vaults this device may sync (the device principal's own ACTIVE grants).
+
+    ACTIVE grants only — a revoked grant (is_active=False) never appears, so the desktop cannot be
+    told it may still sync a vault whose grant was pulled. Returns grants, never credentials, so no
+    revoked-tree credential can surface here. (A revoked or locked-account device cannot even reach
+    this route — get_current_device_principal refuses it first.)"""
+    from app.core.models import DeviceGrant
+    grants = db.query(DeviceGrant).filter(
+        DeviceGrant.device_id == principal.device_id,
+        DeviceGrant.is_active == True,  # noqa: E712
+    ).all()
+    return {"grants": [
+        {"vault_id": str(g.vault_id),
+         "granted_at": (g.granted_at.isoformat() + "Z") if g.granted_at else None}
+        for g in grants
+    ]}
+
+
+@app.post("/device/refresh")
+async def refresh_device_secret_endpoint(
+    principal: DevicePrincipal = Depends(get_current_device_principal),
+    db: Session = Depends(get_db)
+):
+    """Rotate the CURRENT device's own sync secret (device principal) and return the NEW secret ONCE.
+
+    Load-bearing serialization (the mint-vs-revoke race, through the refresh door): the device row
+    is locked FOR UPDATE and is_active re-asserted UNDER the lock — the SAME discipline as the mint —
+    so a refresh interleaved with a revoke either precedes it or blocks then refuses; a refresh can
+    never re-activate or extend a device being revoked. The rotation is a SINGLE atomic write: both
+    secret_hash←new AND prev_secret_hash←old (plus prev_secret_retired_at and epoch) are set before
+    ONE commit, so reuse-detection can never observe a torn state (both-null, or prev==current).
+
+    Rotation is ROUTINE, not a compromise response: it does NOT touch any grant's fingerprint (grants
+    bind to the vault-password fingerprint, a separate axis) and does NOT invalidate already-minted
+    SFTP credentials (they carry their own short TTL, scope, and device_id). Revoke — not rotation —
+    is the compromise verb; the reuse-detection path routes through revoke_device."""
+    # A rotation may be driven ONLY from the device's CURRENT secret. A principal that authenticated
+    # with the PREVIOUS (retired-but-in-grace) secret is refused here with a DISTINCT typed reason —
+    # even though that retired secret is still inside the catch-up window the mint path honors. If a
+    # refresh could rotate from the previous secret, two holders of one secret could each rotate
+    # within the grace window and hand the window forward indefinitely, so the past-grace reuse check
+    # would never observe a stale secret. Requiring the current secret to rotate means a client that
+    # is behind must first catch up to `secret` before it can rotate again. The distinct reason keeps
+    # the lost-rotation-response case recoverable: a device that rotated but never received the new
+    # secret (so it still holds only the previous one) cannot self-recover through refresh, and the
+    # reason tells the desktop to route it to the owner-restore path rather than read it as an
+    # unrelated/unknown secret.
+    if principal.in_grace:
+        raise _device_auth_401("device-secret-stale")
+    from app.core.models import Device
+    from app.core.security import generate_device_secret, hash_device_secret
+
+    # populate_existing() is NOT optional: the resolver already loaded this device on the way in
+    # (same request Session), so without it the FOR UPDATE re-read returns the STALE cached
+    # attributes and the is_active/expires_at re-assert reads the pre-lock values — a refresh racing
+    # a revoke would proceed on a device the DB has already marked revoked. It forces the locked
+    # row's committed state to overwrite the cached instance (matching _lock_vault_for_allocation).
+    device = (db.query(Device).filter(Device.id == principal.device_id)
+              .populate_existing().with_for_update().first())
+    if device is None or not device.is_active:
+        raise _device_auth_401("device-revoked")
+    # Re-assert SUSPENDED under the lock (not just is_active): a suspend that commits while this
+    # refresh waits on the row lock must not let a frozen device rotate its secret — otherwise the
+    # preserved current secret could rotate under the human mid-decision. Matches the mint's
+    # under-lock terminal-state set (revoked + suspended + expired).
+    if device.suspended:
+        raise _device_auth_401("device-suspended")
+    if device.expires_at is not None and device.expires_at <= datetime.utcnow():
+        raise _device_auth_401("device-expired")
+
+    new_secret = generate_device_secret()
+    new_epoch = (device.epoch or 1) + 1
+    # Single atomic rotation — all under the one lock, committed together (no torn state).
+    device.prev_secret_hash = device.secret_hash
+    device.prev_secret_retired_at = datetime.utcnow()
+    device.secret_hash = hash_device_secret(new_secret)
+    device.epoch = new_epoch
+    # A refresh is device sync activity — record it in the same atomic write under the lock.
+    device.last_seen = datetime.utcnow()
+    db.commit()
+    _audit_device("device_refresh", device, details={"epoch": new_epoch})
+    return {
+        "device_id": str(principal.device_id),
+        "epoch": new_epoch,
+        "secret": new_secret,  # ⚠️ shown ONCE — stored only as its hash, never returned again
+        # True when this refresh authenticated with the PREVIOUS (retired) secret — the client was
+        # behind the latest rotation and has now caught up to `secret`. Informational only.
+        "in_grace": bool(principal.in_grace),
+        "warning": "⚠️ Copy this device secret now — it is shown only once and cannot be retrieved later.",
+    }
+
+
 # Authentication Endpoints
 
 # --- Second factor: the two-step login (no session until the second factor) -----------------------
@@ -5861,6 +6164,562 @@ async def delete_temp_credential(
     db.commit()
 
     return {"message": "Temporary credential deleted successfully"}
+
+
+# --- Device revocation cascade ------------------------------------------------------------------
+#
+# The gap this closes: deactivate_temp_credential above flips exactly ONE row, and
+# created_by_temp_credential_id is ON DELETE SET NULL — there is no recursive/tree revocation. So
+# revoking a device must deactivate EVERY credential that device is responsible for, atomically,
+# and tear down any live SFTP transport. These primitives live here (not in a service) because they
+# reuse _revoke_sessions; they mutate `db` but do NOT commit, so a caller can revoke-then-delete in
+# one transaction.
+
+def _collect_device_credentials(db, device_id, vault_id=None):
+    """Every temp credential a device is responsible for, deduped.
+
+    PRIMARY (the device_id join): every credential whose device_id == device_id — i.e. every direct
+    device mint. PLUS (complete-by-construction): the transitive created_by_temp_credential_id
+    descendants of those, so a revoke stays fail-closed even if a FUTURE child-mint path forgets the
+    device_id stamp — the join alone would miss such a child and leave a live SFTP credential. The
+    sweep is a bounded BFS with a `seen` guard: created_by is ON DELETE SET NULL so the graph is
+    acyclic, but the guard caps pathological depth and can never loop. When vault_id is given, the
+    result is restricted to credentials granting THAT vault — mapped via TempCredentialVaultAccess,
+    since temporary_credentials has no bare vault_id column — for a single-vault grant revoke."""
+    from app.core.models import TemporaryCredential, TempCredentialVaultAccess
+
+    collected = {c.id: c for c in db.query(TemporaryCredential).filter(
+        TemporaryCredential.device_id == device_id).all()}
+    seen = set(collected.keys())
+    frontier = list(collected.keys())
+    while frontier:
+        children = db.query(TemporaryCredential).filter(
+            TemporaryCredential.created_by_temp_credential_id.in_(frontier)).all()
+        frontier = []
+        for ch in children:
+            if ch.id not in seen:
+                seen.add(ch.id)
+                collected[ch.id] = ch
+                frontier.append(ch.id)
+
+    if vault_id is not None and collected:
+        vault_cred_ids = {r[0] for r in db.query(TempCredentialVaultAccess.temp_credential_id).filter(
+            TempCredentialVaultAccess.temp_credential_id.in_(list(collected.keys())),
+            TempCredentialVaultAccess.vault_id == vault_id).all()}
+        return [c for c in collected.values() if c.id in vault_cred_ids]
+    return list(collected.values())
+
+
+def revoke_device(db, device, *, actor_username="system"):
+    """Atomically revoke a device and EVERY sync credential it is responsible for.
+
+    Serializes against a concurrent mint by locking the device row FOR UPDATE first: a mint of the
+    same device either commits BEFORE this revoke — and is then collected below — or BLOCKS on the
+    lock until this revoke commits, after which the mint re-reads is_active=False and refuses. So no
+    freshly-minted cred can slip past the collection to keep working on a revoked device.
+
+    In one transaction (the CALLER commits): the device is deactivated so its secret no longer
+    resolves in get_current_device_principal (its refresh/mint path is dead), then every collected
+    credential (the device_id join ∪ created_by descendants) is deactivated and its live sessions are
+    force-closed via _revoke_sessions (the Redis session_terminations publish tears down any live
+    transport at once). A credential in-flight at revoke time also dies at its next SFTP op via
+    _check_session_valid. Returns a small summary (device id + how many credentials were revoked)."""
+    from app.core.models import Device
+    # populate_existing() so the locked read reflects the committed row even if this device was
+    # already loaded earlier in the request — uniform with the mint/refresh locks (here it is
+    # defensive: this path unconditionally deactivates and never trusts the re-read's attributes).
+    device = (db.query(Device).filter(Device.id == device.id)
+              .populate_existing().with_for_update().first())
+    if device is None:
+        return {"device_id": None, "revoked_credentials": 0}  # already gone (e.g. a concurrent delete)
+    device.is_active = False
+    creds = _collect_device_credentials(db, device.id)
+    for cred in creds:
+        cred.is_active = False
+        _revoke_sessions(db, temp_credential_id=cred.id, actor_username=actor_username)
+    return {"device_id": str(device.id), "revoked_credentials": len(creds)}
+
+
+def revoke_grant(db, grant, *, actor_username="system"):
+    """Pull ONE (device, vault) grant and kill that vault's in-flight device credentials.
+
+    Symmetry with revoke_device, fail-closed: a pulled grant must leave no live credential for that
+    vault. Serializes against a concurrent mint by locking the grant's DEVICE row FOR UPDATE — the
+    same row the mint locks — so a mint for this vault either commits first (and is then collected)
+    or blocks until this revoke commits (and then the mint's grant predicate sees the grant inactive
+    and refuses). The grant is deactivated, then the device's credentials FOR THAT VAULT (the
+    collection filtered to grant.vault_id) are deactivated + their sessions
+    force-closed. The device itself and its grants for OTHER vaults are untouched. The CALLER commits."""
+    from app.core.models import Device
+    # Lock the grant's device row (the row a mint for that vault also locks). populate_existing() for
+    # a uniform lock pattern; the result is intentionally unused — only the physical lock matters here.
+    db.query(Device).filter(Device.id == grant.device_id).populate_existing().with_for_update().first()
+    grant.is_active = False
+    creds = _collect_device_credentials(db, grant.device_id, vault_id=grant.vault_id)
+    for cred in creds:
+        cred.is_active = False
+        _revoke_sessions(db, temp_credential_id=cred.id, actor_username=actor_username)
+    return {"device_id": str(grant.device_id), "vault_id": str(grant.vault_id),
+            "revoked_credentials": len(creds)}
+
+
+def _audit_device(action, device, *, status="success", ip=None, details=None, vault_id=None):
+    """Best-effort AuditLog row for a device action, on a FRESH isolated session so it NEVER commits
+    the caller's pending work (log_action commits) — same discipline as the scope-denial audit.
+    Keyed to the owning account (user_id) with resource_type='device'. Never raises (a lost audit
+    row must not fail the device action)."""
+    try:
+        from app.core.database import get_db_context
+        from app.services.audit_logger import AuditLogger
+        if ip is None:
+            try:
+                from app.core.net_utils import current_client_ip
+                ip = current_client_ip()
+            except Exception:  # noqa: BLE001 — IP is best-effort context, never load-bearing
+                ip = None
+        d = dict(details or {})
+        if vault_id is not None:
+            d["vault_id"] = str(vault_id)
+        with get_db_context() as adb:
+            AuditLogger(adb).log_action(
+                action=action, status=status,
+                user_id=getattr(device, "user_id", None),
+                resource_type="device", resource_id=str(getattr(device, "id", None)),
+                ip_address=ip, details=d)
+    except Exception:  # noqa: BLE001 — a lost audit row must never fail the action
+        pass
+
+
+def _device_reuse_alert(device, *, ip=None):
+    """Best-effort SecurityAlert that a device's retired secret was replayed and the device suspended,
+    on a FRESH session. Deduped to at most once per device per window via Redis (defense-in-depth on
+    top of the mandatory prev-kill, which already bounds re-triggers). Fail-open: a Redis outage does
+    NOT suppress the alert. Never raises."""
+    try:
+        from app.core.database import redis_client
+        if redis_client.get(f"device_reuse_alert:{device.id}"):
+            return  # already alerted for this device this window
+        redis_client.setex(f"device_reuse_alert:{device.id}", 3600, "1")
+    except Exception:  # noqa: BLE001 — Redis down must not suppress the alert (fail-open)
+        pass
+    try:
+        from app.core.database import get_db_context
+        from app.core.models import SecurityAlert
+        with get_db_context() as adb:
+            adb.add(SecurityAlert(
+                event_type="device_secret_reuse", severity="warning",
+                message="A retired device sync secret was replayed; the device was suspended.",
+                user_id=getattr(device, "user_id", None), ip_address=ip,
+                details={"device_id": str(device.id)},
+                timestamp=datetime.now(timezone.utc), resolved=False))
+            adb.commit()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _handle_retired_secret_reuse(db, device):
+    """Respond to a RETIRED (past-grace) secret replay on `device` — a reuse/compromise signal.
+
+    MANDATORY (both postures): kill the retired secret (prev_secret_hash=None) so the SAME secret
+    cannot re-trigger — a second presentation is then unrecognized -> plain 401, capping the DoS. Then
+    by config posture: DEFAULT (device_secret_reuse_hard_revoke False) = the SOFTENED, reversible
+    response — SUSPEND the device (grants + device row + current secret preserved) and deactivate its
+    in-flight creds; HARD (True) = the old fail-closed full revoke (device is_active=False + its
+    creds). Both deactivate the device's in-flight creds. Serialized on the device row FOR UPDATE +
+    populate_existing (the device-row lock discipline); the security response is COMMITTED before the
+    best-effort alert/audit so a lost alert can never lose the suspend. The reuse is committed here;
+    the caller raises the 401."""
+    from app.core.models import Device
+    locked = (db.query(Device).filter(Device.id == device.id)
+              .populate_existing().with_for_update().first())
+    if locked is None:
+        db.rollback()  # device deleted out from under us — nothing to do
+        return "device-revoked"  # gone == effectively revoked (caller raises this reason)
+    device = locked
+    # The resolver's _live check was UNLOCKED. If a concurrent revoke or reuse-suspend committed
+    # while we waited on this row lock, the device is no longer a LIVE reuse target — surface the
+    # accurate reason WITHOUT a spurious re-suspend / duplicate alert. (A revoked device already
+    # refuses every secret; a suspended one already had its retired secret killed by the first pass.)
+    if not device.is_active:
+        db.rollback()
+        return "device-revoked"
+    if device.suspended:
+        db.rollback()
+        return "device-suspended"
+    hard = bool(getattr(settings, "device_secret_reuse_hard_revoke", False))
+    # FORWARD (tracked): once successor-use retirement lands (the new secret's first use
+    # provably kills the old one — an UNAMBIGUOUS reuse signal), the default posture should escalate
+    # toward the hard revoke, because a past-grace retired-secret replay becomes a stronger signal.
+    #
+    # We only reach here for a device that was LIVE (is_active True, not suspended) under the lock —
+    # the concurrent-race short-circuits above already returned — so this transition fires exactly
+    # once per suspension event and the alert below needs no further dedup guard.
+    # MANDATORY kill of the retired secret (both postures) — caps repeat-trigger.
+    device.prev_secret_hash = None
+    device.prev_secret_retired_at = None
+    # Deactivate the device's in-flight creds (device_id join ∪ descendants) + tear down transports.
+    creds = _collect_device_credentials(db, device.id)
+    for cred in creds:
+        cred.is_active = False
+        _revoke_sessions(db, temp_credential_id=cred.id, actor_username="device-secret-reuse")
+    if hard:
+        device.is_active = False  # full, non-reversible revoke (fail-closed opt-in)
+    else:
+        device.suspended = True   # reversible freeze (default) — grants + current secret preserved
+    db.commit()  # persist the security response FIRST (must not depend on the best-effort alert/audit)
+    _device_reuse_alert(device)  # one alert per suspension event (this transition fires once)
+    _audit_device("device_secret_reuse_" + ("revoke" if hard else "suspend"), device,
+                  status="failure",
+                  details={"posture": "hard" if hard else "soft", "deactivated_creds": len(creds)})
+    # The typed reason MATCHES the posture actually applied, so the desktop tells a reversible
+    # suspend from a terminal revoke (a hard revoke must not surface as 'device-suspended').
+    return "device-revoked" if hard else "device-suspended"
+
+
+def _device_for_account_or_404(db, device_id, current_user):
+    """Load a device that the CURRENT account may manage, or raise. A non-admin may act only on
+    their own devices; an admin may act on any. 404 (not 403) for a device that isn't the caller's,
+    so the endpoint never reveals whether another account's device id exists."""
+    from app.core.models import Device
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if device is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+    if current_user.role != RoleEnum.ADMIN and device.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Device not found")
+    return device
+
+
+@app.post("/devices/{device_id}/revoke")
+async def revoke_device_endpoint(
+    device_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Revoke a device (account session): deactivate it and cascade-revoke every credential it
+    minted. The device row is KEPT (is_active=False) for the audit trail; use DELETE to remove it."""
+    device = _device_for_account_or_404(db, device_id, current_user)
+    result = revoke_device(db, device, actor_username=current_user.username)
+    db.commit()
+    _audit_device("device_revoke", device,
+                  details={"revoked_credentials": result.get("revoked_credentials")})
+    return {"message": "Device revoked", **result}
+
+
+@app.delete("/devices/{device_id}")
+async def delete_device_endpoint(
+    device_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Delete a device (account session). The revocation cascade runs FIRST, in the SAME transaction,
+    so every credential the device minted is deactivated + its sessions torn down BEFORE the row is
+    removed. Only then is the device deleted — its device_grants cascade away (FK ON DELETE CASCADE)
+    and temporary_credentials.device_id is SET NULL on the (already-deactivated) audit rows, so a
+    live credential is never orphaned."""
+    device = _device_for_account_or_404(db, device_id, current_user)
+    result = revoke_device(db, device, actor_username=current_user.username)
+    # Audit while the row is still valid (its attributes would be inaccessible after the delete);
+    # best-effort on a fresh session, so it doesn't touch this transaction.
+    _audit_device("device_delete", device,
+                  details={"revoked_credentials": result.get("revoked_credentials")})
+    db.delete(device)
+    db.commit()
+    return {"message": "Device deleted", **result}
+
+
+@app.post("/devices/{device_id}/grants/{vault_id}/revoke")
+async def revoke_device_grant_endpoint(
+    device_id: uuid.UUID,
+    vault_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Revoke a single (device, vault) grant (account session), leaving the device and its other
+    grants intact. Kills that vault's in-flight device credentials too."""
+    from app.core.models import DeviceGrant
+    device = _device_for_account_or_404(db, device_id, current_user)
+    grant = db.query(DeviceGrant).filter(
+        DeviceGrant.device_id == device.id,
+        DeviceGrant.vault_id == vault_id,
+    ).first()
+    if grant is None:
+        raise HTTPException(status_code=404, detail="Device grant not found")
+    result = revoke_grant(db, grant, actor_username=current_user.username)
+    db.commit()
+    _audit_device("device_grant_revoke", device, vault_id=vault_id,
+                  details={"revoked_credentials": result.get("revoked_credentials")})
+    return {"message": "Device grant revoked", **result}
+
+
+@app.post("/devices/{device_id}/restore")
+async def restore_device_endpoint(
+    device_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Restore a SUSPENDED device (owner account session). This is the ONLY way to clear a suspend:
+    it is owner-authenticated and does NOT pass the device resolver, so a device-secret presentation
+    can never clear the suspend (the suspend gate sits above the current-secret auth path).
+
+    Restore ALWAYS rotates the secret (unconditional — there is no preserve option): it flips
+    suspended→active and mints a FRESH secret, killing the outgoing one with NO grace
+    (prev_secret_hash = old + prev_secret_retired_at = NULL — never grace-valid, yet a replay of it
+    still trips reuse-detection). Rotate-always is the safe default because a suspend can be provoked
+    by an attacker who captured the device's CURRENT secret and rotated FIRST — the legitimate client
+    then presents the now-previous secret past grace and trips detection. A preserve-restore would
+    hand that still-live current secret straight back to the attacker; rotating instead retires it and
+    issues a new secret carried ONLY in this owner-authenticated response, so the same path is safe
+    whether the suspend was a genuine replay, a lost rotation response, or that capture-and-rotate.
+    The fresh secret is returned ONCE here. Grants are preserved (no vault re-proof). Atomic under
+    populate_existing().with_for_update() (the device-row lock discipline)."""
+    from app.core.models import Device
+    from app.core.security import generate_device_secret, hash_device_secret
+
+    _device_for_account_or_404(db, device_id, current_user)  # authz (owner-or-admin) + existence
+    device = (db.query(Device).filter(Device.id == device_id)
+              .populate_existing().with_for_update().first())
+    if device is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    # Restore re-enables a genuinely SUSPENDED-but-LIVE device only, and must NEVER resurrect a
+    # revoked one. is_active is the permanent revoke flag; the soft reuse response sets only
+    # `suspended` (leaving is_active=True), so a real suspend is (suspended=True, is_active=True).
+    # Require BOTH: reject a live un-suspended device (nothing to restore), a revoked device
+    # (is_active=False), AND a suspend-then-revoked device (suspended=True but is_active=False —
+    # still terminally revoked, so clearing the suspend alone would report a misleading success and
+    # waste a one-time rotated secret on an inert device). Restore clears ONLY `suspended` and never
+    # sets is_active, so no path here can un-revoke.
+    if not (device.suspended and device.is_active):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Device is not restorable (it is not suspended, or it has been revoked).")
+
+    # ALWAYS rotate on restore. Mint a fresh secret and no-grace-kill the outgoing one: retire it
+    # with retired_at=NULL so it is never grace-valid, yet a replay of it still trips reuse-detection.
+    # One atomic write under the device-row lock — suspended cleared AND the full rotation set before
+    # the single commit, so reuse-detection can never observe a torn state.
+    new_secret = generate_device_secret()
+    device.suspended = False
+    device.prev_secret_hash = device.secret_hash
+    device.prev_secret_retired_at = None
+    device.secret_hash = hash_device_secret(new_secret)
+    device.epoch = (device.epoch or 1) + 1
+    db.commit()
+    _audit_device("device_restore", device, details={"rotated": True})
+    return {
+        "message": "Device restored",
+        "device_id": str(device_id),
+        "rotated": True,
+        "secret": new_secret,  # ⚠️ shown ONCE — stored only as its hash, never returned again
+        "warning": ("⚠️ Copy this device secret now — it is shown only once and cannot be "
+                    "retrieved later."),
+    }
+
+
+def _validate_device_label(label, username):
+    """Sanitize a user-chosen device label and keep it deliberately NON-IDENTIFYING, so the device
+    registry cannot quietly leak a machine's identity (a hostname, address, or the account name).
+    Returns the cleaned label (None for empty); raises 400 on an identifying value. A plain nickname
+    ('Work laptop') passes; a path, address, contact handle, or the account username does not."""
+    if label is None:
+        return None
+    label = "".join(ch for ch in label if ch >= " " and ch != "\x7f").strip()
+    if not label:
+        return None
+    if len(label) > 64:
+        label = label[:64].strip()
+    lowered = label.lower()
+    if ("/" in label or "\\" in label or "@" in label
+            or re.match(r"^\d{1,3}(\.\d{1,3}){3}$", label) is not None  # a bare IPv4 address
+            or (username and username.lower() in lowered)):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=("Choose a device label that doesn't identify the machine — no path, address, "
+                    "account name, or contact handle. A simple nickname is ideal."),
+        )
+    return label
+
+
+class DeviceRegisterRequest(BaseModel):
+    """Register a device: an optional, non-identifying label."""
+    label: Optional[str] = Field(default=None, max_length=128)
+
+
+@app.post("/devices")
+async def register_device_endpoint(
+    body: DeviceRegisterRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Register a device for the current account and return its sync secret ONCE.
+
+    Account-session only — a device principal can never enroll another device (no self-expansion).
+    The opaque secret is generated here, stored only as its sha256, and returned in THIS response and
+    never again; if the caller loses it they re-register. Grants are added separately (grant-vault),
+    so a freshly-registered device can reach no vault until the account grants it one."""
+    from app.core.models import Device
+    from app.core.security import generate_device_secret, hash_device_secret
+
+    # Per-account device cap (mirrors max_temp_creds_per_user): count ACTIVE devices; an admin
+    # account is exempt; 0 = unlimited. 409 (well-formed request, conflicts with current state) at
+    # the cap. This bounds total active device sync credentials per account together with the
+    # per-device cred cap, so unlimited registration can't make the total unbounded. Like the
+    # interactive per-user cap, the count-then-insert is not serialized, so a concurrent burst can
+    # transiently exceed the cap by a small bounded amount — acceptable for a resource/DoS bound
+    # (not a security invariant); strict enforcement would need a per-account lock or a DB constraint.
+    cap = getattr(settings, "max_devices_per_user", 0) or 0
+    if cap > 0 and getattr(current_user, "role", None) != RoleEnum.ADMIN:
+        active_devices = db.query(Device).filter(
+            Device.user_id == current_user.id,
+            Device.is_active == True,  # noqa: E712
+        ).count()
+        if active_devices >= cap:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(f"You already have the maximum of {cap} registered device(s). Remove one, "
+                        f"or ask an administrator to raise the limit."))
+
+    label = _validate_device_label(body.label, current_user.username)
+    secret = generate_device_secret()
+    device = Device(
+        user_id=current_user.id,
+        label=label,
+        secret_hash=hash_device_secret(secret),
+        epoch=1,
+        is_active=True,
+    )
+    db.add(device)
+    db.commit()
+    db.refresh(device)
+    _audit_device("device_register", device, details={"label": label})
+    return {
+        "device_id": str(device.id),
+        "label": label,
+        "secret": secret,  # ⚠️ shown ONCE — stored only as its hash, never returned again
+        "warning": "⚠️ Copy this device secret now — it is shown only once and cannot be retrieved later.",
+    }
+
+
+class DeviceGrantRequest(BaseModel):
+    """Grant a device access to a vault: the vault, and its password if the vault is protected."""
+    vault_id: uuid.UUID
+    vault_password: Optional[str] = None
+
+
+@app.post("/devices/{device_id}/grants")
+async def grant_device_vault_endpoint(
+    device_id: uuid.UUID,
+    body: DeviceGrantRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Grant one of the CURRENT ACCOUNT's OWN devices access to a vault (account session).
+
+    This is the ONE place a vault password is proven for the device model: the account proves it
+    here, ONCE, and the proof is frozen as the grant's vault_password_fingerprint. The device mint
+    never re-proves it — it only fingerprint-matches — so a device holds no vault password. Only the
+    device's OWNER may grant it (not admin-overridable: a grant binds a vault-password proof to a
+    device, so only that device's owner should add it), and never the device principal itself.
+
+    Fail-closed and oracle-free: a vault the owner cannot READ is indistinguishable from a
+    nonexistent one (both 404), so the password proof is unreachable for a non-member and cannot
+    become a by-id password oracle. A zero-knowledge vault is refused (never SFTP-syncable)."""
+    from app.core.security import verify_password, vault_password_fingerprint
+    from app.core.database import redis_client
+    from app.core import rate_limit_settings
+    from app.core.models import Device, DeviceGrant
+
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if device is None or device.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    # A vault the owner cannot READ is treated exactly like a nonexistent one (same 404) so this
+    # endpoint is not a vault-existence or password oracle. allow_share defaults False: a read-only
+    # share is not a basis to grant SFTP sync (fail-closed), matching the interactive mint.
+    vault = db.query(Vault).filter(Vault.id == body.vault_id).first()
+    if vault is None or not PermissionService(db).can_access_vault(
+            current_user, vault.id, VaultPermissionEnum.READ):
+        raise HTTPException(status_code=404, detail="Vault not found or not accessible")
+    if getattr(vault, 'type', 'standard') == 'zero_knowledge':
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Zero-knowledge vaults can't be synced to a device.")
+
+    # Prove the vault password ONCE (only for a password-protected vault), on the SAME failure-only,
+    # fixed-window (vault, account) limiter the interactive mint and the web vault-open use, so the
+    # device model's one password proof is not an unthrottled brute-force surface (reachable only by
+    # a member, after the read pre-check above). On success we freeze a fingerprint of the proven
+    # hash; the mint later matches it (never re-proving), and a later password rotation voids the
+    # grant (grant-needs-reproof) with NO limiter burn (the mint carries no password to test).
+    fingerprint = None
+    if vault.password_hash:
+        _rl_key = f"rate_limit:vault:{vault.id}:{current_user.id}"
+        _rl_limit = rate_limit_settings.effective(
+            "rate_limit_vault_attempts_admin" if current_user.role == RoleEnum.ADMIN
+            else "rate_limit_vault_attempts")
+        _rl_attempts = redis_client.get(_rl_key)
+        if _rl_attempts and int(_rl_attempts) >= _rl_limit:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many vault password attempts. Please try again later.")
+        if not body.vault_password or not verify_password(body.vault_password, vault.password_hash):
+            _pipe = redis_client.pipeline()
+            _pipe.incr(_rl_key)
+            _pipe.expire(_rl_key, rate_limit_settings.effective("rate_limit_vault_window_seconds"))
+            _pipe.execute()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=("This vault is password-protected — its correct password is required to "
+                        "sync it to a device."))
+        fingerprint = vault_password_fingerprint(vault.password_hash)
+
+    # Upsert the grant (UNIQUE device_id, vault_id). Re-granting re-proves the password, refreshes
+    # the frozen fingerprint, and reactivates a previously-revoked grant. granted_at records the last
+    # proof time (naive-UTC, matching the column). A concurrent revoke_grant serializes on the grant
+    # row's write lock (last committer wins) and any credentials it killed stay killed — a
+    # reactivated grant simply carries no live cred until the next mint, which is the intended
+    # re-grant behaviour; no device-row lock is needed here (the mint reads a committed grant state).
+    grant = db.query(DeviceGrant).filter(
+        DeviceGrant.device_id == device.id,
+        DeviceGrant.vault_id == vault.id,
+    ).first()
+    if grant is None:
+        grant = DeviceGrant(device_id=device.id, vault_id=vault.id)
+        db.add(grant)
+    grant.vault_password_fingerprint = fingerprint
+    grant.is_active = True
+    grant.granted_by_user_id = current_user.id
+    grant.granted_at = datetime.utcnow()
+    db.commit()
+    db.refresh(grant)
+    _audit_device("device_grant", device, vault_id=vault.id,
+                  details={"password_protected": bool(vault.password_hash)})
+    return {
+        "device_id": str(device.id),
+        "vault_id": str(vault.id),
+        "is_active": True,
+        "password_protected": bool(vault.password_hash),
+        "granted_at": (grant.granted_at.isoformat() + "Z") if grant.granted_at else None,
+    }
+
+
+@app.get("/devices")
+async def list_devices_endpoint(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """List the current account's registered devices (account session), active and revoked, so the
+    owner can manage them. Returns metadata only — NEVER a secret (only the sha256 is stored, and
+    even that is never returned)."""
+    from app.core.models import Device
+    devices = db.query(Device).filter(Device.user_id == current_user.id).all()
+    return {"devices": [
+        {"device_id": str(d.id), "label": d.label, "is_active": d.is_active, "epoch": d.epoch,
+         "created_at": (d.created_at.isoformat() + "Z") if d.created_at else None,
+         "last_seen": (d.last_seen.isoformat() + "Z") if d.last_seen else None,
+         "expires_at": (d.expires_at.isoformat() + "Z") if d.expires_at else None}
+        for d in devices
+    ]}
 
 
 @app.post("/temp-creds/{temp_username}/terminate-sessions")
@@ -19682,6 +20541,30 @@ END $$;""",
             # create_all adds it on a fresh DB; this backfills a receivers table created on an
             # intermediate build. Additive + idempotent; defaults to 0.
             "ALTER TABLE receivers ADD COLUMN IF NOT EXISTS reserved_bytes BIGINT NOT NULL DEFAULT 0",
+            # Device-scoped sync: the device that minted a temp credential (NULL = not a device
+            # mint). This is the primary join key for the device-revocation cascade. The `devices`
+            # and `device_grants` TABLES are created by create_all (new models); only this new
+            # COLUMN + its FK need an ALTER. Add the column, then the FK to devices(id) ON DELETE
+            # SET NULL only if absent — mirroring created_by_temp_credential_id above, so a fresh
+            # create_all install (whose model declares the FK) and an upgraded one don't diverge.
+            # `devices` already exists by now: create_all/init_db runs before this migration pass.
+            "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS device_id UUID",
+            """DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                 WHERE conname = 'temporary_credentials_device_id_fkey'
+                   AND conrelid = 'temporary_credentials'::regclass) THEN
+    UPDATE temporary_credentials t SET device_id = NULL
+      WHERE t.device_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.id = t.device_id);
+    ALTER TABLE temporary_credentials ADD CONSTRAINT temporary_credentials_device_id_fkey
+      FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE SET NULL;
+  END IF;
+END $$;""",
+            # Device-suspended state: a reversible freeze (distinct from the is_active revoke flag),
+            # the softened response to a retired-secret replay. create_all builds it on a fresh DB;
+            # this adds it on a deployment that ran an earlier build of the device schema. Additive +
+            # idempotent; defaults FALSE so every existing device stays un-suspended.
+            "ALTER TABLE devices ADD COLUMN IF NOT EXISTS suspended BOOLEAN NOT NULL DEFAULT FALSE",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)

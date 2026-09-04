@@ -136,6 +136,30 @@ class SessionLimitExceededError(AuthenticationError):
     pass
 
 
+# The FIXED capability set a device sync credential carries on its one granted vault: full
+# read+write file/folder sync, and nothing vault-administrative (no permissions, password, expiry,
+# key-rotation, or vault-delete power). A device NEVER chooses its own caps — that would be a
+# self-escalation surface — so the mint always issues exactly this set (expanded to pull in its
+# prerequisite vault.see_info). It is the least privilege bidirectional sync (rclone bisync) needs:
+# list + download + upload + rename + delete files, and create/delete folders.
+DEVICE_SYNC_VAULT_CAPS = [
+    "vault.see_files", "file.download", "file.upload",
+    "file.rename", "file.delete", "folder.create", "folder.delete",
+]
+
+
+def _device_mint_refusal(reason: str, http_status: int = status.HTTP_403_FORBIDDEN) -> HTTPException:
+    """A typed refusal from the device mint. The `reason` is the single upstream source of the
+    honest state the desktop renders: 'grant-needs-reproof' (a rotation voided the proof — re-prove
+    once, NEVER a hard deny and NEVER a limiter burn) and 'device-revoked'/'device-expired' are
+    DISTINCT recoverable/terminal states; 'no-grant'/'vault-not-standard'/'account-inactive' are
+    should-never-happen guards an honest desktop never reaches, so they need no distinct copy. No
+    password is ever tested on any of these paths, so none touches the vault-password rate limiter
+    and none is a 400/429."""
+    return HTTPException(status_code=http_status,
+                         detail={"reason": reason, "message": "Device sync credential was refused"})
+
+
 class AuthService:
     """Service for authentication operations."""
     
@@ -1003,6 +1027,207 @@ class AuthService:
             'warning': '⚠️ COPY THIS PASSWORD NOW - It cannot be retrieved later!',
             'password_length': len(credential_string),
             'password_policy': 'One-time viewing only. Password is hashed and cannot be retrieved after creation.'
+        }
+
+    def mint_device_sync_credential(self, device, vault_id, validity_minutes=None) -> dict:
+        """Mint a single-use SFTP sync credential for a registered device, authorized by a device
+        GRANT rather than an interactive vault-password proof.
+
+        This is deliberately a SEPARATE path from create_temporary_credential, not a branch through
+        it: it NEVER enters the password-VERIFY branch and NEVER touches the per-vault rate limiter
+        (a device carries no password), and its scope is fixed server-side (a device cannot choose
+        its caps — no self-escalation). The transfer path is otherwise identical to today's temp
+        cred, so a device sync behaves exactly like a password-proved one at the SFTP server; only
+        HOW it was authorized differs.
+
+        Allows the mint IFF all five predicates hold (else a typed refusal; no password is ever
+        supplied, no limiter is ever touched):
+          1. an ACTIVE device_grants row for (device, vault)              -> else 'no-grant'
+          2. the vault is Standard (never zero-knowledge)                 -> else 'vault-not-standard'
+          3. the owning account is active and not locked                 -> else 'account-inactive'
+          4. the device is live (is_active + not expired)                -> else 'device-revoked'/'device-expired'
+          5. the grant's frozen vault_password_fingerprint still equals the vault's LIVE fingerprint
+             -> else the DISTINCT, non-retrying 'grant-needs-reproof' (a rotation voided the proof).
+
+        For a password-protected vault, predicate 5's matched fingerprint is copied from the grant
+        straight onto the issued credential's TempCredentialVaultAccess row, so the transfer-time
+        proof (_vault_password_proven) passes WITHOUT a fresh password test. Skipping the password
+        VERIFY must not skip the fingerprint RECORD, or a password vault would be silently invisible
+        over SFTP.
+
+        Returns the credential dict (shown once). The route adds the host key + host/port."""
+        from app.core.models import Device, DeviceGrant, TempCredentialVaultAccess
+        from app.core.temp_scope import expand_vault_caps, normalize_scope
+
+        # Predicate 4 (device live) UNDER A ROW LOCK — taken BEFORE any predicate and held through the
+        # cred INSERT + commit below, so the whole check→mint is atomic against a concurrent revoke.
+        # Lock the device row FOR UPDATE and re-read its state here: a racing revoke/delete of the same
+        # device either commits first (this mint then blocks on the lock, re-reads is_active=False and
+        # refuses) or blocks until this mint commits (the revoke's collection then sees this cred and
+        # deactivates it). Without the lock, under READ COMMITTED a mint could slip a live cred past a
+        # revoke that had already collected — the revoked device's cred would then keep working to its
+        # TTL. The lock releases only at commit, so the check→insert window never reopens.
+        # populate_existing() is NOT optional here: get_current_device_principal already loaded this
+        # device on the way in (same request Session), so without it a query matching the cached
+        # instance returns the STALE pre-lock attributes — the FOR UPDATE lock would be taken but
+        # is_active would keep the value the resolver read, and a mint racing a revoke would slip a
+        # live cred past. populate_existing() overwrites the instance with the locked row's committed
+        # state, matching the vault-allocation lock (_lock_vault_for_allocation).
+        device = (self.db.query(Device).filter(Device.id == device.id)
+                  .populate_existing().with_for_update().first())
+        if device is None:
+            raise _device_mint_refusal("device-revoked")  # deleted out from under us
+        if not device.is_active:
+            raise _device_mint_refusal("device-revoked")
+        # Re-assert SUSPENDED under the lock too, not just is_active — a suspend (the softened
+        # reuse response) leaves is_active True, so without this a suspend that commits while this
+        # mint waits on the row lock would be missed and a live cred issued after the suspend
+        # deactivated the device's in-flight creds (the same race, through the suspend door). The
+        # under-lock terminal-state set must match the resolver's: revoked + suspended + expired.
+        if getattr(device, "suspended", False):
+            raise _device_mint_refusal("device-suspended")
+        # device.expires_at is stored naive-UTC (like temp_cred.expires_at), so compare with a naive
+        # utcnow() — an aware value here would raise on the comparison.
+        if device.expires_at is not None and device.expires_at <= datetime.utcnow():
+            raise _device_mint_refusal("device-expired")
+
+        # Predicate 1 (an active grant for exactly this device+vault).
+        grant = self.db.query(DeviceGrant).filter(
+            DeviceGrant.device_id == device.id,
+            DeviceGrant.vault_id == vault_id,
+            DeviceGrant.is_active == True,  # noqa: E712
+        ).first()
+        if grant is None:
+            raise _device_mint_refusal("no-grant")
+
+        # Predicate 2 (a Standard, existing vault). A grant to a since-deleted vault is effectively
+        # no grant; a zero-knowledge vault is never SFTP-syncable (its keys are never server-side)
+        # so the device path refuses it outright — no ZK material is ever reached.
+        vault = self.db.query(Vault).filter(Vault.id == vault_id).first()
+        if vault is None:
+            raise _device_mint_refusal("no-grant")
+        if getattr(vault, 'type', 'standard') == 'zero_knowledge':
+            raise _device_mint_refusal("vault-not-standard")
+
+        # Predicate 3 (the owning account is active and not locked).
+        owner = self.db.query(User).filter(User.id == device.user_id).first()
+        if owner is None or not owner.is_active or account_locked(owner):
+            raise _device_mint_refusal("account-inactive")
+
+        # Predicate 5 (the grant is still proven). The grant's frozen fingerprint must still equal
+        # the vault's LIVE password fingerprint; a server-side add/change/rotation of the vault
+        # password changes it -> mismatch -> 'grant-needs-reproof' (a DISTINCT, non-retrying reason;
+        # the desktop shows "re-prove once", never a hard deny). No password is tested; the limiter
+        # is never touched. For a no-password vault both sides are None and this passes. This mirrors
+        # the SFTP-side re-check (_vault_password_proven), so mint-time and transfer-time agree.
+        live_fp = vault_password_fingerprint(vault.password_hash) if vault.password_hash else None
+        if grant.vault_password_fingerprint != live_fp:
+            raise _device_mint_refusal("grant-needs-reproof")
+
+        # Per-device outstanding-credential cap: a SEPARATE bound from the per-user interactive cap
+        # (create_temporary_credential's max_temp_creds_per_user), so a compromised device is bounded
+        # on its own and neither path can starve or exhaust the other. 0 = unlimited. Counts only
+        # OUTSTANDING creds — is_active AND not yet spent (is_used == False) AND not yet expired. The
+        # is_used filter is load-bearing: a single-use cred is SPENT by its one SFTP auth, which flips
+        # is_used True but leaves is_active True until the lazy expiry sweep — so without it every
+        # already-used cred would keep counting for its full TTL, and a device that mints-and-uses in
+        # the normal way would false-hit the cap (a 409 stall) within the hour despite holding no live
+        # credential. (An UNSPENT cred still counts until its hard expires_at, which a shorter
+        # client validity below does not move — spending it, the normal case, is what frees the slot.)
+        cap = getattr(settings, "max_device_sync_creds_per_device", 0) or 0
+        if cap > 0:
+            active_for_device = self.db.query(TemporaryCredential).filter(
+                TemporaryCredential.device_id == device.id,
+                TemporaryCredential.is_active == True,  # noqa: E712
+                TemporaryCredential.is_used == False,  # noqa: E712 — a spent single-use cred frees its slot
+                TemporaryCredential.expires_at > datetime.utcnow(),
+            ).count()
+            if active_for_device >= cap:
+                # 409 (well-formed request, conflicts with current state), mirroring the per-user
+                # cap's status. NOT a password/limiter path.
+                raise _device_mint_refusal("device-cred-cap", http_status=status.HTTP_409_CONFLICT)
+
+        # ---- Mint. A single-use, short-TTL SFTP credential, same lifetimes as the interactive path.
+        # The client MAY request a shorter validity so the credential stops authenticating sooner —
+        # a tighter usable window if the transfer finishes early or the cred is intercepted. It is
+        # CLAMPED to [1, server default]: it can only SHORTEN, never extend past the server's
+        # configured ceiling, so a device can never mint a longer-lived credential than the
+        # interactive path. None (the default) uses the server value unchanged.
+        server_validity = settings.temp_cred_validity_minutes
+        if validity_minutes is not None:
+            validity = max(1, min(int(validity_minutes), server_validity))
+        else:
+            validity = server_validity
+        total_lifetime = max(settings.temp_cred_total_lifetime_minutes, validity)
+        temp_username, credential_string, credential_hash = generate_temporary_credentials()
+        now = datetime.now(timezone.utc)
+        deactivate_at = now + timedelta(minutes=validity)
+        expires_at = now + timedelta(minutes=total_lifetime)
+
+        # A non-NULL selected-mode scope so the SFTP layer treats this as a scoped credential and
+        # enforces the per-vault caps + the fingerprint (a NULL scope would be legacy/unrestricted).
+        scope = normalize_scope({"pages": ["vaults"]})
+        caps = expand_vault_caps(DEVICE_SYNC_VAULT_CAPS)
+
+        temp_cred = TemporaryCredential(
+            user_id=device.user_id,
+            temp_username=temp_username,
+            credential_hash=credential_hash,
+            password_shown=True,
+            deactivate_at=deactivate_at,
+            expires_at=expires_at,
+            note=None,
+            can_create_temp_credentials=False,
+            scope=scope,
+            vault_access_mode='selected',
+            device_id=device.id,  # the revocation cascade's primary join key — every device mint stamps it.
+        )
+        try:
+            self.db.add(temp_cred)
+            self.db.flush()
+            self.db.add(TempCredentialVaultAccess(
+                temp_credential_id=temp_cred.id,
+                vault_id=vault.id,
+                vault_caps=caps,
+                scope_ids=None,  # the whole vault (device sync is not file/folder-restricted)
+                # The grant's fingerprint (== live_fp by predicate 5) recorded WITHOUT a password
+                # test, so _vault_password_proven accepts this cred at transfer for a password vault.
+                # NULL for a no-password vault.
+                vault_password_fingerprint=grant.vault_password_fingerprint,
+                created_by=device.user_id,
+            ))
+            # Record device sync activity on the successful mint — part of THIS atomic commit, on the
+            # device row already locked above. Naive-UTC, matching the device's other timestamps.
+            device.last_seen = datetime.utcnow()
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        self.db.refresh(temp_cred)
+
+        redis_key = f"temp_cred:{temp_username}"
+        redis_client.setex(
+            redis_key,
+            total_lifetime * 60,
+            json.dumps({
+                'id': str(temp_cred.id),
+                'user_id': str(device.user_id),
+                'deactivate_at': deactivate_at.isoformat(),
+                'expires_at': expires_at.isoformat(),
+            })
+        )
+
+        return {
+            'id': str(temp_cred.id),
+            'temp_username': temp_username,
+            'credential': credential_string,  # ⚠️ ONLY TIME the password is returned!
+            'created_at': temp_cred.created_at.isoformat() + 'Z',
+            'deactivate_at': deactivate_at.isoformat().replace('+00:00', 'Z'),
+            'expires_at': expires_at.isoformat().replace('+00:00', 'Z'),
+            'validity_minutes': validity,
+            'total_lifetime_minutes': total_lifetime,
+            'vault_id': str(vault.id),
+            'warning': '⚠️ COPY THIS PASSWORD NOW - It cannot be retrieved later!',
         }
 
     def retrieve_temp_password(self, temp_username: str) -> Optional[str]:

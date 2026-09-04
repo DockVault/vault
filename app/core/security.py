@@ -1334,14 +1334,42 @@ def generate_session_token() -> str:
 def generate_secure_random_string(length: int = 32) -> str:
     """
     Generate a cryptographically secure random string.
-    
+
     Args:
         length: Length of the string in bytes (default 32)
-        
+
     Returns:
         URL-safe random string
     """
     return secrets.token_urlsafe(length)
+
+
+# Device sync secret — the opaque bearer credential a registered device presents to mint
+# single-use SFTP sync credentials.
+#
+# Deliberately NOT a JWT: because verify_access_token() (jwt.decode) raises on it, every
+# get_current_user route rejects it with 401 by construction, so only the device routes (guarded
+# by their own dependency) can accept it. It is 256 bits from a CSPRNG (`secrets`, never the
+# `random` module), shown to the client ONCE at register/rotate, and stored server-side ONLY as
+# its sha256 (hash_device_secret). sha256 — not argon2 — is correct here: a 256-bit random has no
+# low-entropy structure a slow KDF would protect, so a DB-hash leak yields nothing brute-forceable,
+# and every mint/refresh avoids a needless KDF cost. The resolver confirms the hashed-value lookup
+# with hmac.compare_digest (constant-time on the digest), so the final comparison leaks nothing;
+# safety rests on the secret's 256-bit entropy, NOT on the indexed DB lookup being constant-time
+# (it isn't, and need not be — a hit-vs-miss timing reveals only that a given hash is stored, which
+# the holder of that token already knows).
+def generate_device_secret() -> str:
+    """A fresh opaque device sync secret: 32 CSPRNG bytes, URL-safe base64. Returned to the
+    client exactly once; only its hash (hash_device_secret) is ever persisted."""
+    return secrets.token_urlsafe(32)
+
+
+def hash_device_secret(secret: str) -> str:
+    """The at-rest form of a device sync secret: hex sha256 of the presented token. Only this is
+    stored (devices.secret_hash / prev_secret_hash); the raw secret is never persisted. Callers
+    confirm the hashed-value lookup with hmac.compare_digest (constant-time on the digest); the
+    secret's 256-bit entropy — not the indexed DB lookup — is what makes the resolve safe."""
+    return hashlib.sha256((secret or "").encode()).hexdigest()
 
 
 # Input Sanitization
