@@ -61,10 +61,13 @@ def test_vault_key_eligibility_precedes_reconciliation_and_secret_queries():
 
 def test_selected_grants_are_validated_before_one_atomic_database_commit():
     source = _read("app/services/auth_service.py")
+    # Bound the slice to create_temporary_credential alone: mint_device_sync_credential
+    # (a separate credential-minting method with its own atomic commit) now follows it,
+    # so ending at retrieve_temp_password would fold that method's commit into the count.
     method = _slice(
         source,
         "    def create_temporary_credential(",
-        "    def retrieve_temp_password(",
+        "    def mint_device_sync_credential(",
     )
 
     assert "selected_access_plans" in method
