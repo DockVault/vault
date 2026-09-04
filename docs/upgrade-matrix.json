@@ -261,6 +261,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.28.0": {
+      "released": "2026-09-04",
+      "notes": "Device-scoped SFTP sync credentials. Lets a registered device sync a Standard vault over SFTP without ever holding the vault password: the account proves the vault password once, at grant time, which binds the proof to that device, and the device thereafter holds only a per-device, server-scoped, revocable secret (an opaque token, stored only as its hash) from which the server mints single-use, short-lived SFTP credentials. Additive schema, applied so a fresh install and an upgrade converge: two new tables (devices, device_grants) created by create_all, plus a nullable temporary_credentials.device_id column (FK devices.id ON DELETE SET NULL, tagging a minted credential with the device that minted it) added by the boot DDL ADD COLUMN IF NOT EXISTS. All additions are unused by 0.27.0, so a rollback to 0.27.0 is clean -- it leaves the two tables and the column in place and simply stops serving device credentials until you upgrade again. Adds device-sync settings: a per-account device cap (MAX_DEVICES_PER_USER), a per-device credential cap (MAX_DEVICE_SYNC_CREDS_PER_DEVICE), a previous-secret rotation grace window (DEVICE_SECRET_ROTATION_GRACE_MINUTES), the retired-secret reuse-response posture (DEVICE_SECRET_REUSE_HARD_REVOKE), and an advertised SFTP hostname; the defaults suit a single tenant.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -492,6 +500,13 @@
     {
       "from": "0.26.0",
       "to": "0.27.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.27.0",
+      "to": "0.28.0",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
