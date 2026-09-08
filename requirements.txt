@@ -10,7 +10,7 @@
 # the upload endpoints). starlette is pinned explicitly for reproducibility (it arrives via fastapi).
 fastapi==0.141.1
 starlette==1.6.0
-uvicorn[standard]==0.52.3
+uvicorn[standard]==0.52.4
 # 0.0.18 closes CVE-2024-53981 (many-part malformed multipart -> CPU-exhaustion DoS) on top of the
 # earlier 0.0.7 Content-Type option-parsing ReDoS fix (CVE-2024-24762). Pairs with the fastapi/starlette
 # >=0.40 upgrade above (the module imports as `python_multipart`, which fastapi 0.115 resolves).
@@ -19,7 +19,7 @@ python-multipart==0.0.32
 # Config / validation
 pydantic==2.13.4
 pydantic-settings==2.15.0
-python-dotenv==1.2.2
+python-dotenv==1.2.3
 email-validator==2.3.0
 
 # Database + cache
@@ -33,7 +33,7 @@ paramiko==5.0.0
 # Security / crypto
 # 50.0.0 closes CVE-2026-69247 (Bleichenbacher oracle in PKCS#7 decryption); underpins the Fernet
 # at-rest crypto and TLS on a crypto product, so it should not lag.
-cryptography==50.0.0
+cryptography==50.0.1
 argon2-cffi==25.1.0
 bcrypt==5.0.0
 # JWTs are HS256 (symmetric) only. Migrated off the unmaintained python-jose (CVE-2024-33663/33664 —
@@ -47,14 +47,14 @@ keyring==25.7.0
 # allowlist sanitizer applied on save AND before send, so no active content can be stored or
 # mailed. Ships cp38-abi3 musllinux + manylinux wheels, so the alpine image installs a wheel
 # (no compiler) on both amd64 and arm64.
-nh3==0.3.6
+nh3==0.3.7
 
 # In-vault file PREVIEW rendering (Standard vaults only): Markdown -> HTML and Pygments source
 # highlighting. Their output is ALWAYS run back through an nh3 allowlist (app/core/preview_render.py)
 # and shown in a fully-sandboxed, CSP-locked iframe, so neither library's output is trusted markup.
 # Both are pure-Python (no compiler needed for the alpine image).
 Markdown==3.10.3
-Pygments==2.20.0
+Pygments==2.21.0
 
 # NOTE: `requests` was removed — the only outbound HTTP is a stdlib-urllib localhost /health probe.
 # (The test suite's own `requests` dependency lives in tests/requirements-test.txt, not in the image.)
