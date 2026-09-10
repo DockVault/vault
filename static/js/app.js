@@ -1924,6 +1924,27 @@ function logout() {
         if (el) el.replaceChildren();
     });
 
+    // Put the VIEW back on the dashboard as well. showScreen() below only swaps the `.screen`
+    // wrappers, so whichever `.content-section` was active inside the dashboard screen survives a
+    // logout untouched — and the next sign-in on this tab lands straight back on it, which after
+    // the scrub above is an empty one. That is the reported bug: an idle logout while inside a
+    // vault, then a fresh login showing that vault's view with no files in it and no way to get
+    // them back short of a refresh, because state.currentVault is now null so nothing reloads it.
+    //
+    // The header is the worse half. `vault-view-title` still holds the previous session's vault
+    // NAME — for a zero-knowledge vault the CLIENT-DECRYPTED name, which the server itself is
+    // never allowed to see — so a different user signing in on this shared tab reads it straight
+    // off the screen. That is the same finding as the content scrub above, so it gets the same
+    // treatment: leave nothing of the previous session behind.
+    document.querySelectorAll('.content-section').forEach(s => s.classList.remove('active'));
+    document.getElementById('dashboard-section')?.classList.add('active');
+    document.querySelectorAll('.sidebar-item').forEach(i => i.classList.remove('active'));
+    document.querySelector('.sidebar-item[data-section="dashboard"]')?.classList.add('active');
+    const vaultTitleEl = document.getElementById('vault-view-title');
+    if (vaultTitleEl) vaultTitleEl.textContent = '';
+    const vaultDescEl = document.getElementById('vault-view-description');
+    if (vaultDescEl) { vaultDescEl.textContent = ''; vaultDescEl.style.display = 'none'; }
+
     // Drop remembered vault passwords + restored-view so they can't leak to
     // another user who logs in on this same tab without a refresh.
     state.rememberedVaults = {};
