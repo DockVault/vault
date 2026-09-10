@@ -2155,6 +2155,13 @@ body.ctx-menu-open .action-more-wrap.cluster-right:focus-within .action-cluster 
    `btn.hidden = true` (set when the clip empties) would not hide it -- the button stayed visible with
    nothing staged. Restore the hidden attribute for this button. */
 #copied-items-btn[hidden] { display: none; }
+/* And once more in the upload-link dialog's footer, where it was doing real damage rather than
+   leaving a stray button around. submitReceiver() already sets `hidden` on Cancel and "Create link"
+   the moment the link exists, and marks Done visible -- but `.btn` beat `[hidden]` here too, so all
+   three stayed on screen: a Cancel that cannot cancel anything (the link is already created and
+   already listed) and a spent, disabled "Create link" next to the only button that does anything.
+   The JS was right all along; nothing was hiding. */
+#rc-cancel[hidden], #rc-create[hidden], #rc-done[hidden] { display: none; }
 .ci-head { display: flex; align-items: center; justify-content: space-between; padding: var(--space-sm) var(--space-md); border-bottom: 1px solid var(--surface-3); }
 .ci-title { margin: 0; font-size: var(--text-base); }
 .ci-close { background: transparent; border: none; color: var(--text-secondary); font-size: 22px; line-height: 1; cursor: pointer; }

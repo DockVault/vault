@@ -18421,6 +18421,10 @@ function _rtEl(id) { return document.getElementById(id); }
 const _MB = 1048576;
 const _RC_STATUS_LABEL = { active: 'Active', paused: 'Paused', revoked: 'Revoked', expired: 'Expired', exhausted: 'Used up' };
 const _RC_SECRET_STRENGTH = { none: 0, pin: 1, password: 2 };
+// The total upload budget offered for a NEW link whose tag sets no ceiling of its own. A tag WITH a
+// cap still wins — this only fills the field when nothing else decides it. Links that already exist
+// carry their own stored budget and are never revisited by this.
+const RC_DEFAULT_TOTAL_MB = 1024;   // 1 GB
 
 function _mbFromBytes(b) { return (b != null && b > 0) ? Math.round(b / _MB) : ''; }
 function _bytesFromMb(mb) { const n = parseInt(mb, 10); return Number.isFinite(n) && n > 0 ? n * _MB : null; }
@@ -18645,7 +18649,7 @@ function onRcTagChange() {
     const mf = _rcEl('rc-max-file-mb');
     if (t.max_file_bytes_cap) { const cap = _mbFromBytes(t.max_file_bytes_cap); mf.max = cap; mf.value = cap; mf.placeholder = 'up to ' + cap; } else { mf.removeAttribute('max'); mf.value = ''; mf.placeholder = 'unlimited'; }
     const mt = _rcEl('rc-max-total-mb');
-    if (t.max_total_bytes_cap) { const cap = _mbFromBytes(t.max_total_bytes_cap); mt.max = cap; mt.value = cap; mt.placeholder = 'up to ' + cap; } else { mt.removeAttribute('max'); mt.value = mt.value || '100'; mt.placeholder = 'required'; }
+    if (t.max_total_bytes_cap) { const cap = _mbFromBytes(t.max_total_bytes_cap); mt.max = cap; mt.value = cap; mt.placeholder = 'up to ' + cap; } else { mt.removeAttribute('max'); mt.value = mt.value || String(RC_DEFAULT_TOTAL_MB); mt.placeholder = 'required'; }
     const rd = _rcEl('rc-retention-days');
     if (t.retention_max_days) { rd.max = t.retention_max_days; rd.value = t.retention_default_days || ''; rd.placeholder = 'up to ' + t.retention_max_days; } else { rd.removeAttribute('max'); rd.value = t.retention_default_days || ''; rd.placeholder = 'keep'; }
 }
