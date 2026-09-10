@@ -2077,6 +2077,21 @@ details summary:hover {
     transform: translateY(-50%) translateX(0);
 }
 
+/* The cluster and the "more" MENU are alternatives, never both at once. Clicking the button opens
+   the menu with the cursor still on the wrap, so :hover was necessarily still true and the same
+   actions showed twice, overlapping; :focus-within then kept the cluster up even after the pointer
+   left, because the clicked button holds focus. app.js marks the document while the menu is open
+   (openContextMenu / closeContextMenu) and these rules answer both cases at once. They must stay
+   AFTER the reveal rules above -- they win on specificity, but order is what makes that obvious. */
+body.ctx-menu-open .action-more-wrap:hover .action-cluster,
+body.ctx-menu-open .action-more-wrap:focus-within .action-cluster,
+body.ctx-menu-open .action-more-wrap.cluster-right:hover .action-cluster,
+body.ctx-menu-open .action-more-wrap.cluster-right:focus-within .action-cluster {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+
 .context-menu {
     position: fixed;
     min-width: 190px;

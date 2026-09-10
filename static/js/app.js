@@ -11081,6 +11081,8 @@ function _ctxOutside(e) { if (_ctxMenuEl && !_ctxMenuEl.contains(e.target)) clos
 function _ctxKey(e) { if (e.key === 'Escape') closeContextMenu(); }
 function closeContextMenu() {
     if (_ctxMenuEl) { _ctxMenuEl.hidden = true; _ctxMenuEl.replaceChildren(); }
+    // Let the hover cluster work again — see openContextMenu for why it was suppressed.
+    document.body.classList.remove('ctx-menu-open');
     document.removeEventListener('click', _ctxOutside, true);
     document.removeEventListener('keydown', _ctxKey, true);
     window.removeEventListener('scroll', closeContextMenu, true);
@@ -11160,6 +11162,14 @@ function openContextMenu(item, x, y) {
     top = Math.max(pad, Math.min(top, vh - r.height - pad));
     menu.style.left = left + 'px';
     menu.style.top = top + 'px';
+    // The two menus are alternatives, not layers. The horizontal cluster is revealed by CSS alone
+    // (`.action-more-wrap:hover`), and the cursor is by definition still on the wrap at the moment
+    // the button is clicked — so opening this menu used to leave BOTH on screen, the same actions
+    // twice, one of them overlapping the other. `:focus-within` made it outlast the cursor too: the
+    // clicked button keeps focus, so the cluster stayed open even after the pointer left the row.
+    // Marking the document is what lets one line of CSS answer both, since neither is a state the
+    // cluster's own element carries.
+    document.body.classList.add('ctx-menu-open');
     document.addEventListener('click', _ctxOutside, true);
     document.addEventListener('keydown', _ctxKey, true);
     window.addEventListener('scroll', closeContextMenu, true);
