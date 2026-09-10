@@ -561,7 +561,7 @@ class VaultService:
                 'iterations': encrypted_key_data['iterations']
             })
         )
-        # Per-vault size cap. When unset, the model column default (1 GB) applies.
+        # Per-vault size cap. When unset, the model column default applies (new rows only).
         if size_limit is not None:
             vault.size_limit = size_limit
 

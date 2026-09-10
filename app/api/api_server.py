@@ -1118,7 +1118,7 @@ class VaultCreate(BaseModel):
     name_key_version: Optional[int] = None
     password: Optional[str] = None
     expire_files_after_days: Optional[int] = Field(None, gt=0)
-    # Per-vault maximum size in GB (absent => 1 GB, the model column default). Bounded at create
+    # Per-vault maximum size in GB (absent => DEFAULT_VAULT_SIZE_GB). Bounded at create
     # time by the admin per-vault ceiling and the owner's remaining account budget (see
     # _enforce_vault_size); a scoped temp cred / non-admin can never exceed its account quota.
     size_limit_gb: Optional[float] = Field(None, gt=0)
@@ -2279,6 +2279,14 @@ def _directory_search_scope(db: Session) -> str:
 
 _GIB = 1024 ** 3
 _INT64_MAX = 2 ** 63 - 1  # the size_limit column is BigInteger; a larger value overflows it
+
+# How big a vault is when whoever creates it does not say. NEW VAULTS ONLY: it is applied at creation
+# time, so a vault that already exists keeps exactly the size it was given and an upgrade changes
+# nothing. The legacy backfill further down (NULL/0 -> 1 GiB) is deliberately NOT tied to this
+# constant: it repairs rows written before the column had a default, and pointing it here would
+# silently resize vaults on deployments that already exist — the one thing this must not do.
+DEFAULT_VAULT_SIZE_GB = 5
+DEFAULT_VAULT_SIZE_BYTES = DEFAULT_VAULT_SIZE_GB * _GIB
 
 
 def _settings_blob(db: Session) -> dict:
@@ -13223,10 +13231,11 @@ async def create_vault(
     # Per-user vault-count cap (finding F-R015-003): a single account cannot create unbounded vaults.
     _enforce_vault_count(db, current_user)
 
-    # Per-vault size: default 1 GB. Reject a size that is out of range (a sub-nanogigabyte value
+    # Per-vault size: DEFAULT_VAULT_SIZE_GB when the caller does not say. Reject a size out of range (a sub-nanogigabyte value
     # truncates to 0, which every upload guard reads as UNLIMITED; a huge value overflows the
     # BigInteger column and 500s) BEFORE the quota check, then enforce the ceiling / account budget.
-    requested_size = int(vault_create.size_limit_gb * _GIB) if vault_create.size_limit_gb else _GIB
+    requested_size = (int(vault_create.size_limit_gb * _GIB) if vault_create.size_limit_gb
+                      else DEFAULT_VAULT_SIZE_BYTES)
     if requested_size <= 0 or requested_size > _INT64_MAX:
         raise HTTPException(status_code=400,
                             detail=f"Vault size must be between 1 byte and {_INT64_MAX / _GIB:.0f} GB")

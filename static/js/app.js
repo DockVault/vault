@@ -3403,9 +3403,10 @@ function syncCreateVaultForm() {
 //
 // The static copy in index.html is the WITHOUT-clause variant, so the promise is added by this
 // function rather than rendered and then withdrawn.
-const _SIZE_HINT_BASE = 'The most this vault may hold. Default 1 GB.';
+// Keep in step with DEFAULT_VAULT_SIZE_GB server-side — this is only the wording a person reads.
+const _SIZE_HINT_BASE = 'The most this vault may hold. Default 5 GB.';
 const _SIZE_HINT_EDITABLE =
-    "The most this vault may hold. Default 1 GB; you can change it later in the vault's policies.";
+    "The most this vault may hold. Default 5 GB; you can change it later in the vault's policies.";
 
 function createVaultSizeHintBase() {
     if (isScopedTemp) return _SIZE_HINT_BASE;
@@ -3532,9 +3533,9 @@ async function showCreateVault() {
         }
     }
 
-    // Reset the size to the 1 GB default + surface how much the account can still allocate.
+    // Reset the size to the default + surface how much the account can still allocate.
     const sizeInput = document.getElementById('vault-size-gb');
-    if (sizeInput) sizeInput.value = '1';
+    if (sizeInput) sizeInput.value = '5';
     renderVaultSizeAvailability('vault-size-avail', sizeInput, null, createVaultSizeHintBase());
 
     // Reflect the resolved type into password + team-mode visibility, then show.
@@ -3564,9 +3565,12 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
             // stale value for a zero-knowledge vault (its field is hidden).
             password: (vaultType === 'standard' ? (password || null) : null),
             expire_files_after_days: null,
-            // Per-vault maximum size; default 1 GB. The server bounds it by the account budget
-            // and the per-vault ceiling and 400s if over.
-            size_limit_gb: (sizeGb && sizeGb > 0) ? sizeGb : 1
+            // Per-vault maximum size. Sending null when the field is blank hands the decision to
+            // the server's DEFAULT_VAULT_SIZE_GB rather than repeating the number here — this used
+            // to send a hard 1, so the server's default could never actually apply to a vault made
+            // from this form, and changing it server-side alone would have done nothing at all.
+            // The server bounds whatever arrives by the account budget and the per-vault ceiling.
+            size_limit_gb: (sizeGb && sizeGb > 0) ? sizeGb : null
         };
 
         // Zero-knowledge: generate the vault DEK IN THE BROWSER and wrap it to our

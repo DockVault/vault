@@ -746,7 +746,11 @@ class Vault(Base):
     unlock_remember_minutes = Column(Integer, nullable=True)
     
     # Size limit
-    size_limit = Column(BigInteger, default=1073741824)  # Default 1GB
+    # Applied by SQLAlchemy at INSERT, so it governs NEW vaults only — an existing row keeps
+    # whatever it holds and an upgrade never rewrites it. Kept in step with
+    # DEFAULT_VAULT_SIZE_BYTES in the API, which is what a create actually goes through;
+    # this is the fallback for a direct insert that names no size.
+    size_limit = Column(BigInteger, default=5 * 1024 ** 3)  # 5 GiB
     
     # Storage statistics
     total_size_bytes = Column(BigInteger, default=0)
