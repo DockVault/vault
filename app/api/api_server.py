@@ -10871,9 +10871,16 @@ def _receiver_status(r, now=None) -> str:
     return "active"
 
 
-def _receiver_public_dict(r, tag=None) -> dict:
+def _receiver_public_dict(r, tag=None, stored_bytes=None) -> dict:
     """Owner-facing view of a receiver. NEVER includes the token (stored hashed; the plaintext URL is
-    shown only once, in the create response)."""
+    shown only once, in the create response).
+
+    `stored_bytes` is what the drop vault actually HOLDS. It is passed in because the receiver row
+    does not know it — the number lives on the vault — and because reserved_bytes, which the storage
+    ring used to read, is not a usage figure at all: it counts bytes reserved by uploads still IN
+    FLIGHT and is refunded the moment one finalizes. So it sat at zero except during a transfer, and
+    the ring appeared never to move no matter how much was uploaded.
+    """
     return {
         "id": str(r.id),
         "kind": r.kind,
@@ -10895,8 +10902,13 @@ def _receiver_public_dict(r, tag=None) -> dict:
         "status": _receiver_status(r),
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "last_upload_at": r.last_upload_at.isoformat() if r.last_upload_at else None,
-        # Bytes already used in the drop vault, for a storage indicator (ring) against max_total_bytes.
+        # In-flight bytes only (reserve-at-open, refunded on finalize). Kept because it is part of
+        # the cap arithmetic, but it is NOT what a person means by "used" — see stored_bytes.
         "reserved_bytes": r.reserved_bytes or 0,
+        # What the drop vault actually holds: the figure the storage ring shows against
+        # max_total_bytes. None when the caller could not supply it, so a reader can tell "nothing
+        # stored" from "not known" instead of drawing an empty ring over missing data.
+        "stored_bytes": int(stored_bytes) if stored_bytes is not None else None,
     }
 
 
@@ -11110,7 +11122,15 @@ async def list_receivers(
         .order_by(Receiver.created_at.desc()).all()
     tag_ids = {r.tag_id for r in rows if r.tag_id}
     tags = {t.id: t for t in db.query(ReceiverTag).filter(ReceiverTag.id.in_(tag_ids)).all()} if tag_ids else {}
-    return {"receivers": [_receiver_public_dict(r, tags.get(r.tag_id)) for r in rows]}
+    # How full each drop vault is, fetched for the whole page in ONE query rather than per row — the
+    # ring needs it for every card, and a per-receiver lookup here would be an N+1 on a list route.
+    vault_ids = {r.vault_id for r in rows if r.vault_id}
+    stored = dict(
+        db.query(Vault.id, Vault.total_size_bytes).filter(Vault.id.in_(vault_ids)).all()
+    ) if vault_ids else {}
+    return {"receivers": [
+        _receiver_public_dict(r, tags.get(r.tag_id), stored.get(r.vault_id) or 0) for r in rows
+    ]}
 
 
 @app.get("/receiver-policy")

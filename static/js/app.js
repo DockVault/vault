@@ -18472,8 +18472,12 @@ function renderReceiverVaults(receivers) {
         const nm = document.createElement('div'); nm.className = 'rc-vault-name font-medium'; nm.textContent = r.label || 'Upload link'; head.appendChild(nm);
         const st = document.createElement('span'); st.className = 'badge badge-' + (r.status === 'active' ? 'success' : 'secondary'); st.textContent = _RC_STATUS_LABEL[r.status] || r.status; head.appendChild(st);
         card.appendChild(head);
+        // What the vault HOLDS, not what is in flight. This read reserved_bytes, which is refunded
+        // the instant an upload finalizes — so it was zero whenever anyone looked, and the ring
+        // appeared frozen no matter how much had been uploaded through the link.
+        const used = (r.stored_bytes != null) ? r.stored_bytes : 0;
         const pct = (r.max_total_bytes && r.max_total_bytes > 0)
-            ? Math.min(100, Math.round(((r.reserved_bytes || 0) / r.max_total_bytes) * 100)) : null;
+            ? Math.min(100, Math.round((used / r.max_total_bytes) * 100)) : null;
         const ringWrap = document.createElement('div'); ringWrap.className = 'rc-ring-wrap';
         const ring = document.createElement('div'); ring.className = 'rc-ring';
         ring.style.background = pct != null
@@ -18482,8 +18486,8 @@ function renderReceiverVaults(receivers) {
         ring.appendChild(hole); ringWrap.appendChild(ring);
         const usage = document.createElement('div'); usage.className = 'text-tertiary text-xs';
         usage.textContent = r.max_total_bytes
-            ? (_mbFromBytes(r.reserved_bytes || 0) + ' / ' + _mbFromBytes(r.max_total_bytes) + ' MB')
-            : (_mbFromBytes(r.reserved_bytes || 0) + ' MB used');
+            ? (_mbFromBytes(used) + ' / ' + _mbFromBytes(r.max_total_bytes) + ' MB')
+            : (_mbFromBytes(used) + ' MB used');
         ringWrap.appendChild(usage); card.appendChild(ringWrap);
         const files = document.createElement('div'); files.className = 'text-tertiary text-xs';
         files.textContent = (r.max_uploads != null) ? ((r.upload_count || 0) + ' / ' + r.max_uploads + ' files') : ((r.upload_count || 0) + ' files');
@@ -18510,7 +18514,9 @@ function openReceiverInfoModal(r) {
         ['Protection', r.secret_kind === 'password' ? 'Password' : (r.secret_kind === 'pin' ? 'PIN' : 'None')],
         ['Expires', _rcExpiryText(r)],
         ['Files', (r.max_uploads != null) ? ((r.upload_count || 0) + ' / ' + r.max_uploads) : String(r.upload_count || 0)],
-        ['Storage', r.max_total_bytes ? (_mbFromBytes(r.reserved_bytes || 0) + ' / ' + _mbFromBytes(r.max_total_bytes) + ' MB') : (_mbFromBytes(r.reserved_bytes || 0) + ' MB used')],
+        // stored_bytes, not reserved_bytes — the same distinction the card's ring got wrong: reserved
+        // is in-flight and refunded on finalize, so this row read 0 however full the vault was.
+        ['Storage', r.max_total_bytes ? (_mbFromBytes(r.stored_bytes || 0) + ' / ' + _mbFromBytes(r.max_total_bytes) + ' MB') : (_mbFromBytes(r.stored_bytes || 0) + ' MB used')],
         ['Retention', r.retention_days ? (r.retention_days + ' days') : 'Kept'],
     ];
     const modal = document.createElement('div'); modal.className = 'modal active rc-info-modal';
