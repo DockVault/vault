@@ -48,19 +48,45 @@ def _login(page: Page, username: str, password: str):
     raise AssertionError("login was rate limited on every attempt")
 
 
-def _showing(page: Page) -> dict:
+_VISIBLE_JS = """
+    const cluster = document.querySelector('.action-cluster');
+    const menu = document.getElementById('file-context-menu');
+    const visible = (el) => {
+        if (!el) return false;
+        const s = getComputedStyle(el);
+        return s.visibility !== 'hidden' && s.opacity !== '0' && s.display !== 'none';
+    };
+"""
+
+# The cluster is revealed by a CSS transition (opacity/visibility, .12s). Reading the computed style
+# in the same tick as the hover therefore returns the PRE-transition value every time — measured:
+#
+#     before hover      hidden/0
+#     immediately after hidden/0        <- what a single instantaneous read sees
+#     after ~50ms       visible/0.85
+#     after ~120ms      visible/1
+#
+# The first version of this test did exactly that and reported {bar: false} on a working build. That
+# looks identical to "the hover never landed", and it was read that way. It is neither: the hover
+# lands fine and the fix works; the test was racing the animation. So: wait for the state we expect
+# rather than sampling once, and for the NEGATIVE assertions let the transition run first, since
+# "not yet visible" and "deliberately hidden" are the same reading taken at different moments.
+_SETTLE_MS = 250   # comfortably longer than the .12s transition
+
+
+def _await_bar(page: Page, shown: bool, timeout: int = 3000):
+    page.wait_for_function(
+        "(want) => { " + _VISIBLE_JS + " return visible(cluster) === want; }",
+        arg=shown, timeout=timeout,
+    )
+
+
+def _showing(page: Page, settle: bool = True) -> dict:
     """What is actually on screen — computed style, not class names."""
+    if settle:
+        page.wait_for_timeout(_SETTLE_MS)
     return page.evaluate(
-        """() => {
-            const cluster = document.querySelector('.action-cluster');
-            const menu = document.getElementById('file-context-menu');
-            const visible = (el) => {
-                if (!el) return false;
-                const s = getComputedStyle(el);
-                return s.visibility !== 'hidden' && s.opacity !== '0' && s.display !== 'none';
-            };
-            return { bar: visible(cluster), menu: !!(menu && !menu.hidden) };
-        }"""
+        "() => { " + _VISIBLE_JS + " return { bar: visible(cluster), menu: !!(menu && !menu.hidden) }; }"
     )
 
 
@@ -83,6 +109,7 @@ def test_the_hover_bar_and_the_three_dot_menu_are_never_both_on_screen(
     # 1. Hovering shows the horizontal quick options. Also the non-vacuous anchor: if this were
     #    false, every "not visible" below would pass for the wrong reason.
     more.hover()
+    _await_bar(page, True)
     hovered = _showing(page)
     assert hovered["bar"], f"hovering the button should reveal the quick-action bar: {hovered}"
     assert not hovered["menu"], f"hover alone must not open the menu: {hovered}"
@@ -109,6 +136,7 @@ def test_the_hover_bar_and_the_three_dot_menu_are_never_both_on_screen(
     assert not dismissed["bar"], f"nothing should be showing after dismissal: {dismissed}"
 
     more.hover()
+    _await_bar(page, True)
     again = _showing(page)
     assert again["bar"], f"hovering should reveal the bar again after dismissal: {again}"
     assert not again["menu"], f"hovering must not reopen the menu: {again}"
