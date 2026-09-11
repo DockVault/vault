@@ -10877,6 +10877,33 @@ def _receiver_status(r, now=None) -> str:
     return "active"
 
 
+def _audit_access_change(db, actor, action, resource_type, resource_id, details=None):
+    """Record a change to WHO CAN REACH WHAT.
+
+    Access control was the largest hole in the audit log: granting a person, a group or a device
+    access to a vault left no trace, so the log recorded uploads and logins while the permission
+    changes that allowed them passed unrecorded. Every one of those paths now comes through here, so
+    they share a shape and cannot drift apart entry by entry.
+
+    Best-effort by design. An audit write must never be the reason a permission change fails — the
+    change has already been committed by the time this runs, so raising here would report failure for
+    work that succeeded and invite a retry that double-applies it. A write that cannot happen is
+    logged to the process and swallowed.
+    """
+    try:
+        AuditLogger(db).log_action(
+            action=action,
+            status="success",
+            user=actor,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            ip_address=current_client_ip(),
+            details=details or {},
+        )
+    except Exception as e:                                   # noqa: BLE001 - see docstring
+        print(f"⚠ audit write skipped for {action}: {e}")
+
+
 def _receiver_public_dict(r, tag=None, stored_bytes=None) -> dict:
     """Owner-facing view of a receiver. NEVER includes the token (stored hashed; the plaintext URL is
     shown only once, in the create response).
@@ -12939,6 +12966,10 @@ async def add_group_members(
         existing.add(uid)
         added += 1
     db.commit()
+    # Group membership IS access: a member inherits every vault the group can reach, so adding
+    # someone here can widen their reach without any vault being touched.
+    _audit_access_change(db, current_user, "group_members_added", "group", str(group_id),
+                         {"added": added})
     return {"message": f"Added {added} member(s)", "added": added}
 
 
@@ -12956,6 +12987,8 @@ async def remove_group_member(
         (user_groups.c.group_id == group_id) & (user_groups.c.user_id == user_id)
     ))
     db.commit()
+    _audit_access_change(db, current_user, "group_member_removed", "group", str(group_id),
+                         {"user_id": str(user_id)})
     return {"message": "Member removed"}
 
 
@@ -14716,6 +14749,13 @@ async def grant_vault_permission(
         ))
         db.commit()
 
+        # Someone can now open this vault who could not a moment ago. That is the single most
+        # important thing this product does, and until now it left no trace at all — the audit log
+        # recorded uploads and logins while access grants passed unrecorded.
+        _audit_access_change(db, current_user, "vault_permission_granted", "vault", str(vault_id),
+                             {"user_id": str(permission.user_id), "username": user.username,
+                              "level": permission.level, "already_member": bool(_already_member)})
+
         # Optionally email a genuinely-new member that they were added to a vault (opt-in). Best-effort;
         # the default template uses {{vault.name}}/{{vault.url}}, so no action_context is required.
         if not _already_member:
@@ -14812,6 +14852,11 @@ async def revoke_vault_permission(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User does not have access to this vault"
             )
+
+        # Recorded AFTER the rowcount check, so the log says a revoke happened only when one did.
+        # Logging before it would record every 404 as a successful revocation.
+        _audit_access_change(db, current_user, "vault_permission_revoked", "vault", str(vault_id),
+                             {"user_id": str(user_id)})
 
         return {"message": "Permission revoked successfully"}
         
@@ -14923,6 +14968,8 @@ async def grant_vault_group_access(
             )
         )
     db.commit()
+    _audit_access_change(db, current_user, "vault_group_access_granted", "vault", str(vault_id),
+                         {"group_id": str(payload.group_id), "permission": payload.permission})
     return {"message": "Group access granted"}
 
 
@@ -14949,6 +14996,8 @@ async def revoke_vault_group_access(
         )
     )
     db.commit()
+    _audit_access_change(db, current_user, "vault_group_access_revoked", "vault", str(vault_id),
+                         {"group_id": str(group_id)})
     return {"message": "Group access revoked"}
 
 
