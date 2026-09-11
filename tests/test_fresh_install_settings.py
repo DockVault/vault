@@ -76,15 +76,23 @@ def test_the_code_defaults_are_still_off():
 
 
 @pytest.mark.unit
-def test_the_startup_seed_is_gated_and_runs_before_the_tag_seeders():
+def test_the_startup_seed_is_gated_on_the_bootstrap_status():
+    """This test used to assert that the settings seed ran BEFORE the tag seeders.
+
+    That ordering is exactly what caused a regression: the settings seed wrote
+    public_receivers_enabled, and the receiver-tag seeder then read that key back as "an admin has
+    already set this up" and seeded nothing — a deployment with the feature enabled and no tags,
+    which its navigation hides entirely.
+
+    Ordering is no longer load-bearing and must not be asserted, because asserting it would pin the
+    coupling back in place. The tag seeders are told whether this is a new database instead, which is
+    the question they were really asking. See test_fresh_install_is_usable.py for the invariant.
+    """
     src = API.read_text(encoding="utf-8")
-    call = src.index("_seed_default_settings(_admin_bootstrap_status)")
-    tags = src.index("_seed_default_share_tags()", call)
-    assert call < tags, (
-        "the settings seed must run before the tag seeders, so a fresh deployment has the features on "
-        "when their starter tags are written")
     assert "settings_bootstrap.should_seed_settings(bootstrap_status)" in src, (
         "the startup seed must ask the gate rather than deciding for itself")
+    assert "_seed_default_settings(_admin_bootstrap_status)" in src, (
+        "startup must pass the status, or the gate never sees it")
 
 
 @pytest.mark.unit

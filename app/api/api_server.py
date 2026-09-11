@@ -20024,7 +20024,7 @@ def _assert_step_up_boot_contract():
             f"guarded actions not in the catalog: {sorted(extra)}.")
 
 
-def _seed_default_share_tags():
+def _seed_default_share_tags(bootstrap_status=None):
     """Seed the starter share-tag set on a FRESH deployment so sharing works out of the box.
 
     Guarded by _should_seed_default_tags: runs only when the share_tags table is empty AND sharing is
@@ -20035,13 +20035,24 @@ def _seed_default_share_tags():
     """
     try:
         from app.core.database import get_db_context
+        from app.core import settings_bootstrap
         from app.core.models import ShareTag, User, RoleEnum
         with get_db_context() as db:
             has_tags = db.query(ShareTag).first() is not None
             # Gate on the EXPLICIT stored flag, not the effective value: sharing now defaults ON, so a
             # fresh deploy (key absent) must still be seeded so the feature is usable. Only an admin who
             # EXPLICITLY enabled sharing (stored True) counts as already-engaged and is not re-seeded.
-            explicitly_enabled = _global_settings_blob(db).get("sharing_enabled") is True
+            # "Has an admin already engaged with this feature?" — which is NOT the same
+            # question as "is the key set", now that the fresh-install seeder writes these
+            # keys itself. On a brand-new database it wrote sharing_enabled a moment
+            # ago, and reading it back as prior engagement made this seeder skip: the
+            # deployment ended up with the feature ON and ZERO tags, so its nav stayed
+            # hidden and the feature was unreachable. On a genuinely new database nobody
+            # can have engaged with anything, so the answer is simply no.
+            explicitly_enabled = (
+                False if bootstrap_status == settings_bootstrap.FRESH_BOOTSTRAP_STATUS
+                else _global_settings_blob(db).get("sharing_enabled") is True
+            )
             if not sharing_policy.should_seed_default_tags(has_tags, explicitly_enabled):
                 return
             admin = db.query(User).filter(User.role == RoleEnum.ADMIN).first()
@@ -20086,12 +20097,13 @@ def _seed_default_settings(bootstrap_status):
         print(f"⚠ Fresh-install settings seeding skipped: {e}")
 
 
-def _seed_default_note_link_tags():
+def _seed_default_note_link_tags(bootstrap_status=None):
     """Seed the starter public-note-link tags (Open / Restricted / Confidential) on a fresh deployment
     only — no tags AND public links not already enabled — mirroring the share-tag seed. Inert until an
     admin turns public note links on. Best-effort; never bricks startup."""
     try:
         from app.core.database import get_db_context
+        from app.core import settings_bootstrap
         from app.core.models import NoteLinkTag, User, RoleEnum
         with get_db_context() as db:
             has_tags = db.query(NoteLinkTag).first() is not None
@@ -20099,7 +20111,17 @@ def _seed_default_note_link_tags():
             # ON, so a fresh deploy (key absent) must still be seeded so the feature is usable. Only an
             # admin who EXPLICITLY turned it on (stored True) counts as "already engaged" and is not
             # re-seeded a permissive starter set on upgrade.
-            explicitly_enabled = _global_settings_blob(db).get("public_note_links_enabled") is True
+            # "Has an admin already engaged with this feature?" — which is NOT the same
+            # question as "is the key set", now that the fresh-install seeder writes these
+            # keys itself. On a brand-new database it wrote public_note_links_enabled a moment
+            # ago, and reading it back as prior engagement made this seeder skip: the
+            # deployment ended up with the feature ON and ZERO tags, so its nav stayed
+            # hidden and the feature was unreachable. On a genuinely new database nobody
+            # can have engaged with anything, so the answer is simply no.
+            explicitly_enabled = (
+                False if bootstrap_status == settings_bootstrap.FRESH_BOOTSTRAP_STATUS
+                else _global_settings_blob(db).get("public_note_links_enabled") is True
+            )
             if not note_link_policy.should_seed_default_note_link_tags(has_tags, explicitly_enabled):
                 return
             admin = db.query(User).filter(User.role == RoleEnum.ADMIN).first()
@@ -20111,16 +20133,27 @@ def _seed_default_note_link_tags():
         print(f"⚠ Default note-link-tag seeding skipped: {e}")
 
 
-def _seed_default_receiver_tags():
+def _seed_default_receiver_tags(bootstrap_status=None):
     """Seed the starter receiver tags (Drop vault / Confidential inbox) on a fresh deployment only — no
     receiver tags AND receivers not already explicitly enabled. Inert until an admin turns receivers on.
     Best-effort; never bricks startup."""
     try:
         from app.core.database import get_db_context
+        from app.core import settings_bootstrap
         from app.core.models import ReceiverTag, User, RoleEnum
         with get_db_context() as db:
             has_tags = db.query(ReceiverTag).first() is not None
-            explicitly_enabled = _global_settings_blob(db).get("public_receivers_enabled") is True
+            # "Has an admin already engaged with this feature?" — which is NOT the same
+            # question as "is the key set", now that the fresh-install seeder writes these
+            # keys itself. On a brand-new database it wrote public_receivers_enabled a moment
+            # ago, and reading it back as prior engagement made this seeder skip: the
+            # deployment ended up with the feature ON and ZERO tags, so its nav stayed
+            # hidden and the feature was unreachable. On a genuinely new database nobody
+            # can have engaged with anything, so the answer is simply no.
+            explicitly_enabled = (
+                False if bootstrap_status == settings_bootstrap.FRESH_BOOTSTRAP_STATUS
+                else _global_settings_blob(db).get("public_receivers_enabled") is True
+            )
             if not receiver_policy.should_seed_default_receiver_tags(has_tags, explicitly_enabled):
                 return
             admin = db.query(User).filter(User.role == RoleEnum.ADMIN).first()
@@ -21107,9 +21140,9 @@ async def lifespan(app: FastAPI):
     # switched on when their starter tags are written. Gated on the bootstrap status, so an
     # existing deployment is not touched — see _seed_default_settings.
     _seed_default_settings(_admin_bootstrap_status)
-    _seed_default_share_tags()  # after the admin exists, so seed tags can record it as creator
-    _seed_default_note_link_tags()  # public-note-link starter tags (inert until enabled)
-    _seed_default_receiver_tags()  # receiver (upload-link) starter tags (inert until enabled)
+    _seed_default_share_tags(_admin_bootstrap_status)  # after the admin exists, so seed tags can record it as creator
+    _seed_default_note_link_tags(_admin_bootstrap_status)  # public-note-link starter tags (inert until enabled)
+    _seed_default_receiver_tags(_admin_bootstrap_status)  # receiver (upload-link) starter tags (inert until enabled)
     _seed_second_factor_actions()  # the second-factor step-up policy matrix (one row per catalog key)
     _assert_step_up_boot_contract()  # fail boot if any catalog action ships ungatable
     _backfill_default_permissions()
