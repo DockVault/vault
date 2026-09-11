@@ -24,10 +24,12 @@ Lanes:
            passes when live does nothing at all.
 """
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+from playwright.sync_api import Page
 
 from app.core import audit_range
 
@@ -148,3 +150,150 @@ def test_the_live_monitor_page_is_untouched():
     # The monitor's own rendering must still be there.
     assert "monitor-events-list" in app, "the Live Monitor feed element must not have been removed"
     assert "function initMonitor" in app or "connectMonitorWebSocket" in app
+
+
+# --------------------------------------------------------------------------- ui lane
+#
+# These three existed only as a claim until now. The commit that added the feature described this
+# lane in its own message, and the behaviour had been proved with a throwaway script rather than a
+# test in the repo — so anyone reading that commit would believe coverage existed where none did.
+# That is the settings-blob diff again, in prose: a description of a check nobody can run.
+
+
+def _login(page: Page, username: str, password: str):
+    """Sign in, waiting out the login rate limit rather than failing on it."""
+    for _ in range(8):
+        page.fill("#username", username)
+        page.fill("#password", password)
+        page.click("#login-form button[type=submit]")
+        try:
+            page.wait_for_selector("#dashboard-screen.active", timeout=8000)
+            return
+        except Exception:
+            msg = page.evaluate(
+                "() => (document.getElementById('login-error') || {}).textContent || ''")
+            m = re.search(r"(\d+) seconds", msg or "")
+            if not m:
+                raise AssertionError(f"login failed, and not because of rate limiting: {msg!r}")
+            time.sleep(int(m.group(1)) + 3)
+    raise AssertionError("login was rate limited on every attempt")
+
+
+def _open_audit_tab(page: Page):
+    page.evaluate("() => navigateToSection('settings')")
+    page.wait_for_selector("#settings-section.active", timeout=15000)
+    page.evaluate(
+        """() => { const t = [...document.querySelectorAll('.tabs .tab-btn')]
+               .find(x => x.getAttribute('data-tab') === 'audit'); if (t) t.click(); }"""
+    )
+    page.wait_for_selector("#settings-tab-audit.active", timeout=10000)
+
+
+def _which_view(page: Page) -> dict:
+    """What is on screen, by computed style — not by class name."""
+    return page.evaluate(
+        """() => {
+            const wrap = document.querySelector('#settings-tab-audit .data-table-wrapper');
+            const cards = document.getElementById('audit-log-cards');
+            const shown = (el) => el ? getComputedStyle(el).display !== 'none' : null;
+            let stored = null;
+            try { stored = localStorage.getItem('auditView'); } catch (_) { stored = 'BLOCKED'; }
+            return { table: shown(wrap), cards: shown(cards), stored };
+        }"""
+    )
+
+
+def _entry_count(page: Page) -> int:
+    text = page.evaluate("() => (document.getElementById('audit-count') || {}).textContent || ''")
+    m = re.search(r"(\d+)", text or "")
+    return int(m.group(1)) if m else -1
+
+
+@pytest.mark.ui
+def test_the_range_filters_accept_a_time_not_just_a_date(page: Page, admin_creds):
+    page.goto("/")
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open_audit_tab(page)
+    kinds = page.evaluate(
+        """() => ({ from: (document.getElementById('audit-filter-from') || {}).type,
+                    to:   (document.getElementById('audit-filter-to')   || {}).type })"""
+    )
+    assert kinds == {"from": "datetime-local", "to": "datetime-local"}, (
+        f"the range must accept a time, since the endpoint distinguishes the spellings: {kinds}")
+
+
+@pytest.mark.ui
+def test_the_view_switches_and_the_choice_is_remembered(page: Page, admin_creds):
+    page.goto("/")
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open_audit_tab(page)
+    page.click("#audit-search-btn")
+    page.wait_for_function("() => document.querySelectorAll('#audit-log-body tr').length > 0",
+                           timeout=15000)
+
+    start = _which_view(page)
+    assert start["table"] is True and start["cards"] is False, (
+        f"the compact table is the default: {start}")
+
+    page.click("#audit-view-cards")
+    page.wait_for_function(
+        "() => getComputedStyle(document.getElementById('audit-log-cards')).display !== 'none'",
+        timeout=10000)
+    switched = _which_view(page)
+    assert switched["cards"] is True and switched["table"] is False, switched
+    # Non-vacuous: the detailed view actually drew rows, rather than being an empty box that still
+    # counts as "displayed".
+    drawn = page.evaluate("() => document.querySelectorAll('#audit-log-cards .audit-card').length")
+    assert drawn > 0, "the detailed view is showing but drew nothing"
+
+    # Surviving a reload is the half a class toggle alone would not give.
+    page.reload()
+    page.wait_for_selector("#dashboard-screen.active", timeout=20000)
+    _open_audit_tab(page)
+    after = _which_view(page)
+    assert after["stored"] == "cards", f"the choice was not remembered: {after}"
+    assert after["cards"] is True and after["table"] is False, (
+        f"the choice was stored but not applied on load: {after}")
+
+
+@pytest.mark.ui
+def test_live_picks_up_a_new_event_without_being_asked(page: Page, admin_creds):
+    """The assertion is a STRICT increase.
+
+    An earlier version asked for "not fewer", which passes when live does nothing at all — and it did
+    pass, while live was doing nothing. Tightening it is what exposed that the activity socket
+    carries only a minority of audited actions, and why live polls rather than trusting the socket.
+    """
+    page.goto("/")
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open_audit_tab(page)
+    page.click("#audit-search-btn")
+    page.wait_for_function("() => document.querySelectorAll('#audit-log-body tr').length > 0",
+                           timeout=15000)
+
+    # Tick live FIRST, and let its one-shot refresh settle, before reading the baseline.
+    #
+    # Reading the count before ticking made this vacuous: switching live on re-reads immediately, so
+    # it swept up whatever had been logged since the manual search — the login itself, the search —
+    # and the number rose whether or not live went on to track anything. Mutation caught it: removing
+    # the poll entirely left the test passing. The baseline has to be taken from the state live has
+    # already brought up to date, so the only thing left that can move it is the new event.
+    page.check("#audit-live")
+    page.wait_for_timeout(2500)
+    before = _entry_count(page)
+    assert before >= 0, "the entry count should be readable once live has settled"
+
+    # Creating a vault is chosen deliberately: it is one of the four in five audited actions the
+    # activity socket does NOT broadcast, so this can only pass if the poll is doing the work.
+    page.evaluate(
+        """async () => { await apiRequest('/vaults', { method: 'POST',
+               body: JSON.stringify({ name: 'audit-live-' + Date.now(), description: '' }) }); }"""
+    )
+    # No manual search anywhere below. If the number moves, the page moved it.
+    page.wait_for_function(
+        "(n) => { const el = document.getElementById('audit-count');"
+        " const m = (el ? el.textContent : '').match(/(\\d+)/);"
+        " return !!m && Number(m[1]) > n; }",
+        arg=before, timeout=30000)
+    after = _entry_count(page)
+    assert after > before, f"live did not pick the event up on its own: {before} -> {after}"

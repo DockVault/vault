@@ -6633,10 +6633,6 @@ function connectMonitorWebSocket() {
 
 // Handle incoming monitor event
 function handleMonitorEvent(data) {
-    // The Audit Log listens to the same feed, but only as a nudge to re-read itself. Placed first
-    // and wrapped so it can neither change nor break anything below it: the Live Monitor's own
-    // handling is untouched, and a fault here must not take the monitor down with it.
-    try { auditLiveNote(); } catch (_) { /* the audit view is not the monitor's problem */ }
     // Emitted types: login, logout, upload, download, security_incident, error (+ Path A operation_cancelled).
     // Server broadcasts wrap the event under `event`; unwrap for inspection. (The historic bug read the
     // row fields off the TOP-LEVEL `data`, so wrapped Path-A frames rendered as type:'unknown' with an
@@ -6656,6 +6652,13 @@ function handleMonitorEvent(data) {
     if (data.type === 'connected' || data.type === 'pong') {
         return;
     }
+
+    // Past the control frames, this is real activity, so nudge the Audit Log to re-read itself. It
+    // sat ABOVE these returns at first, which meant every stats and keepalive frame triggered a
+    // re-read: live appeared to work with the poll removed entirely, for a reason that had nothing
+    // to do with anything being audited. Wrapped, because a fault in the audit view must not take
+    // the Live Monitor down with it.
+    try { auditLiveNote(); } catch (_) { /* the audit view is not the monitor's problem */ }
 
     // Live notification nudge: the server broadcasts one per recipient when it writes an in-app
     // notification, so the bell (and an open target section, e.g. Notes) updates without a refresh.
