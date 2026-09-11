@@ -1907,7 +1907,6 @@ details summary:hover {
 .preview-render-container { width: 100%; display: flex; flex-direction: column; gap: var(--space-sm); }
 .preview-render-toolbar { display: flex; justify-content: flex-end; }
 .preview-render-frame { width: 100%; height: 80vh; border: 1px solid var(--border); border-radius: var(--radius-md); background: #fff; }
-.preview-render-container [hidden] { display: none; }
 .preview-window-note { font-size: var(--text-xs); color: var(--text-secondary); font-style: italic; padding: 4px 2px; }
 
 /* Live download progress tray: a small fixed panel (bottom-left, opposite the upload tray) with one
@@ -2011,9 +2010,6 @@ details summary:hover {
 /* The extension is read-only until double-clicked, so dim it to signal that. */
 #rename-ext-input[readonly] { opacity: .6; cursor: default; }
 .rename-ext-row .form-control { flex: 1 1 auto; min-width: 0; }
-/* .alert sets display:flex, which beats the UA [hidden]{display:none}; restore hiding so the
-   error bar and the extension-change warning stay gated behind their `hidden` toggles. */
-#rename-error[hidden], #rename-warning[hidden] { display: none; }
 
 /* ============================================================================
    File-row action hover cluster + right-click context menu (shared by both skins)
@@ -2147,21 +2143,6 @@ body.ctx-menu-open .action-more-wrap.cluster-right:focus-within .action-cluster 
     z-index: 1500;
     overflow: hidden;
 }
-/* `display:flex` above ties with the UA `[hidden]{display:none}` on specificity and wins by source
-   order, so a hidden panel would stay rendered -- a fixed, top-right, z-index:1500 box that intercepts
-   clicks on the toolbar beneath it. This higher-specificity rule restores the hidden attribute. */
-.ci-panel[hidden] { display: none; }
-/* Same trap for the toolbar button: `.btn { display:inline-flex }` beats the UA `[hidden]` rule, so
-   `btn.hidden = true` (set when the clip empties) would not hide it -- the button stayed visible with
-   nothing staged. Restore the hidden attribute for this button. */
-#copied-items-btn[hidden] { display: none; }
-/* And once more in the upload-link dialog's footer, where it was doing real damage rather than
-   leaving a stray button around. submitReceiver() already sets `hidden` on Cancel and "Create link"
-   the moment the link exists, and marks Done visible -- but `.btn` beat `[hidden]` here too, so all
-   three stayed on screen: a Cancel that cannot cancel anything (the link is already created and
-   already listed) and a spent, disabled "Create link" next to the only button that does anything.
-   The JS was right all along; nothing was hiding. */
-#rc-cancel[hidden], #rc-create[hidden], #rc-done[hidden] { display: none; }
 .ci-head { display: flex; align-items: center; justify-content: space-between; padding: var(--space-sm) var(--space-md); border-bottom: 1px solid var(--surface-3); }
 .ci-title { margin: 0; font-size: var(--text-base); }
 .ci-close { background: transparent; border: none; color: var(--text-secondary); font-size: 22px; line-height: 1; cursor: pointer; }
@@ -2195,11 +2176,6 @@ body.ctx-menu-open .action-more-wrap.cluster-right:focus-within .action-cluster 
 .ci-item-name { font-size: var(--text-sm); color: var(--text-primary); word-break: break-word; }
 .ci-item-loc, .ci-item-meta { font-size: var(--text-xs); color: var(--text-secondary); word-break: break-word; }
 .ci-actions { border-top: 1px solid var(--surface-3); padding: var(--space-sm) var(--space-md); display: flex; flex-direction: column; gap: 8px; }
-/* Every Copied-Items control below sets `display:flex`/`inline-flex` on its class, which beats the
-   UA `[hidden]{display:none}` on specificity+source-order. Each is toggled via the `hidden` attribute
-   (actions when nothing is selected, the settings row / keep button per selection), so without these
-   the control would stay visible when told to hide. Restore the hidden attribute for each. */
-.ci-actions[hidden], .ci-settings-row[hidden], #ci-keep[hidden] { display: none; }
 .ci-action-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .ci-settings-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
 .ci-settings-label { font-size: var(--text-xs); color: var(--text-secondary); }
@@ -2317,10 +2293,6 @@ body.ctx-menu-open .action-more-wrap.cluster-right:focus-within .action-cluster 
     padding: 4px;
     z-index: 30;
 }
-/* `.split-btn-menu` sets display, which beats the UA `[hidden] { display: none }` on
-   specificity — the same trap this file already documents for the copied-items button
-   and the upload-link footer. Restore it rather than discover it a third time. */
-.split-btn-menu[hidden] { display: none; }
 .split-btn-item {
     display: block;
     width: 100%;
@@ -2378,9 +2350,6 @@ body.ctx-menu-open .action-more-wrap.cluster-right:focus-within .action-cluster 
 .view-switch { display: inline-flex; border: 1px solid var(--surface-3); border-radius: var(--radius-md); overflow: hidden; }
 .view-switch .btn { border-radius: 0; border: 0; }
 .audit-cards { display: flex; flex-direction: column; gap: var(--space-sm); padding: var(--space-md); }
-/* `.audit-cards` sets display, which beats the UA `[hidden] { display: none }` — the same trap this
-   file documents for the copied-items button, the upload-link footer and the groups menu. */
-.audit-cards[hidden] { display: none; }
 .audit-card {
     padding: var(--space-sm) var(--space-md);
     border: 1px solid var(--surface-3);

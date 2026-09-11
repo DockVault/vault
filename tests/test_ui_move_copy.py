@@ -31,13 +31,16 @@ def test_copied_items_panel_is_wired():
     assert "keepAfter" in app                       # keep-after-paste flag
     # the old always-visible bar is gone.
     assert 'id="move-copy-bar"' not in idx
-    # The panel is position:fixed z-index:1500 with display:flex; its `hidden` attribute must be
-    # honoured, or a hidden panel intercepts clicks on the toolbar beneath it (a real regression:
-    # it blocked #create-folder-btn for 30s). This rule restores display:none when hidden.
-    assert ".ci-panel[hidden]" in css
-    # Same for the toolbar button: `.btn { display:inline-flex }` beats [hidden], so without this
-    # rule the "Copied Items" button never hid when the clip emptied (a move left it visible).
-    assert "#copied-items-btn[hidden]" in css
+    # The panel is position:fixed z-index:1500 with display:flex, and the button carries `.btn`;
+    # both beat the user agent's [hidden] rule, so a hidden panel used to intercept clicks on the
+    # toolbar beneath it (a real regression: it blocked #create-folder-btn for 30s). This used to be
+    # two per-element restorations here. There is now ONE general rule for every element that will
+    # ever carry the attribute, so that is what to assert — a per-element check would fail on a fix
+    # that is strictly better than the thing it was written for.
+    utilities = (ROOT / "static" / "css" / "utilities.css").read_text(encoding="utf-8")
+    assert "[hidden] { display: none !important; }" in utilities, (
+        "the general hidden rule is gone; every element whose class sets a display will paint while "
+        "marked hidden")
 
 
 # --------------------------------------------------------------------------- ui lane

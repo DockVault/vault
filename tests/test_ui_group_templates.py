@@ -104,6 +104,53 @@ def test_the_arrow_is_closed_until_asked_and_then_offers_the_template_flow(page:
 
 
 @pytest.mark.ui
+def test_nothing_marked_hidden_is_painting_on_the_pick_screen(page: Page, admin_creds):
+    """Ask the browser what is on screen, not the stylesheet what it says.
+
+    The first version of this feature's tests asserted that components.css contained a restoration
+    rule for .split-btn-menu — and passed while three sibling controls in the same dialog painted
+    anyway, because each carried a class (.btn, .btn-primary, .alert) whose display beat the user
+    agent's [hidden] rule. Asserting the CSS text proved the text. This asks the only question that
+    matters: with `hidden` set, is it drawn?
+    """
+    page.goto("/")
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open_templates(page)
+
+    # On the pick screen these three are marked hidden and must not be drawn.
+    state = page.evaluate(
+        """() => {
+            const out = {};
+            for (const id of ['group-template-back', 'group-template-create', 'group-template-error']) {
+                const el = document.getElementById(id);
+                out[id] = el ? { hidden: el.hidden, display: getComputedStyle(el).display } : 'MISSING';
+            }
+            return out;
+        }"""
+    )
+    for name, seen in state.items():
+        assert seen != 'MISSING', f"{name} is gone from the dialog"
+        assert seen["hidden"] is True, f"{name} should be marked hidden on the pick screen: {seen}"
+        assert seen["display"] == "none", (
+            f"{name} is marked hidden and still painting as {seen['display']!r} — a class is beating "
+            f"the hidden attribute")
+
+    # And the anchor: they DO appear once the screen that owns them is reached, so the assertions
+    # above cannot be passing merely because these controls never draw at all.
+    page.evaluate(
+        """() => [...document.querySelectorAll('#group-template-cards .tpl-card')]
+              .find(c => c.querySelector('h4').textContent.includes('Small team')).click()"""
+    )
+    page.wait_for_selector("#group-template-tree .tpl-node", timeout=10000)
+    after = page.evaluate(
+        """() => ['group-template-back', 'group-template-create'].map(
+               id => getComputedStyle(document.getElementById(id)).display)"""
+    )
+    assert all(d != "none" for d in after), (
+        f"the review screen's own controls must appear once it is shown: {after}")
+
+
+@pytest.mark.ui
 def test_only_what_the_edited_tree_shows_is_created(page: Page, admin_creds):
     page.goto("/")
     _login(page, admin_creds["username"], admin_creds["password"])
@@ -194,8 +241,11 @@ def test_the_split_control_and_the_template_dialog_are_wired():
     assert "data-close-modal" not in html, "that attribute is wired to nothing"
     # The icon has to exist, or the arrow renders empty.
     assert 'symbol id="i-chevron-down"' in html, "the arrow's icon is not defined"
-    assert ".split-btn-menu[hidden]" in css, (
-        "the menu sets display, which beats the UA [hidden] rule — restore it or it never closes")
+    # One general rule replaced the per-element restorations, this menu's included. Asserting the
+    # old targeted selector would now fail on a fix that is strictly better than it.
+    utilities = (ROOT / "static" / "css" / "utilities.css").read_text(encoding="utf-8")
+    assert "[hidden] { display: none !important; }" in utilities, (
+        "the general hidden rule is gone; the menu sets display and would never close")
 
 
 @pytest.mark.unit

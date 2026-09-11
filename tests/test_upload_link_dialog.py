@@ -90,18 +90,16 @@ def test_the_dialog_footer_buttons_actually_hide_when_hidden(page: Page, admin_c
 
 @pytest.mark.unit
 def test_the_css_restores_hidden_for_the_dialog_footer():
-    """A source guard, not a behaviour test — see this module's docstring."""
-    css = (ROOT / "static" / "css" / "components.css").read_text(encoding="utf-8")
-    rule = re.search(r"^([^\n]*\[hidden\][^\n]*)\{\s*display:\s*none;?\s*\}", css, re.M)
-    assert rule, "no [hidden] restoration rule found at all"
+    """A source guard, not a behaviour test — see this module's docstring.
 
-    # Every one of the three must be named. Checking that the rule merely mentions "rc-" would pass
-    # while two of the buttons stayed visible.
-    hidden_rules = "\n".join(
-        line for line in css.splitlines() if "[hidden]" in line and "display: none" in line)
-    for name in FOOTER_BUTTONS:
-        assert f"#{name}[hidden]" in hidden_rules, (
-            f"#{name} must have its hidden attribute restored, or it stays on screen next to Done")
+    This once named all three footer buttons individually, because each needed its own restoration
+    rule. They no longer do: one general rule now covers every element that carries the attribute, so
+    naming three of them would fail on a fix that is strictly better than the patch it replaced. The
+    ui lane above is what actually proves these buttons disappear.
+    """
+    utilities = (ROOT / "static" / "css" / "utilities.css").read_text(encoding="utf-8")
+    assert "[hidden] { display: none !important; }" in utilities, (
+        "the general hidden rule is gone; the dialog will show its spent buttons beside Done again")
 
 
 @pytest.mark.unit

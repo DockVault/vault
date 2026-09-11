@@ -513,3 +513,30 @@
     background: rgba(59, 130, 246, 0.3);
     color: var(--text-primary);
 }
+
+/* ============================================================================
+   THE HIDDEN ATTRIBUTE MEANS HIDDEN
+   ============================================================================
+   The user agent's `[hidden] { display: none }` is a plain rule on a single
+   attribute selector, so ANY class that sets display beats it — `.btn`, `.alert`,
+   `.badge`, `.form-group`, a flex container. Setting `el.hidden = true` then does
+   nothing visible, and the element goes on painting.
+
+   This sheet had accumulated thirteen one-off restorations for exactly that, each
+   added after someone found a control that would not disappear: the copied-items
+   button and panel, the rename error and warning, the upload-link dialog footer,
+   the preview container, the groups dropdown, the audit cards, the bulk bar. That
+   is not thirteen bugs. It is one mechanical fact being paid for retail, thirteen
+   times, and the fourteenth was already waiting — index.html carries 76 `hidden`
+   attributes and most had no restoration at all.
+
+   So: once, generally, for every element that will ever carry it.
+
+   Checked before shipping it, because `!important` is not a thing to scatter: the
+   rule can only break an element that is REVEALED BY A CLASS while still carrying
+   the attribute, since anything that clears the attribute stops matching. No CSS
+   rule in this codebase grants display through a state class (.active/.open/.show),
+   and no element carries both such a class and `hidden`. Modals use .modal/.active
+   and carry no hidden attribute, so this cannot black one out.
+   ============================================================================ */
+[hidden] { display: none !important; }
