@@ -93,13 +93,18 @@ def test_uploading_through_a_link_moves_the_stored_figure(admin):
     Deliberately asserts BOTH halves: stored rises, and reserved returns to zero. Asserting only
     that stored rose would still pass if the two fields were swapped somewhere upstream.
     """
+    # /receiver-tags answers a bare LIST, not an object with a "tags" key. An earlier version of
+    # this test called .get on it and died with AttributeError before asserting anything — the cost
+    # of writing an integration lane that its author could not run.
     tags = admin.get("/receiver-tags").json()
-    tag = (tags.get("tags") or tags)[0]
+    assert isinstance(tags, list) and tags, f"expected a list of receiver tags, got {tags!r}"
+    tag = tags[0]
+
     created = admin.post("/receivers", json={"tag_id": tag["id"], "label": "usage-check",
                                              "max_total_bytes": 10 * 1024 * 1024})
     assert created.status_code in (200, 201), created.text
     rec = created.json()
-    token_url = rec.get("url_path") or f"/u/{rec['token']}"
+    token = rec["token"]          # returned exactly once, at creation
 
     def card():
         rows = admin.get("/receivers").json()["receivers"]
@@ -108,10 +113,19 @@ def test_uploading_through_a_link_moves_the_stored_figure(admin):
     before = card()
     assert before["stored_bytes"] == 0, before
 
+    # The real anonymous path: open a session, send the chunk, finalize. There is no one-shot upload
+    # route — /u/{token} serves the page, and the transfer is the three-step resumable flow below.
     body = b"x" * 4096
-    up = admin.post(f"{token_url}/upload",
-                    files=[("file", ("blob.bin", body, "application/octet-stream"))])
-    assert up.status_code in (200, 201), up.text
+    opened = admin.post(f"/receivers/{token}/upload-session",
+                        json={"filename": "blob.bin", "total_size": len(body), "total_chunks": 1})
+    assert opened.status_code in (200, 201), opened.text
+    session_id = opened.json()["session_id"]
+
+    put = admin.put(f"/receivers/{token}/upload-session/{session_id}/chunks/0", data=body)
+    assert put.status_code in (200, 201, 204), put.text
+
+    done = admin.post(f"/receivers/{token}/upload-session/{session_id}/complete", json={})
+    assert done.status_code in (200, 201), done.text
 
     after = card()
     assert after["stored_bytes"] >= len(body), (
