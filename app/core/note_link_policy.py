@@ -130,20 +130,27 @@ def tag_allows_target(tag, target_kind: str) -> bool:
 # The seeded catalog: a fresh deployment gets these (inert until public links are enabled). Colours +
 # icons drive the "Shared (by me)" tiles. Longer tokens for the secure tiers; the Confidential tag
 # mandates a password + one-time use + a 1-day expiry.
+# Every seeded tag permits all three target kinds. Without an explicit allowed_targets a tag falls
+# back to ["note"], so a fresh deployment could publish a note but not a file or a folder until an
+# admin edited a tag by hand — the sharper end of that being that the feature looked broken rather
+# than switched off. Seed-time only: an existing deployment's tags are never revisited, and an admin
+# who narrows a tag keeps their choice.
+_ALL_TARGETS = ["note", "file", "folder"]
+
 DEFAULT_NOTE_LINK_TAGS = (
     {"name": "Open", "description": "Short, easy link — no expiry, no password, unlimited views.",
      "border_color": "green", "icon": "globe", "min_token_len": 6,
      "default_ttl_hours": None, "max_ttl_hours": None, "require_secret": "none",
-     "max_uses_cap": None, "auto_enroll_new_users": True},
+     "max_uses_cap": None, "auto_enroll_new_users": True, "allowed_targets": list(_ALL_TARGETS)},
     {"name": "Restricted", "description": "Long link, expires after 7 days, no password.",
      "border_color": "amber", "icon": "clock", "min_token_len": 20,
      "default_ttl_hours": 168, "max_ttl_hours": 168, "require_secret": "none",
-     "max_uses_cap": None, "auto_enroll_new_users": True},
+     "max_uses_cap": None, "auto_enroll_new_users": True, "allowed_targets": list(_ALL_TARGETS)},
     {"name": "Confidential", "description": "Long link, password-protected, one view, expires in 1 day.",
      "border_color": "red", "icon": "lock", "min_token_len": 20,
      "default_ttl_hours": 24, "max_ttl_hours": 24, "require_secret": "password",
      "password_min_len": 8, "password_require_alnum": True, "max_uses_cap": 1,
-     "auto_enroll_new_users": True},
+     "auto_enroll_new_users": True, "allowed_targets": list(_ALL_TARGETS)},
 )
 
 

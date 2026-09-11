@@ -19998,6 +19998,39 @@ def _seed_default_share_tags():
         print(f"⚠ Default share-tag seeding skipped: {e}")
 
 
+def _seed_default_settings(bootstrap_status):
+    """Write the fresh-install settings, and only onto a deployment that did not exist before.
+
+    The decision — whether to seed, and which keys — lives in app.core.settings_bootstrap, which is
+    side-effect-free and therefore unit-testable; this function is only the database half. See that
+    module for why these are SEEDED rather than made the code defaults: flipping a default would
+    switch the features on for every existing deployment that had never saved the key, and a
+    settings-blob diff would not even show it.
+
+    Best-effort: a failure logs and is swallowed, and can never brick startup.
+    """
+    from app.core import settings_bootstrap
+    if not settings_bootstrap.should_seed_settings(bootstrap_status):
+        return
+    try:
+        from app.core.database import get_db_context
+        from app.core.models import SystemSetting
+        with get_db_context() as db:
+            row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+            blob = dict(row.value) if (row and row.value) else {}
+            added = settings_bootstrap.settings_to_add(blob)
+            if not added:
+                return
+            merged = {**blob, **added}
+            if row:
+                row.value = merged   # reassign so SQLAlchemy flags the JSON column dirty
+            else:
+                db.add(SystemSetting(key=_SETTINGS_KEY, value=merged))
+            print(f"[OK] Seeded {len(added)} fresh-install settings: {', '.join(sorted(added))}")
+    except Exception as e:
+        print(f"⚠ Fresh-install settings seeding skipped: {e}")
+
+
 def _seed_default_note_link_tags():
     """Seed the starter public-note-link tags (Open / Restricted / Confidential) on a fresh deployment
     only — no tags AND public links not already enabled — mirroring the share-tag seed. Inert until an
@@ -21015,6 +21048,10 @@ async def lifespan(app: FastAPI):
     # is not retained. Fail-safe -- never breaks boot.
     from app.core.admin_password_hygiene import scrub_bootstrap_password_source
     scrub_bootstrap_password_source(_admin_bootstrap_status)
+    # Fresh-install settings BEFORE the tag seeders, so a brand-new deployment has the features
+    # switched on when their starter tags are written. Gated on the bootstrap status, so an
+    # existing deployment is not touched — see _seed_default_settings.
+    _seed_default_settings(_admin_bootstrap_status)
     _seed_default_share_tags()  # after the admin exists, so seed tags can record it as creator
     _seed_default_note_link_tags()  # public-note-link starter tags (inert until enabled)
     _seed_default_receiver_tags()  # receiver (upload-link) starter tags (inert until enabled)
