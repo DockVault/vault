@@ -88,6 +88,34 @@ def test_device_lifecycle_is_audited_exactly_once(verb, path):
 
 
 @pytest.mark.unit
+def test_the_helper_can_actually_reach_everything_it_names():
+    """The failure this test exists for: the helper swallowed a NameError and recorded nothing.
+
+    `current_client_ip` is not a module-level name in api_server — every user imports it locally. The
+    helper was written without that import, so every call raised NameError, the deliberately-silent
+    handler ate it, and six endpoints reported success while writing no audit row at all. Six call
+    sites, a passing suite, and an empty log.
+
+    A best-effort writer hides its own absence by design, so "the call site exists" proves nothing
+    about it. This compiles the helper's body and checks every name it uses is either imported inside
+    it, a parameter, or a module-level definition.
+    """
+    src = API.read_text(encoding="utf-8")
+    start = src.index("def _audit_access_change(")
+    body = src[start:src.index("\ndef ", start + 1)]
+    before = src[:start]
+
+    module_level = re.findall(r"^(?:from [\w.]+ )?import .*$", before, re.M)   # column 0 only
+    for name in ("current_client_ip", "AuditLogger"):
+        in_body = re.search(rf"^\s+(?:from [\w.]+ )?import .*\b{name}\b", body, re.M)
+        at_module_scope = any(re.search(rf"\b{name}\b", line) for line in module_level)
+        assert in_body or at_module_scope, (
+            f"{name} is used by the helper but reachable from neither an import inside it nor the "
+            f"module scope above it — it raises NameError, and the helper swallows that silently, "
+            f"so every call site reports success and writes nothing")
+
+
+@pytest.mark.unit
 def test_the_audit_write_can_never_fail_the_request():
     """The change is already committed when the log is written.
 
@@ -99,7 +127,10 @@ def test_the_audit_write_can_never_fail_the_request():
     body = src[start:src.index("\ndef ", start + 1)]
     assert "try:" in body and "except Exception" in body, (
         "the helper must swallow its own failures")
-    assert "raise" not in body, "the helper must never re-raise into the request"
+    # A `raise` STATEMENT, not the word. The first version matched the substring and failed on a
+    # comment that used "raises" to explain why there must not be one.
+    assert not re.search(r"^\s+raise", body, re.M), (
+        "the helper must never re-raise into the request")
 
 
 @pytest.mark.unit

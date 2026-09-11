@@ -10886,6 +10886,12 @@ def _audit_access_change(db, actor, action, resource_type, resource_id, details=
     logged to the process and swallowed.
     """
     try:
+        # Imported here, the way the rest of this module reaches it — it is NOT a module-level name.
+        # Without this line every call raised NameError, and because the handler below is deliberately
+        # silent, six endpoints reported success while recording nothing at all. A best-effort writer
+        # hides its own absence, which is why the test for this asserts that a row comes BACK rather
+        # than that the call site exists.
+        from app.core.net_utils import current_client_ip
         AuditLogger(db).log_action(
             action=action,
             status="success",
