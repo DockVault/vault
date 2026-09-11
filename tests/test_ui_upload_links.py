@@ -167,3 +167,48 @@ def test_create_requires_total_budget(page: Page, admin, admin_creds):
         expect(page.locator("#rc-result")).to_be_hidden()
     finally:
         admin.put("/settings", json={"public_receivers_enabled": False})
+
+
+def test_a_created_upload_link_says_it_cannot_be_retrieved(page: Page, admin_creds, admin,
+                                                           restore_receivers):
+    """The owner accepted showing the link once, on the condition that the interface says so.
+
+    Read off the SCREEN, not out of the markup: the point is what a person is told at the moment they
+    are handed a credential they cannot get back. A grep of index.html would also pass if the
+    sentence sat in a container that never renders — a failure this codebase has had repeatedly.
+
+    Note which dialogs this covers and which it deliberately does not. An upload link and a public
+    FILE link are stored hashed and genuinely cannot be shown again. A NOTE link is not: its token is
+    stored in plaintext and comes back from /note-links, so its owner can re-read it whenever they
+    like. Telling them otherwise would be a false warning, and a false warning on a security notice
+    is worse than no warning — so #note-public-result is left alone on purpose.
+    """
+    admin.put("/settings", json={"public_receivers_enabled": True})
+    tag_name = unique("OnceOnly")
+    admin.post("/receiver-tags", json={"name": tag_name, "min_token_len": 10,
+                                       "auto_enroll_new_users": True, "is_active": True})
+    try:
+        _login(page, admin_creds["username"], admin_creds["password"])
+        expect(page.locator("#nav-uploadlinks")).to_be_visible(timeout=10000)
+        page.locator("#nav-uploadlinks").click()
+        page.click("#receiver-new-btn")
+        expect(page.locator("#receiver-create-modal")).to_be_visible()
+        page.select_option("#rc-tag", label=tag_name)
+        page.fill("#rc-max-total-mb", "100")
+        page.click("#rc-create")
+
+        result = page.locator("#rc-result")
+        expect(result).to_be_visible(timeout=15000)
+        # The anchor: a link really was created, so the notice below is being read on the screen that
+        # hands it over rather than on an empty dialog.
+        expect(page.locator("#rc-link-value")).not_to_have_value("")
+
+        shown = result.inner_text()
+        assert "only once" in shown, f"the dialog must say the link is shown once: {shown!r}"
+        assert "cannot be retrieved" in shown, (
+            f"the dialog must say it cannot be recovered later: {shown!r}")
+        # And it should point at the way out, since there is one.
+        assert "replace" in shown.lower(), (
+            f"the dialog should say a lost link can be replaced: {shown!r}")
+    finally:
+        admin.put("/settings", json={"public_receivers_enabled": False})
