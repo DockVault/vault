@@ -107,7 +107,13 @@ def test_uploading_through_a_link_moves_the_stored_figure(admin):
     # of writing an integration lane that its author could not run.
     tags = admin.get("/receiver-tags").json()
     assert isinstance(tags, list) and tags, f"expected a list of receiver tags, got {tags!r}"
-    tag = tags[0]
+    # NOT tags[0]. The first seeded tag is "Confidential inbox", which is deliberately not
+    # auto-enrolled — creating a link with it is refused with 403 even for an admin, so this test
+    # died on setup rather than on anything it meant to check. Pick the OPEN tag by name; either
+    # spelling is right depending on when the deployment was seeded.
+    tag = next((t for t in tags if t["name"] in ("Drop vault", "Drop box")), None)
+    if tag is None:
+        pytest.skip(f"no open upload-link tag on this deployment: {[t['name'] for t in tags]}")
 
     created = admin.post("/receivers", json={"tag_id": tag["id"], "label": "usage-check",
                                              "max_total_bytes": 10 * 1024 * 1024})
