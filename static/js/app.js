@@ -6242,6 +6242,261 @@ async function submitGroupForm(e) {
     }
 }
 
+// ============================================================================
+// GROUPS: LOAD FROM TEMPLATE
+// ----------------------------------------------------------------------------
+// A ready-made set of departments, shown as the tree it WOULD create and editable
+// before anything is written. Nothing reaches the server until Create is pressed:
+// the second screen is a proposal, not a report of work already done.
+//
+// Every node is built with DOM APIs and textContent. The template names are authored
+// here, but a name the user types goes back into the same tree and out again, so it
+// is never concatenated into markup.
+// ============================================================================
+
+// The presets. Named for what they are FOR rather than by size, so someone can tell
+// which one fits without counting the entries.
+const GROUP_TEMPLATES = Object.freeze([
+    {
+        id: 'org',
+        name: 'Whole organisation',
+        blurb: 'The departments most companies end up with, with teams nested under the larger ones.',
+        tree: [
+            { name: 'Executive' },
+            { name: 'Finance', children: [{ name: 'Accounts payable' }, { name: 'Payroll' }] },
+            { name: 'People', children: [{ name: 'Recruiting' }, { name: 'HR operations' }] },
+            { name: 'Engineering', children: [{ name: 'Platform' }, { name: 'Product' }, { name: 'QA' }] },
+            { name: 'Sales', children: [{ name: 'Field sales' }, { name: 'Customer success' }] },
+            { name: 'Legal' },
+            { name: 'IT', children: [{ name: 'Support' }, { name: 'Security' }] },
+        ],
+    },
+    {
+        id: 'team',
+        name: 'Small team',
+        blurb: 'A flat set for a handful of people who mostly need somewhere to put things.',
+        tree: [
+            { name: 'Everyone' },
+            { name: 'Admin' },
+            { name: 'Projects' },
+            { name: 'Clients' },
+        ],
+    },
+    {
+        id: 'solo',
+        name: 'Just this machine',
+        blurb: 'One person, one computer. Separates personal from shared without inventing a hierarchy.',
+        tree: [
+            { name: 'Personal' },
+            { name: 'Shared' },
+            { name: 'Archive' },
+        ],
+    },
+]);
+
+// The working copy the review screen edits. Rebuilt from the template every time one is
+// chosen, so backing out and picking another never inherits the previous edits.
+let groupTemplateDraft = [];
+let groupTemplateSeq = 0;
+
+function _tplNode(name, children) {
+    groupTemplateSeq += 1;
+    return {
+        key: 'n' + groupTemplateSeq,
+        name: name,
+        include: true,
+        children: (children || []).map(c => _tplNode(c.name, c.children)),
+    };
+}
+
+function _tplCount(nodes) {
+    // A child of an unticked parent is not created either, because it has nowhere to hang.
+    // Counting it would promise more than Create delivers.
+    return (nodes || []).reduce((n, node) => node.include ? n + 1 + _tplCount(node.children) : n, 0);
+}
+
+function openGroupTemplateModal() {
+    const modal = document.getElementById('group-template-modal');
+    if (!modal) return;
+    _tplShowPick();
+    modal.classList.add('active');
+}
+
+function _tplShowPick() {
+    const grid = document.getElementById('group-template-cards');
+    if (grid) {
+        grid.replaceChildren();
+        GROUP_TEMPLATES.forEach(tpl => {
+            const card = document.createElement('button');
+            card.type = 'button';
+            card.className = 'tpl-card';
+            const h = document.createElement('h4');
+            h.textContent = tpl.name;
+            card.appendChild(h);
+            const p = document.createElement('p');
+            p.textContent = tpl.blurb;
+            card.appendChild(p);
+            const preview = document.createElement('div');
+            preview.className = 'tpl-card-preview';
+            const total = tpl.tree.reduce((n, t) => n + 1 + (t.children ? t.children.length : 0), 0);
+            preview.textContent = total + ' departments · ' + tpl.tree.map(t => t.name).slice(0, 3).join(', ') + '…';
+            card.appendChild(preview);
+            card.addEventListener('click', () => _tplChoose(tpl));
+            grid.appendChild(card);
+        });
+    }
+    document.getElementById('group-template-pick').hidden = false;
+    document.getElementById('group-template-review').hidden = true;
+    document.getElementById('group-template-back').hidden = true;
+    document.getElementById('group-template-create').hidden = true;
+    const err = document.getElementById('group-template-error');
+    if (err) { err.hidden = true; err.textContent = ''; }
+}
+
+function _tplChoose(tpl) {
+    groupTemplateDraft = tpl.tree.map(t => _tplNode(t.name, t.children));
+    document.getElementById('group-template-pick').hidden = true;
+    document.getElementById('group-template-review').hidden = false;
+    document.getElementById('group-template-back').hidden = false;
+    document.getElementById('group-template-create').hidden = false;
+    _tplRenderTree();
+}
+
+function _tplRenderTree() {
+    const host = document.getElementById('group-template-tree');
+    if (!host) return;
+    host.replaceChildren();
+    const walk = (nodes, parent, depth) => {
+        nodes.forEach(node => {
+            const row = document.createElement('div');
+            row.className = 'tpl-node' + (node.include ? '' : ' is-off');
+            row.style.paddingLeft = (depth * 20) + 'px';
+            row.dataset.key = node.key;
+
+            const tick = document.createElement('input');
+            tick.type = 'checkbox';
+            tick.checked = node.include;
+            tick.setAttribute('aria-label', 'Create ' + node.name);
+            tick.addEventListener('change', () => { node.include = tick.checked; _tplRenderTree(); });
+            row.appendChild(tick);
+
+            const name = document.createElement('input');
+            name.type = 'text';
+            name.value = node.name;
+            name.maxLength = 120;
+            name.setAttribute('aria-label', 'Department name');
+            name.addEventListener('input', () => { node.name = name.value; _tplUpdateCount(); });
+            row.appendChild(name);
+
+            const actions = document.createElement('div');
+            actions.className = 'tpl-node-actions';
+
+            const addChild = document.createElement('button');
+            addChild.type = 'button';
+            addChild.className = 'btn btn-ghost btn-sm';
+            addChild.title = 'Add a department inside this one';
+            addChild.setAttribute('aria-label', 'Add a department inside ' + node.name);
+            addChild.appendChild(_svgIcon('plus', 'icon-sm'));
+            addChild.addEventListener('click', () => {
+                node.children.push(_tplNode('New department', []));
+                _tplRenderTree();
+            });
+            actions.appendChild(addChild);
+
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'btn btn-ghost btn-sm';
+            remove.title = 'Remove from this list';
+            remove.setAttribute('aria-label', 'Remove ' + node.name);
+            remove.appendChild(_svgIcon('trash', 'icon-sm'));
+            remove.addEventListener('click', () => {
+                const list = parent ? parent.children : groupTemplateDraft;
+                const i = list.indexOf(node);
+                if (i >= 0) list.splice(i, 1);
+                _tplRenderTree();
+            });
+            actions.appendChild(remove);
+
+            row.appendChild(actions);
+            host.appendChild(row);
+            walk(node.children, node, depth + 1);
+        });
+    };
+    walk(groupTemplateDraft, null, 0);
+    _tplUpdateCount();
+}
+
+function _tplUpdateCount() {
+    const el = document.getElementById('group-template-count');
+    if (!el) return;
+    const n = _tplCount(groupTemplateDraft);
+    el.textContent = n === 1 ? '1 department will be created' : n + ' departments will be created';
+}
+
+// Create the ticked nodes, parents before children, because a child needs its parent id.
+// Sequential on purpose: the order IS the requirement, and firing these in parallel would
+// race a child against the parent it depends on.
+async function submitGroupTemplate() {
+    const btn = document.getElementById('group-template-create');
+    const err = document.getElementById('group-template-error');
+    if (err) { err.hidden = true; err.textContent = ''; }
+
+    let blank = false;
+    const check = (nodes) => nodes.forEach(n => {
+        if (!n.include) return;             // an unticked branch takes its children with it
+        if (!String(n.name || '').trim()) blank = true;
+        check(n.children);
+    });
+    check(groupTemplateDraft);
+    if (blank) {
+        if (err) { err.textContent = 'Every ticked department needs a name.'; err.hidden = false; }
+        return;
+    }
+    if (_tplCount(groupTemplateDraft) === 0) {
+        if (err) { err.textContent = 'Nothing is ticked, so there is nothing to create.'; err.hidden = false; }
+        return;
+    }
+
+    btn.disabled = true;
+    let created = 0;
+    try {
+        const walk = async (nodes, parentId) => {
+            for (const node of nodes) {
+                if (!node.include) continue;
+                const saved = await apiRequest('/groups', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        name: String(node.name).trim(),
+                        description: null,
+                        color: null,
+                        parent_id: parentId || null,
+                    }),
+                });
+                created += 1;
+                if (saved && saved.id) await walk(node.children, saved.id);
+            }
+        };
+        await walk(groupTemplateDraft, null);
+        closeModal();
+        showSuccess(created === 1 ? '1 department created' : created + ' departments created');
+        await loadGroups();
+    } catch (e) {
+        // Say what DID happen. A partial run is the confusing case: some departments now exist,
+        // and reporting a flat "failed" sends someone hunting for a problem that is really a
+        // half-finished job they can see in the list behind the dialog.
+        if (err) {
+            err.textContent = created
+                ? 'Created ' + created + ' before failing: ' + ((e && e.message) || 'unknown error')
+                  + '. The rest were not created.'
+                : 'Could not create the departments: ' + ((e && e.message) || 'unknown error');
+            err.hidden = false;
+        }
+        if (created) { try { await loadGroups(); } catch (_) { /* the list catches up on its own */ } }
+    } finally {
+        btn.disabled = false;
+    }
+}
+
 // (Legacy renderRolesUsersTable/attachRolesListeners removed — the Groups & Roles
 //  view now uses loadGroups() above; role changes happen via the Users page edit.)
 
@@ -19860,6 +20115,29 @@ document.addEventListener('DOMContentLoaded', () => {
     if (createGroupBtn) {
         createGroupBtn.addEventListener('click', () => openGroupModal(null));
     }
+    // The split button's arrow: its own menu, closed by anything that is not itself. The primary
+    // half above is untouched, so the ordinary "New Group" path is exactly what it always was.
+    const groupMoreBtn = document.getElementById('new-group-more');
+    const groupMenu = document.getElementById('new-group-menu');
+    if (groupMoreBtn && groupMenu) {
+        const closeGroupMenu = () => { groupMenu.hidden = true; groupMoreBtn.setAttribute('aria-expanded', 'false'); };
+        groupMoreBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const open = groupMenu.hidden;
+            groupMenu.hidden = !open;
+            groupMoreBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+        });
+        document.addEventListener('click', (e) => { if (!groupMenu.hidden && !groupMenu.contains(e.target)) closeGroupMenu(); });
+        document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeGroupMenu(); });
+        const tplOpen = document.getElementById('group-template-open');
+        if (tplOpen) tplOpen.addEventListener('click', () => { closeGroupMenu(); openGroupTemplateModal(); });
+    }
+    const tplBack = document.getElementById('group-template-back');
+    if (tplBack) tplBack.addEventListener('click', _tplShowPick);
+    const tplCreate = document.getElementById('group-template-create');
+    if (tplCreate) tplCreate.addEventListener('click', submitGroupTemplate);
+    const tplAddRoot = document.getElementById('group-template-add-root');
+    if (tplAddRoot) tplAddRoot.addEventListener('click', () => { groupTemplateDraft.push(_tplNode('New department', [])); _tplRenderTree(); });
     const groupForm = document.getElementById('group-form');
     if (groupForm) {
         groupForm.addEventListener('submit', submitGroupForm);

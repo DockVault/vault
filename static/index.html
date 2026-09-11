@@ -84,6 +84,7 @@
         <symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
         <symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
         <symbol id="i-chevron-right" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+        <symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
         <symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
         <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
         <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></symbol>
@@ -1402,7 +1403,19 @@
                             <h2 class="text-2xl font-bold"><svg class="icon"><use href="#i-users"/></svg> Groups &amp; Roles</h2>
                             <p class="text-secondary">Organize people into departments and review role distribution</p>
                         </div>
-                        <button id="create-group-btn" class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg> New Group</button>
+                        <!-- Split control: the primary action, and one arrow attached to it that offers
+                             the template flow. Two buttons in one bordered group so it reads as a single
+                             control, which is what a split button is. -->
+                        <div class="split-btn" id="new-group-split">
+                            <button id="create-group-btn" class="btn btn-primary split-btn-main"><svg class="icon"><use href="#i-plus"/></svg> New Group</button>
+                            <button id="new-group-more" class="btn btn-primary split-btn-arrow" type="button"
+                                    aria-haspopup="true" aria-expanded="false" aria-label="More ways to create groups">
+                                <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"/></svg>
+                            </button>
+                            <div class="split-btn-menu" id="new-group-menu" role="menu" hidden>
+                                <button type="button" class="split-btn-item" id="group-template-open" role="menuitem">Load from template</button>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Departments workspace: tree + detail -->
@@ -3686,6 +3699,44 @@
             </div>
 
             <!-- Create / Edit Group Modal -->
+            <!-- Load-from-template: two screens in one dialog. First a choice of preset department
+                 sets, then the chosen set shown as the tree it will create, editable before anything is
+                 written. Nothing reaches the server until Create is pressed on the second screen. -->
+            <div id="group-template-modal" class="modal">
+                <div class="modal-content modal-lg">
+                    <div class="modal-header">
+                        <h3 id="group-template-title"><svg class="icon"><use href="#i-users"/></svg> Load from template</h3>
+                        <button class="close-modal-btn modal-close" aria-label="Close">&times;</button>
+                    </div>
+                    <div class="modal-body">
+                        <!-- Screen 1: pick a set -->
+                        <div id="group-template-pick">
+                            <p class="text-secondary mb-md">Start from a ready-made set of departments. You can
+                               change everything on the next screen before anything is created.</p>
+                            <div id="group-template-cards" class="tpl-card-grid"></div>
+                        </div>
+                        <!-- Screen 2: review and edit the tree -->
+                        <div id="group-template-review" hidden>
+                            <p class="text-secondary mb-sm">Uncheck what you do not want, rename anything, and add
+                               your own. Only ticked departments are created.</p>
+                            <div id="group-template-tree" class="tpl-tree"></div>
+                            <div class="flex items-center gap-sm mt-md">
+                                <button type="button" class="btn btn-secondary btn-sm" id="group-template-add-root">
+                                    <svg class="icon"><use href="#i-plus"/></svg> Add department
+                                </button>
+                                <span class="text-tertiary text-sm" id="group-template-count"></span>
+                            </div>
+                            <div class="alert alert-error mt-md" id="group-template-error" hidden></div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-ghost close-modal-btn" id="group-template-cancel">Cancel</button>
+                        <button type="button" class="btn btn-ghost" id="group-template-back" hidden>Back</button>
+                        <button type="button" class="btn btn-primary" id="group-template-create" hidden>Create departments</button>
+                    </div>
+                </div>
+            </div>
+
             <div id="group-modal" class="modal">
                 <div class="modal-content">
                     <div class="modal-header">

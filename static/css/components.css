@@ -2287,3 +2287,89 @@ body.ctx-menu-open .action-more-wrap.cluster-right:focus-within .action-cluster 
    ============================================================================ */
 
 
+
+/* ============================================================================
+   SPLIT BUTTON + LOAD-FROM-TEMPLATE (Groups)
+   A split button is one control: the primary action, and an attached arrow that
+   offers the alternatives. The two halves share a border so it does not read as
+   two buttons that happen to be adjacent.
+   ============================================================================ */
+.split-btn { position: relative; display: inline-flex; align-items: stretch; }
+.split-btn-main { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.split-btn-arrow {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    padding-left: var(--space-xs);
+    padding-right: var(--space-xs);
+    /* A hairline between the halves, so the arrow reads as part of the control rather
+       than as a second button pressed up against it. */
+    border-left: 1px solid rgba(0, 0, 0, .18);
+}
+.split-btn-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    min-width: 190px;
+    background: var(--surface-1);
+    border: 1px solid var(--surface-3);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+    padding: 4px;
+    z-index: 30;
+}
+/* `.split-btn-menu` sets display, which beats the UA `[hidden] { display: none }` on
+   specificity — the same trap this file already documents for the copied-items button
+   and the upload-link footer. Restore it rather than discover it a third time. */
+.split-btn-menu[hidden] { display: none; }
+.split-btn-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: var(--space-xs) var(--space-sm);
+    background: none;
+    border: 0;
+    border-radius: var(--radius-sm);
+    color: var(--text-1);
+    font: inherit;
+    cursor: pointer;
+}
+.split-btn-item:hover, .split-btn-item:focus-visible { background: var(--surface-2); }
+
+.tpl-card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: var(--space-md);
+}
+.tpl-card {
+    text-align: left;
+    padding: var(--space-md);
+    border: 1px solid var(--surface-3);
+    border-radius: var(--radius-md);
+    background: var(--surface-1);
+    cursor: pointer;
+    font: inherit;
+    color: inherit;
+}
+.tpl-card:hover, .tpl-card:focus-visible { border-color: var(--primary); }
+.tpl-card h4 { margin: 0 0 var(--space-xs); font-size: var(--text-base); }
+.tpl-card p { margin: 0 0 var(--space-sm); color: var(--text-2); font-size: var(--text-sm); }
+.tpl-card .tpl-card-preview { color: var(--text-3); font-size: var(--text-sm); }
+
+.tpl-tree { max-height: 46vh; overflow-y: auto; padding-right: var(--space-xs); }
+.tpl-node { display: flex; align-items: center; gap: var(--space-xs); padding: 3px 0; }
+.tpl-node input[type="text"] {
+    flex: 1;
+    min-width: 0;
+    padding: 4px var(--space-xs);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-1);
+    font: inherit;
+}
+.tpl-node input[type="text"]:hover { border-color: var(--surface-3); }
+.tpl-node input[type="text"]:focus { border-color: var(--primary); background: var(--surface-1); outline: none; }
+/* An unticked row stays legible — it is a choice, not an error — but reads as excluded. */
+.tpl-node.is-off input[type="text"] { color: var(--text-3); text-decoration: line-through; }
+.tpl-node-actions { display: flex; gap: 2px; opacity: 0; transition: opacity .1s ease; }
+.tpl-node:hover .tpl-node-actions, .tpl-node:focus-within .tpl-node-actions { opacity: 1; }
