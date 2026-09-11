@@ -88,7 +88,12 @@ def test_admin_tag_crud_and_validation(admin):
 
 def test_seeded_default_tags_present(admin):
     names = {t["name"] for t in admin.get("/receiver-tags").json()}
-    assert {"Drop box", "Confidential inbox"} <= names, names
+    # EITHER name is correct, and which one you get says when the deployment was created. The open
+    # tag is seeded as "Drop vault" now; a deployment seeded before the rename keeps "Drop box",
+    # because renaming tags that already exist is exactly what the change was forbidden to do.
+    # Pinning one name here would fail on precisely the installs we promised not to touch.
+    assert "Confidential inbox" in names, names
+    assert {"Drop vault", "Drop box"} & names, names
 
 
 # --- create + hashed token + owner-paid vault -------------------------------------------------------

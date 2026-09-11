@@ -154,12 +154,12 @@ def test_ttl_ceiling():
 
 def test_default_catalog_shape():
     names = {t["name"] for t in rp.DEFAULT_RECEIVER_TAGS}
-    assert names == {"Drop box", "Confidential inbox"}
+    assert names == {"Drop vault", "Confidential inbox"}
     conf = next(t for t in rp.DEFAULT_RECEIVER_TAGS if t["name"] == "Confidential inbox")
     assert conf["kind_floor"] == "confidential" and conf["require_secret"] == "password"
     assert conf["auto_enroll_new_users"] is False
-    dropbox = next(t for t in rp.DEFAULT_RECEIVER_TAGS if t["name"] == "Drop box")
-    assert dropbox["kind_floor"] == "standard" and dropbox["auto_enroll_new_users"] is True
+    drop_vault = next(t for t in rp.DEFAULT_RECEIVER_TAGS if t["name"] == "Drop vault")
+    assert drop_vault["kind_floor"] == "standard" and drop_vault["auto_enroll_new_users"] is True
 
 
 def test_should_seed_only_on_fresh_deployment():

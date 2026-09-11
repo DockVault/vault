@@ -117,7 +117,7 @@ def validate_tag_fields(data: dict, *, partial: bool = False) -> None:
 # Confidential inbox forces the browser envelope via kind_floor; it is NOT auto-enrolled, so an admin
 # allowlists who may open one.
 DEFAULT_RECEIVER_TAGS = (
-    {"name": "Drop box", "description": "Open upload link — expires in 7 days, 100 MB per file, kept 30 days.",
+    {"name": "Drop vault", "description": "Open upload link — expires in 7 days, 100 MB per file, kept 30 days.",
      "border_color": "blue", "icon": "inbox", "min_token_len": 10,
      "default_ttl_hours": 168, "max_ttl_hours": 168, "require_secret": "none",
      "kind_floor": "standard", "max_file_bytes_cap": 100 * 1024 * 1024,

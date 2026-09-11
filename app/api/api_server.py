@@ -20024,7 +20024,7 @@ def _seed_default_note_link_tags():
 
 
 def _seed_default_receiver_tags():
-    """Seed the starter receiver tags (Drop box / Confidential inbox) on a fresh deployment only — no
+    """Seed the starter receiver tags (Drop vault / Confidential inbox) on a fresh deployment only — no
     receiver tags AND receivers not already explicitly enabled. Inert until an admin turns receivers on.
     Best-effort; never bricks startup."""
     try:
