@@ -93,6 +93,15 @@ def test_uploading_through_a_link_moves_the_stored_figure(admin):
     Deliberately asserts BOTH halves: stored rises, and reserved returns to zero. Asserting only
     that stored rose would still pass if the two fields were swapped somewhere upstream.
     """
+    # Upload links are a deployment-level feature and this test cannot run without them. A FRESH
+    # deployment now seeds them on, so this normally just proceeds. An UPGRADED one deliberately
+    # keeps them off — that is the whole point of the fresh-install seeding — and there the honest
+    # outcome is a skip that says so, not a failure. A test that is permanently red on a correctly
+    # configured deployment teaches everyone to ignore red.
+    settings = admin.get("/settings").json()
+    if settings.get("public_receivers_enabled") is not True:
+        pytest.skip("upload links are disabled on this deployment; a fresh install seeds them on")
+
     # /receiver-tags answers a bare LIST, not an object with a "tags" key. An earlier version of
     # this test called .get on it and died with AttributeError before asserting anything — the cost
     # of writing an integration lane that its author could not run.
