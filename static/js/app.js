@@ -10412,7 +10412,21 @@ function attachSettingsListeners() {
 }
 
 // Open Vault (Placeholder - needs SFTP integration or file listing)
-async function openVault(vaultId) {
+// Which top-level section a vault was opened FROM, so leaving it returns there. Vaults are reachable
+// from more than one page — the vault list, and the drop-vault cards under Upload links — and this
+// used to be hardcoded to 'vaults' at both ends: opening a drop vault moved the sidebar to Vaults,
+// and Back then landed on the vault list, a page the person had not been on. Anything not named here
+// falls back to 'vaults', which is where the great majority of opens come from.
+const VAULT_ORIGIN_SECTIONS = Object.freeze(['vaults', 'uploadlinks']);
+function vaultOriginSection() {
+    return VAULT_ORIGIN_SECTIONS.includes(state.vaultOpenedFrom) ? state.vaultOpenedFrom : 'vaults';
+}
+
+async function openVault(vaultId, options) {
+    // Record where this open came from BEFORE anything can fail: the early returns below (cancelled
+    // unlock, wrong password) leave the person on the page they were already looking at, and that
+    // page is the one this names.
+    state.vaultOpenedFrom = (options && options.from) || 'vaults';
     try {
         // Validate vault ID
         if (!vaultId) {
@@ -10578,10 +10592,12 @@ async function openVault(vaultId) {
         document.querySelectorAll('.vault-tab-content').forEach(c => c.classList.remove('active'));
         document.getElementById('vault-files-tab')?.classList.add('active');
         
-        // Update sidebar active state
+        // Update sidebar active state — to the section this vault was opened FROM. Hardcoding
+        // 'vaults' here moved the rail to Vaults the moment someone opened a drop vault from
+        // Upload links, so the app claimed they were somewhere they had not gone.
         document.querySelectorAll('.sidebar-item').forEach(i => i.classList.remove('active'));
-        const vaultsItem = document.querySelector('.sidebar-item[data-section="vaults"]');
-        if (vaultsItem) vaultsItem.classList.add('active');
+        const originItem = document.querySelector(`.sidebar-item[data-section="${vaultOriginSection()}"]`);
+        if (originItem) originItem.classList.add('active');
         
         // Setup drag-and-drop for file uploads
         setupFileDragDrop();
@@ -14417,6 +14433,9 @@ function saveNavState(override) {
         const isZk = !!(state.currentVault && state.currentVault.type === 'zero_knowledge');
         nav = { section: 'vault', vaultId: state.currentVault.id,
                 folderId: state.currentFolderId || null,
+                // Carry where it was opened from, so a refresh inside a drop vault still knows that
+                // Back means Upload links. Without it the restore silently reverts to the vault list.
+                from: vaultOriginSection(),
                 path: navPathForStorage(state.currentPath || [], isZk) };
     } else {
         return;  // nothing meaningful to save
@@ -14438,7 +14457,7 @@ async function restoreLastView() {
     const nav = getNavState();
     if (!nav) return false;
     if (nav.section === 'vault' && nav.vaultId) {
-        await openVault(nav.vaultId);
+        await openVault(nav.vaultId, { from: nav.from });
         if (!state.currentVault) { navigateToSection('vaults'); return true; }  // open cancelled/failed
         // Restore folder depth if we were inside one.
         if (nav.folderId && state.currentFolderId !== nav.folderId) {
@@ -14512,19 +14531,25 @@ function closeVault() {
     state.currentFolderId = null;
     state.currentPath = [];
     state.vaultPassword = null;
-    saveNavState({ section: 'vaults' });  // a refresh now lands on the vault list, not inside
+    // Back to the section this vault was opened FROM. It was hardcoded to the vault list, so
+    // leaving a drop vault opened from Upload links dropped the person onto a page they had never
+    // been on and lost their place in the one they had.
+    const origin = vaultOriginSection();
+    state.vaultOpenedFrom = null;
+    saveNavState({ section: origin });  // a refresh now lands there too, not inside the vault
 
-    // Switch back to the vaults CONTENT section. (Do NOT use showScreen here —
-    // that toggles top-level .screen elements and would hide the whole
-    // dashboard-screen, leaving a blank page.)
+    // Switch back to that CONTENT section. (Do NOT use showScreen here — that toggles top-level
+    // .screen elements and would hide the whole dashboard-screen, leaving a blank page.)
     document.querySelectorAll('.content-section').forEach(s => s.classList.remove('active'));
-    const vaultsSection = document.getElementById('vaults-section');
-    if (vaultsSection) vaultsSection.classList.add('active');
+    const originSection = document.getElementById(`${origin}-section`);
+    if (originSection) originSection.classList.add('active');
     document.querySelectorAll('.sidebar-item').forEach(i => i.classList.remove('active'));
-    const vaultsItem = document.querySelector('.sidebar-item[data-section="vaults"]');
-    if (vaultsItem) vaultsItem.classList.add('active');
+    const originItem = document.querySelector(`.sidebar-item[data-section="${origin}"]`);
+    if (originItem) originItem.classList.add('active');
 
-    loadVaults();
+    // Reload what that page shows. The drop-vault cards carry a storage ring, so coming back from a
+    // vault where files were just added must re-read them or the ring shows the figure from before.
+    if (origin === 'uploadlinks') loadMyReceivers(); else loadVaults();
 }
 
 // Upload files to vault
@@ -18494,7 +18519,7 @@ function renderReceiverVaults(receivers) {
         card.appendChild(files);
         const actions = document.createElement('div'); actions.className = 'rc-vault-actions flex gap-sm';
         const open = _el('button', 'btn btn-primary btn-sm', 'Open vault'); open.type = 'button';
-        open.addEventListener('click', () => openVault(r.vault_id));
+        open.addEventListener('click', () => openVault(r.vault_id, { from: 'uploadlinks' }));
         const info = _el('button', 'btn btn-secondary btn-sm', 'Info'); info.type = 'button';
         info.addEventListener('click', () => openReceiverInfoModal(r));
         actions.appendChild(open); actions.appendChild(info); card.appendChild(actions);
