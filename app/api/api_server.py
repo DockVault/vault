@@ -2032,22 +2032,17 @@ def _build_audit_query(db: Session, user_id=None, action=None, from_date=None, t
             pass  # ignore an unparseable user id rather than 500
     if action:
         q = q.filter(AuditLog.action.ilike(f"%{_like_escape(action)}%", escape="\\"))
-    if from_date:
-        try:
-            q = q.filter(AuditLog.timestamp >= datetime.fromisoformat(from_date))
-        except ValueError:
-            pass
-    if to_date:
-        try:
-            parsed = datetime.fromisoformat(to_date)
-            # A bare DATE means "up to the end of that day", so a whole day is added. A value that
-            # names a TIME means exactly that instant, and adding a day to it would quietly widen the
-            # range by 24 hours — "up to 14:30" returning tomorrow lunchtime's events as well. Both
-            # spellings arrive here, because fromisoformat accepts either, so they must be told apart.
-            whole_day = len(to_date.strip()) <= 10          # "YYYY-MM-DD" and nothing more
-            q = q.filter(AuditLog.timestamp < (parsed + timedelta(days=1) if whole_day else parsed))
-        except ValueError:
-            pass
+    # Both bounds come from app.core.audit_range, which is side-effect-free and therefore testable
+    # against the real function. It also holds the reason the two ends differ: a bare date means the
+    # whole day, an instant means that instant, and treating them alike widened every timed range by
+    # 24 hours.
+    from app.core import audit_range
+    start = audit_range.lower_bound(from_date)
+    if start is not None:
+        q = q.filter(AuditLog.timestamp >= start)
+    end = audit_range.upper_bound(to_date)
+    if end is not None:
+        q = q.filter(AuditLog.timestamp < end)
     return q
 
 
