@@ -6633,6 +6633,10 @@ function connectMonitorWebSocket() {
 
 // Handle incoming monitor event
 function handleMonitorEvent(data) {
+    // The Audit Log listens to the same feed, but only as a nudge to re-read itself. Placed first
+    // and wrapped so it can neither change nor break anything below it: the Live Monitor's own
+    // handling is untouched, and a fault here must not take the monitor down with it.
+    try { auditLiveNote(); } catch (_) { /* the audit view is not the monitor's problem */ }
     // Emitted types: login, logout, upload, download, security_incident, error (+ Path A operation_cancelled).
     // Server broadcasts wrap the event under `event`; unwrap for inspection. (The historic bug read the
     // row fields off the TOP-LEVEL `data`, so wrapped Path-A frames rendered as type:'unknown' with an
@@ -10356,6 +10360,148 @@ function _auditPageSlice() {
     return { start, logs: _auditLogs.slice(start, start + _AUDIT_PAGE_SIZE) };
 }
 
+// ============================================================================
+// AUDIT LOG: LIVE UPDATES + A SWITCHABLE VIEW
+// ----------------------------------------------------------------------------
+// The Live Monitor page is untouched. This reuses the activity socket it already
+// opens app-wide, but only as a NUDGE: an event says "something happened", and the
+// audit log then re-reads itself from the server. It never renders a websocket
+// frame as an audit row.
+//
+// That distinction matters. A monitor frame and an audit row are different shapes
+// with different fields, and inventing a row from the wrong one would put entries
+// on screen that the server never recorded — a log you cannot trust is worse than
+// one that is a second out of date. Re-reading costs one request per burst and
+// every row remains exactly what /audit/log returned.
+// ============================================================================
+
+const AUDIT_VIEW_KEY = 'auditView';       // 'table' (compact) | 'cards' (detailed)
+let _auditLiveOn = false;
+let _auditLiveTimer = null;
+let _auditLivePoll = null;
+// Often enough to feel live on a page someone is watching; slow enough that leaving the tab
+// open all day is not a load problem.
+const _AUDIT_LIVE_POLL_MS = 5000;
+
+function auditView() {
+    try {
+        return localStorage.getItem(AUDIT_VIEW_KEY) === 'cards' ? 'cards' : 'table';
+    } catch (_) {
+        return 'table';   // private mode / storage blocked — the compact view is the safe default
+    }
+}
+
+function setAuditView(view) {
+    const next = view === 'cards' ? 'cards' : 'table';
+    try { localStorage.setItem(AUDIT_VIEW_KEY, next); } catch (_) { /* remembering is a convenience */ }
+    applyAuditView();
+    renderAuditPage();
+}
+
+function applyAuditView() {
+    const view = auditView();
+    const table = document.querySelector('#settings-tab-audit .data-table-wrapper');
+    const cards = document.getElementById('audit-log-cards');
+    if (table) table.hidden = (view !== 'table');
+    if (cards) cards.hidden = (view !== 'cards');
+    document.querySelectorAll('[data-audit-view]').forEach(btn => {
+        const on = btn.getAttribute('data-audit-view') === view;
+        btn.classList.toggle('btn-primary', on);
+        btn.classList.toggle('btn-ghost', !on);
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+}
+
+// The detailed view. Same rows, same page, more of each row visible without opening
+// anything — which is the point of having two: the table scans, the cards read.
+function renderAuditCards(logs, start) {
+    const host = document.getElementById('audit-log-cards');
+    if (!host) return;
+    host.replaceChildren();
+    if (!logs.length) {
+        host.appendChild(_el('p', 'text-secondary text-center py-xl',
+            'No audit log entries found for the selected filters'));
+        return;
+    }
+    logs.forEach((log, i) => {
+        const gi = start + i;
+        const ok = log.status === 'success';
+        const card = _el('div', 'audit-card' + (ok ? '' : ' is-bad'));
+
+        const head = _el('div', 'audit-card-head');
+        head.appendChild(_el('span', 'badge badge-secondary', (log.action || '').replace(/_/g, ' ')));
+        head.appendChild(_el('span', 'badge badge-' + (ok ? 'success' : 'danger'), log.status || '-'));
+        head.appendChild(_el('span', 'audit-card-when', formatServerTime(log.timestamp)));
+        card.appendChild(head);
+
+        const who = _el('div', 'audit-card-who');
+        who.appendChild(_el('span', '', log.username || 'unknown user'));
+        if (log.ip_address) who.appendChild(_el('span', 'text-tertiary', ' · ' + log.ip_address));
+        if (log.resource_type) {
+            who.appendChild(_el('span', 'text-tertiary',
+                ' · ' + log.resource_type + (log.resource_id ? ' ' + log.resource_id : '')));
+        }
+        card.appendChild(who);
+
+        const view = _el('button', 'btn btn-ghost btn-sm', 'View details');
+        view.type = 'button';
+        view.addEventListener('click', () => openAuditEventModal(gi));
+        card.appendChild(view);
+
+        host.appendChild(card);
+    });
+}
+
+// --- live -------------------------------------------------------------------
+
+function setAuditLive(on) {
+    _auditLiveOn = !!on;
+    const dot = document.getElementById('audit-live-dot');
+    if (dot && !_auditLiveOn) dot.hidden = true;
+    if (_auditLiveTimer) { clearTimeout(_auditLiveTimer); _auditLiveTimer = null; }
+    if (_auditLivePoll) { clearInterval(_auditLivePoll); _auditLivePoll = null; }
+    if (!_auditLiveOn) return;
+
+    // Live means live from now: re-read once on switching on, so the view is not still showing
+    // whatever happened to be there when the box was ticked.
+    void auditLiveRefresh();
+
+    // THE POLL IS THE MECHANISM HERE, NOT A BACKSTOP, AND THAT IS DELIBERATE.
+    // The activity socket carries only a fraction of what is audited: 19 broadcast sites against 91
+    // that write an audit row -- counted, not estimated -- so roughly one auditable action in five
+    // ever reaches it. Creating a vault is one of the four in five that does not. A socket-only
+    // "live" would therefore LOOK live while silently missing most events, which on a page whose
+    // whole purpose is to be complete is worse than not offering live at all. The socket nudge is
+    // kept because it makes the events it does carry appear at once; the poll is what makes the
+    // claim true for the rest.
+    _auditLivePoll = setInterval(() => { void auditLiveRefresh(); }, _AUDIT_LIVE_POLL_MS);
+}
+
+// Called for every activity frame. Coalesced: a burst of twenty events is one re-read,
+// not twenty, and a quiet deployment costs nothing at all.
+function auditLiveNote() {
+    if (!_auditLiveOn || !auditTabIsOpen()) return;
+    if (_auditLiveTimer) return;
+    _auditLiveTimer = setTimeout(() => { _auditLiveTimer = null; auditLiveRefresh(); }, 600);
+}
+
+function auditTabIsOpen() {
+    const tab = document.getElementById('settings-tab-audit');
+    const section = document.getElementById('settings-section');
+    return !!(tab && section && section.classList.contains('active') && tab.classList.contains('active'));
+}
+
+async function auditLiveRefresh() {
+    if (!auditTabIsOpen()) return;
+    const dot = document.getElementById('audit-live-dot');
+    if (dot) dot.hidden = false;
+    try {
+        await searchAuditLog({ silent: true });
+    } finally {
+        if (dot) setTimeout(() => { dot.hidden = true; }, 400);
+    }
+}
+
 function renderAuditPage() {
     const tbody = document.getElementById('audit-log-body');
     if (!tbody) return;
@@ -10388,6 +10534,9 @@ function renderAuditPage() {
             tbody.appendChild(tr);
         });
     }
+    // The detailed view renders from the same page slice, so the two can never disagree about
+    // what is on screen — they are two drawings of one list, not two lists.
+    renderAuditCards(logs, start);
     const countBadge = document.getElementById('audit-count');
     if (countBadge) countBadge.textContent = total + (total === 1 ? ' entry' : ' entries');
     renderAuditPagination(total, pages);
@@ -10461,12 +10610,17 @@ function _renderAuditEventModal(selectedIndex) {
     }
 }
 
-async function searchAuditLog() {
+async function searchAuditLog(options) {
     const tbody = document.getElementById('audit-log-body');
     const countBadge = document.getElementById('audit-count');
-    
+    // A live re-read must not blink. The spinner belongs to a search someone asked for; showing it
+    // every few seconds on its own would make a quiet page look busy and hide the rows being read.
+    const quiet = !!(options && options.silent);
+
     try {
-        tbody.innerHTML = '<tr><td colspan="6" class="text-center py-lg"><div class="loading-spinner mx-auto"></div></td></tr>';
+        if (!quiet) tbody.innerHTML = '<tr><td colspan="6" class="text-center py-lg"><div class="loading-spinner mx-auto"></div></td></tr>';
+        // Keep the reader where they were across a live refresh: re-reading is not a new search.
+        const keepPage = quiet ? _auditPage : 0;
         
         // Get filter values
         const filters = {
@@ -10488,7 +10642,7 @@ async function searchAuditLog() {
         // Store the fetched set and render the first page. Rows and the event modal are built with
         // DOM APIs (below) so all values go through textContent.
         _auditLogs = Array.isArray(logs) ? logs : [];
-        _auditPage = 0;
+        _auditPage = quiet ? keepPage : 0;
         renderAuditPage();
     } catch (error) {
         console.error('Failed to search audit log:', error);
@@ -10649,6 +10803,15 @@ function attachSettingsListeners() {
         searchBtn.addEventListener('click', searchAuditLog);
     }
     
+    // Remembered view, live toggle. applyAuditView() runs here so the stored choice is in force on
+    // first paint rather than after the first search.
+    applyAuditView();
+    document.querySelectorAll('[data-audit-view]').forEach(btn => {
+        btn.addEventListener('click', () => setAuditView(btn.getAttribute('data-audit-view')));
+    });
+    const auditLive = document.getElementById('audit-live');
+    if (auditLive) auditLive.addEventListener('change', () => setAuditLive(auditLive.checked));
+
     const exportBtn = document.getElementById('audit-export-btn');
     if (exportBtn) {
         exportBtn.addEventListener('click', exportAuditLog);

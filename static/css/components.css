@@ -2373,3 +2373,24 @@ body.ctx-menu-open .action-more-wrap.cluster-right:focus-within .action-cluster 
 .tpl-node.is-off input[type="text"] { color: var(--text-3); text-decoration: line-through; }
 .tpl-node-actions { display: flex; gap: 2px; opacity: 0; transition: opacity .1s ease; }
 .tpl-node:hover .tpl-node-actions, .tpl-node:focus-within .tpl-node-actions { opacity: 1; }
+
+/* Audit log: the detailed view, and the switch between it and the compact table. */
+.view-switch { display: inline-flex; border: 1px solid var(--surface-3); border-radius: var(--radius-md); overflow: hidden; }
+.view-switch .btn { border-radius: 0; border: 0; }
+.audit-cards { display: flex; flex-direction: column; gap: var(--space-sm); padding: var(--space-md); }
+/* `.audit-cards` sets display, which beats the UA `[hidden] { display: none }` — the same trap this
+   file documents for the copied-items button, the upload-link footer and the groups menu. */
+.audit-cards[hidden] { display: none; }
+.audit-card {
+    padding: var(--space-sm) var(--space-md);
+    border: 1px solid var(--surface-3);
+    border-left: 3px solid var(--success);
+    border-radius: var(--radius-md);
+    background: var(--surface-1);
+}
+/* A failed action is the one someone is scanning for, so it is marked on the edge rather than only
+   in a badge — findable down the left margin without reading every row. */
+.audit-card.is-bad { border-left-color: var(--danger); }
+.audit-card-head { display: flex; align-items: center; gap: var(--space-xs); flex-wrap: wrap; }
+.audit-card-when { margin-left: auto; color: var(--text-3); font-size: var(--text-sm); }
+.audit-card-who { margin-top: 4px; color: var(--text-2); font-size: var(--text-sm); }

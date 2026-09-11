@@ -2039,7 +2039,13 @@ def _build_audit_query(db: Session, user_id=None, action=None, from_date=None, t
             pass
     if to_date:
         try:
-            q = q.filter(AuditLog.timestamp < datetime.fromisoformat(to_date) + timedelta(days=1))
+            parsed = datetime.fromisoformat(to_date)
+            # A bare DATE means "up to the end of that day", so a whole day is added. A value that
+            # names a TIME means exactly that instant, and adding a day to it would quietly widen the
+            # range by 24 hours — "up to 14:30" returning tomorrow lunchtime's events as well. Both
+            # spellings arrive here, because fromisoformat accepts either, so they must be told apart.
+            whole_day = len(to_date.strip()) <= 10          # "YYYY-MM-DD" and nothing more
+            q = q.filter(AuditLog.timestamp < (parsed + timedelta(days=1) if whole_day else parsed))
         except ValueError:
             pass
     return q
