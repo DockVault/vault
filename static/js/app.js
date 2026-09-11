@@ -18868,6 +18868,11 @@ const _RC_SECRET_STRENGTH = { none: 0, pin: 1, password: 2 };
 // cap still wins — this only fills the field when nothing else decides it. Links that already exist
 // carry their own stored budget and are never revisited by this.
 const RC_DEFAULT_TOTAL_MB = 1024;   // 1 GB
+// Plaintext upload-link URLs seen in THIS page session, keyed by receiver id. The server keeps
+// only a sha256 of each token, so this is the only place a URL can still be read — and only
+// until the page is reloaded. Deliberately not persisted: a bearer credential on disk is exactly
+// what hashing the token was protecting against.
+const rcSessionUrls = Object.create(null);
 
 function _mbFromBytes(b) { return (b != null && b > 0) ? Math.round(b / _MB) : ''; }
 function _bytesFromMb(mb) { const n = parseInt(mb, 10); return Number.isFinite(n) && n > 0 ? n * _MB : null; }
@@ -18940,6 +18945,25 @@ function renderReceiverVaults(receivers) {
         open.addEventListener('click', () => openVault(r.vault_id, { from: 'uploadlinks' }));
         const info = _el('button', 'btn btn-secondary btn-sm', 'Info'); info.type = 'button';
         info.addEventListener('click', () => openReceiverInfoModal(r));
+        // The third control the owner asked for. It is TWO buttons rather than one, because the
+        // honest answer depends on something the server cannot change: the token is stored only as
+        // its sha256, so a link created before this page loaded genuinely cannot be shown again.
+        //   · seen this session  -> Copy link, straight to the clipboard
+        //   · not seen           -> Replace link, which mints a new one and shows it once
+        // Offering a single "Copy link" that silently failed for most links would be worse than
+        // saying which of the two situations you are in.
+        const known = rcSessionUrls[r.id];
+        if (known) {
+            const copy = _el('button', 'btn btn-secondary btn-sm', 'Copy link'); copy.type = 'button';
+            copy.title = 'Copy this upload link to the clipboard';
+            copy.addEventListener('click', () => rcCopyUrl(known));
+            actions.appendChild(copy);
+        } else {
+            const replace = _el('button', 'btn btn-secondary btn-sm', 'Replace link'); replace.type = 'button';
+            replace.title = 'Mint a new URL for this drop vault. The old one stops working.';
+            replace.addEventListener('click', () => rcReplaceLink(r));
+            actions.appendChild(replace);
+        }
         actions.appendChild(open); actions.appendChild(info); card.appendChild(actions);
         grid.appendChild(card);
     });
@@ -19138,6 +19162,10 @@ async function submitReceiver() {
         const rec = await apiRequest('/receivers', { method: 'POST', body: JSON.stringify(payload) });
         const url = window.location.origin + (rec.url_path || ('/u/' + rec.token));
         state._lastRcUrl = url;
+        // Keep it against the receiver's id too, so the drop-vault card can offer Copy for a link
+        // created in this session. In memory only: the server stores the token hashed and cannot
+        // give it back, and writing it to disk here would quietly undo that.
+        rcSessionUrls[rec.id] = url;
         _rcEl('rc-form').hidden = true; _rcEl('rc-result').hidden = false;
         _rcEl('rc-link-value').value = url;
         btn.hidden = true;
@@ -19147,6 +19175,47 @@ async function submitReceiver() {
     } catch (e) {
         if (err) { err.textContent = (e && e.message) || 'Could not create the upload link.'; err.hidden = false; }
         btn.disabled = false;
+    }
+}
+
+// Copy an upload-link URL we still hold in memory for this session.
+function rcCopyUrl(url) {
+    if (!url) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(() => showSuccess('Link copied'))
+            .catch(() => showError('Copy failed — open Info and copy it from there.'));
+    } else {
+        showError('Copying is not available in this browser.');
+    }
+}
+
+// Mint a new URL for a drop vault whose link is no longer recoverable, and show it once.
+//
+// Asks first, and says the part that costs something: the previous URL stops working immediately, so
+// anyone already holding it has to be sent the new one. That is the price of the token being stored
+// hashed, and it is the right price — it means a copy of the database cannot mint working links.
+async function rcReplaceLink(r) {
+    // showConfirm(message, title) — its third parameter is requireInput, NOT an options object.
+    // Passing one would have been truthy and turned this into a type-the-word confirmation.
+    const ok = await showConfirm(
+        'The current link will stop working straight away, and anyone already using it will need the '
+        + 'new one. The files already uploaded are not affected.',
+        'Replace this upload link?');
+    if (!ok) return;
+    try {
+        const res = await apiRequest(`/receivers/${r.id}/replace-link`, { method: 'POST' });
+        const url = window.location.origin + (res.url_path || ('/u/' + res.token));
+        rcSessionUrls[r.id] = url;
+        state._lastRcUrl = url;
+        // showPrompt takes { password, placeholder, defaultValue } — there is no readOnly, so the
+        // field is editable. That is cosmetic here: the value is already copied below, and editing a
+        // displayed copy cannot change the token the server minted.
+        await showPrompt('This is the new link. It is shown once — copy it now.', 'New upload link',
+                         { defaultValue: url });
+        rcCopyUrl(url);
+        loadMyReceivers();
+    } catch (e) {
+        showError((e && e.message) || 'Could not replace the link.');
     }
 }
 

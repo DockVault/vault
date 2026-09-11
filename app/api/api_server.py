@@ -11238,6 +11238,57 @@ async def pause_receiver(
     return {"ok": True, "id": str(r.id), "paused": bool(r.paused)}
 
 
+@app.post("/receivers/{receiver_id}/replace-link")
+async def replace_receiver_link(
+    receiver_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Mint a NEW URL token for one of MY upload links, and return it once.
+
+    This is the honest answer to "I lost the link". The token is a bearer credential and is stored
+    only as its sha256, deliberately: a database read -- a backup, a dump, a replica, an admin with
+    SELECT -- must not be able to mint working upload links. That property is worth more than the
+    convenience of showing the old URL again, and it is the reason the old URL genuinely cannot be
+    recovered rather than merely being withheld.
+
+    So the link is REPLACED instead. The previous token stops working the moment this returns, which
+    is a real consequence and is why the interface asks before calling it: anyone already holding the
+    old URL must be sent the new one. Everything else about the link -- its tag, caps, expiry,
+    retention, its drop vault and everything already uploaded into it -- is untouched.
+    """
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="A temporary session cannot manage upload links.")
+    r = db.query(Receiver).filter(Receiver.id == receiver_id,
+                                  Receiver.owner_id == current_user.id).first()
+    if not r:
+        raise HTTPException(status_code=404, detail="Upload link not found")
+    if r.revoked:
+        raise HTTPException(status_code=400, detail="This upload link has been revoked.")
+
+    # Same allocation discipline as creation: generate, hash, and only keep a candidate whose hash is
+    # unused. Bounded attempts rather than a loop that could spin.
+    token = token_hash = None
+    for _ in range(8):
+        cand = _notelink_gen_token(r.token_len)
+        cand_hash = _receiver_token_hash(cand)
+        if not db.query(Receiver.id).filter(Receiver.token_hash == cand_hash).first():
+            token, token_hash = cand, cand_hash
+            break
+    if token is None:
+        raise HTTPException(status_code=500, detail="Could not allocate a link token; try again.")
+
+    r.token_hash = token_hash
+    db.commit()
+
+    # Replacing a link is an access change: the old URL stops working and a new bearer credential
+    # exists. The token itself is NEVER written to the log.
+    _audit_access_change(db, current_user, "receiver_link_replaced", "receiver", str(r.id))
+
+    return {"ok": True, "id": str(r.id), "token": token, "url_path": f"/u/{token}"}
+
+
 @app.post("/receivers/{receiver_id}/revoke")
 async def revoke_receiver(
     receiver_id: uuid.UUID,

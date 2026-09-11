@@ -146,11 +146,20 @@ def test_a_revoke_is_logged_only_when_something_was_revoked():
 
 @pytest.mark.unit
 def test_the_helper_is_the_single_shape_for_all_of_them():
-    """Six call sites, one helper. Hand-rolled AuditLogger calls at each would drift."""
+    """One helper, not a hand-rolled AuditLogger call per endpoint.
+
+    This asserted an exact call count, which was brittle by construction: adding a legitimate new
+    access change — replacing an upload link, say — broke it, and the only available fix was to edit
+    the number, which is not a check at all. What is worth pinning is that no access-control endpoint
+    writes its own audit row directly, because that is how the shapes drift apart.
+    """
     src = API.read_text(encoding="utf-8")
-    calls = src.count("_audit_access_change(db,")
-    # 6 call sites plus the definition line itself.
-    assert calls == 7, f"expected the access-control set to route through the helper, found {calls}"
+    assert src.count("_audit_access_change(db,") >= 7, (
+        "the access-control set should route through the helper")
+    for verb, path in ACCESS_ENDPOINTS:
+        body = _endpoint_body(src, verb, path)
+        assert "AuditLogger(" not in body, (
+            f"{verb.upper()} {path} builds its own audit row instead of using the shared helper")
 
 
 # --------------------------------------------------------------------------- integration lane
