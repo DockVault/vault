@@ -11239,6 +11239,7 @@ async def pause_receiver(
 
 
 @app.post("/receivers/{receiver_id}/replace-link")
+@require_step_up("receiver.create")
 async def replace_receiver_link(
     receiver_id: uuid.UUID,
     request: Request,
@@ -11260,6 +11261,12 @@ async def replace_receiver_link(
     """
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="A temporary session cannot manage upload links.")
+    # The same two gates as creating a link, because a replacement IS a fresh bearer credential.
+    # The step-up decorator above is the first: a session that cannot pass the step-up to create a
+    # link must not be able to mint one here instead. This is the second: a deployment that has
+    # switched upload links off must not keep issuing live URLs for the links that already exist.
+    if not receiver_policy.public_receivers_enabled(_global_settings_blob(db)):
+        raise HTTPException(status_code=403, detail="Upload links are disabled on this deployment.")
     r = db.query(Receiver).filter(Receiver.id == receiver_id,
                                   Receiver.owner_id == current_user.id).first()
     if not r:

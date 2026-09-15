@@ -130,23 +130,33 @@ def tag_allows_target(tag, target_kind: str) -> bool:
 # The seeded catalog: a fresh deployment gets these (inert until public links are enabled). Colours +
 # icons drive the "Shared (by me)" tiles. Longer tokens for the secure tiers; the Confidential tag
 # mandates a password + one-time use + a 1-day expiry.
-# Every seeded tag permits all three target kinds. Without an explicit allowed_targets a tag falls
-# back to ["note"], so a fresh deployment could publish a note but not a file or a folder until an
-# admin edited a tag by hand — the sharper end of that being that the feature looked broken rather
-# than switched off. Seed-time only: an existing deployment's tags are never revisited, and an admin
-# who narrows a tag keeps their choice.
+#
+# What a tag may publish follows from what its token can safely carry, not from its name. Without an
+# explicit allowed_targets a tag falls back to ["note"], so a fresh deployment could once publish a
+# note but not a file or a folder until an admin edited a tag by hand — the feature looked broken
+# rather than switched off. Seeding every tag with every kind fixed that, and went one tag too far:
+# "Open" is a 6-character, never-expiring, secretless, auto-enrolled link. That floor was calibrated
+# for a short text note, and against the per-IP redemption budget a 6-character token is an
+# enumeration target — so from day one any user could have published a whole folder to a permanent
+# guessable URL, and the tag's description never said it could.
+#
+# So Open publishes NOTES only and stays the short convenience link it was meant to be, while
+# Restricted and Confidential — 20-character tokens, an expiry — publish notes, files and folders.
+# Each description says what its tag permits. Seed-time only: an existing deployment's tags are never
+# revisited, and an admin who widens or narrows a tag keeps their choice.
+_NOTE_ONLY = ["note"]
 _ALL_TARGETS = ["note", "file", "folder"]
 
 DEFAULT_NOTE_LINK_TAGS = (
-    {"name": "Open", "description": "Short, easy link — no expiry, no password, unlimited views.",
+    {"name": "Open", "description": "Short, easy link to a note — no expiry, no password, unlimited views.",
      "border_color": "green", "icon": "globe", "min_token_len": 6,
      "default_ttl_hours": None, "max_ttl_hours": None, "require_secret": "none",
-     "max_uses_cap": None, "auto_enroll_new_users": True, "allowed_targets": list(_ALL_TARGETS)},
-    {"name": "Restricted", "description": "Long link, expires after 7 days, no password.",
+     "max_uses_cap": None, "auto_enroll_new_users": True, "allowed_targets": list(_NOTE_ONLY)},
+    {"name": "Restricted", "description": "Long link to a note, file or folder — expires after 7 days, no password.",
      "border_color": "amber", "icon": "clock", "min_token_len": 20,
      "default_ttl_hours": 168, "max_ttl_hours": 168, "require_secret": "none",
      "max_uses_cap": None, "auto_enroll_new_users": True, "allowed_targets": list(_ALL_TARGETS)},
-    {"name": "Confidential", "description": "Long link, password-protected, one view, expires in 1 day.",
+    {"name": "Confidential", "description": "Long link to a note, file or folder — password-protected, one view, expires in 1 day.",
      "border_color": "red", "icon": "lock", "min_token_len": 20,
      "default_ttl_hours": 24, "max_ttl_hours": 24, "require_secret": "password",
      "password_min_len": 8, "password_require_alnum": True, "max_uses_cap": 1,

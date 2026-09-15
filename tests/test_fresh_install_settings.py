@@ -96,15 +96,80 @@ def test_the_startup_seed_is_gated_on_the_bootstrap_status():
 
 
 @pytest.mark.unit
-def test_every_seeded_note_link_tag_permits_files_and_folders():
-    for tag in note_link_policy.DEFAULT_NOTE_LINK_TAGS:
-        assert tag.get("allowed_targets") == ["note", "file", "folder"], (
-            f"{tag['name']} should permit all three targets out of the box, got "
-            f"{tag.get('allowed_targets')!r} — without it a fresh deployment can publish a note but "
-            f"not a file until an admin edits a tag by hand")
+def test_the_seeded_tags_permit_what_their_tokens_can_safely_carry():
+    """Open is a 6-character, never-expiring, secretless link: notes only. The long-token tags
+    publish files and folders too. And every description says which, so nobody has to open the
+    editor to learn that a folder they published went out on a permanent guessable URL."""
+    tags = {t["name"]: t for t in note_link_policy.DEFAULT_NOTE_LINK_TAGS}
+
+    assert tags["Open"]["allowed_targets"] == ["note"], (
+        f"the Open tag must publish notes only, got {tags['Open']['allowed_targets']!r} — its "
+        f"6-character secretless token was calibrated for a text note, and a folder behind it is a "
+        f"whole folder on a permanent guessable link")
+    for name in ("Restricted", "Confidential"):
+        assert tags[name]["allowed_targets"] == ["note", "file", "folder"], (
+            f"{name} should publish all three kinds out of the box, got "
+            f"{tags[name]['allowed_targets']!r} — without it a fresh deployment can publish a note "
+            f"but not a file until an admin edits a tag by hand")
+        assert tags[name]["min_token_len"] >= 20, (
+            f"{name} publishes files and folders, so its token floor must be the long one")
+
+    # The descriptions are the only place a person is told, so they must agree with the policy.
+    open_desc = tags["Open"]["description"].lower()
+    assert "note" in open_desc and "file" not in open_desc and "folder" not in open_desc, (
+        f"the Open description must say it is for a note and nothing wider: {open_desc!r}")
+    for name in ("Restricted", "Confidential"):
+        desc = tags[name]["description"].lower()
+        assert all(word in desc for word in ("note", "file", "folder")), (
+            f"{name} publishes notes, files and folders and its description must say so: {desc!r}")
 
 
 # --------------------------------------------------------------------------- integration lane
+
+@pytest.mark.integration
+def test_the_open_tag_refuses_a_folder_and_the_long_token_tag_accepts_it(admin):
+    """The seeded rows, asked over HTTP what they will publish — not the catalog they came from.
+
+    A folder behind the Open tag is the thing that must never be minted: a 6-character, secretless,
+    never-expiring link to everything in it. The same folder behind Restricted is fine, because its
+    token is 20 characters and it expires. Both halves are asserted so a fix that simply refused
+    folders everywhere would not pass.
+    """
+    tags = {t["name"]: t for t in admin.get("/note-link-tags").json()}
+    for name in ("Open", "Restricted"):
+        if name not in tags:
+            pytest.skip(f"no seeded {name} tag on this deployment")
+    if "folder" not in (tags["Restricted"].get("allowed_targets") or []):
+        # An existing deployment's tags are never revisited, so one seeded before the long-token
+        # tags permitted files keeps its note-only rows. That is correct, and it is not what this
+        # test is about.
+        pytest.skip("Restricted is note-only here: seeded before the long-token tags published "
+                    "files and folders, and existing tags are never rewritten")
+
+    before = admin.get("/settings").json()
+    snap = {k: before.get(k) for k in ("public_file_links_enabled", "public_note_links_enabled")}
+    admin.put("/settings", json={"public_file_links_enabled": True, "public_note_links_enabled": True})
+    vault = admin.create_vault()
+    try:
+        made = admin.post(f"/vaults/{vault['id']}/folders", json={"name": "published"})
+        made.raise_for_status()
+        folder_id = made.json()["folder"]["id"]
+
+        def link_for(tag):
+            return admin.post("/public-links", json={"vault_id": vault["id"], "target_type": "folder",
+                                                     "target_folder_id": folder_id, "tag_id": tag["id"]})
+
+        refused = link_for(tags["Open"])
+        assert refused.status_code == 400, (
+            f"the Open tag published a folder on a 6-character permanent link: "
+            f"{refused.status_code} {refused.text}")
+        accepted = link_for(tags["Restricted"])
+        assert accepted.status_code == 200, (
+            f"the Restricted tag should publish a folder: {accepted.status_code} {accepted.text}")
+    finally:
+        admin.delete_vault(vault["id"])
+        admin.put("/settings", json={k: val for k, val in snap.items() if val is not None})
+
 
 @pytest.mark.integration
 def test_a_running_fresh_deployment_reports_the_features_on(admin):

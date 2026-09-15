@@ -156,8 +156,9 @@ def test_tag_must_permit_the_target_kind(admin, files_enabled):
 
 
 def test_default_note_link_tags_do_not_permit_files(admin, files_enabled):
-    # The seeded Open/Restricted/Confidential tags default to note-only, so they cannot mint file links
-    # until an admin opts them in — no deployment wakes up exposing files.
+    # The seeded Open tag is note-only however the deployment was seeded: its 6-character secretless
+    # token was calibrated for a text note, so it cannot mint a file link until an admin opts it in.
+    # (The long-token Restricted/Confidential tags publish files and folders on a fresh install.)
     v = admin.create_vault()
     try:
         _upload(admin, v["id"], "y.txt")
@@ -318,8 +319,10 @@ def test_public_link_policy_reader(admin, files_enabled):
     # allowlist internals never leak
     for leak in ("allowed_user_ids", "blocked_user_ids", "allowed_department_ids", "auto_enroll_new_users"):
         assert leak not in row, f"leaked {leak}"
-    # The default seeded note-only tags must NOT appear (they permit no file/folder target).
-    assert "Open" not in names and "Restricted" not in names
+    # The seeded Open tag is note-only and must NOT appear here. (Restricted and Confidential do on
+    # a fresh install — their long tokens publish files and folders — and do not on one seeded
+    # earlier, so neither presence is asserted.)
+    assert "Open" not in names
 
 
 def test_policy_off_returns_no_tags(admin):
