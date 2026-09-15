@@ -269,6 +269,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.29.0": {
+      "released": "2026-09-15",
+      "notes": "Eleven product improvements and their fixes. Bugs: the file list is no longer empty after an idle-lock re-login; a vault's hover bar and its menu are now mutually exclusive; opening a vault from Upload links stays on that page and Back returns there. Defaults for NEW vaults and links only: a new vault defaults to 5 GiB (bounded by the account's remaining headroom, and refused below a usable floor exactly as an explicit request would be); a new upload link defaults to a 1 GiB budget. Audit Log: live updates, a compact table view, filters by user and by date-and-time (sent as explicit instants, so they mean the same thing in every time zone), and audit rows for access-control actions that previously wrote none -- group membership and group vault access now record who gained or lost what, and only when something changed. Upload links: the created-link dialog shows the link once with a Done button; the drop-vault card reports its usage and offers Copy link; replacing a link is gated exactly as creating one (step-up, the feature switch and the tag allowlist); 'drop box' is now 'drop vault'. Fresh deployments only: friendlier defaults seeded at first bootstrap -- a 50 GiB account quota shown live in Settings, temporary vault passcodes, sharing with its tags, public note links, public file and folder links, upload links, invite-by-link, and public-link tags that say exactly what they permit (the short no-expiry tag publishes notes only; the long-token tags publish notes, files and folders). An existing deployment upgraded to this version keeps every setting and every tag it had. Groups: 'Load from template' presets with an editable tree. Signing out clears every link shown during the session. No schema change: the only model edit is the Python-side default for a new vault's size, so an upgrade alters no existing row and a rollback to 0.28.0 is clean.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -507,6 +515,13 @@
     {
       "from": "0.27.0",
       "to": "0.28.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.28.0",
+      "to": "0.29.0",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
