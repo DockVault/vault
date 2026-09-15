@@ -19,6 +19,7 @@ file is the guard that runs everywhere, including where no cgroup is readable.
 import asyncio
 import hashlib
 import io
+import threading
 
 import pytest
 
@@ -35,10 +36,38 @@ PIECE = max(256 * 1024, io.DEFAULT_BUFFER_SIZE * 2)
 
 
 def _run(coro):
-    # `asyncio.run`, so the loop shuts its async generators down. Abandoning one mid-iteration is
-    # exactly what the refusal path does, and a bare `run_until_complete` leaves it pending and
-    # warns about it long after the test that caused it has passed.
-    return asyncio.run(coro)
+    """Run an async body on a loop of its own, in a thread of its own.
+
+    `asyncio.run` refuses when a loop is already running in the calling thread, and in a single
+    invocation of the whole suite one IS running by the time this file is reached: Playwright's
+    sync API drives its loop on a greenlet in the main thread and never returns from it, and its
+    fixtures are session-scoped, so any browser-driven module that sorts before this one leaves the
+    thread's running-loop set for the rest of the process. These tests then fail for a reason that
+    has nothing to do with what they check. A unit test should not depend on ambient loop state at
+    all, so it brings its own thread — and still shuts the loop's async generators down, because
+    abandoning one mid-iteration is exactly what the refusal paths under test do.
+    """
+    outcome = {}
+
+    def _worker():
+        loop = asyncio.new_event_loop()
+        try:
+            outcome["value"] = loop.run_until_complete(coro)
+        except BaseException as exc:                # noqa: BLE001 - re-raised on the caller
+            outcome["error"] = exc
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            finally:
+                loop.close()
+
+    thread = threading.Thread(target=_worker)
+    thread.start()
+    thread.join(timeout=60)
+    assert not thread.is_alive(), "the async body did not finish"
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
 
 
 class _WatchingStream:

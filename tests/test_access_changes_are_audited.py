@@ -242,22 +242,21 @@ def _rows(admin, action, resource_id):
 
 @pytest.mark.integration
 def test_granting_access_shows_up_in_the_audit_log(admin, temp_vault, temp_user):
-    """Read the row back out of the log, rather than trusting that the call site exists."""
-    before = admin.get("/audit/log?action=vault_permission_granted").json()
-    n_before = len(before) if isinstance(before, list) else 0
+    """Read the row back out of the log, rather than trusting that the call site exists.
+
+    By the row's identity, not by the count going up: the log answers at most a page of five
+    hundred, so on a busy deployment the count cannot rise, and the newest row may be someone
+    else's."""
+    assert not _rows(admin, "vault_permission_granted", temp_vault["id"]), "anchor: no row yet"
 
     r = admin.post(f"/vaults/{temp_vault['id']}/permissions",
                    json={"user_id": temp_user["id"], "level": "read"})
     assert r.status_code in (200, 201), r.text
 
-    after = admin.get("/audit/log?action=vault_permission_granted").json()
-    assert isinstance(after, list), after
-    assert len(after) > n_before, "granting access wrote no audit row"
-
-    row = after[0]
-    assert row.get("action") == "vault_permission_granted", row
-    assert str(temp_vault["id"]) == str(row.get("resource_id")), (
-        f"the row should name the vault whose access changed: {row}")
+    rows = _rows(admin, "vault_permission_granted", temp_vault["id"])
+    assert len(rows) == 1, f"granting access should write exactly one row for the vault: {rows}"
+    assert (rows[0].get("details") or {}).get("user_id") == str(temp_user["id"]), (
+        f"the row should name who was granted access: {rows[0]}")
 
 
 @pytest.mark.integration

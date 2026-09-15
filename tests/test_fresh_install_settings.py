@@ -168,7 +168,9 @@ def test_the_open_tag_refuses_a_folder_and_the_long_token_tag_accepts_it(admin):
             f"the Restricted tag should publish a folder: {accepted.status_code} {accepted.text}")
     finally:
         admin.delete_vault(vault["id"])
-        admin.put("/settings", json={k: val for k, val in snap.items() if val is not None})
+        # Every key back as found, an absent one as off. Dropping absent keys left the switch on
+        # after this test on a deployment where it had never been set.
+        admin.put("/settings", json={k: bool(val) for k, val in snap.items()})
 
 
 @pytest.mark.integration
