@@ -1923,6 +1923,16 @@ function logout() {
         const el = document.getElementById(id);
         if (el) el.replaceChildren();
     });
+    // Upload-link and public-link URLs are bearer credentials. The ones minted in this session are
+    // held in memory for the drop-vault card's Copy button and sit in the result field of three
+    // dialogs, and the server cannot produce them again — so the next person on this tab must not
+    // find them either. Same class of residue as the vault title above.
+    for (const id of Object.keys(rcSessionUrls)) delete rcSessionUrls[id];
+    state._lastRcUrl = null;
+    ['rc-link-value', 'pfl-link-value', 'note-public-link-value'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.value = '';
+    });
 
     // Put the VIEW back on the dashboard as well. showScreen() below only swaps the `.screen`
     // wrappers, so whichever `.content-section` was active inside the dashboard screen survives a
@@ -3420,6 +3430,24 @@ async function fetchAccountStorage(excludeVaultId) {
     catch (_) { return null; }
 }
 function _bytesToGb(bytes) { return bytes / (1024 ** 3); }
+
+// The size a new vault is offered before the person changes it. The markup's value attribute
+// carries the same number, so a form reset lands on it too.
+const CREATE_VAULT_PREFILL_GB = 5;
+
+// A prefill above the input's own max is worse than a smaller one: native validation refuses the
+// submit with no toast and no request, so "Create vault" simply does nothing on a deployment
+// whose per-vault ceiling, or the account's remaining headroom, is under the default. Run once the
+// max is known. Kept to one decimal, which is the input's step, so the clamped value is one the
+// input accepts as well.
+function clampVaultSizePrefill(inputEl) {
+    if (!inputEl) return;
+    const ceiling = parseFloat(inputEl.max);
+    if (!Number.isFinite(ceiling)) return;
+    if (parseFloat(inputEl.value) > ceiling) {
+        inputEl.value = String(Math.max(0.1, Math.floor(ceiling * 10) / 10));
+    }
+}
 // Fill a "how much you can allocate" note + set the size input's soft max.
 //
 // For an EXISTING vault the bound comes from that vault's own storage endpoint, because on a
@@ -3467,8 +3495,8 @@ async function renderVaultSizeAvailability(noteId, inputEl, excludeVaultId, base
 async function showCreateVault() {
     // Clear whatever a previous, abandoned open left behind. Only a SUCCESSFUL create reset the
     // form, so cancelling and reopening used to show the old name, description and password.
-    // reset() restores the markup defaults (including size = 1 GB), so it has to run before the
-    // explicit field setup below rather than after it.
+    // reset() restores the markup defaults (the size input's own value attribute among them), so
+    // it has to run before the explicit field setup below rather than after it.
     //
     // This matters more now the description is one row tall: stale text that used to be obvious
     // in a three-row box can sit mostly out of sight in a one-row one.
@@ -3533,10 +3561,13 @@ async function showCreateVault() {
         }
     }
 
-    // Reset the size to the default + surface how much the account can still allocate.
+    // Reset the size to the default, then surface how much the account can still allocate. That
+    // call also sets the input's max; once it is known the prefill is clamped to it, or a ceiling
+    // under the default would leave the form refusing to submit with nothing said.
     const sizeInput = document.getElementById('vault-size-gb');
-    if (sizeInput) sizeInput.value = '5';
-    renderVaultSizeAvailability('vault-size-avail', sizeInput, null, createVaultSizeHintBase());
+    if (sizeInput) sizeInput.value = String(CREATE_VAULT_PREFILL_GB);
+    renderVaultSizeAvailability('vault-size-avail', sizeInput, null, createVaultSizeHintBase())
+        .then(() => clampVaultSizePrefill(sizeInput));
 
     // Reflect the resolved type into password + team-mode visibility, then show.
     syncCreateVaultForm();
@@ -19058,7 +19089,7 @@ function renderMyReceivers(receivers) {
         // Open the receiver's dedicated vault (where the uploads land).
         if (r.vault_id) {
             const op = _el('button', 'btn btn-ghost btn-sm', 'Open vault'); op.type = 'button';
-            op.addEventListener('click', () => { closeModal(); openVault(r.vault_id); });
+            op.addEventListener('click', () => { closeModal(); openVault(r.vault_id, { from: 'uploadlinks' }); });
             actTd.appendChild(op);
         }
         tr.appendChild(actTd); tb.appendChild(tr);
@@ -19082,6 +19113,8 @@ async function revokeReceiver(id) {
 async function openReceiverCreate() {
     if (!state._receiverPolicy) { await refreshReceiverAvailability(); }
     const policy = state._receiverPolicy || { enabled: false, tags: [] };
+    const heading = document.querySelector('#receiver-create-modal .modal-header h3');
+    if (heading) heading.textContent = 'Create an upload link';
     _rcEl('rc-form').hidden = false; _rcEl('rc-result').hidden = true;
     _rcEl('rc-create').hidden = false;
     if (_rcEl('rc-cancel')) _rcEl('rc-cancel').hidden = false;
@@ -19181,11 +19214,7 @@ async function submitReceiver() {
         // created in this session. In memory only: the server stores the token hashed and cannot
         // give it back, and writing it to disk here would quietly undo that.
         rcSessionUrls[rec.id] = url;
-        _rcEl('rc-form').hidden = true; _rcEl('rc-result').hidden = false;
-        _rcEl('rc-link-value').value = url;
-        btn.hidden = true;
-        if (_rcEl('rc-cancel')) _rcEl('rc-cancel').hidden = true;
-        if (_rcEl('rc-done')) _rcEl('rc-done').hidden = false;
+        _rcShowLinkOnce(url, 'Create an upload link');
         loadMyReceivers();
     } catch (e) {
         if (err) { err.textContent = (e && e.message) || 'Could not create the upload link.'; err.hidden = false; }
@@ -19202,6 +19231,23 @@ function rcCopyUrl(url) {
     } else {
         showError('Copying is not available in this browser.');
     }
+}
+
+// Show a freshly minted upload-link URL once, in the create dialog's result pane: the warning that
+// it will not be shown again, the URL, and a Copy button. Shared by creating a link and replacing
+// one, so both hand the credential over the same way. Copying is a click the person makes, not a
+// side effect of being shown the link — a dialog that wrote to the clipboard on its own overwrote
+// whatever they were about to paste, and did it without asking.
+function _rcShowLinkOnce(url, title) {
+    const heading = document.querySelector('#receiver-create-modal .modal-header h3');
+    if (heading) heading.textContent = title || 'Create an upload link';
+    _rcEl('rc-form').hidden = true; _rcEl('rc-result').hidden = false;
+    _rcEl('rc-link-value').value = url;
+    const err = _rcEl('rc-error'); if (err) err.hidden = true;
+    _rcEl('rc-create').hidden = true;
+    if (_rcEl('rc-cancel')) _rcEl('rc-cancel').hidden = true;
+    if (_rcEl('rc-done')) _rcEl('rc-done').hidden = false;
+    _rcEl('receiver-create-modal').classList.add('active');
 }
 
 // Mint a new URL for a drop vault whose link is no longer recoverable, and show it once.
@@ -19222,12 +19268,7 @@ async function rcReplaceLink(r) {
         const url = window.location.origin + (res.url_path || ('/u/' + res.token));
         rcSessionUrls[r.id] = url;
         state._lastRcUrl = url;
-        // showPrompt takes { password, placeholder, defaultValue } — there is no readOnly, so the
-        // field is editable. That is cosmetic here: the value is already copied below, and editing a
-        // displayed copy cannot change the token the server minted.
-        await showPrompt('This is the new link. It is shown once — copy it now.', 'New upload link',
-                         { defaultValue: url });
-        rcCopyUrl(url);
+        _rcShowLinkOnce(url, 'New upload link');
         loadMyReceivers();
     } catch (e) {
         showError((e && e.message) || 'Could not replace the link.');
