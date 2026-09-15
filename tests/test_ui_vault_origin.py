@@ -28,6 +28,8 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page
 
+from conftest import unique
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -90,7 +92,7 @@ def test_leaving_a_vault_returns_to_the_page_it_was_opened_from(
     assert after["rail"] == origin, f"the rail should follow Back to {origin}: {after}"
 
 
-def _open_upload_link(admin):
+def _open_upload_link(admin, label):
     """An upload link (and so a drop vault) to open from both places it is offered, or a skip."""
     settings = admin.get("/settings").json()
     if settings.get("public_receivers_enabled") is not True:
@@ -99,7 +101,7 @@ def _open_upload_link(admin):
     tag = next((t for t in tags if t["name"] in ("Drop vault", "Drop box")), None)
     if tag is None:
         pytest.skip("no open upload-link tag on this deployment")
-    made = admin.post("/receivers", json={"tag_id": tag["id"], "label": "origin-check",
+    made = admin.post("/receivers", json={"tag_id": tag["id"], "label": label,
                                           "max_total_bytes": 10 * 1024 * 1024})
     assert made.status_code in (200, 201), made.text
     return made.json()
@@ -116,7 +118,10 @@ def test_both_real_open_vault_buttons_on_upload_links_declare_where_they_are(
     call site passed. Each button is clicked for real here, and a third one added later without
     an origin would fail this the same way.
     """
-    rec = _open_upload_link(admin)
+    # A label no earlier run can share: a revoked link stays listed, and a row match on a reused
+    # label would be ambiguous.
+    label = unique("origin")
+    rec = _open_upload_link(admin, label)
     try:
         page.goto("/")
         _login(page, admin_creds["username"], admin_creds["password"])
@@ -127,7 +132,7 @@ def test_both_real_open_vault_buttons_on_upload_links_declare_where_they_are(
 
         # The Links tab is the one the page opens on; its table has a ghost "Open vault" button.
         page.wait_for_selector("#receivers-list table", timeout=10000)
-        page.locator("#receivers-list tr", has_text="origin-check").get_by_role(
+        page.locator("#receivers-list tr", has_text=label).get_by_role(
             "button", name="Open vault").click()
         page.wait_for_selector("#vault-view-section.active", timeout=15000)
         assert _where(page)["rail"] == "uploadlinks", (
@@ -139,8 +144,8 @@ def test_both_real_open_vault_buttons_on_upload_links_declare_where_they_are(
         # The Drop vaults tab's card has the other one.
         page.click('#uploadlinks-section [data-rc-tab="vaults"]')
         page.wait_for_selector("#receivers-vaults .rc-vault-actions", timeout=10000)
-        page.locator("#receivers-vaults .rc-vault-card, #receivers-vaults [class*='rc-vault']",
-                     has_text="origin-check").first.get_by_role("button", name="Open vault").click()
+        page.locator("#receivers-vaults .rc-vault-card", has_text=label).get_by_role(
+            "button", name="Open vault").click()
         page.wait_for_selector("#vault-view-section.active", timeout=15000)
         assert _where(page)["rail"] == "uploadlinks", (
             f"the card's Open vault should keep the rail on Upload links: {_where(page)}")

@@ -13,8 +13,8 @@ and no way to get them back short of a refresh.
 The header is the worse half and is a leak rather than an annoyance. `#vault-view-title` still held
 the previous session's vault NAME, and for a zero-knowledge vault that is the CLIENT-DECRYPTED name —
 the one the server is never permitted to see. A different person signing in on a shared tab read it
-straight off the screen. That is the same finding as the content scrub logout already does
-(F-R015-004); this closes the half that was missed.
+straight off the screen. That is the same leak the content scrub in logout already closes; this
+closes the half that was missed.
 
 Lanes:
   * ui   — the behaviour, in a real browser: open a populated vault, log out, log back in, and check
