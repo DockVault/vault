@@ -272,6 +272,23 @@ def _entry_count(page: Page) -> int:
     return int(m.group(1)) if m else -1
 
 
+def _wait_for_search(page: Page):
+    """Until the search has actually returned rows.
+
+    Counting `tr` elements is not that: the spinner row and the "no entries" placeholder are both
+    a `tr`, so on a slow, well-populated log the old wait returned while the request was still in
+    flight, and the assertions below read an empty page. The fetched set is the fact.
+    """
+    page.wait_for_function(
+        "() => Array.isArray(_auditLogs) && _auditLogs.length > 0"
+        " && !document.querySelector('#audit-log-body .loading-spinner')", timeout=20000)
+
+
+def _newest(page: Page):
+    """The identity of the newest row on the page: what moves when a new event arrives."""
+    return page.evaluate("() => _auditLogs.length ? [_auditLogs[0].timestamp, _auditLogs[0].action] : null")
+
+
 @pytest.mark.ui
 def test_the_range_filters_accept_a_time_not_just_a_date(page: Page, admin_creds):
     page.goto("/")
@@ -291,8 +308,7 @@ def test_the_view_switches_and_the_choice_is_remembered(page: Page, admin_creds)
     _login(page, admin_creds["username"], admin_creds["password"])
     _open_audit_tab(page)
     page.click("#audit-search-btn")
-    page.wait_for_function("() => document.querySelectorAll('#audit-log-body tr').length > 0",
-                           timeout=15000)
+    _wait_for_search(page)
 
     start = _which_view(page)
     assert start["table"] is True and start["cards"] is False, (
@@ -331,8 +347,7 @@ def test_live_picks_up_a_new_event_without_being_asked(page: Page, admin_creds):
     _login(page, admin_creds["username"], admin_creds["password"])
     _open_audit_tab(page)
     page.click("#audit-search-btn")
-    page.wait_for_function("() => document.querySelectorAll('#audit-log-body tr').length > 0",
-                           timeout=15000)
+    _wait_for_search(page)
 
     # Tick live FIRST, and let its one-shot refresh settle, before reading the baseline.
     #
@@ -343,20 +358,26 @@ def test_live_picks_up_a_new_event_without_being_asked(page: Page, admin_creds):
     # already brought up to date, so the only thing left that can move it is the new event.
     page.check("#audit-live")
     page.wait_for_timeout(2500)
-    before = _entry_count(page)
-    assert before >= 0, "the entry count should be readable once live has settled"
+    before = _newest(page)
+    assert before, "the newest row should be readable once live has settled"
 
     # Creating a vault is chosen deliberately: it is one of the four in five audited actions the
     # activity socket does NOT broadcast, so this can only pass if the poll is doing the work.
-    page.evaluate(
-        """async () => { await apiRequest('/vaults', { method: 'POST',
-               body: JSON.stringify({ name: 'audit-live-' + Date.now(), description: '' }) }); }"""
+    vault_id = page.evaluate(
+        """async () => { const v = await apiRequest('/vaults', { method: 'POST',
+               body: JSON.stringify({ name: 'audit-live-' + Date.now(), description: '' }) });
+               return v.id; }"""
     )
-    # No manual search anywhere below. If the number moves, the page moved it.
+    # No manual search anywhere below. If the row appears, the page fetched it.
+    #
+    # THE ROW ITSELF, not the entry count. The search returns at most a page of five hundred, so
+    # on a busy deployment the count sits at its cap and a strict increase can never be observed
+    # — which is exactly where a full test run leaves the log. And not "the newest row changed"
+    # either: on a shared deployment someone else's event can be the newest. The row for the vault
+    # just created, found in the fetched set by its id, is what live means, however long the log
+    # is and whoever else is busy.
     page.wait_for_function(
-        "(n) => { const el = document.getElementById('audit-count');"
-        " const m = (el ? el.textContent : '').match(/(\\d+)/);"
-        " return !!m && Number(m[1]) > n; }",
-        arg=before, timeout=30000)
-    after = _entry_count(page)
-    assert after > before, f"live did not pick the event up on its own: {before} -> {after}"
+        "(id) => _auditLogs.some(r => r.action === 'vault_created' && String(r.resource_id) === id)",
+        arg=vault_id, timeout=30000)
+    after = _newest(page)
+    assert after != before, f"live did not pick the event up on its own: {before} -> {after}"

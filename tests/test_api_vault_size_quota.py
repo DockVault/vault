@@ -1,6 +1,6 @@
 """Per-vault size + account-budget enforcement (the reservation model).
 
-A vault carries a declared size_limit (default 1 GB). Two admin settings bound it: max_vault_size
+A vault carries a declared size_limit (default 5 GB, bounded by the per-vault ceiling). Two admin settings bound it: max_vault_size
 (GB) is the hard per-vault ceiling; default_user_quota (GB) is a per-account budget that the SUM of
 an owner's declared vault sizes must stay under. Admins are bounded by the per-vault ceiling but
 exempt from the account budget.
@@ -25,13 +25,38 @@ def _reset_quotas(admin):
     _set_quotas(admin, 1000, 1000)
 
 
-def test_create_vault_default_size_is_1gb(admin):
+def test_create_vault_default_size_is_5gb(admin):
     v = admin.create_vault(name="qsize-default")
     try:
         got = admin.get(f"/vaults/{v['id']}").json()
-        assert got["size_limit"] == GIB
+        assert got["size_limit"] == 5 * GIB
     finally:
         admin.delete_vault(v["id"])
+
+
+def test_a_size_less_create_fits_under_a_ceiling_below_the_default(admin):
+    """A caller who names no size gets the default, bounded by what they may have.
+
+    The default rose from 1 GB to 5 GB. On a deployment whose per-vault ceiling is under that,
+    every create that did not name a size — the API, the desktop app, anything not typing a
+    number into the dialog — was refused with "5 GB exceeds 1 GB", for a size the caller never
+    asked for. Only an EXPLICIT request above the ceiling is a mistake worth refusing.
+    """
+    _set_quotas(admin, 1000, 1)  # 1 GB ceiling, under the 5 GB default
+    v = None
+    try:
+        r = admin.post("/vaults", json={"name": "qsize-fits", "description": "created by tests"})
+        assert r.status_code in (200, 201), (
+            f"a size-less create must fit under the ceiling, not be refused for the default: {r.text}")
+        v = r.json()
+        assert v["size_limit"] == GIB, f"the default should have been bounded to the ceiling: {v}"
+        # An explicit request above the ceiling is still refused.
+        over = admin.post("/vaults", json={"name": "qsize-over", "size_limit_gb": 3})
+        assert over.status_code == 400, over.text
+    finally:
+        _reset_quotas(admin)
+        if v:
+            admin.delete_vault(v["id"])
 
 
 def test_create_vault_with_explicit_size(admin):
@@ -67,7 +92,12 @@ def test_per_vault_ceiling_enforced_at_create(admin):
 
 
 def test_per_vault_ceiling_enforced_at_edit(admin):
-    v = admin.create_vault(name="qsize-edit")
+    # Created AT 1 GB, explicitly. With the default now 5 GB, a vault made before the ceiling was
+    # set would sit above it, and reducing it to 3 GB would be a shrink the edit rightly allows —
+    # which made this test pass 200 where it expects the ceiling to refuse a growth.
+    r = admin.post("/vaults", json={"name": "qsize-edit", "size_limit_gb": 1})
+    assert r.status_code in (200, 201), r.text
+    v = r.json()
     _set_quotas(admin, 1000, 1)  # 1 GB ceiling
     try:
         over = admin.patch(f"/vaults/{v['id']}/settings", json={"size_limit": 3 * GIB})

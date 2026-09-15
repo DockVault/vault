@@ -279,6 +279,6 @@ def test_reopening_resets_every_field_including_the_password(page, fresh_user):
     assert page.evaluate("() => document.querySelector('#vault-hierarchical').checked") is False
     assert page.input_value("#vault-type") == "standard", "the type must fall back to standard"
     assert page.evaluate("() => document.querySelector('#vault-desc').rows") == 1
-    # The size input has value="1" in markup, so reset() restores it rather than emptying it —
+    # The size input has value="5" in markup, so reset() restores it rather than emptying it —
     # which is only meaningful because it was changed to 7 above.
-    assert page.input_value("#vault-size-gb") == "1"
+    assert page.input_value("#vault-size-gb") == "5"

@@ -13362,8 +13362,18 @@ async def create_vault(
     # Per-vault size: DEFAULT_VAULT_SIZE_GB when the caller does not say. Reject a size out of range (a sub-nanogigabyte value
     # truncates to 0, which every upload guard reads as UNLIMITED; a huge value overflows the
     # BigInteger column and 500s) BEFORE the quota check, then enforce the ceiling / account budget.
-    requested_size = (int(vault_create.size_limit_gb * _GIB) if vault_create.size_limit_gb
-                      else DEFAULT_VAULT_SIZE_BYTES)
+    #
+    # The default is bounded by what this person may have, not enforced against it. A caller who
+    # named no size did not ask for 5 GB; on a deployment whose per-vault ceiling (or the account's
+    # remaining budget) is under the default, refusing them for a number they never typed made
+    # every size-less create fail — the API, the desktop app, anything not filling in the dialog.
+    # Only an EXPLICIT request above the cap is a mistake worth refusing.
+    if vault_create.size_limit_gb:
+        requested_size = int(vault_create.size_limit_gb * _GIB)
+    else:
+        cap = _max_allowed_vault_size_bytes(db, current_user)
+        requested_size = (min(DEFAULT_VAULT_SIZE_BYTES, cap) if cap is not None and cap > 0
+                          else DEFAULT_VAULT_SIZE_BYTES)
     if requested_size <= 0 or requested_size > _INT64_MAX:
         raise HTTPException(status_code=400,
                             detail=f"Vault size must be between 1 byte and {_INT64_MAX / _GIB:.0f} GB")

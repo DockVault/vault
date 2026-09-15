@@ -85,7 +85,7 @@ def test_no_server_timestamp_is_parsed_with_a_bare_date_constructor():
                 continue                        # inside parseServerTime itself
             if "* 1000" in arg:                 # epoch seconds
                 continue
-            if arg == "endValue":               # datetime-local input
+            if arg in ("endValue", "localWallClock"):   # datetime-local inputs, local by definition
                 continue
             offenders.append(f"  line {i}: new Date({arg})")
     assert not offenders, (

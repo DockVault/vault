@@ -10650,9 +10650,9 @@ function _renderAuditEventModal(selectedIndex) {
 // and the CSV export had the same hole. Both readers now send the instant the person meant, with
 // its zone made explicit. A zone-less value parses as local time, which is exactly what it is.
 function auditFilterInstant(id) {
-    const raw = (document.getElementById(id) || {}).value;
-    if (!raw) return '';
-    const at = new Date(raw);
+    const localWallClock = (document.getElementById(id) || {}).value;
+    if (!localWallClock) return '';
+    const at = new Date(localWallClock);
     return Number.isNaN(at.getTime()) ? '' : at.toISOString();
 }
 
