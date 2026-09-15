@@ -59,6 +59,47 @@ def test_a_size_less_create_fits_under_a_ceiling_below_the_default(admin):
             admin.delete_vault(v["id"])
 
 
+def test_the_bounded_default_has_a_floor(admin, temp_user_client):
+    """Bounded to what is left, down to a useful minimum; below that, refused rather than shrunk.
+
+    A non-admin, because an admin is exempt from the account budget that makes the cap small.
+    The floor is 1 GiB, a fifth of the default. Both edges: a budget of exactly the floor makes a
+    vault of exactly the floor; a budget with a few megabytes left is refused, as it used to be,
+    rather than quietly producing a vault too small to use.
+    """
+    _set_quotas(admin, 2, 1000)   # 2 GB account budget, no per-vault ceiling to speak of
+    made = []
+    try:
+        # Half the budget spent explicitly: exactly the floor is left.
+        first = temp_user_client.post("/vaults", json={"name": "qsize-half", "size_limit_gb": 1})
+        assert first.status_code in (200, 201), first.text
+        made.append(first.json())
+        at_floor = temp_user_client.post("/vaults", json={"name": "qsize-floor"})
+        assert at_floor.status_code in (200, 201), at_floor.text
+        made.append(at_floor.json())
+        assert made[1]["size_limit"] == GIB, f"1 GiB left should give a 1 GiB vault: {made[1]}"
+        for v in made:
+            temp_user_client.delete_vault(v["id"])
+        made.clear()
+
+        # Now leave LESS than the floor: 1.5 GB of a 2 GB budget spent, half a gigabyte left. The
+        # default must not be bounded down to that; the request is refused the way an explicit
+        # over-size one is, instead of quietly making a vault too small to be worth having.
+        big = temp_user_client.post("/vaults", json={"name": "qsize-most", "size_limit_gb": 1.5})
+        assert big.status_code in (200, 201), big.text
+        made.append(big.json())
+        crumbs = temp_user_client.post("/vaults", json={"name": "qsize-crumbs"})
+        if crumbs.status_code in (200, 201):
+            made.append(crumbs.json())
+        assert crumbs.status_code == 400, (
+            f"a size-less create with under a floor's worth of headroom should be refused, not "
+            f"shrunk: {crumbs.status_code} {crumbs.text}")
+    finally:
+        _reset_quotas(admin)
+        for v in made:
+            temp_user_client.delete_vault(v["id"])
+
+
 def test_create_vault_with_explicit_size(admin):
     r = admin.post("/vaults", json={"name": "qsize-2gb", "size_limit_gb": 2})
     assert r.status_code == 200, r.text

@@ -1928,7 +1928,11 @@ function logout() {
     // dialogs, and the server cannot produce them again — so the next person on this tab must not
     // find them either. Same class of residue as the vault title above.
     for (const id of Object.keys(rcSessionUrls)) delete rcSessionUrls[id];
+    // The three Copy handlers fall back to these once their fields are blank, so blanking the
+    // fields alone would leave every one of them able to copy the previous session's link.
     state._lastRcUrl = null;
+    state._lastPflUrl = null;
+    state._lastPublicLinkUrl = null;
     ['rc-link-value', 'pfl-link-value', 'note-public-link-value'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.value = '';
@@ -3459,6 +3463,9 @@ async function renderVaultSizeAvailability(noteId, inputEl, excludeVaultId, base
     if (!note) return;
     const base = baseText || 'The most this vault may hold.';
     const fmt = g => g.toFixed(g < 10 ? 2 : 0);
+    // Forget the previous open's ceiling before asking for this one. A fetch that fails below
+    // would otherwise leave a stale max on the input, and the prefill clamp would act on it.
+    if (inputEl) inputEl.removeAttribute('max');
 
     if (excludeVaultId) {
         let info = null;
@@ -3567,7 +3574,8 @@ async function showCreateVault() {
     const sizeInput = document.getElementById('vault-size-gb');
     if (sizeInput) sizeInput.value = String(CREATE_VAULT_PREFILL_GB);
     renderVaultSizeAvailability('vault-size-avail', sizeInput, null, createVaultSizeHintBase())
-        .then(() => clampVaultSizePrefill(sizeInput));
+        .then(() => clampVaultSizePrefill(sizeInput))
+        .catch(() => {});
 
     // Reflect the resolved type into password + team-mode visibility, then show.
     syncCreateVaultForm();

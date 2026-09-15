@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import unique
+
 ROOT = Path(__file__).resolve().parent.parent
 API = ROOT / "app" / "api" / "api_server.py"
 APP_JS = ROOT / "static" / "js" / "app.js"
@@ -87,6 +89,13 @@ def test_replacing_a_link_is_gated_exactly_as_creating_one_is():
         "replace-link must demand the same step-up as create: it mints the same kind of credential")
     assert "receiver_policy.public_receivers_enabled(_global_settings_blob(db))" in replace, (
         "replace-link must honour the upload-links kill switch")
+    # The third gate: the tag's allowlist, read at replace time. A person an admin has blocked
+    # from a tag must not be able to mint a fresh URL under it through a link they already hold.
+    assert "sharing_policy.user_can_create_with_tag(" in create   # anchor
+    assert "sharing_policy.user_can_create_with_tag(" in replace, (
+        "replace-link must re-check the tag allowlist; a blocked user could otherwise mint under it")
+    assert 'detail="You are not permitted to create links with this tag."' in replace, (
+        "the refusal must read exactly as create's does")
 
 
 @pytest.mark.unit
@@ -129,6 +138,13 @@ def test_replacing_a_link_kills_the_old_token_and_mints_a_working_one(admin):
     assert made.status_code in (200, 201), made.text
     rec = made.json()
     old_token = rec["token"]
+    try:
+        _check_replacement(admin, rec, old_token)
+    finally:
+        admin.post(f"/receivers/{rec['id']}/revoke")   # per-user active cap; leftovers add up
+
+
+def _check_replacement(admin, rec, old_token):
 
     def opens(token):
         """Ask the route that actually RESOLVES a token.
@@ -182,6 +198,7 @@ def test_replace_link_refuses_once_upload_links_are_switched_off(admin):
     open_tag = _open_tag_or_skip(admin)
     rec = _mint(admin, open_tag, "kill-switch-check")
 
+    before = admin.get("/settings").json().get("public_receivers_enabled")
     admin.put("/settings", json={"public_receivers_enabled": False})
     try:
         create = admin.post("/receivers", json={"tag_id": open_tag["id"], "label": "x",
@@ -194,7 +211,8 @@ def test_replace_link_refuses_once_upload_links_are_switched_off(admin):
         assert replace.json()["detail"] == create.json()["detail"], (
             "the two refusals should say the same thing")
     finally:
-        admin.put("/settings", json={"public_receivers_enabled": True})
+        admin.put("/settings", json={"public_receivers_enabled": bool(before)})   # as found
+        admin.post(f"/receivers/{rec['id']}/revoke")
 
 
 @pytest.mark.integration
@@ -226,3 +244,42 @@ def test_replace_link_demands_the_same_step_up_as_create(admin):
             f"replace must be refused exactly as create is: {replace.json()} vs {create.json()}")
     finally:
         set_action_require_otp(admin, "receiver.create", False)
+        admin.post(f"/receivers/{rec['id']}/revoke")
+
+
+@pytest.mark.integration
+def test_replace_link_refuses_a_user_blocked_from_the_tag(admin):
+    """The third gate. Blocking someone on a tag is an admin saying they may not mint links under
+    it; a replacement is a freshly minted link, so it must be refused the way create is, however
+    long ago the link they hold was made.
+
+    On a throwaway tag, so the seeded one is never edited. The account's own id is read off its
+    token: a bearer token's subject is the account, and no signature check is a trust decision here.
+    """
+    settings = admin.get("/settings").json()
+    if settings.get("public_receivers_enabled") is not True:
+        pytest.skip("upload links are disabled on this deployment")
+    tag = admin.post("/receiver-tags", json={"name": unique("Blockable"), "min_token_len": 10,
+                                             "auto_enroll_new_users": True, "is_active": True})
+    assert tag.status_code in (200, 201), tag.text
+    tag = tag.json()
+    rec = None
+    try:
+        rec = _mint(admin, tag, "blocked-check")
+        me = str(admin._token_claims()["sub"])
+        r = admin.patch(f"/receiver-tags/{tag['id']}", json={"blocked_user_ids": [me]})
+        assert r.status_code == 200, r.text
+
+        create = admin.post("/receivers", json={"tag_id": tag["id"], "label": "x",
+                                                "max_total_bytes": 1024 * 1024})
+        assert create.status_code == 403, f"anchor: create should refuse a blocked user: {create.text}"
+        replace = admin.post(f"/receivers/{rec['id']}/replace-link")
+        assert replace.status_code == 403, (
+            f"blocked from the tag, yet a fresh URL was minted under it: {replace.status_code} "
+            f"{replace.text}")
+        assert replace.json()["detail"] == create.json()["detail"], (
+            f"replace must be refused exactly as create is: {replace.json()} vs {create.json()}")
+    finally:
+        if rec:
+            admin.post(f"/receivers/{rec['id']}/revoke")
+        admin.delete(f"/receiver-tags/{tag['id']}")

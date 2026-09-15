@@ -67,6 +67,11 @@ def test_signing_out_leaves_no_upload_link_url_behind(page: Page, admin, admin_c
             f"anchor: a link should be on screen and in memory before signing out: {held}")
         page.click("#rc-done")
 
+        # Seed the two other remembered URLs too: their Copy handlers fall back to them once the
+        # fields are blank, so a scrub that blanked only the fields would leave both copyable.
+        page.evaluate("""() => { state._lastPflUrl = 'https://example.invalid/p/file';
+                                 state._lastPublicLinkUrl = 'https://example.invalid/n/note'; }""")
+
         page.click("#profile-btn")
         page.click("#dropdown-logout-btn")
         expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
@@ -76,9 +81,12 @@ def test_signing_out_leaves_no_upload_link_url_behind(page: Page, admin, admin_c
                         pfl: (document.getElementById('pfl-link-value') || {}).value || '',
                         note: (document.getElementById('note-public-link-value') || {}).value || '',
                         session: Object.keys(rcSessionUrls).length,
-                        last: state._lastRcUrl || '' })""")
-        assert after == {"field": "", "pfl": "", "note": "", "session": 0, "last": ""}, (
-            f"an upload-link URL survived logout on this tab: {after}")
+                        last: state._lastRcUrl || '',
+                        lastPfl: state._lastPflUrl || '',
+                        lastPublic: state._lastPublicLinkUrl || '' })""")
+        assert after == {"field": "", "pfl": "", "note": "", "session": 0, "last": "",
+                         "lastPfl": "", "lastPublic": ""}, (
+            f"a link URL survived logout on this tab: {after}")
     finally:
         admin.put("/settings", json={"public_receivers_enabled": bool(before)})
         admin.delete(f"/receiver-tags/{tag['id']}")

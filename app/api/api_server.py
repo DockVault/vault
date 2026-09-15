@@ -2291,6 +2291,10 @@ _INT64_MAX = 2 ** 63 - 1  # the size_limit column is BigInteger; a larger value 
 # silently resize vaults on deployments that already exist — the one thing this must not do.
 DEFAULT_VAULT_SIZE_GB = 5
 DEFAULT_VAULT_SIZE_BYTES = DEFAULT_VAULT_SIZE_GB * _GIB
+# The smallest vault a size-less create will quietly make. Below this the default is not bounded
+# to what is left; the request is refused, so a nearly exhausted account is told rather than
+# handed a vault too small to be useful.
+VAULT_SIZE_FLOOR_BYTES = DEFAULT_VAULT_SIZE_BYTES // 5
 
 
 def _settings_blob(db: Session) -> dict:
@@ -11276,6 +11280,19 @@ async def replace_receiver_link(
         raise HTTPException(status_code=404, detail="Upload link not found")
     if r.revoked:
         raise HTTPException(status_code=400, detail="This upload link has been revoked.")
+    # The third of creation's gates: the tag's allowlist, read NOW rather than when the link was
+    # made. An admin who has since blocked this person from the tag, or retired the tag, has said
+    # they may not mint links under it — and a replacement is a freshly minted link.
+    tag = db.query(ReceiverTag).filter(ReceiverTag.id == r.tag_id).first()
+    if not tag or not tag.is_active:
+        raise HTTPException(status_code=404, detail="Receiver tag not found.")
+    allowlist = {"is_active": tag.is_active, "blocked_user_ids": tag.blocked_user_ids,
+                 "allowed_user_ids": tag.allowed_user_ids,
+                 "allowed_department_ids": tag.allowed_department_ids,
+                 "auto_enroll_new_users": tag.auto_enroll_new_users}
+    if not sharing_policy.user_can_create_with_tag(allowlist, current_user.id,
+                                                   _user_group_ids(db, current_user.id)):
+        raise HTTPException(status_code=403, detail="You are not permitted to create links with this tag.")
 
     # Same allocation discipline as creation: generate, hash, and only keep a candidate whose hash is
     # unused. Bounded attempts rather than a loop that could spin.
@@ -13368,11 +13385,16 @@ async def create_vault(
     # remaining budget) is under the default, refusing them for a number they never typed made
     # every size-less create fail — the API, the desktop app, anything not filling in the dialog.
     # Only an EXPLICIT request above the cap is a mistake worth refusing.
+    #
+    # Bounded, but not without a floor. An account with a few megabytes of budget left would
+    # otherwise get a vault of a few megabytes, silently, where it used to be told. Under the
+    # floor the default stands and the usual "exceeds the maximum available" refusal follows.
     if vault_create.size_limit_gb:
         requested_size = int(vault_create.size_limit_gb * _GIB)
     else:
         cap = _max_allowed_vault_size_bytes(db, current_user)
-        requested_size = (min(DEFAULT_VAULT_SIZE_BYTES, cap) if cap is not None and cap > 0
+        requested_size = (min(DEFAULT_VAULT_SIZE_BYTES, cap)
+                          if cap is not None and cap >= VAULT_SIZE_FLOOR_BYTES
                           else DEFAULT_VAULT_SIZE_BYTES)
     if requested_size <= 0 or requested_size > _INT64_MAX:
         raise HTTPException(status_code=400,
