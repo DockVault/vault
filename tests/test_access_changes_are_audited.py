@@ -133,6 +133,21 @@ def test_the_audit_write_can_never_fail_the_request():
         "the helper must never re-raise into the request")
 
 
+def _indent(line):
+    return len(line) - len(line.lstrip(" "))
+
+
+def _call_sits_inside_guard(body, guard, call):
+    """True if `call` appears after `guard` and every line between them, the call included, is
+    indented deeper than the guard — i.e. it is inside the guard's block, not merely below it.
+    Ordering alone would pass a call that was moved out of the `if` but left underneath it."""
+    lines = body.splitlines()
+    g = next(i for i, l in enumerate(lines) if l.strip().startswith(guard))
+    c = next(i for i, l in enumerate(lines) if call in l and i > g)
+    depth = _indent(lines[g])
+    return all(_indent(l) > depth for l in lines[g + 1:c + 1] if l.strip())
+
+
 @pytest.mark.unit
 def test_a_revoke_is_logged_only_when_something_was_revoked():
     """The rowcount check comes first, so a 404 is not recorded as a successful revocation."""
@@ -142,6 +157,46 @@ def test_a_revoke_is_logged_only_when_something_was_revoked():
     logged = body.index('_audit_access_change(db, current_user, "vault_permission_revoked"')
     assert rowcount < logged, (
         "logging before the rowcount check would record every 404 as a revoke that happened")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("verb,path,guard,action", [
+    ('post', "/groups/{group_id}/members", "if added:", "group_members_added"),
+    ('delete', "/groups/{group_id}/members/{user_id}", "if result.rowcount > 0:", "group_member_removed"),
+    ('delete', "/vaults/{vault_id}/group-access/{group_id}", "if result.rowcount > 0:",
+     "vault_group_access_revoked"),
+])
+def test_a_group_change_is_logged_only_when_something_changed(verb, path, guard, action):
+    """Adding members who were already there, or removing one who was not, changes nothing and
+    must not read in the log as if it had. The integration lane below proves it over HTTP; this
+    pins that each write sits inside its guard, so it cannot drift back out during a refactor."""
+    src = API.read_text(encoding="utf-8")
+    body = _endpoint_body(src, verb, path)
+    assert guard in body, f"{verb.upper()} {path} has no guard on its audit write"
+    assert _call_sits_inside_guard(body, guard, f'"{action}"'), (
+        f"{verb.upper()} {path} writes its {action} row outside the guard, so a no-op call is "
+        f"recorded as a change")
+
+
+@pytest.mark.unit
+def test_the_group_grant_row_records_the_level_that_was_written():
+    """The request's string is not what was granted; `perm` is. And a level outside read/write is
+    refused by the model rather than coerced, so the two can never differ."""
+    src = API.read_text(encoding="utf-8")
+    body = _endpoint_body(src, 'post', "/vaults/{vault_id}/group-access")
+    assert '"permission": perm}' in body, "the grant row must carry the level actually written"
+    assert '"permission": payload.permission' not in body, (
+        "the grant row is recording the caller's string, which may be a level never granted")
+    assert re.search(r'permission: str = Field\(.read., pattern="\^\(read\|write\)\$"\)', src), (
+        "VaultGroupAccessAdd.permission must refuse anything but read or write")
+
+
+@pytest.mark.unit
+def test_adding_members_records_who_not_how_many():
+    src = API.read_text(encoding="utf-8")
+    body = _endpoint_body(src, 'post', "/groups/{group_id}/members")
+    assert '"user_ids": [str(u) for u in added]' in body, (
+        "the row must name the members added; a count cannot answer who gained access")
 
 
 @pytest.mark.unit
@@ -163,6 +218,27 @@ def test_the_helper_is_the_single_shape_for_all_of_them():
 
 
 # --------------------------------------------------------------------------- integration lane
+#
+# Five of the six writes were once proved only by grepping for the call site — the exact evidence
+# that turned out to be worthless when the helper raised NameError into its own silent handler. Each
+# lane below performs the call over HTTP and reads the row back out of the log.
+
+from conftest import unique  # noqa: E402
+
+
+@pytest.fixture
+def temp_group(admin):
+    r = admin.post("/groups", json={"name": unique("audited")})
+    r.raise_for_status()
+    group = r.json()
+    yield group
+    admin.delete(f"/groups/{group['id']}")
+
+
+def _rows(admin, action, resource_id):
+    return [r for r in admin.get(f"/audit/log?action={action}").json()
+            if str(r.get("resource_id")) == str(resource_id) and r.get("action") == action]
+
 
 @pytest.mark.integration
 def test_granting_access_shows_up_in_the_audit_log(admin, temp_vault, temp_user):
@@ -182,3 +258,73 @@ def test_granting_access_shows_up_in_the_audit_log(admin, temp_vault, temp_user)
     assert row.get("action") == "vault_permission_granted", row
     assert str(temp_vault["id"]) == str(row.get("resource_id")), (
         f"the row should name the vault whose access changed: {row}")
+
+
+@pytest.mark.integration
+def test_a_group_grant_records_the_level_written_and_refuses_one_it_cannot_grant(
+        admin, temp_vault, temp_group):
+    """'manage' is not a level a group can hold. It used to be coerced to read and logged as
+    'manage' — a row describing a grant that never happened. Now it is refused outright, and the
+    row for a real grant carries exactly what the vault reports."""
+    refused = admin.post(f"/vaults/{temp_vault['id']}/group-access",
+                         json={"group_id": temp_group["id"], "permission": "manage"})
+    assert refused.status_code == 422, (
+        f"a level outside read/write should be refused, not coerced: {refused.status_code} "
+        f"{refused.text}")
+    assert not _rows(admin, "vault_group_access_granted", temp_vault["id"]), (
+        "a refused grant must leave no row")
+
+    r = admin.post(f"/vaults/{temp_vault['id']}/group-access",
+                   json={"group_id": temp_group["id"], "permission": "write"})
+    assert r.status_code in (200, 201), r.text
+    rows = _rows(admin, "vault_group_access_granted", temp_vault["id"])
+    assert len(rows) == 1, rows
+    details = rows[0].get("details") or {}
+    assert details.get("group_id") == str(temp_group["id"]), rows[0]
+    granted = next(g for g in admin.get(f"/vaults/{temp_vault['id']}/group-access").json()
+                   if str(g.get("group_id")) == str(temp_group["id"]))
+    assert details.get("permission") == granted["permission"] == "write", (
+        f"the row must say what the vault actually holds: row {details}, vault {granted}")
+
+
+@pytest.mark.integration
+def test_revoking_group_access_is_recorded_once_and_only_when_it_happened(
+        admin, temp_vault, temp_group):
+    r = admin.post(f"/vaults/{temp_vault['id']}/group-access",
+                   json={"group_id": temp_group["id"], "permission": "read"})
+    assert r.status_code in (200, 201), r.text
+
+    assert admin.delete(f"/vaults/{temp_vault['id']}/group-access/{temp_group['id']}").status_code == 200
+    rows = _rows(admin, "vault_group_access_revoked", temp_vault["id"])
+    assert len(rows) == 1 and (rows[0].get("details") or {}).get("group_id") == str(temp_group["id"]), rows
+
+    # The group no longer has access, so there is nothing to revoke — and nothing to record.
+    assert admin.delete(f"/vaults/{temp_vault['id']}/group-access/{temp_group['id']}").status_code == 200
+    assert len(_rows(admin, "vault_group_access_revoked", temp_vault["id"])) == 1, (
+        "revoking access that was not there was recorded as a revoke that happened")
+
+
+@pytest.mark.integration
+def test_membership_changes_name_the_person_and_only_when_something_changed(
+        admin, temp_group, temp_user):
+    added = admin.post(f"/groups/{temp_group['id']}/members", json={"user_ids": [temp_user["id"]]})
+    assert added.status_code in (200, 201), added.text
+    rows = _rows(admin, "group_members_added", temp_group["id"])
+    assert len(rows) == 1, rows
+    assert str(temp_user["id"]) in ((rows[0].get("details") or {}).get("user_ids") or []), (
+        f"the row must name who was added, not how many: {rows[0]}")
+
+    # Already a member: nothing changed, so nothing is recorded.
+    again = admin.post(f"/groups/{temp_group['id']}/members", json={"user_ids": [temp_user["id"]]})
+    assert again.status_code in (200, 201) and again.json().get("added") == 0, again.text
+    assert len(_rows(admin, "group_members_added", temp_group["id"])) == 1, (
+        "re-adding an existing member was recorded as an access change")
+
+    assert admin.delete(f"/groups/{temp_group['id']}/members/{temp_user['id']}").status_code == 200
+    removed = _rows(admin, "group_member_removed", temp_group["id"])
+    assert len(removed) == 1 and (removed[0].get("details") or {}).get("user_id") == str(temp_user["id"]), removed
+
+    # Not a member any more: nothing to remove, nothing to record.
+    assert admin.delete(f"/groups/{temp_group['id']}/members/{temp_user['id']}").status_code == 200
+    assert len(_rows(admin, "group_member_removed", temp_group["id"])) == 1, (
+        "removing someone who was not a member was recorded as a removal")

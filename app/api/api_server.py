@@ -948,7 +948,10 @@ class GroupMembersAdd(BaseModel):
 
 class VaultGroupAccessAdd(BaseModel):
     group_id: uuid.UUID
-    permission: str = 'read'  # 'read' | 'write'
+    # The two levels a group can hold, and nothing else. Anything wider is refused up front rather
+    # than quietly coerced to 'read' — a caller sending "manage" should be told, and the audit row
+    # written afterwards must never describe a level that was never granted.
+    permission: str = Field('read', pattern="^(read|write)$")
 
 
 # Postgres INTEGER (int4) ceiling. The share limit/lifetime fields map to int4 columns, so bound the
@@ -13012,7 +13015,7 @@ async def add_group_members(
     existing = {
         row[0] for row in db.query(user_groups.c.user_id).filter(user_groups.c.group_id == group_id).all()
     }
-    added = 0
+    added = []
     for uid in payload.user_ids:
         if uid in existing:
             continue
@@ -13023,13 +13026,17 @@ async def add_group_members(
             added_at=datetime.utcnow(), added_by=current_user.id,
         ))
         existing.add(uid)
-        added += 1
+        added.append(uid)
     db.commit()
     # Group membership IS access: a member inherits every vault the group can reach, so adding
-    # someone here can widen their reach without any vault being touched.
-    _audit_access_change(db, current_user, "group_members_added", "group", str(group_id),
-                         {"added": added})
-    return {"message": f"Added {added} member(s)", "added": added}
+    # someone here can widen their reach without any vault being touched. The row names WHO was
+    # added — a count cannot answer "who gained access to everything this group reaches" — and is
+    # written only when someone actually was; re-adding existing members changes nothing and must
+    # not read as if it had.
+    if added:
+        _audit_access_change(db, current_user, "group_members_added", "group", str(group_id),
+                             {"user_ids": [str(u) for u in added], "added": len(added)})
+    return {"message": f"Added {len(added)} member(s)", "added": len(added)}
 
 
 @app.delete("/groups/{group_id}/members/{user_id}")
@@ -13042,12 +13049,15 @@ async def remove_group_member(
     """Remove a user from a group."""
     if not db.query(Group).filter(Group.id == group_id).first():
         raise HTTPException(status_code=404, detail="Group not found")
-    db.execute(user_groups.delete().where(
+    result = db.execute(user_groups.delete().where(
         (user_groups.c.group_id == group_id) & (user_groups.c.user_id == user_id)
     ))
     db.commit()
-    _audit_access_change(db, current_user, "group_member_removed", "group", str(group_id),
-                         {"user_id": str(user_id)})
+    # Recorded only when a membership was actually removed. Logging unconditionally wrote a
+    # removal for every call, including ones that found nothing to remove.
+    if result.rowcount > 0:
+        _audit_access_change(db, current_user, "group_member_removed", "group", str(group_id),
+                             {"user_id": str(user_id)})
     return {"message": "Member removed"}
 
 
@@ -15027,8 +15037,10 @@ async def grant_vault_group_access(
             )
         )
     db.commit()
+    # `perm` is what was written. Logging the request's own string here recorded whatever the caller
+    # typed, which is not what the vault ended up granting.
     _audit_access_change(db, current_user, "vault_group_access_granted", "vault", str(vault_id),
-                         {"group_id": str(payload.group_id), "permission": payload.permission})
+                         {"group_id": str(payload.group_id), "permission": perm})
     return {"message": "Group access granted"}
 
 
@@ -15048,15 +15060,17 @@ async def revoke_vault_group_access(
     if not vault:
         raise HTTPException(status_code=404, detail="Vault not found")
     _require_vault_manager(vault, current_user, db)
-    db.execute(
+    result = db.execute(
         sql_delete(vault_group_access).where(
             vault_group_access.c.vault_id == vault_id,
             vault_group_access.c.group_id == group_id,
         )
     )
     db.commit()
-    _audit_access_change(db, current_user, "vault_group_access_revoked", "vault", str(vault_id),
-                         {"group_id": str(group_id)})
+    # Same rule as every other revoke here: a row only when something was actually revoked.
+    if result.rowcount > 0:
+        _audit_access_change(db, current_user, "vault_group_access_revoked", "vault", str(vault_id),
+                             {"group_id": str(group_id)})
     return {"message": "Group access revoked"}
 
 

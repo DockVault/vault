@@ -88,6 +88,31 @@ def test_the_start_of_the_range_is_inclusive_and_unmodified():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("value,expected", [
+    ("2026-09-11T12:30:00.000Z",     datetime(2026, 9, 11, 12, 30)),   # what the page now sends
+    ("2026-09-11T12:30:00Z",         datetime(2026, 9, 11, 12, 30)),
+    ("2026-09-11T14:30:00+02:00",    datetime(2026, 9, 11, 12, 30)),   # east of Greenwich
+    ("2026-09-11T03:30:00-09:00",    datetime(2026, 9, 11, 12, 30)),   # west of it
+    ("2026-09-12T01:30:00+13:00",    datetime(2026, 9, 11, 12, 30)),   # across midnight
+])
+def test_an_instant_carrying_its_zone_is_compared_in_utc(value, expected):
+    """The column is naive UTC. A value that says which zone it is in must land on the same
+    instant however it was spelled, and must come back naive so the comparison is like with like.
+    Every one of these is an instant, so the upper bound must not add a day to it either."""
+    lo, hi = audit_range.lower_bound(value), audit_range.upper_bound(value)
+    assert lo == expected and hi == expected, (value, lo, hi)
+    assert lo.tzinfo is None and hi.tzinfo is None, "bounds must be naive, like the column"
+
+
+@pytest.mark.unit
+def test_a_value_without_a_zone_is_taken_as_it_stands():
+    """Not everyone types a filter into the page. A bare wall-clock value is still read as the UTC
+    the column is in — the same as before — so a hand-written query does not change meaning."""
+    assert audit_range.lower_bound("2026-09-11T14:30") == datetime(2026, 9, 11, 14, 30)
+    assert audit_range.lower_bound("2026-09-11T14:30").tzinfo is None
+
+
+@pytest.mark.unit
 def test_the_query_uses_the_shared_range_rather_than_its_own_copy():
     """One place decides what a range means.
 
@@ -150,6 +175,44 @@ def test_the_live_monitor_page_is_untouched():
     # The monitor's own rendering must still be there.
     assert "monitor-events-list" in app, "the Live Monitor feed element must not have been removed"
     assert "function initMonitor" in app or "connectMonitorWebSocket" in app
+
+
+# --------------------------------------------------------------------------- integration lane
+
+@pytest.mark.integration
+def test_a_window_spelled_in_another_zone_finds_a_row_written_inside_it(admin, temp_vault, temp_user):
+    """A row at a known instant, then a From/To window around it spelled in a zone that is not UTC.
+
+    This pins the server's side of the contract: an instant is an instant however its zone is
+    written. It is not the lane that goes red for the reported bug — a database that casts an
+    offset-bearing literal itself can pass this on the old code too. What the page actually sent
+    was a zone-less local wall-clock, and the browser test in the audit-filter ui module is the one
+    that fails on that.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    r = admin.post(f"/vaults/{temp_vault['id']}/permissions",
+                   json={"user_id": temp_user["id"], "level": "read"})
+    assert r.status_code in (200, 201), r.text
+    rows = admin.get("/audit/log?action=vault_permission_granted").json()
+    row = next(x for x in rows if x["resource_id"] == temp_vault["id"])
+    at = datetime.fromisoformat(row["timestamp"]).replace(tzinfo=timezone.utc)
+
+    # Not a whole number of hours, and no daylight saving to muddy it.
+    zone = timezone(timedelta(hours=5, minutes=30))
+    window = {"action": "vault_permission_granted",
+              "from_date": (at - timedelta(minutes=1)).astimezone(zone).isoformat(),
+              "to_date": (at + timedelta(minutes=1)).astimezone(zone).isoformat()}
+    found = admin.get("/audit/log", params=window).json()
+    assert any(x["resource_id"] == temp_vault["id"] for x in found), (
+        f"a two-minute window around the row, spelled in +05:30, did not find it: {window}")
+
+    # And the same instants, one minute AFTER the row: the window must genuinely bound.
+    later = {"action": "vault_permission_granted",
+             "from_date": (at + timedelta(minutes=1)).astimezone(zone).isoformat()}
+    assert not any(x["resource_id"] == temp_vault["id"]
+                   for x in admin.get("/audit/log", params=later).json()), (
+        "a window that starts after the row must not contain it")
 
 
 # --------------------------------------------------------------------------- ui lane

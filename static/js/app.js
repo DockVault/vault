@@ -10613,6 +10613,18 @@ function _renderAuditEventModal(selectedIndex) {
     }
 }
 
+// The From/To inputs are datetime-local: a wall-clock time in the viewer's zone, with no zone
+// attached. Sent as typed, the server read it as UTC, so every timed filter was off by the viewer's
+// UTC offset — an admin filtering around an event they could see on the same screen got nothing,
+// and the CSV export had the same hole. Both readers now send the instant the person meant, with
+// its zone made explicit. A zone-less value parses as local time, which is exactly what it is.
+function auditFilterInstant(id) {
+    const raw = (document.getElementById(id) || {}).value;
+    if (!raw) return '';
+    const at = new Date(raw);
+    return Number.isNaN(at.getTime()) ? '' : at.toISOString();
+}
+
 async function searchAuditLog(options) {
     const tbody = document.getElementById('audit-log-body');
     const countBadge = document.getElementById('audit-count');
@@ -10629,8 +10641,8 @@ async function searchAuditLog(options) {
         const filters = {
             user_id: document.getElementById('audit-filter-user').value,
             action: document.getElementById('audit-filter-action').value,
-            from_date: document.getElementById('audit-filter-from').value,
-            to_date: document.getElementById('audit-filter-to').value
+            from_date: auditFilterInstant('audit-filter-from'),
+            to_date: auditFilterInstant('audit-filter-to')
         };
         
         // Build query string
@@ -10666,8 +10678,8 @@ async function exportAuditLog() {
         const filters = {
             user_id: document.getElementById('audit-filter-user').value,
             action: document.getElementById('audit-filter-action').value,
-            from_date: document.getElementById('audit-filter-from').value,
-            to_date: document.getElementById('audit-filter-to').value
+            from_date: auditFilterInstant('audit-filter-from'),
+            to_date: auditFilterInstant('audit-filter-to')
         };
 
         const queryParams = new URLSearchParams();
