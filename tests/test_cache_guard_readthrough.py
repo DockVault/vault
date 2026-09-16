@@ -12,19 +12,15 @@ So for EACH consumer: one op fails with the limiter breaker closed; the breaker 
 the guard's OWN private failure memory must open. The test is parametrized over all three read-through
 consumers so a design that writes the shared breaker in any one of them goes red.
 """
-import os
 import time
 
 import pytest
 
-# Dummy connection strings so importing the API module for _guarded_publish is side-effect-free.
-for _k, _v in {
-    "DATABASE_URL": "postgresql://x:x@localhost:5432/x",
-    "REDIS_URL": "redis://localhost:6379/0",
-    "SECRET_KEY": "t" * 32,
-    "JWT_SECRET_KEY": "t" * 32,
-}.items():
-    os.environ.setdefault(_k, _v)
+# The minimal env the API bootstrap requires, so this module (which imports app.api.api_server for
+# _guarded_publish) passes when run alone with no .env.
+from _bare_api_env import set_bare_api_env
+
+set_bare_api_env()
 
 from app.services import auth_service as A
 from app.core import rate_limiter as R

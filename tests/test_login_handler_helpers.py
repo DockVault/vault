@@ -6,20 +6,22 @@ here.
 import asyncio
 import contextlib
 import json
-import os
 import threading
 
 import pytest
 
+from _bare_api_env import set_bare_api_env
+
 pytestmark = pytest.mark.unit
 
 
-def _drive_login(S, body_dict, events, drain=False):
+def _drive_login(S, body_dict, events, drain=False, done_event=None):
     """Drive POST /auth/login through the ASGI app in-process on a fresh loop in its own thread — the
     suite has no httpx/TestClient, so this speaks raw ASGI. Appends ("response", status) to the shared
     `events` list (the test's patched monitor appends its own ("record", thread) entry), so their
-    ORDER is observable. Returns the loop thread's name. With drain=True, lets fire-and-forget
-    background tasks (the success-path broadcast) finish before the loop closes."""
+    ORDER is observable. Returns the loop thread's name. With drain=True and a `done_event`, waits
+    deterministically for that event (set by the patched fire-and-forget broadcast) before the loop
+    closes — no fixed sleep."""
     holder = {}
 
     async def _drive():
@@ -38,8 +40,11 @@ def _drive_login(S, body_dict, events, drain=False):
                 events.append(("response", msg["status"]))
 
         await S.app(scope, receive, send)
-        if drain:
-            await asyncio.sleep(0.3)  # let the fire-and-forget broadcast task run in the pool
+        if drain and done_event is not None:
+            # Deterministic wait (no fixed sleep): block a helper thread on the event the patched
+            # broadcast sets, so the fire-and-forget broadcast is guaranteed to have run before the
+            # loop closes. Bounded at 5 s so a genuine failure surfaces rather than hangs.
+            await asyncio.get_running_loop().run_in_executor(None, done_event.wait, 5)
 
     err = {}
 
@@ -65,15 +70,9 @@ def _api():
     """Import the API module LAZILY (inside a test), never at module scope. Importing it runs the
     API bootstrap, which fails closed with SystemExit in a bare environment — that would abort strict
     COLLECTION (pytest imports every test module to collect it) before any test runs. Deferring the
-    import to call time keeps collection free of the bootstrap, matching the sibling unit tests. Dummy
-    connection strings so the import that does happen at run time is side-effect-free."""
-    for _k, _v in {
-        "DATABASE_URL": "postgresql://x:x@localhost:5432/x",
-        "REDIS_URL": "redis://localhost:6379/0",
-        "SECRET_KEY": "t" * 32,
-        "JWT_SECRET_KEY": "t" * 32,
-    }.items():
-        os.environ.setdefault(_k, _v)
+    import to call time keeps collection free of the bootstrap, matching the sibling unit tests. The
+    shared helper sets the minimal env the bootstrap requires so this module passes when run alone."""
+    set_bare_api_env()
     import app.api.api_server as S
     return S
 
@@ -169,24 +168,29 @@ def test_a_successful_login_broadcasts_with_include_metrics_false(monkeypatch):
     S = _api()
     user = types.SimpleNamespace(id=uuid.uuid4(), username="alice", email="alice@example.com")
     recorded = []
+    fired = threading.Event()
 
     def _fake_db():
         yield MagicMock()
+
+    def _record(event, include_metrics=True):
+        recorded.append(include_metrics)
+        fired.set()
 
     monkeypatch.setitem(S.app.dependency_overrides, get_db, _fake_db)
     monkeypatch.setattr(AuthService, "authenticate_user", lambda *a, **k: (user, "session-tok"))
     monkeypatch.setattr(S, "_login_second_factor_in_effect", lambda db, u: False)  # no 2FA pending
     monkeypatch.setattr(S, "_setting_int", lambda db, key, default: default)
-    monkeypatch.setattr(S, "broadcast_event",
-                        lambda event, include_metrics=True: recorded.append(include_metrics))
+    monkeypatch.setattr(S, "broadcast_event", _record)
     R._cb_record_failure(_t.time())  # skip real Redis on the middleware / guarded reads
     S._BG_TASKS.clear()
     try:
-        _drive_login(S, {"username": "alice", "password": "right"}, [], drain=True)
+        _drive_login(S, {"username": "alice", "password": "right"}, [], drain=True, done_event=fired)
     finally:
         S._BG_TASKS.clear()
         R._cb_record_success()
 
+    assert fired.is_set(), "the login broadcast never fired"
     assert recorded == [False], (
         f"the login broadcast was not fired with include_metrics=False: recorded={recorded}")
 

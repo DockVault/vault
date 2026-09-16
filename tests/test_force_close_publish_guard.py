@@ -11,18 +11,15 @@ the read-through shape, which also checks the limiter's breaker, would skip it â
 failing, the first revocation attempts and the rest skip (a revert to a raw publish attempts every
 one â€” red).
 """
-import os
 import time
 
 import pytest
 
-for _k, _v in {
-    "DATABASE_URL": "postgresql://x:x@localhost:5432/x",
-    "REDIS_URL": "redis://localhost:6379/0",
-    "SECRET_KEY": "t" * 32,
-    "JWT_SECRET_KEY": "t" * 32,
-}.items():
-    os.environ.setdefault(_k, _v)
+# The minimal env the API bootstrap requires, so this module (which imports app.api.api_server for
+# _guarded_publish_force) passes when run alone with no .env.
+from _bare_api_env import set_bare_api_env
+
+set_bare_api_env()
 
 from app.services import auth_service as A
 from app.core import rate_limiter as R

@@ -13,20 +13,16 @@ what bounds the pool; this test pins the cap the ordering relies on. run_offload
 """
 import asyncio
 import contextvars
-import os
 import threading
 
 import pytest
 from fastapi import HTTPException
 
-# Dummy connection strings so importing the API module (for the _fire_offloop tests) is side-effect-free.
-for _k, _v in {
-    "DATABASE_URL": "postgresql://x:x@localhost:5432/x",
-    "REDIS_URL": "redis://localhost:6379/0",
-    "SECRET_KEY": "t" * 32,
-    "JWT_SECRET_KEY": "t" * 32,
-}.items():
-    os.environ.setdefault(_k, _v)
+# The minimal env the API bootstrap requires, so this module (which imports app.api.api_server for
+# the _fire_offloop tests) passes when run alone with no .env.
+from _bare_api_env import set_bare_api_env
+
+set_bare_api_env()
 
 import app.core.auth_offload as ao
 from app.core.auth_offload import (

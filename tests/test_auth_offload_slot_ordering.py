@@ -15,23 +15,17 @@ slot runs its blocking work off the loop is pinned by the outage tests. The live
 ``engine.pool.checkedout()`` stays at or below the slot count under a burst larger than the pool is
 measured on a running stack.
 """
-import os
-
 import pytest
+
+from _bare_api_env import set_bare_api_env
 
 pytestmark = pytest.mark.unit
 
 
 def _load_app():
-    # Dummy connection strings so the import is side-effect-free (engines/clients connect lazily);
-    # this test never opens a socket, it only reads the declared dependency order.
-    for k, v in {
-        "DATABASE_URL": "postgresql://x:x@localhost:5432/x",
-        "REDIS_URL": "redis://localhost:6379/0",
-        "SECRET_KEY": "t" * 32,
-        "JWT_SECRET_KEY": "t" * 32,
-    }.items():
-        os.environ.setdefault(k, v)
+    # The shared helper sets the minimal env the API bootstrap requires (engines/clients connect
+    # lazily); this test never opens a socket, it only reads the declared dependency order.
+    set_bare_api_env()
     import app.api.api_server as server
     return server.app
 
