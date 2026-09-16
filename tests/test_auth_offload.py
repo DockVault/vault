@@ -13,17 +13,37 @@ what bounds the pool; this test pins the cap the ordering relies on. run_offload
 """
 import asyncio
 import contextvars
+import os
 import threading
 
 import pytest
 from fastapi import HTTPException
 
+# Dummy connection strings so importing the API module (for the _fire_offloop tests) is side-effect-free.
+for _k, _v in {
+    "DATABASE_URL": "postgresql://x:x@localhost:5432/x",
+    "REDIS_URL": "redis://localhost:6379/0",
+    "SECRET_KEY": "t" * 32,
+    "JWT_SECRET_KEY": "t" * 32,
+}.items():
+    os.environ.setdefault(_k, _v)
+
 import app.core.auth_offload as ao
-from app.core.auth_offload import AUTH_OFFLOAD_LIMIT, auth_offload_slot, run_offloaded
+from app.core.auth_offload import (
+    AUTH_OFFLOAD_LIMIT, FIRE_OFFLOOP_LIMIT, auth_offload_slot, run_offloaded)
 
 pytestmark = pytest.mark.unit
 
 _probe = contextvars.ContextVar("offload_probe", default="unset")
+
+
+@pytest.fixture(autouse=True)
+def _restore_offload_globals():
+    """Tests here rebind the module-level slot semaphore onto their own loop; restore a clean one
+    afterwards so a semaphore bound to a now-closed loop never leaks to another module in the same
+    process."""
+    yield
+    ao._auth_slots = asyncio.Semaphore(AUTH_OFFLOAD_LIMIT)
 
 
 def _run(coro):
@@ -125,7 +145,7 @@ def test_the_slot_sheds_load_with_503_when_the_wait_exceeds_the_timeout(monkeypa
             with pytest.raises(HTTPException) as exc:
                 await asyncio.wait_for(waiter.__anext__(), timeout=3)
             assert exc.value.status_code == 503
-            assert exc.value.headers.get("Retry-After")
+            assert exc.value.headers.get("Retry-After") == str(ao._SLOT_RETRY_AFTER_SECONDS)
         finally:
             for g in holders:
                 with pytest.raises(StopAsyncIteration):
@@ -145,3 +165,120 @@ def test_run_offloaded_preserves_contextvars_into_the_worker():
     assert _run(run()) == "set-on-the-loop", (
         "the contextvar set on the loop was not visible inside the offloaded callable — "
         "run_in_executor dropped the context")
+
+
+def test_run_offloaded_keeps_the_loop_free_under_a_blocking_burst():
+    """The core of the login offload, without a server: N concurrent run_offloaded calls doing
+    blocking (GIL-releasing) work must not freeze the loop — an unrelated heartbeat keeps ticking
+    while the burst runs. This is the property the login route relies on to stay responsive under a
+    burst of CPU-bound password verifies. Replacing run_offloaded's executor hop with a direct call on
+    the loop freezes it and the heartbeat stalls — red."""
+    import time as _time
+
+    async def run():
+        ticks = {"n": 0}
+        stop = asyncio.Event()
+
+        async def heartbeat():
+            while not stop.is_set():
+                ticks["n"] += 1
+                await asyncio.sleep(0.005)
+
+        def blocking():
+            _time.sleep(0.3)  # releases the GIL: in a worker thread the loop runs on; on the loop it blocks
+
+        hb = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0.02)
+        before = ticks["n"]
+        await asyncio.gather(*[run_offloaded(blocking) for _ in range(AUTH_OFFLOAD_LIMIT)])
+        advanced = ticks["n"] - before
+        stop.set()
+        await hb
+        return advanced
+
+    advanced = _run(run())
+    # ~0.3 s of loop time at a 5 ms heartbeat is dozens of ticks when the loop is free; a direct call
+    # freezes it for ~8 x 0.3 s and the heartbeat barely advances. 15 sits well between the two.
+    assert advanced >= 15, (
+        f"the loop ticked only {advanced} times during an offloaded blocking burst — it was frozen, "
+        f"so run_offloaded did not move the blocking work off the loop")
+
+
+def test_the_shed_constants_are_the_shipped_values():
+    # Pin the shipped shed configuration so a change is a deliberate, reviewed edit — the shed test
+    # patches the timeout, so without this pin a silent change to the real value would go unnoticed.
+    assert ao.SLOT_ACQUIRE_TIMEOUT_SECONDS == 15.0
+    assert ao._SLOT_RETRY_AFTER_SECONDS == 5
+
+
+def test_run_offloaded_uses_the_dedicated_executor():
+    """The offloaded work must run in the module's dedicated pool (thread name prefix 'auth-offload'),
+    not the loop's default executor shared with the WebSocket poller. Reverting to asyncio.to_thread
+    lands it on a default-executor thread with a different name — red."""
+    async def run():
+        return await run_offloaded(lambda: threading.current_thread().name)
+
+    name = _run(run())
+    assert name.startswith("auth-offload"), (
+        f"offloaded work ran on thread {name!r}, not the dedicated 'auth-offload' pool")
+
+
+def test_fire_offloop_caps_concurrent_side_effects_at_the_limit():
+    """_fire_offloop must run at most FIRE_OFFLOOP_LIMIT side effects at once (their own DB sessions
+    must not outgrow the pool). Fire far more than the limit, hold each, and watch the peak."""
+    import app.api.api_server as S
+    lock = threading.Lock()
+    state = {"current": 0, "peak": 0}
+    release = threading.Event()
+
+    def work():
+        with lock:
+            state["current"] += 1
+            state["peak"] = max(state["peak"], state["current"])
+        release.wait(10)
+        with lock:
+            state["current"] -= 1
+
+    async def run():
+        S._offloop_sem = None  # bind a fresh semaphore on THIS loop
+        S._BG_TASKS.clear()
+        for _ in range(FIRE_OFFLOOP_LIMIT * 3):
+            S._fire_offloop(work)
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if state["current"] >= FIRE_OFFLOOP_LIMIT:
+                break
+        peak = state["peak"]
+        release.set()
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if state["current"] == 0 and not S._BG_TASKS:
+                break
+        return peak
+
+    peak = _run(run())
+    assert peak == FIRE_OFFLOOP_LIMIT, (
+        f"peak concurrent side effects was {peak}, expected {FIRE_OFFLOOP_LIMIT}")
+
+
+def test_fire_offloop_sheds_beyond_the_queue_cap():
+    """Beyond _OFFLOOP_MAX_PENDING queued side effects, _fire_offloop drops rather than growing the
+    queue without bound (the failed-login path feeds it from an unauthenticated door). Removing the
+    cap check schedules the work and increments nothing — red."""
+    import app.api.api_server as S
+
+    async def run():
+        S._offloop_sem = None
+        S._BG_TASKS.clear()
+        for i in range(S._OFFLOOP_MAX_PENDING):
+            S._BG_TASKS.add(("dummy", i))  # saturate the pending set with sentinels
+        before = S._offloop_dropped
+        fired = {"n": 0}
+        S._fire_offloop(lambda: fired.__setitem__("n", fired["n"] + 1))
+        delta = S._offloop_dropped - before
+        S._BG_TASKS.clear()
+        return delta, fired["n"]
+
+    delta, fired = _run(run())
+    assert delta == 1 and fired == 0, (
+        f"side effect not shed at the queue cap: dropped_delta={delta}, fired={fired}")

@@ -11,23 +11,40 @@ import re
 
 import pytest
 
+import conftest
+
 pytestmark = pytest.mark.unit
 
-# The first argument to a docker call — `docker("pause", ...)` / `_docker("pause", ...)` — is how the
-# Redis outage tests suspend the container; that is the marker for a pause site.
-_PAUSE = re.compile(r'\(\s*"pause"')
+# A docker "pause" of the Redis container, in any of the forms the suite uses:
+#   docker("pause", ...)  /  _docker("pause", ...)  /  subprocess.run(["docker", "pause", ...])
+# The quote may be single or double; requiring a preceding "(" or "," keeps prose like "pauses/
+# unpauses" in a docstring from matching.
+_PAUSE = re.compile(r"""[(,]\s*['"]pause['"]""")
 _SETTLES = "wait_out_breaker_cooldown"
 
 
-def test_every_redis_pausing_module_waits_out_the_breaker_cooldown():
+def test_every_redis_pausing_file_waits_out_the_breaker_cooldown():
     tests_dir = pathlib.Path(__file__).parent
+    this_file = pathlib.Path(__file__).name
     offenders = []
-    for path in sorted(tests_dir.glob("test_*.py")):
-        if path.name == pathlib.Path(__file__).name:
-            continue  # this contract module names "pause" only in prose
+    # Scan test modules, conftest, and the shared helper modules (the _*.py files a test imports).
+    for path in sorted(list(tests_dir.glob("test_*.py")) + list(tests_dir.glob("_*.py"))
+                       + [tests_dir / "conftest.py"]):
+        if path.name == this_file or not path.exists():
+            continue
         src = path.read_text(encoding="utf-8")
         if _PAUSE.search(src) and _SETTLES not in src:
             offenders.append(path.name)
     assert not offenders, (
-        "these modules pause the Redis container but never call wait_out_breaker_cooldown(), so the "
+        "these files pause the Redis container but never call wait_out_breaker_cooldown(), so the "
         f"next test in the invocation can start on an open breaker: {offenders}")
+
+
+def test_wait_out_breaker_cooldown_sleep_is_patchable(monkeypatch):
+    # The helper must sleep via the module-level `time` so the offline fast lane can patch it away
+    # instead of spending the real ~11 s cooldown. This also is that consumer of the affordance.
+    slept = []
+    monkeypatch.setattr(conftest.time, "sleep", lambda s: slept.append(s))
+    conftest.wait_out_breaker_cooldown()
+    assert slept, "wait_out_breaker_cooldown did not call the module-level time.sleep (not patchable)"
+    assert slept[0] >= 10, f"expected a cooldown-length sleep, got {slept}"

@@ -68,21 +68,34 @@ def _service_that_finds(cred):
     return svc
 
 
-def _route_for(cred):
+def _route_for(cred, *, allow_device_credential=True):
     svc = _service_that_finds(cred)
     with pytest.raises(_Routed) as exc:
-        svc.authenticate_temporary_credential("temp_probe", "whatever", "203.0.113.9")
+        svc.authenticate_temporary_credential(
+            "temp_probe", "whatever", "203.0.113.9",
+            allow_device_credential=allow_device_credential)
     return exc.value.which
 
 
-def test_a_device_credential_routes_to_the_device_bucket():
-    assert _route_for(_Cred(device_id="dev-123")) == "device"
+def test_a_device_credential_routes_to_the_device_bucket_at_the_sftp_door():
+    # allow_device_credential=True is the SFTP door, where a device credential legitimately spends its
+    # device bucket.
+    assert _route_for(_Cred(device_id="dev-123"), allow_device_credential=True) == "device"
+
+
+def test_a_device_credential_routes_to_its_username_bucket_at_the_web_door():
+    # allow_device_credential=False is the WEB door, where a device credential is refused after the
+    # throttle. It must NOT charge the device bucket there: otherwise its higher trip count classifies
+    # a device-sync name, and wrong-password web attempts drain the device's SFTP budget. It throttles
+    # in its own per-username bucket like any other known name. Reverting to the device bucket here
+    # makes this read "device" and go red.
+    assert _route_for(_Cred(device_id="dev-123"), allow_device_credential=False) == "username"
 
 
 def test_a_known_credential_without_a_device_routes_to_its_own_username_bucket():
-    # The heart of the fix: a hand-out credential, or one whose device was deleted (device_id NULL),
-    # is KNOWN and must throttle in its own per-username bucket — never login:<ip>. Reverting this to
-    # the IP throttle (the old behaviour) makes this assertion read "ip" and go red.
+    # A hand-out credential, or one whose device was deleted (device_id NULL), is KNOWN and must
+    # throttle in its own per-username bucket — never login:<ip>. Reverting this to the IP throttle
+    # (the old behaviour) makes this assertion read "ip" and go red.
     assert _route_for(_Cred(device_id=None)) == "username"
 
 

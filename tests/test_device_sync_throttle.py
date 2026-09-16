@@ -95,9 +95,12 @@ def _attempt_from_device(admin, dev, temp_vault, n_attempts):
     used as far as the cap allows, so on the reverted code each attempt lands a fresh charge on the
     shared IP bucket before any single username's own bucket trips. Returns the usernames minted."""
     names = _mint_many(admin, dev, temp_vault, n_attempts)
-    assert names, "could not mint any credential for the device"
+    # At least two distinct usernames, so on the reverted code the shared IP bucket really fills from
+    # distinct-username charges rather than one username's own bucket tripping first and masking it.
+    assert len(names) >= 2, f"expected at least 2 device credentials for the burst, got {len(names)}"
     for i in range(n_attempts):
-        _login_attempt(names[i % len(names)], _NEVER_VALID)
+        r = _login_attempt(names[i % len(names)], _NEVER_VALID)
+        assert r.status_code in (401, 429), r.text
     return names
 
 
@@ -275,6 +278,18 @@ def _normalize_countdown(text):
     return re.sub(r"\d+", "N", text or "")
 
 
+def _first_ip_bucket_429(max_attempts):
+    """Spray DISTINCT unknown temp_ names from one IP until a 429. Distinct names keep each name's own
+    per-username bucket at 1, so the throttle that finally trips is the per-IP one — the leg whose
+    pre-fix wording said '…from this IP…'. A single repeated name would trip its own username bucket
+    (generic message) first and never exercise the IP leg."""
+    for _ in range(max_attempts):
+        r = _login_attempt("temp_" + unique("ghost"), _NEVER_VALID)
+        if r.status_code == 429:
+            return r
+    return None
+
+
 def test_a_temp_429_does_not_reveal_its_bucket_kind(admin, temp_vault):
     """A temp_ credential's 429 at the web door must not reveal WHICH bucket it hit. The bucket limit
     is a kind oracle -- device (30), per-username (5), IP (10) -- so a device-minted, a hand-out and
@@ -290,16 +305,18 @@ def test_a_temp_429_does_not_reveal_its_bucket_kind(admin, temp_vault):
     handout_429 = _first_temp_429(handout["temp_username"], _LOGIN_LIMIT + 5)
     assert handout_429 is not None, "a hand-out credential's per-username bucket never tripped"
 
-    # A device-bucket temp_ 429.
+    # A device-linked temp_ 429. At the web door a device-linked name throttles in its per-username
+    # bucket (not the device bucket — that is the SFTP door), so it trips like the hand-out; the point
+    # here is that its body/headers are indistinguishable from the other kinds.
     dev = _register_granted_device(admin, temp_vault)
     device_cred = mint_sync_cred(dev["secret"], temp_vault["id"]).json()
     device_429 = _first_temp_429(device_cred["temp_username"], device_limit + 5)
-    assert device_429 is not None, "the device bucket never tripped over HTTP"
+    assert device_429 is not None, "the device-linked name never tripped a web-door throttle"
 
-    # An unknown temp_ username 429 (routes to the IP + username throttle; the per-username bucket
-    # trips first).
-    unknown_429 = _first_temp_429("temp_" + unique("ghost"), _IP_THRESHOLD + 5)
-    assert unknown_429 is not None, "an unknown temp_ username never tripped a throttle"
+    # An unknown temp_ name driven to the per-IP leg (distinct names), the only leg whose pre-fix
+    # wording differed ("…from this IP…").
+    unknown_429 = _first_ip_bucket_429(_IP_THRESHOLD + 5)
+    assert unknown_429 is not None, "the per-IP throttle never tripped for unknown names"
 
     kinds = {"device": device_429, "hand-out": handout_429, "unknown": unknown_429}
     statuses = {name: r.status_code for name, r in kinds.items()}
@@ -362,3 +379,41 @@ def test_the_device_bucket_still_bounds_a_runaway_under_a_redis_outage(admin, te
                 break
             time.sleep(2)
         wait_out_breaker_cooldown()
+
+
+def test_web_door_attempts_on_a_device_name_do_not_reach_the_device_bucket(admin, temp_vault):
+    """At the web door a device-linked name throttles in its per-username bucket, like a hand-out
+    name, and never in the device's SFTP bucket. So (1) it 429s at the login limit, not the higher
+    device limit — no attempt-count classifier — and (2) wrong web attempts do not drain the device's
+    sync budget, so the device still authenticates at the SFTP door afterwards.
+
+    On the reverted code a device-linked name at the web door charges the device bucket: its first
+    429 comes only after ~device_limit tries (classifier), and the burst exhausts the device bucket so
+    the SFTP credential is refused."""
+    device_limit = configured_int_setting("RATE_LIMIT_DEVICE_SYNC_ATTEMPTS") or 30
+    dev = _register_granted_device(admin, temp_vault)
+    web_cred = mint_sync_cred(dev["secret"], temp_vault["id"]).json()
+    sftp_cred = mint_sync_cred(dev["secret"], temp_vault["id"]).json()
+
+    first_429 = None
+    for i in range(1, device_limit + 6):
+        r = _login_attempt(web_cred["temp_username"], _NEVER_VALID)
+        if r.status_code == 429:
+            first_429 = i
+            break
+        assert r.status_code == 401, r.text
+    # (1) It tripped at the LOGIN limit, not the device limit — same count as any other temp_ name.
+    assert first_429 is not None and first_429 <= _LOGIN_LIMIT + 1, (
+        f"a device-linked name 429'd at attempt {first_429} at the web door — that is the device "
+        f"bucket ({device_limit}), not the per-username login limit ({_LOGIN_LIMIT}); its trip count "
+        f"classifies it as a device-sync name")
+
+    # Keep attempting past the trip so a reverted device bucket would be well past its limit.
+    for _ in range(device_limit + 5):
+        _login_attempt(web_cred["temp_username"], _NEVER_VALID)
+
+    # (2) The device's SFTP bucket is untouched: another of its credentials still authenticates at the
+    # SFTP door. On revert the web burst drained the device bucket and this is refused.
+    assert sftp_authenticates(sftp_cred["temp_username"], sftp_cred["credential"]), (
+        "the device's SFTP credential no longer authenticates — web-door attempts drained the "
+        "device's sync budget (the cross-door lockout)")
