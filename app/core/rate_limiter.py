@@ -403,6 +403,29 @@ end
 return {1, limit - current_count - 1, tostring(reset_at)}
 """
 
+    # Read-only twin of _SLIDING_WINDOW_SCRIPT: COUNT the entries already inside the window and read
+    # the oldest one for the reset, but NEVER ZADD -- asking "am I over?" must not consume budget.
+    # ZCOUNT (score >= window_start) needs no prune, so this touches Redis with two pure reads and
+    # writes nothing. Returns {over(0/1), reset_at}.
+    _SLIDING_WINDOW_PEEK_SCRIPT = """
+local key = KEYS[1]
+local window_start = tonumber(ARGV[1])
+local now = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local window = tonumber(ARGV[4])
+local current_count = redis.call('ZCOUNT', key, window_start, '+inf')
+local over = 0
+local reset_at = math.ceil(now + window)
+if current_count >= limit then
+    over = 1
+    local oldest = redis.call('ZRANGEBYSCORE', key, window_start, '+inf', 'WITHSCORES', 'LIMIT', 0, 1)
+    if oldest[2] then
+        reset_at = math.ceil(tonumber(oldest[2]) + window)
+    end
+end
+return {over, tostring(reset_at)}
+"""
+
     def __init__(self, redis_client):
         self.redis = redis_client
     
@@ -479,6 +502,54 @@ return {1, limit - current_count - 1, tostring(reset_at)}
             # blip doesn't take down general API traffic.
             return True, limit, int(now + window)
     
+    def peek_rate_limit(
+        self,
+        identifier: str,
+        limit: int,
+        window: int,
+        prefix: str = "rate_limit",
+    ) -> Tuple[bool, int]:
+        """Read whether `identifier` is AT OR OVER its sliding-window limit right now, WITHOUT
+        charging the bucket and WITHOUT touching the breaker's state.
+
+        The pre-flight ("can I?") counterpart to check_rate_limit ("I am -- am I allowed?"): it
+        counts the entries already in the window and reads the oldest for the reset, but never adds a
+        member, so asking never consumes budget. It also never records breaker success/failure -- a
+        health probe must OBSERVE the breaker, not drive it (the charging paths and the background
+        probe own that state machine). When the breaker is OPEN it raises RateLimiterUnavailable with
+        no socket, the same contract an auth caller relies on, so the caller drops to its durable DB
+        peek exactly as the charging path drops to the DB throttle; any Redis error does the same,
+        because a pre-flight read must never silently under-report a block by claiming "not limited"
+        on error. Returns (over_limit, retry_after_seconds); retry_after is 0 when under the limit.
+        """
+        now = time.time()
+        window_start = now - window
+        if _cb_is_open(now):
+            raise RateLimiterUnavailable("rate limiter circuit open (Redis recently unavailable)")
+        key = f"{prefix}:{identifier}"
+        try:
+            from app.core import redis_guard
+            results = redis_guard.timed_redis(
+                "RateLimiter.peek_rate_limit",
+                lambda: self.redis.eval(
+                    self._SLIDING_WINDOW_PEEK_SCRIPT,
+                    1,
+                    key,
+                    window_start,
+                    now,
+                    limit,
+                    window,
+                ))
+            over = bool(int(results[0]))
+            reset_at = int(results[1])
+            # retry_after is meaningful only when over the limit; report 0 otherwise, so a caller
+            # never reads a spurious wait out of an under-limit peek (whose reset is just now+window).
+            return over, (max(0, reset_at - int(now)) if over else 0)
+        except Exception as e:
+            # Do NOT trip the breaker here: this observer must not drive the state machine. Signal
+            # unavailability so the caller uses the durable DB peek instead of trusting a blank read.
+            raise RateLimiterUnavailable(str(e)) from e
+
     def check_rate_limit(
         self,
         identifier: str,

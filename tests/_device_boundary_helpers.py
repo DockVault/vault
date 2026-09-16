@@ -50,6 +50,17 @@ def mint_sync_cred(secret, vault_id, timeout=90):
     )
 
 
+def preflight(secret, timeout=90):
+    """Call GET /device/sync-preflight as the device (Device-Bearer), returning the raw response.
+    Bounded high so a cache-outage caller waits out socket stalls rather than reading a false red."""
+    anon = ApiClient(BASE_URL)
+    return anon.session.get(
+        f"{BASE_URL}/device/sync-preflight",
+        headers={"Authorization": f"Bearer {secret}"},
+        timeout=timeout,
+    )
+
+
 def cred_row(admin, temp_username, timeout=90):
     """The owner's view of one temp credential from /temp-creds/list, or None."""
     for row in admin.session.get(f"{BASE_URL}/temp-creds/list", timeout=timeout).json():

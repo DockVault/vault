@@ -452,6 +452,62 @@ jobs:
                        "modules were skipped, not exercised)")
           PY
 
+      - name: Exercise the device-sync pre-flight states
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The rate-limited state is reachable only when the device-sync rate limit sits BELOW the
+          # per-device credential cap, so the SFTP-auth bucket trips before unspent creds fill the cap
+          # (above it, the honest answer is legitimately cap-reached and the rate case skips). Set a
+          # small limit and recreate the API on it.
+          if grep -q '^RATE_LIMIT_DEVICE_SYNC_ATTEMPTS=' .env; then
+            sed -i 's/^RATE_LIMIT_DEVICE_SYNC_ATTEMPTS=.*/RATE_LIMIT_DEVICE_SYNC_ATTEMPTS=3/' .env
+          else
+            echo 'RATE_LIMIT_DEVICE_SYNC_ATTEMPTS=3' >> .env
+          fi
+          docker compose up -d --force-recreate vault-api
+          for attempt in $(seq 1 40); do
+            body=""
+            if body="$(curl -fsS --max-time 5 http://127.0.0.1:8200/health 2>/dev/null)"; then
+              case "$body" in
+                *'"database":"connected"'*) break ;;
+              esac
+            fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "::error::vault-api did not return after setting a small device-sync rate limit"
+              exit 1
+            fi
+            sleep 3
+          done
+          docker compose exec -T vault-redis redis-cli FLUSHALL
+          # VAULT_REDIS_OUTAGE_TEST opts the server-not-ready case in: it pauses Redis itself and
+          # waits the breaker out afterwards, so the step leaves the stack as it found it.
+          VAULT_REDIS_OUTAGE_TEST=1           VAULT_REDIS_CONTAINER=vault-redis             python -m pytest tests/test_device_sync_preflight_live.py --maxfail=1 --junitxml=preflight-junit.xml
+          # The point of this step is that the pre-flight states RUN here (rate-limited needs the small
+          # limit, server-not-ready needs the opt-in). Assert most of the module actually ran, so a
+          # guard that skipped it cannot pass this step green.
+          python - <<'PYCHECK'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse("preflight-junit.xml").getroot()
+          tests = sum(int(s.get("tests", 0)) for s in root.iter("testsuite"))
+          skipped = sum(int(s.get("skipped", 0)) for s in root.iter("testsuite"))
+          print(f"pre-flight step: {tests - skipped} ran, {skipped} skipped, {tests} collected")
+          if tests - skipped < 5:
+              sys.exit("::error::the pre-flight step ran fewer than 5 non-skipped tests (the module "
+                       "was skipped, not exercised)")
+          PYCHECK
+          # The server-not-ready case paused Redis; recreate below declares redis service_healthy, so
+          # make sure it came back healthy before later steps run.
+          for attempt in $(seq 1 30); do
+            status="$(docker inspect --format '{{.State.Health.Status}}' vault-redis 2>/dev/null || echo unknown)"
+            if [ "$status" = "healthy" ]; then break; fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::vault-redis did not return to healthy after the pre-flight step (last seen: ${status})"
+              exit 1
+            fi
+            sleep 2
+          done
+
       # A browser failure here used to leave only the accessibility dump Playwright prints, which
       # says what the page contained and not why. One such failure cost an hour of hypotheses --
       # each plausible, each wrong -- that a picture of the page would have settled at once: an

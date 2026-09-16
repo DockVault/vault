@@ -1684,6 +1684,93 @@ class AuthService:
             return {'limit': limit, 'remaining': max(0, limit - 1),
                     'reset': int(time.time()) + window}
 
+    # The typed pre-flight vocabulary. A device asks "can I sync right now?" and gets ONE of these,
+    # about ITS OWN state only -- never anything that distinguishes another device's or a vault's
+    # existence (the auth resolver already collapses unknown/foreign/retired-past-grace secrets to
+    # one 401 before any of this runs). Precedence is documented on device_sync_preflight.
+    PREFLIGHT_OK = "ok"
+    PREFLIGHT_SERVER_NOT_READY = "server-not-ready"
+    PREFLIGHT_GRANT_NEEDED = "grant-needed"
+    PREFLIGHT_CAP_REACHED = "cap-reached"
+    PREFLIGHT_RATE_LIMITED = "rate-limited"
+
+    def device_sync_rate_state(self, device_id) -> Tuple[bool, int]:
+        """PEEK the device's own SFTP-auth throttle bucket -- is it over its limit right now, and
+        for how long -- WITHOUT charging it. The read-only twin of _check_device_rate_limit: same
+        bucket key (device_sync:<device_id>), same limit/window, same Redis->DB fail-closed posture
+        (peek Redis while the breaker is closed, else the durable RateLimitRecord peek keyed by
+        DEVICE), so the pre-flight reports exactly the throttle a real SFTP auth would meet, one step
+        early and without spending a slot. That bucket is charged at the SFTP door, never at the
+        mint, so a mint-time caller has no other way to learn its sync-auth standing.
+        Returns (rate_limited, retry_after_seconds)."""
+        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
+        limit = rate_limit_settings.effective("rate_limit_device_sync_attempts")
+        window = rate_limit_settings.effective("rate_limit_device_sync_window_seconds")
+        try:
+            return rate_limiter.peek_rate_limit(
+                f"device_sync:{device_id}", limit, window, prefix="rate_limit")
+        except RateLimiterUnavailable:
+            # Redis unavailable (breaker open, or the peek itself errored) -> the durable DB counter,
+            # still keyed by DEVICE, read WITHOUT incrementing, so an outage cannot silently
+            # under-report the block or collapse the per-device bound onto the IP one.
+            return self._db_throttle_peek(str(device_id), "device_sync", limit, window)
+
+    def device_sync_preflight(self, device, *, server_ready: bool) -> dict:
+        """A typed, non-enumerating "can this device sync?" answer about THIS device ONLY. Reads
+        only: never mints, never charges the device bucket, never writes the breaker.
+
+        `server_ready` is the caller's PURE-READ verdict on infrastructure (the Redis breaker via
+        redis_circuit_open(), the SFTP host key, the DB) -- computed in the route so this method
+        stays a pure DB+peek reader. Precedence, most-blocking first, so the desktop is told the ONE
+        thing to act on:
+
+          1. server-not-ready -- the deployment is degraded (breaker open / host key missing / DB
+             down). Transient infra beats any authz answer: never send a device chasing a grant it
+             already holds, or hammering, while the server cannot serve. Replaces today's untyped 500.
+          2. grant-needed     -- this device has ZERO active grants, so there is nothing to sync. It
+             reveals only the device's own grant COUNT (already visible to it via /device/grants):
+             it names no vault and never says whether any vault exists, so it leaks no more than the
+             mint's own 'no-grant', which is identical for a missing and for an ungranted vault.
+          3. cap-reached      -- the device is at its per-device outstanding-credential cap; another
+             mint would 409. A HARDER stop than a rate limit (slots free only as creds are spent or
+             expire), and the honest answer when throttled SFTP auth has let unspent creds pile up
+             against the cap -- so it is reported AHEAD of rate-limited, the signal the desktop backs
+             off minting on.
+          4. rate-limited     -- the device's SFTP-auth bucket is over its limit; carries the DEVICE
+             bucket's own retry-after (never the IP bucket's).
+          5. ok               -- has a grant, under the cap, under the rate limit, server ready.
+        """
+        from app.core.models import DeviceGrant
+
+        if not server_ready:
+            return {"status": self.PREFLIGHT_SERVER_NOT_READY}
+
+        has_grant = self.db.query(DeviceGrant.id).filter(
+            DeviceGrant.device_id == device.id,
+            DeviceGrant.is_active == True,  # noqa: E712
+        ).first() is not None
+        if not has_grant:
+            return {"status": self.PREFLIGHT_GRANT_NEEDED}
+
+        # The SAME predicate the mint's cap check uses (active + unspent + unexpired, >= cap), so the
+        # pre-flight says cap-reached exactly when the next mint would 409. 0 = unlimited.
+        cap = getattr(settings, "max_device_sync_creds_per_device", 0) or 0
+        if cap > 0:
+            outstanding = self.db.query(TemporaryCredential).filter(
+                TemporaryCredential.device_id == device.id,
+                TemporaryCredential.is_active == True,  # noqa: E712
+                TemporaryCredential.is_used == False,  # noqa: E712 -- a spent single-use cred frees its slot
+                TemporaryCredential.expires_at > datetime.utcnow(),
+            ).count()
+            if outstanding >= cap:
+                return {"status": self.PREFLIGHT_CAP_REACHED}
+
+        rate_limited, retry_after = self.device_sync_rate_state(device.id)
+        if rate_limited:
+            return {"status": self.PREFLIGHT_RATE_LIMITED, "retry_after": retry_after}
+
+        return {"status": self.PREFLIGHT_OK}
+
     def _check_username_rate_limit(self, username: str):
         """Throttle a KNOWN temp_ credential that has no live device in its OWN per-username bucket
         (`login:<username>`) at the login per-username limit — and NEVER charge the shared
@@ -1840,6 +1927,44 @@ class AuthService:
             # lockout remains the final backstop.
             return False, max(1, min(window, 5))
     
+    @staticmethod
+    def _db_throttle_peek(identifier: str, action: str, limit: int, window: int) -> Tuple[bool, int]:
+        """Read-only twin of _db_throttle_hit: is (identifier, action) at/over its limit in the
+        current DB window, WITHOUT counting an attempt? SELECTs the one RateLimitRecord row and
+        applies the predicate the charging path would reach AFTER its increment -- the next charge is
+        refused iff the in-window count is already >= limit -- so a peek and the real attempt that
+        follows it agree. A row whose window has expired reads as not-limited (the next charge
+        restarts it at 1). Fails CLOSED (limited, a short retry) on its own error, exactly as
+        _db_throttle_hit does: this path runs precisely when Redis is already down, and a silent
+        'not limited' here would under-report a real block. A pure SELECT in its own short-lived
+        session -- no write, nothing to commit."""
+        from sqlalchemy import select
+        now = datetime.utcnow()
+        cutoff = now - timedelta(seconds=window)
+        fail_closed_retry = max(1, min(window, 5))
+        try:
+            tbl = RateLimitRecord.__table__
+            stmt = select(tbl.c.attempt_count, tbl.c.window_start).where(
+                tbl.c.identifier == identifier, tbl.c.action == action)
+            from app.core import redis_guard
+            with get_db_context() as db:
+                # Elapsed-only warning (function + seconds, never the query), matching _db_throttle_hit,
+                # so a slow paused-Redis peek that dropped to this DB read is attributable to its path.
+                row = redis_guard.timed_db("_db_throttle_peek", lambda: db.execute(stmt).first())
+            if row is None:
+                return False, 0
+            count, win_start = row[0], row[1]
+            if win_start is None or win_start < cutoff:
+                return False, 0
+            if count >= limit:
+                elapsed = (now - win_start).total_seconds()
+                return True, max(1, int(window - elapsed))
+            return False, 0
+        except Exception:
+            # Fail CLOSED, like _db_throttle_hit: with Redis already down, a silent 'not limited'
+            # would let the pre-flight wave through a device the throttle is meant to hold back.
+            return True, fail_closed_retry
+
     def _record_failed_login(
         self,
         identifier: str,

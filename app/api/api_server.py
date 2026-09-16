@@ -5331,6 +5331,52 @@ async def mint_device_sync_credential_endpoint(
     return cred
 
 
+def _sftp_host_key_available() -> bool:
+    """True iff the SFTP host key can be loaded right now -- the same precondition the mint fails
+    closed on (a credential whose host key the desktop cannot pin would force a blind
+    trust-on-first-use). A pure local read; any missing/unreadable/unparseable key reads as
+    unavailable (fail closed)."""
+    from app.sftp.host_key import load_host_key
+    key_path = settings.sftp_host_key_path
+    try:
+        if not os.path.exists(key_path):
+            return False
+        key = load_host_key(key_path)
+        return bool(key.get_base64())
+    except Exception:  # noqa: BLE001 -- a bad/odd key file is "not available", never a 500
+        return False
+
+
+@app.get("/device/sync-preflight")
+async def device_sync_preflight_endpoint(
+    principal: DevicePrincipal = Depends(get_current_device_principal),
+    db: Session = Depends(get_db),
+):
+    """A Device-Bearer "can I sync right now?" pre-flight: a typed answer about the CALLING device
+    ONLY, so the desktop can decide -- before it attempts a mint -- whether to proceed, wait, back
+    off, or ask for a grant, turning today's untyped mint-time 500 into a named 'server-not-ready'.
+
+    Non-enumerating BY CONSTRUCTION: it depends on get_current_device_principal, so an absent,
+    malformed, unknown, foreign, or retired-past-grace secret meets the SAME 401 as every other
+    device route BEFORE this body runs -- an unauthenticated or foreign caller learns nothing. Past
+    auth the answer is a pure function of the caller's OWN device state (its grant count, its own
+    credential cap, its own throttle bucket) plus deployment-wide health; it never names a vault and
+    never distinguishes 'does not exist' from 'not allowed' for anything but the caller itself.
+
+    It is a normal /device route, so the general-API rate-limit middleware counts it in the same
+    per-client bucket as the mint -- deliberately NOT a cheaper probe. It MINTS NOTHING, charges NO
+    throttle bucket, and only READS the breaker (never probes or heals it)."""
+    # server-ready is decided HERE with pure reads only, then handed to the service so the whole
+    # precedence lives in one testable place: the Redis breaker (redis_circuit_open() -- a pure read,
+    # never a probe or heal) and the SFTP host key the mint fails closed on. DB liveness is not
+    # re-probed on the loop: this request already authenticated the device, which required a
+    # successful DB read, so a dead DB never reaches here to be mis-reported as anything but its own
+    # error (the same surface the resolver has always had).
+    server_ready = (not redis_circuit_open()) and _sftp_host_key_available()
+    auth_service = AuthService(db)
+    return auth_service.device_sync_preflight(principal.device, server_ready=server_ready)
+
+
 @app.get("/device/grants")
 async def list_device_grants_endpoint(
     principal: DevicePrincipal = Depends(get_current_device_principal),
