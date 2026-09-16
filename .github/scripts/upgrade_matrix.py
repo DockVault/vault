@@ -175,7 +175,8 @@ def _validate_support(support: object, where: str) -> None:
                  f"{where}.support.security_support must not end before code_support")
 
 
-def _validate_vulnerabilities(meta: dict, version: str, versions: dict, where: str) -> None:
+def _validate_vulnerabilities(meta: dict, version: str, versions: dict, where: str,
+                              released_ceiling: str | None) -> None:
     """The optional per-version list of KNOWN, ALREADY-FIXED vulnerabilities.
 
     This is a public repository, so an unpatched-vulnerability disclosure here is a disclosure to an
@@ -185,6 +186,14 @@ def _validate_vulnerabilities(meta: dict, version: str, versions: dict, where: s
     `cvss` and `id` are required keys but may be null: an unrated finding states so explicitly, rather
     than by omission, the same way the support block always states eol/secure. title and description
     carry the meaning and must be printable (see `_printable_string`).
+
+    `released_ceiling`, when supplied, is the newest RELEASED version -- on a push to main that is the
+    VERSION file, which the release commit bumps; at release time it is the version being cut. A
+    `fixed_in` above it names a fix that does not exist yet, which turns the entry back into the
+    unpatched disclosure the listing rule exists to prevent. Declared-and-later alone does not catch
+    this: a phantom version can be declared to bridge the adjacency chain, and phantoms are only
+    rejected in the release gate. Left None (e.g. validating a published asset with no VERSION at
+    hand) the ceiling is not enforced and the declared-and-later rule still holds.
     """
     vulns = meta.get("vulnerabilities")
     if vulns is None:
@@ -213,6 +222,10 @@ def _validate_vulnerabilities(meta: dict, version: str, versions: dict, where: s
                  f"{spot}.fixed_in ({fixed_in}) must be a version later than {version}; a "
                  "vulnerability is listed only once fixed, and cannot be fixed in the release it "
                  "affects or an earlier one")
+        if released_ceiling is not None:
+            _require(_sort_key(fixed_in) <= _sort_key(released_ceiling),
+                     f"{spot} names {fixed_in} as the fix but the newest released version is "
+                     f"{released_ceiling}; an unreleased fix is an unpatched disclosure")
         _string(vuln.get("published"), f"{spot}.published", pattern=_DATE_RE)
 
 
@@ -237,8 +250,14 @@ def load_matrix(path: Path) -> dict:
     return data
 
 
-def validate_matrix(data: dict) -> dict:
-    """Check the whole file. Returns it unchanged so callers can chain."""
+def validate_matrix(data: dict, released_ceiling: str | None = None) -> dict:
+    """Check the whole file. Returns it unchanged so callers can chain.
+
+    `released_ceiling` is the newest released version, against which a vulnerability's `fixed_in` is
+    bounded so an unreleased fix cannot be listed (see `_validate_vulnerabilities`). Callers supply it
+    from the VERSION file (on main) or the version being cut (at release time); left None it is not
+    enforced.
+    """
     _no_unknown_keys(data, _TOP_KEYS, "upgrade matrix")
     _require(
         data.get("schema_version") == SUPPORTED_SCHEMA_VERSION,
@@ -281,7 +300,7 @@ def validate_matrix(data: dict) -> dict:
             _require(isinstance(meta["must_land_here"], bool),
                      f"versions[{version}].must_land_here must be a boolean")
         _validate_support(meta.get("support"), f"versions[{version}]")
-        _validate_vulnerabilities(meta, version, versions, f"versions[{version}]")
+        _validate_vulnerabilities(meta, version, versions, f"versions[{version}]", released_ceiling)
         # secure and the vulnerability list must agree. A secure version has nothing outstanding; and
         # from _VULN_LISTED_FROM on, a version that declares itself insecure must say what is wrong
         # with it (every such entry names a fix, so this discloses nothing unpatched).

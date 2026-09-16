@@ -176,7 +176,13 @@ def _check_upgrade_matrix(path: Path, version: str, released: set[str]) -> str |
     """
     matrix = _upgrade_matrix_module()
     try:
-        data = matrix.validate_matrix(matrix.load_matrix(path))
+        # A vulnerability's `fixed_in` may not name a version that is not released yet. The ceiling is
+        # the newest released version: the highest of the already-released tags and the one being cut
+        # now (which is being released by this very run). Taking the max rather than just the version
+        # being cut keeps it correct for a backport, whose version is below the newest release.
+        newest_released = max({version} | released,
+                              key=lambda v: tuple(int(p) for p in v.split(".")))
+        data = matrix.validate_matrix(matrix.load_matrix(path), released_ceiling=newest_released)
         matrix.assert_no_phantom_versions(data, released, version)
         reason = matrix.assert_release_declared(data, version)
     except matrix.UpgradeMatrixError as exc:

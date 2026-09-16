@@ -62,7 +62,10 @@ def _valid():
 # --- the committed file ------------------------------------------------------------------------
 
 def test_the_committed_matrix_is_valid():
-    um.validate_matrix(um.load_matrix(MATRIX_PATH))
+    # Against the real VERSION file: on main that is the newest released version, so a vulnerability
+    # naming an unreleased `fixed_in` would be caught here on an ordinary push, not only at release.
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    um.validate_matrix(um.load_matrix(MATRIX_PATH), released_ceiling=version)
 
 
 def test_every_released_tag_has_an_entry_and_a_way_to_reach_it():
@@ -304,6 +307,42 @@ def test_an_insecure_version_before_0_28_0_need_not_itemise():
     # the rule only bites from 0.28.0 on.
     data = _valid()
     data["versions"]["0.1.0"]["support"] = _support(secure=False)
+    um.validate_matrix(data)
+
+
+def _matrix_with_a_fix_in_the_newest_version():
+    """0.28.0 and 0.29.0 are insecure and each name a later fix; 0.30.0 is the newest and secure."""
+    m = _valid()
+    m["versions"]["0.28.0"] = {"released": "2026-09-04", "notes": "x", "support": _support(secure=False),
+                               "vulnerabilities": [{"title": "a", "description": "d", "severity": None,
+                                                    "cvss": None, "id": None, "fixed_in": "0.29.0",
+                                                    "published": "2026-09-15"}]}
+    m["versions"]["0.29.0"] = {"released": "2026-09-15", "notes": "y", "support": _support(secure=False),
+                               "vulnerabilities": [{"title": "b", "description": "d", "severity": None,
+                                                    "cvss": None, "id": None, "fixed_in": "0.30.0",
+                                                    "published": "2026-09-20"}]}
+    m["versions"]["0.30.0"] = {"released": "2026-09-20", "notes": "z", "support": _support(secure=True)}
+    m["edges"] += [
+        {"from": "0.2.0", "to": "0.28.0", "kind": "direct", "reversible": True, "requires_backup": False},
+        {"from": "0.28.0", "to": "0.29.0", "kind": "direct", "reversible": True, "requires_backup": False},
+        {"from": "0.29.0", "to": "0.30.0", "kind": "direct", "reversible": True, "requires_backup": False},
+    ]
+    return m
+
+
+def test_a_fix_in_an_unreleased_version_is_rejected_below_the_ceiling():
+    # 0.29.0 names 0.30.0 as its fix. With the newest released version at 0.29.1, 0.30.0 does not
+    # exist yet -- listing it would disclose an unpatched issue -- so validation is refused.
+    data = _matrix_with_a_fix_in_the_newest_version()
+    with pytest.raises(um.UpgradeMatrixError, match="names 0.30.0 as the fix but the newest released"):
+        um.validate_matrix(data, released_ceiling="0.29.1")
+
+
+def test_the_same_fix_is_accepted_once_its_version_is_released():
+    # In the release commit that cuts 0.30.0 the ceiling rises to 0.30.0, and the same entry passes.
+    data = _matrix_with_a_fix_in_the_newest_version()
+    um.validate_matrix(data, released_ceiling="0.30.0")
+    # And with no ceiling supplied the check is simply not applied (the declared-and-later rule holds).
     um.validate_matrix(data)
 
 
