@@ -1700,6 +1700,7 @@ async def require_interactive_admin(
 
 async def require_interactive_user(
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> User:
     """Reject a temporary-credential session on the device-management routes.
 
@@ -1711,6 +1712,19 @@ async def require_interactive_user(
     device id ahead of the 403 would itself tell a temp session whether that id exists.
     """
     if getattr(current_user, "_is_temp_session", False):
+        # A temporary session reaching for device management is a probe worth recording — the same
+        # gap _audit_admin_denial closes for the admin plane. Best-effort: everything is swallowed so
+        # a lost audit row never turns the 403 into a 500.
+        try:
+            from app.core.net_utils import current_client_ip
+            AuditLogger(db).log_action(
+                action="device_access_denied", status="failure", user=current_user,
+                resource_type="device", resource_id="device_management",
+                ip_address=current_client_ip(),
+                details={"reason": "temporary credential rejected on a device-management route"},
+            )
+        except Exception:  # noqa: BLE001 — a lost audit row must never mask the 403
+            pass
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This action requires an interactive session, not a temporary credential.",

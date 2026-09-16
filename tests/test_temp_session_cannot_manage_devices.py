@@ -32,18 +32,29 @@ def test_a_temporary_session_cannot_manage_or_enumerate_devices(admin):
         ("post", f"/devices/{real_id}/restore", None),
         ("post", f"/devices/{fake_id}/restore", None),
         ("post", f"/devices/{real_id}/revoke", None),
+        ("post", f"/devices/{fake_id}/revoke", None),
         ("delete", f"/devices/{real_id}", None),
+        ("delete", f"/devices/{fake_id}", None),
     ]
-    for verb, path, body in checks:
-        r = getattr(sess, verb)(path, json=body) if body is not None else getattr(sess, verb)(path)
-        assert r.status_code == 403, (
-            f"a temporary session reached {verb.upper()} {path}: {r.status_code} {r.text[:200]}")
+    try:
+        for verb, path, body in checks:
+            r = getattr(sess, verb)(path, json=body) if body is not None else getattr(sess, verb)(path)
+            assert r.status_code == 403, (
+                f"a temporary session reached {verb.upper()} {path}: {r.status_code} {r.text[:200]}")
 
-    # None of those attempts altered the account's devices.
-    devices = admin.get("/devices").json()["devices"]
-    still = next((d for d in devices if str(d.get("device_id")) == real_id), None)
-    assert still is not None and still.get("is_active") is True, (
-        "a temporary session's calls altered the account's devices")
+        # None of those attempts altered the account's devices.
+        devices = admin.get("/devices").json()["devices"]
+        still = next((d for d in devices if str(d.get("device_id")) == real_id), None)
+        assert still is not None and still.get("is_active") is True, (
+            "a temporary session's calls altered the account's devices")
+
+        # And the probe left a trace: reaching for device management from a temporary session is
+        # recorded, the same way an admin-plane denial is — an unrecorded 403 is a blind spot.
+        denials = admin.get("/audit/log?action=device_access_denied").json()
+        assert isinstance(denials, list) and len(denials) > 0, (
+            "a temporary session's device-management probe was refused but left no audit row")
+    finally:
+        admin.delete(f"/devices/{real_id}")
 
 
 def test_an_interactive_owner_still_manages_devices(admin, temp_vault):
