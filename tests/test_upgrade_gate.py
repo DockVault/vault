@@ -727,6 +727,36 @@ def test_clean_matrix_text_consumes_whole_ecma48_sequences_including_string_payl
     assert "\x1b" not in out          # the second pass guarantees no ESC ever reaches the terminal
 
 
+# The 8-bit C1 introducers and terminator, and unterminated string types. A C1 byte was always
+# dropped by the isprintable pass, but its PAYLOAD used to survive as text, and an unterminated
+# OSC/DCS/... left its payload too. Each C1 form and each unterminated string type is now consumed
+# whole. C1 bytes: CSI U+009B, OSC U+009D, DCS U+0090, PM U+009E, APC U+009F, SOS U+0098, ST U+009C.
+_CSI8, _OSC8, _DCS8, _PM8, _APC8, _SOS8, _ST8 = "\x9b", "\x9d", "\x90", "\x9e", "\x9f", "\x98", "\x9c"
+_C1_AND_UNTERMINATED_CASES = [
+    (_CSI8 + "31mred", "red"),                       # 8-bit CSI
+    (_OSC8 + "0;PWN" + _ST8, ""),                     # 8-bit OSC, 8-bit ST
+    (_OSC8 + "0;PWN" + "\x07", ""),                   # 8-bit OSC, BEL-terminated
+    (_DCS8 + "q#0" + _ST8, ""),                       # 8-bit DCS
+    (_APC8 + "x" + "\x1b\\", ""),                     # 8-bit APC, 7-bit ST
+    (_PM8 + "p" + _ST8, ""),                          # 8-bit PM
+    (_SOS8 + "s" + _ST8, ""),                          # 8-bit SOS
+    ("\x1b]0;PWN", ""),                               # unterminated OSC -> swallowed to end of string
+    ("\x1bPdcs-no-term", ""),                         # unterminated DCS -> to end
+    (_APC8 + "apc-no-term", ""),                       # unterminated 8-bit APC -> to end
+    ("\x1bPq\x07more\x1b\\", ""),                      # BEL is not a DCS terminator; runs to ST
+    ("\x1b]0;a\x1bb\x1b\\", ""),                       # ESC inside an OSC payload -> whole run to ST
+    ("\x1b]1;A\x07mid\x1b]2;B\x07", "mid"),            # nested/adjacent OSC: the middle text survives
+]
+
+
+@pytest.mark.parametrize("raw, expected", _C1_AND_UNTERMINATED_CASES)
+def test_clean_matrix_text_handles_c1_forms_and_unterminated_string_types(raw, expected):
+    out = dv.clean_matrix_text(raw)
+    assert out == expected, f"{raw!r} -> {out!r}, expected {expected!r}"
+    # No control or C1 byte survives (C0 0x00-0x1F, DEL/C1 0x7F-0x9F).
+    assert not any(ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f for ch in out)
+
+
 def test_lifecycle_is_read_from_the_newest_local_view_not_the_frozen_target():
     # A version becomes end-of-life AFTER it ships; the target's own published matrix is frozen at
     # cut time and forever self-declares eol:false, so this checkout's newer view must win.

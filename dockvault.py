@@ -1788,24 +1788,26 @@ def preferred_lifecycle_matrix(local_matrix, fetched_matrix, version):
 
 
 # A terminal escape sequence, matched as a WHOLE so its payload is removed with it, not left behind
-# as visible litter. This is the ECMA-48 escape grammar, and ORDER matters. The STRING-TYPE sequences
-# carry an arbitrary payload between an introducer and a terminator, and are listed FIRST so the whole
-# run is consumed:
-#   * OSC (ESC ]) -- window title, hyperlink -- ends at BEL or ST (ESC \);
-#   * DCS/APC/PM/SOS (ESC P / _ / ^ / X) end at ST.
-# Then CSI (ESC [ params intermediates final -- a colour code, a screen-clear). LAST, the generic
-# escape: ESC, zero or more intermediates (0x20-0x2F), one final byte (0x30-0x7E) -- which covers the
-# nF (e.g. charset ESC ( B), Fp (keypad ESC =), Fe (C1) and Fs (RIS ESC c) forms in one rule.
-# It sits last on purpose: a full CSI is consumed by the CSI rule first, and an UNTERMINATED CSI
-# degrades here to just "ESC [" consumed with its parameters left as harmless text -- never an ESC.
-# The earlier bug was an ordering one: the old short class 0x5C-0x5F contained ']', so ESC+] matched
-# it before the OSC rule, and DCS/APC/PM/SOS had no rule at all, so their payloads survived as text
-# even though the ESC byte itself was always removed.
+# as visible litter. This is the ECMA-48 escape grammar, and ORDER matters. Each control has a 7-bit
+# form (ESC + a byte) and an 8-bit C1 form (a single 0x80-0x9F byte); both are accepted, since a
+# fetched asset could carry either. The STRING-TYPE sequences carry an arbitrary payload between an
+# introducer and a terminator, and are listed FIRST so the whole run is consumed:
+#   * OSC (ESC ] or U+009D) -- window title, hyperlink -- ends at BEL, ST (ESC \ or U+009C);
+#   * DCS/APC/PM/SOS (ESC P/_/^/X or U+0090/9F/9E/98) end at ST (BEL is NOT a terminator for these).
+# Their body is DOTALL non-greedy with the terminator OPTIONAL (`...|$`): an unterminated string type
+# is swallowed to end of string, exactly as a real terminal keeps consuming it, so no payload leaks.
+# Then CSI (ESC [ or U+009B, params intermediates final -- a colour code, a screen-clear). LAST, the
+# generic 7-bit escape: ESC, zero or more intermediates (0x20-0x2F), one final byte (0x30-0x7E),
+# covering the nF (charset ESC ( B), Fp (keypad ESC =), Fe and Fs (RIS ESC c) forms. It sits last on
+# purpose: a full CSI is consumed by the CSI rule first, and an unterminated 7-bit CSI degrades here
+# to just "ESC [" with its parameters left as harmless text. The isprintable second pass then drops
+# any control or C1 byte that no rule consumed, so no such byte ever reaches the terminal.
 _TERMINAL_ESCAPE_RE = re.compile(
-    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"     # OSC: ESC ] ... (BEL | ST)
-    r"|\x1b[P_^X][^\x1b]*\x1b\\"             # DCS / APC / PM / SOS: ESC (P|_|^|X) ... ST
-    r"|\x1b\[[0-?]*[ -/]*[@-~]"              # CSI: ESC [ params intermediates final
-    r"|\x1b[ -/]*[0-~]"                      # nF / Fp / Fe / Fs: ESC intermediates* final
+    r"(?:\x1b\]|\x9d).*?(?:\x07|\x1b\\|\x9c|$)"          # OSC: ESC ] / U+009D ... BEL | ST | end
+    r"|(?:\x1b[P_^X]|[\x90\x9e\x9f\x98]).*?(?:\x1b\\|\x9c|$)"  # DCS/APC/PM/SOS ... ST | end
+    r"|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]"                 # CSI: ESC [ / U+009B params intermediates final
+    r"|\x1b[ -/]*[0-~]",                                 # nF / Fp / Fe / Fs: ESC intermediates* final
+    re.DOTALL,
 )
 
 
@@ -1819,11 +1821,13 @@ def clean_matrix_text(value):
     would act on that terminal. The committed file is validated against these at commit time; a
     fetched one is trusted only this far. Two passes: first whole escape sequences are removed by the
     ECMA-48 grammar (the string types OSC/DCS/APC/PM/SOS with their payloads, CSI, and the generic
-    nF/Fp/Fe/Fs escapes), so nothing between an introducer and its terminator is left as visible text;
-    then anything `str.isprintable()` rejects (the C0/C1 controls, a lone or malformed ESC,
-    line/paragraph separators) is dropped -- the second pass is the guarantee that no ESC byte ever
-    reaches the terminal even if a sequence is malformed. Printable Unicode is kept, as is a plain
-    space. The visible text between sequences is preserved -- e.g. the label of an OSC-8 hyperlink."""
+    nF/Fp/Fe/Fs escapes), in both their 7-bit ESC forms and their 8-bit C1 forms, and an unterminated
+    string type is swallowed to end of string -- so nothing between an introducer and its terminator
+    is left as visible text. Then anything `str.isprintable()` rejects (the C0/C1 controls, a lone or
+    malformed ESC, line/paragraph separators) is dropped -- the second pass is the guarantee that no
+    control byte ever reaches the terminal even if a sequence is malformed. Printable Unicode is kept,
+    as is a plain space. The visible text between sequences is preserved -- e.g. an OSC-8 hyperlink's
+    label survives while its URL does not."""
     if not isinstance(value, str):
         return ""
     text = _TERMINAL_ESCAPE_RE.sub("", value)
