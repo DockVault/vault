@@ -20828,6 +20828,9 @@ def _run_lightweight_migrations():
             "ALTER TABLE notes ALTER COLUMN title TYPE TEXT",
             "ALTER TABLE note_public_links ALTER COLUMN title_snapshot TYPE TEXT",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS note VARCHAR(500)",
+            # The credential-lifecycle slot marker: set by the connection-close hook when a
+            # credential's connection finishes, freeing its cap slot (see app/core/temp_cred_slot.py).
+            "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS slot_released_at TIMESTAMP",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS can_create_temp_credentials BOOLEAN DEFAULT FALSE",
             # Least-privilege scope for temp credentials (the temp_credential_vault_access
             # TABLE itself is created by create_all; only new COLUMNS need an ALTER).
@@ -21339,6 +21342,21 @@ def _verify_encryption_key_canary():
         print(f"⚠ encryption-key canary check skipped: {e}")
 
 
+def _release_finished_cred_slots():
+    """Release the cap slots of credentials already finished under the pre-lifecycle model, leaving
+    any whose connection is open at upgrade time in use (idempotent; marker-guarded). Best-effort:
+    never block boot. Logic lives in app.core.temp_cred_slot so it is testable."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.temp_cred_slot import backfill_released_slots
+        with get_db_context() as db:
+            released = backfill_released_slots(db)
+        if released:
+            print(f"[OK] Released {released} finished credential slot(s) on upgrade")
+    except Exception as e:  # noqa: BLE001 -- best-effort lifecycle migration, never block boot
+        print(f"⚠ credential-slot release backfill skipped: {e}")
+
+
 def _purge_audit_log_names():
     """Strip residual plaintext names (file/folder/old/new/vault_name) from legacy audit-log rows
     written before the AuditLogger began redacting them (idempotent; a marker makes it a no-op after
@@ -21577,6 +21595,7 @@ async def lifespan(app: FastAPI):
     _backfill_encrypted_names()
     _backfill_file_checksums()          # seal any legacy plaintext file content checksums at rest
     _purge_audit_log_names()            # strip residual plaintext names from legacy audit-log rows
+    _release_finished_cred_slots()      # free cap slots of credentials finished before this upgrade
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
     _admin_bootstrap_status = _seed_admin_user()
     # Once the admin is bootstrapped, ADMIN_PASSWORD is spent: drop it (remove a writable mounted

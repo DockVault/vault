@@ -331,9 +331,10 @@ def test_the_preflight_is_counted_in_the_same_middleware_class_as_the_mint():
 
 
 def test_the_preflight_cap_predicate_matches_the_mint():
-    # The pre-flight must say cap-reached exactly when the next mint would 409, so both count active +
-    # unspent + unexpired credentials and compare against the cap the same way.
+    # The pre-flight must say cap-reached exactly when the next mint would 409, so both count the SAME
+    # slot-holders: they share ONE predicate (outstanding_conditions), so neither inlines
+    # its own copy. The predicate's behaviour is proven in test_temp_cred_slot.py.
     src = _flat(_AUTH)
-    assert src.count("TemporaryCredential.is_used == False,") >= 2
-    assert src.count("TemporaryCredential.expires_at > datetime.utcnow(),") >= 2
+    assert "outstanding_conditions(TemporaryCredential, datetime.utcnow())" in src
+    # Both cap sites compare the shared count against the cap; neither inlines the old predicate.
     assert "if outstanding >= cap:" in src and "if active_for_device >= cap:" in src

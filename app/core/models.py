@@ -329,6 +329,12 @@ class TemporaryCredential(Base):
     is_used = Column(Boolean, default=False)
     used_at = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
+    # Set by the SFTP connection-close hook (and the reaper backstop) when this credential's
+    # connection has FINISHED: the state-derived signal that frees its cap slot. NULL = still holds
+    # its slot (active, or in use with a live connection). Never un-set, never flips is_used or
+    # is_active -- a spent credential stays spent, and 'used/expired' is distinct from 'deleted'.
+    # See app/core/temp_cred_slot.py for the one shared slot predicate both caps use.
+    slot_released_at = Column(DateTime, nullable=True)
 
     # Optional creator note explaining why the credential was issued.
     note = Column(String(500), nullable=True)

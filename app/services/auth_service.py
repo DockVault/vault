@@ -27,6 +27,7 @@ from app.core.database import redis_client, get_db_context
 from app.core.safe_log import safe_event
 from app.core.config import settings
 from app.core import rate_limit_settings, vault_attempt_throttle
+from app.core.temp_cred_slot import outstanding_conditions
 
 
 # --- Best-effort cache guard: read-through, with a PRIVATE failure memory ----------------------
@@ -759,8 +760,7 @@ class AuthService:
             if not _exempt:
                 _active_temp = self.db.query(TemporaryCredential).filter(
                     TemporaryCredential.user_id == user_id,
-                    TemporaryCredential.is_active == True,  # noqa: E712
-                    TemporaryCredential.expires_at > datetime.utcnow(),
+                    *outstanding_conditions(TemporaryCredential, datetime.utcnow()),
                 ).count()
                 if _active_temp >= _max_temp:
                     # 409 (not 400): the request is well-formed; it conflicts with the current state
@@ -1277,21 +1277,18 @@ class AuthService:
 
         # Per-device outstanding-credential cap: a SEPARATE bound from the per-user interactive cap
         # (create_temporary_credential's max_temp_creds_per_user), so a compromised device is bounded
-        # on its own and neither path can starve or exhaust the other. 0 = unlimited. Counts only
-        # OUTSTANDING creds — is_active AND not yet spent (is_used == False) AND not yet expired. The
-        # is_used filter is load-bearing: a single-use cred is SPENT by its one SFTP auth, which flips
-        # is_used True but leaves is_active True until the lazy expiry sweep — so without it every
-        # already-used cred would keep counting for its full TTL, and a device that mints-and-uses in
-        # the normal way would false-hit the cap (a 409 stall) within the hour despite holding no live
-        # credential. (An UNSPENT cred still counts until its hard expires_at, which a shorter
-        # client validity below does not move — spending it, the normal case, is what frees the slot.)
+        # on its own and neither path can starve or exhaust the other. 0 = unlimited. "Outstanding"
+        # is the ONE shared slot predicate (app/core/temp_cred_slot.outstanding_conditions), so the
+        # mint and the pre-flight count the same set: a credential holds a slot from mint until its
+        # connection FINISHES (the close hook sets slot_released_at) or its VALIDITY window ends
+        # (deactivate_at) -- NOT at first-auth. is_used is deliberately out of it: a spent cred stays
+        # IN USE while its connection is open, and the validity bound (not the 65-min hard expiry)
+        # frees a SIGKILLed one, which is what closes the measured unspent-credential amplifier.
         cap = getattr(settings, "max_device_sync_creds_per_device", 0) or 0
         if cap > 0:
             active_for_device = self.db.query(TemporaryCredential).filter(
                 TemporaryCredential.device_id == device.id,
-                TemporaryCredential.is_active == True,  # noqa: E712
-                TemporaryCredential.is_used == False,  # noqa: E712 — a spent single-use cred frees its slot
-                TemporaryCredential.expires_at > datetime.utcnow(),
+                *outstanding_conditions(TemporaryCredential, datetime.utcnow()),
             ).count()
             if active_for_device >= cap:
                 # 409 (well-formed request, conflicts with current state), mirroring the per-user
@@ -1752,15 +1749,13 @@ class AuthService:
         if not has_grant:
             return {"status": self.PREFLIGHT_GRANT_NEEDED}
 
-        # The SAME predicate the mint's cap check uses (active + unspent + unexpired, >= cap), so the
+        # The SAME shared slot predicate the mint's cap check uses (outstanding_conditions), so the
         # pre-flight says cap-reached exactly when the next mint would 409. 0 = unlimited.
         cap = getattr(settings, "max_device_sync_creds_per_device", 0) or 0
         if cap > 0:
             outstanding = self.db.query(TemporaryCredential).filter(
                 TemporaryCredential.device_id == device.id,
-                TemporaryCredential.is_active == True,  # noqa: E712
-                TemporaryCredential.is_used == False,  # noqa: E712 -- a spent single-use cred frees its slot
-                TemporaryCredential.expires_at > datetime.utcnow(),
+                *outstanding_conditions(TemporaryCredential, datetime.utcnow()),
             ).count()
             if outstanding >= cap:
                 return {"status": self.PREFLIGHT_CAP_REACHED}

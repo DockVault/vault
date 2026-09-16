@@ -36,86 +36,29 @@ def _flat(path: Path) -> str:
     return re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
 
 
-# ---- Cap: only outstanding (active + unspent + unexpired) credentials count ----------------------
-def test_cap_filter_counts_only_active_unspent_unexpired():
-    """The behaviour the per-device cap rests on: a spent (is_used) credential drops out of the
-    count, so a device that mints-and-uses does not stall against the cap.
-
-    A throwaway table mirrors the columns the cap query touches (device_id, is_active, is_used,
-    expires_at); the assertion runs the EXACT filter predicate the mint uses. The source rule below
-    pins that the live query is that predicate.
-    """
-    sa = pytest.importorskip("sqlalchemy")
-    from sqlalchemy.orm import declarative_base, sessionmaker
-
-    Base = declarative_base()
-
-    class TempCred(Base):
-        __tablename__ = "device_cap_probe"
-        id = sa.Column(sa.Integer, primary_key=True)
-        device_id = sa.Column(sa.String)
-        is_active = sa.Column(sa.Boolean)
-        is_used = sa.Column(sa.Boolean)
-        expires_at = sa.Column(sa.DateTime)
-
-    engine = sa.create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-    s = Session()
-
-    now = datetime.utcnow()
-    future = now + timedelta(hours=1)
-    past = now - timedelta(hours=1)
-    DEV, OTHER = "dev-1", "dev-2"
-    s.add_all([
-        TempCred(id=1, device_id=DEV, is_active=True, is_used=False, expires_at=future),   # outstanding -> counts
-        TempCred(id=2, device_id=DEV, is_active=True, is_used=True, expires_at=future),     # SPENT -> must NOT count
-        TempCred(id=3, device_id=DEV, is_active=True, is_used=False, expires_at=past),      # expired -> must NOT count
-        TempCred(id=4, device_id=DEV, is_active=False, is_used=False, expires_at=future),   # revoked -> must NOT count
-        TempCred(id=5, device_id=OTHER, is_active=True, is_used=False, expires_at=future),  # another device -> isolated
-    ])
-    s.commit()
-
-    def outstanding_for(dev):
-        return s.query(TempCred).filter(
-            TempCred.device_id == dev,
-            TempCred.is_active == True,   # noqa: E712
-            TempCred.is_used == False,    # noqa: E712
-            TempCred.expires_at > datetime.utcnow(),
-        ).count()
-
-    # Only the single outstanding row counts for this device — the spent, expired, revoked, and
-    # other-device rows are all excluded.
-    assert outstanding_for(DEV) == 1
-    assert outstanding_for(OTHER) == 1  # device isolation: one path never counts another's creds
-
-    # Spend the last outstanding cred: the count drops to zero, so a fresh mint is NOT blocked —
-    # this is the regression the is_used filter closes (a spent cred was stalling the cap for its TTL).
-    s.query(TempCred).filter(TempCred.id == 1).update({"is_used": True})
-    s.commit()
-    assert outstanding_for(DEV) == 0
-
-    s.close()
-    engine.dispose()
-
-
-def test_cap_query_in_source_filters_on_is_used():
-    """The live per-device cap query must filter is_active AND is_used == False AND expires_at.
-
-    Pinned as a source rule because the count runs in a method that needs the full application to
-    import; a refactor that dropped the is_used clause would silently reopen the 409-stall and pass
-    every pure test otherwise.
+# ---- Cap: both cap sites use the ONE shared slot predicate --------------------------------------
+def test_the_device_and_user_cap_sites_use_the_one_shared_slot_predicate():
+    """The credential-lifecycle change replaced the inline per-device cap predicate (is_active AND
+    is_used == False AND
+    expires_at) with the single shared slot predicate in app/core/temp_cred_slot, so the mint, the
+    pre-flight, and the per-user cap all count the SAME set of slot-holders. Pinned as a source rule
+    because the counts run in methods that need the full application to import; the predicate's own
+    behaviour -- what counts as a slot-holder, the connection-close release, the in-flight-safe
+    upgrade backfill -- is proven in test_temp_cred_slot.py. A site that reverted to an inline
+    predicate would silently diverge the mint from the pre-flight (the duplication this closes).
     """
     flat = _flat(AUTH_SERVICE)
-    device_cap_queries = [
-        q for q in re.findall(r"query\(TemporaryCredential\)\.filter\([^;]{0,400}?\.count\(\)", flat)
-        if "device_id == device.id" in q
-    ]
-    assert device_cap_queries, "did not find the per-device cap count query (rule matched nothing)"
-    for q in device_cap_queries:
-        assert "is_used == False" in q, f"per-device cap count no longer excludes spent creds:\n  {q}"
-        assert "is_active == True" in q, f"per-device cap count no longer requires active:\n  {q}"
-        assert "expires_at >" in q, f"per-device cap count no longer excludes expired:\n  {q}"
+    cap_queries = re.findall(r"query\(TemporaryCredential\)\.filter\([^;]{0,400}?\.count\(\)", flat)
+    device_caps = [q for q in cap_queries if "device_id == device.id" in q]
+    user_caps = [q for q in cap_queries if "user_id == user_id" in q]
+    assert len(device_caps) >= 2, "expected the mint AND the pre-flight per-device cap counts"
+    assert user_caps, "expected the per-user cap count"
+    for q in device_caps + user_caps:
+        assert "outstanding_conditions(" in q, (
+            f"a cap count no longer uses the shared slot predicate:\n  {q}")
+        # The old inline clauses must be gone, or a stale copy could drift from the shared one.
+        assert "is_used == False" not in q and "expires_at >" not in q, (
+            f"a cap count still inlines the old predicate instead of sharing one:\n  {q}")
 
 
 # ---- Validity: a client may only SHORTEN the TTL, never extend it --------------------------------
