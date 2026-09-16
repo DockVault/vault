@@ -132,7 +132,7 @@ def test_a_closed_breaker_reports_not_open():
     assert R.redis_circuit_open() is False
 
 
-# --- FIX 1: the breaker can never sit open with no working probe ---------------------------------
+# --- the breaker can never sit open with no working probe ----------------------------------------
 # The flag has no timer and the probe is its only closer, and while open no foreground caller records
 # a failure -- so "open with no working probe" would be permanent. Three ways it could arise, each
 # covered below: a failure racing the probe's exit, a Thread.start() that raised, and a hung probe.
