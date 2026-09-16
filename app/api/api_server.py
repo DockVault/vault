@@ -5560,7 +5560,10 @@ async def login(
             user, session_token = auth_service.authenticate_temporary_credential(
                 temp_username=login_request.username,
                 credential=login_request.password,
-                ip_address=client_ip
+                ip_address=client_ip,
+                # A device-minted sync credential is refused at the web door (same generic 401 as a
+                # wrong credential, and it is not spent) — it belongs at the SFTP door only.
+                allow_device_credential=False,
             )
             is_temporary = True
         else:

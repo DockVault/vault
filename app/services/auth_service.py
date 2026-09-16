@@ -337,7 +337,9 @@ class AuthService:
         self,
         temp_username: str,
         credential: str,
-        ip_address: str
+        ip_address: str,
+        *,
+        allow_device_credential: bool = True,
     ) -> Tuple[User, str]:
         """
         Authenticate using temporary one-time credentials.
@@ -376,6 +378,18 @@ class AuthService:
         # deactivated one by response time (same discipline as authenticate_user). Every non-success
         # outcome returns the same generic message; the specific reason is for internal handling only.
         if not verify_temporary_credential(credential, temp_cred.credential_hash):
+            self._record_failed_login(temp_username, ip_address)
+            raise InvalidCredentialsError("Invalid temporary credentials")
+
+        # A device-minted sync credential (device_id set) is issued for one SFTP sync run and has no
+        # legitimate use at an interactive door. The caller says which door this is
+        # (allow_device_credential=False for web login); the client cannot influence it. Refused with
+        # the SAME generic error, the same failed-login record, and the same throttle charge (already
+        # taken at the top) as a wrong credential, so a device-minted username is indistinguishable
+        # from any other. Placed AFTER the verify above (a wrong-password probe pays the same argon2
+        # cost either way — no timing tell that a username is a sync credential) and BEFORE the
+        # is_used claim below (so refusing it never spends the credential the device still needs).
+        if not allow_device_credential and temp_cred.device_id is not None:
             self._record_failed_login(temp_username, ip_address)
             raise InvalidCredentialsError("Invalid temporary credentials")
 
