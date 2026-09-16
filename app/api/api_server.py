@@ -39,6 +39,8 @@ bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
 from app.core import vault_attempt_throttle
+from app.core import redis_guard
+from app.core.rate_limiter import redis_circuit_open
 from app.core.auth_offload import (
     auth_offload_slot, run_offloaded, FIRE_OFFLOOP_LIMIT, _offload_executor)
 from app.core.chunk_cleanup import fail_chunk_session
@@ -9746,24 +9748,30 @@ def _notelink_fail_key(token: str) -> str:
 
 def _notelink_locked(token: str) -> bool:
     """True if this link is in failed-secret lockout. Raises on a Redis outage so the caller fails
-    CLOSED (503) — a link's lockout must never silently lift because the store is unreachable."""
+    CLOSED (503) — a link's lockout must never silently lift because the store is unreachable, and on
+    an anonymous read path the lockout is the only throttle a secret-guesser meets. While the breaker
+    is open we raise BEFORE the socket, so the outage costs no on-loop stall here."""
+    if redis_circuit_open():
+        raise RuntimeError("rate-limit store unavailable")
     from app.core.rate_limiter import rate_limiter as _rl
     r = getattr(_rl, "redis", None)
     if r is None:
         raise RuntimeError("rate-limit store unavailable")
-    n = r.get(_notelink_fail_key(token))
+    n = redis_guard.timed_redis("_notelink_locked", lambda: r.get(_notelink_fail_key(token)))
     return n is not None and int(n) >= _NOTELINK_FAIL_MAX
 
 
 def _notelink_record_fail(token: str) -> int:
-    """Count one wrong-secret attempt; returns the running count. Best-effort — a store outage is
-    handled by the redemption rate-limit gate (which fails closed) before we get here."""
+    """Count one wrong-secret attempt; returns the running count. While the breaker is open, return
+    the lockout MAX before the socket — a wrong guess during an outage counts as locked, never lifts."""
+    if redis_circuit_open():
+        return _NOTELINK_FAIL_MAX
     from app.core.rate_limiter import rate_limiter as _rl
     r = getattr(_rl, "redis", None)
     if r is None:
         return _NOTELINK_FAIL_MAX
     try:
-        n = int(r.incr(_notelink_fail_key(token)))
+        n = int(redis_guard.timed_redis("_notelink_record_fail", lambda: r.incr(_notelink_fail_key(token))))
         if n == 1:
             r.expire(_notelink_fail_key(token), _NOTELINK_FAIL_WINDOW)
         return n
@@ -9772,6 +9780,8 @@ def _notelink_record_fail(token: str) -> int:
 
 
 def _notelink_clear_fails(token: str) -> None:
+    if redis_circuit_open():
+        return  # skip the socket while open; clearing a lockout is best-effort on success only
     from app.core.rate_limiter import rate_limiter as _rl
     r = getattr(_rl, "redis", None)
     if r is not None:
@@ -10243,22 +10253,28 @@ def _publiclink_grant_key(grant: str) -> str:
 
 def _publiclink_locked(token_hash: str) -> bool:
     """True if this link is in failed-secret lockout. Raises on a Redis outage so the caller fails
-    CLOSED — a lockout must never silently lift because the store is unreachable."""
+    CLOSED — a lockout must never silently lift because the store is unreachable (an anonymous read
+    path, where the lockout is the only throttle). While the breaker is open we raise before the
+    socket, so the outage costs no on-loop stall here."""
+    if redis_circuit_open():
+        raise RuntimeError("rate-limit store unavailable")
     from app.core.rate_limiter import rate_limiter as _rl
     r = getattr(_rl, "redis", None)
     if r is None:
         raise RuntimeError("rate-limit store unavailable")
-    n = r.get(_publiclink_fail_key(token_hash))
+    n = redis_guard.timed_redis("_publiclink_locked", lambda: r.get(_publiclink_fail_key(token_hash)))
     return n is not None and int(n) >= _PUBLINK_FAIL_MAX
 
 
 def _publiclink_record_fail(token_hash: str) -> int:
+    if redis_circuit_open():
+        return _PUBLINK_FAIL_MAX  # a wrong guess during an outage counts as locked, never lifts
     from app.core.rate_limiter import rate_limiter as _rl
     r = getattr(_rl, "redis", None)
     if r is None:
         return _PUBLINK_FAIL_MAX
     try:
-        n = int(r.incr(_publiclink_fail_key(token_hash)))
+        n = int(redis_guard.timed_redis("_publiclink_record_fail", lambda: r.incr(_publiclink_fail_key(token_hash))))
         if n == 1:
             r.expire(_publiclink_fail_key(token_hash), _PUBLINK_FAIL_WINDOW)
         return n
@@ -10267,6 +10283,8 @@ def _publiclink_record_fail(token_hash: str) -> int:
 
 
 def _publiclink_clear_fails(token_hash: str) -> None:
+    if redis_circuit_open():
+        return  # skip the socket while open; clearing a lockout is best-effort on success only
     from app.core.rate_limiter import rate_limiter as _rl
     r = getattr(_rl, "redis", None)
     if r is not None:
@@ -10279,7 +10297,9 @@ def _publiclink_clear_fails(token_hash: str) -> None:
 def _publiclink_issue_grant(link_id, client_ip: str) -> str:
     """Mint a single-use download grant bound to (link_id, client_ip), stored HASHED in Redis with a
     short TTL. Raises RuntimeError if Redis is unavailable — a grant that cannot be stored is never
-    handed out (the caller answers 503)."""
+    handed out (the caller answers 503). While the breaker is open we raise before the socket."""
+    if redis_circuit_open():
+        raise RuntimeError("grant store unavailable")
     import secrets as _secrets
     from app.core.rate_limiter import rate_limiter as _rl
     r = getattr(_rl, "redis", None)
@@ -10289,7 +10309,9 @@ def _publiclink_issue_grant(link_id, client_ip: str) -> str:
     payload = f"{link_id}|{client_ip or ''}"
     try:
         # NX so a (astronomically unlikely) hash collision never overwrites a live grant.
-        ok = r.set(_publiclink_grant_key(grant), payload, ex=_PUBLINK_GRANT_TTL, nx=True)
+        ok = redis_guard.timed_redis(
+            "_publiclink_issue_grant",
+            lambda: r.set(_publiclink_grant_key(grant), payload, ex=_PUBLINK_GRANT_TTL, nx=True))
     except Exception as e:
         raise RuntimeError("grant store unavailable") from e
     if not ok:
@@ -10300,14 +10322,17 @@ def _publiclink_issue_grant(link_id, client_ip: str) -> str:
 def _publiclink_consume_grant(grant: str, link_id, client_ip: str) -> bool:
     """Consume a download grant: it must exist, be bound to THIS link and client IP, and be removed by
     THIS request (single-winner) — so a grant is good for exactly one download. Any miss returns False
-    (the caller answers with the uniform 404). A Redis outage means the grant can't be found → False."""
+    (the caller answers with the uniform 404). A Redis outage means the grant can't be found → False;
+    while the breaker is open we return False before the socket."""
+    if redis_circuit_open():
+        return False
     from app.core.rate_limiter import rate_limiter as _rl
     r = getattr(_rl, "redis", None)
     if r is None:
         return False
     key = _publiclink_grant_key(grant)
     try:
-        raw = r.get(key)
+        raw = redis_guard.timed_redis("_publiclink_consume_grant", lambda: r.get(key))
     except Exception:
         return False
     if raw is None:
@@ -11626,21 +11651,28 @@ def _receiver_fail_key(token_hash: str) -> str:
 
 
 def _receiver_locked(token_hash: str) -> bool:
+    """True if this receiver is in failed-secret lockout. Raises on a Redis outage so the caller fails
+    CLOSED — an anonymous read path, where the lockout is the only throttle; while the breaker is open
+    we raise before the socket, so the outage costs no on-loop stall here."""
+    if redis_circuit_open():
+        raise RuntimeError("rate-limit store unavailable")
     from app.core.rate_limiter import rate_limiter as _rl
     r = getattr(_rl, "redis", None)
     if r is None:
         raise RuntimeError("rate-limit store unavailable")
-    n = r.get(_receiver_fail_key(token_hash))
+    n = redis_guard.timed_redis("_receiver_locked", lambda: r.get(_receiver_fail_key(token_hash)))
     return n is not None and int(n) >= _RECV_FAIL_MAX
 
 
 def _receiver_record_fail(token_hash: str) -> int:
+    if redis_circuit_open():
+        return _RECV_FAIL_MAX  # a wrong guess during an outage counts as locked, never lifts
     from app.core.rate_limiter import rate_limiter as _rl
     r = getattr(_rl, "redis", None)
     if r is None:
         return _RECV_FAIL_MAX
     try:
-        n = int(r.incr(_receiver_fail_key(token_hash)))
+        n = int(redis_guard.timed_redis("_receiver_record_fail", lambda: r.incr(_receiver_fail_key(token_hash))))
         if n == 1:
             r.expire(_receiver_fail_key(token_hash), _RECV_FAIL_WINDOW)
         return n
@@ -11649,6 +11681,8 @@ def _receiver_record_fail(token_hash: str) -> int:
 
 
 def _receiver_clear_fails(token_hash: str) -> None:
+    if redis_circuit_open():
+        return  # skip the socket while open; clearing a lockout is best-effort on success only
     from app.core.rate_limiter import rate_limiter as _rl
     r = getattr(_rl, "redis", None)
     if r is not None:
