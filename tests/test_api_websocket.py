@@ -283,18 +283,19 @@ def test_ws_handshake_rejects_a_token_whose_session_row_is_gone(base_url, admin)
         try:
             ws.send(json.dumps({"type": "auth", "token": client.token}))
             ws.settimeout(8)
-            authenticated = False
-            for _ in range(5):
-                try:
-                    msg = ws.recv()
-                except Exception:
-                    break  # socket closed -> handshake rejected, as required
-                if msg:
-                    authenticated = True
-                    break
-            assert not authenticated, (
-                "the handshake authenticated a token whose ActiveSession row was deleted — an ABSENT "
-                "row must be rejected like a revoked one")
+            # Decide by the FIRST frame's type, mirroring test_ws_revoked_token_closed: a rejection
+            # sends {"type": "error", ...} then closes 1008; a successful auth's first frame is
+            # {"type": "connected", ...}. (An earlier instrument that flagged ANY non-empty frame as
+            # authenticated read the server's own rejection frame as success.)
+            first = json.loads(ws.recv())
+            assert first.get("type") == "error", (
+                "the handshake authenticated a token whose ActiveSession row was deleted "
+                f"(first frame {first.get('type')!r}) — an ABSENT row must be rejected like a revoked "
+                f"one. On the pre-fix handshake the first frame is 'connected'.")
+            with pytest.raises(Exception):
+                # after the error frame the server closes rather than streaming events
+                while True:
+                    ws.recv()
         finally:
             ws.close()
     finally:
