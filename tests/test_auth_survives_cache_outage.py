@@ -58,26 +58,34 @@ def redis_outage():
 def test_web_login_returns_a_token_during_a_cache_outage(admin, temp_user, redis_outage):
     """A correct password signs in during the outage — including a user who already holds a session,
     the case that stayed broken until the terminate-session cache delete became best-effort too."""
+    # 90 s, not the usual 15: during the pause each raw redis call on the login path stalls for the
+    # socket timeout before its guard continues (rate-limit read, terminate-session delete,
+    # create-session write, plus the try-wrapped monitor/activity publishes), and a CI runner pays
+    # more of them than a local box. The contract is "returns a token, not a 500" — latency during an
+    # outage is not what this test asserts, so a tight client timeout would be a false red.
     first = ApiClient(BASE_URL)
     r1 = first.session.post(f"{BASE_URL}/auth/login",
                             json={"username": temp_user["_username"], "password": temp_user["_password"]},
-                            timeout=15)
+                            timeout=90)
     assert r1.status_code == 200 and r1.json().get("access_token"), (
         f"first login during outage returned no token: {r1.status_code} {r1.text[:200]}")
 
     second = ApiClient(BASE_URL)
     r2 = second.session.post(f"{BASE_URL}/auth/login",
                              json={"username": temp_user["_username"], "password": temp_user["_password"]},
-                             timeout=15)
+                             timeout=90)
     assert r2.status_code == 200 and r2.json().get("access_token"), (
         f"re-login for a user with an existing session failed during the outage: "
         f"{r2.status_code} {r2.text[:200]}")
 
 
+@pytest.mark.sftp
 def test_a_valid_sftp_credential_is_not_burned_during_a_cache_outage(admin, redis_outage):
     """A valid single-use credential over SFTP during the outage authenticates, or is left UNUSED —
     never refused-and-consumed, which would strand its holder the moment the cache went down."""
-    tc = admin.post("/auth/temp-credentials", json={"note": unique("burn")})
+    # 90 s on every call below (not the ApiClient default): a paused cache makes each request pay
+    # socket-timeout stalls, so a tight bound would be a false red rather than a real failure.
+    tc = admin.session.post(f"{BASE_URL}/auth/temp-credentials", json={"note": unique("burn")}, timeout=90)
     assert tc.status_code in (200, 201), tc.text
     tc = tc.json()
 
@@ -92,8 +100,10 @@ def test_a_valid_sftp_credential_is_not_burned_during_a_cache_outage(admin, redi
 def test_mints_during_a_cache_outage_do_not_500_or_orphan(admin, temp_vault, redis_outage):
     """Both mint doors return a typed, usable credential during the outage — not a 500 that commits a
     row nobody receives, which counts against the caps until the cache recovers."""
+    # 90 s on every call below (not the ApiClient default): a paused cache makes each request pay
+    # socket-timeout stalls, so a tight bound would be a false red rather than a real failure.
     note = unique("outage")
-    interactive = admin.post("/auth/temp-credentials", json={"note": note})
+    interactive = admin.session.post(f"{BASE_URL}/auth/temp-credentials", json={"note": note}, timeout=90)
     assert interactive.status_code in (200, 201), (
         f"interactive mint failed during the outage: {interactive.status_code} {interactive.text[:200]}")
     assert interactive.json().get("credential"), "interactive mint returned no usable credential"
@@ -113,7 +123,7 @@ def test_mints_during_a_cache_outage_do_not_500_or_orphan(admin, temp_vault, red
         # returned (the list does not expose a device id at this version) — and assert exactly
         # one of each, not is_used. A failed mint that committed an orphan while returning non-500
         # would leave a SECOND row under the same note, so the "exactly one" still catches it.
-        rows = admin.get("/temp-creds/list").json()
+        rows = admin.session.get(f"{BASE_URL}/temp-creds/list", timeout=90).json()
         by_note = [r for r in rows if r.get("note") == note]
         assert len(by_note) == 1 and by_note[0]["is_used"] is False, (
             f"interactive mint left {len(by_note)} rows under its note — orphan committed: {by_note}")
@@ -121,4 +131,5 @@ def test_mints_during_a_cache_outage_do_not_500_or_orphan(admin, temp_vault, red
         assert len(by_user) == 1 and by_user[0]["is_used"] is False, (
             f"device mint's returned credential is not a single usable row: {by_user}")
     finally:
-        admin.delete(f"/devices/{dev['device_id']}")
+        # Still inside the outage (the fixture unpauses at teardown, after this runs), so bound it too.
+        admin.session.delete(f"{BASE_URL}/devices/{dev['device_id']}", timeout=90)

@@ -24,32 +24,35 @@ def temp_login(admin):
     return sess, tc
 
 
-def register_device(admin, label="sync-box"):
-    r = admin.post("/devices", json={"label": unique(label)})
+def register_device(admin, label="sync-box", timeout=90):
+    # Explicit timeout: a caller exercising a cache outage bounds every request at a value that
+    # covers the worst-case count of per-call socket-timeout stalls (a paused Redis) with margin.
+    r = admin.session.post(f"{BASE_URL}/devices", json={"label": unique(label)}, timeout=timeout)
     r.raise_for_status()
     return r.json()  # {device_id, label, secret, ...}
 
 
-def grant(admin, device_id, vault_id):
-    r = admin.post(f"/devices/{device_id}/grants", json={"vault_id": str(vault_id)})
+def grant(admin, device_id, vault_id, timeout=90):
+    r = admin.session.post(f"{BASE_URL}/devices/{device_id}/grants",
+                           json={"vault_id": str(vault_id)}, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
 
-def mint_sync_cred(secret, vault_id):
+def mint_sync_cred(secret, vault_id, timeout=90):
     """Mint a single-use SFTP credential as the device (Device-Bearer), returning the raw response."""
     anon = ApiClient(BASE_URL)
     return anon.session.post(
         f"{BASE_URL}/device/sync-credential",
         json={"vault_id": str(vault_id)},
         headers={"Authorization": f"Bearer {secret}"},
-        timeout=15,
+        timeout=timeout,  # bounded high so a cache-outage caller waits out socket stalls, not a false red
     )
 
 
-def cred_row(admin, temp_username):
+def cred_row(admin, temp_username, timeout=90):
     """The owner's view of one temp credential from /temp-creds/list, or None."""
-    for row in admin.get("/temp-creds/list").json():
+    for row in admin.session.get(f"{BASE_URL}/temp-creds/list", timeout=timeout).json():
         if row.get("temp_username") == temp_username:
             return row
     return None
@@ -58,7 +61,10 @@ def cred_row(admin, temp_username):
 def sftp_authenticates(temp_username, credential):
     """True iff the credential opens an authenticated SFTP session at the real door."""
     t = paramiko.Transport((SFTP_HOST, SFTP_PORT))
-    t.banner_timeout = 30
+    # Bounded high (not the default 15 s): during a cache outage the SFTP auth path pays the same
+    # per-call socket-timeout stalls, so a tight banner/auth timeout would be a false red, not a bug.
+    t.banner_timeout = 90
+    t.auth_timeout = 90
     try:
         t.connect(username=temp_username, password=credential)
         return t.is_authenticated()
