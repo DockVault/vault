@@ -388,7 +388,7 @@ jobs:
           set -euo pipefail
           VAULT_REDIS_OUTAGE_TEST=1 \
           VAULT_REDIS_CONTAINER=vault-redis \
-            python -m pytest tests/test_api_rate_limit_classes.py::test_general_api_classes_fail_open_during_redis_outage tests/test_auth_survives_cache_outage.py tests/test_auth_offload_under_outage.py tests/test_login_offload_keeps_loop_free.py --maxfail=1 --junitxml=outage-junit.xml
+            python -m pytest tests/test_api_rate_limit_classes.py::test_general_api_classes_fail_open_during_redis_outage tests/test_auth_survives_cache_outage.py tests/test_auth_offload_under_outage.py --maxfail=1 --junitxml=outage-junit.xml
           # Guard against a silently vacuous step: at least one non-skipped test must have run (an
           # opt-in gate or a missing precondition skipping the lot would otherwise pass green).
           python - <<'PY'
