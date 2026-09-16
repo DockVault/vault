@@ -83,6 +83,13 @@ class OtpResult:
 
 
 def _resolve_redis(redis):
+    # When the limiter's breaker is open, route straight to the durable DB path: returning None here
+    # makes every caller skip its Redis branch (issue/verify/invalidate all guard on `redis is not
+    # None`), so a step-up prompt during an outage does not pay a socket timeout per store op on the
+    # loop (the issue path touches Redis up to three times). Read the breaker, never probe it.
+    from app.core.rate_limiter import redis_circuit_open
+    if redis_circuit_open():
+        return None
     if redis is not None:
         return redis
     try:
