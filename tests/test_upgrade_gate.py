@@ -697,6 +697,36 @@ def test_a_tampered_vulnerability_title_renders_without_the_escape_sequence():
     assert "DANGERcleared" in line                                      # the visible text survives
 
 
+# Every ECMA-48 sequence family, and the payload-survival defect they exposed: an OSC/DCS/APC/PM/SOS
+# string type used to have its ESC removed but its PAYLOAD left as visible text, and RIS/charset/
+# keypad escapes left their final byte. The regex now consumes each as a whole unit, and the
+# isprintable pass guarantees no ESC survives even a malformed one.
+_ESC, _BEL, _ST = "\x1b", "\x07", "\x1b\\"
+_ESCAPE_CASES = [
+    (_ESC + "]0;PWNED" + _BEL, ""),                                          # OSC, BEL-terminated
+    (_ESC + "]0;PWNED" + _ST, ""),                                           # OSC, ST-terminated
+    (_ESC + "]8;;http://evil" + _BEL + "link" + _ESC + "]8;;" + _BEL, "link"),  # OSC-8: label survives
+    (_ESC + "_APC" + _ST, ""),                                               # APC
+    (_ESC + "Pq#0;2;0;0;0" + _ST, ""),                                       # DCS
+    (_ESC + "^PM" + _ST, ""),                                                # PM
+    (_ESC + "Xsos" + _ST, ""),                                               # SOS
+    (_ESC + "[31mred" + _ESC + "[0m", "red"),                                # CSI colour pair
+    (_ESC + "[2J", ""),                                                      # CSI screen-clear
+    (_ESC + "c", ""),                                                        # RIS (Fs)
+    (_ESC + "(B", ""),                                                       # charset designation (nF)
+    (_ESC + "=", ""),                                                        # keypad mode (Fp)
+    (_ESC + "[31", "31"),                                    # unterminated CSI: "ESC [" go, params stay
+    ("just text", "just text"),                                             # plain text untouched
+]
+
+
+@pytest.mark.parametrize("raw, expected", _ESCAPE_CASES)
+def test_clean_matrix_text_consumes_whole_ecma48_sequences_including_string_payloads(raw, expected):
+    out = dv.clean_matrix_text(raw)
+    assert out == expected, f"{raw!r} -> {out!r}, expected {expected!r}"
+    assert "\x1b" not in out          # the second pass guarantees no ESC ever reaches the terminal
+
+
 def test_lifecycle_is_read_from_the_newest_local_view_not_the_frozen_target():
     # A version becomes end-of-life AFTER it ships; the target's own published matrix is frozen at
     # cut time and forever self-declares eol:false, so this checkout's newer view must win.

@@ -1787,12 +1787,26 @@ def preferred_lifecycle_matrix(local_matrix, fetched_matrix, version):
     return local_matrix if version_support(local_matrix, version) else fetched_matrix
 
 
-# A terminal escape: a lone ESC-introduced sequence, a CSI sequence (ESC [ ... final byte, e.g. a
-# colour code or a screen-clear), or an OSC string (ESC ] ... terminator). Matched as a whole so the
-# printable bytes that follow the ESC (the "[31m" of a colour code) are removed with it, not left as
-# visible litter.
+# A terminal escape sequence, matched as a WHOLE so its payload is removed with it, not left behind
+# as visible litter. This is the ECMA-48 escape grammar, and ORDER matters. The STRING-TYPE sequences
+# carry an arbitrary payload between an introducer and a terminator, and are listed FIRST so the whole
+# run is consumed:
+#   * OSC (ESC ]) -- window title, hyperlink -- ends at BEL or ST (ESC \);
+#   * DCS/APC/PM/SOS (ESC P / _ / ^ / X) end at ST.
+# Then CSI (ESC [ params intermediates final -- a colour code, a screen-clear). LAST, the generic
+# escape: ESC, zero or more intermediates (0x20-0x2F), one final byte (0x30-0x7E) -- which covers the
+# nF (e.g. charset ESC ( B), Fp (keypad ESC =), Fe (C1) and Fs (RIS ESC c) forms in one rule.
+# It sits last on purpose: a full CSI is consumed by the CSI rule first, and an UNTERMINATED CSI
+# degrades here to just "ESC [" consumed with its parameters left as harmless text -- never an ESC.
+# The earlier bug was an ordering one: the old short class 0x5C-0x5F contained ']', so ESC+] matched
+# it before the OSC rule, and DCS/APC/PM/SOS had no rule at all, so their payloads survived as text
+# even though the ESC byte itself was always removed.
 _TERMINAL_ESCAPE_RE = re.compile(
-    r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"     # OSC: ESC ] ... (BEL | ST)
+    r"|\x1b[P_^X][^\x1b]*\x1b\\"             # DCS / APC / PM / SOS: ESC (P|_|^|X) ... ST
+    r"|\x1b\[[0-?]*[ -/]*[@-~]"              # CSI: ESC [ params intermediates final
+    r"|\x1b[ -/]*[0-~]"                      # nF / Fp / Fe / Fs: ESC intermediates* final
+)
 
 
 def clean_matrix_text(value):
@@ -1801,11 +1815,15 @@ def clean_matrix_text(value):
     The upgrade matrix is fetched over HTTPS as a published release asset and its strings are printed
     RAW on the operator's terminal (version notes, vulnerability titles and descriptions, hop
     conditions, backup and block reasons). A tampered or compromised asset could carry ANSI escape
-    sequences -- a colour code, a cursor move, a screen-clear, a window-title set -- that would
-    execute on that terminal. The committed file is validated against these at commit time, but a
-    fetched one is trusted only this far: escapes are removed and then anything `str.isprintable()`
-    rejects (the C0/C1 controls, a lone ESC, line/paragraph separators) is dropped. Printable Unicode
-    is kept, and a plain space is kept."""
+    sequences -- a colour code, a cursor move, a screen-clear, a window-title set, a hyperlink -- that
+    would act on that terminal. The committed file is validated against these at commit time; a
+    fetched one is trusted only this far. Two passes: first whole escape sequences are removed by the
+    ECMA-48 grammar (the string types OSC/DCS/APC/PM/SOS with their payloads, CSI, and the generic
+    nF/Fp/Fe/Fs escapes), so nothing between an introducer and its terminator is left as visible text;
+    then anything `str.isprintable()` rejects (the C0/C1 controls, a lone or malformed ESC,
+    line/paragraph separators) is dropped -- the second pass is the guarantee that no ESC byte ever
+    reaches the terminal even if a sequence is malformed. Printable Unicode is kept, as is a plain
+    space. The visible text between sequences is preserved -- e.g. the label of an OSC-8 hyperlink."""
     if not isinstance(value, str):
         return ""
     text = _TERMINAL_ESCAPE_RE.sub("", value)
