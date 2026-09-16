@@ -391,7 +391,11 @@ class AuthService:
         # is_used claim below (so refusing it never spends the credential the device still needs).
         if not allow_device_credential and temp_cred.device_id is not None:
             self._record_failed_login(temp_username, ip_address)
-            raise InvalidCredentialsError("Invalid temporary credentials")
+            # A DISTINCT internal message: the wire body is the login handler's own generic literal
+            # (this class always maps to one "Invalid username or password"), so no oracle opens, but
+            # the audit row and the security monitor — which record str(exc) — must not file "a live
+            # sync credential arrived at the interactive door" as an ordinary mistyped password.
+            raise InvalidCredentialsError("device sync credential presented at the web login")
 
         # Credential is valid — now enforce credential state.
         if not temp_cred.is_active:
@@ -1010,17 +1014,14 @@ class AuthService:
         # to the DB), so a cache outage must not 500 the mint and leave a committed, never-returned
         # orphan counting against the caller's cap. The key is kept, not deleted.
         redis_key = f"temp_cred:{temp_username}"
+        redis_value = json.dumps({
+            'id': str(temp_cred.id),
+            'user_id': str(user_id),
+            'deactivate_at': deactivate_at.isoformat(),
+            'expires_at': expires_at.isoformat()
+        })
         try:
-            redis_client.setex(
-                redis_key,
-                total_lifetime * 60,
-                json.dumps({
-                    'id': str(temp_cred.id),
-                    'user_id': str(user_id),
-                    'deactivate_at': deactivate_at.isoformat(),
-                    'expires_at': expires_at.isoformat()
-                })
-            )
+            redis_client.setex(redis_key, total_lifetime * 60, redis_value)
         except Exception as e:  # noqa: BLE001 — cache write is best-effort; the DB row is authoritative
             safe_event('temp-cred.cache-write.skipped', exc=e)
         
@@ -1227,17 +1228,14 @@ class AuthService:
         self.db.refresh(temp_cred)
 
         redis_key = f"temp_cred:{temp_username}"
+        redis_value = json.dumps({
+            'id': str(temp_cred.id),
+            'user_id': str(device.user_id),
+            'deactivate_at': deactivate_at.isoformat(),
+            'expires_at': expires_at.isoformat(),
+        })
         try:
-            redis_client.setex(
-                redis_key,
-                total_lifetime * 60,
-                json.dumps({
-                    'id': str(temp_cred.id),
-                    'user_id': str(device.user_id),
-                    'deactivate_at': deactivate_at.isoformat(),
-                    'expires_at': expires_at.isoformat(),
-                })
-            )
+            redis_client.setex(redis_key, total_lifetime * 60, redis_value)
         except Exception as e:  # noqa: BLE001 — best-effort cache write; the committed row is authoritative
             safe_event('temp-cred.cache-write.skipped', exc=e)
 
@@ -1437,15 +1435,12 @@ class AuthService:
         # leave a credential already claimed as used with no session returned.
         token_hash = hash_session_token(session_token)
         redis_key = f"session:{token_hash}"
+        redis_value = json.dumps({
+            'session_id': str(session.id),
+            'user_id': str(user.id)
+        })
         try:
-            redis_client.setex(
-                redis_key,
-                1800,  # 30 minutes
-                json.dumps({
-                    'session_id': str(session.id),
-                    'user_id': str(user.id)
-                })
-            )
+            redis_client.setex(redis_key, 1800, redis_value)  # 30 minutes
         except Exception as e:  # noqa: BLE001 — best-effort session cache; the DB row is authoritative
             safe_event('session.cache-write.skipped', exc=e)
         

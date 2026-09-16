@@ -32,6 +32,16 @@ def test_a_device_minted_credential_is_refused_at_the_web_door_and_still_works_o
         assert r.status_code == 401, (
             f"a device-minted credential signed in at the web door: {r.status_code} {r.text[:200]}")
 
+        # The refusal carries a distinct INTERNAL message (for the audit row and the security
+        # monitor), but the wire body must be identical to any other failed login: a correct password
+        # on a device credential must look exactly like a wrong password, or the 401 itself is an
+        # oracle that a username is a sync credential.
+        wrong = web.session.post(f"{BASE_URL}/auth/login",
+                                 json={"username": cred["temp_username"], "password": "wrong-pw-xyz"},
+                                 timeout=15)
+        assert r.status_code == wrong.status_code and r.text == wrong.text, (
+            "the device-credential refusal body differs from a wrong-password body — a wire oracle")
+
         row = cred_row(admin, cred["temp_username"])
         assert row is not None and row["is_used"] is False, (
             f"the web-door refusal spent the credential: {row}")
