@@ -7,6 +7,7 @@ Performance: Key endpoints support ETag-based conditional responses to reduce tr
 """
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
+import asyncio
 import hashlib
 import uuid
 import json
@@ -5123,7 +5124,8 @@ async def mint_device_sync_credential_endpoint(
         )
 
     auth_service = AuthService(db)
-    cred = auth_service.mint_device_sync_credential(
+    cred = await _offload_auth(
+        auth_service.mint_device_sync_credential,
         principal.device, body.vault_id, validity_minutes=body.validity_minutes)
     _audit_device("device_sync_cred_mint", principal.device, vault_id=body.vault_id,
                   details={"cred_id": cred.get("id")})
@@ -5553,6 +5555,25 @@ async def second_factor_step_up(
                                                 session_hash=session_hash)}
 
 
+# Synchronous auth work (a login or a credential mint) touches the database and, during a cache
+# outage, blocks on a Redis socket. Run it in a worker thread so one caller's stall does not freeze
+# the event loop for every other request. Concurrency is bounded BELOW the DB pool on purpose: each
+# offloaded call holds a request-scoped DB session for its whole duration, and the default thread
+# pool (~40) is larger than the connection pool (10 + 20 overflow), so an unbounded outage-time burst
+# would drain the pool and fail EVERY request, not just logins — turning the freeze the offload is
+# meant to remove into pool exhaustion. This semaphore caps in-flight offloaded auth so the pool
+# always keeps headroom for unrelated requests. Pairs with the session-cache breaker (never instead):
+# the breaker bounds each stall to one per cooldown, the semaphore bounds how many run at once.
+_AUTH_OFFLOAD_LIMIT = 8  # < the DB pool base (10); the rest of the pool + overflow stays free
+_auth_offload = asyncio.Semaphore(_AUTH_OFFLOAD_LIMIT)
+
+
+async def _offload_auth(fn, *args, **kwargs):
+    """Run blocking auth work off the event loop, with concurrency bounded below the DB pool."""
+    async with _auth_offload:
+        return await asyncio.to_thread(lambda: fn(*args, **kwargs))
+
+
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(
     login_request: LoginRequest,
@@ -5571,7 +5592,8 @@ async def login(
         # Check if this is a temporary credential (starts with "temp_")
         if login_request.username.startswith("temp_"):
             # Authenticate as temporary credential
-            user, session_token = auth_service.authenticate_temporary_credential(
+            user, session_token = await _offload_auth(
+                auth_service.authenticate_temporary_credential,
                 temp_username=login_request.username,
                 credential=login_request.password,
                 ip_address=client_ip,
@@ -5584,7 +5606,8 @@ async def login(
             # Regular user authentication. The org policy decides whether the submitted value is
             # resolved as a username, an email, or either — the temp_ branch above stays first and
             # policy-independent (temp usernames are their own namespace, never an email).
-            user, session_token = auth_service.authenticate_user(
+            user, session_token = await _offload_auth(
+                auth_service.authenticate_user,
                 login_request.username,
                 login_request.password,
                 client_ip,
@@ -5876,7 +5899,8 @@ async def create_temp_credentials(
         parent_vault_ids = list(parent_vault_caps.keys())
         parent_vault_scope = getattr(current_user, '_temp_vault_scope', {}) or {}
 
-    temp_creds = auth_service.create_temporary_credential(
+    temp_creds = await _offload_auth(
+        auth_service.create_temporary_credential,
         current_user.id,
         validity_minutes=payload.validity_minutes if payload else None,
         total_lifetime_minutes=payload.total_lifetime_minutes if payload else None,
