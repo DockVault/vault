@@ -60,7 +60,7 @@ from app.config.branding import branding
 # auth one under an alias so the later vault import below can't shadow it — otherwise the
 # login throttle's `except` would bind the wrong class and a throttled login would surface
 # as a 500 instead of a 429.
-from app.services.auth_service import AuthService, InvalidCredentialsError, AccountLockedError, RateLimitExceededError as AuthRateLimitExceededError
+from app.services.auth_service import AuthService, InvalidCredentialsError, AccountLockedError, SessionLimitExceededError, RateLimitExceededError as AuthRateLimitExceededError
 from app.core.authorization import PermissionService, PermissionDeniedError, ResourceNotFoundError, AuthorizationError
 from app.services.vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, _name_match_filter, is_refundable_serve_failure
 from app.services.vault_service import require_file_scope, require_folder_scope, require_item_scope, require_download_scope, folder_ancestry, filter_listing_for_scope
@@ -5927,7 +5927,12 @@ async def login(
             is_scoped_temp=_is_scoped(user),
         )
     
-    except (InvalidCredentialsError, AccountLockedError) as e:
+    except (InvalidCredentialsError, AccountLockedError, SessionLimitExceededError) as e:
+        # SessionLimitExceededError joins here so a temp credential that already has a live session
+        # gets the SAME generic 401 as a wrong credential, never an uncaught 500 -- a 500 on the login
+        # door is a "this credential is live and in use" oracle. Only AccountLockedError branches to a
+        # 403 below; SessionLimitExceededError falls through to the uniform "Invalid username or
+        # password" like InvalidCredentialsError, and is recorded as a failed login like it.
         audit_logger.log_login_failure(login_request.username, client_ip, str(e))
         
         # AWAITED in the offload pool: the brute-force counter must advance on every failed login

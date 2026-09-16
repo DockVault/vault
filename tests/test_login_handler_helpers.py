@@ -92,6 +92,7 @@ class _Exc(Exception):
 @pytest.mark.parametrize("raiser_name,expected_status", [
     ("InvalidCredentialsError", 401),   # wrong password
     ("AuthRateLimitExceededError", 429),  # throttled
+    ("SessionLimitExceededError", 401),   # a temp credential already live/in use -> generic 401, NOT a 500 oracle
 ])
 def test_a_failed_login_records_off_loop_and_before_the_response(raiser_name, expected_status,
                                                                  monkeypatch):
@@ -103,12 +104,13 @@ def test_a_failed_login_records_off_loop_and_before_the_response(raiser_name, ex
     S = _api()
     from unittest.mock import MagicMock
     from app.core.database import get_db
-    from app.services.auth_service import AuthService, InvalidCredentialsError
+    from app.services.auth_service import AuthService, InvalidCredentialsError, SessionLimitExceededError
     from app.services.auth_service import RateLimitExceededError as AuthRateLimitExceededError
     from app.core import rate_limiter as R
     import time as _t
 
     raiser = {"InvalidCredentialsError": InvalidCredentialsError("bad"),
+              "SessionLimitExceededError": SessionLimitExceededError("already has a live session"),
               "AuthRateLimitExceededError": AuthRateLimitExceededError("too many", retry_after=1,
                                                                        limit=5, remaining=0)}[raiser_name]
 
