@@ -1787,23 +1787,70 @@ def preferred_lifecycle_matrix(local_matrix, fetched_matrix, version):
     return local_matrix if version_support(local_matrix, version) else fetched_matrix
 
 
+# A terminal escape: a lone ESC-introduced sequence, a CSI sequence (ESC [ ... final byte, e.g. a
+# colour code or a screen-clear), or an OSC string (ESC ] ... terminator). Matched as a whole so the
+# printable bytes that follow the ESC (the "[31m" of a colour code) are removed with it, not left as
+# visible litter.
+_TERMINAL_ESCAPE_RE = re.compile(
+    r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")
+
+
+def clean_matrix_text(value):
+    """Strip terminal escape sequences and other non-printable characters from a matrix string.
+
+    The upgrade matrix is fetched over HTTPS as a published release asset and its strings are printed
+    RAW on the operator's terminal (version notes, vulnerability titles and descriptions, hop
+    conditions, backup and block reasons). A tampered or compromised asset could carry ANSI escape
+    sequences -- a colour code, a cursor move, a screen-clear, a window-title set -- that would
+    execute on that terminal. The committed file is validated against these at commit time, but a
+    fetched one is trusted only this far: escapes are removed and then anything `str.isprintable()`
+    rejects (the C0/C1 controls, a lone ESC, line/paragraph separators) is dropped. Printable Unicode
+    is kept, and a plain space is kept."""
+    if not isinstance(value, str):
+        return ""
+    text = _TERMINAL_ESCAPE_RE.sub("", value)
+    return "".join(ch for ch in text if ch.isprintable() or ch == " ")
+
+
+def version_vulnerabilities(matrix, version):
+    """The list of known, already-fixed vulnerabilities declared for `version`, or [].
+
+    Tolerant like `version_support`: a matrix that predates the field, or does not declare the
+    version, or states something other than a list, reads as 'none listed' rather than an error."""
+    if not isinstance(matrix, dict):
+        return []
+    version = (version or "").lstrip("vV")
+    meta = (matrix.get("versions") or {}).get(version) or {}
+    vulns = meta.get("vulnerabilities")
+    return vulns if isinstance(vulns, list) else []
+
+
 def support_line(matrix, version):
     """A one-line human summary of a version's lifecycle, or '' when nothing is stated. Names the
-    end-of-life state, any extended-support tail dates, and whether the version is insecure."""
+    end-of-life state, any extended-support tail dates, and whether the version is insecure -- and,
+    when the matrix lists them, how many known vulnerabilities it has, their titles, and the release
+    that fixes them. Every matrix-sourced fragment is escape-stripped before it reaches a terminal."""
     s = version_support(matrix, version)
     if not s:
         return ""
     if s.get("eol") is True:
         parts = ["end-of-life"]
         if s.get("code_support"):
-            parts.append("code support until %s" % s["code_support"])
+            parts.append("code support until %s" % clean_matrix_text(s["code_support"]))
         if s.get("security_support"):
-            parts.append("security support until %s" % s["security_support"])
+            parts.append("security support until %s" % clean_matrix_text(s["security_support"]))
         head = "; ".join(parts)
     else:
         head = "supported"
     if s.get("secure") is False:
         head += " -- has known unpatched vulnerabilities"
+        vulns = version_vulnerabilities(matrix, version)
+        if vulns:
+            titles = "; ".join(clean_matrix_text(v.get("title") or "") for v in vulns)
+            fixes = sorted({v.get("fixed_in") for v in vulns if v.get("fixed_in")},
+                           key=lambda t: parse_semver(t) or (0, 0, 0))
+            fixed = " -- fixed in %s" % ", ".join(clean_matrix_text(f) for f in fixes) if fixes else ""
+            head += " (%d): %s%s" % (len(vulns), titles, fixed)
     return head
 
 
@@ -4230,9 +4277,10 @@ class DockVault:
         print("    reversible   : %s" % ("no" if plan["irreversible"] else "yes"))
         print("    backup       : %s" % ("required" if plan["requires_backup"] else "not required"))
         for condition in plan["conditions"]:
-            print(pal.paint("    note         : %s" % condition.get("summary", ""), "yellow"))
+            print(pal.paint("    note         : %s" % clean_matrix_text(condition.get("summary", "")),
+                            "yellow"))
             if condition.get("detect"):
-                print("                   check with: %s" % condition["detect"])
+                print("                   check with: %s" % clean_matrix_text(condition["detect"]))
 
     def _require_backup(self, args, interactive, reason):
         """Take a backup, or accept an operator's word that one exists. False = do not proceed.
@@ -4243,7 +4291,7 @@ class DockVault:
         prompt says so rather than implying a guarantee it cannot make.
         """
         pal = self.pal
-        print(pal.paint("\n  A backup is required: %s" % reason, "yellow"))
+        print(pal.paint("\n  A backup is required: %s" % clean_matrix_text(reason), "yellow"))
         if args and getattr(args, "backup_verified", False):
             print("  --backup-verified given: proceeding on your own backup. This tool has not "
                   "checked that it exists or that it restores.")
@@ -4345,9 +4393,17 @@ class DockVault:
             self._fail("%s is end-of-life and cannot be upgraded or downgraded to (%s)."
                        % (tag, support_line(eol_matrix, tag)))
         if version_support(eol_matrix, tag).get("secure") is False:
-            print(pal.paint(
-                "  WARNING: %s has known unpatched vulnerabilities (%s)."
-                % (tag, support_line(eol_matrix, tag)), "red"))
+            vulns = version_vulnerabilities(eol_matrix, tag)
+            if vulns:
+                titles = "; ".join(clean_matrix_text(v.get("title") or "") for v in vulns)
+                fixes = sorted({v.get("fixed_in") for v in vulns if v.get("fixed_in")},
+                               key=lambda t: parse_semver(t) or (0, 0, 0))
+                fixed = (" Fixed in %s." % ", ".join(clean_matrix_text(f) for f in fixes)) if fixes else ""
+                print(pal.paint(
+                    "  WARNING: %s has %d known unpatched vulnerability(ies): %s.%s"
+                    % (tag, len(vulns), titles, fixed), "red"))
+            else:
+                print(pal.paint("  WARNING: %s has known unpatched vulnerabilities." % tag, "red"))
 
         # A downgrade the matrix refuses: an older image cannot read data written by the newer one,
         # so the move is not offered even with an 'i accept'. Read off this checkout's matrix, which
@@ -4359,11 +4415,11 @@ class DockVault:
                 "%s -> %s is a downgrade this deployment cannot take: an older image cannot read the "
                 "data written by the newer one (%s). Deploy the older version as a fresh set and "
                 "restore from a backup instead of downgrading over these volumes."
-                % (current, tag, down_reason))
+                % (current, tag, clean_matrix_text(down_reason)))
 
         if plan["blocked"] is not None:
             self._fail("the upgrade matrix says this change must not be taken directly: %s"
-                       % plan["blocked"].get("reason", "no reason recorded"))
+                       % clean_matrix_text(plan["blocked"].get("reason", "no reason recorded")))
 
         dry_run = bool(getattr(args, "dry_run", False)) if args else False
         if dry_run:

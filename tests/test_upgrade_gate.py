@@ -639,6 +639,64 @@ def test_support_line_names_eol_tail_and_insecurity():
     assert dv.support_line(_matrix(), "0.1.0") == ""  # nothing stated -> empty
 
 
+# --- the per-version vulnerability list, and escape-stripping matrix-sourced strings ------------
+
+def _matrix_with_vulnerabilities():
+    m = _matrix()
+    m["schema_version"] = 2
+    m["versions"]["0.1.0"]["support"] = {"eol": False, "secure": False}
+    m["versions"]["0.1.0"]["vulnerabilities"] = [
+        {"title": "First issue", "description": "d", "severity": None, "cvss": None,
+         "id": None, "fixed_in": "0.2.0", "published": "2026-01-02"},
+        {"title": "Second issue", "description": "d", "severity": None, "cvss": None,
+         "id": None, "fixed_in": "0.2.0", "published": "2026-01-02"},
+    ]
+    m["versions"]["0.2.0"]["support"] = {"eol": False, "secure": True}
+    return m
+
+
+def test_version_vulnerabilities_is_tolerant_of_an_older_or_odd_matrix():
+    m = _matrix_with_vulnerabilities()
+    assert len(dv.version_vulnerabilities(m, "0.1.0")) == 2
+    assert dv.version_vulnerabilities(m, "v0.1.0")                       # tolerates a v-prefix
+    assert dv.version_vulnerabilities(_matrix(), "0.1.0") == []          # field absent -> []
+    assert dv.version_vulnerabilities({"versions": {"0.1.0": {"vulnerabilities": "x"}}}, "0.1.0") == []
+    assert dv.version_vulnerabilities(None, "0.1.0") == []
+
+
+def test_support_line_names_the_vulnerability_count_titles_and_fix():
+    m = _matrix_with_vulnerabilities()
+    line = dv.support_line(m, "0.1.0")
+    assert "has known unpatched vulnerabilities (2):" in line
+    assert "First issue" in line and "Second issue" in line
+    assert "fixed in 0.2.0" in line
+    assert dv.support_line(m, "0.2.0") == "supported"                   # secure -> just supported
+    # An insecure version whose matrix predates the field still names the bare fact.
+    assert "unpatched" in dv.support_line(_lifecycle_matrix(), "0.1.0")
+
+
+# A colour code, a reset, and a screen-clearing CSI sequence around visible text.
+_CLEARING_TITLE = "\x1b[31mDANGER\x1b[0m\x1b[2Jcleared"
+
+
+def test_clean_matrix_text_removes_terminal_escapes_but_keeps_visible_text():
+    assert dv.clean_matrix_text(_CLEARING_TITLE) == "DANGERcleared"
+    # A lone ESC, a C0 (BEL) and a C1 (NEL) control are dropped; a plain space and printable Unicode
+    # (an em dash, an accented letter) survive.
+    assert dv.clean_matrix_text("a\x1b\x07b\x85 — café") == "ab — café"
+    assert dv.clean_matrix_text(123) == ""                              # non-strings answer empty
+
+
+def test_a_tampered_vulnerability_title_renders_without_the_escape_sequence():
+    # The runtime protection: a fetched (possibly tampered) asset whose title carries escape
+    # sequences must not print them raw to the operator's terminal.
+    m = _matrix_with_vulnerabilities()
+    m["versions"]["0.1.0"]["vulnerabilities"][0]["title"] = _CLEARING_TITLE
+    line = dv.support_line(m, "0.1.0")
+    assert "\x1b" not in line and "[31m" not in line and "[2J" not in line
+    assert "DANGERcleared" in line                                      # the visible text survives
+
+
 def test_lifecycle_is_read_from_the_newest_local_view_not_the_frozen_target():
     # A version becomes end-of-life AFTER it ships; the target's own published matrix is frozen at
     # cut time and forever self-declares eol:false, so this checkout's newer view must win.
