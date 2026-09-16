@@ -154,16 +154,6 @@ def check_db_connection() -> bool:
         return False
 
 
-def check_redis_connection() -> bool:
-    """Check cache availability without leaking connection details."""
-    try:
-        _require_redis_client().ping()
-        return True
-    except Exception:
-        print("Redis connection failed")
-        return False
-
-
 _redis_probe_client = None
 
 

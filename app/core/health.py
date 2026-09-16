@@ -6,8 +6,9 @@ no paths, no capacity figures, no host details, no exception text. Knowing that 
 writable is operationally useful; knowing *where* it is, or how full, tells an anonymous caller
 about the machine.
 
-This mirrors ``check_db_connection`` / ``check_redis_connection`` in ``database.py``, which
-already answer as bare booleans "without leaking connection details".
+This mirrors ``check_db_connection`` in ``database.py``, which already answers as a bare boolean
+"without leaking connection details" (the Redis check lives in the ``/health`` handler now, behind
+the breaker and off the loop).
 """
 import os
 import socket

@@ -37,7 +37,7 @@ from pathlib import Path
 from app.core.config import bootstrap_entrypoint
 bootstrap_entrypoint("API")
 
-from app.core.database import get_db, init_db, check_db_connection, check_redis_connection, redis_probe_ping
+from app.core.database import get_db, init_db, check_db_connection, redis_probe_ping
 from app.core import vault_attempt_throttle
 from app.core import redis_guard
 from app.core.rate_limiter import redis_circuit_open
@@ -2145,6 +2145,11 @@ async def health_check():
     # disconnected with no socket when it is open), else probe OFF the loop on the dedicated
     # short-timeout client; the DB check also runs off the loop, bounded by its own connect timeout.
     # Never write the breaker; keep the report exactly as honest and no richer (it is unauthenticated).
+    #
+    # Budget: these two run sequentially on the default executor -- the DB connect timeout (5 s) plus
+    # the probe (1 s) is a 6 s worst case, under the container HEALTHCHECK's --timeout=8s. Raising the
+    # DB connect timeout past ~7 s would blow that budget and make a DB outage restart the container
+    # after the healthcheck's retry count, so keep it well under.
     loop = asyncio.get_running_loop()
     db_ok = await loop.run_in_executor(None, check_db_connection)
     if redis_circuit_open():
