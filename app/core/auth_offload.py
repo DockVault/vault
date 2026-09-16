@@ -12,10 +12,13 @@ socket. Two mechanisms keep that from freezing the server:
   * ``run_offloaded`` runs the blocking work in a worker thread, so one caller's stall does not hold
     the event loop and concurrent callers do not serialize behind it.
 
-``asyncio.to_thread`` uses the event loop's default ``ThreadPoolExecutor`` (``min(32, cpu + 4)``
-workers, shared with other offloaded work such as preview rendering); the slot cap, not the executor,
-is what bounds these routes. This pairs with the session-cache circuit breaker rather than replacing
-it: the breaker bounds each stall, the slot bounds how many requests run at once.
+``run_offloaded`` uses a DEDICATED ``ThreadPoolExecutor`` (this module's ``_offload_executor``), not
+the event loop's default one — the default is shared with the ``/ws/monitor`` pub/sub poller, which
+parks roughly a whole worker per open browser and could starve the offload. The dedicated pool is
+sized to the slot count plus the side-effect bound, so the SLOT, not an incidentally-starved executor,
+is what bounds these routes. It carries the caller's contextvars across the hop (``run_in_executor``
+does not, where ``asyncio.to_thread`` did). This pairs with the session-cache circuit breaker rather
+than replacing it: the breaker bounds each stall, the slot bounds how many requests run at once.
 """
 import asyncio
 import contextvars

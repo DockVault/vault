@@ -451,14 +451,18 @@ class AuthService:
             TemporaryCredential.temp_username == temp_username
         ).first()
         # Any KNOWN temp_ credential throttles in a bucket of its OWN, never the shared login:<ip>
-        # bucket: the device's bucket when it carries a device_id (live or revoked), else its own
-        # per-username bucket (a hand-out credential, or one whose device was DELETED and its link SET
-        # NULL). This is what stops a looping client of a deleted/hand-out credential from spending
-        # the human's per-IP login budget and locking the owner out. Only a credential the lookup
-        # does NOT find (an unknown/probed username) falls to the IP + username login throttle, so
-        # junk still lands in a bounded bucket; the dummy-verify below keeps that miss timing-identical.
+        # bucket, so a looping client cannot spend the human's per-IP login budget and lock the owner
+        # out. WHICH own bucket depends on the door: a device-linked credential charges its device
+        # bucket ONLY at the SFTP door (allow_device_credential); at the WEB door it is a known temp_
+        # name like any other and charges login:<temp_username>. That keeps the web door from (a)
+        # classifying a device-sync name by its higher device trip count and (b) draining the device's
+        # SFTP budget to lock the real device out — the web door can never reach the device bucket.
+        # Every other known credential (hand-out, or one whose device was DELETED and its link SET
+        # NULL) uses its per-username bucket. Only a credential the lookup does NOT find (an
+        # unknown/probed username) falls to the IP + username login throttle, so junk still lands in a
+        # bounded bucket; the dummy-verify below keeps that miss timing-identical.
         device_id = getattr(temp_cred, "device_id", None) if temp_cred else None
-        if device_id is not None:
+        if device_id is not None and allow_device_credential:
             self._check_device_rate_limit(device_id, ip_address)
         elif temp_cred is not None:
             self._check_username_rate_limit(temp_username)

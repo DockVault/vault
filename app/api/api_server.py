@@ -1905,7 +1905,36 @@ def _guarded_publish_force(channel: str, message: str) -> bool:
         raise
 
 
+def _login_429_detail_and_headers(username: str, exc):
+    """Build the body and headers for a login 429. For a temp_ username the rate-limit headers are
+    dropped and the body is a single generic message, so the 429 does not reveal WHICH bucket raised
+    (the limit value and the "…from this IP…" wording are both kind oracles). The human keeps the
+    exact message and its X-RateLimit headers. Pure and unit-pinned; the general middleware may
+    re-stamp X-RateLimit-* on the wire, so this handler-level drop is defence in depth."""
+    is_temp = username.startswith("temp_")
+    headers = {}
+    if not is_temp:
+        if getattr(exc, 'limit', None):
+            headers["X-RateLimit-Limit"] = str(exc.limit)
+        if hasattr(exc, 'remaining'):
+            headers["X-RateLimit-Remaining"] = str(exc.remaining)
+    retry = getattr(exc, 'retry_after', None)
+    if retry:
+        headers["Retry-After"] = str(retry)
+    if is_temp:
+        detail = (f"Too many login attempts. Please try again in {retry} seconds."
+                  if retry else "Too many login attempts. Please try again later.")
+    else:
+        detail = str(exc)
+    return detail, headers
+
+
 _offloop_sem = None  # created lazily on the running loop
+# Queue-depth cap: FIRE_OFFLOOP_LIMIT bounds how many side effects run AT ONCE, not how many may
+# pile up waiting. The failed-login record feeds this queue from an UNAUTHENTICATED door, so under a
+# spray the backlog could grow without bound. Beyond this many pending, shed the side effect.
+_OFFLOOP_MAX_PENDING = FIRE_OFFLOOP_LIMIT * 4
+_offloop_dropped = 0  # count of side effects shed because the queue was saturated (best-effort telemetry)
 
 
 def _fire_offloop(fn, *args, **kwargs) -> None:
@@ -1927,9 +1956,15 @@ def _fire_offloop(fn, *args, **kwargs) -> None:
         # No running loop (a sync caller): just run it inline — there is no loop to protect.
         fn(*args, **kwargs)
         return
-    global _offloop_sem
+    global _offloop_sem, _offloop_dropped
     if _offloop_sem is None:
         _offloop_sem = asyncio.Semaphore(FIRE_OFFLOOP_LIMIT)
+
+    # Shed rather than queue without bound: a login must never wait on telemetry, and under a
+    # pathological backlog the durable state is unaffected — only this best-effort nudge is lost.
+    if len(_BG_TASKS) >= _OFFLOOP_MAX_PENDING:
+        _offloop_dropped += 1
+        return
 
     # Copy the caller's context: run_in_executor does not propagate contextvars (asyncio.to_thread
     # did), so the side effect would otherwise run with an empty context.
@@ -5846,35 +5881,7 @@ async def login(
         _fire_offloop(_record_failed_login_bg, login_request.username, client_ip,
                       f"Rate limit exceeded: {str(e)}")
         
-        # Add rate-limit headers to the 429. For a temp_ credential at the web door emit ONLY
-        # Retry-After and DROP X-RateLimit-Limit / X-RateLimit-Remaining: the limit VALUE is a kind
-        # oracle — a device bucket, a per-username bucket and the human login bucket carry different
-        # limits, so a prober could tell which kind a temp_ username hit from its very first 429. The
-        # body is already the same generic "Too many login attempts" for every kind; dropping these
-        # two headers makes the whole 429 identical across temp_ kinds. The human password login is
-        # unaffected and keeps its headers.
-        headers = {}
-        is_temp_username = login_request.username.startswith("temp_")
-        if not is_temp_username:
-            if hasattr(e, 'limit') and e.limit:
-                headers["X-RateLimit-Limit"] = str(e.limit)
-            if hasattr(e, 'remaining'):
-                headers["X-RateLimit-Remaining"] = str(e.remaining)
-        if hasattr(e, 'retry_after') and e.retry_after:
-            headers["Retry-After"] = str(e.retry_after)
-
-        # Body must not reveal WHICH bucket raised for a temp_ username. A known credential's buckets
-        # only ever say "Too many login attempts…", but an unknown temp_ name falls to the IP leg
-        # whose message says "…from this IP…" — a one-request kind/existence classifier. Emit one
-        # generic detail for every temp_ username regardless of the bucket; the human keeps the exact
-        # message. Retry-After carries the countdown either way.
-        if is_temp_username:
-            retry = getattr(e, 'retry_after', None)
-            detail = ("Too many login attempts. Please try again in "
-                      f"{retry} seconds." if retry else "Too many login attempts. Please try again later.")
-        else:
-            detail = str(e)
-
+        detail, headers = _login_429_detail_and_headers(login_request.username, e)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=detail,
@@ -7200,7 +7207,11 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                     _rev = _wsdb.query(_WsAS.revoked).filter(
                         _WsAS.session_token == hash_session_token(session_token)
                     ).first()
-                    if _rev is not None and _rev[0]:
+                    # One security answer, matching get_current_user: reject a token whose session row
+                    # is ABSENT (fail closed) as well as one marked revoked. Every regular login
+                    # inserts a session row, so a missing row means it was deleted or never existed —
+                    # the handshake must not stream the fleet feed to it.
+                    if _rev is None or _rev[0]:
                         raise ValueError("Session terminated")
                 else:
                     # Temp sessions: full parity with get_current_user, which bounds a temp session
