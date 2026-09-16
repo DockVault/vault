@@ -22,22 +22,54 @@ pytestmark = pytest.mark.unit
 _PAUSE = re.compile(r"""[(,]\s*['"]pause['"]""")
 _SETTLES = "wait_out_breaker_cooldown"
 
+# Directory parts to skip: the recursive walk must stay in the suite's OWN files, not descend into a
+# vendored interpreter (the project's lane convention puts one at tests/.venv), where site-packages
+# modules — a Pygments lexer, Playwright's _page.py — legitimately contain `("pause"...)` and are
+# nothing to do with the Redis contract.
+_SKIP_PARTS = {"site-packages", "venv", ".venv", "__pycache__", "node_modules"}
 
-def test_every_redis_pausing_file_waits_out_the_breaker_cooldown():
-    tests_dir = pathlib.Path(__file__).parent
+
+def _pause_offenders(root: pathlib.Path):
+    """Files under `root` (recursively, but skipping vendored trees) that pause Redis without settling
+    the breaker cooldown. Skips this contract module itself, which names "pause" only in prose."""
     this_file = pathlib.Path(__file__).name
     offenders = []
-    # Scan EVERY .py under tests/ RECURSIVELY (test modules, conftest, helper modules, any subdir),
-    # so a pause site the non-recursive globs would have missed cannot slip through.
-    for path in sorted(tests_dir.rglob("*.py")):
+    for path in sorted(root.rglob("*.py")):
+        rel = path.relative_to(root)
+        if any(part.startswith(".") or part in _SKIP_PARTS for part in rel.parts):
+            continue  # a vendored interpreter / cache / hidden dir, not a suite file
         if path.name == this_file:
             continue
         src = path.read_text(encoding="utf-8")
         if _PAUSE.search(src) and _SETTLES not in src:
-            offenders.append(path.name)
+            offenders.append(str(rel))
+    return offenders
+
+
+def test_every_redis_pausing_file_waits_out_the_breaker_cooldown():
+    offenders = _pause_offenders(pathlib.Path(__file__).parent)
     assert not offenders, (
         "these files pause the Redis container but never call wait_out_breaker_cooldown(), so the "
         f"next test in the invocation can start on an open breaker: {offenders}")
+
+
+def test_the_pause_scan_ignores_vendored_trees_but_still_catches_real_sites(tmp_path):
+    # A vendored interpreter under tests/ (e.g. tests/.venv/.../site-packages) must NOT be scanned —
+    # its modules legitimately contain ("pause"...) — while a genuine suite file that pauses without
+    # settling the cooldown must still be caught.
+    vendored = tmp_path / ".venv" / "lib" / "site-packages"
+    vendored.mkdir(parents=True)
+    (vendored / "lexer.py").write_text('docker("pause", "x")  # no cooldown, but vendored', encoding="utf-8")
+    (tmp_path / "test_real.py").write_text(
+        'docker("pause", REDIS)\n# a genuine pause site that never settles the breaker\n', encoding="utf-8")
+    (tmp_path / "test_ok.py").write_text(
+        'docker("pause", REDIS)\nwait_out_breaker_cooldown()\n', encoding="utf-8")
+
+    offenders = _pause_offenders(tmp_path)
+    assert not any("site-packages" in o or ".venv" in o for o in offenders), (
+        f"the scan descended into a vendored interpreter: {offenders}")
+    assert "test_real.py" in offenders, f"the scan missed a real pause-without-cooldown site: {offenders}"
+    assert "test_ok.py" not in offenders, f"a file that settles the cooldown was flagged: {offenders}"
 
 
 def test_wait_out_breaker_cooldown_sleep_is_patchable(monkeypatch):

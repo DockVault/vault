@@ -12,10 +12,16 @@ burst, time one unrelated authenticated request on its own session. Offloaded it
 (no password verify on its path); with run_offloaded replaced by a direct call on the login route it
 waits behind the serialized verifies. The threshold sits well under N single verifies.
 
-Opt-in via the login limit like its offload siblings: it fires N logins from one source IP, so it
-needs a raised login limit and skips on the shipped-default throttle stack.
+OPT-IN, and NOT in the main lane. Measured: 3/3 green in isolation, but a 1-in-2 flake when run in the
+big single-invocation lane beside the Redis-pausing modules (the unrelated GET measured ~0.63 s on a
+two-vCPU CI runner sharing N Argon2 verifies, close enough to the relative ceiling to tip under
+scheduling noise). It is timing-sensitive by nature, so it runs only in the general-API outage step
+(opt-in, raised limiter, where the other outage modules already live); the unit heartbeat test
+(test_auth_offload.py) and the shipped-slot pin stay the robust main-lane guards for the offload.
+It fires N logins from one source IP, so it also needs a raised login limit.
 """
 import concurrent.futures
+import os
 import time
 
 import pytest
@@ -27,6 +33,11 @@ _N = 8  # equal to the offload slot count: a full burst that still fits the slot
 
 pytestmark = [
     pytest.mark.integration,
+    pytest.mark.skipif(
+        os.environ.get("VAULT_REDIS_OUTAGE_TEST") not in ("1", "true", "yes"),
+        reason="opt-in and load-sensitive: set VAULT_REDIS_OUTAGE_TEST=1 to run it (it lives in the "
+               "general-API outage step, not the main lane, to avoid a scheduling-noise flake)",
+    ),
     pytest.mark.skipif(
         _LOGIN_LIMIT is not None and _LOGIN_LIMIT <= 50,
         reason=f"fires {_N} logins from one IP; needs a raised login limit (deployment has "
